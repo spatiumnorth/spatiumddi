@@ -177,6 +177,43 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The database's memory limit is sized from the node, with the api
+  and the worker (#1115).** The supervisor sizes the api and worker
+  limits from the node's RAM (#947) and firstboot renders the same
+  numbers into the spatium-control HelmChart (#1003), but the
+  CloudNativePG cluster kept the chart's BYO default of `1Gi` (with
+  `shared_buffers: 256MB`, sized for the same gibibyte) on every
+  appliance whatever the node had. Under a bulk record load the
+  primary hit that cap, the kernel OOM-killed it, CloudNativePG
+  failed over, and every write in the failover window was lost — on
+  a 12 GiB seed with 7.6 GiB free (observed live on a seven-node QA
+  cluster: 93,000 of 1,000,000 records created; the same load
+  completed with zero database restarts once the cap was raised).
+  The three workloads are now one whole-node budget rather than
+  three independent fractions: a 2 GiB reserve for the platform
+  (k3s, the supervisor, the bind9/kea DaemonSets, the CNPG
+  operator — about 1.7 GiB measured on an idle 6 GiB appliance),
+  then the remainder split api one half, worker one quarter,
+  Postgres one quarter, clamped to 1–8, 1–4 and 1–4 GiB, with
+  `shared_buffers` a quarter of the Postgres cap (Postgres' own
+  guidance; the chart's 256MB-of-1Gi is the same ratio). On 8 GiB
+  that is api 3072Mi / worker 1536Mi / Postgres 1536Mi; on 12 GiB
+  5120 / 2560 / 2560; on a 6 GiB appliance every share sits on its
+  floor and Postgres stays at 1024Mi. The api and worker limits are
+  therefore lower than before on nodes under 16 GiB (an 8 GiB
+  node's api was 4096Mi, now 3072Mi): limits are ceilings, and the
+  sum of the three now fits the node beside the reserve instead of
+  exceeding it. The reserve, the shares and the caps are one table
+  in `k8s_api.control_plane_sizing`, mirrored in firstboot and held
+  together by `test_control_plane_sizing.py`; they are the knob to
+  turn if a workload needs a different split. firstboot renders the
+  Postgres sizing into the HelmChart so a fresh install's Cluster is
+  created with it — a resources change on a formed cluster is a
+  CloudNativePG rolling restart, replicas first, then a switchover —
+  and an appliance that upgrades into this sizing takes that one
+  rolling restart on its first heartbeat, after which the #1005
+  guard keeps every later heartbeat quiet.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —
