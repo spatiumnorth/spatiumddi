@@ -177,6 +177,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS agent: `queries_total` counted every query twice on BIND 9.20
+  (#1064).** The poller listed the opcode table's `QUERY` and the
+  nsstat family's `Requestv4`/`Requestv6` under one column so either
+  shape of `named` would light it up, then summed whatever it found —
+  and every current BIND publishes both, so `dns_metric_sample`
+  reported 2.00× the queries the daemon received (the DHCP sampler,
+  whose counters have one spelling, matched kea to the packet in the
+  same window). `noerror` folded `QrySuccess` beside the
+  `QryAuthAns`/`QryNoauthAns` split the same way and doubled on
+  every answered query. The spellings are now alternatives in order
+  of preference — the first one present is the value — and the
+  poller's tests carry a 9.20 sample with both.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —
