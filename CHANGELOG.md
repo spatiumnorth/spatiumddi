@@ -177,6 +177,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS agent held `pending_approval` can be approved through the
+  API (#1121).** `DNS_REQUIRE_AGENT_APPROVAL=true` holds a re-registering
+  agent whose fingerprint changed (a wiped agent volume legitimately
+  produces one): its config long-poll answers `pending_approval` and
+  never a bundle, so `named` stays deferred. Nothing cleared the hold —
+  `ServerUpdate` has no approval field and the DNS router had no
+  approve route, while DHCP has had `POST /dhcp/servers/{id}/approve`
+  all along — so the only recovery was a database write or deleting
+  and re-registering the server. `POST /dns/groups/{group_id}/servers/
+  {server_id}/approve` (superadmin) now mirrors the DHCP endpoint:
+  clears the flag, writes a `dns.server.approve` audit event, wakes
+  the agent and returns the server row. Idempotent. The DNS server
+  modal still only shows the flag (the DHCP page has an Approve
+  control); the UI control is follow-up work.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —
