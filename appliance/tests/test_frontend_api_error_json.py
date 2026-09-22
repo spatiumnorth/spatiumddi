@@ -55,7 +55,13 @@ def _locations(text: str) -> dict[str, str]:
 
 
 def _api_locations(locs: dict[str, str]) -> dict[str, str]:
-    return {spec: body for spec, body in locs.items() if spec.startswith("/api/")}
+    """Prefix locations under ``/api/`` and regex locations anchored there (the
+    storage action's exact-path block, #1080)."""
+    return {
+        spec: body
+        for spec, body in locs.items()
+        if spec.startswith("/api/") or re.match(r"~\*?\s*\^/api/", spec)
+    }
 
 
 @CONFIGS

@@ -258,6 +258,37 @@ server {
         proxy_send_timeout       1800s;
     }
 
+    # Storage management actions (#1080). Two budgets sit behind this
+    # route, both longer than the 60 s ``proxy_read_timeout`` the
+    # generic ``/api/`` block below carries: the api waits up to 90 s
+    # for the appliance's supervisor (appliance/supervisor.py, the
+    # storage channel's ``timeout=90.0``) before its own 504, and the
+    # supervisor waits 60 s for the host runner before reporting
+    # ``ok=false "the host storage runner did not answer within 60s"``
+    # -- a report that reaches the api a little AFTER nginx's 60 s
+    # clock, which started before the supervisor's. Either way the
+    # operator got nginx's generic did-not-answer JSON at 60.000 s and
+    # never the message written to send them to
+    # ``journalctl -u spatiumddi-storage-action``. An exact-path regex
+    # (any appliance id) so no other /api/ route waits longer; sized
+    # above the route's budget with margin, the way the backup and
+    # upgrade-image blocks are sized to theirs. Must not diverge from
+    # charts/spatiumddi/templates/frontend-tls-config.yaml.
+    location ~ ^/api/v1/appliance/appliances/[^/]+/storage/action$ {
+        error_page 502 504 @api_unavailable;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass         $api_upstream;
+        proxy_set_header   Host $http_host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
+
     # Proxy API calls to the backend. Using a variable for proxy_pass
     # forces nginx to re-resolve the upstream on each request via the
     # resolver above (instead of binding at config-load time).
