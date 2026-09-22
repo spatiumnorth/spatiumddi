@@ -22,6 +22,45 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **DNS agent config bundles are rendered once, in the worker, and
+  served as stored bytes (#1111).** `GET /api/v1/dns/agents/config`
+  used to assemble the whole group — every record of every zone — in
+  the api request path, once per agent long-poll that observed a
+  change and once per page while ops were pending, with peak memory
+  proportional to the record count; at 1.09 M `dns_record` rows the
+  records query no longer fit asyncpg's 30 s `command_timeout` and
+  every poll of every agent answered 503 for as long as anyone
+  watched. The bundle is now rendered once per (server, watermark) by
+  a Celery task on a new `bundles` queue (add it to the worker's `-Q`
+  list on BYO deployments; the chart, `k8s/base` and both compose files
+  carry it) and stored in the new `dns_agent_bundle` table — gzip at
+  rest, the same ETags for the same state — and the long-poll streams
+  the stored bytes with the per-server ops page spliced in. A change
+  marks the bundle dirty in its own transaction (`bundle_dirty_seq` on
+  `dns_server`), the worker coalesces renders per server, and a 30 s
+  sweep re-enqueues anything left behind. The ops page is gated to the
+  bundle's snapshot so a body can never lack a record the agent
+  already applied. Render failures surface on the server row
+  (`bundle_render_status` / `_error` / `_at`, in the servers API) and
+  through the new `agent_bundle_render_failed` alert rule, seeded
+  enabled. The migration release keeps the inline build as a fallback
+  (`DNS_AGENT_BUNDLE_INLINE_FALLBACK`, on) for deployments whose worker
+  lags a release; default off once the worker path is proven. Agents
+  need no change; one deliberate difference is that a page of ops no
+  longer rotates the ETag, so the poll after the last ack answers 304
+  instead of re-sending the whole body. Migration `c4d1e7f90a2b`
+  (additive: one table, eight nullable-or-defaulted columns).
+- **The bundle's records query orders by the `(zone_id, name)` index
+  prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
+  UUID, so the planner sorted the whole table on every build. The
+  order is now the index prefix plus every other shipped column — a
+  total order over what the payload carries, so the ETag stays stable
+  without `id`. Every agent's ETag rotates once on the first poll after
+  upgrade (one full-body fetch; a full re-render only under
+  split-horizon, where records are structural).
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing

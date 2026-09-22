@@ -179,6 +179,67 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Stored bundles — rendered once, served as bytes (#1111)
+
+The bundle the long-poll hands out is **not assembled in the request**. It
+is rendered once per `(server, watermark)` by the Celery worker
+(`app.tasks.agent_bundles`, queue `bundles`) and stored in
+`dns_agent_bundle` — `etag`, `structural_etag`, the compact JSON body
+gzip-compressed — and the long-poll reads one small row per wake, compares
+`If-None-Match` with the stored ETag, splices the per-server ops page in
+front of the stored bytes and streams them. Whatever the group's record
+count, the api never holds the group's record set as Python objects and
+never serialises a multi-megabyte body on the request loop; the DB runs
+the records query once per change, not once per agent per poll. The worker
+has no HTTP liveness probe and its per-task engine carries no
+`command_timeout`, so a render of a million-row group simply runs.
+
+*What says a stored bundle is current.* `dns_server.bundle_dirty_seq` is
+bumped **in the same transaction** as every change that feeds the bundle
+(an `after_flush` listener, `services/dns/bundle_dirty.py`, maps every
+contributor — records via their zone, zones, views, ACLs, options, TSIG
+keys, update ACLs, sibling servers for the catalog producer pick, new
+pending ops, blocklists, pools, and the platform singletons — to the
+servers it feeds); `bundle_watermark` is the sequence the newest stored
+bundle was rendered at. Current ⇔ `watermark ≥ seq`: one integer
+comparison, no assembly, no content hash. A spurious bump costs one
+render; a missed one is prevented by construction for anything written
+through the ORM. After commit the render is enqueued (the worker coalesces
+duplicates: one render in flight per server, one more after it if a change
+landed meanwhile — that is what turns a thousand-batch seed into a handful
+of renders), and a 30 s beat sweep re-enqueues anything still behind, so a
+lost broker message costs at most one tick.
+
+*The ops page is gated to the bundle's snapshot.* Every body an agent
+holds is a superset of every op it has applied — the inline build had that
+by construction because the body was built moments before the page, and a
+response now ships only ops created at or before the stored bundle's
+`snapshot_at`. Without the gate a slow render could hand an agent an older
+body with a newer `structural_etag`, and the full re-render (or a restart
+replaying `current.json`) would drop a record the agent had already applied
+over RFC 2136. An op newer than the snapshot rides with the next render,
+whose dirty mark its own commit already made.
+
+*What the agent sees.* Nothing changes in the protocol: weak `ETag` / 304 /
+the body shape / the "200 while ops are pending" fast path /
+`structural_etag` / the #882 quarantine. The one difference is that the
+ETag is the stored body's and no longer folds the ops page in, so a page
+does not rotate it — the fast path answers 200 with the same ETag and the
+next page, and the poll after the last ack answers 304 instead of
+re-sending the whole body. The agent never short-circuits on an unchanged
+ETag (it saves, compares `structural_etag`, drains the ops).
+
+*Staleness is never silent.* A missing or stale bundle is never served: the
+poll holds on the wake the render publishes, 304 at the deadline. A render
+that raises lands on `dns_server.bundle_render_status / _error / _at` —
+deliberately not `config_failed_etag`, which is the agent's #882 verdict
+and is cleared by its next healthy heartbeat — and fires the
+`agent_bundle_render_failed` alert (critical when the server has never had
+a bundle, warning while a previous one is still served). The migration
+release keeps `dns_agent_bundle_inline_fallback` on: a deployment whose
+worker is still one release behind builds a missing or stale bundle inline
+exactly as before, once per version, because it stores what it built.
+
 ### RFC 2136 `nsupdate` responsibility
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:
