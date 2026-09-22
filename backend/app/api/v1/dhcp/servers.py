@@ -218,6 +218,13 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
+    # ``degraded`` (the agent's own word; anything but ``ok`` is not serving);
+    # NULL when the agent has never reported one — UNKNOWN, never "fine".
+    # ``daemon_status_since`` is when the CURRENT status was first reported.
+    daemon_status: str | None = None
+    daemon_reason: str | None = None
+    daemon_status_since: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -282,6 +289,9 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            daemon_status=s.daemon_status,
+            daemon_reason=s.daemon_reason,
+            daemon_status_since=s.daemon_status_since,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )

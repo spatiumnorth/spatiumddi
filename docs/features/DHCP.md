@@ -892,6 +892,14 @@ heartbeat (`config` field → `dhcp_server.config_apply_*`), which drives the
 server-row chip, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
 
+The heartbeat's `daemon` field — `{"status": "ok"}` after a good reload,
+`{"status": "degraded", "reason": ...}` when a control socket is
+unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
+/ `daemon_reason` / `daemon_status_since` since #1067 (it was declared and
+read by nothing before), is exposed on the server row, drives a chip and a
+detail banner, and feeds the `agent_daemon_degraded` alert rule once a
+non-`ok` state has outlasted a five-minute grace.
+
 ---
 
 ## 7. DHCP ↔ IPAM Synchronization

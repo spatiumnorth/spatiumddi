@@ -5173,6 +5173,24 @@ export interface ConfigApplyFields {
   config_apply_at: string | null;
 }
 
+/**
+ * Daemon state an agent reported on its heartbeat (#1067), shared by DNS and
+ * DHCP servers.
+ *
+ * `daemon_status` is the agent's own word: `ok` while the daemon is up,
+ * `degraded` while it is not serving (a DNS agent waiting for its first
+ * bundle, a Kea whose control socket is unreachable). Anything that is not
+ * `ok` is not serving. `null` means the agent has never reported one — a
+ * pre-#1061 agent, or an agentless driver — and renders as unknown, never as
+ * healthy. `daemon_status_since` is when the CURRENT status was first
+ * reported; it moves only when the status changes.
+ */
+export interface DaemonStateFields {
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -5208,6 +5226,9 @@ export interface DNSServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7932,6 +7953,9 @@ export interface DHCPServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;

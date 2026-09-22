@@ -44,6 +44,7 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
     hash_token,
@@ -520,6 +521,11 @@ async def agent_heartbeat(
     # this model since it was written and read by nothing; a server could be
     # reachable, healthy and serving a config the operator never approved.
     apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
+    # #1067 — the daemon state. ``body.daemon`` has been declared on this model
+    # since it was written and read by nothing: an agent whose ``named`` never
+    # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
+    # indistinguishable from a healthy one.
+    apply_reported_daemon_state(server, body.daemon, agent_kind="dns", server_id=str(server.id))
 
     # Process op ACKs
     for ack in body.ops_ack:

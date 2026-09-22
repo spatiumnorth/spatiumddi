@@ -263,6 +263,27 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     config_failed_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── #1067 daemon state ──
+    #
+    # The agent's own word about its daemon, reported on every heartbeat
+    # (``daemon: {status, reason}``; agent supervisor.py DEFERRED_DAEMON_STATUS,
+    # sync.py on a failed apply). Distinct from ``status`` / ``last_seen_at``
+    # (is the agent talking to us) and from ``config_apply_status`` (is the
+    # live config the saved one): a DNS agent waiting for its first bundle
+    # heartbeats every 30 s with ``degraded`` while ``named`` never starts,
+    # and until #1067 nothing here kept that. Any word other than ``ok`` is
+    # stored as sent and read as not serving. NULL = never reported (a
+    # pre-#1061 agent, or an agentless driver): UNKNOWN, never ``ok``.
+    # ``daemon_status_since`` is the stamp of the heartbeat that FIRST
+    # reported the current status (it moves only on a status change), so the
+    # row can say how long a daemon has been degraded; ``last_seen_at`` says
+    # whether the report is current.
+    daemon_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    daemon_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    daemon_status_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Issue #197 — link back to the parent Application appliance
     # (when the row was registered through the supervisor's role-
     # assignment flow). ``ON DELETE CASCADE`` does the orphan-row

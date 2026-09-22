@@ -40,6 +40,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
@@ -905,6 +906,10 @@ async def agent_heartbeat(
     # recorded success and stamped its readiness marker, so nothing on this
     # side ever learned the scope changes were not live.
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
+    # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
+    # the same dict, the top-level ``status``; ``daemon`` is the source). Same
+    # gap as the DNS side: declared, accepted, never read.
+    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

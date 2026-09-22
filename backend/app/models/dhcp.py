@@ -311,6 +311,15 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # the failure is still current or predates the config now saved.
     config_failed_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1067 — the agent's own word about the Kea daemon, reported on every
+    # heartbeat (``daemon: {status, reason}``; sync.py sets ``degraded`` when a
+    # control socket is unreachable or a config was rejected, ``ok`` after a
+    # good reload). Same shape and semantics as ``DNSServer`` — see there.
+    daemon_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    daemon_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    daemon_status_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
 

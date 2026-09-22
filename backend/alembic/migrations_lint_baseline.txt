@@ -258,6 +258,9 @@ backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:65
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:66
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:70
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:71
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:63
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:64
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:65
 backend/alembic/versions/b7e29c4f5d18_dns_dhcp_tags.py:drop_column:63
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_column:60
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_constraint_fk:61

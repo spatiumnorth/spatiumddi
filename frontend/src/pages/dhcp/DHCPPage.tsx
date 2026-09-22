@@ -57,6 +57,7 @@ import { CreateServerModal } from "./CreateServerModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
+import { DaemonStateChip } from "@/components/DaemonStateChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
@@ -1030,6 +1031,7 @@ function GroupServersList({
                         </span>
                       )}
                       <ConfigApplyChip server={s} />
+                      <DaemonStateChip server={s} />
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
                       <span className="font-mono">

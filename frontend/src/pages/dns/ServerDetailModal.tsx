@@ -32,6 +32,7 @@ import { Modal } from "@/components/ui/modal";
 import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
+import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import {
   dnsApi,
   logsApi,
@@ -267,6 +268,7 @@ function OverviewTab({
           healthy while the agent is running a config the operator never
           approved, so this has to be the first thing read. */}
       <ConfigApplyBanner server={server} />
+      <DaemonStateBanner server={server} />
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
       </div>
