@@ -177,6 +177,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The storage action route keeps its own answer through the
+  frontend (#1080).** `POST …/appliances/{id}/storage/action` waits
+  up to 90 s for the appliance's supervisor before its own 504, and
+  the supervisor waits 60 s for the host runner before reporting
+  "the host storage runner did not answer within 60s" — but the
+  frontend proxied every `/api/` route with a 60 s read timeout, so
+  nginx answered for the api at 60.000 s every time (its generic
+  "retry shortly" JSON; before #1087 the `405 Not Allowed` page the
+  issue was filed on) and neither message ever reached the operator.
+  Observed live on a single-node QA appliance with the runner's
+  `.path` unit stopped: through the frontend the client got 504 at
+  60.02-60.05 s while the supervisor's report reached the api 60.06 s
+  after the request, ~80 ms after nginx had cut it; the same request
+  made inside the appliance against the api Service answered 200 in
+  60.09 s carrying that report. The route now has its own `location`
+  in both nginx templates with a 120 s budget; `appliance/tests` read
+  the three budgets from source (proxy > route > supervisor) so they
+  cannot drift apart again.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —
