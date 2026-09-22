@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     # one response — 500k ops took the api to 4.2 GB and a memcg kill on
     # every poll (appliance sizing campaign, 2026-09-02/03).
     dns_agent_ops_batch: int = 5000
+    # #1111 — the bundle is rendered once per (server, watermark) and stored
+    # in ``dns_agent_bundle``; this many versions per server are kept (the
+    # agent's own N-1 rule, #882), older ones are pruned on store.
+    dns_agent_bundle_keep_versions: int = 2
 
     # DHCP agent
     dhcp_agent_key: str = ""

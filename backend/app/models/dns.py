@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -334,6 +335,49 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── #1111 stored config bundle ────────────────────────────────────────
+    #
+    # The agent's config bundle is rendered ONCE per (server, watermark) —
+    # by the worker (``app.tasks.agent_bundles``), or inline by the api
+    # during the migration release — and stored in ``dns_agent_bundle``;
+    # the long-poll serves the stored bytes. Two integers make "is the
+    # stored bundle current?" one comparison on this row, which the
+    # long-poll already refreshes on every wake:
+    #
+    #   bundle_dirty_seq  — bumped IN the transaction of every change that
+    #                       feeds the bundle (``services.dns.bundle_dirty``),
+    #                       so it cannot be lost to a Redis outage and a new
+    #                       mutation site cannot forget it the way a
+    #                       ``collect_wake`` site can.
+    #   bundle_watermark  — the ``bundle_dirty_seq`` the newest stored
+    #                       bundle was rendered at. Current ⇔ watermark ≥ seq.
+    #
+    # ``bundle_etag`` / ``bundle_built_at`` / ``bundle_render_count`` mirror
+    # the newest stored row so the server list shows them without a join.
+    # ``bundle_render_*`` is the CONTROL PLANE's verdict on its last render
+    # — deliberately not ``config_failed_etag``, which is the AGENT's
+    # verdict (#882) and is cleared by its next healthy heartbeat, so a
+    # render failure written there would hide inside the mechanism meant
+    # to expose it.
+    bundle_dirty_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=sa_text("0")
+    )
+    bundle_watermark: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    bundle_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bundle_built_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ``worker`` / ``api`` — who rendered the bundle being served; the number
+    # that says whether the worker path is carrying the load.
+    bundle_rendered_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    bundle_render_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=sa_text("0")
+    )
+    # ``ok`` / ``failed`` / NULL (never rendered).
+    bundle_render_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    bundle_render_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bundle_render_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:
     #   {"username", "password", "winrm_port", "transport", "use_tls",
@@ -373,6 +417,69 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
+    """One rendered config bundle for one agent-based DNS server (#1111).
+
+    Rendered from the same payload ``build_config_bundle`` always produced,
+    serialised once in the #958 wire shape (compact separators, raw UTF-8,
+    no NaN) and gzip-compressed; the agent long-poll serves the stored bytes
+    instead of assembling the group's whole record set on the request loop
+    once per agent per change. ``etag`` / ``structural_etag`` are the values
+    the agent compares — computed by the same ``_compute_etag`` over the
+    same canonical payload, so a given state hashes to what it did before.
+
+    ``body`` is the JSON object WITHOUT ``etag``, ``pending_record_ops`` and
+    ``pending_ops_remaining``. Those are per-server, per-poll state and the
+    long-poll splices them in per request — but only ops created at or
+    before ``snapshot_at`` ride with this body. That gate is what keeps the
+    invariant the inline build had by construction: every body an agent
+    holds is a superset of every op it has applied, so a structural
+    re-render (or a restart replaying the cached bundle) can never drop a
+    record the agent already applied incrementally.
+
+    The last ``settings.dns_agent_bundle_keep_versions`` rows per server
+    are kept (the agent's own N-1 rule, #882); older ones are pruned on
+    store. ``dirty_watermark`` is ``DNSServer.bundle_dirty_seq`` as the
+    render observed it; ``(server_id, dirty_watermark)`` is unique, which
+    is what makes a render idempotent however many pollers ask for it.
+    """
+
+    __tablename__ = "dns_agent_bundle"
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id", "dirty_watermark", name="uq_dns_agent_bundle_server_watermark"
+        ),
+        Index("ix_dns_agent_bundle_server_built", "server_id", "built_at"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    dirty_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # DB clock at the start of the render; the ops-page gate.
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    etag: Mapped[str] = mapped_column(String(128), nullable=False)
+    structural_etag: Mapped[str] = mapped_column(String(128), nullable=False)
+    # False under split-horizon (records are structural there and queued
+    # ops are retired by the render), so the long-poll never pages ops for
+    # such a server — the same rule the inline build applied.
+    ships_ops: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # gzip of the compact JSON body. Deferred: the long-poll reads the row's
+    # metadata on every wake and the body only when it answers 200.
+    body: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
+    body_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    body_gzip_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    records: Mapped[int] = mapped_column(Integer, nullable=False)
+    render_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    # ``worker`` / ``api`` (the migration-release inline fallback).
+    rendered_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):

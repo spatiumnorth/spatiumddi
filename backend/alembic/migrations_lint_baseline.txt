@@ -351,6 +351,8 @@ backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rena
 backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rename_table:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:46
+backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:125
+backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:127
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_column:106
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:104
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:105
