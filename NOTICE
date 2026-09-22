@@ -125,6 +125,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - dnspython — ISC — https://www.dnspython.org
 - Jinja2 — BSD 3-Clause — https://jinja.palletsprojects.com
 - pywinrm (Windows DNS / DHCP over WinRM) — MIT — https://github.com/diyan/pywinrm
+- requests-credssp (CredSSP transport for WinRM) — MIT — https://github.com/jborean93/requests-credssp
 - pysnmp — BSD 2-Clause — https://github.com/lextudio/pysnmp
 - openpyxl (XLSX import/export) — MIT — https://openpyxl.readthedocs.io
 - reportlab (PDF export) — BSD 3-Clause — https://www.reportlab.com

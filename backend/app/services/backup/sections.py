@@ -282,6 +282,13 @@ SECTIONS: tuple[Section, ...] = (
         tables=(
             "dhcp_server_group",
             "dhcp_server",
+            # #1110 — observed Windows failover relationships + per-server
+            # scope presence. Re-read by the next topology poll, but they
+            # FK into dhcp_server, so a selective restore of this section
+            # TRUNCATE-CASCADEs them; listing them restores them with it
+            # (same placement as dns_server_zone_state in the DNS section).
+            "dhcp_failover_relationship",
+            "dhcp_server_scope_state",
             "dhcp_scope",
             "dhcp_pool",
             "dhcp_static_assignment",

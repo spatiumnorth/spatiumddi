@@ -41,6 +41,14 @@ row id across polls, which is what lets an ``ip_address`` mirror
 back-link to one and stay valid (#620). Absence still means deleted,
 under the same floor guards (``_absence_delete_ok``).
 
+The same phase records what the server holds and its Windows failover
+relationships (#1110, ``services.dhcp.windows_failover``). When more than
+one Windows member of the group holds a scope, only ONE of them — the
+scope's reconcile owner — imports its view of it; the others report and are
+compared against it. Failover partners do not sync configuration, so two
+holders routinely disagree, and each merging its own view undid the other
+on every poll.
+
 Per CLAUDE.md non-negotiable #9, the whole operation is idempotent: a
 second run over the same wire state is a no-op (the dedup key is
 ``(server_id, ip_address)`` and all updates are set-to-observed).
@@ -72,6 +80,16 @@ from app.services.dhcp.lease_cleanup import purge_lease
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dhcp.normalize import norm_ip, norm_mac
 from app.services.dhcp.static_ipam import remove_ipam_for_static, upsert_ipam_for_static
+from app.services.dhcp.windows_failover import (
+    GroupObservations,
+    Verdict,
+    canonical_cidr,
+    classify_serving,
+    load_group_observations,
+    reconcile_owner,
+    record_failover_observation,
+    record_scope_observation,
+)
 
 
 def _refresh_lease_owned_row(
@@ -106,7 +124,17 @@ class PullLeasesResult:
     statics_synced: int = 0  # DHCPStaticAssignment rows created or changed
     pools_removed: int = 0  # DHCPPool rows gone from the wire
     statics_removed: int = 0  # DHCPStaticAssignment rows gone from the wire
+    # #1110 — scopes this server also holds but whose import belongs to
+    # another member of the group (see ``windows_failover.reconcile_owner``).
+    scopes_deferred: int = 0
     errors: list[str] = field(default_factory=list)
+    # #1110 — conditions worth telling an operator that are not a failure of
+    # THIS poll: two Windows members serving a scope uncoordinated, failover
+    # partners whose configuration has drifted, a failover read that was
+    # denied. Persistent by nature, so unlike ``errors`` they do not by
+    # themselves make the scheduled pull write an audit row every tick; the
+    # group and scope views show the same state from the stored observations.
+    warnings: list[str] = field(default_factory=list)
     # #428 — DNS group ids whose zones received a DDNS record this pull;
     # the caller publishes an agent wake for them AFTER its commit so the
     # records converge instantly instead of on the agent's safety tick.
@@ -169,9 +197,11 @@ async def pull_leases_from_server(
         # not ``now()`` — the latter is transaction-start time and would drift
         # earlier the longer this transaction runs.
         snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+        scopes_ok = True
         try:
             wire_scopes = await driver.get_scopes(server)
         except Exception as exc:  # noqa: BLE001
+            scopes_ok = False
             result.errors.append(f"get_scopes failed: {exc}")
             logger.warning(
                 "dhcp_pull_scopes_driver_failed",
@@ -180,7 +210,12 @@ async def pull_leases_from_server(
                 error=str(exc),
             )
             wire_scopes = []
+        observations = await _observe_topology(
+            db, server, driver, wire_scopes, result, apply=apply, scopes_ok=scopes_ok
+        )
         for wscope in wire_scopes:
+            if observations is not None and not _owns_scope(server, wscope, observations, result):
+                continue
             await _upsert_scope(
                 db, server, wscope, subnets, result, apply=apply, snapshot_at=snapshot_at
             )
@@ -497,6 +532,98 @@ async def pull_leases_from_server(
 
 
 # ── helpers ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class _Topology:
+    """What the ownership check needs: the group's observations + the clock."""
+
+    obs: GroupObservations
+    now: datetime
+
+
+async def _observe_topology(
+    db: AsyncSession,
+    server: DHCPServer,
+    driver: Any,
+    wire_scopes: list[dict[str, Any]],
+    result: PullLeasesResult,
+    *,
+    apply: bool,
+    scopes_ok: bool,
+) -> _Topology | None:
+    """Record what this server holds and its failover relationships (#1110),
+    then load the group's observations for the ownership check.
+
+    Returns None when there is no one to share a scope with — a groupless
+    server, or a group with a single Windows member — so the reconcile runs
+    exactly as it always has.
+
+    The failover read is skipped when ``get_scopes`` itself failed: the
+    server is almost certainly unreachable, and a third WinRM call to it would
+    only add another full timeout to the poll. Its last-known relationships
+    stay in force.
+    """
+    now = datetime.now(UTC)
+    if apply and scopes_ok:
+        await record_scope_observation(db, server, wire_scopes, now=now)
+    if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
+        try:
+            failover = await driver.get_failover_relationships(server)
+        except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
+            failover = {"ok": False, "error": str(exc), "relationships": []}
+        if not failover.get("ok"):
+            result.warnings.append(
+                f"could not read failover relationships: {failover.get('error')} — keeping "
+                f"the last ones read"
+            )
+            logger.warning(
+                "dhcp_pull_failover_read_failed",
+                server=str(server.id),
+                error=str(failover.get("error")),
+            )
+        await record_failover_observation(db, server, failover, now=now)
+    if server.server_group_id is None or not wire_scopes:
+        return None
+    if apply:
+        await db.flush()
+    obs = await load_group_observations(db, server.server_group_id)
+    if len(obs.members) < 2:
+        return None
+    return _Topology(obs=obs, now=now)
+
+
+def _owns_scope(
+    server: DHCPServer, wscope: dict[str, Any], topo: _Topology, result: PullLeasesResult
+) -> bool:
+    """Is ``server`` the member whose view of this scope gets imported?
+
+    With more than one Windows member holding a scope, every member's pass
+    used to merge its own view — so two failover partners that disagreed
+    (they do not sync configuration) undid each other on every poll, and the
+    reservations and DNS records that differed were created and torn down
+    each time. One member imports; the others only report (#1110).
+
+    The owner's pass is also the one that reports how the scope is served,
+    so a condition is said once per poll rather than once per holder.
+    """
+    cidr = canonical_cidr(wscope.get("subnet_cidr"))
+    if cidr is None:
+        return True
+    owner = reconcile_owner(server, cidr, topo.obs, now=topo.now)
+    if owner.id != server.id:
+        result.scopes_deferred += 1
+        return False
+    holders = topo.obs.holders(cidr, now=topo.now)
+    if len(holders) >= 2:
+        serving = classify_serving(holders, topo.obs.members)
+        if serving.verdict in (
+            Verdict.UNCOORDINATED,
+            Verdict.UNKNOWN,
+            Verdict.SPLIT_SCOPE,
+        ) or bool(serving.drift):
+            result.warnings.append(f"scope {cidr}: {serving.detail}")
+    return True
 
 
 async def _load_subnet_cache(db: AsyncSession) -> list[tuple[Subnet, ipaddress._BaseNetwork]]:

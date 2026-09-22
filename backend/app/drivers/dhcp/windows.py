@@ -10,11 +10,27 @@ WinRM by invoking the ``DhcpServer`` PowerShell module.
   * Reads — ``get_leases`` (``Get-DhcpServerv4Lease``) and
     ``get_scopes`` (``Get-DhcpServerv4Scope`` + option values +
     exclusions + reservations rolled into one PowerShell call).
+  * Failover reads (#1110) — ``get_failover_relationships``
+    (``Get-DhcpServerv4Failover``, for the topology poll) and
+    ``probe_scopes`` (live presence + relationships, for the
+    write-through to plan from).
+  * Failover management (#1110 Phase 2) — ``create_`` / ``update_`` /
+    ``delete_failover_relationship``, ``add_`` / ``remove_failover_scopes``
+    and ``replicate_failover``. Every one of these cmdlets acts on BOTH
+    partners from the server it runs on, so the WinRM logon has to be able
+    to authenticate onward to the partner — the "second hop". Only the
+    ``credssp`` transport can (see ``failover_management_blocker``); the
+    others are refused before anything is sent.
   * Writes (per-object, idempotent) — ``apply_scope`` /
     ``remove_scope`` / ``apply_reservation`` /
     ``remove_reservation`` / ``apply_exclusion`` /
     ``remove_exclusion``. Called from the SpatiumDDI scope / pool /
     static API endpoints via ``services.dhcp.windows_writethrough``.
+    The scope-dependent ones check that this server holds the scope, in
+    the same script as the write, and report ``False`` rather than act
+    when it does not: a group's Windows members need not all hold the
+    same scopes, and a write that creates one where it was not is how
+    two servers come to hand out the same addresses (#1110).
 
 **What's NOT implemented** — the whole-bundle push contract
 (``render_config`` / ``apply_config`` / ``reload`` / ``restart``) is
@@ -38,7 +54,9 @@ Fernet-encrypted JSON dict:
 
 A service account in the Windows ``DHCP Users`` (read) or ``DHCP
 Administrators`` (read+write) group is sufficient for the PowerShell
-calls we invoke.
+calls we invoke. Whether ``DHCP Users`` may read failover relationships
+is not established; a denied read is reported (``ok`` false) rather than
+taken to mean "no relationships".
 """
 
 from __future__ import annotations
@@ -193,6 +211,241 @@ $result | ConvertTo-Json -Compress -Depth 5
 """
 
 
+# ── Windows failover relationships (#1110) ──────────────────────────────
+#
+# Enumerates every failover relationship on the server into ``$rels``, with
+# its own ``$foOk`` / ``$foErr`` / ``$foCode`` so a failed failover read is
+# distinguishable from "this server has no relationships" (the #620 lesson:
+# an empty list must not be ambiguous). Shared by ``_PS_LIST_FAILOVER`` (the
+# topology poll) and ``_ps_probe_scopes`` (the write-through's live check).
+#
+# ``SharedSecret`` is deliberately not selected — the secret never crosses
+# the wire. ``EnableAuth`` says whether message authentication is on.
+#
+# ``FullyQualifiedErrorId`` carries the Win32 code as ``WIN32 <n>`` (seen in
+# the wild as ``WIN32 5,Get-DhcpServerv4Failover`` for access denied), which is
+# how the parser tells "no relationships" apart from a real failure without
+# matching a locale-dependent message.
+_PS_FAILOVER_SNIPPET = r"""
+$foOk = $true; $foErr = $null; $foCode = $null; $rels = @()
+try {
+    foreach ($f in @(Get-DhcpServerv4Failover -ErrorAction Stop)) {
+        if ($null -eq $f) { continue }
+        $ids = @()
+        foreach ($sid in @($f.ScopeId)) { if ($sid) { $ids += $sid.ToString() } }
+        $rels += [PSCustomObject]@{
+            name = [string]$f.Name
+            partner_server = [string]$f.PartnerServer
+            mode = [string]$f.Mode
+            server_role = [string]$f.ServerRole
+            state = [string]$f.State
+            load_balance_percent = $f.LoadBalancePercent
+            reserve_percent = $f.ReservePercent
+            max_client_lead_time_seconds = if ($null -ne $f.MaxClientLeadTime) { [int]$f.MaxClientLeadTime.TotalSeconds } else { $null }
+            state_switch_interval_seconds = if ($null -ne $f.StateSwitchInterval) { [int]$f.StateSwitchInterval.TotalSeconds } else { $null }
+            auto_state_transition = $f.AutoStateTransition
+            enable_auth = $f.EnableAuth
+            scope_ids = $ids
+        }
+    }
+} catch {
+    $foOk = $false
+    $foErr = "$($_.Exception.Message)"
+    if ("$($_.FullyQualifiedErrorId)" -match 'WIN32 (\d+)') { $foCode = [int]$Matches[1] }
+}
+$fo = [PSCustomObject]@{ ok = $foOk; error = $foErr; error_code = $foCode; relationships = $rels }
+"""
+
+_PS_LIST_FAILOVER = (
+    "$ErrorActionPreference = 'Stop'\n"
+    + _PS_FAILOVER_SNIPPET
+    + "\n$fo | ConvertTo-Json -Compress -Depth 6\n"
+)
+
+# Win32 codes a failover enumeration can come back with when the server
+# simply HAS no relationships: ERROR_NO_MORE_ITEMS (259) and
+# ERROR_DHCP_FO_RELATIONSHIP_DOES_NOT_EXIST (20115). Anything else is a real
+# failure and leaves ``ok`` false. Misreading a failure as "none" is the safe
+# direction anyway — the write-through then refuses to activate a shared scope
+# rather than trusting a relationship it could not see — but a wrong "unknown"
+# on every install with no relationships would refuse far too much.
+_FAILOVER_EMPTY_CODES: frozenset[int] = frozenset({259, 20115})
+
+
+def _ps_probe_scopes(scope_ids: Sequence[str]) -> str:
+    """The write-through's live check: does this server hold these scopes, in
+    what state, over which range — plus every failover relationship it has.
+
+    ``Get-DhcpServerv4Scope`` is enumerated under ``-ErrorAction Stop``, never
+    queried per id with ``SilentlyContinue``: a failed lookup must fail the
+    probe, not read as "this server does not have the scope" — the planner
+    would then activate the scope on another member while this one is
+    already serving it.
+    """
+    want = ",".join(_ps_literal(sid) for sid in scope_ids)
+    return f"""$ErrorActionPreference = 'Stop'
+$want = @({want})
+$found = @{{}}
+foreach ($s in @(Get-DhcpServerv4Scope)) {{
+    if ($null -eq $s) {{ continue }}
+    $sid = $s.ScopeId.ToString()
+    if ($want -contains $sid) {{ $found[$sid] = $s }}
+}}
+$scopes = @()
+foreach ($sid in $want) {{
+    $s = $found[$sid]
+    if ($s) {{
+        $ex = @()
+        foreach ($e in @(Get-DhcpServerv4ExclusionRange -ScopeId $sid)) {{
+            if ($e) {{ $ex += [PSCustomObject]@{{ start_ip = $e.StartRange.ToString(); end_ip = $e.EndRange.ToString() }} }}
+        }}
+        $scopes += [PSCustomObject]@{{ scope_id = $sid; present = $true; state = $s.State.ToString(); start_range = $s.StartRange.ToString(); end_range = $s.EndRange.ToString(); exclusions = $ex }}
+    }} else {{
+        $scopes += [PSCustomObject]@{{ scope_id = $sid; present = $false; state = $null; start_range = $null; end_range = $null; exclusions = @() }}
+    }}
+}}
+{_PS_FAILOVER_SNIPPET}
+[PSCustomObject]@{{ scopes = $scopes; failover = $fo }} | ConvertTo-Json -Compress -Depth 6
+"""
+
+
+# PowerShell line every scope-guarded write prints instead of acting when the
+# scope does not exist on the server it was sent to (#1110). A token on stdout,
+# not a thrown error: "not here" is a normal answer on a group whose members
+# hold different scopes, and ``run_ps`` turns every non-zero exit into the
+# same RuntimeError as a genuine failure.
+_ABSENT_TOKEN = "SPDDI-SCOPE-ABSENT"
+
+# The existence check those writes share. Enumerated, never
+# ``Get-DhcpServerv4Scope -ScopeId`` under ``SilentlyContinue`` — that returns
+# $null for a lookup that FAILED as well as for one that found nothing, and
+# "failed" would then read as "not here, skip it": a reservation silently
+# missing from a failover partner, which is the drift this module exists to
+# prevent. Inherits ``$ErrorActionPreference = 'Stop'`` from the script.
+_PS_SCOPE_PRESENT = (
+    "$present = @(Get-DhcpServerv4Scope | Where-Object "
+    "{ $_.ScopeId.ToString() -eq $scopeId }).Count -gt 0"
+)
+
+
+# ── failover management (#1110 Phase 2) ────────────────────────────────
+#
+# Every ``*-DhcpServerv4Failover*`` write acts on both partners from the one
+# server it runs on: ``Add-DhcpServerv4Failover`` creates the relationship on
+# the partner and copies the scopes there, ``Remove-DhcpServerv4FailoverScope``
+# deletes the partner's copy, ``Invoke-DhcpServerv4FailoverReplication``
+# pushes configuration to it. So the WinRM logon on the server we dial has to
+# be able to authenticate to the partner. An NTLM (or Basic) logon over WinRM
+# is a network logon with no credential to pass on — the classic PowerShell
+# "second hop" — and the partner answers access denied. CredSSP delegates the
+# credential itself, which is exactly what this needs and why it is the one
+# transport allowed. (Kerberos with constrained delegation would also work,
+# but the image carries no GSSAPI stack, so pywinrm cannot speak Kerberos at
+# all here.)
+SECOND_HOP_TRANSPORTS: frozenset[str] = frozenset({"credssp"})
+
+
+class FailoverManagementUnavailable(ValueError):
+    """The server's WinRM transport cannot reach the failover partner."""
+
+
+def failover_management_blocker(server: Any) -> str | None:
+    """Why this server cannot drive a failover change, or None if it can.
+
+    Decided from the stored credentials alone, before anything is sent: a
+    transport that cannot make the second hop fails on the partner half of
+    the cmdlet, and a half-applied relationship change is worse than a
+    refusal.
+    """
+    blob = getattr(server, "credentials_encrypted", None)
+    if not blob:
+        return f"{server.name} has no Windows credentials set."
+    creds = decrypt_dict(blob)
+    transport = str(creds.get("transport") or "ntlm").lower()
+    if transport in SECOND_HOP_TRANSPORTS:
+        return None
+    return (
+        f"{server.name} connects over WinRM with the '{transport}' transport. A failover "
+        f"change runs on {server.name} and has to authenticate from there to the partner "
+        f"server, which a '{transport}' logon cannot do (the PowerShell remoting "
+        f"'second hop'). Switch the server's WinRM transport to CredSSP — enable it on "
+        f"Windows with Enable-WSManCredSSP -Role Server — or make the change on Windows "
+        f"and run Sync."
+    )
+
+
+# One script per management op. Operator values travel as a base64 JSON
+# payload bound through ConvertFrom-Json — never interpolated — and the shared
+# secret with them. Errors are re-thrown as their MESSAGE only, so the script
+# text (which carries the payload) cannot come back in an error record. Kept
+# to one cmdlet each: WinRM ships a script as ONE ``powershell
+# -EncodedCommand`` line under CMD.EXE's length cap, and a single script
+# holding every op plus the relationship read came to over half again that
+# cap. The server's relationships are read back in a second, separate call.
+_PS_FAILOVER_PRELUDE = (
+    "$ErrorActionPreference='Stop'\n"
+    "$d=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))"
+    "|ConvertFrom-Json\n"
+    "function S($v){if($null -eq $v){$null}else{New-TimeSpan -Seconds ([int]$v)}}\n"
+)
+_PS_FAILOVER_TUNING = (
+    "if($null -ne $d.max_client_lead_time_seconds){$p.MaxClientLeadTime=S $d.max_client_lead_time_seconds}\n"
+    "if($null -ne $d.auto_state_transition){$p.AutoStateTransition=[bool]$d.auto_state_transition}\n"
+    "if($null -ne $d.state_switch_interval_seconds){$p.StateSwitchInterval=S $d.state_switch_interval_seconds}\n"
+    "if($d.shared_secret){$p.SharedSecret=[string]$d.shared_secret}\n"
+)
+_PS_FAILOVER_OPS: dict[str, str] = {
+    "create": (
+        "$p=@{Name=$d.name;PartnerServer=$d.partner_server;ScopeId=@($d.scope_ids)}\n"
+        "if($d.mode -eq 'HotStandby'){$p.ServerRole=$d.server_role\n"
+        "if($null -ne $d.reserve_percent){$p.ReservePercent=[uint32]$d.reserve_percent}}\n"
+        "elseif($null -ne $d.load_balance_percent){$p.LoadBalancePercent=[uint32]$d.load_balance_percent}\n"
+        + _PS_FAILOVER_TUNING
+        + "Add-DhcpServerv4Failover @p -Confirm:$false|Out-Null"
+    ),
+    "update": (
+        "$p=@{Name=$d.name}\n"
+        "if($null -ne $d.mode){$p.Mode=$d.mode}\n"
+        "if($null -ne $d.server_role){$p.ServerRole=$d.server_role}\n"
+        "if($null -ne $d.load_balance_percent){$p.LoadBalancePercent=[uint32]$d.load_balance_percent}\n"
+        "if($null -ne $d.reserve_percent){$p.ReservePercent=[uint32]$d.reserve_percent}\n"
+        + _PS_FAILOVER_TUNING
+        + "Set-DhcpServerv4Failover @p -Force -Confirm:$false|Out-Null"
+    ),
+    "delete": "Remove-DhcpServerv4Failover -Name $d.name -Confirm:$false|Out-Null",
+    "add_scopes": (
+        "Add-DhcpServerv4FailoverScope -Name $d.name -ScopeId @($d.scope_ids) "
+        "-Confirm:$false|Out-Null"
+    ),
+    "remove_scopes": (
+        "Remove-DhcpServerv4FailoverScope -Name $d.name -ScopeId @($d.scope_ids) "
+        "-Confirm:$false|Out-Null"
+    ),
+    "replicate": (
+        "if(@($d.scope_ids).Count -gt 0){Invoke-DhcpServerv4FailoverReplication "
+        "-ScopeId @($d.scope_ids) -Force -Confirm:$false|Out-Null}\n"
+        "else{Invoke-DhcpServerv4FailoverReplication -Name @($d.name) -Force "
+        "-Confirm:$false|Out-Null}"
+    ),
+}
+
+# Scope ids per management call. ``Add-``/``Remove-DhcpServerv4FailoverScope``
+# and the replication cmdlet take any subset, so a long list is simply sent in
+# several calls; ~45 encoded characters per id keeps a full chunk well under
+# the command-line cap alongside the largest op body.
+_FAILOVER_SCOPE_CHUNK = 30
+
+
+def _ps_failover_op(data: dict[str, Any]) -> str:
+    payload = base64.b64encode(json.dumps(data).encode("utf-8")).decode("ascii")
+    return (
+        _PS_FAILOVER_PRELUDE.replace("__PAYLOAD__", payload)
+        + "try{\n"
+        + _PS_FAILOVER_OPS[data["op"]]
+        + '\n}catch{throw "$($_.Exception.Message)"}\n"OK"\n'
+    )
+
+
 # Hard upper bound on ops per WinRM round-trip in the batch dispatchers.
 # This is a sanity cap only — the REAL gate is the encoded-command-line
 # budget (CMD.EXE ~8191 chars; see app/drivers/_winrm.py). #426 reworked
@@ -285,6 +538,189 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_TOPOLOGY)
         return _parse_scopes(raw)
 
+    async def get_failover_relationships(self, server: Any) -> dict[str, Any]:
+        """Every failover relationship on the server (#1110).
+
+        Returns ``{"ok", "error", "relationships"}``. ``ok`` false means the
+        enumeration itself failed (typically access denied) and
+        ``relationships`` is then empty-because-unknown, NOT empty-because-
+        none — the caller must keep what it knew rather than conclude the
+        server has no relationships. Each relationship::
+
+            {"name", "partner_server", "mode", "server_role", "state",
+             "load_balance_percent", "reserve_percent",
+             "max_client_lead_time_seconds", "state_switch_interval_seconds",
+             "auto_state_transition", "enable_auth", "scope_ids": [...]}
+
+        A transport failure or an unparseable response raises, like
+        ``get_leases``.
+        """
+        creds = _load_credentials(server)
+        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_FAILOVER)
+        return _parse_failover(raw)
+
+    async def probe_scopes(self, server: Any, scope_ids: Sequence[str]) -> dict[str, Any]:
+        """Live presence of ``scope_ids`` on the server, plus its failover
+        relationships (#1110) — what the write-through plans from.
+
+        Returns ``{"scopes": {scope_id: {"present", "is_active", "start_ip",
+        "end_ip", "exclusions"}}, "failover": <get_failover_relationships
+        shape>}``. Every requested id has an entry. Raises on a transport
+        failure, a failed scope enumeration, or an unparseable response —
+        a probe that cannot say whether a server holds a scope must not be
+        read as "it does not".
+        """
+        if not scope_ids:
+            return {"scopes": {}, "failover": {"ok": True, "error": None, "relationships": []}}
+        creds = _load_credentials(server)
+        raw = await asyncio.to_thread(_run_ps, server, creds, _ps_probe_scopes(scope_ids))
+        return _parse_probe(raw, scope_ids)
+
+    # ── failover management (#1110 Phase 2) ────────────────────────────
+    #
+    # Each runs ON ``server`` and acts on both partners from there (see
+    # ``failover_management_blocker``). Each returns this server's failover
+    # relationships as they stand afterwards, in the
+    # ``get_failover_relationships`` shape, and raises on any failure —
+    # including ``FailoverManagementUnavailable`` before anything is sent
+    # when the transport cannot make the second hop.
+
+    async def _failover_op(self, server: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """Run one management op — in scope chunks where the op allows — then
+        read the server's relationships back."""
+        blocker = failover_management_blocker(server)
+        if blocker is not None:
+            raise FailoverManagementUnavailable(blocker)
+        creds = _load_credentials(server)
+        sids = list(data.get("scope_ids") or [])
+        chunks = [
+            sids[i : i + _FAILOVER_SCOPE_CHUNK] for i in range(0, len(sids), _FAILOVER_SCOPE_CHUNK)
+        ]
+        if data["op"] == "create" and len(chunks) > 1:
+            # A relationship is created with its first chunk of scopes; the
+            # rest join it the same way a later add would.
+            await asyncio.to_thread(
+                _run_ps, server, creds, _ps_failover_op({**data, "scope_ids": chunks[0]})
+            )
+            for chunk in chunks[1:]:
+                await asyncio.to_thread(
+                    _run_ps,
+                    server,
+                    creds,
+                    _ps_failover_op({"op": "add_scopes", "name": data["name"], "scope_ids": chunk}),
+                )
+        elif data["op"] in ("add_scopes", "remove_scopes", "replicate") and len(chunks) > 1:
+            for chunk in chunks:
+                await asyncio.to_thread(
+                    _run_ps, server, creds, _ps_failover_op({**data, "scope_ids": chunk})
+                )
+        else:
+            await asyncio.to_thread(_run_ps, server, creds, _ps_failover_op(data))
+        raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_FAILOVER)
+        return _parse_failover(raw)
+
+    async def create_failover_relationship(
+        self,
+        server: Any,
+        *,
+        name: str,
+        partner_server: str,
+        scope_ids: Sequence[str],
+        mode: str,
+        load_balance_percent: int | None = None,
+        server_role: str | None = None,
+        reserve_percent: int | None = None,
+        max_client_lead_time_seconds: int | None = None,
+        auto_state_transition: bool | None = None,
+        state_switch_interval_seconds: int | None = None,
+        shared_secret: str | None = None,
+    ) -> dict[str, Any]:
+        """``Add-DhcpServerv4Failover`` on ``server`` with ``partner_server``.
+
+        Windows requires at least one scope, which must exist on ``server``
+        and NOT on the partner: the cmdlet creates the relationship on both
+        sides and copies each scope to the partner. ``mode`` is
+        ``LoadBalance`` or ``HotStandby``; ``server_role`` is THIS server's
+        role in hot-standby mode.
+        """
+        return await self._failover_op(
+            server,
+            {
+                "op": "create",
+                "name": name,
+                "partner_server": partner_server,
+                "scope_ids": list(scope_ids),
+                "mode": mode,
+                "load_balance_percent": load_balance_percent,
+                "server_role": server_role,
+                "reserve_percent": reserve_percent,
+                "max_client_lead_time_seconds": max_client_lead_time_seconds,
+                "auto_state_transition": auto_state_transition,
+                "state_switch_interval_seconds": state_switch_interval_seconds,
+                "shared_secret": shared_secret or None,
+            },
+        )
+
+    async def update_failover_relationship(
+        self, server: Any, *, name: str, **changes: Any
+    ) -> dict[str, Any]:
+        """``Set-DhcpServerv4Failover`` — only the keys in ``changes`` are sent.
+
+        Accepts ``mode``, ``server_role``, ``load_balance_percent``,
+        ``reserve_percent``, ``max_client_lead_time_seconds``,
+        ``auto_state_transition``, ``state_switch_interval_seconds`` and
+        ``shared_secret``. None means "leave as it is".
+        """
+        allowed = {
+            "mode",
+            "server_role",
+            "load_balance_percent",
+            "reserve_percent",
+            "max_client_lead_time_seconds",
+            "auto_state_transition",
+            "state_switch_interval_seconds",
+            "shared_secret",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unsupported failover field(s): {sorted(unknown)}")
+        data: dict[str, Any] = {"op": "update", "name": name}
+        data.update({k: changes.get(k) for k in allowed})
+        return await self._failover_op(server, data)
+
+    async def delete_failover_relationship(self, server: Any, *, name: str) -> dict[str, Any]:
+        """``Remove-DhcpServerv4Failover``. Windows deletes the scopes the
+        relationship covered from the PARTNER; ``server`` keeps its copies."""
+        return await self._failover_op(server, {"op": "delete", "name": name})
+
+    async def add_failover_scopes(
+        self, server: Any, *, name: str, scope_ids: Sequence[str]
+    ) -> dict[str, Any]:
+        """``Add-DhcpServerv4FailoverScope`` — each scope must exist on
+        ``server`` and not on the partner; Windows copies it there."""
+        return await self._failover_op(
+            server, {"op": "add_scopes", "name": name, "scope_ids": list(scope_ids)}
+        )
+
+    async def remove_failover_scopes(
+        self, server: Any, *, name: str, scope_ids: Sequence[str]
+    ) -> dict[str, Any]:
+        """``Remove-DhcpServerv4FailoverScope`` — takes the scopes out of the
+        relationship and deletes them from the PARTNER; ``server`` keeps them."""
+        return await self._failover_op(
+            server, {"op": "remove_scopes", "name": name, "scope_ids": list(scope_ids)}
+        )
+
+    async def replicate_failover(
+        self, server: Any, *, name: str, scope_ids: Sequence[str] = ()
+    ) -> dict[str, Any]:
+        """``Invoke-DhcpServerv4FailoverReplication`` — copy ``server``'s
+        configuration of the scopes (every scope of relationship ``name``
+        when ``scope_ids`` is empty) over the partner's."""
+        return await self._failover_op(
+            server, {"op": "replicate", "name": name, "scope_ids": list(scope_ids)}
+        )
+
     # ── writes (per-object, surgical) ──────────────────────────────────
     #
     # Path B, trimmed. Instead of the full "apply config bundle" contract
@@ -310,19 +746,30 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
         lease_seconds: int,
         is_active: bool,
         options: dict[str, Any],
-    ) -> None:
-        """Create or update a scope on Windows DHCP.
+        create_if_missing: bool = True,
+    ) -> bool:
+        """Create or update a scope on Windows DHCP. Returns whether it applied.
 
         ``options`` is keyed by our canonical names (``routers``,
         ``dns-servers``, …). We translate back to option IDs here and
         ship the whole desired-option-set; existing options not in the
         desired set are removed so Windows matches our DB exactly.
+
+        ``create_if_missing=False`` (#1110) makes this update-only: a scope
+        this server does not have is left absent and the call returns False.
+        The write-through passes it for every member of a group with more
+        than one Windows server, because on such a group creating the scope
+        here is how two servers end up handing out the same addresses — the
+        scope already lives on another member, uncoordinated with this one.
+        The check sits in the same script as the write, so a plan made from a
+        probe a few seconds old still cannot create what it did not intend to.
         """
         id_options = _options_by_id(options)
         payload_b64 = base64.b64encode(json.dumps({"options": id_options}).encode("utf-8")).decode(
             "ascii"
         )
         state = "Active" if is_active else "InActive"
+        create = "$true" if create_if_missing else "$false"
         script = f"""
 $ErrorActionPreference = 'Stop'
 $scopeId    = {_ps_literal(scope_id)}
@@ -336,8 +783,11 @@ $state      = {_ps_literal(state)}
 $payload    = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{payload_b64}'))
 $data       = $payload | ConvertFrom-Json
 
-$existing = Get-DhcpServerv4Scope -ScopeId $scopeId -ErrorAction SilentlyContinue
-if ($existing) {{
+{_PS_SCOPE_PRESENT}
+if (-not $present -and -not {create}) {{
+    '{_ABSENT_TOKEN}'
+}} else {{
+if ($present) {{
     Set-DhcpServerv4Scope -ScopeId $scopeId -Name $name -Description $desc `
         -LeaseDuration $lease -State $state `
         -StartRange $startRange -EndRange $endRange
@@ -369,19 +819,36 @@ Get-DhcpServerv4OptionValue -ScopeId $scopeId -ErrorAction SilentlyContinue | Fo
     }}
 }}
 "OK"
+}}
 """
         creds = _load_credentials(server)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        return _ABSENT_TOKEN not in (out or "")
 
-    async def remove_scope(self, server: Any, scope_id: str) -> None:
-        """Delete a scope on Windows DHCP. ``Remove-DhcpServerv4Scope -Force``."""
+    async def remove_scope(self, server: Any, scope_id: str) -> bool:
+        """Delete a scope on Windows DHCP. ``Remove-DhcpServerv4Scope -Force``.
+
+        Returns False, and does nothing, when the server does not have the
+        scope (#1110). Deleting something already gone is the delete having
+        happened — it used to throw, so a scope removed on the Windows side
+        first could never be deleted in SpatiumDDI afterwards, and on a group
+        whose members hold different scopes every delete failed on the
+        members that never had it.
+        """
         script = f"""
 $ErrorActionPreference = 'Stop'
-Remove-DhcpServerv4Scope -ScopeId {_ps_literal(scope_id)} -Force
-"OK"
+$scopeId = {_ps_literal(scope_id)}
+{_PS_SCOPE_PRESENT}
+if ($present) {{
+    Remove-DhcpServerv4Scope -ScopeId $scopeId -Force
+    "OK"
+}} else {{
+    '{_ABSENT_TOKEN}'
+}}
 """
         creds = _load_credentials(server)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        return _ABSENT_TOKEN not in (out or "")
 
     async def set_scope_state(self, server: Any, scope_id: str, *, active: bool) -> None:
         """Activate or deactivate an existing scope, changing nothing else.
@@ -414,9 +881,15 @@ Set-DhcpServerv4Scope -ScopeId {_ps_literal(scope_id)} -State {_ps_literal(state
         mac_address: str,
         hostname: str = "",
         description: str = "",
-    ) -> None:
+    ) -> bool:
         """Upsert a DHCP reservation. Windows keys reservations by ClientId
         (MAC with dashes); if one exists for that MAC we Set-, else Add-.
+
+        Returns False without writing when the server does not hold the
+        scope (#1110) — on a group whose Windows members hold different
+        scopes, a reservation belongs on the members that serve its scope and
+        nowhere else. It used to throw there instead, so every reservation
+        edit on such a group failed.
         """
         client_id = mac_address.lower().replace(":", "-")
         script = f"""
@@ -427,6 +900,10 @@ $clientId = {_ps_literal(client_id)}
 $name     = {_ps_literal(hostname)}
 $desc     = {_ps_literal(description)}
 
+{_PS_SCOPE_PRESENT}
+if (-not $present) {{
+    '{_ABSENT_TOKEN}'
+}} else {{
 $existing = Get-DhcpServerv4Reservation -ScopeId $scopeId -ErrorAction SilentlyContinue |
     Where-Object {{ $_.ClientId -eq $clientId }}
 if ($existing) {{
@@ -437,9 +914,11 @@ if ($existing) {{
         -ClientId $clientId -Name $name -Description $desc
 }}
 "OK"
+}}
 """
         creds = _load_credentials(server)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        return _ABSENT_TOKEN not in (out or "")
 
     async def remove_reservation(self, server: Any, *, scope_id: str, mac_address: str) -> None:
         """Delete a reservation by MAC (ClientId)."""
@@ -455,29 +934,38 @@ Remove-DhcpServerv4Reservation -ScopeId {_ps_literal(scope_id)} `
 
     async def apply_exclusion(
         self, server: Any, *, scope_id: str, start_ip: str, end_ip: str
-    ) -> None:
-        """Add an exclusion range, idempotently.
+    ) -> bool:
+        """Add an exclusion range, idempotently. Returns whether it applied.
 
         #426: check-then-act on the (start, end) pair instead of matching
         the English substring 'already' in the error — the real Windows
         overlap message is locale-dependent ("…overlaps with an existing
         exclusion range") and has no 'already', so the old guard re-threw
         on every re-apply on a non-English host.
+
+        Returns False without writing when the server does not hold the
+        scope (#1110) — same reasoning as ``apply_reservation``.
         """
         script = f"""
 $ErrorActionPreference = 'Stop'
 $scopeId = {_ps_literal(scope_id)}
 $start   = {_ps_literal(start_ip)}
 $end     = {_ps_literal(end_ip)}
+{_PS_SCOPE_PRESENT}
+if (-not $present) {{
+    '{_ABSENT_TOKEN}'
+}} else {{
 $exists = Get-DhcpServerv4ExclusionRange -ScopeId $scopeId -ErrorAction SilentlyContinue |
     Where-Object {{ [string]$_.StartRange -eq $start -and [string]$_.EndRange -eq $end }}
 if (-not $exists) {{
     Add-DhcpServerv4ExclusionRange -ScopeId $scopeId -StartRange $start -EndRange $end
 }}
 "OK"
+}}
 """
         creds = _load_credentials(server)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        return _ABSENT_TOKEN not in (out or "")
 
     async def remove_exclusion(
         self, server: Any, *, scope_id: str, start_ip: str, end_ip: str
@@ -749,6 +1237,10 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             "scope_import": True,
             "scope_management": True,
             "reservation_management": True,
+            # #1110 — failover relationships are read (and honoured by the
+            # write-through) and, over a CredSSP transport, managed.
+            "failover_read": True,
+            "failover_management": True,
             "address_families": ["ipv4"],
             "transport": "winrm",
         }
@@ -935,6 +1427,168 @@ def _parse_scopes(raw: str) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Normalise a PowerShell-serialised collection to a list.
+
+    ``ConvertTo-Json`` hands a collection back as ``null``, a bare scalar
+    (one element, when the pipeline unrolled it), a list, or — on Windows
+    PowerShell 5.1 with the legacy ``System.Array`` type data loaded — an
+    ``{"value": [...], "Count": n}`` wrapper. All four mean the same thing.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict) and "value" in value and set(value) <= {"value", "Count"}:
+        return _as_list(value["value"])
+    return [value]
+
+
+def _opt_str(value: Any) -> str | None:
+    """``[string]$null`` serialises as ``""``; both mean "not reported"."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _canonical_scope_id(value: Any) -> str | None:
+    import ipaddress  # noqa: PLC0415
+
+    try:
+        return str(ipaddress.IPv4Address(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _shape_relationship(raw: dict[str, Any]) -> dict[str, Any] | None:
+    name = _opt_str(raw.get("name"))
+    if name is None:
+        return None
+    scope_ids: list[str] = []
+    for sid in _as_list(raw.get("scope_ids")):
+        canon = _canonical_scope_id(sid)
+        if canon is not None and canon not in scope_ids:
+            scope_ids.append(canon)
+    return {
+        "name": name,
+        "partner_server": _opt_str(raw.get("partner_server")) or "",
+        "mode": _opt_str(raw.get("mode")),
+        "server_role": _opt_str(raw.get("server_role")),
+        "state": _opt_str(raw.get("state")),
+        "load_balance_percent": _opt_int(raw.get("load_balance_percent")),
+        "reserve_percent": _opt_int(raw.get("reserve_percent")),
+        "max_client_lead_time_seconds": _opt_int(raw.get("max_client_lead_time_seconds")),
+        "state_switch_interval_seconds": _opt_int(raw.get("state_switch_interval_seconds")),
+        "auto_state_transition": _opt_bool(raw.get("auto_state_transition")),
+        "enable_auth": _opt_bool(raw.get("enable_auth")),
+        "scope_ids": scope_ids,
+    }
+
+
+def _shape_failover_block(block: Any) -> dict[str, Any]:
+    """The ``$fo`` object from ``_PS_FAILOVER_SNIPPET`` → neutral dict."""
+    if not isinstance(block, dict):
+        raise RuntimeError("Windows DHCP failover response had no failover block")
+    ok = block.get("ok") is True
+    error = _opt_str(block.get("error"))
+    if not ok and _opt_int(block.get("error_code")) in _FAILOVER_EMPTY_CODES:
+        # "There are none" reported as an error — not a failure to read.
+        return {"ok": True, "error": None, "relationships": []}
+    if not ok:
+        return {
+            "ok": False,
+            "error": error or "failover enumeration failed",
+            "relationships": [],
+        }
+    rels: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in _as_list(block.get("relationships")):
+        if not isinstance(raw, dict):
+            continue
+        shaped = _shape_relationship(raw)
+        if shaped is None or shaped["name"] in seen:
+            continue
+        seen.add(shaped["name"])
+        rels.append(shaped)
+    return {"ok": True, "error": None, "relationships": rels}
+
+
+def _load_json_object(raw: str, what: str) -> dict[str, Any]:
+    """Parse a PowerShell envelope that must be a JSON object.
+
+    Empty or garbled output raises rather than defaulting: every caller of
+    these reads would otherwise act on "no relationships" / "scope absent",
+    and both of those are answers the write-through turns into decisions.
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise RuntimeError(f"Windows DHCP {what} returned no output")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("windows_dhcp_parse_failed", what=what, raw=text[:400], error=str(exc))
+        raise RuntimeError(f"Windows DHCP {what} response was not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Windows DHCP {what} response was not a JSON object")
+    return parsed
+
+
+def _parse_failover(raw: str) -> dict[str, Any]:
+    """Parse ``_PS_LIST_FAILOVER`` output."""
+    return _shape_failover_block(_load_json_object(raw, "failover read"))
+
+
+def _parse_probe(raw: str, scope_ids: Sequence[str]) -> dict[str, Any]:
+    """Parse ``_ps_probe_scopes`` output into ``{"scopes", "failover"}``.
+
+    Every requested id gets an entry. An id the response does not mention is
+    an error, not "absent": the script emits one row per requested id, so a
+    missing row means the output was truncated or mangled.
+    """
+    parsed = _load_json_object(raw, "scope probe")
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in _as_list(parsed.get("scopes")):
+        if not isinstance(row, dict):
+            continue
+        sid = _canonical_scope_id(row.get("scope_id"))
+        if sid is None:
+            continue
+        present = row.get("present") is True
+        exclusions: list[tuple[str, str]] = []
+        for ex in _as_list(row.get("exclusions")):
+            if isinstance(ex, dict) and ex.get("start_ip") and ex.get("end_ip"):
+                exclusions.append((str(ex["start_ip"]), str(ex["end_ip"])))
+        state = _opt_str(row.get("state"))
+        by_id[sid] = {
+            "present": present,
+            "is_active": (state or "").lower() == "active" if present else None,
+            "start_ip": _opt_str(row.get("start_range")) if present else None,
+            "end_ip": _opt_str(row.get("end_range")) if present else None,
+            "exclusions": exclusions if present else [],
+        }
+    scopes: dict[str, dict[str, Any]] = {}
+    for requested in scope_ids:
+        sid = _canonical_scope_id(requested)
+        if sid is None or sid not in by_id:
+            raise RuntimeError(f"Windows DHCP scope probe did not report scope {requested!r}")
+        scopes[sid] = by_id[sid]
+    return {"scopes": scopes, "failover": _shape_failover_block(parsed.get("failover"))}
 
 
 def _translate_options(raw_options: dict[str, Any]) -> dict[str, Any]:

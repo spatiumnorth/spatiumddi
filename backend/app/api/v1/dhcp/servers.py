@@ -391,15 +391,58 @@ class SyncLeasesResponse(BaseModel):
     statics_synced: int = 0
     pools_removed: int = 0
     statics_removed: int = 0
+    # #1110 — scopes this server holds whose import belongs to another member
+    # of its group (one member imports a shared scope; the rest report).
+    scopes_deferred: int = 0
     # MAC deny-filter reconciliation against the group's active blocks.
     # Zero when the server isn't in a group or has no blocks configured.
     mac_blocks_added: int = 0
     mac_blocks_removed: int = 0
     errors: list[str]
+    # #1110 — standing conditions rather than failures of this sync: a scope
+    # two Windows members serve uncoordinated, failover partners whose
+    # configuration has drifted, a failover read that was denied.
+    warnings: list[str] = []
     # Set on the agent-based no-op path (Kea): a human-readable explanation
     # that there was nothing to pull and the agent was nudged to re-poll its
     # config. ``None`` for the normal agentless lease-pull path.
     note: str | None = None
+
+
+# #1110 — Kea serves every scope of its group through the bundle, and Windows
+# serves the scopes the write-through puts on it. The two have no protocol in
+# common: Kea's HA hook and Windows failover cannot coordinate, so a group
+# with both kinds of member hands every Windows-held scope out twice. Refused
+# at the two places a server joins a group from the API; an existing mixed
+# group is surfaced on the group's Windows failover view instead.
+_UNCOORDINATABLE_DRIVERS = frozenset({"kea", "windows_dhcp"})
+
+
+async def _assert_driver_mix_allowed(
+    db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
+) -> None:
+    if group_id is None or driver not in _UNCOORDINATABLE_DRIVERS:
+        return
+    other = "windows_dhcp" if driver == "kea" else "kea"
+    q = select(DHCPServer.name).where(
+        DHCPServer.server_group_id == group_id, DHCPServer.driver == other
+    )
+    if exclude_server_id is not None:
+        q = q.where(DHCPServer.id != exclude_server_id)
+    clash = (await db.execute(q.limit(3))).scalars().all()
+    if clash:
+        kinds = {"kea": "Kea", "windows_dhcp": "Windows DHCP"}
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This server group already has {kinds[other]} members "
+                f"({', '.join(clash)}). Kea and Windows DHCP servers cannot coordinate — "
+                f"Kea's HA and Windows failover do not speak to each other — so a group "
+                f"with both would hand out every scope's addresses from two servers that "
+                f"do not know about each other. Put the {kinds[driver]} server in its own "
+                f"server group."
+            ),
+        )
 
 
 @router.get("", response_model=list[ServerResponse])
@@ -414,6 +457,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
+    await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
     # drivers (FortiGate) speak HTTPS on 443; agent/agentless DHCP daemons use 67.
@@ -501,6 +545,10 @@ async def update_server(
     changes = body.model_dump(
         exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    target_group = changes.get("server_group_id", s.server_group_id)
+    target_driver = changes.get("driver", s.driver)
+    if target_group != s.server_group_id or target_driver != s.driver:
+        await _assert_driver_mix_allowed(db, target_group, target_driver, exclude_server_id=s.id)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -1051,9 +1099,11 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "statics_synced": result.statics_synced,
             "pools_removed": result.pools_removed,
             "statics_removed": result.statics_removed,
+            "scopes_deferred": result.scopes_deferred,
             "mac_blocks_added": mac_added,
             "mac_blocks_removed": mac_removed,
             "errors": result.errors[:20],
+            "warnings": result.warnings[:20],
         },
     )
     await db.commit()
@@ -1073,9 +1123,11 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         statics_synced=result.statics_synced,
         pools_removed=result.pools_removed,
         statics_removed=result.statics_removed,
+        scopes_deferred=result.scopes_deferred,
         mac_blocks_added=mac_added,
         mac_blocks_removed=mac_removed,
         errors=result.errors,
+        warnings=result.warnings,
     )
 
 
