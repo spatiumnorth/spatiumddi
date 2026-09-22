@@ -263,9 +263,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # the sizing campaign's 250k A+PTR zone the build held ~500k instances
     # in the identity map for the life of the request, most of the api's
     # working set on every long-poll (2026-09-02/03). Only the eight fields
-    # the bundle and the view filter read are fetched, ordered by (zone,
-    # id) so the rendered payload — and therefore the ETag — is the same
-    # from one poll to the next.
+    # the bundle and the view filter read are fetched.
+    #
+    # The ordering exists so the rendered payload — and therefore the ETag —
+    # is the same from one poll to the next. #1111: it is now the
+    # ``ix_dns_record_zone_name`` prefix followed by every remaining shipped
+    # column, not ``(zone_id, id)``. Stability needs a total order on what
+    # the payload CARRIES — two rows identical in every shipped column
+    # render identically whichever comes first — so ``id`` buys nothing,
+    # and it cost a lot: no index covers ``(zone_id, id)`` and ``id`` is a
+    # random UUID, so at 1.09 M rows the planner sorted the whole table
+    # (an external merge at the shipped ``work_mem``) inside asyncpg's 30 s
+    # ``command_timeout``, and every poll of every agent answered 503
+    # (seven-node probe, 2026-09-21). With the index prefix the planner can
+    # walk ``(zone_id, name)`` and finish the tie-break with an incremental
+    # sort on the tiny per-name groups instead of sorting the table.
     records_by_zone: dict[Any, list[Any]] = {}
     if zone_ids:
         rec_res = await db.execute(
@@ -282,7 +294,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 DNSRecord.pool_member_id,
             )
             .where(DNSRecord.zone_id.in_(zone_ids))
-            .order_by(DNSRecord.zone_id, DNSRecord.id)
+            .order_by(
+                DNSRecord.zone_id,
+                DNSRecord.name,
+                DNSRecord.record_type,
+                DNSRecord.value,
+                DNSRecord.ttl,
+                DNSRecord.priority,
+                DNSRecord.weight,
+                DNSRecord.port,
+                DNSRecord.view_id,
+                DNSRecord.pool_member_id,
+            )
         )
         for rec in rec_res:
             records_by_zone.setdefault(rec.zone_id, []).append(rec)

@@ -5,8 +5,15 @@ This was one ``select(DNSRecord)`` per zone inside the zone loop, each row a
 tracked ORM instance. At the sizing campaign's 250k A+PTR records the build
 held ~500k instances for the life of the request — most of the api's working
 set on every agent long-poll (2026-09-02/03). The rows are now column tuples
-from a single ``WHERE zone_id IN (...)`` ordered by (zone, id), so the
-payload — and the ETag the agent compares — is the same from poll to poll.
+from a single ``WHERE zone_id IN (...)`` in a stable order, so the payload —
+and the ETag the agent compares — is the same from poll to poll.
+
+#1111 — the order is the ``ix_dns_record_zone_name`` prefix ``(zone_id,
+name)`` followed by every other shipped column, not ``(zone_id, id)``: ``id``
+is a random UUID no index covers, so at 1.09 M rows the planner sorted the
+whole table inside asyncpg's 30 s ``command_timeout`` and every agent poll
+answered 503. A total order over the shipped columns keeps the payload stable
+without it.
 """
 
 from __future__ import annotations
@@ -84,6 +91,13 @@ async def test_all_zones_records_come_from_one_query(db_session: AsyncSession) -
         event.remove(Engine, "before_cursor_execute", counter)
 
     assert len(counter.statements) == 1, counter.statements
+    # #1111 — the order the planner can serve from ``ix_dns_record_zone_name``
+    # (zone_id, name) rather than a full sort of the table by a random UUID.
+    ordered = " ".join(counter.statements[0].split())
+    assert (
+        "ORDER BY dns_record.zone_id, dns_record.name, dns_record.record_type" in ordered
+    ), ordered
+    assert "dns_record.id" not in ordered.split("ORDER BY", 1)[1], ordered
     assert sorted(len(z["records"]) for z in bundle["zones"]) == [30, 30, 30, 30]
     rec = bundle["zones"][0]["records"][0]
     assert set(rec) == {"name", "type", "ttl", "value", "priority", "weight", "port"}
