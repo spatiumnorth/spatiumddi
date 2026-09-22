@@ -1148,8 +1148,17 @@ def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
 # k3s restart (k3s re-applies the on-disk HelmChart manifest). The supervisor
 # knows the node's RAM, so it sizes the three workloads from it and writes
 # the result where it survives (the same HelmChartConfig as the replica
-# overrides, #272). ``limits`` only — requests stay the chart's, so
-# scheduling on a small box is unchanged.
+# overrides, #272). ``limits`` for the api and the worker — their requests
+# stay the chart's, so scheduling on a small box is unchanged. Postgres also
+# gets its memory REQUEST, because CloudNativePG's admission webhook refuses
+# a Cluster whose request is below ``shared_buffers`` ("Memory request is
+# lower than PostgreSQL `shared_buffers` value"): on an 8 GiB node the sized
+# 368MB against the chart's 256Mi request left the helm release failed, and
+# k3s's helm-controller then uninstalled and reinstalled the whole control
+# plane every few minutes (nightly-20260916-postqa, full lane, 2026-09-22).
+# The request follows shared_buffers and never drops below the chart's
+# 256Mi, so a node whose sizing lands on the chart's numbers renders exactly
+# the chart's numbers.
 #
 # #1115 — the three are budgeted from the WHOLE node, not as independent
 # fractions: a fixed reserve for the platform (k3s, the supervisor, the
@@ -1176,6 +1185,9 @@ _POSTGRES_MEM_SHARE = 0.25
 _POSTGRES_MEM_MIN_MIB = 1024
 _POSTGRES_MEM_MAX_MIB = 4096
 _POSTGRES_SHARED_BUFFERS_SHARE = 0.25
+# charts/spatiumddi/values.yaml: postgresql.resources.requests.memory: 256Mi —
+# the floor of the request the sizing writes beside shared_buffers.
+_POSTGRES_MEM_REQUEST_MIN_MIB = 256
 # Below this much RAM the worker runs two prefork processes instead of the
 # chart's four: the campaign's 8 GiB single node OOMed the 1Gi worker at
 # four, and the queues it serves (ipam/dns/dhcp/default) are latency-, not
@@ -1189,21 +1201,28 @@ def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
 
 def control_plane_sizing(mem_total_mib: int) -> dict[str, int]:
     """PURE: the whole-node budget for a node with ``mem_total_mib`` of RAM —
-    the ``api``, ``worker`` and ``postgres`` memory limits in MiB and Postgres'
-    ``shared_buffers`` in MB (which Postgres reads as MiB). The one place the
-    arithmetic lives; firstboot mirrors it in bash so a fresh install's first
-    render already carries these numbers."""
+    the ``api``, ``worker`` and ``postgres`` memory limits in MiB, Postgres'
+    ``shared_buffers`` in MB (which Postgres reads as MiB) and the Postgres
+    memory request in MiB (``postgres_request``, at or above
+    ``shared_buffers``). The one place the arithmetic lives; firstboot mirrors
+    it in bash so a fresh install's first render already carries these
+    numbers."""
     budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
     postgres_mib = _clamp_mib(
         budget, _POSTGRES_MEM_SHARE, _POSTGRES_MEM_MIN_MIB, _POSTGRES_MEM_MAX_MIB
     )
+    shared_buffers_mb = int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE)
     return {
         "api": _clamp_mib(budget, _API_MEM_SHARE, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB),
         "worker": _clamp_mib(
             budget, _WORKER_MEM_SHARE, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB
         ),
         "postgres": postgres_mib,
-        "shared_buffers": int(postgres_mib * _POSTGRES_SHARED_BUFFERS_SHARE),
+        "shared_buffers": shared_buffers_mb,
+        # CloudNativePG refuses a Cluster whose memory request is below
+        # shared_buffers (Postgres reads MB as MiB, so the two compare one
+        # to one); the chart's own 256Mi is the floor.
+        "postgres_request": max(_POSTGRES_MEM_REQUEST_MIN_MIB, shared_buffers_mb),
     }
 
 
@@ -1212,9 +1231,12 @@ def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
     a node with ``mem_total_mib`` of RAM — ``{}`` when the size is unknown
     (the chart's defaults then stand, exactly as before).
 
-    The ``postgresql`` block carries the CloudNativePG instance limit and the
-    matching ``shared_buffers``; the chart renders both straight into the
-    Cluster CR (``templates/cnpg-cluster.yaml``), and a change to either on a
+    The ``postgresql`` block carries the CloudNativePG instance limit, the
+    matching ``shared_buffers`` and the memory request CloudNativePG's
+    admission webhook demands at or above ``shared_buffers`` (with the
+    chart's 256Mi request alone the Cluster is refused as soon as the sizing
+    moves off 256MB); the chart renders them straight into the Cluster CR
+    (``templates/cnpg-cluster.yaml``), and a change to any of them on a
     formed cluster is a CNPG rolling restart — replicas first, then a
     switchover of the primary. On a fresh install firstboot renders the same
     numbers into the HelmChart, so the Cluster is created with them and
@@ -1231,7 +1253,10 @@ def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
             "resources": {"limits": {"memory": f"{sized['worker']}Mi"}},
         },
         "postgresql": {
-            "resources": {"limits": {"memory": f"{sized['postgres']}Mi"}},
+            "resources": {
+                "requests": {"memory": f"{sized['postgres_request']}Mi"},
+                "limits": {"memory": f"{sized['postgres']}Mi"},
+            },
             "cnpg": {"parameters": {"shared_buffers": f"{sized['shared_buffers']}MB"}},
         },
     }

@@ -212,7 +212,13 @@ the formatter handles the rest.
   CloudNativePG rolling restart, replicas first, then a switchover —
   and an appliance that upgrades into this sizing takes that one
   rolling restart on its first heartbeat, after which the #1005
-  guard keeps every later heartbeat quiet.
+  guard keeps every later heartbeat quiet. The Postgres memory
+  request follows `shared_buffers` (never below the chart's `256Mi`):
+  CloudNativePG's admission webhook refuses a Cluster whose request
+  is below `shared_buffers`, and with the chart's request left alone
+  an 8 GiB node's `368MB` put the helm release in a failed state,
+  with k3s uninstalling and reinstalling the whole control plane
+  every few minutes.
 
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed

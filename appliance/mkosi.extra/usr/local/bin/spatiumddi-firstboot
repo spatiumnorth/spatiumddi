@@ -804,7 +804,7 @@ _render_control_helmchart() {
         printf '%s' "$v"
     }
     local MEM_TOTAL_MIB BUDGET_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_CONCURRENCY
-    local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB
+    local POSTGRES_MEM_MIB POSTGRES_SHARED_BUFFERS_MB POSTGRES_MEM_REQUEST_MIB
     local API_SIZING_YAML WORKER_SIZING_YAML POSTGRES_SIZING_YAML POSTGRES_PARAMETERS_YAML
     MEM_TOTAL_MIB=$(_mem_total_mib)
     API_MEM_MIB=""
@@ -812,6 +812,7 @@ _render_control_helmchart() {
     WORKER_CONCURRENCY=""
     POSTGRES_MEM_MIB=""
     POSTGRES_SHARED_BUFFERS_MB=""
+    POSTGRES_MEM_REQUEST_MIB=""
     if [ -n "$MEM_TOTAL_MIB" ] && [ "$MEM_TOTAL_MIB" -gt 0 ] 2>/dev/null; then
         # #1115 — a whole-node budget: _PLATFORM_RESERVE_MIB = 2048 for k3s,
         # the supervisor, the bind9/kea DaemonSets and the CNPG operator, then
@@ -829,6 +830,12 @@ _render_control_helmchart() {
         # _POSTGRES_SHARED_BUFFERS_SHARE = 1/4 of the Postgres cap (Postgres'
         # guidance; the chart's 256MB-of-1Gi is the same ratio).
         POSTGRES_SHARED_BUFFERS_MB=$(( POSTGRES_MEM_MIB / 4 ))
+        # _POSTGRES_MEM_REQUEST_MIN_MIB = 256 (the chart's own request).
+        # CloudNativePG's admission webhook refuses a Cluster whose memory
+        # request is below shared_buffers, so the request follows it and
+        # never drops below the chart's.
+        POSTGRES_MEM_REQUEST_MIB=$POSTGRES_SHARED_BUFFERS_MB
+        if [ "$POSTGRES_MEM_REQUEST_MIB" -lt 256 ]; then POSTGRES_MEM_REQUEST_MIB=256; fi
         # _WORKER_SMALL_NODE_MIB = 12288.
         if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
         # >&2, NOT bare echo. THIS FUNCTION'S STDOUT IS THE MANIFEST: the
@@ -841,7 +848,7 @@ _render_control_helmchart() {
         # up, with a parse error in the k3s log as the only symptom.
         # firstboot does `exec >>"$LOG" 2>&1` and the caller redirects only
         # stdout, so stderr is still the log.
-        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB" >&2
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB (budget ${BUDGET_MIB} MiB after the platform reserve): api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY} postgres=${POSTGRES_MEM_MIB}Mi shared_buffers=${POSTGRES_SHARED_BUFFERS_MB}MB request=${POSTGRES_MEM_REQUEST_MIB}Mi" >&2
     else
         echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
@@ -857,8 +864,8 @@ _render_control_helmchart() {
             "$API_MEM_MIB")
         WORKER_SIZING_YAML=$(printf '      concurrency: %s\n      resources:\n        limits:\n          memory: "%sMi"' \
             "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
-        POSTGRES_SIZING_YAML=$(printf '      resources:\n        limits:\n          memory: "%sMi"' \
-            "$POSTGRES_MEM_MIB")
+        POSTGRES_SIZING_YAML=$(printf '      resources:\n        requests:\n          memory: "%sMi"\n        limits:\n          memory: "%sMi"' \
+            "$POSTGRES_MEM_REQUEST_MIB" "$POSTGRES_MEM_MIB")
         POSTGRES_PARAMETERS_YAML=$(printf '        parameters:\n          shared_buffers: "%sMB"' \
             "$POSTGRES_SHARED_BUFFERS_MB")
     fi

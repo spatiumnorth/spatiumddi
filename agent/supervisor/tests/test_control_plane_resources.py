@@ -86,10 +86,18 @@ def test_sizing_scales_with_ram_inside_the_clamps() -> None:
     assert _limit(big, "postgresql") == "4096Mi"
     assert big["postgresql"]["cnpg"]["parameters"]["shared_buffers"] == "1024MB"
     assert big["worker"]["concurrency"] == 4
-    # Requests are never set: scheduling on a small node is unchanged.
+    # api and worker requests are never set: scheduling on a small node is
+    # unchanged. Postgres' request follows shared_buffers — CloudNativePG's
+    # webhook refuses a Cluster whose request is below it — floored at the
+    # chart's own 256Mi, so the 6 GiB render is exactly the chart's.
     for doc in (six, eight, twelve):
-        for component in ("api", "worker", "postgresql"):
+        for component in ("api", "worker"):
             assert "requests" not in doc[component]["resources"]
+    assert six["postgresql"]["resources"]["requests"] == {"memory": "256Mi"}
+    assert eight["postgresql"]["resources"]["requests"] == {"memory": "384Mi"}
+    assert twelve["postgresql"]["resources"]["requests"] == {"memory": "640Mi"}
+    assert small["postgresql"]["resources"]["requests"] == {"memory": "256Mi"}
+    assert big["postgresql"]["resources"]["requests"] == {"memory": "1024Mi"}
     # The postgresql block never carries the instance count: that is the
     # control-plane size's, merged in by apply_control_plane_overrides.
     assert "instances" not in eight["postgresql"]["cnpg"]
@@ -103,7 +111,13 @@ def test_the_budget_fits_the_node_beside_the_reserve() -> None:
         s = k8s_api.control_plane_sizing(mem)
         assert s["api"] + s["worker"] + s["postgres"] + 2048 <= mem, (mem, s)
     s = k8s_api.control_plane_sizing(12288)
-    assert s == {"api": 5120, "worker": 2560, "postgres": 2560, "shared_buffers": 640}
+    assert s == {
+        "api": 5120,
+        "worker": 2560,
+        "postgres": 2560,
+        "shared_buffers": 640,
+        "postgres_request": 640,
+    }
 
 
 def test_unknown_ram_leaves_the_chart_defaults_alone() -> None:
@@ -127,7 +141,7 @@ def test_the_overrides_carry_the_sizing_and_state_the_redis_kind(monkeypatch) ->
     # count, under the one ``postgresql`` key the chart reads.
     assert doc["postgresql"] == {
         "cnpg": {"instances": 1, "parameters": {"shared_buffers": "384MB"}},
-        "resources": {"limits": {"memory": "1536Mi"}},
+        "resources": {"requests": {"memory": "384Mi"}, "limits": {"memory": "1536Mi"}},
     }
     assert doc["redis"] == {"kind": "sentinel", "sentinel": {"replicas": 1}}
 
@@ -171,8 +185,10 @@ def test_an_operators_own_request_keys_survive_the_merge(monkeypatch) -> None:
 
 
 def test_an_operators_own_postgres_parameters_survive_the_merge(monkeypatch) -> None:
-    """shared_buffers lands beside a work_mem the operator set by hand, and
-    the requests the chart carries are never touched (#1115)."""
+    """shared_buffers lands beside a work_mem the operator set by hand; the
+    memory request is the sizing's, at shared_buffers, because CloudNativePG
+    refuses a Cluster whose request is below it — an operator's 512Mi under a
+    640MB shared_buffers would fail the webhook (#1115)."""
     current = yaml.safe_dump(
         {
             "postgresql": {
@@ -191,7 +207,7 @@ def test_an_operators_own_postgres_parameters_survive_the_merge(monkeypatch) -> 
     doc = rec.doc
     assert doc["postgresql"] == {
         "cnpg": {"instances": 3, "parameters": {"work_mem": "32MB", "shared_buffers": "640MB"}},
-        "resources": {"requests": {"memory": "512Mi"}, "limits": {"memory": "2560Mi"}},
+        "resources": {"requests": {"memory": "640Mi"}, "limits": {"memory": "2560Mi"}},
     }
 
 

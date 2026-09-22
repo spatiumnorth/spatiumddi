@@ -110,6 +110,12 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
     assert pg, "could not find firstboot's POSTGRES_MEM_MIB invocation"
     sb = re.search(r"POSTGRES_SHARED_BUFFERS_MB=\$\(\( POSTGRES_MEM_MIB / (\d+) \)\)", src)
     assert sb, "could not find firstboot's shared_buffers divisor"
+    req = re.search(
+        r'if \[ "\$POSTGRES_MEM_REQUEST_MIB" -lt (\d+) \]; '
+        r"then POSTGRES_MEM_REQUEST_MIB=(\d+); fi",
+        src,
+    )
+    assert req, "could not find firstboot's Postgres request floor"
     thr = re.search(r'\[ "\$MEM_TOTAL_MIB" -le (\d+) \]; then WORKER_CONCURRENCY=(\d+); else WORKER_CONCURRENCY=(\d+)', src)
     assert thr, "could not find firstboot's concurrency threshold"
 
@@ -123,8 +129,10 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         WORKER_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" {wrk.group(1)} {wrk.group(2)} {wrk.group(3)} {wrk.group(4)})
         POSTGRES_MEM_MIB=$(_clamp_mib "$BUDGET_MIB" {pg.group(1)} {pg.group(2)} {pg.group(3)} {pg.group(4)})
         POSTGRES_SHARED_BUFFERS_MB=$(( POSTGRES_MEM_MIB / {sb.group(1)} ))
+        POSTGRES_MEM_REQUEST_MIB=$POSTGRES_SHARED_BUFFERS_MB
+        if [ "$POSTGRES_MEM_REQUEST_MIB" -lt {req.group(1)} ]; then POSTGRES_MEM_REQUEST_MIB={req.group(2)}; fi
         if [ "$MEM_TOTAL_MIB" -le {thr.group(1)} ]; then C={thr.group(2)}; else C={thr.group(3)}; fi
-        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $C"
+        echo "$API_MEM_MIB $WORKER_MEM_MIB $POSTGRES_MEM_MIB $POSTGRES_SHARED_BUFFERS_MB $C $POSTGRES_MEM_REQUEST_MIB"
     """
     out = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=True
@@ -135,6 +143,7 @@ def _bash_sizing(mem_mib: int) -> dict[str, int]:
         "postgres": int(out[2]),
         "shared_buffers": int(out[3]),
         "concurrency": int(out[4]),
+        "postgres_request": int(out[5]),
     }
 
 
@@ -149,6 +158,10 @@ def test_bash_and_python_agree(mem_mib: int) -> None:
     assert (
         py["postgresql"]["cnpg"]["parameters"]["shared_buffers"]
         == f"{sh['shared_buffers']}MB"
+    )
+    assert (
+        py["postgresql"]["resources"]["requests"]["memory"]
+        == f"{sh['postgres_request']}Mi"
     )
 
 
