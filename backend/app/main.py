@@ -28,6 +28,11 @@ from app.services import (
     audit_forward,  # noqa: F401
     event_publisher,  # noqa: F401
 )
+
+# #1111 — same pattern: the after_flush listener that marks DNS agent bundles
+# dirty in the transaction that changes their inputs must be attached before
+# any request handler writes a DNS row.
+from app.services.dns import bundle_dirty  # noqa: F401
 from app.services.feature_modules import require_module
 
 logger = structlog.get_logger(__name__)

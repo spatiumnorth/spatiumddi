@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     # in ``dns_agent_bundle``; this many versions per server are kept (the
     # agent's own N-1 rule, #882), older ones are pruned on store.
     dns_agent_bundle_keep_versions: int = 2
+    # After a commit that dirtied a bundle, publish the render request to the
+    # worker (the 30 s render-missing sweep is the backstop either way). Off
+    # only for test suites that have no broker.
+    dns_agent_bundle_enqueue_renders: bool = True
+    # TTL of the per-server render lock and the fleet-wide render slot — the
+    # ceiling on one render before a crashed worker's lock expires.
+    dns_agent_bundle_render_lock_seconds: int = 900
 
     # DHCP agent
     dhcp_agent_key: str = ""

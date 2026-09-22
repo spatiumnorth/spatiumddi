@@ -220,19 +220,25 @@ async def prune(db: AsyncSession, server_id: uuid.UUID) -> int:
     return int(result.rowcount or 0)
 
 
-async def record_failure(db: AsyncSession, server: DNSServer, error: str) -> None:
-    """A render that raised is visible on the server row, never served."""
+async def record_failure(db: AsyncSession, server_id: uuid.UUID, error: str) -> None:
+    """A render that raised is visible on the server row, never served.
+
+    Takes the id, not the instance: the caller has just rolled back the
+    failed render, and a rollback expires every instance in the session —
+    touching ``server.id`` afterwards would lazy-load inside an async
+    context and raise, and the failure would never be recorded.
+    """
     text = (error or "").strip()[:_MAX_ERROR] or "render failed"
     await db.execute(
         update(DNSServer)
-        .where(DNSServer.id == server.id)
+        .where(DNSServer.id == server_id)
         .values(
             bundle_render_status=RENDER_STATUS_FAILED,
             bundle_render_error=text,
             bundle_render_at=func.now(),
         )
     )
-    logger.warning("dns_agent_bundle_render_failed", server_id=str(server.id), error=text)
+    logger.warning("dns_agent_bundle_render_failed", server_id=str(server_id), error=text)
 
 
 __all__ = [
