@@ -36,9 +36,7 @@ function explain(server: Partial<DaemonStateFields>): string {
   return [
     `The agent reports its daemon is ${status.replace(/_/g, " ")}: it is heartbeating, but not serving.`,
     server.daemon_reason ? `\n\nAgent reported: ${server.daemon_reason}` : "",
-    since
-      ? `\n\nSince: ${since.toLocaleString()} (${sinceLabel(since)})`
-      : "",
+    since ? `\n\nSince: ${since.toLocaleString()} (${sinceLabel(since)})` : "",
   ].join("");
 }
 
@@ -82,9 +80,9 @@ export function DaemonStateBanner({
     <div className="rounded border border-rose-600/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-800 dark:text-rose-300">
       <div className="font-medium">Daemon {status.replace(/_/g, " ")}</div>
       <p className="mt-0.5 opacity-90">
-        The agent is heartbeating, but reports that its daemon is not
-        serving. Reachability, the health check and the last-seen stamp all
-        read normal in this state; only this report says otherwise.
+        The agent is heartbeating, but reports that its daemon is not serving.
+        Reachability, the health check and the last-seen stamp all read normal
+        in this state; only this report says otherwise.
       </p>
       {server.daemon_reason && (
         <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-black/5 p-2 font-mono text-[11px] dark:bg-white/5">

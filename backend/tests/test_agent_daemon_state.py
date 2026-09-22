@@ -178,7 +178,9 @@ async def test_dns_heartbeat_persists_the_daemon_state(
 ) -> None:
     server, headers = await _dns_agent(db_session)
 
-    resp = await client.post("/api/v1/dns/agents/heartbeat", headers=headers, json={"daemon": DEFERRED})
+    resp = await client.post(
+        "/api/v1/dns/agents/heartbeat", headers=headers, json={"daemon": DEFERRED}
+    )
     assert resp.status_code == 200, resp.text
     await db_session.refresh(server)
     assert server.daemon_status == STATUS_DEGRADED

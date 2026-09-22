@@ -3432,8 +3432,7 @@ async def _matching_agent_daemon_degraded_subjects(
                 f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
                 f"(since {since.isoformat(timespec='seconds')}). The agent is heartbeating, "
                 "so the server reads reachable and healthy on every other signal while it "
-                "is not serving."
-                + (f" Agent reported: {reason}" if reason else "")
+                "is not serving." + (f" Agent reported: {reason}" if reason else "")
             )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append((subject_id, f"{row.name} ({kind})", message, rule.severity))

@@ -95,7 +95,9 @@ def apply_reported_daemon_state(
     server.daemon_status = status
     # The reason describes a state that is not ``ok``; on ``ok`` it is over,
     # and last week's "start deferred" next to a green status misleads.
-    server.daemon_reason = None if status == STATUS_OK else _clip(reported.get("reason"), _MAX_REASON)
+    server.daemon_reason = (
+        None if status == STATUS_OK else _clip(reported.get("reason"), _MAX_REASON)
+    )
     if status != previous or server.daemon_status_since is None:
         server.daemon_status_since = stamp
 
