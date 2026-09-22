@@ -11,11 +11,14 @@ import hmac
 import json
 import os
 import uuid
+import zlib
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
@@ -23,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
     dns_wake_channels,
@@ -32,6 +36,7 @@ from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DNSAgentBundle,
     DNSKey,
     DNSRecordOp,
     DNSServer,
@@ -44,13 +49,17 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
-from app.services.dns.agent_config import build_config_bundle
+from app.services.dns import agent_bundle_store as bundle_store
+from app.services.dns.agent_bundle_render import render_and_store
+from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body, record_failure
+from app.services.dns.agent_config import page_pending_ops
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
     needs_rotation,
     verify_agent_token,
 )
+from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
@@ -359,6 +368,83 @@ async def agent_register(
     )
 
 
+_BODY_CHUNK = 64 * 1024
+
+
+def _bundle_prefix(etag: str, ops: list[dict[str, Any]], remaining: int) -> bytes:
+    """The per-poll head of the response: ``etag`` and the ops page, in the
+    #958 wire shape. This ``json.dumps`` of at most ``dns_agent_ops_batch``
+    small dicts is the only serialisation left on the request loop."""
+    return (
+        b'{"etag":'
+        + json.dumps(etag).encode("utf-8")
+        + b',"pending_record_ops":'
+        + encode_body(ops)
+        + b',"pending_ops_remaining":'
+        + str(int(remaining)).encode("ascii")
+        + b","
+    )
+
+
+def _iter_bundle_bytes(prefix: bytes, body_gz: bytes) -> Iterator[bytes]:
+    """Stream ``prefix`` + the stored body minus its opening brace.
+
+    The stored body is a JSON object, so dropping its first byte and
+    concatenating yields one object with the per-poll keys first. A sync
+    iterator: Starlette runs it in its threadpool, so gunzipping a 26 MB
+    body never blocks the event loop and never exists whole in memory.
+    """
+    yield prefix
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    opened = False
+    for offset in range(0, len(body_gz), _BODY_CHUNK):
+        out = inflater.decompress(body_gz[offset : offset + _BODY_CHUNK])
+        if not opened and out:
+            out = out[1:]
+            opened = True
+        if out:
+            yield out
+    tail = inflater.flush()
+    if not opened and tail:
+        tail = tail[1:]
+    if tail:
+        yield tail
+
+
+def _bundle_response(
+    bundle: DNSAgentBundle, body_gz: bytes, ops: list[dict[str, Any]], remaining: int
+) -> StreamingResponse:
+    return StreamingResponse(
+        _iter_bundle_bytes(_bundle_prefix(bundle.etag, ops, remaining), body_gz),
+        media_type="application/json",
+        headers={"ETag": format_etag(bundle.etag)},
+    )
+
+
+async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
+    """Migration-release fallback: build in the request as before, store it.
+
+    Once per (server, version) — the store is idempotent on the watermark
+    and a concurrent render (another replica, or the worker) simply wins;
+    then this poll serves the row that won. A render that raises fails the
+    poll as it always did, and is recorded on the server row.
+    """
+    server_id = server.id  # a rollback expires the instance
+    try:
+        outcome = await render_and_store(db, server, rendered_by=RENDERED_BY_API)
+    except Exception as exc:
+        await db.rollback()
+        await record_failure(db, server_id, f"{type(exc).__name__}: {exc}")
+        await db.commit()
+        raise
+    # Commit now: the stored row serves every other poller of this server.
+    await db.commit()
+    if outcome.bundle is not None:
+        return outcome.bundle
+    await db.refresh(server)
+    return await bundle_store.current(db, server)
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     db: DB,
@@ -371,6 +457,42 @@ async def agent_config_longpoll(
     Returns 304 if the server's current bundle matches If-None-Match.
     Otherwise holds the connection up to LONGPOLL_TIMEOUT_SECONDS waiting for
     any change, then returns the current bundle with a new ETag.
+
+    #1111 — the bundle is no longer assembled here. It is rendered once per
+    (server, watermark) by the worker (``app.tasks.agent_bundles``) and
+    stored in ``dns_agent_bundle``; this handler reads one small row per
+    wake, compares ``If-None-Match`` with the stored ETag, splices the
+    per-server ops page in front of the stored bytes and streams them. No
+    assembly and no 26 MB string on the request loop whatever the group's
+    record count, and one build per change instead of one per agent per
+    change (it used to be one per agent per wake, and one per PAGE while
+    ops were pending).
+
+    The agents' contract is unchanged: weak ETag / 304 / the body shape /
+    the "200 while ops are pending" fast path / ``structural_etag`` / the
+    #882 quarantine. One deliberate difference: the ETag is the stored
+    body's and no longer folds the ops page in, so a page does not rotate
+    it — the fast path answers 200 with the same ETag and the next page,
+    and the poll after the last ack answers 304 instead of re-sending the
+    whole body. The agent never short-circuits on an unchanged ETag (it
+    saves, compares ``structural_etag``, drains the ops), so nothing on its
+    side changes.
+
+    The ops page is gated to the stored bundle's snapshot: an op created
+    after it rides with the next render, whose dirty mark its own commit
+    already made. Every body an agent holds is therefore a superset of
+    every op it has applied — the invariant the inline build had by
+    construction, and what keeps a later structural re-render (or a restart
+    replaying the cached bundle) from dropping a record the agent already
+    applied incrementally.
+
+    A missing or stale bundle is never served: the render is enqueued (the
+    worker coalesces duplicates) and the poll holds on the wake the worker
+    publishes when it lands, 304 at the deadline. While
+    ``settings.dns_agent_bundle_inline_fallback`` is on — the migration
+    release, whose worker may still be one release behind — the api renders
+    it inline instead: exactly the old build, once per version, because it
+    stores what it built.
     """
     server, _payload = auth
     if server.pending_approval:
@@ -378,64 +500,42 @@ async def agent_config_longpoll(
         return {"pending_approval": True, "etag": None}
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
-    # #358 — subscribe to this agent's wake channels BEFORE the first
-    # bundle build so a mutation that commits + publishes during this
-    # request can't land in the gap. A wake collapses the re-poll
-    # latency; with Redis down the subscription degrades to the old
-    # ``LONGPOLL_POLL_INTERVAL`` sleep, so behaviour is unchanged.
+    enqueued = False
+    # #358 — subscribe to this agent's wake channels BEFORE the first read so
+    # a change (or a render) that commits + publishes during this request
+    # can't land in the gap. A wake collapses the re-poll latency; with
+    # Redis down the subscription degrades to the old poll interval.
     async with wake_subscription(dns_wake_channels(server)) as wake:
         while True:
-            # Pick up server-row column changes a wake may be signalling
-            # (group_id, etc.) — build_config_bundle re-queries zones /
-            # records fresh, but server attributes are read off this
-            # cached instance (expire_on_commit=False, no in-loop commit).
+            # The server row carries the dirty sequence and the watermark of
+            # the newest stored bundle; refresh it so a change committed on
+            # any replica, or the worker's store, is seen here
+            # (expire_on_commit=False, no in-loop commit).
             await db.refresh(server)
-            bundle = await build_config_bundle(db, server)
-            etag = bundle["etag"]
-            # Early return if there are pending ops (fast-path per §3)
-            has_pending_ops = bool(bundle.get("pending_record_ops"))
-            if not etag_matches(if_none_match, etag) or has_pending_ops:
-                server.last_config_etag = etag
-                await db.commit()
-                # Serialise ONCE and hand the bytes back. Returning the dict
-                # sends it through FastAPI's jsonable_encoder, which walks and
-                # copies the whole structure — for a 250k-record group that is
-                # 500k record dicts duplicated on the request loop before the
-                # JSON is even written, the difference between a bundle that
-                # fits the api's memory limit and one that is memcg-killed
-                # (appliance sizing campaign, 2026-09-03: the api still hit
-                # 4.18 GB twice serving the first bundle after the paged-ops
-                # and one-query-records fixes). json.dumps of the same dict
-                # is what the ETag already hashes.
-                #
-                # #958 — the kwargs are Starlette ``JSONResponse.render``'s,
-                # not ``json.dumps``'s. They are not cosmetic: the stock
-                # defaults put a space after every ``,`` and ``:``, which on
-                # the 250k-record bundle this path exists to shrink is
-                # +3.5 MB (+13.5%) of string built in-process, and escape
-                # non-ASCII to ``\uXXXX`` (six bytes a character instead of
-                # two) so an IDN or a UTF-8 record value inflates further.
-                # ``allow_nan=False`` restores the guardrail: Python's own
-                # ``json.loads`` ACCEPTS bare ``NaN``, so a stray float would
-                # round-trip control plane → agent unnoticed and fail only on
-                # a strict parser. With these, the body is byte-identical to
-                # what FastAPI sent before the switch.
-                return Response(
-                    content=json.dumps(
-                        bundle,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        separators=(",", ":"),
-                        default=str,
-                    ),
-                    media_type="application/json",
-                    headers={"ETag": format_etag(etag)},
-                )
+            bundle = await bundle_store.current(db, server)
+            if bundle is None:
+                if settings.dns_agent_bundle_inline_fallback:
+                    bundle = await _render_inline(db, server)
+                elif not enqueued:
+                    await enqueue_renders([server.id])
+                    enqueued = True
+            if bundle is not None:
+                ops: list[dict[str, Any]] = []
+                remaining_ops = 0
+                if bundle.ships_ops:
+                    ops, remaining_ops = await page_pending_ops(
+                        db, server, up_to=bundle.snapshot_at
+                    )
+                # Early return if there are pending ops (fast-path per §3)
+                if not etag_matches(if_none_match, bundle.etag) or ops:
+                    server.last_config_etag = bundle.etag
+                    await db.commit()
+                    body_gz = await bundle_store.load_body(db, bundle)
+                    return _bundle_response(bundle, body_gz, ops, remaining_ops)
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                response.status_code = 304
-                response.headers["ETag"] = format_etag(etag)
-                return Response(status_code=304, headers={"ETag": format_etag(etag)})
+                headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
+                return Response(status_code=304, headers=headers)
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 

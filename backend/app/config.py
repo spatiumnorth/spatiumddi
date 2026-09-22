@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     # TTL of the per-server render lock and the fleet-wide render slot — the
     # ceiling on one render before a crashed worker's lock expires.
     dns_agent_bundle_render_lock_seconds: int = 900
+    # The long-poll serves stored bundles only. While this is on — the
+    # migration release, whose worker may still be one release behind — a
+    # missing or stale bundle is built inline in the request exactly as
+    # before, once per (server, version), because it stores what it built.
+    # Default off once the worker path is proven.
+    dns_agent_bundle_inline_fallback: bool = True
 
     # DHCP agent
     dhcp_agent_key: str = ""
