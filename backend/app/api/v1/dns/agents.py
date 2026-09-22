@@ -34,6 +34,7 @@ from app.core.agent_wake import (
 )
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dns import get_driver as get_dns_driver
+from app.metrics import AGENT_BUNDLE_INLINE_RENDERS, AGENT_BUNDLE_SERVED
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAgentBundle,
@@ -440,6 +441,7 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
     # Commit now: the stored row serves every other poller of this server.
     await db.commit()
     if outcome.bundle is not None:
+        AGENT_BUNDLE_INLINE_RENDERS.labels(family="dns").inc()
         return outcome.bundle
     await db.refresh(server)
     return await bundle_store.current(db, server)
@@ -531,10 +533,12 @@ async def agent_config_longpoll(
                     server.last_config_etag = bundle.etag
                     await db.commit()
                     body_gz = await bundle_store.load_body(db, bundle)
+                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="full").inc()
                     return _bundle_response(bundle, body_gz, ops, remaining_ops)
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
+                AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
                 return Response(status_code=304, headers=headers)
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 

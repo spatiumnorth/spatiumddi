@@ -200,6 +200,16 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # are critical (may not be serving at all).
 RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 
+# #1111 — the control plane could not RENDER a DNS agent's config bundle.
+# The mirror image of ``agent_config_rejected``: that one is the agent
+# refusing what it was sent, this one is the control plane failing to
+# produce it. Nothing else alarms — the agent keeps serving its last bundle,
+# keeps heartbeating, and truthfully reports ``ok`` for the config it HAS —
+# while the config the operator saved is live nowhere until a render
+# succeeds. Severity: warning while a previous bundle is still being served,
+# critical when the server has never had one.
+RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED = "agent_bundle_render_failed"
+
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
 # row for a cluster node).
@@ -518,6 +528,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
+        RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
@@ -3359,6 +3370,56 @@ async def _matching_agent_config_rejected_subjects(
     return matches
 
 
+async def _matching_agent_bundle_render_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``agent_bundle_render_failed`` — every agent-based DNS server whose
+    last bundle render raised (#1111).
+
+    Reads the ``bundle_render_*`` columns the render writes; no probing.
+    Auto-resolves through ``evaluate_all``'s standard diff the moment a
+    render succeeds (the store clears the columns as a group). NULL is not
+    a match: it means never rendered, which on a fresh install is the
+    state a few seconds before the first render lands.
+    """
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.dns.agent_bundle_store import RENDER_STATUS_FAILED  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer).where(DNSServer.bundle_render_status == RENDER_STATUS_FAILED)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for row in rows:
+        detail = (row.bundle_render_error or "").strip()
+        if row.bundle_watermark is None:
+            what = (
+                "has never had a config bundle rendered, so it has nothing to apply "
+                "and may not be serving what is saved here at all"
+            )
+            severity = "critical"
+        else:
+            what = (
+                "is still being served its previous bundle; the changes saved since "
+                "are live nowhere until a render succeeds"
+            )
+            severity = "warning"
+        message = (
+            f"DNS server '{row.name}': the control plane could not render its config bundle and it {what}."
+            + (f" Render error: {detail}" if detail else "")
+        )
+        matches.append(
+            (f"{DNSServer.__tablename__}:{row.id}", f"{row.name} (DNS)", message, severity)
+        )
+    return matches
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4442,6 +4503,51 @@ async def seed_agent_config_rejected_alert_rule() -> None:
                     "when the agent reports a successful apply."
                 ),
                 rule_type=RULE_TYPE_AGENT_CONFIG_REJECTED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+_AGENT_BUNDLE_RENDER_FAILED_RULE_NAME = "Agent config bundle render failed"
+
+
+async def seed_agent_bundle_render_failed_alert_rule() -> None:
+    """Seed the #1111 rule, ENABLED by default, for the same reason as
+    ``agent_config_rejected``: it applies to every install that runs a DNS
+    agent, needs no configuration, and cannot false-fire — it reads the
+    control plane's own verdict on a render it ran. The failure it catches
+    (a saved config that never became a bundle) is invisible on every other
+    signal: the agent is reachable, healthy, and reporting ``ok`` for the
+    bundle it has. Keyed on ``name``; a renamed or disabled rule is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_BUNDLE_RENDER_FAILED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_BUNDLE_RENDER_FAILED_RULE_NAME,
+                description=(
+                    "Fires when the control plane cannot render a DNS agent's config "
+                    "bundle — the mirror image of a rejected apply. The agent keeps "
+                    "serving its last bundle and reports ok for it, so the server "
+                    "looks healthy on every other signal while the configuration "
+                    "saved since is live nowhere. Critical when the server has never "
+                    "had a bundle at all; warning while a previous one is still "
+                    "served. Auto-resolves when a render succeeds."
+                ),
+                rule_type=RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
                 severity="warning",
                 enabled=True,
                 notify_syslog=True,
@@ -5744,6 +5850,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # same shape ``secret_expiring`` uses for its two credential
                 # tables. Without the prefix a dns_server and a dhcp_server
                 # sharing a UUID would collide into one event.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:
+                unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in unrendered]
+                # Same subject shape as agent_config_rejected: the id carries
+                # the table so the two rules' events never collide.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)

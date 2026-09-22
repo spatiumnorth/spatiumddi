@@ -181,7 +181,12 @@ def collect_affected(session: Any) -> Affected:
 def mark_dirty(session: Any, aff: Affected) -> list[uuid.UUID]:
     """Bump ``bundle_dirty_seq`` for every agent-based server ``aff`` names,
     on the session's current connection (inside the same transaction).
-    Returns the bumped server ids."""
+    Returns the bumped server ids.
+
+    A Core UPDATE, so ``DNSServer`` instances already in the session keep
+    their loaded value until refreshed — the long-poll refreshes on every
+    wake and the render reads the row fresh, which is where it matters.
+    """
     if aff.is_empty():
         return []
     conn = session.connection()

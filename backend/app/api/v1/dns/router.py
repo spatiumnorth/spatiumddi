@@ -522,6 +522,21 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1111 — the stored agent config bundle: what the long-poll serves and
+    # when it was rendered, whether the newest render is behind the changes
+    # made since (watermark < dirty_seq), how many renders this server has
+    # had (the "builds per change" number), and the CONTROL PLANE's own
+    # verdict on its last render — distinct from the agent's #882 verdict
+    # above, which is about applying what it was sent.
+    bundle_etag: str | None = None
+    bundle_built_at: datetime | None = None
+    bundle_rendered_by: str | None = None
+    bundle_watermark: int | None = None
+    bundle_dirty_seq: int = 0
+    bundle_render_count: int = 0
+    bundle_render_status: str | None = None
+    bundle_render_error: str | None = None
+    bundle_render_at: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -558,6 +573,15 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            bundle_etag=s.bundle_etag,
+            bundle_built_at=s.bundle_built_at,
+            bundle_rendered_by=s.bundle_rendered_by,
+            bundle_watermark=s.bundle_watermark,
+            bundle_dirty_seq=s.bundle_dirty_seq,
+            bundle_render_count=s.bundle_render_count,
+            bundle_render_status=s.bundle_render_status,
+            bundle_render_error=s.bundle_render_error,
+            bundle_render_at=s.bundle_render_at,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
