@@ -186,7 +186,7 @@ async def test_drifted_partners_do_not_undo_each_other(
     """dhcp1 has reservation A, dhcp2 has reservation B (an unreplicated
     console edit on each). Polling both, in one run, twice, must converge on
     ONE view with no create/delete churn — and say the partners drifted."""
-    _g, (s1, s2), scope = await _setup(db_session)
+    (s1, s2), scope = (await _setup(db_session))[1:]
     by_name = {
         "dhcp1": _Server(
             scopes=[wire_scope([(MAC_A, "10.50.0.10")])],
@@ -231,7 +231,7 @@ async def test_an_unreachable_owner_hands_the_scope_to_the_partner(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An owner whose view has gone stale must not freeze the import."""
-    _g, (s1, s2), scope = await _setup(db_session)
+    (s1, s2), scope = (await _setup(db_session))[1:]
     by_name = {
         "dhcp1": _Server(scopes=[wire_scope([(MAC_A, "10.50.0.10")])]),
         "dhcp2": _Server(scopes=[wire_scope([(MAC_B, "10.50.0.11")])]),
@@ -253,7 +253,7 @@ async def test_an_unreachable_owner_hands_the_scope_to_the_partner(
 async def test_single_member_group_reconciles_exactly_as_before(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _g, (s1,), scope = await _setup(db_session, ("dhcp1",))
+    (s1,), scope = (await _setup(db_session, ("dhcp1",)))[1:]
     _install(monkeypatch, {"dhcp1": _Server(scopes=[wire_scope([(MAC_A, "10.50.0.10")])])})
     result = await pl.pull_leases_from_server(db_session, s1)
     await db_session.commit()
@@ -265,7 +265,7 @@ async def test_single_member_group_reconciles_exactly_as_before(
 async def test_uncoordinated_shared_scope_is_reported(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _g, (s1, s2), _scope = await _setup(db_session)
+    s1, s2 = (await _setup(db_session))[1]
     same = wire_scope([(MAC_A, "10.50.0.10")])
     _install(monkeypatch, {"dhcp1": _Server(scopes=[same]), "dhcp2": _Server(scopes=[same])})
     await pl.pull_leases_from_server(db_session, s2)  # dhcp2 first: records its view
@@ -281,7 +281,7 @@ async def test_uncoordinated_shared_scope_is_reported(
 async def test_poll_records_relationships_and_scope_presence(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     st = _Server(
         scopes=[wire_scope([(MAC_A, "10.50.0.10")])],
         failover={"ok": True, "error": None, "relationships": [rel("dhcp9.elsewhere")]},
@@ -308,7 +308,7 @@ async def test_a_denied_failover_read_keeps_the_last_relationships(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """'The read was denied' must not become 'there is no failover'."""
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     st = _Server(
         scopes=[wire_scope([])],
         failover={"ok": True, "error": None, "relationships": [rel("dhcp2")]},
@@ -334,7 +334,7 @@ async def test_a_denied_failover_read_keeps_the_last_relationships(
 async def test_a_failover_read_that_raises_is_recorded_not_fatal(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _g, (s1,), scope = await _setup(db_session, ("dhcp1",))
+    (s1,), scope = (await _setup(db_session, ("dhcp1",)))[1:]
     st = _Server(scopes=[wire_scope([(MAC_A, "10.50.0.10")])], failover=RuntimeError("boom"))
     _install(monkeypatch, {"dhcp1": st})
     await pl.pull_leases_from_server(db_session, s1)
@@ -349,7 +349,7 @@ async def test_failover_read_is_skipped_when_the_scope_read_failed(
 ) -> None:
     """The server is almost certainly unreachable; a third WinRM call would
     only add another full timeout to the poll."""
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     st = _Server(scopes_error=RuntimeError("WinRM down"))
     _install(monkeypatch, {"dhcp1": st})
     await pl.pull_leases_from_server(db_session, s1)
@@ -361,7 +361,7 @@ async def test_failover_read_is_skipped_when_the_scope_read_failed(
 async def test_an_empty_scope_read_records_nothing(db_session: AsyncSession) -> None:
     """Empty is indistinguishable from a quiet enumeration failure (#482):
     let the view go stale instead of claiming the server holds nothing."""
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     db_session.add(DHCPServerScopeState(server_id=s1.id, scope_cidr=CIDR, is_active=True))
     await db_session.flush()
     await record_scope_observation(db_session, s1, [], now=datetime.now(UTC))
@@ -372,7 +372,7 @@ async def test_an_empty_scope_read_records_nothing(db_session: AsyncSession) -> 
 
 @pytest.mark.asyncio
 async def test_scope_observation_writes_only_what_changed(db_session: AsyncSession) -> None:
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     now = datetime.now(UTC)
     other = wire_scope([], subnet_cidr="10.50.1.0/24", scope_id="10.50.1.0")
     await record_scope_observation(db_session, s1, [wire_scope([]), other], now=now)
@@ -396,7 +396,7 @@ async def test_scope_observation_writes_only_what_changed(db_session: AsyncSessi
 async def test_failover_observation_updates_in_place_and_drops_the_gone(
     db_session: AsyncSession,
 ) -> None:
-    _g, (s1,), _scope = await _setup(db_session, ("dhcp1",))
+    (s1,) = (await _setup(db_session, ("dhcp1",)))[1]
     now = datetime.now(UTC)
     two = [rel("dhcp2"), {**rel("dhcp3"), "name": "other"}]
     await record_failover_observation(
