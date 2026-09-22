@@ -8,11 +8,14 @@ on a ``named`` restart counters drop back to zero, which we detect as
 ``delta < 0`` and absorb.
 
 For MVP we report five scalar counters derived from the server-level
-``<counters type="opcode">`` and ``<counters type="qryrcode">`` (or
-equivalent ``<nsstat>`` blocks depending on the BIND build):
+``<counters type="opcode">`` and ``<counters type="nsstat">`` blocks
+(older builds spell some of them differently — see ``_COUNTERS``):
 
-    queries_total   — total incoming queries (opcode QUERY)
-    noerror         — QryAuthAns + QryNoauthAns (NOERROR responses)
+    queries_total   — total incoming queries (opcode QUERY; the nsstat
+                      Requestv4 + Requestv6 on a build without the
+                      opcode table)
+    noerror         — QryAuthAns + QryNoauthAns (NOERROR responses;
+                      QrySuccess on a build without the split)
     nxdomain        — QryNXDOMAIN
     servfail        — QrySERVFAIL
     recursion       — QryRecursion (queries that triggered recursion)
@@ -38,23 +41,40 @@ log = structlog.get_logger(__name__)
 
 STATS_URL = "http://127.0.0.1:8053/xml/v3/server"
 
-# Column → one or more BIND counter names. When multiple counters
-# contribute, they're summed. Different BIND builds report under
-# slightly different element names; we include both of the common
-# shapes so a typical Alpine/Debian ``named`` lights up out of the box.
-_COUNTERS: dict[str, tuple[str, ...]] = {
-    "queries_total": ("QUERY", "Requestv4", "Requestv6"),
-    "noerror": ("QryAuthAns", "QryNoauthAns", "QrySuccess"),
-    "nxdomain": ("QryNXDOMAIN",),
-    "servfail": ("QrySERVFAIL",),
-    "recursion": ("QryRecursion",),
+# Column → the SPELLINGS of that column, in order of preference. Each
+# spelling is one or more BIND counter names that are summed; the first
+# spelling with any counter present is the column's value and the rest
+# are ignored. Different BIND builds report under different element
+# names, and the spellings exist so a typical Alpine/Debian ``named``
+# lights up out of the box — but they are alternatives, never addends:
+# the opcode table's ``QUERY`` and the nsstat family's ``Requestv4`` /
+# ``Requestv6`` count the SAME requests (by opcode, by address family),
+# and BIND 9.20 publishes both. Summing them counted every query twice
+# on every current BIND (#1064); ``QryAuthAns`` + ``QryNoauthAns`` beside
+# ``QrySuccess`` did the same to ``noerror`` on every answered query.
+_COUNTERS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "queries_total": (("QUERY",), ("Requestv4", "Requestv6")),
+    "noerror": (("QryAuthAns", "QryNoauthAns"), ("QrySuccess",)),
+    "nxdomain": (("QryNXDOMAIN",),),
+    "servfail": (("QrySERVFAIL",),),
+    "recursion": (("QryRecursion",),),
     # Response Rate Limiting (#146 Phase 3). BIND9 publishes these in the
     # same statistics-channels XML under the rate-limiting family:
     # RateDropped = responses dropped, RateSlipped = responses truncated
     # (TC=1) so a legit client can retry over TCP. Both 0 when RRL is off.
-    "rate_dropped": ("RateDropped",),
-    "rate_slipped": ("RateSlipped",),
+    "rate_dropped": (("RateDropped",),),
+    "rate_slipped": (("RateSlipped",),),
 }
+
+
+def _column_value(totals: dict[str, int], spellings: tuple[tuple[str, ...], ...]) -> int:
+    """The first spelling with any of its counters present, summed; 0 when
+    the snapshot carries none of them."""
+    for names in spellings:
+        present = [n for n in names if n in totals]
+        if present:
+            return sum(totals[n] for n in present)
+    return 0
 
 
 def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
@@ -79,13 +99,7 @@ def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
             continue
         totals[name] = totals.get(name, 0) + val
 
-    out: dict[str, int] = {}
-    for col, names in _COUNTERS.items():
-        total = 0
-        for n in names:
-            total += totals.get(n, 0)
-        out[col] = total
-    return out
+    return {col: _column_value(totals, spellings) for col, spellings in _COUNTERS.items()}
 
 
 class MetricsPoller:
