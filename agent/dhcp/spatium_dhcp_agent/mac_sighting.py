@@ -40,7 +40,7 @@ import httpx
 import structlog
 
 from .config import AgentConfig
-from .push import CPPoster, disabled_spool
+from .push import CPPoster, disabled_spool, late_bound
 from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -225,7 +225,10 @@ class MacSightingShipper:
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("mac_sightings"),
             CPPoster(
-                cfg, token_ref, "/api/v1/dhcp/agents/mac-sightings", lambda: self._cp_client()
+                cfg,
+                token_ref,
+                "/api/v1/dhcp/agents/mac-sightings",
+                late_bound(self, "_cp_client"),
             ),
             event_prefix="mac_sighting_ship",
             retry_backoff_seconds=BATCH_INTERVAL,

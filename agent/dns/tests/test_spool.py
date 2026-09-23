@@ -54,7 +54,8 @@ def _drain_all(sp: Spool) -> list[dict[str, Any]]:
 def test_append_then_drain_preserves_order(tmp_path: Path) -> None:
     sp = Spool(tmp_path, "s", 10_000_000, enabled=True)
     for i in range(20):
-        assert sp.append({"i": i})
+        kept = sp.append({"i": i})
+        assert kept
     assert len(sp) == 20
     assert [p["i"] for p in _drain_all(sp)] == list(range(20))
     assert len(sp) == 0
@@ -92,7 +93,8 @@ def test_cap_trims_oldest_and_counts_persistently(tmp_path: Path) -> None:
 
 def test_oversize_entry_is_refused_and_counted(tmp_path: Path) -> None:
     sp = Spool(tmp_path, "s", 50, enabled=True)
-    assert not sp.append({"blob": "x" * 500})
+    kept = sp.append({"blob": "x" * 500})
+    assert not kept
     assert len(sp) == 0
     assert sp.status()["trimmed_entries_total"] == 1
 
@@ -150,7 +152,8 @@ def test_tmp_files_from_a_crash_are_discarded(tmp_path: Path) -> None:
 
 def test_disabled_spool_keeps_nothing(tmp_path: Path) -> None:
     sp = Spool(tmp_path, "s", 10_000_000, enabled=False)
-    assert not sp.append({"i": 0})
+    kept = sp.append({"i": 0})
+    assert not kept
     assert len(sp) == 0
     assert not (tmp_path / "spool").exists()
 

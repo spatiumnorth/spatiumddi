@@ -38,7 +38,7 @@ import structlog
 
 from .config import AgentConfig
 from .lease_snapshot import LeaseSnapshot
-from .push import CPPoster, disabled_spool, drain_for
+from .push import CPPoster, disabled_spool, drain_for, late_bound
 from .spool import RETRY, SENT, Shipper, Spool, classify_status
 
 log = structlog.get_logger(__name__)
@@ -127,7 +127,7 @@ class LeaseWatcher:
         self._last_flush = time.monotonic()
         self._last_drain = 0.0
         self._offset = 0
-        self._poster = CPPoster(cfg, token_ref, LEASE_EVENTS_PATH, lambda: self._client())
+        self._poster = CPPoster(cfg, token_ref, LEASE_EVENTS_PATH, late_bound(self, "_client"))
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("lease_events"),
             self._post_events,

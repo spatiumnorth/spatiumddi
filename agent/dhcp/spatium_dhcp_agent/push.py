@@ -38,6 +38,21 @@ def disabled_spool(stream: str) -> Spool:
     return Spool(Path("."), stream, 0, enabled=False)
 
 
+def late_bound(owner: Any, attr: str) -> Callable[[], httpx.Client]:
+    """A client factory that looks ``owner.<attr>`` up on EVERY call.
+
+    Passing ``self._client`` directly would capture the bound method at
+    construction, so a test that swaps the owner's ``_client`` afterwards
+    (``monkeypatch.setattr(obj, "_client", ...)``) would silently keep talking
+    to the real one.
+    """
+
+    def factory() -> httpx.Client:
+        return getattr(owner, attr)()
+
+    return factory
+
+
 class CPPoster:
     """POST one payload to one control-plane path; return the HTTP status.
 
@@ -133,4 +148,4 @@ def drain_for(shipper: Shipper, budget_seconds: float) -> bool:
             return False
 
 
-__all__ = ["CPPoster", "disabled_spool", "drain_for"]
+__all__ = ["CPPoster", "disabled_spool", "drain_for", "late_bound"]

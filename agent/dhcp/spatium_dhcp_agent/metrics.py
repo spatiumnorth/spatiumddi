@@ -73,7 +73,7 @@ import structlog
 
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, send_command
-from .push import CPPoster, disabled_spool, drain_for
+from .push import CPPoster, disabled_spool, drain_for, late_bound
 from .socket_drops import SocketDropCounter
 from .spool import RETRY, Shipper, Spool
 
@@ -163,7 +163,7 @@ class MetricsPoller:
         self.token_ref = token_ref
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("metrics"),
-            CPPoster(cfg, token_ref, METRICS_PATH, lambda: self._client()),
+            CPPoster(cfg, token_ref, METRICS_PATH, late_bound(self, "_client")),
             event_prefix="metrics_report",
         )
         self._stop = threading.Event()

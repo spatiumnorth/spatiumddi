@@ -31,7 +31,7 @@ import httpx
 import structlog
 
 from .config import AgentConfig
-from .push import CPPoster, disabled_spool
+from .push import CPPoster, disabled_spool, late_bound
 from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -229,7 +229,10 @@ class DhcpFingerprintShipper:
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("fingerprints"),
             CPPoster(
-                cfg, token_ref, "/api/v1/dhcp/agents/dhcp-fingerprints", lambda: self._cp_client()
+                cfg,
+                token_ref,
+                "/api/v1/dhcp/agents/dhcp-fingerprints",
+                late_bound(self, "_cp_client"),
             ),
             event_prefix="dhcp_fingerprint_ship",
             retry_backoff_seconds=BATCH_INTERVAL,

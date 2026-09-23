@@ -39,7 +39,7 @@ import httpx
 import structlog
 
 from .config import AgentConfig
-from .push import CPPoster, disabled_spool, drain_for
+from .push import CPPoster, disabled_spool, drain_for, late_bound
 from .spool import RETRY, Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -82,7 +82,7 @@ class LogShipper:
         self._inode: int | None = None
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("dhcp_log"),
-            CPPoster(cfg, token_ref, LOG_ENTRIES_PATH, lambda: self._cp_client()),
+            CPPoster(cfg, token_ref, LOG_ENTRIES_PATH, late_bound(self, "_cp_client")),
             event_prefix="dhcp_log_ship",
             retry_backoff_seconds=BATCH_INTERVAL,
         )
