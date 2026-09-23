@@ -1064,7 +1064,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
 - A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. Three-or-more Kea members is nonsensical for `libdhcp_ha.so` (it only speaks pairs) and should be validated at the CRUD layer.
-- Mixed groups (Kea + Windows DHCP read-only) are allowed — only the Kea members participate in HA.
+- Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
 
@@ -1124,7 +1124,7 @@ HA is configured on the server group, not a separate page. Edit the group under 
 
 ## 15. Windows DHCP — Path A (read-only)
 
-SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's implementation (Path A) is WinRM-driven and focused on **lease mirroring** — SpatiumDDI polls the Windows server for its active leases and reflects them into IPAM, but does not push config bundles. Path B (full scope/reservation CRUD via WinRM) is on the roadmap.
+SpatiumDDI supports Windows Server DHCP as an **agentless** backend, driven over WinRM. It polls each Windows server for its leases and scopes and reflects them into IPAM, and writes scope / pool / reservation edits through to the server per object (it does not push config bundles — Windows has no whole-config entry point). A group with more than one Windows member is covered in §15.8.
 
 ### 15.1 What's implemented
 
@@ -1135,6 +1135,8 @@ SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's imp
 | Per-object scope CRUD | ✅ | `Add-DhcpServerv4Scope` / `Remove-DhcpServerv4Scope`. |
 | Per-object reservation CRUD | ✅ | `Add-DhcpServerv4Reservation` / `Remove-DhcpServerv4Reservation`. |
 | Per-object exclusion CRUD | ✅ | `Add-DhcpServerv4ExclusionRange` / `Remove-DhcpServerv4ExclusionRange`. |
+| Read failover relationships | ✅ | `Get-DhcpServerv4Failover`, on the lease-sync poll (#1110). |
+| Manage failover relationships | ✅ | `Add-` / `Set-` / `Remove-DhcpServerv4Failover`, `Add-` / `Remove-DhcpServerv4FailoverScope`, `Invoke-DhcpServerv4FailoverReplication` (#1110). Needs the CredSSP WinRM transport. |
 | Bundle push (`/sync`) | ❌ | `READ_ONLY_DRIVERS` — rejected by the API. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `reload` / `restart` / `validate_config` | ❌ | Not applicable to Windows; raise `NotImplementedError`. |
 
@@ -1158,6 +1160,7 @@ Stored on `DHCPServer.credentials_encrypted` as a Fernet-encrypted JSON dict:
 Service account requirements:
 - **Read-only lease mirroring**: member of the Windows `DHCP Users` local group.
 - **Per-object scope/reservation/exclusion CRUD**: member of `DHCP Administrators`.
+- **Managing failover relationships**: `DHCP Administrators` on **both** partners, and `"transport": "credssp"` — each cmdlet runs on one server and acts on its partner from there (see §15.8).
 
 See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
 
@@ -1200,15 +1203,29 @@ Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
 
 - Scope options pushed from SpatiumDDI instead of being managed in the Windows DHCP MMC.
 - Client class / policy rendering.
-- DHCP failover pair configuration from SpatiumDDI.
 
-The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers.
+The per-object writes (`apply_scope`, `apply_reservation`, `apply_exclusion`) are wired: the scope / pool / static endpoints write through before committing (`services.dhcp.windows_writethrough`). What remains is the list above.
 
 ### 15.7 Migrating off Windows DHCP entirely (issue #756)
 
 Everything above treats Windows as a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, ships **disabled**, `/api/v1/migration/cutover`, superadmin) drives the switch per scope: parity against the live server (lease time, pools, reservations, options), the lease handover, the switch itself, and a decommission checklist.
 
 Two things matter here. The **lease handover** exists because the DHCP importer (§8) deliberately skips live leases — so a naive switch hands clients to a Kea with an empty lease database, and the first renewal offers a fresh pool address to a client still using the one Windows gave it. The handover promotes each live Windows lease to a reservation (stamped `import_source="windows_cutover"`) so a renewing client keeps the address it already holds. And the **switch is ordered**: the Windows scope is deactivated *before* the managed scope is activated, so the two never answer the same subnet at once; if the managed side then fails to come up, the Windows scope is re-activated. Rollback reverses it, with the recovery-time expectation stated as the scope's lease time. See [MIGRATION.md](MIGRATION.md#windows--spatiumddi-cutover-756).
+
+### 15.8 Two or more Windows servers in one group (issue #1110)
+
+Two Windows DHCP servers only share a scope safely inside a **failover relationship** that covers it; without one they hand out the same addresses. So on a group with two or more Windows members:
+
+- Writes go only to the members that already **hold** the scope, and never create it anywhere else. A covered scope is written to **both** partners — Windows failover syncs leases between partners, not configuration.
+- A **new** scope goes to one member, by its **Windows placement**: into a failover relationship (created on one side and added to it, so Windows copies it to the partner) or on one server only. Without a placement, the one relationship the members share is used; otherwise the create is **refused (422)** with the choices. Activating a scope several members hold with no relationship covering it is **refused (422)**.
+- **Deleting** a scope a failover pair in the group covers takes it out of the relationship and then deletes it; a scope whose partner is outside the group is **refused (409)**.
+- A **split scope** (no relationship, the servers' parts kept apart) is left alone unless a change would make the parts overlap — then it is **refused (422)**.
+- **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
+- The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
+- A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+
+The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 
 ## 16. Rules & constraints
 

@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_fqdn
 from app.core.permissions import require_resource_permission
@@ -28,7 +29,9 @@ from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
+    WindowsPlacement,
     push_scope_upsert,
 )
 from app.services.tags import apply_tag_filter
@@ -272,6 +275,32 @@ def _validate_relay_family(addrs: list[str], address_family: str) -> None:
             )
 
 
+class WindowsPlacementIn(BaseModel):
+    """Where a scope no Windows member holds goes, on a group with two or more
+    Windows DHCP members (#1110) — ignored on any other group, and on a scope
+    a member already holds. Give one of the two; see ``WindowsPlacement``."""
+
+    #: Create it on this one Windows member only.
+    server_id: uuid.UUID | None = None
+    #: Create it on one side of this failover relationship and add it to the
+    #: relationship, so Windows copies it to the partner.
+    failover_relationship: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def _one(self) -> WindowsPlacementIn:
+        if self.server_id is not None and self.failover_relationship:
+            raise ValueError("give server_id or failover_relationship, not both")
+        return self
+
+
+def _placement(value: WindowsPlacementIn | None) -> WindowsPlacement | None:
+    if value is None:
+        return None
+    return WindowsPlacement(
+        server_id=value.server_id, failover_relationship=value.failover_relationship
+    )
+
+
 class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
@@ -316,6 +345,9 @@ class ScopeCreate(BaseModel):
     # Relay-agent (giaddr) IPs (issue #337) — see DHCPScope.relay_addresses.
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #1110 — see ``WindowsPlacementIn``. Only consulted when no Windows
+    # member holds the scope yet; an existing one stays where it is held.
+    windows_placement: WindowsPlacementIn | None = None
 
     @model_validator(mode="after")
     def _field_aliases(self) -> ScopeCreate:
@@ -406,6 +438,9 @@ class ScopeUpdate(BaseModel):
     # scope's relay set (empty list clears it); omit to leave unchanged.
     relay_addresses: list[str] | None = None
     tags: dict[str, Any] | None = None
+    # #1110 — only read when no Windows member of the group holds the scope
+    # (restored from Trash, or deleted on Windows): where to put it back.
+    windows_placement: WindowsPlacementIn | None = None
 
     @model_validator(mode="after")
     def _field_aliases(self) -> ScopeUpdate:
@@ -742,7 +777,12 @@ async def create_scope(
         ) from exc
     # Push to every Windows DHCP member of the group BEFORE commit so a
     # WinRM failure rolls the DB row back.
-    await push_scope_upsert(db, scope, adopt_existing=adopt_existing)
+    await push_scope_upsert(
+        db,
+        scope,
+        adopt_existing=adopt_existing,
+        placement=_placement(body.windows_placement),
+    )
     collect_wake(dhcp_group_channel(group_id))
     write_audit(
         db,
@@ -764,6 +804,23 @@ async def get_scope(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> ScopeRespons
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
     return _scope_to_response(scope)
+
+
+@router.get("/scopes/{scope_id}/failover", response_model=ScopeServingResponse)
+async def get_scope_failover(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> ScopeServingResponse:
+    """How the Windows DHCP members of the scope's group serve it (#1110).
+
+    One row per Windows member — does it hold the scope, is it active there,
+    which failover relationship covers it, does its configuration match the
+    member whose view is imported — plus a verdict: ``single_server``,
+    ``failover``, ``split_scope``, ``uncoordinated`` (two servers can hand out
+    the same address), and so on. From the topology poll's observations, not
+    a live read. ``no_windows_members`` for a group without Windows members.
+    """
+    scope = await db.get(DHCPScope, scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="Scope not found")
+    return ScopeServingResponse.model_validate(await scope_serving_report(db, scope))
 
 
 @router.put("/scopes/{scope_id}", response_model=ScopeResponse)
@@ -842,10 +899,17 @@ async def update_scope(
             await _assert_no_overlapping_group_cidr(
                 db, scope.group_id, subnet, exclude_scope_id=scope.id
             )
+    placement_in = body.windows_placement
+    changes.pop("windows_placement", None)
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
-    await push_scope_upsert(db, scope, adopt_existing=adopt_existing)
+    await push_scope_upsert(
+        db,
+        scope,
+        adopt_existing=adopt_existing,
+        placement=_placement(placement_in),
+    )
     collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,

@@ -54,6 +54,8 @@ from app.services.dhcp.agent_token import (
 )
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.lease_cleanup import peer_holds_active_lease
+from app.services.dhcp.normalize import norm_ip, norm_mac
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -956,7 +958,9 @@ async def agent_lease_events(
       - Active lease + existing row that's manually allocated / static_dhcp
         / reserved → leave alone (operator owns that row; lease just
         co-exists in DHCPLease).
-      - Released/expired lease → if the IPAM row is auto_from_lease, remove it.
+      - Released/expired lease → if the IPAM row is auto_from_lease, remove it —
+        unless another server in the group still reports the lease active
+        (an HA peer that has not reported the release yet, #1110).
     """
     from app.models.ipam import IPAddress
     from app.services.dhcp.pull_leases import (
@@ -1015,15 +1019,24 @@ async def agent_lease_events(
         .scalars()
         .all()
     )
+    # Keyed on the NORMALISED pair (#1110). The event carries strings; a row
+    # loaded from the database carries an ``IPv4Address`` (asyncpg decodes
+    # INET natively) — so keying the map on the raw values never matched a
+    # stored lease, and every renewal event INSERTED another ``dhcp_lease``
+    # row for the same lease instead of updating the one it had. Harmless-
+    # looking until something counts rows per address: a release then only
+    # ever reached the new row, leaving the original "active" until its
+    # expiry, which kept a Kea HA partner's shared IPAM mirror alive.
     lease_by_key: dict[tuple[str, str], DHCPLease] = {
-        (lease.ip_address, lease.mac_address): lease for lease in existing_leases
+        (norm_ip(str(lease.ip_address)), norm_mac(str(lease.mac_address))): lease
+        for lease in existing_leases
     }
 
     # Upsert every DHCPLease first, then a single flush so new rows get
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
     for ev in events:
-        key = (ev.ip_address, ev.mac_address)
+        key = (norm_ip(ev.ip_address), norm_mac(ev.mac_address))
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1071,8 +1084,15 @@ async def agent_lease_events(
     ipam_existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
+    # Normalised for the same reason as ``lease_by_key`` above (#1110): the
+    # stored ``address`` is an ``IPv4Address``, the event's is a string. Raw
+    # keys never matched a stored row, so a release / expiry event found no
+    # mirror to tear down — the IPAM row and its DDNS records outlived the
+    # lease until the time-based sweep caught up with its expiry — and every
+    # active event for a known address fell through to a doomed INSERT that
+    # only the #564 savepoint rescued.
     ipam_by_key: dict[tuple[Any, str], IPAddress] = {
-        (row.subnet_id, row.address): row for row in ipam_existing
+        (row.subnet_id, norm_ip(str(row.address))): row for row in ipam_existing
     }
 
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
@@ -1088,8 +1108,8 @@ async def agent_lease_events(
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
-        lease = lease_by_key[(ev.ip_address, ev.mac_address)]
-        ipam_row = ipam_by_key.get((subnet.id, ev.ip_address))
+        lease = lease_by_key[(norm_ip(ev.ip_address), norm_mac(ev.mac_address))]
+        ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
         if is_active:
@@ -1109,7 +1129,7 @@ async def agent_lease_events(
                 # so a unique-violation self-heals into the incumbent
                 # row instead of 500-ing on uq_ip_address_subnet_address.
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
-                ipam_by_key[(subnet.id, ev.ip_address)] = ipam_row
+                ipam_by_key[(subnet.id, norm_ip(ev.ip_address))] = ipam_row
                 # A fresh insert already carries the right fields; only a
                 # race-lost incumbent we own gets the same update a
                 # pre-existing row would take (never a manual/static row).
@@ -1168,6 +1188,17 @@ async def agent_lease_events(
                         error=str(exc),
                     )
         else:  # expired / released / declined
+            # #1110 — under Kea HA both peers report every lease, so a
+            # release reaches us once per peer. The first to arrive must not
+            # take the shared mirror + DDNS away while the other peer still
+            # reports the lease active; the second one (or the expiry sweep,
+            # if the other peer never reports) does.
+            if (
+                ipam_row is not None
+                and ipam_row.auto_from_lease
+                and await peer_holds_active_lease(db, lease, now=now)
+            ):
+                continue
             if ipam_row is not None and ipam_row.auto_from_lease:
                 # Revoke DDNS BEFORE deleting the row — revoke reads
                 # dns_record_id / hostname off the row to find what to
@@ -1184,7 +1215,7 @@ async def agent_lease_events(
                         error=str(exc),
                     )
                 await db.delete(ipam_row)
-                ipam_by_key.pop((subnet.id, ev.ip_address), None)
+                ipam_by_key.pop((subnet.id, norm_ip(ev.ip_address)), None)
 
     # ── New-device watch: classify the collected MAC sightings (issue #459) ──
     # Flush first so freshly-created mirror rows have ids for the FK. Each

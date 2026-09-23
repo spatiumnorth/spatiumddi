@@ -16,6 +16,7 @@ import {
   isAdoptionRequired,
 } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
+import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
@@ -141,6 +142,11 @@ export function CreateScopeModal({
   // Initial pool — only used when creating; edits happen in the Pools tab.
   const [poolStart, setPoolStart] = useState("");
   const [poolEnd, setPoolEnd] = useState("");
+  // #1110 — where a NEW scope goes on a group with two or more Windows DHCP
+  // members: "" (let the server decide — the one relationship the members
+  // share, else it refuses and lists the choices), "rel:<name>" or
+  // "srv:<server id>". Creating it on every member is the outage.
+  const [placement, setPlacement] = useState("");
   const [error, setError] = useState("");
   // 409 + X-Adoption-Required from a cloud (FortiGate) group member: a DHCP
   // server already exists on the interface that SpatiumDDI didn't create
@@ -225,6 +231,20 @@ export function CreateScopeModal({
     setRaOther(m !== "slaac");
   }
 
+  const { data: failover } = useGroupFailover(groupId || undefined);
+  const windowsMembers = failover?.members ?? [];
+  const pairedRelationships = (failover?.relationships ?? []).filter(
+    (r) => r.complete,
+  );
+  // An existing scope stays where it is held; a placement is only asked for
+  // when no Windows member holds it — a new scope, or one restored from Trash
+  // or deleted on Windows.
+  const heldNowhere =
+    !editing ||
+    failover?.scopes.find((s) => s.scope_id === scope?.id)?.verdict ===
+      "not_on_windows";
+  const needsPlacement = !isV6 && windowsMembers.length >= 2 && heldNowhere;
+
   const [prefilled, setPrefilled] = useState(false);
   useEffect(() => {
     if (editing || prefilled) return;
@@ -301,6 +321,10 @@ export function CreateScopeModal({
       const data: Partial<DHCPScope> & {
         group_id?: string;
         clear_pxe_profile?: boolean;
+        windows_placement?: {
+          server_id?: string;
+          failover_relationship?: string;
+        };
       } = {
         group_id: groupId || undefined,
         name,
@@ -358,6 +382,11 @@ export function CreateScopeModal({
       } else if (editing && scope?.pxe_profile_id) {
         data.clear_pxe_profile = true;
       }
+      if (needsPlacement && placement.startsWith("rel:")) {
+        data.windows_placement = { failover_relationship: placement.slice(4) };
+      } else if (needsPlacement && placement.startsWith("srv:")) {
+        data.windows_placement = { server_id: placement.slice(4) };
+      }
       if (editing) return dhcpApi.updateScope(scope!.id, data, adoptExisting);
       return dhcpApi
         .createScope(subnetId, data, adoptExisting)
@@ -385,6 +414,7 @@ export function CreateScopeModal({
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnetId] });
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-group"] });
       qc.invalidateQueries({ queryKey: ["dhcp-pools"] });
+      qc.invalidateQueries({ queryKey: [GROUP_FAILOVER_QUERY_KEY] });
       if (editing && scope?.subnet_id && scope.subnet_id !== subnetId) {
         qc.invalidateQueries({
           queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
@@ -519,6 +549,45 @@ export function CreateScopeModal({
             </Field>
           )}
         </div>
+        {needsPlacement && (
+          <Field
+            label="Windows placement"
+            hint={
+              "This group has more than one Windows DHCP server. Two Windows servers " +
+              "holding the same scope without a failover relationship each hand out the " +
+              "same addresses, so a new scope goes to ONE of them — on its own, or into " +
+              "a failover relationship, which copies it to the partner."
+            }
+          >
+            <select
+              className={inputCls}
+              value={placement}
+              onChange={(e) => setPlacement(e.target.value)}
+            >
+              <option value="">
+                {pairedRelationships.length === 1
+                  ? `Automatic — failover relationship '${pairedRelationships[0].name}'`
+                  : "— Choose —"}
+              </option>
+              {pairedRelationships.length > 0 && (
+                <optgroup label="Into a failover relationship">
+                  {pairedRelationships.map((r) => (
+                    <option key={r.name} value={`rel:${r.name}`}>
+                      {r.name} ({r.sides.map((s) => s.server_name).join(" ↔ ")})
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="On one server only">
+                {windowsMembers.map((m) => (
+                  <option key={m.server_id} value={`srv:${m.server_id}`}>
+                    Only {m.server_name}
+                  </option>
+                ))}
+              </optgroup>
+            </select>
+          </Field>
+        )}
         <Field label="Description">
           <input
             className={inputCls}

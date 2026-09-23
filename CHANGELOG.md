@@ -22,6 +22,146 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Fixed
+
+- **Two Windows DHCP servers in one server group no longer end up
+  handing out the same addresses — and failover relationships can be
+  managed from SpatiumDDI (#1110).** SpatiumDDI had
+  no model of a Windows failover relationship. The write-through sent
+  every scope, pool and reservation write to EVERY Windows member of
+  the group, create-or-update: a new scope landed on both servers,
+  and an edit to a scope one server held quietly CREATED it on the
+  other. Two DHCP servers, the same range, no coordination — while
+  both writes returned success, both servers showed the scope, and
+  the UI showed one scope on one group.
+  **Windows failover relationships are now read** —
+  `Get-DhcpServerv4Failover`, on the existing topology poll — along
+  with which scopes each Windows server actually holds, and shown on
+  the group (a *Windows DHCP failover* panel), as a column in the
+  scopes table and as a strip on the IPAM subnet's scope card. REST:
+  `GET /dhcp/server-groups/{id}/failover` and
+  `GET /dhcp/scopes/{id}/failover`. The shared secret is never read.
+  **On a group with two or more Windows members, a write now probes
+  every member live and goes only to the members that hold the
+  scope, update-only** — the "never create it here" check runs in the
+  same PowerShell as the write. A NEW scope goes to ONE member, by
+  the scope's *Windows placement*: into a failover relationship
+  (created on one side and added to it, so Windows copies it to the
+  partner) or on one server only. Without a placement, the one
+  relationship the members share is used; otherwise the create is
+  refused (422) with the choices listed. Activating a scope held by
+  several members that no relationship covers is refused (422).
+  Deleting a scope a failover pair in the group covers takes it out
+  of the relationship on one side (Windows deletes the partner's
+  copy) and deletes it there; a scope whose partner is outside the
+  group is refused (409), because that step deletes a copy on a
+  server SpatiumDDI does not manage. Reservations and exclusions need
+  no probe: the driver skips a member without the scope, and only
+  "no member holds it" is refused.
+  **Relationships are managed from the group's panel** — create,
+  edit, delete, add and remove scopes, and replicate one partner's
+  configuration over the other's — and from REST routes under
+  `/dhcp/server-groups/{id}/failover/relationships` (superadmin,
+  audited, the shared secret never stored, logged or audited). Every
+  `*-DhcpServerv4Failover*` cmdlet runs on one server and acts on its
+  partner from there, so it needs the WinRM logon to make the
+  PowerShell "second hop": only CredSSP can, and any other transport
+  is refused (422) before anything is sent. Where a cmdlet runs is
+  also what it does to the other server — a create or add COPIES the
+  scope from the holder, a removal DELETES the partner's copy and the
+  operator picks which side keeps it, and a load-balance share or
+  hot-standby role is the value of the side it runs on, so an edit
+  names that side (left to pick one itself, the same request could
+  make both partners Active). The first cut shipped every op in one
+  PowerShell script that encoded to ~12,700 characters against
+  WinRM's 7,800-character command-line budget — every call would have
+  been refused before it was sent; a test now pins every op, with
+  maximal inputs, under the budget, and long scope lists go in
+  chunks.
+  **Split scopes are protected.** SpatiumDDI writes one range and one
+  set of exclusions to every server holding a scope, so a new range,
+  or removing an exclusion, could merge two servers' disjoint halves
+  into the outage. Those writes are now simulated per holder and
+  refused (422) when the halves would overlap; everything else goes
+  through.
+  **Kea and Windows servers can no longer share a group** (422 on
+  server create / move): Kea serves every active scope of its group
+  and cannot coordinate with Windows failover. An existing mixed
+  group is flagged on the panel and its shared scopes are reported
+  uncoordinated.
+  **New default-on alert rule, *DHCP scope served uncoordinated***
+  (`dhcp_scope_uncoordinated`, critical): one event per scope two
+  servers serve without coordinating — silent everywhere else, and
+  the only signal there is, since both servers report the scope
+  healthy.
+  **This deliberately deviates from the issue's plan**, which was to
+  write a covered scope to ONE partner and "let Windows replicate".
+  Windows replicates LEASES between failover partners continuously
+  but not CONFIGURATION: option values, exclusions and reservations
+  move only when someone runs `Invoke-DhcpServerv4FailoverReplication`
+  or the console's *Replicate Scope* (Microsoft's own DHCP-team post
+  on this is the reason its auto-sync tool exists). Writing one
+  partner would leave the other serving stale reservations after a
+  failover. Microsoft's IPAM writes both partners, and so does this;
+  replication is offered as an explicit action for drift made in the
+  DHCP console.
+  **The topology poll stopped undoing itself.** Each Windows member's
+  pass merged its own view of the group's scopes — so two partners
+  that disagreed about one reservation (the ordinary state of two
+  servers that do not sync configuration) created it and
+  absence-deleted it again on every poll, along with its IPAM mirror
+  and DNS records. One member now imports each shared scope — the
+  lowest-named member whose last read is under 15 minutes old, so an
+  unreachable partner cannot freeze a scope — and the others are
+  compared against it: a differing configuration hash is reported as
+  drift instead of fought over.
+  **Shared lease teardown waits for the last peer.** A failover or HA
+  pair reports every lease once per partner, but the IPAM mirror and
+  its DDNS records are one row and one A/PTR. `purge_lease`, the
+  expiry sweep and the Kea release/expire event all tore them down
+  when ONE partner stopped reporting the lease — the other's next
+  poll recreated both, so DDNS flapped. They now wait while another
+  server in the same group holds an active, unexpired lease on the
+  address. Scope deletion is exempt, since every copy goes at once.
+  **Found on the way, in the Kea lease-event handler, and fixed
+  because the guard depends on it:** the lookups compared the event's
+  string address with the stored `IPv4Address` (asyncpg decodes INET
+  natively) and never matched. Every renewal event INSERTED another
+  `dhcp_lease` row for the same lease instead of updating the one it
+  had, and a release found no stored IPAM mirror, so the mirror and
+  its DNS records outlived the lease until the expiry sweep. The test
+  client's shared session hid both — the identity map handed the
+  handler the objects the test built, strings and all — so the new
+  tests reload from the database between requests, as production
+  does.
+  **Single-member groups keep the old scope write** (no probe,
+  create-or-update), with three changes to the failure path: a scope
+  delete probes first, so a failover scope gets the explanation
+  rather than Windows' raw error; deleting a scope already gone from
+  the server is now a no-op instead of a 502 that made the scope
+  undeletable in SpatiumDDI; and a reservation for a scope the server
+  does not have is a 409 that says so.
+  1 MCP tool (`find_dhcp_failover_relationships`, read-only, default
+  on); deliberately no `propose_*` write tool — the management routes
+  create and delete scopes on the partner and carry the shared
+  secret — and not a feature module (it extends existing DHCP
+  resources). **Not yet verified against a live
+  Windows failover pair:** the exact JSON `Get-DhcpServerv4Failover`
+  returns, whether it errors or returns nothing on a server with no
+  relationships, and whether `DHCP Users` may run it. The parser
+  reads a failed or unrecognised response as *unknown*, never as
+  *no relationships*, and the write-through refuses rather than
+  guesses on unknown. The management cmdlets follow Microsoft's
+  documented parameters and have not been run against a real pair
+  over CredSSP yet either.
+- **Choosing the CredSSP WinRM transport failed on every call.** The
+  server form has offered it for years, but `requests-credssp` — the
+  library pywinrm imports for it — was never installed, so pywinrm
+  raised before connecting. Now a dependency (MIT; `NOTICE` and
+  `docs/THIRD_PARTY.md`), because #1110's relationship management
+  needs it. Kerberos is in the same position (the images carry no
+  GSSAPI stack) and is now documented as such; tracked in #1128.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
@@ -2744,6 +2884,13 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `8e317fdd5b12` — #1110: `dhcp_failover_relationship` (Windows
+  failover relationships as each server reports them) and
+  `dhcp_server_scope_state` (which scopes each server holds, keyed by
+  CIDR), plus nullable `dhcp_server.scopes_observed_at` /
+  `.failover_observed_at` / `.failover_error`. No backfill: every row
+  is written by the topology poll, and NULL means never observed —
+  unknown, not "none".
 - `e3b9d7412c5a` — `appliance.desired_removable_mounts` (JSONB, NOT
   NULL, `[]`): the removable (USB) disks a node should keep mounted for
   backups (#989 item 3). No backfill — an install upgrades into the

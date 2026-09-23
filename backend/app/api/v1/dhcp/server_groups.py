@@ -19,12 +19,22 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._failover_schemas import (
+    FailoverActionResponse,
+    FailoverRelationshipCreate,
+    FailoverRelationshipUpdate,
+    FailoverReplicate,
+    FailoverScopesChange,
+    GroupFailoverResponse,
+)
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp import windows_failover_manage as fo_manage
+from app.services.dhcp.windows_failover_report import group_failover_report
 
 router = APIRouter(
     prefix="/server-groups",
@@ -224,6 +234,220 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupRespons
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
     return _group_to_response(g)
+
+
+@router.get("/{group_id}/failover", response_model=GroupFailoverResponse)
+async def get_group_failover(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupFailoverResponse:
+    """Windows DHCP failover as the group's members report it (#1110).
+
+    The failover relationships each Windows member reports (merged across
+    the two partners), whether each member's view is current, and how every
+    scope a member holds is served — by one server, by a failover pair, or
+    by several servers that do not coordinate. Read from what the topology
+    poll stored, never live; ``members[].failover_observed_at`` /
+    ``scopes_observed_at`` say how old it is. A group with no Windows
+    members answers with empty lists.
+    """
+    g = await db.get(DHCPServerGroup, group_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail="Server group not found")
+    return GroupFailoverResponse.model_validate(await group_failover_report(db, g))
+
+
+# ── Windows failover relationship management (#1110 Phase 2) ──────────
+#
+# Each action runs one ``*-DhcpServerv4Failover*`` cmdlet on one member,
+# which acts on both partners from there — so the member's WinRM transport
+# must be CredSSP (refused with a 422 otherwise, before anything is sent).
+# Superadmin, like every other group write: these create and delete scopes
+# on the partner server and carry the relationship's shared secret. The
+# secret reaches Windows and nothing else — not the audit row, not a log.
+
+
+async def _group_or_404(db: DB, group_id: uuid.UUID) -> DHCPServerGroup:
+    g = await db.get(DHCPServerGroup, group_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail="Server group not found")
+    return g
+
+
+async def _action_response(
+    db: DB,
+    g: DHCPServerGroup,
+    user: SuperAdmin,
+    result: fo_manage.FailoverActionResult,
+    audit_fields: dict[str, object],
+) -> FailoverActionResponse:
+    write_audit(
+        db,
+        user=user,
+        action=f"failover_{result.action}",
+        resource_type="dhcp_server_group",
+        resource_id=str(g.id),
+        resource_display=f"{g.name}:{result.relationship}",
+        new_value={
+            "relationship": result.relationship,
+            "ran_on": result.ran_on.name,
+            "partner": result.partner.name if result.partner else None,
+            "scope_ids": result.scope_ids,
+            "warnings": result.warnings,
+            **audit_fields,
+        },
+    )
+    await db.commit()
+    return FailoverActionResponse(
+        action=result.action,  # type: ignore[arg-type]
+        relationship=result.relationship,
+        ran_on_server_id=result.ran_on.id,
+        ran_on_server_name=result.ran_on.name,
+        partner_server_id=result.partner.id if result.partner else None,
+        partner_server_name=result.partner.name if result.partner else None,
+        scope_ids=result.scope_ids,
+        warnings=result.warnings,
+        failover=GroupFailoverResponse.model_validate(await group_failover_report(db, g)),
+    )
+
+
+def _tuning_audit(
+    body: FailoverRelationshipCreate | FailoverRelationshipUpdate,
+) -> dict[str, object]:
+    fields = body.model_dump(mode="json", exclude={"shared_secret"}, exclude_none=True)
+    fields["shared_secret_set"] = body.shared_secret is not None
+    return fields
+
+
+@router.post(
+    "/{group_id}/failover/relationships",
+    response_model=FailoverActionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_failover_relationship(
+    group_id: uuid.UUID, body: FailoverRelationshipCreate, db: DB, user: SuperAdmin
+) -> FailoverActionResponse:
+    """Create a Windows DHCP failover relationship between two members.
+
+    ``Add-DhcpServerv4Failover`` runs on ``server_id``, which must hold every
+    scope in ``scope_ids``; Windows copies them to ``partner_server_id``,
+    which must hold none of them. Checked live before anything is sent.
+    """
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.create_relationship(
+        db,
+        g,
+        name=body.name,
+        server_id=body.server_id,
+        partner_server_id=body.partner_server_id,
+        scope_ids=body.scope_ids,
+        mode=body.mode,
+        load_balance_percent=body.load_balance_percent,
+        server_role=body.server_role,
+        reserve_percent=body.reserve_percent,
+        max_client_lead_time_seconds=body.max_client_lead_time_seconds,
+        auto_state_transition=body.auto_state_transition,
+        state_switch_interval_seconds=body.state_switch_interval_seconds,
+        shared_secret=body.shared_secret,
+    )
+    return await _action_response(db, g, user, result, _tuning_audit(body))
+
+
+@router.patch(
+    "/{group_id}/failover/relationships/{name}",
+    response_model=FailoverActionResponse,
+)
+async def update_failover_relationship(
+    group_id: uuid.UUID, name: str, body: FailoverRelationshipUpdate, db: DB, user: SuperAdmin
+) -> FailoverActionResponse:
+    """Change a relationship's mode or tuning (``Set-DhcpServerv4Failover``).
+    Fields left out are left as they are."""
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.update_relationship(
+        db,
+        g,
+        name,
+        changes=body.model_dump(exclude_unset=True, exclude={"server_id"}),
+        server_id=body.server_id,
+    )
+    return await _action_response(db, g, user, result, _tuning_audit(body))
+
+
+@router.delete(
+    "/{group_id}/failover/relationships/{name}",
+    response_model=FailoverActionResponse,
+)
+async def delete_failover_relationship(
+    group_id: uuid.UUID,
+    name: str,
+    db: DB,
+    user: SuperAdmin,
+    keep_server_id: uuid.UUID | None = None,
+) -> FailoverActionResponse:
+    """Delete a relationship (``Remove-DhcpServerv4Failover``).
+
+    Windows deletes the PARTNER's copy of every scope the relationship
+    covered; ``keep_server_id`` — default the hot-standby Active side, else
+    the lowest-named — keeps its copies and serves them alone.
+    """
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.delete_relationship(db, g, name, keep_server_id=keep_server_id)
+    return await _action_response(db, g, user, result, {})
+
+
+@router.post(
+    "/{group_id}/failover/relationships/{name}/scopes",
+    response_model=FailoverActionResponse,
+)
+async def add_failover_scopes(
+    group_id: uuid.UUID, name: str, body: FailoverScopesChange, db: DB, user: SuperAdmin
+) -> FailoverActionResponse:
+    """Add scopes to a relationship (``Add-DhcpServerv4FailoverScope``).
+
+    Each scope must be held by exactly one side, which is where the cmdlet
+    runs; Windows copies it to the other.
+    """
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.add_scopes(db, g, name, scope_ids=body.scope_ids)
+    return await _action_response(db, g, user, result, {})
+
+
+@router.delete(
+    "/{group_id}/failover/relationships/{name}/scopes/{scope_id}",
+    response_model=FailoverActionResponse,
+)
+async def remove_failover_scope(
+    group_id: uuid.UUID,
+    name: str,
+    scope_id: str,
+    db: DB,
+    user: SuperAdmin,
+    keep_server_id: uuid.UUID | None = None,
+) -> FailoverActionResponse:
+    """Take a scope out of a relationship (``Remove-DhcpServerv4FailoverScope``).
+
+    Windows deletes the PARTNER's copy; ``keep_server_id`` keeps serving it.
+    """
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.remove_scopes(
+        db, g, name, scope_ids=[scope_id], keep_server_id=keep_server_id
+    )
+    return await _action_response(db, g, user, result, {})
+
+
+@router.post(
+    "/{group_id}/failover/relationships/{name}/replicate",
+    response_model=FailoverActionResponse,
+)
+async def replicate_failover_relationship(
+    group_id: uuid.UUID, name: str, body: FailoverReplicate, db: DB, user: SuperAdmin
+) -> FailoverActionResponse:
+    """Copy one side's scope configuration over the partner's
+    (``Invoke-DhcpServerv4FailoverReplication``) — for drift made on Windows."""
+    g = await _group_or_404(db, group_id)
+    result = await fo_manage.replicate(
+        db, g, name, source_server_id=body.source_server_id, scope_ids=body.scope_ids
+    )
+    return await _action_response(
+        db, g, user, result, {"source_server_id": str(body.source_server_id)}
+    )
 
 
 @router.put("/{group_id}", response_model=GroupResponse)
