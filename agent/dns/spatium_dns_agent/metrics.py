@@ -8,17 +8,35 @@ on a ``named`` restart counters drop back to zero, which we detect as
 ``delta < 0`` and absorb.
 
 For MVP we report five scalar counters derived from the server-level
-``<counters type="opcode">`` and ``<counters type="nsstat">`` blocks
-(older builds spell some of them differently — see ``_COUNTERS``):
+For MVP we report five scalar counters derived from the server-level
+``<counters type="opcode">``, ``<counters type="rcode">`` and
+``<counters type="nsstat">`` blocks (older builds spell some of them
+differently — see ``_COUNTERS``):
 
     queries_total   — total incoming queries (opcode QUERY; the nsstat
                       Requestv4 + Requestv6 on a build without the
                       opcode table)
-    noerror         — QryAuthAns + QryNoauthAns (NOERROR responses;
-                      QrySuccess on a build without the split)
-    nxdomain        — QryNXDOMAIN
-    servfail        — QrySERVFAIL
+    noerror         — responses sent with rcode NOERROR (the server-level
+                      rcode table's NOERROR; QrySuccess + QryNxrrset on a
+                      build without the table)
+    nxdomain        — responses sent with rcode NXDOMAIN (rcode NXDOMAIN;
+                      QryNXDOMAIN on a build without the table)
+    servfail        — responses sent with rcode SERVFAIL (rcode SERVFAIL;
+                      QrySERVFAIL on a build without the table)
     recursion       — QryRecursion (queries that triggered recursion)
+
+The rcode breakdown is read from the rcode table, never from the nsstat
+answer classes: ``QryAuthAns`` / ``QryNoauthAns`` count every
+authoritative / non-authoritative response whatever its rcode, so a
+``noerror`` derived from them counted each authoritative NXDOMAIN answer
+under ``noerror`` as well as under ``nxdomain`` (#1116).
+    recursion       — QryRecursion (queries that triggered recursion)
+
+The rcode breakdown is read from the rcode table, never from the nsstat
+answer classes: ``QryAuthAns`` / ``QryNoauthAns`` count every
+authoritative / non-authoritative response whatever its rcode, so a
+``noerror`` derived from them counted each authoritative NXDOMAIN answer
+under ``noerror`` as well as under ``nxdomain`` (#1116).
 
 Per-QTYPE + per-zone breakdowns are in the XML too and can be added
 later without a protocol change — the control-plane ingestion path
@@ -64,11 +82,16 @@ STATS_URL = "http://127.0.0.1:8053/xml/v3/server"
 # the opcode table's ``QUERY`` and the nsstat family's ``Requestv4`` /
 # ``Requestv6`` count the SAME requests (by opcode, by address family),
 # and BIND 9.20 publishes both. Summing them counted every query twice
-# on every current BIND (#1064); ``QryAuthAns`` + ``QryNoauthAns`` beside
-# ``QrySuccess`` did the same to ``noerror`` on every answered query.
+# on every current BIND (#1064).
 _COUNTERS: dict[str, tuple[tuple[str, ...], ...]] = {
     "queries_total": (("QUERY",), ("Requestv4", "Requestv6")),
-    "noerror": (("QryAuthAns", "QryNoauthAns"), ("QrySuccess",)),
+    # The rcode breakdown's fallback, for a build without the server-level
+    # rcode table (_RCODE_TABLE below is the value when it is there): the
+    # nsstat classes that carry exactly that rcode — NOERROR is an answer
+    # with data (QrySuccess) or without (QryNxrrset, NODATA). Never
+    # QryAuthAns / QryNoauthAns: those count every response whatever its
+    # rcode, NXDOMAIN included (#1116).
+    "noerror": (("QrySuccess", "QryNxrrset"),),
     "nxdomain": (("QryNXDOMAIN",),),
     "servfail": (("QrySERVFAIL",),),
     "recursion": (("QryRecursion",),),
@@ -89,6 +112,40 @@ def _column_value(totals: dict[str, int], spellings: tuple[tuple[str, ...], ...]
         if present:
             return sum(totals[n] for n in present)
     return 0
+
+
+# Column → its counter in the server-level ``<counters type="rcode">``
+# table: the responses BIND sent, by rcode — the breakdown itself. Read
+# from the ``<server>`` element only: every view repeats NXDOMAIN /
+# SERVFAIL / REFUSED under ``resstats`` as that view's RESOLVER counters
+# (answers this server received, not sent), so a name-wide sum would
+# fold them in.
+_RCODE_TABLE: dict[str, str] = {
+    "noerror": "NOERROR",
+    "nxdomain": "NXDOMAIN",
+    "servfail": "SERVFAIL",
+}
+
+
+def _server_rcodes(root: ET.Element) -> dict[str, int]:
+    """The server-level rcode table as {name: value}; {} on a build that
+    does not publish one (the nsstat fallback in ``_COUNTERS`` applies)."""
+    out: dict[str, int] = {}
+    server = root.find("server")
+    if server is None:
+        return out
+    for counters in server.findall("counters"):
+        if counters.get("type") != "rcode":
+            continue
+        for el in counters.findall("counter"):
+            name = el.get("name")
+            if not name:
+                continue
+            try:
+                out[name] = int((el.text or "0").strip())
+            except ValueError:
+                continue
+    return out
 
 
 def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
@@ -113,7 +170,13 @@ def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
             continue
         totals[name] = totals.get(name, 0) + val
 
-    return {col: _column_value(totals, spellings) for col, spellings in _COUNTERS.items()}
+    out = {col: _column_value(totals, spellings) for col, spellings in _COUNTERS.items()}
+    # The rcode breakdown: the rcode table when the build publishes it.
+    rcodes = _server_rcodes(root)
+    for col, name in _RCODE_TABLE.items():
+        if name in rcodes:
+            out[col] = rcodes[name]
+    return out
 
 
 class MetricsPoller:

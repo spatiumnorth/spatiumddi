@@ -419,6 +419,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS agent: `noerror` counted every authoritative NXDOMAIN answer too
+  (#1116).** The poller derived the rcode breakdown from BIND's nsstat
+  answer classes and read `noerror` from `QryAuthAns` + `QryNoauthAns` —
+  every authoritative / non-authoritative response whatever its rcode —
+  so an authoritative NXDOMAIN answer was counted under `noerror` as well
+  as under `nxdomain`, and the dashboard's breakdown summed to more
+  answers than the daemon sent (50 NXDOMAIN answers on the QA fleet:
+  `QryAuthAns` +50, rcode `NOERROR` +0). `noerror`, `nxdomain` and
+  `servfail` now come from the server-level rcode table BIND publishes
+  (`NOERROR` / `NXDOMAIN` / `SERVFAIL`), read from the `<server>` element
+  only, since each view repeats those names as resolver counters; a
+  build without the table falls back to the nsstat classes that carry
+  exactly that rcode (`QrySuccess` + `QryNxrrset`, `QryNXDOMAIN`,
+  `QrySERVFAIL`).
+
 - **DNS agent: `queries_total` counted every query twice on BIND 9.20
   (#1064).** The poller listed the opcode table's `QUERY` and the
   nsstat family's `Requestv4`/`Requestv6` under one column so either
@@ -426,11 +441,10 @@ the formatter handles the rest.
   and every current BIND publishes both, so `dns_metric_sample`
   reported 2.00× the queries the daemon received (the DHCP sampler,
   whose counters have one spelling, matched kea to the packet in the
-  same window). `noerror` folded `QrySuccess` beside the
-  `QryAuthAns`/`QryNoauthAns` split the same way and doubled on
-  every answered query. The spellings are now alternatives in order
-  of preference — the first one present is the value — and the
-  poller's tests carry a 9.20 sample with both.
+  same window). The spellings are now alternatives in order of
+  preference — the first one present is the value — and the
+  poller's tests carry a 9.20 sample with both. (`noerror` had the
+  same fold; it now reads BIND's rcode table instead — #1116, above.)
 
 - **The storage action route keeps its own answer through the
   frontend (#1080).** `POST …/appliances/{id}/storage/action` waits
