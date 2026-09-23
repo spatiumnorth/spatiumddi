@@ -123,12 +123,39 @@ async def test_no_warning_for_a_plain_zone(db_session: AsyncSession, monkeypatch
 
 
 async def test_view_scoped_zone_is_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:
-    """A view-scoped zone warns that the transfer may answer from another view.
+    """A view-scoped zone read WITHOUT addressing its view carries the caveat.
 
     An AXFR is addressed by zone *name*, and under split-horizon several zone
-    rows share one name — so the diff can compare this row against a different
-    view's content. Report that rather than let an operator "fix" it.
+    rows share one name — so a transfer the server matches to a view by the
+    control plane's address can compare this row against a different view's
+    content. Report that rather than let an operator "fix" it. Since #920 an
+    agent-managed server is read through the zone's own view, so the caveat
+    stays only where that cannot happen — here an operator-run BIND9, which
+    SpatiumDDI reaches unsigned and which authorises by address.
     """
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="split.example.com."
+    )
+    server.agent_id = None
+    view = DNSView(group_id=group.id, name="internal", match_clients=["10.0.0.0/8"])
+    db_session.add(view)
+    await db_session.flush()
+    zone.view_id = view.id
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert len(report.warnings) == 1
+    assert "view" in report.warnings[0].lower()
+    assert "ns1" in report.warnings[0]
+
+
+async def test_view_addressed_transfer_carries_no_view_caveat(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#920: an agent-managed server's transfer is signed with the zone's own
+    view key, so the server answers from that view — the caveat would be
+    telling the operator to distrust a comparison that is exactly right."""
     group, _server, zone = await _group_server_zone(
         db_session, server_name="ns1", zone_name="split.example.com."
     )
@@ -140,8 +167,8 @@ async def test_view_scoped_zone_is_flagged(db_session: AsyncSession, monkeypatch
     monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
 
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
-    assert len(report.warnings) == 1
-    assert "view" in report.warnings[0].lower()
+    assert [s.status for s in report.servers] == ["ok"]
+    assert report.warnings == []
 
 
 async def test_view_scoped_records_are_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:

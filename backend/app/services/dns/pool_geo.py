@@ -304,6 +304,25 @@ def build_view_descriptors(ordered_views: list, geo: GeoSteering) -> list[dict[s
     return descs
 
 
+def view_renders_zone(view_desc: dict[str, Any], operator_target_ids: set[Any]) -> bool:
+    """True when ``view_desc`` carries a copy of a zone scoped to ``operator_target_ids``.
+
+    ``operator_target_ids`` is the zone's own pinned ``view_id`` plus the view
+    of every view-scoped record in it (issue #24). An operator view renders
+    the zone unless that set is non-empty and names only OTHER operator
+    views; geo views and the catch-all always render it (issue #530).
+
+    The one rule both the bundle builder (which zone copies a view gets) and
+    the transfer-key resolver (which view the control plane reads a zone
+    from, #920) follow, so the view a transfer asks for always holds the zone.
+    """
+    return not (
+        view_desc["kind"] == "operator"
+        and bool(operator_target_ids)
+        and view_desc["id"] not in operator_target_ids
+    )
+
+
 def records_for_view(
     rec_rows: list[DNSRecord], view_desc: dict[str, Any], geo: GeoSteering
 ) -> list[DNSRecord]:

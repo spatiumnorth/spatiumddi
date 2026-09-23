@@ -465,6 +465,21 @@ the formatter handles the rest.
   the three budgets from source (proxy > route > supervisor) so they
   cannot drift apart again.
 
+- **Drift and Sync with Servers work on groups with DNS views
+  (#920).** BIND chooses the view for a request by the requester's
+  address before it looks at `allow-transfer`, and a view's client
+  list never names the control plane. So on a group whose views are
+  scoped to real clients, every drift report and every sync failed
+  with "The peer didn't know the key we used" — for a key that was
+  loaded and granted — and where a broad view did match the api's
+  address, it answered with its own copy of a same-named zone. Each
+  rendered view now admits one key of its own, derived from the
+  group's TSIG key and never shown, and refuses every other view's;
+  drift and sync sign with the key of the view that holds the zone.
+  Every other request is matched to a view exactly as before. An
+  agent that predates this is still read with the group key, and the
+  report says when a comparison may come from another view.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —

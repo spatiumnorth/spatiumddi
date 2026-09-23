@@ -25,10 +25,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
-from app.drivers.dns.base import RecordData
+from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSZone
 from app.services.dns.pull_from_server import _key
-from app.services.dns.tsig import resolve_group_transfer_key, transfer_needs_tsig
+from app.services.dns.tsig import (
+    is_view_transfer_key,
+    pull_zone_records_signed,
+    resolve_group_transfer_key,
+    resolve_view_transfer_key,
+    transfer_needs_tsig,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -110,31 +116,22 @@ async def compute_zone_drift(
     # Must happen before the gather() below, which deliberately touches no
     # DB. Skipped entirely when no server needs it, so a group of Windows or
     # operator-run servers never decrypts a secret it has no use for.
-    transfer_key = (
-        await resolve_group_transfer_key(db, group_id)
-        if any(transfer_needs_tsig(s) for s in servers)
-        else None
-    )
+    needs_tsig = any(transfer_needs_tsig(s) for s in servers)
+    transfer_key = await resolve_group_transfer_key(db, group_id) if needs_tsig else None
 
-    # Split-horizon caveat. Under views (#24) each view gets its own zone row
-    # and its own rendered zone file, but an AXFR is addressed by zone *name*
-    # — the server answers with whichever view matches the control plane's
-    # source IP, which is not necessarily the view this row belongs to. The
-    # diff would then report the other view's content as drift in both
-    # directions. We can't tell from the wire which view answered, so say so
-    # rather than let an operator "fix" a difference that isn't one.
-    if zone.view_id is not None:
-        report.warnings.append(
-            "This zone belongs to a DNS view. A zone transfer is answered by "
-            "whichever view matches the control plane's source address, so "
-            "differences below may reflect a different view rather than real drift."
-        )
-    elif any(r.view_id is not None for r in db_rows):
-        report.warnings.append(
-            "Some records in this zone are scoped to a specific DNS view and are "
-            "only served to clients matching it. They may appear as missing here "
-            "even when the server is correct."
-        )
+    # #920 — under split-horizon (#24) the server answers a transfer from the
+    # view the request selects, and BIND selects by ``match-clients`` before it
+    # consults allow-transfer. The operator's client lists never name the
+    # control plane, so a transfer signed with the group key matched no view
+    # (BADKEY, "the key is unknown", for a loaded and granted key) or was
+    # caught by a broad view and read that view's copy. The agent now admits
+    # one derived key per view into that view alone; sign with the key of the
+    # view holding this zone's copy, and keep the group key as the fallback
+    # for an agent that predates the view keys.
+    view_transfer = await resolve_view_transfer_key(db, zone) if needs_tsig else None
+    view_key, view_name = view_transfer if view_transfer is not None else (None, None)
+    # server_id -> the transfer was addressed to the zone's own view.
+    view_addressed: dict[str, bool] = {}
 
     async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(
@@ -154,6 +151,7 @@ async def compute_zone_drift(
         # and neither of which they can reach anyway, because the agent owns
         # named.conf. Naming the missing key is the difference between a
         # fixable report and a dead end.
+        keys: list[TsigKey | None]
         if transfer_needs_tsig(srv):
             if transfer_key is None:
                 entry.status = "unsupported"
@@ -164,16 +162,21 @@ async def compute_zone_drift(
                     "new config, then re-run this report."
                 )
                 return entry
-            srv_tsig = transfer_key
+            # Views are a BIND9 render; the other agent driver declines them.
+            keys = (
+                [view_key, transfer_key]
+                if view_key is not None and srv.driver == "bind9"
+                else [transfer_key]
+            )
         else:
             # Only sign where an agent actually granted the key. Windows Path
             # A and an operator's own BIND9 both AXFR unsigned and are
             # authorised by address; handing either a key it never granted
             # turns a working pull into NOTAUTH.
-            srv_tsig = None
+            keys = [None]
         try:
-            on_wire: list[RecordData] = await driver.pull_zone_records(
-                srv, zone.name, tsig=srv_tsig
+            on_wire, used = await pull_zone_records_signed(
+                driver, srv, zone.name, keys, view_name=view_name
             )
         except Exception as exc:  # noqa: BLE001 — per-server, never fail the whole report
             entry.status = "error"
@@ -187,6 +190,7 @@ async def compute_zone_drift(
             )
             return entry
 
+        view_addressed[entry.server_id] = is_view_transfer_key(used)
         wire_by_key = {_key(r, zone.name): r for r in on_wire}
         entry.extra_on_server = [
             _to_drift_record(r) for k, r in wire_by_key.items() if k not in db_by_key
@@ -202,5 +206,35 @@ async def compute_zone_drift(
     # only touches the driver (network), never the shared AsyncSession, and
     # isolates its own failures, so gather() is safe. Order is preserved.
     report.servers = list(await asyncio.gather(*(_drift_for_server(s) for s in servers)))
+
+    # Split-horizon caveats. A zone that belongs to a view has one copy per
+    # view it lives in, and an AXFR names only the zone. A transfer addressed
+    # to the zone's own view (#920) compares the right copy; any other one —
+    # an operator-run server authorised by address, an agent that predates the
+    # view keys — was answered by whichever view matches the control plane's
+    # source address, which may be a different view's content. We cannot tell
+    # from the wire which view answered, so name the servers it applies to
+    # rather than let an operator "fix" a difference that isn't one.
+    if zone.view_id is not None:
+        unaddressed = [
+            s.server_name
+            for s in report.servers
+            if s.status == "ok" and not view_addressed.get(s.server_id, False)
+        ]
+        if unaddressed:
+            report.warnings.append(
+                "This zone belongs to a DNS view, and the zone transfer from "
+                f"{', '.join(unaddressed)} could not be addressed to that view, so "
+                "it was answered by whichever view matches the control plane's "
+                "source address. Differences below from "
+                f"{'that server' if len(unaddressed) == 1 else 'those servers'} may "
+                "reflect a different view rather than real drift."
+            )
+    elif any(r.view_id is not None for r in db_rows):
+        report.warnings.append(
+            "Some records in this zone are scoped to a specific DNS view and are "
+            "only served to clients matching it. They may appear as missing here "
+            "even when the server is correct."
+        )
 
     return report
