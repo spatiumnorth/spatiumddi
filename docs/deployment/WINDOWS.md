@@ -22,7 +22,7 @@ Both DNS Path B and DHCP Path A use WinRM, so they share most of the setup:
 3. **Create a service account** in the right security group:
    - DNS Path B → in `DnsAdmins` on the DC (or a delegated group with the same DNS rights).
    - DHCP → in `DHCP Administrators` if SpatiumDDI should write scopes / reservations / exclusions; `DHCP Users` is enough to mirror leases and scopes read-only.
-4. **Configure the account in SpatiumDDI** when you add the server — username / password / transport (`ntlm` recommended for domain-joined, `basic` if you must, `kerberos` if you run the AD side).
+4. **Configure the account in SpatiumDDI** when you add the server — username / password / transport (`ntlm` recommended for domain-joined, `credssp` where the server has to reach another one, `basic` if you must).
 5. (DNS only) **Enable dynamic updates** on each zone you want SpatiumDDI to write records to — **Nonsecure and secure** for Path A's unsigned RFC 2136, or **Secure only** if you're using Path B exclusively for zone management and don't need per-record writes.
 6. (DNS Path A only) **Allow AXFR** from the SpatiumDDI host, or use Path B (WinRM) to sidestep AXFR entirely.
 
@@ -55,9 +55,10 @@ You want a listener on port **5985** (HTTP) or **5986** (HTTPS). SpatiumDDI pref
 | Transport | Port | Cert needed? | When to use |
 |---|---|---|---|
 | `ntlm` | 5985 or 5986 | No | Domain-joined AD environments — default. Works from Linux via `pywinrm`. |
-| `kerberos` | 5985 or 5986 | No (but needs Kerberos tickets) | If the SpatiumDDI host is domain-joined and running `kinit`. Not typical — and the published images carry no GSSAPI / Kerberos libraries, so today this choice fails at connect time. |
 | `basic` | 5985 or 5986 | Recommended HTTPS | Non-domain use. Requires `AllowUnencrypted=true` on HTTP — avoid. |
 | `credssp` | 5985 or 5986 | Yes | The "second hop": the one transport whose logon on the Windows server can authenticate onward to another server. **Required to manage Windows DHCP failover relationships from SpatiumDDI** (see [More than one Windows DHCP server in a group](#more-than-one-windows-dhcp-server-in-a-group)). Enable it on each server with `Enable-WSManCredSSP -Role Server`. |
+
+**Kerberos is not offered.** It needs the `gssapi` library and the system Kerberos libraries (neither is in the images; `gssapi` has no Linux wheel) plus realm / KDC configuration the control plane has nowhere to take from — so it could never connect. The API refuses it (422), and a server saved with it before fails with that explanation instead of a library error; edit it and pick NTLM or CredSSP. Real Kerberos support is on the roadmap as [#1128](https://github.com/spatiumnorth/spatiumddi/issues/1128).
 
 SpatiumDDI stores these on `DNSServer.credentials_encrypted` / `DHCPServer.credentials_encrypted` as a Fernet-encrypted dict:
 

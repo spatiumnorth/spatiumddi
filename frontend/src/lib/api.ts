@@ -4913,7 +4913,8 @@ export interface WindowsDNSCredentials {
   username: string;
   password: string;
   winrm_port?: number;
-  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  // Kerberos is not offered: the images carry no GSSAPI stack (#1128).
+  transport?: "ntlm" | "basic" | "credssp";
   use_tls?: boolean;
   verify_tls?: boolean;
 }
@@ -7977,7 +7978,8 @@ export interface WindowsDHCPCredentials {
   username: string;
   password: string;
   winrm_port?: number;
-  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  // Kerberos is not offered: the images carry no GSSAPI stack (#1128).
+  transport?: "ntlm" | "basic" | "credssp";
   use_tls?: boolean;
   verify_tls?: boolean;
 }

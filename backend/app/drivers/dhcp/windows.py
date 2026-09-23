@@ -47,7 +47,7 @@ Fernet-encrypted JSON dict:
       "username": "SPATIUM\\dhcpreader",
       "password": "…",
       "winrm_port": 5985,
-      "transport": "ntlm",    # ntlm | kerberos | basic | credssp
+      "transport": "ntlm",    # ntlm | credssp | basic
       "use_tls": false,
       "verify_tls": false
     }
@@ -340,8 +340,8 @@ _PS_SCOPE_PRESENT = (
 # "second hop" — and the partner answers access denied. CredSSP delegates the
 # credential itself, which is exactly what this needs and why it is the one
 # transport allowed. (Kerberos with constrained delegation would also work,
-# but the image carries no GSSAPI stack, so pywinrm cannot speak Kerberos at
-# all here.)
+# but this build cannot speak Kerberos at all — see
+# ``_winrm.SUPPORTED_TRANSPORTS`` and #1128.)
 SECOND_HOP_TRANSPORTS: frozenset[str] = frozenset({"credssp"})
 
 
