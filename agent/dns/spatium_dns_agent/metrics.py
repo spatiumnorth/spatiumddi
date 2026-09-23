@@ -41,6 +41,19 @@ under ``noerror`` as well as under ``nxdomain`` (#1116).
 Per-QTYPE + per-zone breakdowns are in the XML too and can be added
 later without a protocol change — the control-plane ingestion path
 just ignores unknown fields today.
+
+Delivery (#1077): each bucket is shipped through a :class:`.spool.Shipper`.
+A bucket the control plane does not accept is spooled to disk under
+``<state_dir>/spool/metrics/`` and replayed oldest-first once it answers,
+carrying its ORIGINAL ``bucket_at``, so a late bucket lands on the minute
+it happened and the time-series panels fill the gap in (the ingest has no
+age guard). The ingest ACCUMULATES per ``(server_id, bucket_at)``, so it is
+the spool's ``batch_id`` — answered as a duplicate on replay — not the
+timestamp that stops a replayed bucket being counted twice. The
+baseline (``_prev``) still advances on a failed report: the delta is kept
+in the spool, not lost, so re-baselining against the old snapshot would
+double-count it. Metrics have no max age — a minute per row is a few MB
+for weeks of backlog.
 """
 
 from __future__ import annotations
@@ -54,6 +67,7 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
@@ -166,11 +180,22 @@ def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
 
 
 class MetricsPoller:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        *,
+        spool: Spool | None = None,
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
         self._stop = threading.Event()
         self._prev: dict[str, int] | None = None
+        # #1077 — no spool given (tests, ad-hoc callers) means a disabled one:
+        # a failed bucket is dropped, exactly the pre-spool behaviour.
+        if spool is None:
+            spool = Spool(cfg.state_dir, "metrics", 0, enabled=False)
+        self.shipper = Shipper(spool, self._post, event_prefix="dns_metrics_report")
 
     def stop(self) -> None:
         self._stop.set()
@@ -209,28 +234,35 @@ class MetricsPoller:
             delta[col] = d
         return delta
 
-    def _report(self, bucket_at: datetime, delta: dict[str, int]) -> None:
-        try:
-            with self._cp_client() as c:
-                resp = c.post(
-                    "/api/v1/dns/agents/metrics",
-                    json={"bucket_at": bucket_at.isoformat(), **delta},
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-            if resp.status_code not in (200, 204):
-                log.warning("dns_metrics_report_failed", status=resp.status_code)
-        except httpx.HTTPError as e:
-            log.warning("dns_metrics_report_http_error", error=str(e))
+    def _post(self, payload: dict) -> int:
+        with self._cp_client() as c:
+            resp = c.post(
+                "/api/v1/dns/agents/metrics",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+            )
+        return resp.status_code
+
+    def _report(self, bucket_at: datetime, delta: dict[str, int]) -> str:
+        """Send one bucket now, or queue it behind any backlog."""
+        return self.shipper.ship({"bucket_at": bucket_at.isoformat(), **delta})
+
+    def tick(self) -> None:
+        """One poll: snapshot, delta, report — or just drain the backlog."""
+        current = self._poll_named()
+        delta = self._compute_delta(current) if current is not None else None
+        if delta is not None:
+            now = datetime.now(UTC).replace(microsecond=0)
+            bucket = now.replace(second=(now.second // 60) * 60)
+            self._report(bucket, delta)  # drains the backlog first
+        elif len(self.shipper.spool):
+            # No bucket this tick (first poll, counter reset, named down):
+            # still give a queued backlog its chance to reach the control plane.
+            self.shipper.drain()
 
     def run(self) -> None:
         while not self._stop.is_set():
-            current = self._poll_named()
-            if current is not None:
-                delta = self._compute_delta(current)
-                if delta is not None:
-                    now = datetime.now(UTC).replace(microsecond=0)
-                    bucket = now.replace(second=(now.second // 60) * 60)
-                    self._report(bucket, delta)
+            self.tick()
             interval = 60.0 + random.uniform(-3, 3)
             self._stop.wait(timeout=max(30.0, interval))
 

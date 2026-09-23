@@ -5166,6 +5166,43 @@ export type ConfigApplyStatus =
   /** Failed with no previously-working config to fall back to. */
   | "no_previous";
 
+/** One stream of an agent's durable push spool (#1077). */
+export interface AgentSpoolStreamStatus {
+  enabled: boolean;
+  entries: number;
+  bytes: number;
+  cap_bytes: number;
+  oldest_at: string | null;
+  trimmed_entries_total: number;
+  trimmed_bytes_total: number;
+  last_trim_at: string | null;
+  expired_entries_total: number;
+  rejected_entries_total: number;
+  write_failures_total: number;
+}
+
+/**
+ * An agent's durable push spool as last reported on its heartbeat (#1077):
+ * pushes the control plane has not acknowledged yet, queued on the agent's
+ * disk and replayed in order on reconnect. The `*_total` counters are
+ * cumulative across agent restarts.
+ *
+ * `null` on the server row means the agent has never reported one — a
+ * pre-#1077 agent or an agentless driver. That is unknown, not "empty".
+ */
+export interface AgentSpoolStatus {
+  enabled: boolean;
+  cap_bytes: number;
+  bytes: number;
+  entries: number;
+  oldest_at: string | null;
+  trimmed_entries_total: number;
+  trimmed_bytes_total: number;
+  last_trim_at: string | null;
+  expired_entries_total: number;
+  streams: Record<string, AgentSpoolStreamStatus>;
+}
+
 /** Config-apply fields shared by DNS servers, DHCP servers and LG collectors. */
 export interface ConfigApplyFields {
   config_apply_status: ConfigApplyStatus | null;
@@ -5209,6 +5246,8 @@ export interface DNSServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  /** #1077 — push spool as last reported; `null` = never reported. */
+  spool_status: AgentSpoolStatus | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7933,6 +7972,8 @@ export interface DHCPServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  /** #1077 — push spool as last reported; `null` = never reported. */
+  spool_status: AgentSpoolStatus | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;

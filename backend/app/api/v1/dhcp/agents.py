@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -40,6 +40,13 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.ingest_receipt import (
+    BatchId,
+    IngestAck,
+    claim_batch,
+    duplicate_response,
+)
+from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
@@ -56,6 +63,7 @@ from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.lease_cleanup import peer_holds_active_lease
 from app.services.dhcp.normalize import norm_ip, norm_mac
+from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dhcp-agents"])
@@ -115,6 +123,14 @@ class AgentHeartbeatRequest(BaseModel):
     # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
     # AgentHeartbeatRequest for why this stays a loose dict.
     config: dict[str, Any] = {}
+    # #1077 — the agent's durable push spool (``SpoolManager.status()``):
+    # bytes / entries queued, oldest entry, cumulative trim counters and a
+    # per-stream breakdown. Loose dict at the edge for the same reason as
+    # ``config``; ``apply_reported_spool`` validates it against
+    # ``SpoolStatus`` and ignores (with a log line) a malformed report rather
+    # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
+    # leaves the stored value untouched.
+    spool: dict[str, Any] | None = None
     # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
@@ -200,6 +216,8 @@ class LeaseEventBatch(BaseModel):
     # cap with generous headroom so a malformed/hostile client can't ship an
     # unbounded batch into the per-event ingestion loop.
     leases: list[LeaseEvent] = Field(default_factory=list, max_length=500)
+    # #1077 — replay-dedupe key minted by the agent's spool.
+    batch_id: BatchId = None
 
 
 class DHCPFingerprintEntry(BaseModel):
@@ -219,6 +237,7 @@ class DHCPFingerprintEntry(BaseModel):
 
 class DHCPFingerprintBatch(BaseModel):
     fingerprints: list[DHCPFingerprintEntry]
+    batch_id: BatchId = None
 
 
 class DHCPOfferEntry(BaseModel):
@@ -233,6 +252,7 @@ class DHCPOfferEntry(BaseModel):
 
 class DHCPOfferBatch(BaseModel):
     offers: list[DHCPOfferEntry]
+    batch_id: BatchId = None
 
 
 class RAObservationEntry(BaseModel):
@@ -249,6 +269,55 @@ class RAObservationEntry(BaseModel):
 
 class RAObservationBatch(BaseModel):
     observations: list[RAObservationEntry] = Field(default_factory=list, max_length=200)
+    batch_id: BatchId = None
+
+
+# ── Batch-ingest responses (#1077) ──────────────────────────────────────────
+#
+# Every batch-ingest route answers an ``IngestAck`` subclass: the shared
+# ``status`` / ``duplicate`` pair plus that route's own counters. A replayed
+# batch (same ``batch_id``, already committed) comes back ``duplicate=true``
+# with every counter at zero.
+
+
+class LeaseEventsAck(IngestAck):
+    upserted: int = 0
+
+
+class MacSightingsAck(IngestAck):
+    recorded: int = 0
+    new: int = 0
+
+
+class DHCPMetricsAck(IngestAck):
+    pass
+
+
+class DHCPLogAck(IngestAck):
+    inserted: int = 0
+    dropped: int = 0
+    #: Lines older than the control plane's activity-log retention
+    #: (``prune_logs.DEFAULT_RETENTION_HOURS``), skipped rather than inserted
+    #: into a table the nightly prune would empty straight away.
+    expired: int = 0
+
+
+class DHCPFingerprintsAck(IngestAck):
+    upserted: int = 0
+    dropped: int = 0
+    enqueued: int = 0
+
+
+class DHCPOffersAck(IngestAck):
+    """Per-classification counts (``expected`` / ``acknowledged`` / ``rogue`` /
+    ``skipped``) from ``record_offers``."""
+
+
+class RAObservationsAck(IngestAck):
+    expected: int = 0
+    acknowledged: int = 0
+    rogue: int = 0
+    skipped: int = 0
 
 
 # ── Auth ────────────────────────────────────────────────────────────────────
@@ -907,6 +976,8 @@ async def agent_heartbeat(
     # recorded success and stamped its readiness marker, so nothing on this
     # side ever learned the scope changes were not live.
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
+    # #1077 — spool state. Only written when the heartbeat carries it.
+    apply_reported_spool(server, body.spool, agent_kind="dhcp", server_id=str(server.id))
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
@@ -939,12 +1010,12 @@ async def agent_heartbeat(
     )
 
 
-@router.post("/lease-events")
+@router.post("/lease-events", response_model=LeaseEventsAck)
 async def agent_lease_events(
     body: LeaseEventBatch,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Bulk lease ingestion from the agent.
 
     In addition to upserting the DHCPLease row, we mirror live leases into
@@ -971,6 +1042,12 @@ async def agent_lease_events(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    # #1077 — a replay of a batch already committed writes nothing. Claimed
+    # before any write so the receipt and the rows share one transaction.
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.lease_events"
+    ):
+        return duplicate_response(upserted=0)
     now = datetime.now(UTC)
     events = body.leases
     if not events:
@@ -1275,14 +1352,15 @@ class MacSightingBatch(BaseModel):
     model_config = {"extra": "forbid"}
 
     sightings: list[MacSightingEntry] = Field(default_factory=list, max_length=500)
+    batch_id: BatchId = None
 
 
-@router.post("/mac-sightings")
+@router.post("/mac-sightings", response_model=MacSightingsAck)
 async def agent_mac_sightings(
     body: MacSightingBatch,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Ingest first-sighting (mac, ip) pairs from the agent's opt-in L2 sniffer.
 
     arpwatch-style: a MAC seen on the wire even if it never does DHCP (static
@@ -1302,6 +1380,10 @@ async def agent_mac_sightings(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.mac_sightings"
+    ):
+        return duplicate_response(recorded=0, new=0)
     if not body.sightings:
         return {"recorded": 0, "new": 0}
     if not await is_module_enabled(db, "security.new_device_watch"):
@@ -1443,14 +1525,15 @@ class DHCPMetricReport(BaseModel):
     # un-upgraded fleet reads as a fleet that has never dropped a packet.
     receive_drop: int | None = None
     socket_drop: int | None = None
+    batch_id: BatchId = None
 
 
-@router.post("/metrics")
+@router.post("/metrics", response_model=DHCPMetricsAck)
 async def agent_metrics(
     body: DHCPMetricReport,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Ingest one sample row, accumulating into ``(server_id, bucket_at)``.
 
     A second report for a bucket that already exists is ADDED to it rather
@@ -1464,13 +1547,18 @@ async def agent_metrics(
     exactly wrong for the #980 loss counters, where the discarded minute is
     the one an operator is looking for.
 
-    The trade is that a client-side retry of an identical body would now
-    double-count. Nothing retries today (``MetricsPoller._report`` logs a
-    failed POST and moves on), and under-reporting loss is the worse of the
-    two failure modes; a retry added later needs an idempotency key rather
-    than a last-write-wins overwrite that loses a poll in normal operation.
+    Accumulating means a retried body must not be counted twice, and since
+    #1077 agents DO retry: a failed POST is spooled to disk and replayed on
+    reconnect. The replay carries the same ``batch_id`` and is answered as a
+    duplicate before anything is added — the idempotency key this docstring
+    used to say a future retry would need. A body without ``batch_id`` (an
+    agent older than #1077, which never retries) accumulates unconditionally.
     """
     server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.metrics"
+    ):
+        return duplicate_response()
     values = {
         "discover": max(0, body.discover),
         "offer": max(0, body.offer),
@@ -1506,7 +1594,7 @@ async def agent_metrics(
                 continue
             setattr(existing, k, v if prior is None else prior + v)
     await db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "duplicate": False}
 
 
 @router.post("/ops/{op_id}/ack")
@@ -1537,13 +1625,15 @@ class DHCPLogBatch(BaseModel):
     Same shape as the DNS query log batch. The agent tails Kea's
     file output (we configure a file ``output_options`` in the
     rendered ``kea-dhcp4.conf`` so the lines are tail-able), batches
-    them, and POSTs every few seconds.
+    them, and POSTs every few seconds. Replays are deduplicated per batch
+    by ``batch_id`` (#1077).
     """
 
     lines: list[str]
+    batch_id: BatchId = None
 
 
-@router.post("/log-entries")
+@router.post("/log-entries", response_model=DHCPLogAck)
 async def agent_log_entries(
     body: DHCPLogBatch,
     db: DB,
@@ -1554,17 +1644,30 @@ async def agent_log_entries(
     Capped at 1000 lines per request. The parser tolerates lines it
     can't fully match — they still get inserted with the raw text
     preserved so the UI shows everything Kea emitted.
+
+    Lines whose own timestamp is older than the activity-log retention
+    window are counted as ``expired`` and not inserted (#1077): a replayed
+    outage backlog would otherwise write rows the nightly prune deletes on
+    its next run. A line with no parseable timestamp is stamped with the
+    arrival time by the parser, so it is never expired.
     """
     from app.services.logs.kea_parser import parse_kea_line  # noqa: PLC0415
 
     server, _ = auth
+    if not await claim_batch(db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.log"):
+        return duplicate_response(inserted=0)
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
+    expired_cutoff = now - timedelta(hours=ACTIVITY_LOG_RETENTION_HOURS)
     inserted = 0
+    expired = 0
     for raw in capped:
         parsed = parse_kea_line(raw, fallback_ts=now)
         if parsed is None:
+            continue
+        if parsed.ts < expired_cutoff:
+            expired += 1
             continue
         db.add(
             DHCPLogEntry(
@@ -1580,18 +1683,18 @@ async def agent_log_entries(
         )
         inserted += 1
     await db.commit()
-    return {"status": "ok", "inserted": inserted, "dropped": dropped}
+    return {"status": "ok", "inserted": inserted, "dropped": dropped, "expired": expired}
 
 
 # ── DHCP fingerprint ingestion (Phase 2 device profiling) ─────────────
 
 
-@router.post("/dhcp-fingerprints")
+@router.post("/dhcp-fingerprints", response_model=DHCPFingerprintsAck)
 async def agent_dhcp_fingerprints(
     body: DHCPFingerprintBatch,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Bulk fingerprint upsert from the agent's scapy sniffer.
 
     Capped at 500 entries per request so a misbehaving agent can't
@@ -1611,6 +1714,10 @@ async def agent_dhcp_fingerprints(
     from app.services.profiling.passive import upsert_fingerprint
 
     server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.fingerprints"
+    ):
+        return duplicate_response(upserted=0, dropped=0, enqueued=0)
     capped = body.fingerprints[:500]
     dropped = max(0, len(body.fingerprints) - len(capped))
     upserted = 0
@@ -1664,12 +1771,12 @@ async def agent_dhcp_fingerprints(
     }
 
 
-@router.post("/dhcp-offers")
+@router.post("/dhcp-offers", response_model=DHCPOffersAck)
 async def agent_dhcp_offers(
     body: DHCPOfferBatch,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Ingest observed DHCP OFFERs from the agent's rogue-detection probe (#370).
 
     The agent broadcasts a DISCOVER and ships every OFFER it gets back; we
@@ -1681,6 +1788,8 @@ async def agent_dhcp_offers(
     from app.services.dhcp.rogue_detection import ObservedOffer, record_offers
 
     server, _ = auth
+    if not await claim_batch(db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.offers"):
+        return duplicate_response()
     capped = body.offers[:200]
     offers = [
         ObservedOffer(
@@ -1696,12 +1805,12 @@ async def agent_dhcp_offers(
     return counts
 
 
-@router.post("/ra-observations")
+@router.post("/ra-observations", response_model=RAObservationsAck)
 async def agent_ra_observations(
     body: RAObservationBatch,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Ingest observed IPv6 Router Advertisements from the agent's RA sniffer (#524).
 
     The agent's opt-in passive sniffer ships every ICMPv6 type-134 RA it sees;
@@ -1715,6 +1824,10 @@ async def agent_ra_observations(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.ra_observations"
+    ):
+        return duplicate_response()
     if not body.observations:
         return {"expected": 0, "acknowledged": 0, "rogue": 0, "skipped": 0}
     if not await is_module_enabled(db, "ipv6.router_advertisements"):

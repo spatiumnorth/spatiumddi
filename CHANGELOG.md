@@ -22,7 +22,79 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Agents no longer lose what they collected during a control-plane
+  outage — stats, logs and Kea lease events are spooled to disk and
+  replayed on reconnect (#1077).** Non-negotiable #5 kept the agents
+  *serving* through an outage; nothing kept them *reporting*. Every
+  shipper dropped a batch the control plane did not accept, and every
+  buffer lived in process memory, so a maintenance window measured in
+  hours lost that window's query logs, DHCP activity and per-minute
+  metrics — and Kea lease events, the only way the control plane
+  learns about agent-managed leases, so those leases never reached
+  `dhcp_lease`, IPAM or DDNS until the client renewed. The DNS and
+  DHCP agents now write each unaccepted batch under
+  `<state dir>/spool/<stream>/`, survive restarts with it, and drain
+  it in order — a live batch never overtakes the backlog — with the
+  original timestamps, so the charts and logs fill the gap in. Bounded
+  by bytes (`AGENT_SPOOL_MAX_BYTES`, default 256 MiB; the oldest
+  batches are trimmed and counted at the cap) and, for log streams, by
+  age (`AGENT_SPOOL_LOG_MAX_AGE_HOURS`, default 24, the control plane's
+  own log retention). The DHCP agent also reconciles leases from a
+  full Kea snapshot (`lease4-get-page`) after each start and recovery,
+  posted to the existing lease-events endpoint — push-plus-pull, the
+  way the Windows path already works.
+  **Replay is idempotent on the server.** Each spooled batch carries a
+  `batch_id`, and every batch-ingest endpoint (DNS metrics and query
+  log; DHCP lease events, activity log, metrics, MAC sightings,
+  fingerprints, rogue-probe offers, RA observations) claims it in the
+  new `agent_ingest_receipt` table in the **same transaction** as the
+  rows it inserts — so the batch in flight when the control plane
+  stopped, committed but with its response lost, is answered
+  `{"duplicate": true}` on replay and inserts nothing. One shared
+  helper, so the check cannot be present in nine handlers and missing
+  from the tenth. A body without `batch_id` (an agent older than this)
+  is ingested exactly as before. A malformed id is a 422. A batch that
+  keeps drawing a plain 500 (a server bug, not an outage) is moved to
+  `spool/<stream>/poison/` after 5 consecutive attempts spanning 10
+  minutes, and only once the control plane has taken the batch queued
+  behind it — so it cannot hold its whole stream hostage, while a 500
+  for *every* body (schema skew mid-upgrade) costs nothing; 502/503/504
+  never count and restart the run. Receipts are
+  kept 35 days and pruned by the nightly log sweep. The query-log and
+  activity-log endpoints also skip lines older than the 24 h retention
+  window (reported as `expired`) rather than inserting rows the next
+  prune deletes; a line with no parseable timestamp is stamped with
+  its arrival time and never expired.
+  **Surfaced, not silent.** The spool rides the heartbeat as `spool`
+  and lands on `dns_server.spool_status` / `dhcp_server.spool_status`
+  (NULL = never reported, which is unknown — not "empty"). The server
+  lists and detail views show an amber *Replaying 3.2 MB backlog* chip
+  while a backlog drains and a red *Spool trimmed* chip for 24 h after
+  the cap forced a drop. New default-**on** alert rule
+  `agent_spool_trimmed`: **critical** when lease events were trimmed,
+  warning for anything else, auto-resolving 24 h after the last trim.
+  MCP: one new read-only tool, `find_agents_with_spool_backlog`
+  (default on — read-only fleet health, no secrets, no off-prem
+  calls); extending `find_agents_with_config_failures` instead was
+  rejected because a config revert and a replay backlog are different
+  questions with different remedies. Not a feature module
+  (non-negotiable #14): it extends the existing agent resources.
+  The nine batch-ingest routes now publish a typed response
+  (`status`, `duplicate`, plus their own counters), which retires
+  them from the untyped-route baseline. Migration `c5e8a1f3d027`.
+
 ### Changed
+
+- **DNS per-minute metrics now accumulate per bucket, like DHCP
+  (#1077).** `POST /dns/agents/metrics` replaced an existing
+  `(server, bucket_at)` row instead of adding to it — the same jitter
+  collision #980 fixed on the DHCP side: the agent floors `bucket_at`
+  to the minute on a 60 s ± 3 s interval, so about one bucket in forty
+  received two genuinely different deltas and the overwrite discarded
+  one. It accumulates now; that is only safe because a replayed batch
+  is deduplicated by its `batch_id` (above).
 
 - **The Kerberos WinRM transport is no longer offered (#1128).** The
   Windows DNS and DHCP server forms listed it, but it needs the
@@ -36,6 +108,23 @@ the formatter handles the rest.
   Real Kerberos support stays on the roadmap as #1128.
 
 ### Fixed
+
+- **A Kea lease in the "released" state was mirrored as active
+  (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
+  released; the DHCP agent's state map knew only `0`–`2` and fell
+  through to `active`, so a released lease kept its IPAM mirror row
+  (and DDNS records) alive until it expired. It is now sent as
+  `released`, which the ingest already treats as not active.
+
+- **Newer agents keep working against an older control plane
+  (#1077).** The heartbeat and lease/MAC-sighting request models are
+  `extra="forbid"`, so a pre-#1077 control plane 422s the new `spool`
+  and `batch_id` fields — and the spool classifies a 422 as a verdict
+  on the body and drops it. Both agents re-send once without the
+  field when the 422 names it, and remember not to send it again, so
+  an agent upgraded ahead of its control plane neither goes stale nor
+  silently discards lease batches. Order of upgrade still recommended:
+  control plane first.
 
 - **Two Windows DHCP servers in one server group no longer end up
   handing out the same addresses — and failover relationships can be
@@ -2911,6 +3000,15 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
+  `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed
+  for the 35-day prune) — replay dedupe for spooled agent pushes; and
+  nullable JSONB `dns_server.spool_status` / `dhcp_server.spool_status`.
+  No backfill: NULL means the agent has never reported a spool. The
+  receipt table is its own **volatile** backup section
+  (`agent_ingest_receipts`), excluded by default — restoring receipts
+  without the rows they vouch for would make a replay of those batches
+  read as a duplicate and be dropped.
 - `8e317fdd5b12` — #1110: `dhcp_failover_relationship` (Windows
   failover relationships as each server reports them) and
   `dhcp_server_scope_state` (which scopes each server holds, keyed by

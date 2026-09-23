@@ -695,6 +695,7 @@ Same-install restores return `{"same_install": true, ...counters all zero}`. The
 | DNS query log / DHCP activity log | Short-lived diagnostic data. Sectioned as `logs` (volatile). |
 | nmap scan history | Often huge, regenerable. Sectioned as `nmap_history` (volatile). |
 | Metric samples | Volatile, short retention. Sectioned as `metrics` (volatile). |
+| Agent ingest receipts (#1077) | Replay-dedupe state for spooled agent pushes, 35-day retention. Sectioned as `agent_ingest_receipts` (volatile). Restoring receipts without the rows they vouch for would make a replay of those batches read as duplicates, so an empty table is the safe post-restore state. |
 | Uploaded asset directory | Phase 2 polish — uploaded files (custom-field attachments, future logo overrides) aren't a separately-tracked path yet. |
 
 #### Restore drills (issue #702)

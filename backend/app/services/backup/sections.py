@@ -430,6 +430,23 @@ SECTIONS: tuple[Section, ...] = (
         volatile=True,
     ),
     Section(
+        key="agent_ingest_receipts",
+        label="Agent ingest receipts",
+        description=(
+            "Replay-dedupe receipts for spooled agent pushes (issue #1077): "
+            "which agent batches have already been ingested, so a batch "
+            "replayed after a lost response inserts nothing. Volatile — "
+            "35-day retention, and only the batch in flight at the moment a "
+            "response was lost ever consults it. Excluded from default "
+            "backup: restoring receipts WITHOUT the log / metric / lease rows "
+            "they vouch for would make a replay of those batches read as "
+            "duplicates and be dropped, so an empty table is the safe state "
+            "after a restore."
+        ),
+        tables=("agent_ingest_receipt",),
+        volatile=True,
+    ),
+    Section(
         key="leases",
         label="DHCP leases + history",
         description=(

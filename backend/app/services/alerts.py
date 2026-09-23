@@ -200,6 +200,26 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # are critical (may not be serving at all).
 RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 
+# Issue #1077 — an agent's durable push spool hit its byte cap during a
+# control-plane outage and discarded its OLDEST queued batches. Subject =
+# the dns_server / dhcp_server row (subject_type "agent", same prefixed id
+# shape as ``agent_config_rejected``).
+#
+# The spool exists so an outage costs nothing; a trim is the one case where
+# it did cost something, and nothing else says so — the time-series panels
+# simply show a hole. Fires while the agent's reported ``last_trim_at`` is
+# inside the last 24 h and auto-resolves after that (trim counters are
+# cumulative, so there is no "recovered" report to key off).
+#
+# Severity from WHAT was trimmed: ``lease_events`` is critical, because Kea
+# lease events are the only way the control plane learns about
+# agent-managed leases — a trimmed one is a lease with no IPAM mirror and no
+# DDNS record until the client renews (the agent's lease-snapshot backstop
+# reconciles most of it, but the alarm must not assume that). Anything else
+# (query / activity logs, metrics, sniffer telemetry) is a stats gap and a
+# warning.
+RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
+
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
 # row for a cluster node).
@@ -530,6 +550,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
+        RULE_TYPE_AGENT_SPOOL_TRIMMED,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -3372,6 +3393,84 @@ async def _matching_agent_config_rejected_subjects(
     return matches
 
 
+def _fmt_bytes(n: int) -> str:
+    size = float(max(0, n))
+    if size < 1024:
+        return f"{size:.0f} B"
+    for unit in ("KiB", "MiB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} GiB"
+
+
+async def _matching_agent_spool_trimmed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``agent_spool_trimmed`` — every DNS / DHCP server whose agent reported a
+    spool trim within :data:`spool_status.TRIM_RECENT_WINDOW` (#1077).
+
+    Reads ``spool_status`` as the heartbeat stored it; no probing. NULL (never
+    reported — a pre-#1077 agent or an agentless driver) is not a match, for
+    the same reason it is not in ``agent_config_rejected``.
+    """
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.spool_status import (  # noqa: PLC0415
+        CRITICAL_STREAMS,
+        recently_trimmed_streams,
+    )
+
+    now = now or datetime.now(UTC)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for model, kind in ((DNSServer, "DNS"), (DHCPServer, "DHCP")):
+        rows = (
+            (await db.execute(select(model).where(model.spool_status.is_not(None)))).scalars().all()
+        )
+        for row in rows:
+            trimmed = recently_trimmed_streams(row.spool_status, now=now)
+            if not trimmed:
+                continue
+            parts = []
+            for name in sorted(trimmed):
+                s = trimmed[name]
+                rejected = int(s.get("rejected_entries_total") or 0)
+                parts.append(
+                    f"{name} ({int(s.get('trimmed_entries_total') or 0)} batches, "
+                    f"{_fmt_bytes(int(s.get('trimmed_bytes_total') or 0))} trimmed at the cap"
+                    + (f", {rejected} refused by the control plane" if rejected else "")
+                    + " since agent state was created)"
+                )
+            critical = bool(CRITICAL_STREAMS & set(trimmed))
+            consequence = (
+                " Lease events were among them: those leases have no IPAM mirror row and "
+                "no DDNS record until the client renews or the agent's lease snapshot "
+                "reconciles them."
+                if critical
+                else " The control plane will show a gap in those streams for the outage."
+            )
+            message = (
+                f"{kind} server '{row.name}' had to discard queued data: its agent's push "
+                "spool either reached its size cap during a control-plane outage and "
+                "dropped the oldest batches, or gave up on a batch the control plane kept "
+                "refusing (a 4xx, or a 500 that other batches did not get — see the "
+                f"agent log for agent_spool_entry_poisoned). Streams affected in the last "
+                f"24 h: {'; '.join(parts)}.{consequence} If it was the cap, raise "
+                "AGENT_SPOOL_MAX_BYTES on the agent if outages this long are expected."
+            )
+            matches.append(
+                (
+                    f"{model.__tablename__}:{row.id}",
+                    f"{row.name} ({kind})",
+                    message,
+                    "critical" if critical else "warning",
+                )
+            )
+    return matches
+
+
 async def _matching_dhcp_scope_uncoordinated_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -4309,6 +4408,7 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
 
 
 _AGENT_CONFIG_REJECTED_RULE_NAME = "Agent config apply rejected"
+_AGENT_SPOOL_TRIMMED_RULE_NAME = "Agent push spool trimmed"
 
 
 async def seed_node_pressure_alert_rule() -> None:
@@ -4506,6 +4606,48 @@ async def seed_agent_config_rejected_alert_rule() -> None:
                     "when the agent reports a successful apply."
                 ),
                 rule_type=RULE_TYPE_AGENT_CONFIG_REJECTED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+async def seed_agent_spool_trimmed_alert_rule() -> None:
+    """Seed the #1077 rule, ENABLED by default.
+
+    Silent on every install whose agents never hit their spool cap — which is
+    every install whose control-plane outages are shorter than a few hundred
+    MiB of backlog — and on agents too old to report a spool. When it does
+    speak, data the operator would otherwise assume was replayed is gone, and
+    nothing else says so: the charts just have a hole. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_SPOOL_TRIMMED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_SPOOL_TRIMMED_RULE_NAME,
+                description=(
+                    "Fires when a DNS or DHCP agent's durable push spool reached "
+                    "its size cap during a control-plane outage and discarded its "
+                    "oldest queued batches, so part of the outage's logs, metrics "
+                    "or lease events will never arrive. Critical when Kea lease "
+                    "events were trimmed (leases missing from IPAM and DDNS until "
+                    "renewal), otherwise a warning. Auto-resolves 24 h after the "
+                    "last trim."
+                ),
+                rule_type=RULE_TYPE_AGENT_SPOOL_TRIMMED,
                 severity="warning",
                 enabled=True,
                 notify_syslog=True,
@@ -5859,6 +6001,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # same shape ``secret_expiring`` uses for its two credential
                 # tables. Without the prefix a dns_server and a dhcp_server
                 # sharing a UUID would collide into one event.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_AGENT_SPOOL_TRIMMED:
+                trimmed_hits = await _matching_agent_spool_trimmed_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
+                # Same prefixed "<table>:<id>" subject as agent_config_rejected.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)

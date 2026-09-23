@@ -287,6 +287,63 @@ live nowhere. The verdict rides the heartbeat's `config` field, lands on
 the server detail, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
 
+### Push spool — the reporting half of an outage (issue #1077)
+
+Non-negotiable #5 keeps the agent *serving* through a control-plane outage.
+The spool keeps it *reporting*: a query-log batch or a per-minute metric the
+control plane does not accept is written to disk and replayed, in order, when
+it answers again — instead of being dropped, which is what every shipper did
+before (and every in-memory buffer was lost on an agent restart besides).
+
+| | |
+|---|---|
+| Location | `<state dir>/spool/<stream>/` — `/var/lib/spatium-dns-agent/spool/` by default. One file per batch, written tmp + fsync + rename, so a crash leaves a batch whole or absent. Survives agent restarts. |
+| Streams | DNS: `query_log`, `metrics`. (DHCP: `dhcp_log`, `lease_events`, `metrics`, `mac_sightings`, `fingerprints`, `ra_observations` — see [`DHCP.md`](../features/DHCP.md).) |
+| `AGENT_SPOOL_ENABLED` | Default `true`. `false` restores the pre-#1077 drop behaviour — kept for the negative control in tests, not as a tuning knob. |
+| `AGENT_SPOOL_MAX_BYTES` | Default `268435456` (256 MiB), shared across the agent's streams by fixed weights. At the cap the **oldest** batches are trimmed and counted. Keep it well under the agent state volume (the Helm chart's `storage.agentState` defaults to 1 Gi, and PowerDNS also keeps `pdns.log` in that directory). |
+| `AGENT_SPOOL_LOG_MAX_AGE_HOURS` | Default `24`, matching the control plane's query-log retention. Log batches spooled longer ago than this are dropped at drain time (counted as *expired*) rather than shipped into a table the nightly prune would empty. Metrics are not age-limited. |
+
+**Ordering.** A live batch never overtakes the backlog: while anything is
+spooled, new batches queue behind it. Drain stops at the first failure so a
+still-unreachable control plane does not reorder the queue.
+
+**Replay is idempotent on the server.** Every spooled batch carries a
+`batch_id` (32 lowercase hex). The ingest endpoint records it in
+`agent_ingest_receipt` in the **same transaction** as the rows it inserts, so
+the batch in flight when the control plane went away — committed, but its
+response lost — is answered `{"status": "ok", "duplicate": true}` on replay
+and inserts nothing. This matters most for metrics, which accumulate per
+bucket: an undeduplicated replay would double a minute of traffic. Receipts
+are kept 35 days (pruned by the nightly log sweep). A body without `batch_id`
+(a pre-#1077 agent) is ingested exactly as before. A 4xx that is not about
+auth or rate-limiting is a verdict on the batch, so that one batch is dropped
+rather than jamming everything queued behind it. A batch that keeps drawing a
+plain **500** — a server bug meeting that particular body — is treated the
+same way, but only after 5 consecutive attempts spanning at least 10 minutes
+**and** once the control plane has accepted the batch queued behind it — a 500
+for every body (schema skew mid-upgrade, an unhandled dependency error) is an
+outage in all but status code and costs nothing. It is moved to
+`spool/<stream>/poison/` (the last 20 are kept) rather than deleted, so it can
+be inspected. **502 / 503 / 504 never count**, and reset the run: that is the
+control plane or its proxy being down, which is exactly what the spool rides
+out.
+
+**Retention on the server too.** The query-log endpoint skips lines whose
+own timestamp is older than the 24 h retention window and reports them as
+`expired` — a belt to the agent's spool-age braces. A line with no parseable
+timestamp is stamped with the arrival time and is never expired. RPZ hits
+are exempt (they are kept 30 days).
+
+**Surfaced, not silent.** The spool rides every heartbeat as `spool`
+(bytes / entries queued, oldest entry, cumulative trim counters, per-stream
+breakdown) and lands on `dns_server.spool_status` — NULL until an agent
+reports one, which means *unknown*, never "empty". The server list shows an
+amber **Replaying … backlog** chip while a backlog drains and a red **Spool
+trimmed** chip for 24 h after the cap forced a drop; the default-on
+`agent_spool_trimmed` alert fires on the same condition, and the
+`find_agents_with_spool_backlog` Copilot tool answers "did we lose anything
+during the maintenance window?".
+
 
 ---
 
@@ -312,6 +369,18 @@ the server detail, the `agent_config_rejected` alert rule and the
     "failed_etag": null,
     "phase": null,
     "error": null
+  },
+  "spool": {
+    "enabled": true,
+    "cap_bytes": 268435456,
+    "bytes": 3355443,
+    "entries": 41,
+    "oldest_at": "2026-09-22T09:14:00.000Z",
+    "trimmed_entries_total": 0,
+    "trimmed_bytes_total": 0,
+    "last_trim_at": null,
+    "expired_entries_total": 0,
+    "streams": {"query_log": {"bytes": 3301000, "entries": 38, "...": "..."}, "metrics": {"...": "..."}}
   },
   "ops_ack": [
     {"op_id": "...", "result": "ok"},
@@ -471,7 +540,7 @@ way the PowerDNS driver provisions its local API key.
 
 | Path | Purpose | Typical size |
 |---|---|---|
-| `/var/lib/spatium-dns-agent` | Agent state, config cache, TSIG, tokens | <10 MB |
+| `/var/lib/spatium-dns-agent` | Agent state, config cache, TSIG, tokens, push spool (#1077) | <10 MB, plus up to `AGENT_SPOOL_MAX_BYTES` (256 MiB) of spool during an outage |
 | `/var/cache/bind` (bind9 image) | Zone files, journals | grows with zone count |
 
 Both must survive restarts → named volumes in Compose / PVCs in K8s.

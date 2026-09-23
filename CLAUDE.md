@@ -1170,6 +1170,28 @@ suggestion, free-space treemap.
   plane is unapplied); and `DNSServerOptions.allow_query` is interpolated
   into `named.conf` unvalidated — a third instance of the #876/#899
   class, used deliberately here as the E2E fault-injection lever.
+- ✅ [**Agents spool and replay what they collect during a control-plane outage**](https://github.com/spatiumnorth/spatiumddi/issues/1077)
+  — the *reporting* half of non-negotiable #5 (unreleased). Every shipper
+  used to drop a batch the control plane refused, from in-memory buffers an
+  agent restart emptied, so a maintenance window lost its query logs, DHCP
+  activity, metrics and — the correctness hole — Kea lease events, the only
+  way the control plane learns about agent-managed leases. Now each agent
+  keeps a byte-capped on-disk spool per stream (`AGENT_SPOOL_MAX_BYTES`,
+  default 256 MiB, oldest trimmed; log streams also age-capped at 24 h) and
+  drains it in order on reconnect, and the DHCP agent reconciles leases from
+  a full Kea snapshot after each start and recovery. **Replay is made safe
+  server-side**: every batch-ingest endpoint claims the batch's `batch_id` in
+  `agent_ingest_receipt` in the same transaction as its rows
+  (`services/agents/ingest_receipt.py`, one helper for all nine), so a batch
+  whose response was lost comes back `duplicate` and inserts nothing — which
+  is what let DNS metrics switch from overwrite to accumulate (#980's jitter
+  collision, DNS side) without a replay double-counting. Log ingest skips
+  lines already past the 24 h retention. Spool state rides the heartbeat to
+  `{dns,dhcp}_server.spool_status` (NULL = unknown) → server-row chip, the
+  default-on `agent_spool_trimmed` alert (critical when lease events were
+  trimmed) and `find_agents_with_spool_backlog`. Receipts are their own
+  volatile backup section on purpose: restored without the rows they vouch
+  for, they would turn a replay into silent loss. Migration `c5e8a1f3d027`.
 - ⬜ [**Config snapshots + rollback**](https://github.com/spatiumnorth/spatiumddi/issues/883) — audit-log-driven revert
   of a single change plus scoped named snapshots. Distinct from #882,
   which is an agent-side safety net rather than an operator action.

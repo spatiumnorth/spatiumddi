@@ -15,8 +15,15 @@ because:
 
 The probe is DISCOVER-only and uses a spoofed locally-administered source MAC +
 a random transaction id, and never sends a REQUEST — so it never actually
-consumes a lease. Mirrors :class:`DhcpFingerprintShipper` for the
-ship / retry / re-bootstrap-on-401 semantics.
+consumes a lease. A failed ship is logged and dropped; the heartbeat thread
+owns re-bootstrap on 401 / 404.
+
+Deliberately NOT spooled (#1077), unlike the passive sniffers: each probe is a
+fresh reading of what answers on the segment *now*, repeated every
+``interval``, and the payload carries no observation time. A replayed batch
+would be stamped with its arrival time on the control plane, reporting a
+responder that may have left hours ago as currently present; a responder that
+is still there is simply observed again on the next probe after reconnect.
 """
 
 from __future__ import annotations
