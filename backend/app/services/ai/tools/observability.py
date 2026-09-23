@@ -528,6 +528,88 @@ async def find_agents_with_config_failures(
     return out[: args.limit]
 
 
+# ── find_agents_with_spool_backlog (issue #1077) ──────────────────────
+
+
+class FindAgentSpoolBacklogArgs(BaseModel):
+    include_healthy: bool = Field(
+        default=False,
+        description=(
+            "Also list agents whose spool is empty and has not trimmed in the "
+            "last 24 h. Agents that have never reported a spool (pre-#1077, or "
+            "agentless drivers) are never listed — that is UNKNOWN, not empty."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_agents_with_spool_backlog",
+    description=(
+        "List DNS and DHCP servers whose agent is holding a backlog of pushes "
+        "(query logs, DHCP activity, metrics, Kea lease events) that the "
+        "control plane has not yet received, or whose backlog hit its size cap "
+        "in the last 24 h and discarded the oldest data (issue #1077). Use this "
+        "to answer 'why is there a gap in the query log / DHCP charts?' or "
+        "'did we lose anything during the maintenance window?'. A non-zero "
+        "'bytes' means the agent is still replaying (the gap will fill in, with "
+        "original timestamps); 'trimmed_recently' lists streams that lost data "
+        "for good — 'lease_events' there means leases missing from IPAM and "
+        "DDNS until the clients renew. Read-only."
+    ),
+    args_model=FindAgentSpoolBacklogArgs,
+    category="ops",
+)
+async def find_agents_with_spool_backlog(
+    db: AsyncSession,
+    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    args: FindAgentSpoolBacklogArgs,
+) -> list[dict[str, Any]]:
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.spool_status import recently_trimmed_streams  # noqa: PLC0415
+
+    out: list[dict[str, Any]] = []
+    for model, kind in ((DNSServer, "dns_server"), (DHCPServer, "dhcp_server")):
+        rows = (
+            (await db.execute(select(model).where(model.spool_status.is_not(None)))).scalars().all()
+        )
+        for r in rows:
+            spool = r.spool_status or {}
+            trimmed = sorted(recently_trimmed_streams(spool))
+            backlog = int(spool.get("bytes") or 0)
+            if not args.include_healthy and backlog <= 0 and not trimmed:
+                continue
+            raw_streams = spool.get("streams")
+            streams: dict[str, Any] = raw_streams if isinstance(raw_streams, dict) else {}
+            out.append(
+                {
+                    "kind": kind,
+                    "id": str(r.id),
+                    "name": r.name,
+                    "enabled": spool.get("enabled"),
+                    "bytes": backlog,
+                    "entries": int(spool.get("entries") or 0),
+                    "cap_bytes": spool.get("cap_bytes"),
+                    "oldest_at": spool.get("oldest_at"),
+                    "last_trim_at": spool.get("last_trim_at"),
+                    "trimmed_bytes_total": spool.get("trimmed_bytes_total"),
+                    "trimmed_recently": trimmed,
+                    "streams": {
+                        name: {
+                            "bytes": s.get("bytes"),
+                            "entries": s.get("entries"),
+                            "oldest_at": s.get("oldest_at"),
+                            "last_trim_at": s.get("last_trim_at"),
+                        }
+                        for name, s in streams.items()
+                        if isinstance(s, dict)
+                    },
+                }
+            )
+    return out[: args.limit]
+
+
 # ── find_influxdb_targets (issue #889) ─────────────────────────────
 
 

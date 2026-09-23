@@ -835,7 +835,9 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 2. Agent logs: `"Control plane unreachable — operating from cached config"`
 3. Agent continues serving from cached config — **DHCP service is NOT interrupted**
 4. Agent retries connectivity every 60 seconds
-5. On reconnect: agent reports "gap period" lease events in bulk
+5. On reconnect: agent replays every push it spooled during the gap — lease
+   events, activity log, metrics — in order, then reconciles leases from a
+   full Kea snapshot (see *Push spool* below, #1077)
 
 ### Cache Format
 
@@ -891,6 +893,54 @@ the Kubernetes readiness marker. The agent now reports the verdict on its
 heartbeat (`config` field → `dhcp_server.config_apply_*`), which drives the
 server-row chip, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
+
+### Push spool + lease snapshot (issue #1077)
+
+Kea lease events are the **only** way the control plane learns about
+agent-managed leases — `KeaDriver.get_leases()` is a stub and the scheduled
+lease pull deliberately skips agent-based drivers. So before #1077 an outage
+long enough to overflow the agent's 5,000-event memory buffer, or any agent
+restart during one, left leases with no `dhcp_lease` row, no IPAM mirror and
+no DDNS record until the client happened to renew.
+
+Two mechanisms close that, push-plus-pull like the Windows path:
+
+* **Durable spool.** Every push the control plane does not accept is written
+  under `<state dir>/spool/<stream>/` (`/var/lib/spatium-dhcp-agent/spool/`)
+  and replayed in order on reconnect, surviving agent restarts. Streams:
+  `lease_events`, `dhcp_log`, `metrics`, `mac_sightings`, `fingerprints`,
+  `ra_observations`. The rogue-DHCP probe and HA status are deliberately
+  **not** spooled — they are current-state readings with no observation
+  time, and replaying a stale one would be wrong rather than late. Same
+  settings as the DNS agent: `AGENT_SPOOL_ENABLED` (default `true`),
+  `AGENT_SPOOL_MAX_BYTES` (default 256 MiB, split across streams; oldest
+  batches trimmed at the cap — keep it well under the agent state volume,
+  1 Gi `storage.agentState` in the Helm chart), `AGENT_SPOOL_LOG_MAX_AGE_HOURS`
+  (default 24; applies to the activity log only). See
+  [`DNS_AGENT.md` §3](../deployment/DNS_AGENT.md) for ordering and replay
+  semantics.
+* **Lease snapshot backstop.** After each agent start and each recovery from
+  an outage (at most once per 5 minutes) the agent pages Kea's full lease
+  table over the control socket (`lease4-get-page`, 100 leases per POST) and
+  posts it to the existing `POST /dhcp/agents/lease-events` endpoint. That
+  ingest is an upsert, so the snapshot reconciles whatever the spool missed —
+  including leases trimmed at the cap. DHCPv4 only.
+
+Every spooled batch carries a `batch_id`; the control plane records it in
+`agent_ingest_receipt` in the same transaction as the rows, so a batch whose
+response was lost is acknowledged `{"duplicate": true}` on replay and inserts
+nothing. That is load-bearing for metrics, which **accumulate** per bucket
+since #980 — an undeduplicated replay would double a minute of packet counts
+and packet loss. The activity-log endpoint also skips lines older than its
+24 h retention (`expired` in the response). The agent reports lease state
+`released` (Kea 3.0 CSV state 3) as such; the ingest treats it like any other
+non-active state and tears down the auto IPAM mirror + DDNS.
+
+The spool's state rides the heartbeat as `spool` → `dhcp_server.spool_status`
+(NULL = never reported), shown as an amber *Replaying … backlog* or red
+*Spool trimmed* chip on the server row. The default-on `agent_spool_trimmed`
+alert fires for 24 h after a trim, **critical** when `lease_events` were among
+the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 
 ---
 

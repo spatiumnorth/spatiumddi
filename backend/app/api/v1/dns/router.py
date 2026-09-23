@@ -78,6 +78,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
@@ -522,6 +523,10 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1077 — the agent's push spool as last reported on its heartbeat.
+    # NULL when never reported (a pre-#1077 agent, or an agentless driver):
+    # UNKNOWN, never "empty".
+    spool_status: SpoolStatus | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -558,6 +563,7 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            spool_status=s.spool_status,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,

@@ -14,12 +14,18 @@ from . import __version__, kea_ctrl
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
+from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
 
 
 class HeartbeatClient:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        spool_manager: SpoolManager | None = None,
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
         self._stop = threading.Event()
@@ -35,6 +41,14 @@ class HeartbeatClient:
         # #637 — cached Kea daemon version. See _kea_version(); immutable for the
         # life of this process, so it is probed until it answers and then reused.
         self._kea_version_cached: str | None = None
+        # #1077 — the durable push spool; its status() rides the heartbeat's
+        # ``spool`` field so the control plane can show a backlog replaying
+        # (and alert on trims) instead of a silent hole that fills in later.
+        self.spool_manager = spool_manager
+        # Set when the control plane 422s the ``spool`` field: its heartbeat
+        # model is ``extra="forbid"`` and predates #1077. Dropping the field
+        # keeps the agent's liveness signal alive across the version skew.
+        self._spool_field_unsupported = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -87,6 +101,11 @@ class HeartbeatClient:
             # treat that as "unknown", never as "old".
             "kea_version": self._kea_version(),
         }
+        if self.spool_manager is not None and not self._spool_field_unsupported:
+            try:
+                body["spool"] = self.spool_manager.status()
+            except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
+                log.warning("heartbeat_spool_status_failed", error=str(exc))
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
@@ -99,6 +118,15 @@ class HeartbeatClient:
                     json=body,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
+                if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
+                    log.warning("heartbeat_spool_field_unsupported")
+                    self._spool_field_unsupported = True
+                    body.pop("spool")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    )
             if resp.status_code == 200:
                 data = resp.json()
                 rotated = data.get("rotated_token")

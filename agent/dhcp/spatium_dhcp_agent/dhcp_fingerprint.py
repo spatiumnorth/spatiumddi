@@ -31,6 +31,8 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .push import CPPoster, disabled_spool
+from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
@@ -195,11 +197,13 @@ class DhcpFingerprintShipper:
 
     The sniffer pushes observations into an in-memory buffer; the
     main loop drains the buffer every ``BATCH_INTERVAL`` seconds (or
-    sooner once the buffer hits ``MAX_BATCH``). On 401 / 404 we drop
-    the batch and log — the heartbeat thread is the canonical
-    re-bootstrap trigger for the agent (it clears the on-disk token
-    and exits so the container restarts), so duplicating that here
-    would race the heartbeat.
+    sooner once the buffer hits ``MAX_BATCH``). A batch the control
+    plane does not take — unreachable, 5xx, or a 401 / 404 while the
+    token is stale — is kept in the ``fingerprints`` spool and replayed
+    in order (#1077). We never re-bootstrap from here: the heartbeat
+    thread is the canonical trigger (it clears the on-disk token and
+    exits so the container restarts), so duplicating that here would
+    race the heartbeat.
     """
 
     def __init__(
@@ -207,6 +211,7 @@ class DhcpFingerprintShipper:
         cfg: AgentConfig,
         token_ref: list[str],
         iface: str | None = None,
+        spool: Spool | None = None,
     ) -> None:
         self.cfg = cfg
         self.token_ref = token_ref
@@ -219,6 +224,16 @@ class DhcpFingerprintShipper:
         self._sniffer: Any = None
         self._lock = threading.Lock()
         self._last_flush = time.monotonic()
+        # #1077 — a batch the control plane does not take is spooled to disk
+        # and replayed in order, instead of dropped.
+        self._shipper = Shipper(
+            spool if spool is not None else disabled_spool("fingerprints"),
+            CPPoster(
+                cfg, token_ref, "/api/v1/dhcp/agents/dhcp-fingerprints", lambda: self._cp_client()
+            ),
+            event_prefix="dhcp_fingerprint_ship",
+            retry_backoff_seconds=BATCH_INTERVAL,
+        )
 
     def stop(self) -> None:
         # ``run()`` owns the sniffer lifecycle and stops the scapy
@@ -333,33 +348,10 @@ class DhcpFingerprintShipper:
         if not batch:
             return
         payload = {"fingerprints": [obs.to_payload() for obs in batch]}
-        try:
-            with self._cp_client() as c:
-                resp = c.post(
-                    "/api/v1/dhcp/agents/dhcp-fingerprints",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-        except httpx.HTTPError as exc:
-            log.warning(
-                "dhcp_fingerprint_ship_http_error",
-                error=str(exc),
-                batch_size=len(batch),
-            )
-            self._last_flush = time.monotonic()
-            return
-        if resp.status_code in (401, 404):
-            log.warning(
-                "dhcp_fingerprint_unauthorized",
-                status=resp.status_code,
-                hint="heartbeat thread will trigger rebootstrap",
-            )
-        elif resp.status_code not in (200, 204):
-            log.warning(
-                "dhcp_fingerprint_ship_failed",
-                status=resp.status_code,
-                batch_size=len(batch),
-            )
+        # Sent now, or spooled behind the backlog for replay. A 401 / 404 is
+        # retried rather than dropped: the heartbeat thread is the canonical
+        # re-bootstrap trigger, and the batch is good once the token is.
+        self._shipper.ship(payload)
         self._last_flush = time.monotonic()
 
     def run(self) -> None:
@@ -376,6 +368,10 @@ class DhcpFingerprintShipper:
         while not self._stop.is_set():
             if self._should_flush():
                 self._flush()
+            elif len(self._shipper.spool):
+                # Idle tick with a backlog; the shipper's retry backoff
+                # throttles this while the control plane is still away.
+                self._shipper.drain()
             self._stop.wait(timeout=1.0)
         if self._sniffer is not None:
             try:

@@ -48,6 +48,17 @@ healthy. Only ``socket_drop`` moves.
 Both are ``None`` — not 0 — when they could not be measured, so an agent
 that cannot read them, or one older than this change, is reported as
 UNKNOWN rather than as a server with no loss.
+
+Delivery (#1077): a bucket the control plane does not accept is kept in the
+``metrics`` stream of the durable spool and replayed, oldest first, when it
+answers again. The baseline advances on every poll regardless of whether the
+report landed — the interval's delta is queued, not lost — and each bucket
+keeps the ``bucket_at`` it was measured at, so a replay fills the gap in the
+time series instead of stacking a day of traffic onto the reconnect minute.
+The ``batch_id`` the spool stamps is what keeps a replay of the bucket in
+flight at the moment of an outage from being counted twice: the ingest
+ACCUMULATES per ``(server_id, bucket_at)`` (#980), so without it a lost
+response would double that minute.
 """
 
 from __future__ import annotations
@@ -62,7 +73,9 @@ import structlog
 
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, send_command
+from .push import CPPoster, disabled_spool, drain_for
 from .socket_drops import SocketDropCounter
+from .spool import RETRY, Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
@@ -96,6 +109,12 @@ _STAT_MAP = {
 # ``_compute_delta`` so a multi-stat → single-column mapping doesn't
 # re-diff the same column twice.
 _METRIC_COLUMNS = sorted(set(_STAT_MAP.values()))
+
+METRICS_PATH = "/api/v1/dhcp/agents/metrics"
+# #1077 — how long one poll tick may spend replaying a backlog. A day-long
+# outage is ~1,440 one-row buckets; at 50 per drain pass the replay would
+# otherwise take half an hour of ticks.
+DRAIN_BUDGET = 20.0
 
 
 def _extract_counter(series: Any) -> int | None:
@@ -137,9 +156,16 @@ def _parse_snapshot(resp: dict[str, Any]) -> dict[str, int]:
 
 
 class MetricsPoller:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self, cfg: AgentConfig, token_ref: list[str], spool: Spool | None = None
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
+        self._shipper = Shipper(
+            spool if spool is not None else disabled_spool("metrics"),
+            CPPoster(cfg, token_ref, METRICS_PATH, lambda: self._client()),
+            event_prefix="metrics_report",
+        )
         self._stop = threading.Event()
         # Previous snapshot. None on first tick — the first post-boot
         # bucket is absorbed (no baseline to diff against).
@@ -191,25 +217,21 @@ class MetricsPoller:
 
     def _report(
         self, bucket_at: datetime, delta: dict[str, int], socket_drop: int | None
-    ) -> None:
-        try:
-            with self._client() as c:
-                resp = c.post(
-                    "/api/v1/dhcp/agents/metrics",
-                    json={
-                        "bucket_at": bucket_at.isoformat(),
-                        "socket_drop": socket_drop,
-                        **delta,
-                    },
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-            if resp.status_code not in (200, 204):
-                log.warning("metrics_report_failed", status=resp.status_code)
-        except httpx.HTTPError as e:
-            log.warning("metrics_report_http_error", error=str(e))
+    ) -> str:
+        """Returns the spool outcome (``sent`` / ``retry`` / ``rejected``)."""
+        # Sent now, or spooled (behind any backlog) for replay — never dropped
+        # while the spool is enabled and has room.
+        return self._shipper.ship(
+            {
+                "bucket_at": bucket_at.isoformat(),
+                "socket_drop": socket_drop,
+                **delta,
+            }
+        )
 
     def run(self) -> None:
         while not self._stop.is_set():
+            self._shipper.last_send_outcome = None
             current = self._poll_kea()
             if current is not None:
                 delta = self._compute_delta(current)
@@ -223,12 +245,24 @@ class MetricsPoller:
                 socket_drop = self._socket.sample()
                 if delta is not None:
                     # Bucket timestamp is "now, rounded to the poll
-                    # interval" — the server path dedupes on
-                    # (server_id, bucket_at) so a retry that lands in
-                    # the next interval won't double-count.
+                    # interval". The server ACCUMULATES per
+                    # (server_id, bucket_at) (#980), so it is the spool's
+                    # batch_id — not the timestamp — that stops a replayed
+                    # bucket being counted twice (#1077).
                     now = datetime.now(UTC).replace(microsecond=0)
                     bucket = now.replace(second=(now.second // 60) * 60)
                     self._report(bucket, delta, socket_drop)
+            # Replay whatever the spool still holds — covers a tick with no
+            # bucket to report (first poll, Kea down) as well as a backlog
+            # longer than the slice ``ship`` drains ahead of a live bucket.
+            # Skipped when a POST this tick already found the control plane
+            # down: a second attempt would only cost another timeout. Keyed
+            # on the last ATTEMPTED send, not on ``_report``'s return — that
+            # is RETRY whenever the live bucket was queued behind a backlog
+            # longer than one drain slice, i.e. on exactly the long-outage
+            # replay this budget exists for.
+            if self._shipper.last_send_outcome != RETRY:
+                drain_for(self._shipper, DRAIN_BUDGET)
             # 60s base + small jitter so paired peers don't hit the
             # control plane in lockstep.
             interval = 60.0 + random.uniform(-3, 3)
