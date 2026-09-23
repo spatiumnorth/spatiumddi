@@ -22,6 +22,19 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **The Kerberos WinRM transport is no longer offered (#1128).** The
+  Windows DNS and DHCP server forms listed it, but it needs the
+  `gssapi` library and the system Kerberos libraries — neither in
+  the images, and `gssapi` has no Linux wheel — plus realm / KDC
+  configuration the control plane has nowhere to take from, so it
+  failed on every call. It is gone from both forms, the API refuses
+  it at save (422, saying why), and a server saved with it before
+  fails with that explanation instead of a library error; edit it
+  and pick NTLM or CredSSP. NTLM, CredSSP and Basic are unchanged.
+  Real Kerberos support stays on the roadmap as #1128.
+
 ### Fixed
 
 - **Two Windows DHCP servers in one server group no longer end up
@@ -159,8 +172,8 @@ the formatter handles the rest.
   library pywinrm imports for it — was never installed, so pywinrm
   raised before connecting. Now a dependency (MIT; `NOTICE` and
   `docs/THIRD_PARTY.md`), because #1110's relationship management
-  needs it. Kerberos is in the same position (the images carry no
-  GSSAPI stack) and is now documented as such; tracked in #1128.
+  needs it. Kerberos was in the same position (the images carry no
+  GSSAPI stack) and is no longer offered — see #1128 under Changed.
 
 ### Changed
 

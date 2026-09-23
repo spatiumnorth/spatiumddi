@@ -1045,9 +1045,24 @@ suggestion, free-space treemap.
   `DHCP_DRIVERS.md` §4. **Not yet verified against a live failover pair**:
   the JSON shape of `Get-DhcpServerv4Failover`, its no-relationships
   behaviour, whether `DHCP Users` may run it, and the management cmdlets
-  over CredSSP; unreadable = unknown, never "none". **Known gap:** the
-  `kerberos` WinRM transport has the same missing-library problem CredSSP
-  had (no GSSAPI stack in the images) — documented, not fixed here ([#1128](https://github.com/spatiumnorth/spatiumddi/issues/1128)).
+  over CredSSP; unreadable = unknown, never "none". The `kerberos` WinRM
+  transport had the same missing-library problem CredSSP had and is no
+  longer offered — see #1128 below.
+- ⬜ [**Kerberos WinRM transport for Windows DNS / DHCP**](https://github.com/spatiumnorth/spatiumddi/issues/1128)
+  — **removed, not built** (unreleased): the forms offered `kerberos` while
+  the images carried no GSSAPI stack, so it failed on every call. The API now
+  refuses it at save (`drivers/_winrm.validate_transport`, shared by the DNS
+  and DHCP credential inputs; `SUPPORTED_TRANSPORTS` is ntlm / credssp /
+  basic), and a stored `kerberos` row fails in `run_ps` with the reason. To
+  build it for real: `gssapi` has **no Linux wheel**, so it compiles in the
+  builder stage against `libkrb5-dev` on amd64 + arm64 and the runtime needs
+  `libgssapi-krb5-2` (Trivy, `NOTICE`, `THIRD_PARTY.md`); the control plane
+  is not domain-joined, so it needs a `krb5.conf` (realm / KDC) from env or a
+  mounted secret — chart values and appliance included, non-negotiable #12 —
+  and a ticket from the stored password (pyspnego + gssapi can, verify it) or
+  a keytab. Kerberos with constrained delegation would also give Windows DHCP
+  failover management (#1110) a second hop without CredSSP. Untestable
+  without an AD KDC, which is why it waits.
 
 #### Operational tooling
 

@@ -25,6 +25,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.drivers._winrm import validate_transport
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.fortigate import test_fortigate_credentials
@@ -66,7 +67,7 @@ class WindowsCredentialsInput(BaseModel):
 
     All fields are optional to support **partial updates** on edit: if the
     server already has stored credentials, sending just ``{"transport":
-    "kerberos"}`` (for example) decrypts the existing blob, merges the
+    "credssp"}`` (for example) decrypts the existing blob, merges the
     transport change, and re-encrypts. On create, ``username`` + ``password``
     are still required — the create endpoint validates that explicitly.
     """
@@ -74,7 +75,7 @@ class WindowsCredentialsInput(BaseModel):
     username: str | None = None
     password: str | None = None
     winrm_port: int | None = None
-    # transport: ntlm | kerberos | basic | credssp
+    # transport: ntlm | credssp | basic (kerberos: #1128)
     transport: str | None = None
     use_tls: bool | None = None
     verify_tls: bool | None = None
@@ -82,11 +83,9 @@ class WindowsCredentialsInput(BaseModel):
     @field_validator("transport")
     @classmethod
     def _valid_transport(cls, v: str | None) -> str | None:
-        # #426: reject a bogus transport at save instead of failing
-        # opaquely at apply (pywinrm only speaks these four).
-        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
-            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
-        return v
+        # #426 / #1128: reject a transport this build cannot speak at save,
+        # instead of failing opaquely at the first call.
+        return validate_transport(v)
 
     @field_validator("winrm_port")
     @classmethod
