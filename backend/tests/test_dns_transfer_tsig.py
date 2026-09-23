@@ -593,3 +593,36 @@ async def test_sync_with_servers_reads_through_the_zones_view(
     await pull_zone_from_server(db_session, zone, apply=False)
 
     assert recording_driver.seen == [view_transfer_key(_LEGACY, "lab")]
+
+
+class _GlueDriver:
+    """A live agent-managed zone as the BIND9 agent serves it: one real
+    record plus the ``ns1 A 127.0.0.1`` glue the agent writes into every
+    zone file."""
+
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: Any = None
+    ) -> list[RecordData]:
+        return [
+            RecordData(name="www", record_type="A", value="192.0.2.80", ttl=300),
+            RecordData(name="ns1", record_type="A", value="127.0.0.1", ttl=3600),
+        ]
+
+
+async def test_sync_never_imports_the_agents_ns_glue(db_session: AsyncSession) -> None:
+    """Sync-with-servers is additive: anything on the wire and not in the DB
+    becomes a row. The agent's own glue would become one on every zone, an
+    operator-invisible record the agent then renders a second time."""
+    register_driver("bind9", _GlueDriver)  # type: ignore[arg-type]
+    try:
+        grp = await _group(db_session, tsig_key_name=_LEGACY.name, tsig_key_secret=_B64)
+        zone = await _zone_with_server(db_session, grp, "bind9")
+
+        result = await pull_zone_from_server(db_session, zone, apply=False)
+    finally:
+        from app.drivers.dns.bind9 import BIND9Driver
+
+        register_driver("bind9", BIND9Driver)
+
+    assert [r["name"] for r in result.imported_records] == ["www"]
+    assert result.server_records == 1

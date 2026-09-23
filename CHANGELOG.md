@@ -480,6 +480,18 @@ the formatter handles the rest.
   agent that predates this is still read with the group key, and the
   report says when a comparison may come from another view.
 
+- **An agent-managed zone can read in sync, and Sync with Servers no
+  longer imports a record nobody made.** The BIND9 agent writes
+  `ns1 IN A 127.0.0.1` into every zone it serves, so BIND will load a
+  zone whose NS names an in-zone host. The drift report listed that
+  glue as extra on the server on every agent-managed zone, so none
+  ever read in sync, and every sync imported it into the database as
+  an ordinary record. It is now treated like the apex SOA and NS:
+  zone-level apparatus, left out of the comparison and the import —
+  unless the zone really holds that record, which is then compared
+  like any other. Found once the transfer in the entry above went
+  through.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —

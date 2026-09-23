@@ -132,6 +132,40 @@ def _key(r: RecordData | DNSRecord, zone_name: str) -> tuple[str, str, str]:
     return (name, rtype, _normalize_value(rtype, r.value, zone_name))
 
 
+#: The address record the BIND9 agent writes into every primary zone file,
+#: beside the apex ``NS ns1.<zone>`` it also writes, so BIND will load a zone
+#: whose NS names an in-zone host (``_write_zone_file`` in
+#: agent/dns/spatium_dns_agent/drivers/bind9.py). Keep the two in step.
+_AGENT_NS_GLUE = RecordData(name="ns1", record_type="A", value="127.0.0.1")
+
+
+def without_agent_ns_glue(
+    on_wire: list[RecordData],
+    server: Any,
+    zone_name: str,
+    db_keys: set[tuple[str, str, str]],
+) -> list[RecordData]:
+    """``on_wire`` minus the agent's own NS glue, when ``server`` is agent-managed BIND9.
+
+    The glue is render apparatus, the same class as the apex SOA and NS the
+    AXFR helper already drops: nobody created it, and SpatiumDDI puts it on
+    every zone the agent serves. Left in, every drift report on an
+    agent-managed BIND9 zone lists ``ns1 A 127.0.0.1`` as extra on the
+    server forever, so no zone ever reads in sync, and every sync-with-servers
+    imports it into the DB as a record an operator never made — which the
+    agent then renders a second time. Found once #920 let the transfer
+    through on the QA seed. A zone whose DB really holds that exact record
+    keeps it, and it is compared like any other. An operator-run BIND9, or any
+    other driver, never had it added, so its records pass through untouched.
+    """
+    if getattr(server, "driver", None) != "bind9" or getattr(server, "agent_id", None) is None:
+        return on_wire
+    glue = _key(_AGENT_NS_GLUE, zone_name)
+    if glue in db_keys:
+        return on_wire
+    return [r for r in on_wire if _key(r, zone_name) != glue]
+
+
 async def _resolve_primary_and_driver(
     db: AsyncSession, zone: DNSZone
 ) -> tuple[Any, Any, list[TsigKey | None], str | None]:
@@ -264,6 +298,7 @@ async def pull_zone_from_server(
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
     db_keys = {_key(r, zone.name) for r in db_rows}
+    on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
     if apply and result.imported:
@@ -454,6 +489,7 @@ async def sync_zone_with_server(
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
     db_keys = {_key(r, zone.name) for r in db_rows}
+    on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     pull_result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
     if apply and pull_result.imported:

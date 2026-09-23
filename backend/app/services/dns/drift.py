@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSZone
-from app.services.dns.pull_from_server import _key
+from app.services.dns.pull_from_server import _key, without_agent_ns_glue
 from app.services.dns.tsig import (
     is_view_transfer_key,
     pull_zone_records_signed,
@@ -191,6 +191,7 @@ async def compute_zone_drift(
             return entry
 
         view_addressed[entry.server_id] = is_view_transfer_key(used)
+        on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
         wire_by_key = {_key(r, zone.name): r for r in on_wire}
         entry.extra_on_server = [
             _to_drift_record(r) for k, r in wire_by_key.items() if k not in db_by_key
