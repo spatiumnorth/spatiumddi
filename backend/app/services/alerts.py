@@ -347,6 +347,18 @@ RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 # are not loss.
 RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 
+# Issue #1110 — a DHCP scope served by two or more servers that do not
+# coordinate: Windows DHCP members holding it with no failover relationship
+# covering it on both, over overlapping ranges; or a Windows member holding a
+# scope a Kea member of the same group also serves. Each server hands out the
+# same addresses to different clients, and neither reports a problem — both
+# scopes look healthy, both servers answer, and the first symptom is two
+# machines with one address. Subject = the group + scope CIDR (a scope held on
+# Windows need not have a SpatiumDDI row). Reads the topology poll's stored
+# observations through the same report the group's Windows failover panel
+# shows, so the alarm and the panel cannot disagree.
+RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
+
 # Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
 # Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
 # sweep + SNMP poll already write + the ip_mac_history observation log; no new
@@ -518,6 +530,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
+        RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
@@ -3359,6 +3372,57 @@ async def _matching_agent_config_rejected_subjects(
     return matches
 
 
+async def _matching_dhcp_scope_uncoordinated_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``dhcp_scope_uncoordinated`` — every scope the group failover report
+    (#1110) marks ``uncoordinated``, in every group with a Windows member.
+
+    ``unknown`` (a member's failover relationships could not be read) is
+    deliberately not a match: it is a read failure the panel already shows,
+    and paging on it would page on every denied read. Auto-resolves when the
+    poll next reads the scope in a relationship, or on one server only.
+    """
+    from app.models.dhcp import DHCPServer, DHCPServerGroup  # noqa: PLC0415
+    from app.services.dhcp.windows_failover_report import (  # noqa: PLC0415
+        group_failover_report,
+    )
+
+    group_ids = (
+        (
+            await db.execute(
+                select(DHCPServer.server_group_id)
+                .where(
+                    DHCPServer.driver == "windows_dhcp",
+                    DHCPServer.server_group_id.is_not(None),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for gid in group_ids:
+        group = await db.get(DHCPServerGroup, gid)
+        if group is None:
+            continue
+        report = await group_failover_report(db, group)
+        for row in report["scopes"]:
+            if row["verdict"] != "uncoordinated":
+                continue
+            matches.append(
+                (
+                    f"{group.id}:{row['cidr']}",
+                    f"{row['cidr']} ({group.name})",
+                    f"DHCP scope {row['cidr']} in server group '{group.name}': {row['detail']}",
+                    "critical",
+                )
+            )
+    return matches
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4452,6 +4516,50 @@ async def seed_agent_config_rejected_alert_rule() -> None:
         await session.commit()
 
 
+_DHCP_SCOPE_UNCOORDINATED_RULE_NAME = "DHCP scope served uncoordinated"
+
+
+async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
+    """Seed the #1110 rule, ENABLED by default.
+
+    Silent on every install without a Windows DHCP server, and on one with a
+    single Windows server per group; it only speaks when two servers already
+    hand out the same addresses. That is the outage, not an early warning,
+    and nothing else says it: both servers report the scope healthy. Keyed on
+    ``name``; an operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_SCOPE_UNCOORDINATED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_SCOPE_UNCOORDINATED_RULE_NAME,
+                description=(
+                    "Fires for each DHCP scope that two or more servers serve without "
+                    "coordinating: Windows DHCP servers holding it with no failover "
+                    "relationship covering it, over overlapping ranges, or a Windows "
+                    "server holding a scope a Kea server in the same group also serves. "
+                    "Each server can hand the same address to a different client, while "
+                    "both report the scope healthy. Resolves when the scope is put in a "
+                    "failover relationship or left on one server only."
+                ),
+                rule_type=RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DHCP_PACKETS_DROPPED_RULE_NAME = "DHCP packets dropped"
 
 
@@ -5515,6 +5623,7 @@ async def seed_dns_dga_alert_rule() -> None:
 _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
+    RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -5736,6 +5845,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # there is no row and no single node it belongs to, and which
                 # node a replica sits on is already in the message.
                 subject_type = "cluster"
+            elif rule.rule_type == RULE_TYPE_DHCP_SCOPE_UNCOORDINATED:
+                uncoordinated = await _matching_dhcp_scope_uncoordinated_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in uncoordinated]
+                # A scope held on Windows need not have a SpatiumDDI row, so the
+                # subject is "<group id>:<cidr>", not a dhcp_scope id.
+                subject_type = "dhcp_scope"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]

@@ -48,6 +48,7 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
+from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -379,7 +380,7 @@ class WindowsCredentialsInput(BaseModel):
     ``has_credentials``.
 
     Mirrors the DHCP-side shape. All fields are optional to support
-    **partial updates**: sending ``{"transport": "kerberos"}`` on an
+    **partial updates**: sending ``{"transport": "credssp"}`` on an
     existing server decrypts the stored blob, merges the transport
     change, and re-encrypts. On first-time set, ``username`` + ``password``
     are still required — the endpoint validates that explicitly.
@@ -388,7 +389,7 @@ class WindowsCredentialsInput(BaseModel):
     username: str | None = None
     password: str | None = None
     winrm_port: int | None = None
-    # transport: ntlm | kerberos | basic | credssp
+    # transport: ntlm | credssp | basic (kerberos: #1128)
     transport: str | None = None
     use_tls: bool | None = None
     verify_tls: bool | None = None
@@ -396,10 +397,9 @@ class WindowsCredentialsInput(BaseModel):
     @field_validator("transport")
     @classmethod
     def _valid_transport(cls, v: str | None) -> str | None:
-        # #426: reject a bogus transport at save (pywinrm only speaks these).
-        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
-            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
-        return v
+        # #426 / #1128: reject a transport this build cannot speak at save,
+        # instead of failing opaquely at the first call.
+        return validate_transport(v)
 
     @field_validator("winrm_port")
     @classmethod

@@ -799,6 +799,89 @@ async def find_dhcp_pool_occupancy(
     return out[: args.limit]
 
 
+# ── find_dhcp_failover_relationships (issue #1110) ────────────────────
+#
+# Deliberately no ``propose_*`` counterpart for the Phase 2 management routes
+# (non-negotiable #13, explicit decision): creating, removing or re-scoping a
+# relationship creates and DELETES scopes on the partner server, and creating
+# one carries the relationship's shared secret — the broad-blast-radius,
+# secret-bearing shape that guidance keeps off the copilot.
+
+
+class FindDHCPFailoverRelationshipsArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None,
+        description=(
+            "Limit to one DHCP server group (UUID). Omit to cover every group "
+            "with a Windows DHCP member."
+        ),
+    )
+    only_at_risk: bool = Field(
+        default=False,
+        description=(
+            "Return only scopes that are NOT safely served — held by several "
+            "Windows servers with no failover relationship, or whose "
+            "coordination could not be read, or failover partners whose "
+            "configuration has drifted."
+        ),
+    )
+
+
+@register_tool(
+    name="find_dhcp_failover_relationships",
+    description=(
+        "Windows DHCP failover relationships as each Windows server reports "
+        "them (Get-DhcpServerv4Failover): name, mode (LoadBalance / "
+        "HotStandby), per-side role, state and load-balance share, MCLT, and "
+        "the scopes each covers — plus, per scope, which Windows servers of the "
+        "group hold it and a verdict: single_server, failover, "
+        "failover_one_sided (partner not in the group), split_scope, or "
+        "uncoordinated (two servers can hand out the same address). Use for "
+        "'are my Windows DHCP servers in failover?', 'which scopes could get "
+        "duplicate addresses?', or 'are the partners' configs in sync?'. From "
+        "the topology poll's stored observations, not a live read. Windows "
+        "failover syncs leases between partners but NOT configuration. A group "
+        "that also has Kea members lists them in kea_members; a scope both a Kea "
+        "and a Windows member serve is reported uncoordinated. Read-only: "
+        "relationships are created and changed from the group's Windows failover "
+        "panel or its REST routes, never from chat."
+    ),
+    args_model=FindDHCPFailoverRelationshipsArgs,
+    category="dhcp",
+    module="core.dhcp",
+)
+async def find_dhcp_failover_relationships(
+    db: AsyncSession, user: User, args: FindDHCPFailoverRelationshipsArgs
+) -> list[dict[str, Any]]:
+    # The same report the group view renders, run through the same response
+    # model so timestamps and ids come out as the REST route emits them.
+    from app.api.v1.dhcp._failover_schemas import GroupFailoverResponse  # noqa: PLC0415
+    from app.services.dhcp.windows_failover_report import (  # noqa: PLC0415
+        group_failover_report,
+    )
+
+    stmt = (
+        select(DHCPServerGroup)
+        .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+        .where(DHCPServer.driver == "windows_dhcp")
+        .distinct()
+        .order_by(DHCPServerGroup.name)
+    )
+    if args.group_id:
+        stmt = stmt.where(DHCPServerGroup.id == args.group_id)
+    groups = (await db.execute(stmt)).scalars().all()
+    out: list[dict[str, Any]] = []
+    for group in groups:
+        report = GroupFailoverResponse.model_validate(
+            await group_failover_report(db, group)
+        ).model_dump(mode="json")
+        if args.only_at_risk:
+            report["scopes"] = [s for s in report["scopes"] if not s["safe"] or s.get("drift")]
+        report["group_name"] = group.name
+        out.append(report)
+    return out
+
+
 # ── find_dhcp_responders (issue #370) ─────────────────────────────────
 
 

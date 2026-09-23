@@ -180,6 +180,7 @@ Runs in the **API image**. Authoritative list, with versions:
 | [dnspython](https://www.dnspython.org/) | ISC | DDNS, AXFR, resolution |
 | [Jinja2](https://jinja.palletsprojects.com/) | BSD 3-Clause | Config rendering |
 | [pywinrm](https://github.com/diyan/pywinrm) | MIT | Windows DNS/DHCP over WinRM |
+| [requests-credssp](https://github.com/jborean93/requests-credssp) | MIT | CredSSP transport for WinRM — required to manage Windows DHCP failover relationships (second hop) |
 | [pysnmp](https://github.com/lextudio/pysnmp) | BSD 2-Clause | SNMP polling |
 | [paramiko](https://www.paramiko.org/) | **LGPL 2.1** | SSH transport |
 | [smbprotocol](https://github.com/jborean93/smbprotocol) | MIT | SMB backup targets |

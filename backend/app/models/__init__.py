@@ -39,6 +39,7 @@ from app.models.cutover import (
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
+    DHCPFailoverRelationship,
     DHCPLease,
     DHCPLeaseHistory,
     DHCPMACBlock,
@@ -47,6 +48,7 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServer,
     DHCPServerGroup,
+    DHCPServerScopeState,
     DHCPStaticAssignment,
 )
 from app.models.dhcp_device_policy import DHCPDevicePolicy
@@ -250,6 +252,8 @@ __all__ = [
     "VRF",
     "DHCPServerGroup",
     "DHCPServer",
+    "DHCPFailoverRelationship",
+    "DHCPServerScopeState",
     "DHCPScope",
     "DHCPPool",
     "DHCPStaticAssignment",

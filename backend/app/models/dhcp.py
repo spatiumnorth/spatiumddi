@@ -33,7 +33,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy import text as sa_text
-from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
+from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
@@ -381,12 +381,160 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── #1110 topology observation (agentless drivers with get_scopes) ───
+    #
+    # Freshness lives HERE, per server, not on the observation rows. The
+    # topology poll runs every ~15 s and rewriting an ``observed_at`` on
+    # every scope-state row each time would be N updates per server per
+    # poll to record that nothing changed; the rows are written only when
+    # their content does, and "is this server's view current?" is one
+    # timestamp.
+    #
+    # ``scopes_observed_at`` — last SUCCESSFUL scope enumeration. Another
+    # member's scope-state rows only count as evidence while this is
+    # recent: an unreachable partner's last-known view must not keep
+    # claiming a scope it may no longer serve.
+    scopes_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # ``failover_observed_at`` — last SUCCESSFUL read of this server's
+    # Windows failover relationships. NULL means never read, which is not
+    # the same as "has none": the rows in ``dhcp_failover_relationship``
+    # say what the server has, this says whether we know.
+    failover_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # The most recent failover read's failure, cleared by the next success.
+    # A read that fails leaves the previous relationship rows in place —
+    # last-known-good, like the lease floor guard (#482) — so this is the
+    # only thing that says they are stale and why.
+    failover_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     group: Mapped[DHCPServerGroup | None] = relationship(
         "DHCPServerGroup", back_populates="servers", lazy="joined"
     )
     leases: Mapped[list[DHCPLease]] = relationship(
         "DHCPLease", back_populates="server", cascade="all, delete-orphan"
     )
+
+
+# ── Windows DHCP failover observation (#1110) ─────────────────────────────
+
+
+class DHCPFailoverRelationship(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A Windows DHCP failover relationship, as ONE server reports it.
+
+    A mirror of ``Get-DhcpServerv4Failover``, refreshed by the topology poll
+    and after every relationship action SpatiumDDI takes
+    (``services.dhcp.windows_failover_manage``). It is an observation, never
+    a desired state: nothing reconciles Windows towards it, so a change made
+    in the DHCP console is simply read back. It exists so the write-through
+    and the reconciler can answer the question the group model cannot: is
+    this scope *coordinated* between these two servers, or are two servers
+    handing out the same addresses on their own?
+
+    One row per ``(observing server, relationship name)``, not one per
+    relationship. Both partners report the same relationship under the same
+    name, each from its own side (``partner_server`` names the OTHER one, and
+    ``server_role`` / ``load_balance_percent`` are this side's values), and a
+    relationship whose partner is not registered in SpatiumDDI is only ever
+    seen from one side. Storing observations rather than a merged object
+    keeps each poll the owner of exactly its own rows and never asks one
+    server's read to overwrite what another server said.
+
+    The shared secret is never read: the PowerShell selects the properties
+    it wants, and ``SharedSecret`` is not one of them. ``enable_auth`` says
+    whether message authentication is on, which is all an operator needs.
+    """
+
+    __tablename__ = "dhcp_failover_relationship"
+    __table_args__ = (
+        UniqueConstraint("server_id", "name", name="uq_dhcp_failover_relationship_server_name"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # ``PartnerServer`` verbatim — whatever name or address the relationship
+    # was created with. Resolved against the group's members at read time
+    # (``services.dhcp.windows_failover``), never stored as an FK: the
+    # partner may not be registered at all, which is itself worth showing.
+    partner_server: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Windows' own spellings, verbatim: ``LoadBalance`` / ``HotStandby`` for
+    # the mode, ``Active`` / ``Standby`` for the hot-standby role (NULL in
+    # load-balance mode), ``Normal`` / ``CommunicationInterrupted`` /
+    # ``PartnerDown`` / … for the state. A translation table would be one
+    # more thing to drift from what the operator sees in PowerShell.
+    mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    server_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    load_balance_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserve_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_client_lead_time_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state_switch_interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    auto_state_transition: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    enable_auth: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # The relationship's explicit scope membership — Windows ``ScopeId``s,
+    # i.e. network addresses (``"10.1.2.0"``), in the order reported. A
+    # relationship between two servers says nothing about whether a GIVEN
+    # scope is in it; this list is the only thing that does.
+    scope_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
+
+class DHCPServerScopeState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One scope as one agentless DHCP server reports it.
+
+    The group model says every member serves every scope. That is how Kea HA
+    works and is not how a pair of Windows servers works unless a failover
+    relationship covers the scope — so "which member actually has this scope,
+    and is it active there?" has to be recorded per server rather than
+    assumed. The write-through does not plan from these rows (it probes live,
+    ``services.dhcp.windows_writethrough``); they feed the reconciler's choice
+    of which member's view of a shared scope to import, and the group / scope
+    views.
+
+    Keyed by the scope's CIDR, not by ``dhcp_scope.id``: a Windows scope whose
+    subnet is not in IPAM has no ``DHCPScope`` row, and it still counts when
+    deciding whether a server is serving a range it shares with another.
+
+    Written only when the content changes (``modified_at`` records when);
+    whether the row is CURRENT is ``DHCPServer.scopes_observed_at``.
+    """
+
+    __tablename__ = "dhcp_server_scope_state"
+    __table_args__ = (
+        UniqueConstraint("server_id", "scope_cidr", name="uq_dhcp_server_scope_state"),
+        Index("ix_dhcp_server_scope_state_cidr", "scope_cidr"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scope_cidr: Mapped[str] = mapped_column(CIDR, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # The scope's dynamic range and exclusions on THIS server. Two servers
+    # holding one scope with disjoint effective ranges is a split scope —
+    # safe, and the only way to tell it apart from two servers handing out
+    # the same addresses.
+    start_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    end_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    exclusions: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    # sha256 over what should be identical on two failover partners (range,
+    # exclusions, reservations, options, lease time, state). Windows syncs
+    # LEASES between partners on its own but not configuration, so two
+    # partners disagreeing is ordinary drift, and this is how it is seen.
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
 
 # ── Scope / Pool / Static / Client Class ─────────────────────────────────────

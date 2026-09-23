@@ -980,6 +980,89 @@ suggestion, free-space treemap.
   55/60 are DHCPv4 codes, and the v6 branch of both renderers builds its class
   list from generic client classes alone. **Deferred:** auto-creating the
   quarantine pool, DHCPv6, and rules keyed on fingerbank device *name*.
+- 🟡 [**Windows DHCP failover relationships — two Windows members of one group no longer serve a scope uncoordinated**](https://github.com/spatiumnorth/spatiumddi/issues/1110)
+  — **implemented in full (unreleased); only live verification against a
+  real failover pair remains.** The write-through sent every scope / pool /
+  reservation write to EVERY Windows member of a group, create-or-update,
+  so a new scope landed on both servers and an edit to a scope one server
+  held CREATED it on the other: two DHCP servers, one range, no
+  coordination, both writes reporting success. Now
+  `get_failover_relationships` (`Get-DhcpServerv4Failover`, shared secret
+  never selected) and per-server scope presence are recorded by the
+  existing topology poll (`dhcp_failover_relationship` +
+  `dhcp_server_scope_state`, freshness per server on `DHCPServer`;
+  migration `8e317fdd5b12`), and one pure classifier —
+  `services/dhcp/windows_failover.classify_serving`, verdicts
+  `single_server` / `failover` / `failover_one_sided` / `split_scope` /
+  `uncoordinated` / `unknown` / `not_on_windows` — feeds the write-through
+  (from a live probe), the poll, two REST views
+  (`GET /dhcp/{server-groups,scopes}/{id}/failover`), 1 MCP tool
+  (`find_dhcp_failover_relationships`, default on) and the default-on
+  `dhcp_scope_uncoordinated` alert rule, so a refusal, a badge and an alarm
+  cannot disagree. Two holders are a pair when both report a relationship
+  of the same NAME covering the scope, so no `PartnerServer`-vs-host
+  matching is needed.
+  **On 2+ Windows members** a scope write goes to the current holders only,
+  update-only — the no-create check runs in the same PowerShell as the
+  write. A NEW scope goes to ONE member by its `windows_placement` (into a
+  relationship — created on one side, then `Add-DhcpServerv4FailoverScope`
+  copies it to the partner — or on one server only; with none, the one
+  shared relationship, else 422). Activating an uncoordinated shared scope
+  is 422. Deleting a failover-pair scope goes out of the relationship first;
+  a partner outside the group is 409. Writes that would make a split
+  scope's halves overlap (a new range, a removed exclusion) are simulated
+  and refused. Kea + Windows in one group is refused at server create /
+  move (Kea HA cannot coordinate with Windows failover); an existing mixed
+  group is reported uncoordinated.
+  **Deliberately NOT the issue's "write one partner, let Windows
+  replicate"**: Windows failover syncs LEASES, not CONFIGURATION (option
+  values, exclusions, reservations need `Invoke-DhcpServerv4FailoverReplication`),
+  so one partner would go stale; Microsoft's IPAM writes both, and so does
+  this. Replication is an explicit operator action instead.
+  **Phase 2 — managing relationships** (`services/dhcp/windows_failover_manage.py`,
+  routes under `/dhcp/server-groups/{id}/failover/relationships`,
+  superadmin): create / edit / delete, add / remove scopes, replicate.
+  Imperative, not desired-state — no new table; each action runs one cmdlet
+  and re-reads. Every such cmdlet acts on both partners from the server it
+  runs on, so it needs the **CredSSP** WinRM transport (the second hop) —
+  anything else is 422 before sending. `requests-credssp` added for it,
+  which also fixes CredSSP having been offered in the UI and broken on
+  every call. Where a cmdlet runs is what it does: create/add copies from
+  the holder, remove/delete deletes the partner's copy (caller picks the
+  keeper), a share or role is the running side's value (an edit names the
+  side). One-script-per-op: the first cut encoded to ~12,700 chars against
+  WinRM's 7,800 budget; a test pins every op under it. No `propose_*` (#13):
+  these create/delete partner scopes and carry the shared secret, which is
+  never stored, logged or audited.
+  **Also fixed:** the poll's per-member merge undid itself on drifted
+  partners every tick (one reconcile owner per shared scope now — lowest
+  name among views fresher than 15 min — others compared by config hash);
+  `purge_lease` / expiry sweep / Kea release tore down a shared IPAM mirror
+  + DDNS while a peer still leased the address (`peer_holds_active_lease`);
+  and the Kea lease-event handler keyed its maps on raw `IPv4Address` vs
+  string, so every renewal INSERTED a duplicate `dhcp_lease` row and a
+  release never found a stored mirror. See `WINDOWS.md` §3,
+  `DHCP_DRIVERS.md` §4. **Not yet verified against a live failover pair**:
+  the JSON shape of `Get-DhcpServerv4Failover`, its no-relationships
+  behaviour, whether `DHCP Users` may run it, and the management cmdlets
+  over CredSSP; unreadable = unknown, never "none". The `kerberos` WinRM
+  transport had the same missing-library problem CredSSP had and is no
+  longer offered — see #1128 below.
+- ⬜ [**Kerberos WinRM transport for Windows DNS / DHCP**](https://github.com/spatiumnorth/spatiumddi/issues/1128)
+  — **removed, not built** (unreleased): the forms offered `kerberos` while
+  the images carried no GSSAPI stack, so it failed on every call. The API now
+  refuses it at save (`drivers/_winrm.validate_transport`, shared by the DNS
+  and DHCP credential inputs; `SUPPORTED_TRANSPORTS` is ntlm / credssp /
+  basic), and a stored `kerberos` row fails in `run_ps` with the reason. To
+  build it for real: `gssapi` has **no Linux wheel**, so it compiles in the
+  builder stage against `libkrb5-dev` on amd64 + arm64 and the runtime needs
+  `libgssapi-krb5-2` (Trivy, `NOTICE`, `THIRD_PARTY.md`); the control plane
+  is not domain-joined, so it needs a `krb5.conf` (realm / KDC) from env or a
+  mounted secret — chart values and appliance included, non-negotiable #12 —
+  and a ticket from the stored password (pyspnego + gssapi can, verify it) or
+  a keytab. Kerberos with constrained delegation would also give Windows DHCP
+  failover management (#1110) a second hop without CredSSP. Untestable
+  without an AD KDC, which is why it waits.
 
 #### Operational tooling
 
