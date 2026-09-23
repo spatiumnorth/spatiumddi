@@ -22,7 +22,9 @@ exercised as a shell run, not reasoned about:
   * the class present, or an apiserver that did not answer → nothing is touched;
   * spatium-bootstrap not ``deployed`` → nothing is re-run and nothing is
     logged (every first boot is this case: the release is still installing);
-  * a bootstrap install Job still running → it is not deleted mid-helm;
+  * a bootstrap install Job that has not completed — running, retrying a
+    failed or interrupted upgrade, just created, gone → it is left to
+    helm-controller (only a completed Job is re-run);
   * the class not back within the bound → a WARN and the old degraded path;
   * a joined member, or a node with no control chart → the function is inert.
 
@@ -55,9 +57,10 @@ SHELL = shutil.which("dash") or "sh"
 
 # The stub apiserver. State lives in files under $STUB (so one run can change
 # it mid-flight): ``class`` present, ``apierr`` = the apiserver is down,
-# ``deployed`` = spatium-bootstrap's release secret says deployed, ``active`` =
-# its install Job is running, ``rerun_after`` = how many class polls after the
-# Job is deleted until the re-run has re-created the class (absent = never).
+# ``deployed`` = spatium-bootstrap's release secret says deployed, ``job.<field>``
+# = that ``.status`` field of its install Job (``job.absent`` = no Job at all),
+# ``rerun_after`` = how many class polls after the Job is deleted until the
+# re-run has re-created the class (absent = never).
 STUB_K3S = r"""#!/bin/sh
 S="$STUB"
 echo "$*" >> "$S/calls.log"
@@ -81,7 +84,13 @@ case "$args" in
     [ -f "$S/deployed" ] && echo "secret/sh.helm.release.v1.spatium-bootstrap.v1"
     exit 0 ;;
   "-n kube-system get job helm-install-spatium-bootstrap"*)
-    [ -f "$S/active" ] && printf 1
+    if [ -f "$S/job.absent" ]; then
+      echo 'Error from server (NotFound): jobs.batch "helm-install-spatium-bootstrap" not found' >&2
+      exit 1
+    fi
+    for f in succeeded active failed; do
+      case "$args" in *"{.status.$f}"*) [ -f "$S/job.$f" ] && cat "$S/job.$f" ;; esac
+    done
     exit 0 ;;
   "-n kube-system delete job helm-install-spatium-bootstrap"*)
     touch "$S/rerun"; exit 0 ;;
@@ -108,17 +117,32 @@ def _extract_function(name: str) -> str:
     raise AssertionError(f"{name}() has no closing brace at column 0")
 
 
+# The install Job's ``.status`` in each state a test puts it in — what the
+# apiserver answers field by field (a count of 0 is omitted, so "new" has none).
+JOB_STATUS = {
+    "complete": {"succeeded": "1"},
+    "running": {"active": "1"},
+    "retrying": {"failed": "2"},  # between two failed attempts: no pod is active
+    "new": {},  # just created; its pod not counted yet
+}
+
+
 def _run(tmp_path: Path, *, cls: bool = False, apierr: bool = False, deployed: bool = True,
-         active: bool = False, rerun_after: int | None = 2, member: bool = False,
+         job: str = "complete", rerun_after: int | None = 2, member: bool = False,
          manifest: str | None = "deferred") -> tuple[subprocess.CompletedProcess, list[str]]:
     stub = tmp_path / "stub"
     stub.mkdir()
     k3s = tmp_path / "k3s"
     k3s.write_text(STUB_K3S)
     k3s.chmod(0o755)
-    for flag, on in (("class", cls), ("apierr", apierr), ("deployed", deployed), ("active", active)):
+    for flag, on in (("class", cls), ("apierr", apierr), ("deployed", deployed)):
         if on:
             (stub / flag).touch()
+    if job == "absent":
+        (stub / "job.absent").touch()
+    else:
+        for field, value in JOB_STATUS[job].items():
+            (stub / f"job.{field}").write_text(value)
     if rerun_after is not None:
         (stub / "rerun_after").write_text(str(rerun_after))
     manifests = tmp_path / "manifests"
@@ -176,12 +200,12 @@ def test_an_apiserver_that_did_not_answer_proves_nothing(tmp_path: Path) -> None
 
 def test_a_bootstrap_release_that_is_not_deployed_is_left_alone_quietly(tmp_path: Path) -> None:
     """Every FIRST boot is this case — the release is still installing and
-    creates the class itself during the webhook wait — and a failed / pending
-    release is helm-stuck-recover's (a re-run here would fire the reinstall
-    policy mid-boot). Nothing is re-run and nothing is said: a WARN here read
-    as a false alarm on every install (seen on the first QA build of this
-    fix), and release_control_manifest already speaks if the class is still
-    missing when the chart is released."""
+    creates the class itself during the webhook wait. Nothing is re-run and
+    nothing is said: a WARN here read as a false alarm on every install (seen
+    on the first QA build of this fix), and release_control_manifest already
+    speaks if the class is still missing when the chart is released. (A
+    failed or interrupted UPGRADE still has a deployed revision — see the
+    install-Job test below for that case.)"""
     proc, calls = _run(tmp_path, deployed=False)
     assert proc.returncode == 0, proc.stderr
     assert not _deleted(calls) and not _nudged(calls)
@@ -201,17 +225,39 @@ def test_the_class_absent_reruns_bootstrap_then_nudges(tmp_path: Path) -> None:
     nudge = next(i for i, c in enumerate(calls) if "annotate" in c)
     assert len(polls) == 3
     assert delete < polls[0] and polls[-1] < nudge
+    assert "re-running the spatium-bootstrap release" in proc.stdout
     assert "re-created by spatium-bootstrap" in proc.stdout
 
 
 def test_a_running_bootstrap_job_is_not_deleted(tmp_path: Path) -> None:
     """Deleting a live helm run leaves the release pending-upgrade. The running
     Job re-creates the class on its own; the function only waits for it."""
-    proc, calls = _run(tmp_path, active=True, rerun_after=None)
+    proc, calls = _run(tmp_path, job="running", rerun_after=None)
     # nothing re-runs, so the class never appears: the bound is reached
     assert proc.returncode == 0, proc.stderr
     assert not _deleted(calls)
     assert not _nudged(calls)
+    assert "has not completed" in proc.stdout
+    assert "within 3 min" in proc.stderr
+
+
+@pytest.mark.parametrize("job", ["retrying", "new", "absent"])
+def test_only_a_completed_bootstrap_job_is_rerun(tmp_path: Path, job: str) -> None:
+    """The release check cannot see a failed or interrupted upgrade: Helm keeps
+    the previous revision ``deployed`` until the next one SUCCEEDS (it records
+    the new one ``pending-upgrade``, then ``failed``), while klipper-helm acts
+    on the latest. So a Job retrying that upgrade — between attempts it has no
+    active pod — would be deleted by a "not running" test, and its re-run would
+    fire the reinstall policy in the middle of a boot. The same test would
+    delete a Job helm-controller had only just created for a changed chart.
+    Only a COMPLETED Job is re-run; anything else is helm-controller's own run
+    (and helm-stuck-recover's), and the function only waits, saying so."""
+    proc, calls = _run(tmp_path, job=job, rerun_after=None)
+    assert proc.returncode == 0, proc.stderr
+    assert not _deleted(calls)
+    assert not _nudged(calls)
+    assert "has not completed" in proc.stdout
+    assert "re-running" not in proc.stdout
     assert "within 3 min" in proc.stderr
 
 

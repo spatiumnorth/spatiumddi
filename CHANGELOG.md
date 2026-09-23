@@ -434,9 +434,10 @@ the formatter handles the rest.
   came up, unranked or otherwise. firstboot now has
   `spatium-bootstrap` put the class back before it releases the
   control chart — on an explicit NotFound, with the release
-  `deployed`, it re-runs the release's helm-install Job (the lever
-  `spatiumddi-helm-stuck-recover` already uses), waits up to 3 min
-  for the class, then re-queues every ReplicaSet, StatefulSet and
+  `deployed` and its helm-install Job completed, it re-runs that
+  Job (the lever `spatiumddi-helm-stuck-recover` already uses; a
+  running or retrying Job is left to helm-controller), waits up to
+  3 min for the class, then re-queues every ReplicaSet, StatefulSet and
   DaemonSet in `spatium` with a metadata-only annotation so the
   creates the apiserver refused are retried now rather than on the
   controllers' exponential backoff (up to ~16 min). Releasing the
