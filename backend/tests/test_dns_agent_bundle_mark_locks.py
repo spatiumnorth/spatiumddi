@@ -210,3 +210,43 @@ async def test_a_savepoint_release_takes_no_server_row_lock(db_session: AsyncSes
         assert await _seq(db_session, server_id) == before + 1
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_mark_that_fails_fails_the_write_at_flush_and_at_commit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #1122 review's item 7, under the collect-then-bump split: a change
+    must never commit without its bump. A resolve that fails at the flush
+    raises out of the flush; a bump that fails in ``before_commit`` raises out
+    of the commit, and the change is not in the database afterwards."""
+    from app.services.dns import bundle_dirty
+
+    server, zone = await _group(db_session)
+    await db_session.commit()
+    zone_id, server_id = zone.id, server.id
+
+    def _boom(*_a, **_kw):  # noqa: ANN002, ANN003
+        raise RuntimeError("synthetic mark failure")
+
+    monkeypatch.setattr(bundle_dirty, "_resolve", _boom)
+    db_session.add(_record(zone, "at-flush"))
+    with pytest.raises(RuntimeError, match="synthetic mark failure"):
+        await db_session.flush()
+    await db_session.rollback()
+    monkeypatch.undo()
+
+    monkeypatch.setattr(bundle_dirty, "_bump", _boom)
+    db_session.add(_record(await db_session.get(DNSZone, zone_id), "at-commit"))
+    with pytest.raises(RuntimeError, match="synthetic mark failure"):
+        await db_session.commit()
+    await db_session.rollback()
+    monkeypatch.undo()
+
+    names = (
+        (await db_session.execute(select(DNSRecord.name).where(DNSRecord.zone_id == zone_id)))
+        .scalars()
+        .all()
+    )
+    assert names == [], f"a change committed without its bump: {names}"
+    assert await _seq(db_session, server_id) >= 1
