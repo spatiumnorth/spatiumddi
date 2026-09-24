@@ -663,7 +663,10 @@ async def agent_config_longpoll(
                 remaining_ops = 0
                 if bundle.ships_ops:
                     ops, remaining_ops = await page_pending_ops(
-                        db, server, up_to=bundle.snapshot_at
+                        db,
+                        server,
+                        up_to=bundle.snapshot_at,
+                        visible_xacts=bundle.visible_xacts,
                     )
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:

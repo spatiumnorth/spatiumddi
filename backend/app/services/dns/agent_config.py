@@ -26,9 +26,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import Boolean, Text, and_, cast, func, literal, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.types import UserDefinedType
 
 from app.config import settings
 from app.core.crypto import decrypt_str
@@ -876,8 +877,63 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     )
 
 
+class _XID8(UserDefinedType[Any]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "xid8"
+
+
+class _PGSnapshot(UserDefinedType[Any]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "pg_snapshot"
+
+
+def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None:
+    """The condition for "a body rendered at this snapshot reflects this op".
+
+    ``visible_xacts`` is the ``pg_current_snapshot()`` the render took before
+    it read anything (``agent_bundle_render``): an op whose transaction is
+    visible in it had committed before the render's records query began,
+    and under READ COMMITTED that query's own, later snapshot sees at least
+    as much, so the body carries the op's record. ``created_at`` cannot say
+    that: it is ``now()``, the op's transaction START, and a bulk write that
+    started before the render and committed after its records query passes
+    ``created_at <= snapshot_at`` with records the body never read.
+
+    An op queued before ``dns_record_op.xact_id`` existed (NULL), and every op
+    against a bundle rendered before ``visible_xacts`` existed, keep that time
+    gate. So does any pair this cluster cannot compare: a transaction id or a
+    snapshot it has not reached yet can only have come from another cluster
+    (both tables are in the DNS backup section, and a restore onto a new
+    appliance starts its transaction ids afresh), where the ids mean nothing
+    here. ``None`` when neither bound is given (no gate).
+    """
+    if visible_xacts is None:
+        return None if up_to is None else DNSRecordOp.created_at <= up_to
+    xid = cast(cast(DNSRecordOp.xact_id, Text), _XID8())
+    snapshot = cast(literal(visible_xacts, Text), _PGSnapshot())
+    reached = func.pg_snapshot_xmax(func.pg_current_snapshot())
+    comparable = and_(
+        DNSRecordOp.xact_id.is_not(None),
+        xid < reached,
+        func.pg_snapshot_xmax(snapshot) <= reached,
+    )
+    visible = func.pg_visible_in_snapshot(xid, snapshot, type_=Boolean)
+    by_time: Any = not_(comparable)
+    if up_to is not None:
+        by_time = and_(by_time, DNSRecordOp.created_at <= up_to)
+    return or_(and_(comparable, visible), by_time)
+
+
 async def retire_queued_ops(
-    db: AsyncSession, server: DNSServer, *, up_to: datetime | None = None
+    db: AsyncSession,
+    server: DNSServer,
+    *,
+    up_to: datetime | None = None,
+    visible_xacts: str | None = None,
 ) -> int:
     """Split-horizon: retire this server's queued ops as ``applied``.
 
@@ -890,16 +946,21 @@ async def retire_queued_ops(
     up in ``pending``. A sibling view's op the sweep would otherwise leave
     behind is covered by ``record_ops.sweep_zone_ops``.
 
-    #1111 — ``up_to`` is the render's snapshot: only ops created at or
-    before it are retired, so an op that landed mid-render is never marked
-    applied by a body that did not see its record.
+    #1111 — only the ops the render's snapshot covers are retired
+    (``_covered_by``: committed before the render read), so an op whose
+    transaction was still open when the render read is never marked applied
+    by a body that did not see its record. That was reachable by time alone:
+    a bulk write that started before the render and committed after its
+    records query had ``created_at`` inside the window, and its ops were
+    retired unseen — and an ACME DNS-01 wait read them as applied.
     """
     conds: list[Any] = [
         DNSRecordOp.server_id == server.id,
         DNSRecordOp.state.in_(QUEUED_OP_STATES),
     ]
-    if up_to is not None:
-        conds.append(DNSRecordOp.created_at <= up_to)
+    covered = _covered_by(up_to, visible_xacts)
+    if covered is not None:
+        conds.append(covered)
     stale_ops = (await db.execute(select(DNSRecordOp).where(*conds))).scalars().all()
     for op in stale_ops:
         op.state = "applied"
@@ -909,7 +970,11 @@ async def retire_queued_ops(
 
 
 async def page_pending_ops(
-    db: AsyncSession, server: DNSServer, *, up_to: datetime | None = None
+    db: AsyncSession,
+    server: DNSServer,
+    *,
+    up_to: datetime | None = None,
+    visible_xacts: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
 
@@ -936,21 +1001,24 @@ async def page_pending_ops(
     Issue #182: nothing ships while the server is in operator-set
     maintenance mode; ops accumulate in ``pending`` and ship on resume.
 
-    #1111 — ``up_to`` gates the page to ops created at or before the stored
-    bundle's snapshot. Every body an agent holds must be a superset of every
-    op it has applied, or a later structural re-render (or a restart
-    replaying the cached bundle) drops a record the agent already applied
-    incrementally; the inline build had that by construction because the
-    body was built moments before the page, and this is what keeps it once
-    the body is rendered asynchronously. An op newer than the snapshot rides
-    with the next render — whose dirty mark its own commit already made.
+    #1111 — the page is gated to the ops the stored bundle's snapshot
+    covers (``_covered_by``: committed before its render read; ``up_to`` /
+    ``visible_xacts`` are the bundle's ``snapshot_at`` / ``visible_xacts``).
+    Every body an agent holds must be a superset of every op it has applied,
+    or a later structural re-render (or a restart replaying the cached
+    bundle) drops a record the agent already applied incrementally; the
+    inline build had that by construction because the body was built
+    moments before the page, and this is what keeps it once the body is
+    rendered asynchronously. An op the snapshot does not cover rides with
+    the next render — whose dirty mark its own commit already made.
     """
     if server.maintenance_mode:
         return [], 0
     batch = max(1, int(settings.dns_agent_ops_batch))
     conds: list[Any] = [DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending"]
-    if up_to is not None:
-        conds.append(DNSRecordOp.created_at <= up_to)
+    covered = _covered_by(up_to, visible_xacts)
+    if covered is not None:
+        conds.append(covered)
     op_res = await db.execute(
         select(DNSRecordOp)
         .where(*conds)

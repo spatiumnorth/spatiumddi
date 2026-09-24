@@ -112,6 +112,7 @@ async def store(
     *,
     dirty_watermark: int,
     snapshot_at: datetime,
+    visible_xacts: str | None = None,
     etag: str,
     structural_etag: str,
     ships_ops: bool,
@@ -137,6 +138,7 @@ async def store(
     app_version = settings.version
     payload: dict[str, Any] = {
         "snapshot_at": snapshot_at,
+        "visible_xacts": visible_xacts,
         "etag": etag,
         "structural_etag": structural_etag,
         "ships_ops": ships_ops,

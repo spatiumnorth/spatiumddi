@@ -755,6 +755,8 @@ backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:137
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:138
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:139
 backend/alembic/versions/f3a8c2d491e7_password_policy.py:drop_column:140
+backend/alembic/versions/f3a9d61c07e4_dns_ops_covered_by_commit.py:drop_column:57
+backend/alembic/versions/f3a9d61c07e4_dns_ops_covered_by_commit.py:drop_column:58
 backend/alembic/versions/f3b6d914c072_dns_server_daemon_version.py:drop_column:46
 backend/alembic/versions/f3b8d21c74ae_dhcp_device_policy.py:drop_table:97
 backend/alembic/versions/f3b8d24a1c70_appliance_evict_requested.py:drop_column:39

@@ -458,6 +458,16 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1111 — the transaction that queued the op (``pg_current_xact_id()``).
+    # ``created_at`` is that transaction's START, so it cannot say whether
+    # the op had committed before a render read its records; visibility of
+    # this id in the render's snapshot can (``agent_config._covered_by``).
+    # NULL on ops queued before the column existed.
+    xact_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        server_default=sa_text("(pg_current_xact_id()::text)::bigint"),
+    )
 
 
 class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
@@ -473,12 +483,12 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
 
     ``body`` is the JSON object WITHOUT ``etag``, ``pending_record_ops`` and
     ``pending_ops_remaining``. Those are per-server, per-poll state and the
-    long-poll splices them in per request — but only ops created at or
-    before ``snapshot_at`` ride with this body. That gate is what keeps the
-    invariant the inline build had by construction: every body an agent
-    holds is a superset of every op it has applied, so a structural
-    re-render (or a restart replaying the cached bundle) can never drop a
-    record the agent already applied incrementally.
+    long-poll splices them in per request — but only ops whose transaction
+    had committed before the render read (``visible_xacts``) ride with this
+    body. That gate is what keeps the invariant the inline build had by
+    construction: every body an agent holds is a superset of every op it has
+    applied, so a structural re-render (or a restart replaying the cached
+    bundle) can never drop a record the agent already applied incrementally.
 
     The last ``settings.dns_agent_bundle_keep_versions`` rows per server
     are kept (the agent's own N-1 rule, #882); older ones are pruned on
@@ -501,8 +511,13 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
         nullable=False,
     )
     dirty_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # DB clock at the start of the render; the ops-page gate.
+    # DB clock at the start of the render; the ops-page gate for ops queued
+    # before ``dns_record_op.xact_id`` existed.
     snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # ``pg_current_snapshot()`` as the render read (its text form): an op is
+    # covered by this body when its ``xact_id`` is visible in it. NULL on
+    # bundles rendered before the column existed (the time gate applies).
+    visible_xacts: Mapped[str | None] = mapped_column(Text, nullable=True)
     etag: Mapped[str] = mapped_column(String(128), nullable=False)
     structural_etag: Mapped[str] = mapped_column(String(128), nullable=False)
     # False under split-horizon (records are structural there and queued
