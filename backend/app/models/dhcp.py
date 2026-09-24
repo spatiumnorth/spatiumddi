@@ -20,7 +20,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -1085,13 +1087,23 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
     still local — so one lease event arrives here twice (once from each
     peer). The scope_id link points to the group-level scope the lease
     matches.
+
+    Identity (#1141): a DHCPv4 lease is its client's MAC; a DHCPv6 lease is
+    its DUID + IAID, and usually carries no MAC at all (Kea records a
+    hardware address only when it can derive one). So ``mac_address`` is
+    nullable, and the CHECK requires one identity or the other — a lease
+    naming neither cannot be matched to anything, renewed, or released.
     """
 
     __tablename__ = "dhcp_lease"
     __table_args__ = (
         Index("ix_dhcp_lease_server_ip", "server_id", "ip_address"),
         Index("ix_dhcp_lease_server_mac", "server_id", "mac_address"),
+        Index("ix_dhcp_lease_server_duid", "server_id", "duid"),
         Index("ix_dhcp_lease_state", "state"),
+        CheckConstraint(
+            "mac_address IS NOT NULL OR duid IS NOT NULL", name="ck_dhcp_lease_identity"
+        ),
     )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
@@ -1105,7 +1117,12 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         nullable=True,
     )
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
-    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    # DHCPv6 client identity (#1141): the DUID in Kea's colon-separated
+    # lowercase hex form (``services.dhcp.normalize.canonical_duid``) and the
+    # IA's IAID. NULL on a v4 lease.
+    duid: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    iaid: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     user_class: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -1165,6 +1182,11 @@ class DHCPLeaseHistory(UUIDPrimaryKeyMixin, Base):
         Index("ix_dhcp_lease_history_ip_address", "ip_address"),
         Index("ix_dhcp_lease_history_mac_address", "mac_address"),
         Index("ix_dhcp_lease_history_server_expired", "server_id", "expired_at"),
+        # Same identity rule as ``dhcp_lease`` (#1141).
+        CheckConstraint(
+            "mac_address IS NOT NULL OR duid IS NOT NULL",
+            name="ck_dhcp_lease_history_identity",
+        ),
     )
 
     server_id: Mapped[uuid.UUID] = mapped_column(
@@ -1178,7 +1200,9 @@ class DHCPLeaseHistory(UUIDPrimaryKeyMixin, Base):
         nullable=True,
     )
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
-    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
+    duid: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    iaid: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

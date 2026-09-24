@@ -43,7 +43,10 @@ def test_role_ports() -> None:
     assert 'udp dport 53 accept comment "role:dns-and-dhcp"' in p.body
     assert "udp dport 67 accept" in p.body
     assert "udp dport 68 accept" in p.body
+    # DHCPv6 (#1139): relayed Relay-Forward and on-link Solicit both land on 547.
+    assert "udp dport 547 accept" in p.body
     assert 53 in p.expected_tcp_ports and 67 in p.expected_udp_ports
+    assert 547 in p.expected_udp_ports
 
 
 # ── Control-plane peer scoping (the #285 hardening) ──────────────────

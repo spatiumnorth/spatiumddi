@@ -84,7 +84,7 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
     "dns-technitium": [53],
-    "dhcp": [67, 68],
+    "dhcp": [67, 68, 547],  # 547: DHCPv6 (#1139)
 }
 _K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
 _K3S_APISERVER_TCP = 6443
