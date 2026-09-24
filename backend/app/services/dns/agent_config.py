@@ -351,6 +351,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # emits a zone-level clause only for a non-None value, because in
             # BIND a zone-level allow-transfer shadows the options one.
             "allow_transfer": getattr(z, "allow_transfer", None),
+            # #1153 — the zone's SOA MNAME / RNAME, and its NS when it has no
+            # NS records of its own. Settable and persisted, never shipped, so
+            # the BIND9 agent served the placeholder ``ns1.<zone>`` (glued to
+            # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
+            "primary_ns": getattr(z, "primary_ns", "") or "",
+            "admin_email": getattr(z, "admin_email", "") or "",
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone

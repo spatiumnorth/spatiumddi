@@ -151,6 +151,28 @@ the formatter handles the rest.
 - **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
   pull path stamped `last_seen_at` on the rows it mirrors; the agent's
   lease-event path never did. Both do now.
+- **A BIND9 zone's apex comes from the zone — its Primary NS, Admin
+  Email and NS records — instead of a name server at 127.0.0.1
+  (#1153).** The BIND9 agent opened every zone file, reverse zones
+  included, with the same apex: `SOA ns1.<zone> admin.<zone>`,
+  `NS ns1.<zone>` and the glue `ns1 A 127.0.0.1`. A zone's
+  `primary_ns` and `admin_email` were stored and editable but never
+  reached the agent, so editing them changed nothing on the wire,
+  and a zone's own NS records were served *beside* `ns1.<zone>`.
+  Every zone therefore told any resolver following its NS set to
+  query loopback. Both fields now reach the agent. The NS set is the
+  zone's own NS records at `@` when it has any (what the delegation
+  wizard copies to the parent); else its Primary NS, when that can
+  resolve (outside the zone, or inside it with an A/AAAA record in
+  the zone); else, as the last resort, the old placeholder — logged
+  as the warning `bind9_zone_apex_ns_is_loopback`. The SOA MNAME is
+  the Primary NS (else the first NS record), the RNAME the Admin
+  Email. The placeholder glue is never served beside an address the
+  zone holds for `ns1` itself. Editing Primary NS or Admin Email
+  bumps the zone's serial, so secondaries transfer the new apex. A
+  zone that sets none of this renders exactly as before; the zone
+  payload gained two fields, so every agent re-renders once after
+  the upgrade and reloads only the zones whose apex changed.
 
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client

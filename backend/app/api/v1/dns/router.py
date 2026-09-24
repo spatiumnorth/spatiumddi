@@ -4748,8 +4748,18 @@ async def update_zone(
         dnssec_flip = "dnssec_sign" if changes["dnssec_enabled"] else "dnssec_unsign"
         if dnssec_flip == "dnssec_sign":
             await _check_driver_gated_operation(dnssec_flip, group_id, db)
+    # #1153 — the agent renders the SOA MNAME / RNAME (and, for a zone with no
+    # NS records of its own, the apex NS) from these two fields. A new apex
+    # served under the old serial never reaches a secondary: it transfers only
+    # when the serial moves.
+    apex_changed = any(
+        k in changes and (changes[k] or "") != (getattr(zone, k) or "")
+        for k in ("primary_ns", "admin_email")
+    )
     for k, v in changes.items():
         setattr(zone, k, v)
+    if apex_changed:
+        bump_zone_serial(zone)
     if dnssec_flip == "dnssec_sign":
         await enqueue_dnssec_op(db, zone, "dnssec_sign")
     elif dnssec_flip == "dnssec_unsign":
