@@ -139,7 +139,7 @@ async def test_with_the_fallback_off_a_missing_bundle_holds_and_the_workers_rend
     await db_session.commit()
 
     # Nothing stored: the render is requested once and the poll holds to
-    # its deadline. Never a stale or improvised 200.
+    # its deadline. Never an improvised 200.
     held = await client.get(CONFIG_URL, headers=headers)
     assert held.status_code == 304
     assert "etag" not in held.headers

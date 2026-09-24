@@ -484,7 +484,7 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
         AGENT_BUNDLE_INLINE_RENDERS.labels(family="dns").inc()
         return outcome.bundle
     await db.refresh(server)
-    return await bundle_store.current(db, server)
+    return await bundle_store.newest(db, server)
 
 
 _INLINE_LOCK_PREFIX = "spatium:bundle:inline:"
@@ -606,25 +606,33 @@ async def agent_config_longpoll(
     saves, compares ``structural_etag``, drains the ops), so nothing on its
     side changes.
 
-    The ops page is gated to the stored bundle's snapshot: an op created
-    after it rides with the next render, whose dirty mark its own commit
-    already made. Every body an agent holds is therefore a superset of
-    every op it has applied — the invariant the inline build had by
-    construction, and what keeps a later structural re-render (or a restart
-    replaying the cached bundle) from dropping a record the agent already
-    applied incrementally.
+    The ops page is gated to what the stored bundle's snapshot covers: an
+    op whose transaction had not committed when its render read rides with
+    the next render, whose dirty mark its own commit made. Every body an
+    agent holds is therefore a superset of every op it has applied — the
+    invariant the inline build had by construction, and what keeps a later
+    structural re-render (or a restart replaying the cached bundle) from
+    dropping a record the agent already applied incrementally.
 
-    A missing or stale bundle is never served: the render is enqueued (the
-    worker coalesces duplicates) and the poll holds on the wake the worker
-    publishes when it lands, 304 at the deadline. While
-    ``settings.dns_agent_bundle_inline_fallback`` is on — the migration
-    release, whose worker may still be one release behind — the api renders
-    it inline instead, exactly the old build, but only where the worker has
-    not (``_inline_eligible``): a bundle stale for longer than
-    ``dns_agent_bundle_inline_fallback_after_seconds``, or a server that has
-    never had one. One attempt per server at a time, none during a failed
-    attempt's backoff, and a failed attempt holds the poll on the worker
-    like the fallback being off.
+    The newest bundle this release stored is served even when changes have
+    been committed since it was rendered (``bundle_store.newest``). Under a
+    write storm marks arrive faster than renders finish, so no render is
+    current until the writes stop; serving only a current one held every
+    agent on its last config for the whole storm. Now each render the
+    worker lands reaches the agents, at most one render behind; that is
+    safe because of the gate above. A bundle that is not current also has
+    its render enqueued (the worker coalesces duplicates), and the poll
+    holds on the wake the worker publishes when one lands. With nothing
+    stored for this release the poll holds, 304 at the deadline.
+
+    While ``settings.dns_agent_bundle_inline_fallback`` is on (the
+    migration release, whose worker may still be one release behind), the
+    api renders inline, exactly the old build, but only where the worker
+    has not (``_inline_eligible``): a bundle stale for longer than
+    ``dns_agent_bundle_inline_fallback_after_seconds``, or a server that
+    has never had one. One attempt per server at a time, none during a
+    failed attempt's backoff, and a failed attempt leaves the poll on the
+    worker's renders like the fallback being off.
     """
     server, _payload = auth
     if server.pending_approval:
@@ -645,17 +653,23 @@ async def agent_config_longpoll(
             # any replica, or the worker's store, is seen here
             # (expire_on_commit=False, no in-loop commit).
             await db.refresh(server)
-            bundle = await bundle_store.current(db, server)
-            if bundle is None:
+            # The newest bundle this release stored, current or not: under a
+            # write storm no render is current until the writes stop, and
+            # each one that lands is served as it lands (docstring).
+            bundle = await bundle_store.newest(db, server)
+            if not bundle_store.is_current(server):
                 if settings.dns_agent_bundle_inline_fallback and not inline_tried:
                     try:
-                        bundle = await _bounded_inline(db, server)
-                        inline_tried = bundle is not None
+                        rendered = await _bounded_inline(db, server)
+                        inline_tried = rendered is not None
+                        if rendered is not None:
+                            bundle = rendered
                     except _InlineRenderFailed:
-                        # Once per poll: hold on the worker's render instead.
+                        # Once per poll: the worker's renders serve it instead.
                         inline_tried = True
                         await db.refresh(server)
-                if bundle is None and not enqueued:
+                        bundle = await bundle_store.newest(db, server)
+                if not enqueued and not bundle_store.is_current(server):
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:

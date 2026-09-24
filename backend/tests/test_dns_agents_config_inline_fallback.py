@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns import agents as agents_api
 from app.config import settings
+from app.core.http_etag import etag_matches
 from app.core.redis_client import make_async_redis
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
 from app.services.dns import agent_bundle_store as store
@@ -192,11 +193,15 @@ async def test_a_bundle_stale_for_less_than_the_bound_is_left_to_the_worker(
     redis_ok: object,
 ) -> None:
     """During a change storm every bundle is stale almost all the time, and
-    the worker renders it within seconds: the api must not build it too."""
+    the worker renders it within seconds: the api must not build it too.
+    Meanwhile the agent gets the worker's newest render (the long-poll serves
+    the newest stored bundle, not only a current one)."""
     server, headers = await _stored_then_marked(db_session)
+    stored_etag = server.bundle_etag
     calls = _count_inline(monkeypatch)
     polled = await client.get(CONFIG_URL, headers=headers)
-    assert polled.status_code == 304, polled.text
+    assert polled.status_code == 200, polled.text
+    assert etag_matches(polled.headers["etag"], stored_etag)
     assert calls == [], "the api built a bundle the worker had just been asked for"
 
 
@@ -302,12 +307,14 @@ async def test_one_inline_attempt_per_server_at_a_time(
     )
     await db_session.commit()
     lock_key = INLINE_LOCK_PREFIX + str(server.id)
+    stored_etag = server.bundle_etag
     rc = redis_ok
     await rc.set(lock_key, "another-replica", ex=60)  # type: ignore[attr-defined]
     try:
         calls = _count_inline(monkeypatch)
         polled = await client.get(CONFIG_URL, headers=headers)
-        assert polled.status_code == 304, polled.text
+        assert polled.status_code == 200, polled.text
+        assert etag_matches(polled.headers["etag"], stored_etag)
         assert calls == []
     finally:
         await rc.delete(lock_key)  # type: ignore[attr-defined]
@@ -333,13 +340,17 @@ async def test_a_failed_inline_attempt_backs_off_every_replica(
     )
     await db_session.commit()
     server_id = str(server.id)
+    stored_etag = server.bundle_etag
     backoff_key = INLINE_BACKOFF_PREFIX + server_id
     rc = redis_ok
     try:
         calls = _count_inline(monkeypatch, fail=True)
         first = await client.get(CONFIG_URL, headers=headers)
         second = await client.get(CONFIG_URL, headers=headers)
-        assert first.status_code == 304 and second.status_code == 304
+        # Both polls get the worker's newest render.
+        assert first.status_code == 200 and second.status_code == 200
+        assert etag_matches(first.headers["etag"], stored_etag)
+        assert etag_matches(second.headers["etag"], stored_etag)
         assert calls == [1], f"{len(calls)} inline attempts across two polls, want 1"
         assert await rc.ttl(backoff_key) > 0  # type: ignore[attr-defined]
     finally:

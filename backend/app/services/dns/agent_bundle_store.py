@@ -86,7 +86,29 @@ def compress_body(body_json: bytes) -> bytes:
 async def current(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     """The stored bundle at the server's watermark, metadata only (the body
     column is deferred), or ``None`` when nothing current is stored."""
-    if server.bundle_watermark is None or not is_current(server):
+    if not is_current(server):
+        return None
+    return await newest(db, server)
+
+
+async def newest(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
+    """The newest bundle this release stored for ``server`` (the one at its
+    watermark), metadata only, whether or not changes have been committed
+    since it was rendered; ``None`` when this release has stored none.
+
+    This, not ``current()``, is what the long-poll serves. Under a write
+    storm marks arrive faster than renders finish, so no render is current
+    until the writes stop, and serving only a current bundle held every
+    agent on its last config for the whole storm: in a 250k-record seed a
+    pool failover waited 339 s to leave ``named`` while 74 renders landed
+    unserved. A stored render is as safe to serve as a current one: its ops
+    page carries only the ops its snapshot covers (``agent_config
+    ._covered_by``), so the body reflects every op shipped with it, and what
+    committed after it rides the next render. A bundle another release
+    rendered is not served (its output may differ from this release's); the
+    sweep re-renders it.
+    """
+    if server.bundle_watermark is None or server.bundle_app_version != settings.version:
         return None
     return (
         await db.execute(
