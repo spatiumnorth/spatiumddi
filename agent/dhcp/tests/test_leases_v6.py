@@ -75,7 +75,8 @@ def test_csv_rows_key_on_duid_and_keep_the_mac_only_when_kea_has_one() -> None:
     assert a["mac_address"] == "bc:24:11:41:b7:45"
     assert a["hostname"] == "client1.example.com."
     assert a["state"] == "active"
-    assert a["expires_at"] == a["ends_at"] is not None
+    assert a["ends_at"] is not None
+    assert a["expires_at"] == a["ends_at"]
     b = _parse_row_v6(without_mac)
     assert b is not None
     assert b["mac_address"] is None and b["duid"] and b["iaid"] == 7
