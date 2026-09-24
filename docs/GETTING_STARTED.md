@@ -284,7 +284,7 @@ On the subnet create form:
 
 *What this does: turns a documented subnet into a range the DHCP server actually serves — until now the subnet only exists on paper.*
 
-With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab → **New Scope**. The form pre-fills defaults from Settings (DNS servers, domain, search list, NTP, lease time), so most scopes are a one-click save.
+With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab → **New Scope**. The form pre-fills the subnet's gateway as the router, the defaults from Settings (DNS servers, domain, search list, NTP, lease time) and, on an IPv4 subnet of /28 or larger, a suggested **Initial pool**: a dynamic range from the tenth host address to the last usable one (`.10–.254` on a /24). Most scopes are a one-click save; change or clear the initial pool when part of that range is meant for static addresses.
 
 [Pools](#dhcp-pool) go under scopes:
 - **Dynamic** — handed out to clients.
@@ -293,9 +293,9 @@ With a subnet and a DHCP server group in place, open the subnet → **DHCP** tab
 
 For Windows DHCP servers in Path A (read-only) you can't create scopes from SpatiumDDI — you create them in the Windows DHCP MMC, and SpatiumDDI auto-imports them on the next lease sync.
 
-> **Worked example — Ridgeline College.** On `10.20.21.0/24`, Ridgeline creates one scope, accepts the pre-filled defaults, and defines two pools: a **dynamic** pool `10.20.21.100–10.20.21.199` for staff laptops, and an **excluded** pool `10.20.21.1–10.20.21.9` for network infrastructure. Everything else is left for static allocation in step 10.
+> **Worked example — Ridgeline College.** On `10.20.21.0/24`, Ridgeline creates one scope and accepts the pre-filled defaults except the suggested initial pool: it replaces `10.20.21.10–10.20.21.254` with `10.20.21.100–10.20.21.199`, a **dynamic** pool for staff laptops. Kept as suggested, the pool would take in `10.20.21.10`, the address step 10 gives `print-01`, and that allocation would stop to ask for confirmation. Then **Add Pool** on the new scope creates an **excluded** pool `10.20.21.1–10.20.21.9` for network infrastructure. Everything else is left for static allocation in step 10.
 
-> **How you know it worked:** the scope and its pools are listed on the subnet's DHCP tab, and the subnet's IP grid marks the pool boundaries — allocating inside a dynamic pool is refused, which is the guardrail working as intended.
+> **How you know it worked:** the scope and its pools are listed on the subnet's DHCP tab, and the subnet's IP grid marks the pool boundaries — allocating an address inside the dynamic pool by hand asks you to confirm first: a reminder to pin a matching static reservation on the scope, so the DHCP server doesn't lease that address to another client.
 
 ---
 

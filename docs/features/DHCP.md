@@ -452,8 +452,6 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 `create_static` / `update_static` reject (never silently) on:
 - **Duplicate MAC within the server group** — a MAC can be reserved only once
   across every scope in the same group (409).
-- **IP inside a `dynamic` pool on the scope** — the IP must be excluded from any
-  dynamic pool first (409). (Reserved/excluded pools do not block a static.)
 - **IP outside the scope's subnet** — 422 (issue #619). See §16 for the
   rationale.
 - **A body `scope_id`** — 422 (issue #619). The scope comes from the path on
@@ -462,6 +460,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 - **Malformed hostname** — 422. The reservation hostname is operator-entered,
   so it is validated against the RFC 1123 host rule rather than sanitized (see
   `DNS.md` §18).
+
+An IP inside a `dynamic` pool is **not** a conflict: a reservation there is the
+normal way to pin a device, and every driver honours it (#631; see §16).
 
 ---
 

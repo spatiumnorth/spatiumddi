@@ -306,6 +306,22 @@ the formatter handles the rest.
   `docs/THIRD_PARTY.md`), because #1110's relationship management
   needs it. Kerberos was in the same position (the images carry no
   GSSAPI stack) and is no longer offered — see #1128 under Changed.
+- **The docs still described the pre-#631 dynamic-pool guard
+  (#1162).** Getting Started §9 said allocating inside a dynamic pool
+  "is refused", and IPAM.md's status line and allocation-UI notes said
+  a 422 answers it with the submit button disabled. Since #631 a
+  manual allocation there answers a force-overridable `409`
+  (`requires_confirmation`, a `dynamic_pool` warning naming the pool)
+  and the modal offers **Allocate anyway**; the docs now say so, as
+  IPAM.md's own rules table always did. DHCP.md's conflict list still
+  said a reservation inside a dynamic pool is refused until the pool
+  excludes it — #631 removed that 409, and its "exclude it first"
+  advice was the harmful part; the list now says in-pool reservations
+  are allowed. §9 also says what New Scope pre-fills, including its
+  suggested initial pool (the tenth host address to the last usable
+  one), and its worked example now replaces that suggestion: kept, the
+  dynamic pool would take in `10.20.21.10`, the address step 10
+  allocates, and step 10 would stop to ask for confirmation.
 
 ### Changed
 
