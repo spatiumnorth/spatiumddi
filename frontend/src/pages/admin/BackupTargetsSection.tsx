@@ -13,6 +13,7 @@ import {
   ServerCrash,
   Trash2,
   Wifi,
+  X,
 } from "lucide-react";
 
 import {
@@ -23,6 +24,7 @@ import {
   type BackupTargetKind,
   type BackupTargetUpdate,
 } from "@/lib/api";
+import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 
 /**
@@ -488,12 +490,27 @@ function RestoreFromArchiveModal({
     !restoreMut.isPending &&
     (mode !== "selective" || sections.length > 0);
 
+  const { dialogProps, titleProps } = useModalDialog(onClose);
+
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 text-sm">
-      <div className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-5 shadow-lg">
+      <div
+        {...dialogProps}
+        className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-5 shadow-lg focus:outline-none"
+      >
         <div className="mb-3 flex items-center gap-2">
           <RefreshCw className="h-4 w-4 text-primary" />
-          <h3 className="font-semibold">Restore from archive</h3>
+          <h3 {...titleProps} className="font-semibold">
+            Restore from archive
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close dialog"
+            className="ml-auto rounded p-1 text-muted-foreground hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           {mode === "full" ? (
@@ -739,12 +756,29 @@ function TargetFormModal({
     onError: (err: Error) => setError(err.message || "save failed"),
   });
 
+  const { dialogProps, titleProps } = useModalDialog(onClose);
+
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30">
-      <div className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-5 shadow-lg">
-        <h3 className="mb-3 text-sm font-semibold">
-          {mode === "create" ? "Add backup target" : `Edit "${existing!.name}"`}
-        </h3>
+      <div
+        {...dialogProps}
+        className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-5 shadow-lg focus:outline-none"
+      >
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <h3 {...titleProps} className="text-sm font-semibold">
+            {mode === "create"
+              ? "Add backup target"
+              : `Edit "${existing!.name}"`}
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close dialog"
+            className="rounded p-1 text-muted-foreground hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
 
         <form
           onSubmit={(e) => {

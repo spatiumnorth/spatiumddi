@@ -117,7 +117,7 @@ import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
@@ -7103,12 +7103,14 @@ function DnsSyncModal({
     setter(items.every((k) => set.has(k)) ? new Set() : new Set(items));
   }
 
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
 
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="w-full max-w-[95vw] sm:max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh]"
+        {...dialogProps}
+        className="w-full max-w-[95vw] sm:max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh] focus:outline-none"
         style={dialogStyle}
       >
         <div
@@ -7119,7 +7121,7 @@ function DnsSyncModal({
           )}
         >
           <div>
-            <h2 className="text-base font-semibold">
+            <h2 {...titleProps} className="text-base font-semibold">
               DNS Sync — {scope.label}
             </h2>
             <p className="text-xs text-muted-foreground">
@@ -7131,6 +7133,7 @@ function DnsSyncModal({
           </div>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="rounded p-1 text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />

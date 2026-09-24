@@ -336,6 +336,21 @@ the formatter handles the rest.
   (`usePermissions`, which already gated the address rows). The
   server stays the enforcement point.
 
+- **Every hand-built dialog is announced as a dialog (#1156).**
+  Seventeen dialogs drew their own card instead of using the shared
+  `Modal`: the IPAM tools (Find free space, Split, Merge, Resize, Bulk
+  allocate, Move block, DNS Sync, the address detail, both imports),
+  Factory reset, the backup restore and destination forms, the
+  custom-field and auth-provider editors and the custom-field delete
+  confirm, and the nmap and packet-capture confirms. None had
+  `role="dialog"`, `aria-modal` or an accessible name, their close
+  buttons had no name, and page code that checks for an open dialog
+  could not see them — so **?** opened the shortcuts overlay on top of
+  them. They now take the shared `Modal`'s contract from one hook,
+  `useModalDialog`: named by their heading, modal, focus kept inside,
+  Esc to close, and a named close button (the two backup forms gain
+  one). Their layout is unchanged.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing

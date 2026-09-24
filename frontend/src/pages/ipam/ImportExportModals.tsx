@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import { permissionGate } from "@/hooks/usePermissions";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 
 // ─── Import Modal ────────────────────────────────────────────────────────────
@@ -52,7 +52,8 @@ export function ImportModal({
     blocks: number;
   } | null>(null);
 
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
 
   async function handlePreview() {
     if (!file || !spaceId) return;
@@ -106,7 +107,8 @@ export function ImportModal({
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        {...dialogProps}
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl focus:outline-none"
         style={dialogStyle}
       >
         <div
@@ -116,11 +118,15 @@ export function ImportModal({
             dragHandleProps.className,
           )}
         >
-          <h2 className="flex items-center gap-2 text-base font-semibold">
+          <h2
+            {...titleProps}
+            className="flex items-center gap-2 text-base font-semibold"
+          >
             <Upload className="h-4 w-4" /> Import IPAM data
           </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />
@@ -440,7 +446,8 @@ export function AddressImportModal({
   const [committed, setCommitted] =
     useState<AddressImportCommitResponse | null>(null);
 
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
 
   async function handlePreview() {
     if (!file) return;
@@ -489,7 +496,8 @@ export function AddressImportModal({
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        {...dialogProps}
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl focus:outline-none"
         style={dialogStyle}
       >
         <div
@@ -499,12 +507,16 @@ export function AddressImportModal({
             dragHandleProps.className,
           )}
         >
-          <h2 className="flex items-center gap-2 text-base font-semibold">
+          <h2
+            {...titleProps}
+            className="flex items-center gap-2 text-base font-semibold"
+          >
             <Upload className="h-4 w-4" /> Import IP addresses into{" "}
             <span className="font-mono text-sm">{subnet.network}</span>
           </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />

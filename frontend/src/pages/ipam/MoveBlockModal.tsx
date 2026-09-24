@@ -20,7 +20,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, CheckCircle2, X } from "lucide-react";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import {
@@ -45,7 +45,8 @@ export function MoveBlockModal({
   onCommitted: (result: BlockMoveCommitResponse) => void;
 }) {
   const qc = useQueryClient();
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
 
   const [targetSpaceId, setTargetSpaceId] = useState<string>("");
   const [targetParentId, setTargetParentId] = useState<string | "">("");
@@ -122,8 +123,9 @@ export function MoveBlockModal({
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
+        {...dialogProps}
         style={dialogStyle}
-        className="relative max-h-[90vh] w-full max-w-2xl overflow-hidden rounded-lg border bg-card shadow-xl"
+        className="relative max-h-[90vh] w-full max-w-2xl overflow-hidden rounded-lg border bg-card shadow-xl focus:outline-none"
       >
         <div
           {...dragHandleProps}
@@ -131,12 +133,13 @@ export function MoveBlockModal({
         >
           <div className="flex items-center gap-2">
             <ArrowRight className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">
+            <h2 {...titleProps} className="text-sm font-semibold">
               Move block {block.network}
             </h2>
           </div>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <X className="h-4 w-4" />
