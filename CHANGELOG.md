@@ -24,6 +24,28 @@ the formatter handles the rest.
 
 ### Added
 
+- **DHCPv6 leases reach the control plane (#1141).** Kea's DHCPv6
+  leases never did: the agent tailed `kea-leases4.csv` only and snapshotted
+  with `lease4-get-page` only, and the ingest required a MAC, which is a
+  DHCPv4 identity most DHCPv6 leases don't carry. So a v6 lease was never
+  stored, never mirrored into IPAM ("Seen: Never"), and never produced an
+  AAAA or ip6.arpa PTR. The agent now tails `kea-leases6.csv` and walks
+  `lease6-get-page`, and the ingest keys a v6 lease on **DUID + IAID**:
+  `dhcp_lease.mac_address` is nullable, `duid` / `iaid` are stored, and a
+  CHECK requires one identity or the other. A hardware address Kea learned
+  rides along as enrichment. v6 leases mirror into IPAM and drive DDNS
+  through the same path as v4. Only IA_NA is ingested: IA_TA addresses are
+  short-lived, and an IA_PD lease is a delegated prefix, not a host address
+  (deferred). v6 events travel in batches of their own, so a control plane
+  older than this rejects only the v6 batches it could never ingest and
+  still takes the v4 leases. Every surface that read the lease MAC now
+  copes with there being none: the lease list and history (which show the
+  DUID), the expiry sweep, and the WOL and E911 resolvers. The
+  `find_dhcp_leases` copilot tool returns `duid` / `iaid` and filters on a
+  DUID. Also: a DHCPv6 scope with no domain-search (option 24) now falls
+  back to the scope's domain-name, then the subnet's `domain_name`, exactly
+  as the RA's DNSSL does. Migration `f4c8a2d61b37`.
+
 - **Agents no longer lose what they collected during a control-plane
   outage — stats, logs and Kea lease events are spooled to disk and
   replayed on reconnect (#1077).** Non-negotiable #5 kept the agents
@@ -108,6 +130,27 @@ the formatter handles the rest.
   Real Kerberos support stays on the roadmap as #1128.
 
 ### Fixed
+
+- **Relayed DHCPv6 never reached Kea on the appliance (#1139,
+  #1140).** Two faults in series, so fixing either alone changed nothing.
+  **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
+  has no raw-socket mode, so every DHCPv6 packet hit the `input` chain's
+  drop policy. The role now opens **547** in all three firewall renderers
+  and the builtin DHCP fleet policy (seed migration `e6b2f07a3c91`). The
+  base config gains the host's own DHCPv6-client return
+  (`udp sport 547 dport 546`) beside the v4 one. **The socket:** with
+  `interfaces: ["*"]` kea-dhcp6 binds link-local and `ff02::1:2` only, and
+  a relay sends its Relay-Forward to the server's global address. The Kea
+  agent now adds an `iface/address` entry per stable global IPv6 address
+  on the host, for groups with v6 scopes. The addresses are detected, not
+  configured, because (measured on Kea 3.0.3) an entry naming an address
+  the interface doesn't hold makes kea-dhcp6 refuse its whole config. For
+  the same reason the agent re-renders whenever the host's address set
+  changes.
+
+- **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
+  pull path stamped `last_seen_at` on the rows it mirrors; the agent's
+  lease-event path never did. Both do now.
 
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client

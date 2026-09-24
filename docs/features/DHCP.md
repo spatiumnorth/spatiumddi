@@ -153,6 +153,59 @@ scopes; v4 scopes ignore these columns and always serve addresses +
 options. Changing the mode shifts the agent ConfigBundle ETag, so the
 Kea agent re-pulls and re-renders.
 
+#### DHCPv6 behind a relay, the firewall, and v6 leases (issues #1139–#1141)
+
+**Unicast sockets (#1140).** `interfaces: ["*"]` makes kea-dhcp6 bind each
+interface's link-local address and the `ff02::1:2` group, and nothing
+else. A relay does not send there. It sends its Relay-Forward to the server
+address it was configured with, which is a global unicast address, so a
+relayed Solicit reached the NIC and found no socket. When a group has IPv6
+scopes, the Kea agent now adds an `"<iface>/<address>"` entry for each
+stable global IPv6 address it finds on the host (`/proc/net/if_inet6`;
+temporary, deprecated, tentative and dad-failed addresses are skipped). The
+render is `["*", "ens18/2001:db8:87::40"]`: the wildcard sockets stay and
+the unicast one is added.
+
+The addresses are detected, never configured. Measured on kea-dhcp6
+3.0.3: an entry naming an address the interface does not hold makes Kea
+refuse the whole config, which takes DHCPv6 down. So the agent reads them
+immediately before each render, and re-renders when the set changes. The
+bundle ETag cannot see host addresses, so nothing else would. To check a
+node:
+
+```bash
+ss -ulpn6 | grep 547    # expect the global address, not only fe80::…%iface and ff02::1:2
+```
+
+**Firewall (#1139).** The appliance's `dhcp` role opens UDP **547** as well
+as 67/68. Kea's v6 server has no raw-socket mode, so every DHCPv6 packet
+goes through the `input` chain, and without the rule it hit the drop
+policy. The port is always open, not gated on a v6 scope existing:
+nothing in the role assignment carries scope families, and an idle
+kea-dhcp6 answers nothing. The host's own DHCPv6-client return
+(`udp sport 547 dport 546`) is in the base config's floor, next to the v4
+one.
+
+**Leases (#1141).** The agent tails `kea-leases6.csv` beside the v4 file
+and walks `lease6-get-page` on start and after an outage. A v6 lease is
+identified by **DUID + IAID**, so `dhcp_lease.mac_address` is nullable,
+`duid` / `iaid` are stored, and a CHECK requires one identity or the other.
+Kea records a hardware address on a v6 lease only when it can derive one.
+When it does, it rides along as enrichment. v6 leases mirror into IPAM,
+drive DDNS (AAAA + ip6.arpa PTR, through the same path as v4) and satisfy
+`dns_track_dynamic_leases`. Only **IA_NA** is ingested. IA_TA addresses are
+short-lived privacy addresses. An IA_PD lease delegates a *prefix*, which
+is not a host address the mirror can hold, so it is deferred. The agent
+sends v6 events in batches of their own: a control plane older than
+#1141 requires a MAC and 422s a batch containing a MAC-less event. Kept
+apart, the v4 leases beside them still land.
+
+**Domain search (#1141).** A stateful or stateless v6 scope that sets no
+`domain-search` (option 24) now gets one by the same fallback the RA's
+DNSSL uses (`radvd.resolve_dnssl`): the scope's `domain-name`, then the
+subnet's `domain_name`. The two can no longer disagree. A scope's own
+`domain-search` always wins.
+
 ### DHCPPool Model (Dynamic Ranges)
 
 Each scope can have **multiple pools**, each with its own range and optional class restrictions.
@@ -777,6 +830,7 @@ Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server,
 ```
 DHCPLease (not persisted long-term — cached in Redis, written to DB for history)
   ip_address, mac_address, hostname
+  duid, iaid            -- DHCPv6 identity (#1141); mac_address is NULL on most v6 leases
   scope_id, server_id   -- per-server (each Kea owns its own memfile)
   starts_at, ends_at, expires_at
   state: enum(active, expired, released, abandoned)
