@@ -188,3 +188,24 @@ async def test_with_redis_a_concurrent_request_coalesces_and_the_holder_renders_
     finally:
         await client.delete(lock_key, dirty_key, agent_bundles.RENDER_SLOT_KEY)
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_re_renders_a_bundle_from_another_release(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1/0")
+    server, _ = await _agent(db_session)
+    await db_session.commit()
+    assert (await agent_bundles._run(str(server.id)))["status"] == "stored"
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        agent_bundles, "enqueue_render", lambda sid: (captured.append(sid), True)[1]
+    )
+    assert (await agent_bundles._sweep())["stale"] == 0
+
+    monkeypatch.setattr(settings, "version", "next-release")
+    assert (await agent_bundles._sweep())["stale"] == 1
+    assert captured == [str(server.id)]
+    assert (await agent_bundles._run(str(server.id)))["status"] == "stored"

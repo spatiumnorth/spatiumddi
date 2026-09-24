@@ -408,6 +408,16 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     bundle_render_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The release (``settings.version``) that rendered the stored bundle. A
+    # bundle rendered by another release is not current, so an upgrade that
+    # changes the renderer's output re-renders every server once instead of
+    # serving the previous release's bytes until something marks it.
+    bundle_app_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # When the stored bundle first fell behind ``bundle_dirty_seq``: set by
+    # the dirty mark, cleared by a render that catches up, restarted by one
+    # that finishes still behind. NULL while current. The stalled-render
+    # alert measures from here.
+    bundle_dirty_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:
@@ -508,6 +518,10 @@ class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
     render_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     # ``worker`` / ``api`` (the migration-release inline fallback).
     rendered_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    # ``settings.version`` of the process that rendered it.
+    app_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

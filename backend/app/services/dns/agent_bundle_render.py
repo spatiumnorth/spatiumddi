@@ -25,15 +25,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSAgentBundle, DNSServer
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns.agent_config import render_bundle_body, retire_queued_ops
-
-logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)

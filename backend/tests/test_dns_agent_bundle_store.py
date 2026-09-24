@@ -197,3 +197,69 @@ async def test_record_failure_surfaces_on_the_server_row_and_is_cleared_by_a_goo
     await db_session.commit()
     assert server.bundle_render_status == store.RENDER_STATUS_OK
     assert server.bundle_render_error is None
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_rendered_by_another_release_is_not_current_and_is_replaced(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release that changes what the renderer emits must re-render every
+    server once, not serve the previous release's bytes until something
+    unrelated marks it. Same watermark, so the row is replaced in place."""
+    server, _zone = await _agent(db_session, records=3)
+    await db_session.commit()
+    first = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert store.is_current(server)
+
+    monkeypatch.setattr(settings, "version", "next-release")
+    assert not store.is_current(server), "rendered by another release"
+    assert await store.current(db_session, server) is None
+
+    again = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert again.stored, "a different release's row at this watermark is replaced"
+    assert again.watermark == first.watermark
+    assert again.etag == first.etag, "same state, same ETag"
+    assert server.bundle_app_version == "next-release"
+    assert store.is_current(server)
+    rows = (
+        (
+            await db_session.execute(
+                select(DNSAgentBundle).where(DNSAgentBundle.server_id == server.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [r.app_version for r in rows] == ["next-release"]
+
+    # The same release rendering the same watermark again is still a no-op.
+    dup = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_API)
+    await db_session.commit()
+    assert not dup.stored
+
+
+@pytest.mark.asyncio
+async def test_bundle_dirty_at_tracks_how_long_the_stored_bundle_has_been_behind(
+    db_session: AsyncSession,
+) -> None:
+    server, zone = await _agent(db_session, records=3)
+    await db_session.commit()
+    await db_session.refresh(server)
+    assert server.bundle_dirty_at is not None, "marked by the records insert"
+
+    await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert server.bundle_dirty_at is None, "caught up"
+
+    _add_record(db_session, zone, "later")
+    await db_session.commit()
+    await db_session.refresh(server)
+    first_mark = server.bundle_dirty_at
+    assert first_mark is not None
+
+    _add_record(db_session, zone, "later-still")
+    await db_session.commit()
+    await db_session.refresh(server)
+    assert server.bundle_dirty_at == first_mark, "kept across further marks"

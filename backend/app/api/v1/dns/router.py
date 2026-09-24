@@ -83,6 +83,7 @@ from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
@@ -558,6 +559,11 @@ class ServerResponse(BaseModel):
     bundle_render_status: str | None = None
     bundle_render_error: str | None = None
     bundle_render_at: datetime | None = None
+    # The release that rendered the stored bundle (a mismatch with the
+    # running one means the upgrade's re-render is still pending), and when
+    # the stored bundle fell behind — NULL while it is current.
+    bundle_app_version: str | None = None
+    bundle_dirty_at: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -608,6 +614,8 @@ class ServerResponse(BaseModel):
             bundle_render_status=s.bundle_render_status,
             bundle_render_error=s.bundle_render_error,
             bundle_render_at=s.bundle_render_at,
+            bundle_app_version=s.bundle_app_version,
+            bundle_dirty_at=s.bundle_dirty_at,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
@@ -5150,6 +5158,10 @@ async def _replace_update_acl_rows(
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
+    # #1111 — a Core delete is invisible to the bundle dirty-mark listener.
+    # Clearing the ACL to an empty list writes nothing else, so without this
+    # the agents keep serving the revoked ``allow-update``.
+    await mark_bundles_dirty(db, zone_ids=[zone.id])
     for seq, e in enumerate(body.entries):
         db.add(
             DNSZoneUpdateAcl(

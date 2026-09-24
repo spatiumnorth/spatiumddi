@@ -13,7 +13,11 @@ Two integers on ``dns_server`` decide whether a stored bundle is current
 (``is_current``): ``bundle_dirty_seq`` is bumped in the transaction of
 every change that feeds the bundle (``services.dns.bundle_dirty``), and
 ``bundle_watermark`` is the sequence the newest stored bundle was rendered
-at. No assembly and no content hash are involved in that check.
+at. No assembly and no content hash are involved in that check. The bundle
+must also have been rendered by the running release
+(``bundle_app_version``): what the renderer emits changes between releases,
+and a bundle rendered by the previous one would otherwise be served until
+something unrelated marked the server.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,9 +51,12 @@ _MAX_ERROR = 2000
 
 
 def is_current(server: DNSServer) -> bool:
-    """True when the newest stored bundle reflects every change made so far."""
+    """True when the newest stored bundle reflects every change made so far
+    and was rendered by the running release."""
     return (
-        server.bundle_watermark is not None and server.bundle_watermark >= server.bundle_dirty_seq
+        server.bundle_watermark is not None
+        and server.bundle_watermark >= server.bundle_dirty_seq
+        and server.bundle_app_version == settings.version
     )
 
 
@@ -86,6 +93,7 @@ async def current(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
             select(DNSAgentBundle).where(
                 DNSAgentBundle.server_id == server.id,
                 DNSAgentBundle.dirty_watermark == server.bundle_watermark,
+                DNSAgentBundle.app_version == settings.version,
             )
         )
     ).scalar_one_or_none()
@@ -115,34 +123,41 @@ async def store(
     """Insert one rendered bundle and mirror it onto the server row.
 
     Returns ``None`` — and writes nothing — when a row for
-    ``(server, dirty_watermark)`` already exists: a concurrent render (two
-    api replicas building inline, or the api racing the worker during the
-    migration release) simply lost, and the caller serves the row that
-    won. The mirror columns only ever move forward, so a slow render that
-    finishes after a newer one cannot roll the served bundle back. The
-    render counter is incremented in SQL so it is exact under that race.
+    ``(server, dirty_watermark)`` rendered by this release already exists:
+    a concurrent render (two api replicas building inline, or the api
+    racing the worker during the migration release) simply lost, and the
+    caller serves the row that won. A row at that watermark rendered by a
+    DIFFERENT release is replaced in place — that is the re-render an
+    upgrade forces. The mirror columns only ever move forward, so a slow
+    render that finishes after a newer one cannot roll the served bundle
+    back. The render counter is incremented in SQL so it is exact under
+    that race.
     """
     body_gz = compress_body(body_json)
+    app_version = settings.version
+    payload: dict[str, Any] = {
+        "snapshot_at": snapshot_at,
+        "etag": etag,
+        "structural_etag": structural_etag,
+        "ships_ops": ships_ops,
+        "body": body_gz,
+        "body_bytes": len(body_json),
+        "body_gzip_bytes": len(body_gz),
+        "records": records,
+        "render_ms": render_ms,
+        "rendered_by": rendered_by,
+        "app_version": app_version,
+    }
+    insert_stmt = pg_insert(DNSAgentBundle).values(
+        id=uuid.uuid4(), server_id=server.id, dirty_watermark=dirty_watermark, **payload
+    )
     inserted = (
         await db.execute(
-            pg_insert(DNSAgentBundle)
-            .values(
-                id=uuid.uuid4(),
-                server_id=server.id,
-                dirty_watermark=dirty_watermark,
-                snapshot_at=snapshot_at,
-                etag=etag,
-                structural_etag=structural_etag,
-                ships_ops=ships_ops,
-                body=body_gz,
-                body_bytes=len(body_json),
-                body_gzip_bytes=len(body_gz),
-                records=records,
-                render_ms=render_ms,
-                rendered_by=rendered_by,
-            )
-            .on_conflict_do_nothing(constraint="uq_dns_agent_bundle_server_watermark")
-            .returning(DNSAgentBundle.id, DNSAgentBundle.built_at)
+            insert_stmt.on_conflict_do_update(
+                constraint="uq_dns_agent_bundle_server_watermark",
+                set_={**payload, "built_at": func.now()},
+                where=DNSAgentBundle.app_version != insert_stmt.excluded.app_version,
+            ).returning(DNSAgentBundle.id, DNSAgentBundle.built_at)
         )
     ).one_or_none()
     if inserted is None:
@@ -179,6 +194,15 @@ async def store(
             bundle_etag=etag,
             bundle_built_at=built_at,
             bundle_rendered_by=rendered_by,
+            bundle_app_version=app_version,
+            # Caught up: nothing is waiting. Still behind — changes landed
+            # while this render ran — restart the clock from now, so the
+            # stalled-render alert measures time without a render landing,
+            # not the length of a write storm that renders keep up with.
+            bundle_dirty_at=case(
+                (DNSServer.bundle_dirty_seq <= dirty_watermark, None),
+                else_=func.now(),
+            ),
         )
     )
     await prune(db, server.id)
@@ -197,8 +221,12 @@ async def store(
         render_ms=render_ms,
         rendered_by=rendered_by,
     )
-    row = await db.get(DNSAgentBundle, new_id)
-    assert row is not None  # just inserted in this transaction
+    # populate_existing: a re-render by another release REPLACES the row in
+    # place (same id), and an instance of the old one may already sit in
+    # this session's identity map — returned as-is it would carry the old
+    # ETag and snapshot.
+    row = await db.get(DNSAgentBundle, new_id, populate_existing=True)
+    assert row is not None  # just written in this transaction
     return row
 
 

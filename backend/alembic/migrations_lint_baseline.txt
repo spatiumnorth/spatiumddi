@@ -580,6 +580,9 @@ backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:60
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:166
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:167
 backend/alembic/versions/d92f4a18c763_audit_chain_hash.py:drop_column:168
+backend/alembic/versions/d9a4c27e18f3_dns_agent_bundle_app_version.py:drop_column:56
+backend/alembic/versions/d9a4c27e18f3_dns_agent_bundle_app_version.py:drop_column:57
+backend/alembic/versions/d9a4c27e18f3_dns_agent_bundle_app_version.py:drop_column:58
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:338
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:342
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:344

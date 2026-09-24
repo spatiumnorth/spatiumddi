@@ -248,7 +248,15 @@ _AGENT_DAEMON_DEGRADED_GRACE = timedelta(minutes=5)
 # while the config the operator saved is live nowhere until a render
 # succeeds. Severity: warning while a previous bundle is still being served,
 # critical when the server has never had one.
+#
+# It also fires when a render never RAN: changes have waited longer than
+# ``_AGENT_BUNDLE_STALL`` with no render landing (``bundle_dirty_at``). An
+# OOM-killed render, a render slot left held by a dead worker, or a worker
+# that does not consume the ``bundles`` queue never records a failure, so
+# the failure columns alone cannot see the one condition that most needs
+# seeing once the inline fallback is off.
 RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED = "agent_bundle_render_failed"
+_AGENT_BUNDLE_STALL = timedelta(minutes=10)
 
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
@@ -3626,23 +3634,37 @@ async def _matching_agent_daemon_degraded_subjects(
 async def _matching_agent_bundle_render_failed_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
+    now: datetime,
 ) -> list[tuple[str, str, str, str | None]]:
     """``agent_bundle_render_failed`` — every agent-based DNS server whose
-    last bundle render raised (#1111).
+    last bundle render raised, or whose changes have waited longer than
+    ``_AGENT_BUNDLE_STALL`` with no render landing (#1111).
 
-    Reads the ``bundle_render_*`` columns the render writes; no probing.
-    Auto-resolves through ``evaluate_all``'s standard diff the moment a
-    render succeeds (the store clears the columns as a group). NULL is not
-    a match: it means never rendered, which on a fresh install is the
-    state a few seconds before the first render lands.
+    Reads the ``bundle_*`` columns the dirty mark and the render write; no
+    probing. Auto-resolves through ``evaluate_all``'s standard diff the
+    moment a render succeeds (the store clears the failure columns as a
+    group, and clears ``bundle_dirty_at`` once it has caught up). NULL
+    status is not a failure: it means never rendered, which on a fresh
+    install is the state a few seconds before the first render lands — the
+    stall branch is what catches a first render that never comes.
     """
+    from app.drivers.dns import AGENTLESS_DRIVERS  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
     from app.services.dns.agent_bundle_store import RENDER_STATUS_FAILED  # noqa: PLC0415
 
+    stalled_before = now - _AGENT_BUNDLE_STALL
     rows = (
         (
             await db.execute(
-                select(DNSServer).where(DNSServer.bundle_render_status == RENDER_STATUS_FAILED)
+                select(DNSServer).where(
+                    DNSServer.is_enabled.is_(True),
+                    DNSServer.pending_approval.is_(False),
+                    DNSServer.driver.not_in(list(AGENTLESS_DRIVERS)),
+                    or_(
+                        DNSServer.bundle_render_status == RENDER_STATUS_FAILED,
+                        DNSServer.bundle_dirty_at < stalled_before,
+                    ),
+                )
             )
         )
         .scalars()
@@ -3650,7 +3672,6 @@ async def _matching_agent_bundle_render_failed_subjects(
     )
     matches: list[tuple[str, str, str, str | None]] = []
     for row in rows:
-        detail = (row.bundle_render_error or "").strip()
         if row.bundle_watermark is None:
             what = (
                 "has never had a config bundle rendered, so it has nothing to apply "
@@ -3663,10 +3684,20 @@ async def _matching_agent_bundle_render_failed_subjects(
                 "are live nowhere until a render succeeds"
             )
             severity = "warning"
-        message = (
-            f"DNS server '{row.name}': the control plane could not render its config bundle and it {what}."
-            + (f" Render error: {detail}" if detail else "")
-        )
+        if row.bundle_render_status == RENDER_STATUS_FAILED:
+            detail = (row.bundle_render_error or "").strip()
+            message = (
+                f"DNS server '{row.name}': the control plane could not render its "
+                f"config bundle and it {what}." + (f" Render error: {detail}" if detail else "")
+            )
+        else:
+            waited = int((now - row.bundle_dirty_at).total_seconds() // 60)
+            message = (
+                f"DNS server '{row.name}': changes have waited {waited} minutes for a "
+                f"config bundle render that has not landed, and it {what}. Check "
+                "that a worker consumes the 'bundles' queue and that its renders "
+                "are not being killed (memory limit)."
+            )
         matches.append(
             (f"{DNSServer.__tablename__}:{row.id}", f"{row.name} (DNS)", message, severity)
         )
@@ -4929,12 +4960,14 @@ async def seed_agent_bundle_render_failed_alert_rule() -> None:
                 name=_AGENT_BUNDLE_RENDER_FAILED_RULE_NAME,
                 description=(
                     "Fires when the control plane cannot render a DNS agent's config "
-                    "bundle — the mirror image of a rejected apply. The agent keeps "
-                    "serving its last bundle and reports ok for it, so the server "
-                    "looks healthy on every other signal while the configuration "
-                    "saved since is live nowhere. Critical when the server has never "
-                    "had a bundle at all; warning while a previous one is still "
-                    "served. Auto-resolves when a render succeeds."
+                    "bundle — the mirror image of a rejected apply — or when changes "
+                    "have waited 10 minutes with no render landing (no worker "
+                    "consuming the 'bundles' queue, or renders being killed). The "
+                    "agent keeps serving its last bundle and reports ok for it, so the "
+                    "server looks healthy on every other signal while the "
+                    "configuration saved since is live nowhere. Critical when the "
+                    "server has never had a bundle at all; warning while a previous "
+                    "one is still served. Auto-resolves when a render catches up."
                 ),
                 rule_type=RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
                 severity="warning",
@@ -6260,7 +6293,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # a UUID never collide into one event.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:
-                unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule)
+                unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in unrendered]
                 # Same subject shape as agent_config_rejected: the id carries
                 # the table so the two rules' events never collide.

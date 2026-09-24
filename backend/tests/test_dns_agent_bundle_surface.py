@@ -4,8 +4,10 @@ that fires when the control plane could not render one."""
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns.router import ServerResponse
@@ -87,7 +89,7 @@ async def test_the_render_failed_rule_matches_failed_servers_by_severity(
     await store.record_failure(db_session, served.id, "boom-served")
     await db_session.commit()
 
-    matches = await alerts._matching_agent_bundle_render_failed_subjects(db_session, None)  # type: ignore[arg-type]
+    matches = await alerts._matching_agent_bundle_render_failed_subjects(db_session, None, datetime.now(UTC))  # type: ignore[arg-type]
     by_subject = {sid: (msg, sev) for sid, _disp, msg, sev in matches}
     assert set(by_subject) == {f"dns_server:{never.id}", f"dns_server:{served.id}"}
     assert by_subject[f"dns_server:{never.id}"][1] == "critical"
@@ -102,5 +104,42 @@ async def test_the_render_failed_rule_matches_failed_servers_by_severity(
     # A good render clears it — the rule auto-resolves through the diff.
     await render_and_store(db_session, never, rendered_by=store.RENDERED_BY_WORKER)
     await db_session.commit()
-    matches = await alerts._matching_agent_bundle_render_failed_subjects(db_session, None)  # type: ignore[arg-type]
+    matches = await alerts._matching_agent_bundle_render_failed_subjects(db_session, None, datetime.now(UTC))  # type: ignore[arg-type]
     assert {sid for sid, *_ in matches} == {f"dns_server:{served.id}"}
+
+
+@pytest.mark.asyncio
+async def test_the_rule_also_fires_when_changes_wait_with_no_render_landing(
+    db_session: AsyncSession,
+) -> None:
+    """An OOM-killed render, a render slot held by a dead worker, or a worker
+    that does not consume ``bundles`` never records a failure — the bundle
+    just stays behind. That is the case the failure columns cannot see."""
+    stalled = await _agent(db_session)
+    recent = await _agent(db_session)
+    disabled = await _agent(db_session)
+    await db_session.commit()
+    await render_and_store(db_session, stalled, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    now = datetime.now(UTC)
+    long_ago = now - alerts._AGENT_BUNDLE_STALL - timedelta(minutes=1)
+    for srv, since in ((stalled, long_ago), (recent, now), (disabled, long_ago)):
+        await db_session.execute(
+            update(DNSServer)
+            .where(DNSServer.id == srv.id)
+            .values(bundle_dirty_seq=DNSServer.bundle_dirty_seq + 1, bundle_dirty_at=since)
+        )
+    disabled.is_enabled = False
+    await db_session.commit()
+
+    matches = await alerts._matching_agent_bundle_render_failed_subjects(db_session, None, now)  # type: ignore[arg-type]
+    by_subject = {sid: (msg, sev) for sid, _disp, msg, sev in matches}
+    assert set(by_subject) == {f"dns_server:{stalled.id}"}
+    msg, sev = by_subject[f"dns_server:{stalled.id}"]
+    assert sev == "warning", "a previous bundle is still served"
+    assert "bundles" in msg
+
+    # A render that catches up clears it.
+    await render_and_store(db_session, stalled, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert await alerts._matching_agent_bundle_render_failed_subjects(db_session, None, now) == []  # type: ignore[arg-type]

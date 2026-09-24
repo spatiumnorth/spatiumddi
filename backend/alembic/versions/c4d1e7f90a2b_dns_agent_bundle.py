@@ -1,6 +1,6 @@
 """Stored DNS agent config bundles (#1111).
 
-One table and eight columns, all additive; no backfill and no data
+One table and nine columns, all additive; no backfill and no data
 migration. An install upgrades into this with no bundle stored for any
 server, which is also what every existing row means: the long-poll then
 either builds inline once (``dns_agent_bundle_inline_fallback``, the

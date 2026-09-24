@@ -753,6 +753,15 @@ from celery.signals import task_failure  # noqa: E402
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
 
+# #1111 — the after_flush listener that marks DNS agent bundles dirty in the
+# transaction that changes their inputs. It is installed by importing the
+# module, and nothing a worker imports reaches it otherwise (``app.main``
+# does, for the api only). Without it every DNS write a Celery task makes —
+# pool failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync, blocklist
+# refresh — commits unmarked: the stored bundle stays "current" and the new
+# ops are gated out of every ops page, so agents never receive them.
+importlib.import_module("app.services.dns.bundle_dirty")
+
 
 @task_failure.connect
 def _capture_task_failure(
