@@ -180,6 +180,25 @@ the formatter handles the rest.
   neither DNS step; a planned subnet now gets its reverse zone and
   gateway PTR at apply, the same as one created directly.
 
+- **Purging a subnet takes its DNS records off the wire (#1151).** A
+  subnet's addresses cascade away when it is deleted for good, but
+  `dns_record.ip_address_id` is `SET NULL`, and neither Trash purge —
+  **Delete permanently** in Trash, or the daily sweep after the
+  retention window — withdrew anything first. Every A record IPAM had
+  published for those addresses (and their PTRs in a reverse zone a
+  sibling subnet kept, extra-zone records and aliases) stayed in its
+  zone, ownerless, and BIND kept answering for addresses IPAM no
+  longer had. Both paths now withdraw every auto-generated record of
+  the subnet's addresses through the record-op queue before the
+  delete, and wake the agents; the direct permanent delete
+  (`?permanent=true`), which withdrew only each address's primary A,
+  does the same. Only what is really going is touched: records made
+  by hand stay, a sibling subnet's records stay, and a subnet still
+  inside the retention window — or restored from Trash — keeps every
+  record. Records already orphaned by an earlier purge are not swept
+  up automatically; **Sync DNS** on a subnet whose zones hold them
+  lists them as stale and withdraws them.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell
