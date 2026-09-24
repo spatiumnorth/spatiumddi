@@ -454,6 +454,21 @@ the formatter handles the rest.
   default and pins the daily release check and the appliance
   slot-image catalogue to the old path. Update the value, or remove
   the line to take the default.
+  **Pinned releases pull from the old path (#1163).** Every release
+  up to and including `2026.09.04-1` names its images under
+  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
+  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
+  taken from such a tag, or from a checkout older than this change,
+  fails at `docker compose pull` — `git pull` for the current file,
+  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
+  copy. Every published chart version up to and including
+  `2026.9.4-1` defaults to the old path too: install or upgrade those
+  with `--set image.repository=spatiumnorth` plus
+  `dnsAgents.image.repository`,
+  `dnsAgents.flavors.powerdns.repository`,
+  `dnsAgents.flavors.technitium.repository` and
+  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
+  names (the chart README lists them).
 - **The release check reported a permanently up-to-date install when
   its repo had moved.** GitHub answers `301` for a renamed repo, which
   an org rename makes routine — and httpx does not follow redirects by

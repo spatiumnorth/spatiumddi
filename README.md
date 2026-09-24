@@ -1230,6 +1230,8 @@ docker compose up -d                  # recreate api/worker/beat/frontend on the
 
 **Pin to a specific release** (recommended for production — reproducible, no surprise upgrades):
 
+> Pin with the current `docker-compose.yml`: it pulls from `ghcr.io/spatiumnorth/`, where every release tag is published. A copy taken from a release tag up to and including `2026.09.04-1`, or from a checkout older than the organization move (#1100), names `ghcr.io/spatiumddi/` instead, which now answers `denied` — `git pull` first, or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your copy.
+
 ```bash
 # In your .env:
 SPATIUMDDI_VERSION=2026.06.25-1
