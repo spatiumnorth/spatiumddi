@@ -67,6 +67,22 @@ SWEEP_FAILED_BACKOFF = timedelta(minutes=5)
 SWEEP_MAX_PER_TICK = 500
 _CONNECT_TIMEOUT = 2.0
 
+# Release a key only while it still holds this holder's token. A lease can
+# run out under a slow or stalled holder and another render take the key;
+# an unconditional DELETE from the first holder would then free it under
+# the second and let a third start beside it.
+_RELEASE_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+async def _release(client: Any, key: str, value: str) -> None:
+    await client.eval(_RELEASE_IF_OWNER, 1, key, value)
+
+
 TASK_RENDER = "app.tasks.agent_bundles.render_dns_bundle"
 TASK_SWEEP = "app.tasks.agent_bundles.render_missing_sweep"
 
@@ -125,17 +141,21 @@ async def _run(server_id_text: str) -> dict[str, Any]:
     lock_key = RENDER_LOCK_PREFIX + server_id_text
     dirty_key = RENDER_DIRTY_PREFIX + server_id_text
     ttl = max(60, int(settings.dns_agent_bundle_render_lock_seconds))
+    # This render's own token: the lock holds it, the slot holds it with the
+    # server id (so the slot still says whose render holds it).
+    token = uuid.uuid4().hex
+    slot_value = f"{server_id_text}:{token}"
     client = None
     have_lock = False
     have_slot = False
     try:
         client = make_async_redis(settings.redis_url, socket_connect_timeout=_CONNECT_TIMEOUT)
-        if not await client.set(lock_key, "1", nx=True, ex=ttl):
+        if not await client.set(lock_key, token, nx=True, ex=ttl):
             await client.set(dirty_key, "1", ex=ttl)
             return {"status": "coalesced"}
         have_lock = True
-        if not await client.set(RENDER_SLOT_KEY, server_id_text, nx=True, ex=ttl):
-            await client.delete(lock_key)
+        if not await client.set(RENDER_SLOT_KEY, slot_value, nx=True, ex=ttl):
+            await _release(client, lock_key, token)
             return {"status": "deferred"}
         have_slot = True
     except Exception as exc:  # noqa: BLE001 — Redis is advisory here: render anyway
@@ -163,9 +183,9 @@ async def _run(server_id_text: str) -> dict[str, Any]:
         if client is not None:
             try:
                 if have_slot:
-                    await client.delete(RENDER_SLOT_KEY)
+                    await _release(client, RENDER_SLOT_KEY, slot_value)
                 if have_lock:
-                    await client.delete(lock_key)
+                    await _release(client, lock_key, token)
             except Exception:  # noqa: BLE001
                 pass
             try:
