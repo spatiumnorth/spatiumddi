@@ -12,12 +12,17 @@ import type { DaemonStateFields } from "@/lib/api";
  * and before #1067 the control plane dropped the field. This chip is where
  * that state shows.
  *
- * Renders nothing on `ok` and nothing on `null`. `null` means the agent has
- * never reported a daemon state — a pre-#1061 agent, or an agentless driver
- * with no daemon of its own — and that is unknown, not healthy (the #882
- * posture). Anything that is not `ok` renders as not serving: the vocabulary
- * is the agent's, and a word this UI has not seen is still a state the agent
- * chose to report.
+ * Renders only when the server's `daemon_not_serving` is `true`. Never on
+ * `ok`; never on `null` — the agent has never reported a daemon state (a
+ * pre-#1061 agent, or an agentless driver with no daemon of its own), which
+ * is unknown, not healthy (the #882 posture); and never on a `degraded` that
+ * is the agent echoing a failed config apply, which the config-apply chip
+ * already reports at #882's severity — a reverted daemon IS serving. That
+ * reading is the server's (`daemon_state.is_not_serving`), the same one the
+ * `agent_daemon_degraded` rule uses, so the chip and the alert cannot
+ * disagree. Any other word that is not `ok` renders: the vocabulary is the
+ * agent's, and a word this UI has not seen is still a state it chose to
+ * report.
  */
 
 function sinceLabel(since: Date): string {
@@ -47,8 +52,8 @@ export function DaemonStateChip({
   server: Partial<DaemonStateFields>;
   className?: string;
 }) {
-  const status = server.daemon_status;
-  if (!status || status === "ok") return null;
+  if (server.daemon_not_serving !== true) return null;
+  const status = server.daemon_status ?? "not serving";
 
   return (
     <span
@@ -70,8 +75,8 @@ export function DaemonStateBanner({
 }: {
   server: Partial<DaemonStateFields>;
 }) {
-  const status = server.daemon_status;
-  if (!status || status === "ok") return null;
+  if (server.daemon_not_serving !== true) return null;
+  const status = server.daemon_status ?? "not serving";
   const since = server.daemon_status_since
     ? new Date(server.daemon_status_since)
     : null;

@@ -230,7 +230,9 @@ RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
 # ``degraded`` with "start deferred, no bundle yet" on every heartbeat, and
 # the pod restarts on its liveness probe every two minutes), or a Kea whose
 # control socket the DHCP agent cannot reach. Reachability alerting cannot
-# see either: the agent is talking to us perfectly.
+# see either: the agent is talking to us perfectly. Where one rule ends and
+# the other begins is ``daemon_state.is_not_serving`` — the agents echo a
+# failed apply into the daemon field too, and that echo stays #882's.
 #
 # The grace covers a normal first boot. Every fresh member defers its daemon
 # for the seconds it takes the first bundle to land, and reports ``degraded``
@@ -565,10 +567,12 @@ RULE_TYPES = frozenset(
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
+        RULE_TYPE_DHCP_PACKETS_DROPPED,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
+        RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -3546,26 +3550,32 @@ async def _matching_agent_daemon_degraded_subjects(
     now: datetime,
 ) -> list[tuple[str, str, str, str]]:
     """``agent_daemon_degraded`` — every agent-managed server whose agent
-    reports a daemon that is not ``ok``, and has for longer than the grace
+    reports a daemon that is not serving, and has for longer than the grace
     (#1067).
 
     Reads the ``daemon_*`` columns the two heartbeat handlers write; no
-    probing. ``daemon_status_since`` is the stamp of the heartbeat that FIRST
-    reported the current status (it moves only on a status change), so it is
-    the grace clock and no watermark of our own is needed. Auto-resolves
-    through ``evaluate_all``'s standard diff the moment the agent reports
-    ``ok`` again.
+    probing. "Not serving" is ``daemon_state.is_not_serving`` — the same
+    classification the server responses publish as ``daemon_not_serving``,
+    so this rule and the chip cannot disagree. ``daemon_status_since`` is the
+    stamp of the heartbeat that began the current state (a repeated report
+    never moves it), so it is the grace clock and no watermark of our own is
+    needed. Auto-resolves through ``evaluate_all``'s standard diff the moment
+    the agent reports ``ok`` again.
 
     Not a match: NULL (never reported — a pre-#1061 agent or an agentless
     driver; unknown is not an alarm), a row in operator-set maintenance mode
-    (#182: the operator is working on it), and a ``degraded`` whose reason is
-    a config-apply verdict (``config_apply_*``) — the daemon is up, serving
-    its last-known-good config, and #882's rule already carries that with
-    the right severity.
+    (#182: the operator is working on it), and a ``degraded`` that is the
+    agent echoing a failed config apply — ``config_apply_*`` from either
+    agent, or Kea's ``dhcp4_config_rejected`` / ``dhcp6_…`` from the DHCP
+    one. #882's rule already carries each of those, with the severity its
+    verdict deserves; firing here too would page twice for one event.
     """
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
-    from app.services.agents.daemon_state import STATUS_OK  # noqa: PLC0415
+    from app.services.agents.daemon_state import (  # noqa: PLC0415
+        STATUS_OK,
+        is_not_serving,
+    )
 
     matches: list[tuple[str, str, str, str]] = []
     for model, kind in ((DNSServer, "DNS"), (DHCPServer, "DHCP")):
@@ -3583,12 +3593,12 @@ async def _matching_agent_daemon_degraded_subjects(
             .all()
         )
         for row in rows:
+            if not is_not_serving(row.daemon_status, row.daemon_reason):
+                continue
             since = row.daemon_status_since
             if since is None or (now - since) <= _AGENT_DAEMON_DEGRADED_GRACE:
                 continue
             reason = (row.daemon_reason or "").strip()
-            if reason.startswith("config_apply_"):
-                continue
             minutes = int((now - since).total_seconds() // 60)
             message = (
                 f"{kind} server '{row.name}' reports its daemon is "

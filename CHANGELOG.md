@@ -467,27 +467,37 @@ the formatter handles the rest.
 
 - **A DNS or DHCP agent that is up but not serving now shows as such
   (#1067).** The agents have always carried a `daemon` object on every
-  heartbeat — `{"status": "degraded", "reason": "start deferred, no
-  bundle yet"}` while a DNS agent waits for its first bundle (#1061),
-  `ok` once the daemon is up — and both heartbeat handlers declared the
-  field and read nothing from it, so a registered, heartbeating server
-  whose `named` never started read `active`, seen seconds ago, config
-  ok, while its pod restarted on the liveness probe every two minutes
-  (measured for twelve minutes on a nested three-node cluster). The
-  state now lands on `dns_server` / `dhcp_server` as `daemon_status`,
-  `daemon_reason` and `daemon_status_since` (the stamp of the heartbeat
-  that first reported the current status, so the row can say how long),
-  is exposed on both server responses, renders as a chip on the DNS and
-  DHCP server rows and a banner on the server detail, degrades the
-  dashboard's health header, and drives a new `agent_daemon_degraded`
-  alert rule (seeded enabled, critical) once a non-`ok` state has
-  outlasted a five-minute grace. NULL means never reported — a
-  pre-#1061 agent, or an agentless driver — and reads as unknown, never
-  healthy. The DNS agent also now reports `ok` once its daemon is
-  confirmed running instead of an empty object for the life of the
-  process. Migration `b7d21c9e4f06` adds the three nullable columns and
-  a partial index over the unhealthy states to both tables (expand
-  only).
+  heartbeat —
+  `{"status": "degraded", "reason": "start deferred, no bundle yet"}`
+  while a DNS agent waits for its first bundle (#1061), `ok` once the
+  daemon is up — and both heartbeat handlers declared the field and read
+  nothing from it, so a registered, heartbeating server whose `named`
+  never started read `active`, seen seconds ago, config ok, while its pod
+  restarted on the liveness probe every two minutes (measured for twelve
+  minutes on a nested three-node cluster). The state now lands on
+  `dns_server` / `dhcp_server` as `daemon_status`, `daemon_reason` and
+  `daemon_status_since` (the stamp of the heartbeat that began the
+  current state, so the row can say how long), is exposed on both server
+  responses, renders as a chip on the DNS and DHCP server rows and a
+  banner on the server detail, degrades the dashboard's health header,
+  and drives a new `agent_daemon_degraded` alert rule (seeded enabled,
+  critical) once a daemon that is not serving has outlasted a five-minute
+  grace. All of those read one server-side classification,
+  `daemon_not_serving` on both responses: a `degraded` that is the agent
+  echoing a failed config apply (`config_apply_*`, or the DHCP agent's
+  `dhcp4_config_rejected` / `dhcp6_…`) is #882's to report, so it neither
+  pages nor draws a red "not serving" chip beside the config-apply one
+  for a daemon that is up on its last-known-good config. NULL means never
+  reported — a pre-#1061 agent, or an agentless driver — and reads as
+  unknown, never healthy. The DNS agent also now reports `ok` once its
+  daemon is confirmed running instead of an empty object for the life of
+  the process. Migration `b7d21c9e4f06` adds the three nullable columns
+  and a partial index over the unhealthy states to both tables (expand
+  only). `agent_daemon_degraded` and #980's `dhcp_packets_dropped` are
+  also in the rule-type allow-list now: both were seeded and evaluated,
+  but `POST /alerts/rules` refused them with a 422 and the conformity
+  `alert_rule_enabled` check read them as not applicable. A test now
+  fails for the next rule type left out.
 
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed

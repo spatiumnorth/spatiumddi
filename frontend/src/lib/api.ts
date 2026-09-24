@@ -5216,17 +5216,26 @@ export interface ConfigApplyFields {
  * DHCP servers.
  *
  * `daemon_status` is the agent's own word: `ok` while the daemon is up,
- * `degraded` while it is not serving (a DNS agent waiting for its first
- * bundle, a Kea whose control socket is unreachable). Anything that is not
- * `ok` is not serving. `null` means the agent has never reported one — a
+ * `degraded` otherwise — a DNS agent waiting for its first bundle, a Kea
+ * whose control socket is unreachable, or either agent echoing a failed
+ * config apply (#882). `null` means the agent has never reported one — a
  * pre-#1061 agent, or an agentless driver — and renders as unknown, never as
- * healthy. `daemon_status_since` is when the CURRENT status was first
- * reported; it moves only when the status changes.
+ * healthy. `daemon_status_since` is when the CURRENT state began; a repeated
+ * report never moves it.
+ *
+ * `daemon_not_serving` is the server's one reading of the three, and the
+ * field to render from: `true` when the daemon is not serving; `false` on
+ * `ok`, or when the `degraded` is a config-apply echo (the config-apply chip
+ * already shows that, at #882's severity, and a reverted daemon IS serving);
+ * `null` when never reported. Re-deriving "not serving" from `daemon_status`
+ * is what put a red chip on every routine revert while the alert, which
+ * reads the same classification as this field, stayed quiet.
  */
 export interface DaemonStateFields {
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
+  daemon_not_serving: boolean | null;
 }
 
 export interface DNSServer {
@@ -5269,6 +5278,8 @@ export interface DNSServer {
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7998,6 +8009,8 @@ export interface DHCPServer {
   daemon_status: string | null;
   daemon_reason: string | null;
   daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;

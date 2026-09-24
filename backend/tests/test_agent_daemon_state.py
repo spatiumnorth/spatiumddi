@@ -11,8 +11,10 @@ config ok, for as long as it took someone to look at the pod.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +29,8 @@ from app.services.agents.daemon_state import (
     STATUS_DEGRADED,
     STATUS_OK,
     apply_reported_daemon_state,
+    is_config_apply_verdict,
+    is_not_serving,
     is_unhealthy,
 )
 from app.services.alerts import _matching_agent_daemon_degraded_subjects
@@ -70,9 +74,11 @@ def test_an_empty_report_leaves_the_last_known_state_alone() -> None:
     assert row.daemon_status_since == _T0
 
 
-def test_since_moves_only_when_the_status_changes() -> None:
-    """The stamp means 'since this status', not 'last reported': a heartbeat
-    every 30 s must not keep resetting the clock the alert reads."""
+def test_since_moves_only_when_the_state_changes() -> None:
+    """The stamp means 'since this state', not 'last reported': a heartbeat
+    every 30 s must not keep resetting the clock the alert reads, and nor
+    must a newer reason for the same state. The same ``degraded`` crossing
+    from not serving to a config-apply echo IS a new state."""
     row = _row()
     _report(row, DEFERRED)
     _report(row, DEFERRED, at=_T0 + timedelta(minutes=5))
@@ -82,10 +88,29 @@ def test_since_moves_only_when_the_status_changes() -> None:
         {"status": STATUS_DEGRADED, "reason": "config_apply_reverted: boom"},
         at=_T0 + timedelta(minutes=6),
     )
-    assert row.daemon_status_since == _T0  # same status, newer reason
+    assert row.daemon_status_since == _T0 + timedelta(minutes=6)
     assert row.daemon_reason == "config_apply_reverted: boom"
-    _report(row, {"status": STATUS_OK}, at=_T0 + timedelta(minutes=7))
-    assert row.daemon_status_since == _T0 + timedelta(minutes=7)
+    _report(
+        row,
+        {"status": STATUS_DEGRADED, "reason": "config_apply_revert_failed: boom"},
+        at=_T0 + timedelta(minutes=7),
+    )
+    assert row.daemon_status_since == _T0 + timedelta(minutes=6)  # another echo, same state
+    _report(row, {"status": STATUS_OK}, at=_T0 + timedelta(minutes=8))
+    assert row.daemon_status_since == _T0 + timedelta(minutes=8)
+
+
+def test_a_deferral_after_an_old_revert_starts_its_own_clock() -> None:
+    """What the state clock is for. A row that has echoed a revert for hours
+    and then defers its start (a restart with no rendered config) must not
+    inherit the revert's start time: the alert would skip its grace and page
+    the moment a normal first boot began, quoting hours it never lasted."""
+    row = _row()
+    _report(row, {"status": STATUS_DEGRADED, "reason": "config_apply_reverted: boom"})
+    later = _T0 + timedelta(hours=3)
+    _report(row, DEFERRED, at=later)
+    assert row.daemon_status == STATUS_DEGRADED
+    assert row.daemon_status_since == later
 
 
 def test_ok_clears_the_reason() -> None:
@@ -98,13 +123,15 @@ def test_ok_clears_the_reason() -> None:
 
 def test_a_word_this_control_plane_has_not_seen_is_still_stored() -> None:
     """Unlike #882's closed vocabulary, a daemon status is a health signal and
-    anything but ``ok`` reads as not serving. Hiding a newer agent's word
-    behind the last known state would recreate the gap for the next word."""
+    anything but ``ok`` reads as not serving (short of a config-apply echo,
+    which is #882's). Hiding a newer agent's word behind the last known
+    state would recreate the gap for the next word."""
     row = _row()
     _report(row, {"status": STATUS_OK})
     _report(row, {"status": "down", "reason": "named exited 1"}, at=_T0 + timedelta(minutes=1))
     assert row.daemon_status == "down"
     assert is_unhealthy(row.daemon_status)
+    assert is_not_serving(row.daemon_status, row.daemon_reason) is True
     assert row.daemon_status_since == _T0 + timedelta(minutes=1)
 
 
@@ -119,6 +146,67 @@ def test_null_is_unknown_not_unhealthy() -> None:
     assert not is_unhealthy(None)
     assert not is_unhealthy(STATUS_OK)
     assert is_unhealthy(STATUS_DEGRADED)
+
+
+# ── not serving vs a config-apply echo ────────────────────────────────────
+
+# Every daemon ``reason`` the two agents send, spelled as their sources spell
+# it (pinned by ``test_the_classifier_matches_what_the_agents_actually_send``).
+# ``True`` = the agent echoing a failed config apply, which is #882's to report.
+_AGENT_REASONS = [
+    ("start deferred, no bundle yet", False),  # dns supervisor.py
+    ("config_apply_reverted: named-checkconf failed", True),  # dns + dhcp sync.py
+    ("config_apply_revert_failed: rndc reconfig failed", True),  # dns sync.py
+    ("config_apply_no_previous: named-checkconf failed", True),  # dns sync.py
+    ("dhcp4_config_rejected: pool 10.0.0.0/24 is not part of the subnet", True),
+    ("dhcp6_config_rejected: unknown option", True),
+    ("dhcp4_socket_unreachable: [Errno 111] Connection refused", False),
+    ("dhcp6_socket_unreachable: [Errno 2] No such file or directory", False),
+]
+
+
+@pytest.mark.parametrize(("reason", "echo"), _AGENT_REASONS)
+def test_a_config_apply_echo_is_told_apart_from_a_daemon_that_is_down(
+    reason: str, echo: bool
+) -> None:
+    assert is_config_apply_verdict(reason) is echo
+    assert is_not_serving(STATUS_DEGRADED, reason) is (not echo)
+
+
+def test_not_serving_is_unknown_on_null_and_matches_only_a_leading_echo() -> None:
+    assert is_not_serving(None, None) is None
+    assert is_not_serving(STATUS_OK, None) is False
+    assert is_not_serving("down", None) is True  # a word we have never seen
+    assert is_not_serving(STATUS_DEGRADED, "") is True
+    # Only the agent's own prefix counts; a reason that merely mentions one
+    # is still a daemon that is not serving.
+    assert is_not_serving(STATUS_DEGRADED, "waiting after config_apply_reverted: x") is True
+
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def test_the_classifier_matches_what_the_agents_actually_send() -> None:
+    """``is_config_apply_verdict`` parses text two other packages write, so
+    pin their spellings: an agent that rewords a reason must fail here, not
+    quietly turn every routine revert back into a critical 'not serving'
+    page — or hide a daemon that really is down."""
+    dns = _REPO / "agent" / "dns" / "spatium_dns_agent"
+    dhcp = _REPO / "agent" / "dhcp" / "spatium_dhcp_agent"
+    if not dns.is_dir() or not dhcp.is_dir():
+        pytest.skip("agent sources are not in this checkout (the api image ships backend/)")
+    dns_sync = (dns / "sync.py").read_text()
+    dhcp_sync = (dhcp / "sync.py").read_text()
+    assert '"reason": "start deferred, no bundle yet"' in (dns / "supervisor.py").read_text()
+    assert '"reason": f"config_apply_{status.status}: {status.error}"' in dns_sync
+    assert '"reason": f"config_apply_reverted: {truncate_error(str(cause))}"' in dhcp_sync
+    assert '"reason": f"{daemon}_config_rejected: {last_err}"' in dhcp_sync
+    assert '"reason": f"{daemon}_socket_unreachable: {last_err}"' in dhcp_sync
+    daemons = re.findall(r'_reload_socket\(\s*[^,]+,\s*[^,]+,\s*"(\w+)"', dhcp_sync)
+    assert sorted(daemons) == ["dhcp4", "dhcp6"]
+    for pkg in (dns, dhcp):  # the vocabulary behind ``status.status``
+        verdicts = re.findall(r'^STATUS_\w+ = "(\w+)"', (pkg / "config_apply.py").read_text(), re.M)
+        assert sorted(verdicts) == ["no_previous", "ok", "revert_failed", "reverted"]
 
 
 # ── the heartbeat handlers, both families ─────────────────────────────────
@@ -212,7 +300,10 @@ async def test_dhcp_heartbeat_persists_the_daemon_state(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     server, headers = await _dhcp_agent(db_session)
-    degraded = {"status": "degraded", "reason": "kea-dhcp4_socket_unreachable: refused"}
+    degraded = {
+        "status": "degraded",
+        "reason": "dhcp4_socket_unreachable: [Errno 111] Connection refused",
+    }
 
     resp = await client.post(
         "/api/v1/dhcp/agents/heartbeat",
@@ -224,7 +315,7 @@ async def test_dhcp_heartbeat_persists_the_daemon_state(
     assert resp.status_code == 200, resp.text
     await db_session.refresh(server)
     assert server.daemon_status == STATUS_DEGRADED
-    assert server.daemon_reason == "kea-dhcp4_socket_unreachable: refused"
+    assert server.daemon_reason == "dhcp4_socket_unreachable: [Errno 111] Connection refused"
     assert server.daemon_status_since is not None
 
     resp = await client.post(
@@ -245,7 +336,7 @@ def _stamped(server: object) -> None:
             setattr(server, attr, uuid.uuid4() if attr == "id" else _T0)
 
 
-def test_dns_server_response_exposes_the_daemon_state() -> None:
+def _dns_model(**daemon: object) -> DNSServer:
     s = DNSServer(
         group_id=uuid.uuid4(),
         name="ns1",
@@ -261,19 +352,13 @@ def test_dns_server_response_exposes_the_daemon_state() -> None:
         maintenance_mode=False,
         is_trial_boot=False,
         reboot_requested=False,
-        daemon_status=STATUS_DEGRADED,
-        daemon_reason="start deferred, no bundle yet",
-        daemon_status_since=_T0,
+        **daemon,
     )
     _stamped(s)
-    out = DNSServerResponse.from_model(s)
-    assert out.daemon_status == STATUS_DEGRADED
-    assert out.daemon_reason == "start deferred, no bundle yet"
-    assert out.daemon_status_since == _T0
-    assert out.model_dump()["daemon_status"] == STATUS_DEGRADED
+    return s
 
 
-def test_dhcp_server_response_exposes_the_daemon_state() -> None:
+def _dhcp_model(**daemon: object) -> DHCPServer:
     s = DHCPServer(
         name="kea1",
         description="",
@@ -287,15 +372,57 @@ def test_dhcp_server_response_exposes_the_daemon_state() -> None:
         maintenance_mode=False,
         is_trial_boot=False,
         reboot_requested=False,
-        daemon_status=STATUS_OK,
-        daemon_reason=None,
-        daemon_status_since=_T0,
+        **daemon,
     )
     _stamped(s)
+    return s
+
+
+def test_dns_server_response_exposes_the_daemon_state() -> None:
+    s = _dns_model(
+        daemon_status=STATUS_DEGRADED,
+        daemon_reason="start deferred, no bundle yet",
+        daemon_status_since=_T0,
+    )
+    out = DNSServerResponse.from_model(s)
+    assert out.daemon_status == STATUS_DEGRADED
+    assert out.daemon_reason == "start deferred, no bundle yet"
+    assert out.daemon_status_since == _T0
+    assert out.daemon_not_serving is True
+    assert out.model_dump()["daemon_status"] == STATUS_DEGRADED
+
+
+def test_dhcp_server_response_exposes_the_daemon_state() -> None:
+    s = _dhcp_model(daemon_status=STATUS_OK, daemon_reason=None, daemon_status_since=_T0)
     out = DHCPServerResponse.from_model(s)
     assert out.daemon_status == STATUS_OK
     assert out.daemon_reason is None
     assert out.daemon_status_since == _T0
+    assert out.daemon_not_serving is False
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        (None, None, None),  # never reported: unknown, not healthy, not an alarm
+        (STATUS_OK, None, False),
+        (STATUS_DEGRADED, "start deferred, no bundle yet", True),
+        (STATUS_DEGRADED, "dhcp4_socket_unreachable: [Errno 111] Connection refused", True),
+        (STATUS_DEGRADED, "config_apply_reverted: named-checkconf failed", False),
+        (STATUS_DEGRADED, "dhcp4_config_rejected: bad pool", False),
+    ],
+)
+def test_both_responses_publish_the_one_not_serving_reading(
+    status: str | None, reason: str | None, expected: bool | None
+) -> None:
+    """The chip, the banner and the dashboard read ``daemon_not_serving``
+    instead of re-deriving it from ``daemon_status`` — the re-derivation is
+    what put a red 'not serving' chip on every routine revert while the alert
+    (correctly) stayed quiet."""
+    dns = DNSServerResponse.from_model(_dns_model(daemon_status=status, daemon_reason=reason))
+    dhcp = DHCPServerResponse.from_model(_dhcp_model(daemon_status=status, daemon_reason=reason))
+    assert dns.daemon_not_serving is expected
+    assert dhcp.daemon_not_serving is expected
 
 
 # ── the alert matcher ─────────────────────────────────────────────────────
@@ -376,13 +503,30 @@ async def test_matcher_ignores_ok_null_maintenance_and_config_apply_verdicts(
         daemon_status_since=old,
         maintenance_mode=True,
     )
-    # A failed apply is #882's alarm, with #882's severity: the daemon is up,
-    # serving the previous config, and the DNS agent still says ``degraded``.
+    # A failed apply is #882's alarm, at the severity #882 gives its verdict —
+    # whichever verdict it was, and however each agent spells the echo. Firing
+    # here as well would page twice for one event.
     await _dns_server(
         db_session,
         "ns-reverted",
         daemon_status=STATUS_DEGRADED,
         daemon_reason="config_apply_reverted: named-checkconf failed",
+        daemon_status_since=old,
+    )
+    await _dns_server(
+        db_session,
+        "ns-no-previous",
+        daemon_status=STATUS_DEGRADED,
+        daemon_reason="config_apply_no_previous: named-checkconf failed",
+        daemon_status_since=old,
+    )
+    # The DHCP agent leaves Kea's refusal in place when there is nothing to
+    # roll back to (no_previous) or the rollback fails too (revert_failed).
+    await _dhcp_server(
+        db_session,
+        "kea-rejected",
+        daemon_status=STATUS_DEGRADED,
+        daemon_reason="dhcp4_config_rejected: pool 10.0.0.0/24 is not part of the subnet",
         daemon_status_since=old,
     )
     assert await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now) == []
@@ -395,7 +539,7 @@ async def test_matcher_spans_both_families(db_session: AsyncSession) -> None:
         db_session,
         "kea-dark",
         daemon_status=STATUS_DEGRADED,
-        daemon_reason="kea-dhcp4_socket_unreachable: refused",
+        daemon_reason="dhcp4_socket_unreachable: [Errno 111] Connection refused",
         daemon_status_since=now - timedelta(minutes=9),
     )
     matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, now)

@@ -549,6 +549,7 @@ function AttentionAgentsPanel({
     config_apply_error?: string | null;
     daemon_status?: string | null;
     daemon_reason?: string | null;
+    daemon_not_serving?: boolean | null;
   }[];
   dnsGroups: DNSServerGroup[];
   dhcpGroups: DHCPServerGroup[];
@@ -625,6 +626,7 @@ function AttentionAgentsPanel({
                     error={s.config_apply_error}
                   />
                   <DaemonChip
+                    notServing={s.daemon_not_serving ?? null}
                     status={s.daemon_status ?? null}
                     reason={s.daemon_reason}
                   />
@@ -1723,10 +1725,12 @@ export function DashboardPage() {
   // #1067 — an agent whose daemon is not serving keeps heartbeating too, so
   // ``status`` and the last-seen stamp read normal while it answers nothing
   // (a DNS agent waiting for a bundle that never comes). The agent says so
-  // on every heartbeat; that report degrades the header. NULL is UNKNOWN,
-  // never ok — and, as for the config verdict, not counted as a failure.
+  // on every heartbeat; that report degrades the header. Read from the
+  // server's ``daemon_not_serving``, not ``daemon_status``: a ``degraded``
+  // that echoes a failed apply is already counted above as a config
+  // failure, and NULL is UNKNOWN — never ok, and not a failure either.
   const daemonDegradedServers = supervisedServers.filter(
-    (s) => s.daemon_status != null && s.daemon_status !== "ok",
+    (s) => s.daemon_not_serving === true,
   ).length;
   // The actual offenders, not just how many. "4 agents needing attention"
   // that navigates to a page which does not name those four is the same
@@ -1739,7 +1743,7 @@ export function DashboardPage() {
       s.status === "unreachable" ||
       s.status === "error" ||
       (s.config_apply_status != null && s.config_apply_status !== "ok") ||
-      (s.daemon_status != null && s.daemon_status !== "ok"),
+      s.daemon_not_serving === true,
   );
 
   const degraded =
@@ -1753,8 +1757,10 @@ export function DashboardPage() {
     : warning > 0
       ? "near capacity"
       : "healthy";
-  // The label is a rollup of four unrelated things; without this the
-  // operator sees "degraded" and has no idea which one to chase.
+  // The label is a rollup of five unrelated things; without this the
+  // operator sees "degraded" and has no idea which one to chase. Every
+  // input to ``degraded`` above needs its line here, or the header can read
+  // "degraded" beside "No … problems detected".
   const healthDetail =
     [
       critical > 0
@@ -1768,6 +1774,9 @@ export function DashboardPage() {
         : null,
       configFailedServers > 0
         ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
+        : null,
+      daemonDegradedServers > 0
+        ? `${daemonDegradedServers} daemon${daemonDegradedServers === 1 ? "" : "s"} not serving`
         : null,
     ]
       .filter(Boolean)
@@ -2480,6 +2489,7 @@ export function DashboardPage() {
                       configApplyError={s.config_apply_error}
                       daemonStatus={s.daemon_status}
                       daemonReason={s.daemon_reason}
+                      daemonNotServing={s.daemon_not_serving}
                     />
                   );
                 })}
@@ -2536,6 +2546,7 @@ export function DashboardPage() {
                       configApplyError={s.config_apply_error}
                       daemonStatus={s.daemon_status}
                       daemonReason={s.daemon_reason}
+                      daemonNotServing={s.daemon_not_serving}
                     />
                   );
                 })}
@@ -2829,18 +2840,23 @@ function ConfigApplyChip({
  * #1067 — the daemon state the agent itself reports. A DNS agent whose
  * `named` never started (no bundle yet) heartbeats every 30 s with
  * `daemon.status = degraded`; before #1067 the control plane dropped the
- * field and the row read healthy. Renders nothing on `ok` and on null
- * (never reported: a pre-#1061 agent or an agentless driver — unknown, not
- * healthy, and not a failure either, the same posture as the config chip).
+ * field and the row read healthy. Renders only on the server's
+ * `daemon_not_serving` — never on `ok`, never on null (never reported: a
+ * pre-#1061 agent or an agentless driver — unknown, not healthy, and not a
+ * failure either, the same posture as the config chip), and never on a
+ * `degraded` that echoes a failed apply, which `ConfigApplyChip` beside it
+ * already shows at #882's severity.
  */
 function DaemonChip({
+  notServing,
   status,
   reason,
 }: {
+  notServing: boolean | null;
   status: string | null;
   reason?: string | null;
 }) {
-  if (status == null || status === "ok") return null;
+  if (notServing !== true || status == null) return null;
   return (
     <StatusChip
       tone="red"
@@ -2866,6 +2882,7 @@ function ServerRow({
   configApplyError = null,
   daemonStatus = null,
   daemonReason = null,
+  daemonNotServing = null,
 }: {
   name: string;
   host: string;
@@ -2879,6 +2896,7 @@ function ServerRow({
   configApplyError?: string | null;
   daemonStatus?: string | null;
   daemonReason?: string | null;
+  daemonNotServing?: boolean | null;
 }) {
   const dotCls =
     status === "active"
@@ -2934,7 +2952,11 @@ function ServerRow({
           />
         )}
         <ConfigApplyChip status={configApplyStatus} error={configApplyError} />
-        <DaemonChip status={daemonStatus} reason={daemonReason} />
+        <DaemonChip
+          notServing={daemonNotServing}
+          status={daemonStatus}
+          reason={daemonReason}
+        />
         <StatusIcon className="h-3 w-3 text-muted-foreground/50" />
       </div>
       <span className="w-20 flex-shrink-0 text-right text-muted-foreground">

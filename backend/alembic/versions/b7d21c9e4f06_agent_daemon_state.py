@@ -31,9 +31,9 @@ depends_on = None
 # state" — a pre-#1061 agent still in the field, or an agentless driver
 # (Windows DNS, the cloud providers, ``technitium_api``) that has no daemon
 # of its own to report on. The read side treats NULL as UNKNOWN, never as
-# ``ok``. ``daemon_status_since`` is the stamp of the heartbeat that FIRST
-# reported the current status (it moves only on a status change), so a row
-# can say how long a daemon has been degraded.
+# ``ok``. ``daemon_status_since`` is the stamp of the heartbeat that began
+# the current state (a repeated report never moves it — see
+# ``services/agents/daemon_state``), so a row can say how long it has held.
 _TABLES = ("dns_server", "dhcp_server")
 
 

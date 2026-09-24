@@ -280,11 +280,13 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # live config the saved one): a DNS agent waiting for its first bundle
     # heartbeats every 30 s with ``degraded`` while ``named`` never starts,
     # and until #1067 nothing here kept that. Any word other than ``ok`` is
-    # stored as sent and read as not serving. NULL = never reported (a
-    # pre-#1061 agent, or an agentless driver): UNKNOWN, never ``ok``.
-    # ``daemon_status_since`` is the stamp of the heartbeat that FIRST
-    # reported the current status (it moves only on a status change), so the
-    # row can say how long a daemon has been degraded; ``last_seen_at`` says
+    # stored as sent; whether it means *not serving* is
+    # ``daemon_state.is_not_serving`` (a ``degraded`` that echoes a failed
+    # config apply is #882's, via ``config_apply_status``). NULL = never
+    # reported (a pre-#1061 agent, or an agentless driver): UNKNOWN, never
+    # ``ok``. ``daemon_status_since`` is the stamp of the heartbeat that
+    # began the current state (a repeated report never moves it), so the row
+    # can say how long a daemon has been degraded; ``last_seen_at`` says
     # whether the report is current.
     daemon_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     daemon_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
