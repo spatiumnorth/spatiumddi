@@ -109,6 +109,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **firstboot no longer runs the words of its own #1042 comment as
+  commands (#1132).** `_render_control_helmchart` writes the
+  `spatium-control` HelmChart through an unquoted here-document, so
+  the shell expands everything inside it, and the #1042 comment there
+  wrapped ten words in single backticks. `/bin/sh` ran each one as a
+  command substitution, as root, on every boot: ten `...: not found`
+  lines per boot in `/var/log/spatiumddi/firstboot.log`, and the
+  comment reached the live HelmChart with those words deleted. No
+  command by those names is on the appliance's `PATH`, so nothing
+  ran. The words are now quoted, so the comment renders as written
+  and the HelmChart object is unchanged. A new test renders the chart
+  under dash and scans every unquoted here-document in firstboot for
+  a backtick substitution.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell

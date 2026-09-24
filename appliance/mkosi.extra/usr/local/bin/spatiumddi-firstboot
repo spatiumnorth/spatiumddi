@@ -863,23 +863,23 @@ spec:
   chartContent: ${chart_b64}
   targetNamespace: spatium
   createNamespace: false
-  # #1042 — failurePolicy is deliberately LEFT AT THE CRD DEFAULT (`reinstall`).
+  # #1042 — failurePolicy is deliberately LEFT AT THE CRD DEFAULT ('reinstall').
   #
-  # The first cut of this fix set `abort`, on the reasoning that a clean
+  # The first cut of this fix set 'abort', on the reasoning that a clean
   # uninstall of a release owning SECRET_KEY is too destructive to self-heal
   # into. Review measured the cost and it is worse than the disease:
   # spatiumddi-helm-stuck-recover only acts on a HelmChart carrying a
-  # `Failed` condition, and only after a 600 s latch, on a 5 min tick. A
-  # release left `pending-upgrade` by the slot reboot — i.e. exactly the
-  # scenario #1042 was found in — may never set `Failed` at all, so `abort`
-  # risks an INDEFINITE outage with no API and no UI, where `reinstall`
+  # 'Failed' condition, and only after a 600 s latch, on a 5 min tick. A
+  # release left 'pending-upgrade' by the slot reboot — i.e. exactly the
+  # scenario #1042 was found in — may never set 'Failed' at all, so 'abort'
+  # risks an INDEFINITE outage with no API and no UI, where 'reinstall'
   # recovers in seconds.
   #
-  # What made `reinstall` dangerous was never the reinstall: it was that the
-  # app Secret lacked `helm.sh/resource-policy: keep`, so the uninstall half
+  # What made 'reinstall' dangerous was never the reinstall: it was that the
+  # app Secret lacked 'helm.sh/resource-policy: keep', so the uninstall half
   # DELETED it and the install half minted a new SECRET_KEY. With the
   # annotation (charts/spatiumddi/templates/secret.yaml) the Secret survives
-  # the uninstall and the reinstall's `lookup` finds the same key — the same
+  # the uninstall and the reinstall's 'lookup' finds the same key — the same
   # mechanism that carried the Postgres and Redis secrets through the very
   # same event. A reinstall is disruptive and self-healing; it is no longer
   # lossy, which is the property that actually mattered.
