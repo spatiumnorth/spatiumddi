@@ -167,6 +167,19 @@ the formatter handles the rest.
   space applies however the group was found. An existing inheriting
   subnet gets its reverse zone on its next allocation or **Sync DNS**.
 
+- **A new subnet no longer starts "1 DNS record out of sync"
+  (#1150).** Subnet create adds the network, broadcast and gateway
+  placeholder rows and never published the gateway's PTR, so under a
+  reverse zone every new subnet opened with the gateway's PTR missing
+  — the drift banner on day one, and `gateway.<zone>` unresolvable in
+  reverse until someone ran **Sync DNS**. The gateway's PTR is now
+  published at create (still no forward `gateway.<zone>` A record, by
+  design), into the subnet's auto-created reverse zone or whichever
+  reverse zone covers it; `skip_reverse_zone` still creates no zone.
+  The subnet planner's apply built the same placeholder and ran
+  neither DNS step; a planned subnet now gets its reverse zone and
+  gateway PTR at apply, the same as one created directly.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell

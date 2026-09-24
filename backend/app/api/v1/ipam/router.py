@@ -1253,6 +1253,8 @@ async def _sync_dns_record(
     zone_id: uuid.UUID | None = None,
     action: str = "create",  # create | update | delete
     ttl: int | None = None,
+    *,
+    backfill_reverse_zone: bool = True,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1264,6 +1266,12 @@ async def _sync_dns_record(
     passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
     zone default. Updates preserve the existing TTL so a rename doesn't
     churn it.
+
+    ``backfill_reverse_zone=False`` skips the reverse-zone catch-up below. A
+    caller that has just made that decision itself passes it — subnet create
+    ran (or, with ``skip_reverse_zone``, deliberately did not run) the
+    reverse-zone step, and the gateway placeholder's sync must not undo the
+    opt-out (spatiumddi#1150).
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -1326,12 +1334,13 @@ async def _sync_dns_record(
     # Backfill the reverse zone if missing. Subnets created before DNS was
     # assigned won't have had `ensure_reverse_zone_for_subnet` run at create
     # time, so every IP allocation is an opportunity to catch up.
-    try:
-        from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+    if backfill_reverse_zone:
+        try:
+            from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
 
-        await ensure_reverse_zone_for_subnet(db, subnet, None)
-    except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
-        pass
+            await ensure_reverse_zone_for_subnet(db, subnet, None)
+        except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
+            pass
 
     zone_domain = zone.name.rstrip(".") if zone else ""
     fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
@@ -4237,6 +4246,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # not endpoint slots, so the network/broadcast/gateway concept
     # doesn't apply.
     auto_created: list[str] = []
+    gw_row: IPAddress | None = None
     is_v6 = isinstance(net, ipaddress.IPv6Network)
     # Threshold is version-aware: a v4 /31+/32 has no network/broadcast concept
     # (RFC 3021), and the v6 analogue is /127+/128. The old flat ``< 31`` was v4
@@ -4275,16 +4285,15 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
         # Gateway — use provided or default to first usable host
         gw_addr = body.gateway or str(net.network_address + 1)
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=gw_addr,
-                status="reserved",
-                description="Gateway",
-                hostname="gateway",
-                created_by_user_id=current_user.id,
-            )
+        gw_row = IPAddress(
+            subnet_id=subnet.id,
+            address=gw_addr,
+            status="reserved",
+            description="Gateway",
+            hostname="gateway",
+            created_by_user_id=current_user.id,
         )
+        db.add(gw_row)
         subnet.gateway = gw_addr
         auto_created.append(gw_addr)
 
@@ -4321,6 +4330,16 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             dns_group_id=body.dns_group_id,
             dns_zone_id=uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None,
         )
+
+    # spatiumddi#1150 — publish the gateway placeholder's PTR now, the way an
+    # address allocated a second later gets its records. The rows above are
+    # plain db.add()s, so a subnet under a reverse zone started "1 DNS record
+    # out of sync · 1 missing" (sync_check expects the gateway's PTR) until
+    # someone ran Sync DNS. _sync_dns_record already treats the `gateway`
+    # hostname specially: no forward A, PTR only. No reverse-zone catch-up
+    # inside it — the step above just ran, or skip_reverse_zone said not to.
+    if gw_row is not None:
+        await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
 
     await db.commit()
     await db.refresh(subnet)
