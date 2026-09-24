@@ -515,6 +515,22 @@ the formatter handles the rest.
   (the DHCP page has an Approve control); the UI control is follow-up
   work.
 
+- **The appliance kubelet now evicts on memory before the kernel's OOM
+  killer does (#1124).** k3s's kubelet defaults carry disk eviction
+  thresholds only, so memory exhaustion went straight to the kernel's
+  global OOM killer, which picks by `oom_score_adj`: on a QA node it
+  killed the api's uvicorn while a runaway pod was the cause.
+  `config.yaml` now passes `memory.available<512Mi` (restating k3s's disk
+  floors, since `--eviction-hard` replaces the whole map), a 30 s
+  pressure-transition period instead of 5 min, and
+  `kube-reserved=memory=1Gi` plus `system-reserved=memory=512Mi`, so the
+  kubelet evicts by PriorityClass first. **Upgrade note:** those settings
+  set aside 2 GiB on every node, and pods are scheduled only into the
+  rest. A control plane now needs at least 4 GiB of RAM and a DNS / DHCP
+  appliance at least 3 GiB; a smaller box upgraded to this release comes
+  back with its pods `Pending` on `Insufficient memory`. The recommended
+  sizes (8 GiB control plane, 4 GiB DNS / DHCP) are unaffected.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —
