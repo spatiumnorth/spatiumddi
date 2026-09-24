@@ -40,6 +40,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
     IngestAck,
@@ -978,6 +979,10 @@ async def agent_heartbeat(
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
     # #1077 — spool state. Only written when the heartbeat carries it.
     apply_reported_spool(server, body.spool, agent_kind="dhcp", server_id=str(server.id))
+    # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
+    # the same dict, the top-level ``status``; ``daemon`` is the source). Same
+    # gap as the DNS side: declared, accepted, never read.
+    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

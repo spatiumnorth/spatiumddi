@@ -11,6 +11,7 @@ booted Kea straight into it.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -40,6 +41,15 @@ class _FakeHeartbeat:
         self.daemon_status: dict[str, Any] = {}
         self.pending_acks: list[dict[str, Any]] = []
         self.config_apply = ApplyStatus()
+
+
+# The control plane parses the daemon ``reason`` a failed apply leaves behind
+# (#1067): ``daemon_state.is_config_apply_verdict`` reads
+# ``config_apply_reverted:`` and Kea's own ``dhcp4_config_rejected:`` /
+# ``dhcp6_…`` as a failed apply — #882's to report — rather than a daemon that
+# is not serving. Reword either and a routine rejection pages critical as "not
+# serving" on top of #882's own alarm.
+_KEA_REJECTED = re.compile(r"dhcp[46]_config_rejected: ")
 
 
 def _bundle(tag: str, subnet: str = "192.0.2.0/24") -> dict[str, Any]:
@@ -122,6 +132,7 @@ def test_rejected_config_reverts_the_files_on_disk(
     assert loop.apply_status.status == STATUS_REVERTED
     assert loop.apply_status.failed_etag == "bad"
     assert loop.apply_status.etag == "good"
+    assert loop.heartbeat.daemon_status["reason"].startswith("config_apply_reverted: ")
 
 
 def test_unreachable_socket_does_not_revert(
@@ -171,6 +182,8 @@ def test_failure_with_no_previous_is_reported_distinctly(
     assert _apply(loop, "bad") is False
     assert loop.apply_status.status == STATUS_NO_PREVIOUS
     assert loop.apply_status.etag is None
+    # Nothing to roll back to: Kea's refusal is what the heartbeat carries.
+    assert _KEA_REJECTED.match(loop.heartbeat.daemon_status["reason"])
 
 
 def test_revert_failure_is_reported_distinctly(
@@ -182,6 +195,7 @@ def test_revert_failure_is_reported_distinctly(
     assert _apply(loop, "bad") is False
     assert loop.apply_status.status == STATUS_REVERT_FAILED
     assert "revert also failed" in (loop.apply_status.error or "")
+    assert _KEA_REJECTED.match(loop.heartbeat.daemon_status["reason"])
 
 
 def test_render_failure_is_tagged_as_such(

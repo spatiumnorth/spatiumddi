@@ -287,6 +287,28 @@ live nowhere. The verdict rides the heartbeat's `config` field, lands on
 the server detail, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
 
+**So is a daemon that is not serving (#1067).** The heartbeat's `daemon`
+field is `{"status": "ok"}` once the daemon is confirmed up and
+`{"status": "degraded", "reason": ...}` while it is not — from the moment a
+start is deferred because no bundle has been rendered yet
+(`"start deferred, no bundle yet"`, #1061) until the first bundle lands,
+and after a failed apply. A registered agent in that state heartbeats
+every 30 s, `named` never starts and the pod restarts on its liveness
+probe every two minutes, while `status`, `last_seen_at` and the config
+verdict all read normal. The field lands on `dns_server.daemon_status` /
+`daemon_reason` / `daemon_status_since` (the stamp of the heartbeat that
+began the current state, so "degraded for 12 min" is readable), is
+exposed on the server row, drives a chip and a detail banner, and the
+`agent_daemon_degraded` alert rule fires once a daemon that is not serving
+has stayed that way past a five-minute grace. A failed apply is the
+exception: the agent echoes it as `degraded` with a `config_apply_*`
+reason, but that is the revert reported above — often a daemon that is up
+on its last-known-good config — so the chip, the banner and the alert all
+leave it to `agent_config_rejected`. They read one server-side
+classification, `daemon_not_serving` on the server response, so they
+cannot disagree. NULL means the agent has never reported one — a
+pre-#1061 agent, or an agentless driver — and is unknown, never healthy.
+
 ### Push spool — the reporting half of an outage (issue #1077)
 
 Non-negotiable #5 keeps the agent *serving* through a control-plane outage.
@@ -354,15 +376,8 @@ during the maintenance window?".
 ```json
 {
   "agent_version": "2026.04.13-1",
-  "daemon": {
-    "flavor": "bind9",
-    "version": "9.20.1",
-    "running": true,
-    "pid": 12,
-    "started_at": "2026-04-14T12:00:00Z",
-    "queries_per_sec_1m": 42.1,
-    "cache_hit_ratio_5m": 0.87
-  },
+  "daemon_version": "9.20.27",
+  "daemon": {"status": "ok"},
   "config": {
     "status": "ok",
     "etag": "sha256:...",

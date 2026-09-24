@@ -894,6 +894,20 @@ heartbeat (`config` field → `dhcp_server.config_apply_*`), which drives the
 server-row chip, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
 
+The heartbeat's `daemon` field — `{"status": "ok"}` after a good reload,
+`{"status": "degraded", "reason": ...}` when a control socket is
+unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
+/ `daemon_reason` / `daemon_status_since` since #1067 (it was declared and
+read by nothing before), is exposed on the server row, drives a chip and a
+detail banner, and feeds the `agent_daemon_degraded` alert rule once a
+daemon that is not serving has stayed that way past a five-minute grace. A
+rejected config is not that: `config-test` refuses without disturbing the
+running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
+Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
+reported by `agent_config_rejected`. The server response's
+`daemon_not_serving` is `false` for it, and that one field is what the
+chip, the banner and the alert read.
+
 ### Push spool + lease snapshot (issue #1077)
 
 Kea lease events are the **only** way the control plane learns about
