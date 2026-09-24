@@ -60,7 +60,8 @@ sections A → Z.
 
 The FastAPI app serves the standard interactive docs and the raw
 OpenAPI schema (configured in `create_app()` in
-[`backend/app/main.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/main.py)):
+[`backend/app/main.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/main.py)
+and [`backend/app/api/docs.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/api/docs.py)):
 
 | Route | What it serves |
 |---|---|
@@ -69,7 +70,10 @@ OpenAPI schema (configured in `create_app()` in
 | `/api/openapi.json` | The OpenAPI 3.x schema document |
 
 Note the `/api/` prefix on the docs routes — they are **not** under
-`/api/v1`. The schema is auto-generated from the Pydantic request /
+`/api/v1`. The api serves the Swagger UI and ReDoc bundles itself, from
+`/api/docs/static/`, not from a CDN. So both pages work through the web
+port, under the console's Content-Security-Policy, and on an air-gapped
+install. The schema is auto-generated from the Pydantic request /
 response models on every route, so it always reflects the running
 build. Each router carries a `tags=[...]` label (alphabetised in
 `router.py`) so the Swagger / ReDoc sidebar groups endpoints by
