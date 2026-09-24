@@ -576,3 +576,78 @@ async def test_clearing_a_zones_update_acl_marks_its_group(
     assert r.status_code == 200, r.text
 
     assert (await _seqs(db_session, [server]))[server.id] == before + 1
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_savepoint_keeps_the_outer_transactions_mark_and_render(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A savepoint that rolls back must not drop what the OUTER transaction
+    marked: SQLAlchemy dispatches ``after_rollback`` for a nested rollback too,
+    and a listener that clears its state there loses the outer change's render
+    enqueue (and, once the mark itself is deferred to commit, the mark)."""
+    _g, (server,), _, zone = await _group(db_session, agent_servers=1)
+    await db_session.commit()
+    server_id = server.id
+    before = (await _seqs(db_session, [server]))[server_id]
+    captured: list[str] = []
+    monkeypatch.setattr(settings, "dns_agent_bundle_enqueue_renders", True)
+    monkeypatch.setattr(bundle_dirty, "_enqueue_sync", lambda ids: captured.extend(ids))
+
+    db_session.add(_record(zone, "outer"))
+    await db_session.flush()
+    with pytest.raises(RuntimeError):
+        async with db_session.begin_nested():
+            db_session.add(_record(zone, "inner"))
+            await db_session.flush()
+            raise RuntimeError("the savepoint's work fails")
+    await db_session.commit()
+    for _ in range(20):
+        if captured:
+            break
+        await asyncio.sleep(0.05)
+
+    after = (
+        await db_session.execute(
+            select(DNSServer.bundle_dirty_seq).where(DNSServer.id == server_id)
+        )
+    ).scalar_one()
+    assert after >= before + 1, "the outer change is marked"
+    assert captured == [str(server_id)], (
+        "the outer change's render was not enqueued after its commit: the "
+        f"savepoint's rollback cleared it (captured {captured!r})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_released_savepoint_enqueues_nothing_until_the_outer_commit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQLAlchemy dispatches ``after_commit`` when a savepoint is RELEASED,
+    while the outer transaction and its bump are still uncommitted. A render
+    enqueued there reads the old sequence and finds nothing to do, and the
+    real commit then had nothing left to enqueue."""
+    _g, (server,), _, zone = await _group(db_session, agent_servers=1)
+    await db_session.commit()
+    server_id = server.id
+    captured: list[str] = []
+    monkeypatch.setattr(settings, "dns_agent_bundle_enqueue_renders", True)
+    monkeypatch.setattr(bundle_dirty, "_enqueue_sync", lambda ids: captured.extend(ids))
+
+    async with db_session.begin_nested():
+        db_session.add(_record(zone, "released"))
+    for _ in range(10):
+        await asyncio.sleep(0.05)
+    assert captured == [], (
+        "the render was enqueued when the savepoint was released, before the "
+        f"outer transaction committed the change (captured {captured!r})"
+    )
+
+    await db_session.commit()
+    for _ in range(20):
+        if captured:
+            break
+        await asyncio.sleep(0.05)
+    assert captured == [
+        str(server_id)
+    ], f"the outer commit enqueued {captured!r}, want the server's render"

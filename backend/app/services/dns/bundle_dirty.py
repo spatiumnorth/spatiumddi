@@ -480,6 +480,12 @@ def _after_flush(session: Any, flush_context: Any) -> None:  # noqa: ARG001
 
 
 def _after_commit(session: Any) -> None:
+    # Fires at a SAVEPOINT release too (``SessionTransaction.commit``:
+    # ``_parent is None or nested``), while the outer transaction — and the
+    # bump — is still uncommitted. A render enqueued there reads the old
+    # sequence, and the real commit then has nothing left to enqueue.
+    if session.in_nested_transaction():
+        return
     pending = getattr(session, _PENDING_ATTR, None)
     if not pending:
         return
@@ -488,6 +494,14 @@ def _after_commit(session: Any) -> None:
 
 
 def _after_rollback(session: Any) -> None:
+    # SQLAlchemy dispatches ``after_rollback`` for a SAVEPOINT rollback too
+    # (``SessionTransaction.rollback``: ``_parent is None or nested``). The
+    # outer transaction's marks survive a savepoint rolling back and still
+    # commit, so their renders must still be enqueued; only the outermost
+    # rollback discards them. A mark made inside the savepoint stays queued
+    # too — one render that finds the bundle current, never a missed one.
+    if session.in_nested_transaction():
+        return
     if getattr(session, _PENDING_ATTR, None):
         setattr(session, _PENDING_ATTR, set())
 
