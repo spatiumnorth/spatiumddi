@@ -1,6 +1,10 @@
 """The render task's Redis keys (#1111, review item B): the fleet-wide render
 slot and the per-server lock.
 
+* A render killed mid-flight (an OOM kill never runs ``finally``) must not
+  hold the fleet slot — and with it every server's render — for long: the
+  keys are a short lease the holder renews while it renders, not a 15-minute
+  TTL.
 * A holder must never release a key it no longer owns: after a lease ran
   out and another render took the key, an unconditional ``DELETE`` would
   free it under that render and let a third one start beside it.
@@ -12,6 +16,11 @@ parallel workers never share the one global slot.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
+import sys
+import time
 import uuid
 
 import pytest
@@ -55,6 +64,13 @@ async def _agent(db: AsyncSession) -> DNSServer:
     )
     await db.flush()
     return server
+
+
+def _set_lease(monkeypatch: pytest.MonkeyPatch, seconds: int) -> None:
+    """The render lease, where the build has one (a build without it holds the
+    keys for its fixed TTL, which is what the tests below catch)."""
+    if "dns_agent_bundle_render_lease_seconds" in type(settings).model_fields:
+        monkeypatch.setattr(settings, "dns_agent_bundle_render_lease_seconds", seconds)
 
 
 @pytest_asyncio.fixture
@@ -170,3 +186,102 @@ async def test_a_render_never_releases_a_server_lock_it_no_longer_holds(
         f"{holder!r} -> {after!r}): a third render of the same server could "
         "start beside R2"
     )
+
+
+_KILLED_HOLDER = r"""
+import asyncio, os, sys
+from app.tasks import agent_bundles
+
+async def _hang(server_id):
+    await asyncio.sleep(300)
+
+agent_bundles._render_once = _hang
+agent_bundles.RENDER_SLOT_KEY = os.environ["T_SLOT"]
+agent_bundles.RENDER_LOCK_PREFIX = os.environ["T_LOCK"]
+agent_bundles.RENDER_DIRTY_PREFIX = os.environ["T_DIRTY"]
+asyncio.run(agent_bundles._run(sys.argv[1]))
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_killed_render_frees_the_fleet_slot_within_one_lease(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker process SIGKILLed mid-render (the OOM killer) never runs its
+    ``finally``. Its keys must expire within one lease, not after the render
+    ceiling, or every server's render is deferred until they do."""
+    client, keys = redis_keys
+    lease = 2
+    _set_lease(monkeypatch, lease)
+    victim = await _agent(db_session)
+    other = await _agent(db_session)
+    await db_session.commit()
+
+    env = {
+        **os.environ,
+        "T_SLOT": keys["slot"],
+        "T_LOCK": keys["lock"],
+        "T_DIRTY": keys["dirty"],
+        "DNS_AGENT_BUNDLE_RENDER_LEASE_SECONDS": str(lease),
+    }
+    proc = subprocess.Popen(  # noqa: S603 — this interpreter, a fixed script
+        [sys.executable, "-c", _KILLED_HOLDER, str(victim.id)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not await client.get(keys["slot"]):
+            assert proc.poll() is None, proc.stderr.read().decode()[-2000:] if proc.stderr else ""
+            await asyncio.sleep(0.1)
+        assert await client.get(keys["slot"]), "the doomed render never took the slot"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        ttl_after_kill = await client.ttl(keys["slot"])
+
+        deadline = time.monotonic() + lease + 6
+        outcome: dict = {}
+        while time.monotonic() < deadline:
+            outcome = await agent_bundles._run(str(other.id))
+            if outcome.get("status") != "deferred":
+                break
+            await asyncio.sleep(0.5)
+        assert outcome.get("status") == "stored", (
+            f"{lease + 6}s after the render holding the fleet slot was SIGKILLed, "
+            f"another server's render is still {outcome.get('status')!r}: the dead "
+            f"holder's slot had {ttl_after_kill}s left to live when it died, and "
+            "every server's render waits for it"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_a_render_longer_than_its_lease_keeps_the_slot(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is renewed while the render runs: a render several leases long
+    still owns the slot at the end, and nothing else rendered meanwhile."""
+    client, keys = redis_keys
+    lease = 1
+    _set_lease(monkeypatch, lease)
+    slow = await _agent(db_session)
+    other = await _agent(db_session)
+    await db_session.commit()
+    real = agent_bundles._render_once
+
+    async def _slow(server_id):  # noqa: ANN001
+        if server_id == slow.id:
+            await asyncio.sleep(3.5 * lease)
+        return await real(server_id)
+
+    monkeypatch.setattr(agent_bundles, "_render_once", _slow)
+    task = asyncio.create_task(agent_bundles._run(str(slow.id)))
+    await asyncio.sleep(2.5 * lease)
+    assert await client.get(keys["slot"]), "the slot lapsed under a render still running"
+    assert (await agent_bundles._run(str(other.id)))["status"] == "deferred"
+    result = await asyncio.wait_for(task, 30)
+    assert result["status"] == "stored", result

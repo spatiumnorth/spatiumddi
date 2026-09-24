@@ -24,6 +24,11 @@ out):
   chart ships the worker at 1Gi. A task that finds the slot taken
   re-enqueues itself a couple of seconds later.
 
+Both are a short lease (``dns_agent_bundle_render_lease_seconds``) that a
+thread of the render's own renews while it runs, and each holds the
+render's token, so a render killed mid-flight frees them within one lease
+and no render ever releases a key it no longer owns.
+
 ``render_missing_sweep`` (beat, 30 s) enqueues every enabled agent-based
 server whose newest stored bundle is behind its dirty sequence — the
 belt and braces for a lost broker message.
@@ -32,6 +37,7 @@ belt and braces for a lost broker message.
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -42,7 +48,7 @@ from sqlalchemy import and_, or_, select
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_server_channel, publish_wake
-from app.core.redis_client import make_async_redis
+from app.core.redis_client import make_async_redis, make_sync_redis
 from app.db import task_session
 from app.drivers.dns import AGENTLESS_DRIVERS
 from app.models.dns import DNSServer
@@ -79,8 +85,72 @@ return 0
 """
 
 
+# Extend a key's lease only while it still holds this holder's token.
+_RENEW_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('pexpire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+# The dirty flag outlives any render that could consume it: the task's own
+# hard time limit.
+DIRTY_FLAG_SECONDS = 960
+
+
 async def _release(client: Any, key: str, value: str) -> None:
     await client.eval(_RELEASE_IF_OWNER, 1, key, value)
+
+
+def _lease_ms() -> int:
+    return max(1, int(settings.dns_agent_bundle_render_lease_seconds)) * 1000
+
+
+class _LeaseKeeper:
+    """Renews a render's keys every third of the lease until stopped.
+
+    A thread with its own (sync) client, not a task on the render's event
+    loop: serialising and gzipping a million-row bundle blocks that loop
+    for seconds at a time, and a lease renewed from it would lapse under a
+    render that is alive. A process killed mid-render takes the thread with
+    it, so the lease then runs out on its own.
+    """
+
+    def __init__(self, keys: list[tuple[str, str]], lease_ms: int) -> None:
+        self._keys = list(keys)
+        self._lease_ms = lease_ms
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="bundle-lease", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _loop(self) -> None:
+        client = None
+        while not self._stop.wait(self._lease_ms / 3000):
+            try:
+                if client is None:
+                    client = make_sync_redis(
+                        settings.redis_url,
+                        socket_connect_timeout=_CONNECT_TIMEOUT,
+                        socket_timeout=_CONNECT_TIMEOUT,
+                    )
+                for key, value in list(self._keys):
+                    if not client.eval(_RENEW_IF_OWNER, 1, key, value, str(self._lease_ms)):
+                        # Lapsed and taken (or gone): not ours to extend.
+                        self._keys.remove((key, value))
+                        logger.warning("dns_agent_bundle_lease_lost", key=key)
+            except Exception as exc:  # noqa: BLE001 — keep trying until stopped
+                logger.warning("dns_agent_bundle_lease_renew_failed", error=str(exc))
+                client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 TASK_RENDER = "app.tasks.agent_bundles.render_dns_bundle"
@@ -140,7 +210,7 @@ async def _run(server_id_text: str) -> dict[str, Any]:
     server_id = uuid.UUID(server_id_text)
     lock_key = RENDER_LOCK_PREFIX + server_id_text
     dirty_key = RENDER_DIRTY_PREFIX + server_id_text
-    ttl = max(60, int(settings.dns_agent_bundle_render_lock_seconds))
+    lease_ms = _lease_ms()
     # This render's own token: the lock holds it, the slot holds it with the
     # server id (so the slot still says whose render holds it).
     token = uuid.uuid4().hex
@@ -148,16 +218,19 @@ async def _run(server_id_text: str) -> dict[str, Any]:
     client = None
     have_lock = False
     have_slot = False
+    keeper: _LeaseKeeper | None = None
     try:
         client = make_async_redis(settings.redis_url, socket_connect_timeout=_CONNECT_TIMEOUT)
-        if not await client.set(lock_key, token, nx=True, ex=ttl):
-            await client.set(dirty_key, "1", ex=ttl)
+        if not await client.set(lock_key, token, nx=True, px=lease_ms):
+            await client.set(dirty_key, "1", ex=DIRTY_FLAG_SECONDS)
             return {"status": "coalesced"}
         have_lock = True
-        if not await client.set(RENDER_SLOT_KEY, slot_value, nx=True, ex=ttl):
+        if not await client.set(RENDER_SLOT_KEY, slot_value, nx=True, px=lease_ms):
             await _release(client, lock_key, token)
             return {"status": "deferred"}
         have_slot = True
+        keeper = _LeaseKeeper([(RENDER_SLOT_KEY, slot_value), (lock_key, token)], lease_ms)
+        keeper.start()
     except Exception as exc:  # noqa: BLE001 — Redis is advisory here: render anyway
         logger.warning(
             "dns_agent_bundle_lock_unavailable", server_id=server_id_text, error=str(exc)
@@ -180,6 +253,8 @@ async def _run(server_id_text: str) -> dict[str, Any]:
                 logger.warning("dns_agent_bundle_render_loop_capped", server_id=server_id_text)
                 break
     finally:
+        if keeper is not None:
+            keeper.stop()
         if client is not None:
             try:
                 if have_slot:

@@ -110,9 +110,12 @@ class Settings(BaseSettings):
     # worker (the 30 s render-missing sweep is the backstop either way). Off
     # only for test suites that have no broker.
     dns_agent_bundle_enqueue_renders: bool = True
-    # TTL of the per-server render lock and the fleet-wide render slot — the
-    # ceiling on one render before a crashed worker's lock expires.
-    dns_agent_bundle_render_lock_seconds: int = 900
+    # The per-server render lock and the fleet-wide render slot are a lease
+    # of this many seconds, renewed every third of it for as long as the
+    # render runs. A render killed mid-flight (the OOM killer never runs its
+    # ``finally``) frees both within one lease, instead of holding every
+    # server's render for as long as a render may take.
+    dns_agent_bundle_render_lease_seconds: int = 60
     # The long-poll serves stored bundles only. While this is on — the
     # migration release, whose worker may still be one release behind — a
     # missing or stale bundle is built inline in the request exactly as
