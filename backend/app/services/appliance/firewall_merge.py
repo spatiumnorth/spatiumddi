@@ -144,6 +144,10 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
             (20, "accept", "udp", (547,), "any", "both", None, None),
         ],
     ),
+    # BGP for a passive looking-glass collector (#566) — seeded by
+    # b8e2d5c07a14 (#1166). The supervisor's own renderer always opened it;
+    # this policy did not exist, so fleet enforcement closed the port.
+    ("role", "looking-glass", True, [(10, "accept", "tcp", (179,), "any", "both", None, None)]),
     (
         "role",
         "control-plane",

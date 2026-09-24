@@ -36,6 +36,9 @@ _MATRIX: list[dict] = [
     {"role_assignment": {"roles": ["dns-bind9"]}},
     {"role_assignment": {"roles": ["dhcp"]}},
     {"role_assignment": {"roles": ["dns-powerdns", "dhcp"]}},
+    # #1166 — looking-glass (tcp/179) existed in the supervisor renderer only.
+    {"role_assignment": {"roles": ["looking-glass"]}},
+    {"role_assignment": {"roles": ["dns-bind9", "dhcp", "looking-glass"]}},
     # single-node CP: pod/service CIDR, no peers
     {
         "role_assignment": {"roles": []},

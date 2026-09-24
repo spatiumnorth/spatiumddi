@@ -79,6 +79,9 @@ _ROLE_PORTS_TCP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
     "dns-technitium": [53],
+    # BGP (#566) — was only in the supervisor's table, so the port vanished
+    # whenever this renderer or the merge drove the node (#1166).
+    "looking-glass": [179],
 }
 _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],

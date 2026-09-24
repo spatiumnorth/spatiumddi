@@ -4915,6 +4915,9 @@ function ApplianceRoleAssignmentSection({
   if (roles.has("dhcp")) {
     firewallOpenPorts.push("UDP/67", "UDP/68", "UDP/547");
   }
+  if (roles.has("looking-glass")) {
+    firewallOpenPorts.push("TCP/179");
+  }
 
   return (
     <div>
