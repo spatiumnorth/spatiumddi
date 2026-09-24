@@ -202,7 +202,9 @@ bumped **in the same transaction** as every change that feeds the bundle
 contributor — records via their zone, zones, views, ACLs, options, TSIG
 keys, update ACLs, sibling servers for the catalog producer pick, new
 pending ops, blocklists, pools, and the platform singletons — to the
-servers it feeds); `bundle_watermark` is the sequence the newest stored
+servers it feeds; each flush's servers are collected and bumped once, at
+the outermost commit, in server-id order, so the bump's row locks live for
+the COMMIT alone and two writers can never deadlock on them); `bundle_watermark` is the sequence the newest stored
 bundle was rendered at. Current ⇔ `watermark ≥ seq` **and** the bundle was
 rendered by the running release (`bundle_app_version`): one integer and one
 string comparison, no assembly, no content hash. The release half is what
@@ -212,7 +214,14 @@ unrelated marks it. After commit the render is enqueued (the worker
 coalesces duplicates: one render in flight per server, one more after it if
 a change landed meanwhile — that is what turns a thousand-batch seed into a
 handful of renders), and a 30 s beat sweep re-enqueues anything still
-behind, so a lost broker message costs at most one tick.
+behind, so a lost broker message costs at most one tick. The per-server
+lock and the fleet-wide render slot are a lease
+(`dns_agent_bundle_render_lease_seconds`, 60 s) that the render renews
+while it runs and releases only while it still holds it: a render the OOM
+killer takes mid-flight frees the slot within one lease instead of holding
+every server's render for the render ceiling. A render waiting for the slot
+keeps its server's lock, so the duplicates the sweep and further marks
+enqueue meanwhile coalesce into it.
 
 *Every process that writes DNS rows must carry the listener.* It is
 installed by importing `bundle_dirty`: `app.main` does so for the api,
@@ -274,7 +283,19 @@ worker, or a worker that does not consume the `bundles` queue never records
 a failure, and that is the case that most needs seeing. The migration
 release keeps `dns_agent_bundle_inline_fallback` on: a deployment whose
 worker is still one release behind builds a missing or stale bundle inline
-exactly as before, once per version, because it stores what it built.
+exactly as before, once per version, because it stores what it built. The
+fallback is bounded. The api builds a server's bundle only when the server
+has never had one, or when its stale bundle has waited longer than
+`dns_agent_bundle_inline_fallback_after_seconds` (120 s) for the worker;
+every render that lands restarts that clock, so a change storm the worker
+keeps up with costs the api nothing (unbounded, a 250k-record seed had the
+api build the growing bundle 48 times beside the worker). One attempt per
+server at a time across replicas, and none for
+`dns_agent_bundle_inline_fallback_backoff_seconds` (600 s) after one fails.
+A failed attempt (at a million records the records query outlives the
+api's 30 s `command_timeout`) is logged and counted
+(`spatiumddi_agent_bundle_inline_failures_total`) and the poll waits for
+the worker's render; it is never recorded as the server's render failure.
 
 ### RFC 2136 `nsupdate` responsibility
 

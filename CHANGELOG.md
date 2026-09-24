@@ -138,10 +138,20 @@ the formatter handles the rest.
   through the new `agent_bundle_render_failed` alert rule, seeded
   enabled, which also fires when changes have waited 10 minutes with
   no render landing (`bundle_dirty_at`) — a killed render or a worker
-  not consuming `bundles` never records a failure. The migration
-  release keeps the inline build as a fallback
-  (`DNS_AGENT_BUNDLE_INLINE_FALLBACK`, on) for deployments whose worker
-  lags a release; default off once the worker path is proven. Agents
+  not consuming `bundles` never records a failure. The dirty mark's row
+  locks are taken once, at commit, in server-id order (held from the first
+  marking flush to the end of the transaction they stalled heartbeats and
+  deadlocked concurrent writers), and a savepoint's release or rollback
+  no longer pre-empts or drops the render enqueue. The render slot and
+  per-server lock are a 60 s lease renewed while the render runs and
+  released only by their holder, and a render waiting for the slot keeps
+  its lock so duplicates coalesce into it. The migration release keeps the
+  inline build as a fallback (`DNS_AGENT_BUNDLE_INLINE_FALLBACK`, on) for
+  deployments whose worker lags a release, bounded: only for a server that
+  has never had a bundle or whose bundle has waited more than 120 s for the
+  worker, one attempt per server at a time, 10 minutes of backoff after a
+  failure; a failed attempt waits for the worker instead of failing the
+  poll and is never recorded as the render verdict. Agents
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
   instead of re-sending the whole body. Migrations `c4d1e7f90a2b` and
