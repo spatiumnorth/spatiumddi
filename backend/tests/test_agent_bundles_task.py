@@ -209,3 +209,36 @@ async def test_the_sweep_re_renders_a_bundle_from_another_release(
     assert (await agent_bundles._sweep())["stale"] == 1
     assert captured == [str(server.id)]
     assert (await agent_bundles._run(str(server.id)))["status"] == "stored"
+
+
+@pytest.mark.asyncio
+async def test_a_server_deleted_mid_render_ends_the_render_as_gone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The render reads the server and its zones, the server is deleted
+    (another session commits it), and the store's INSERT then violates the
+    bundle's FK. That is not a failed render: nothing is left to render for.
+    It used to log ``dns_agent_bundle_render_failed`` and raise out of the
+    task (a Celery task failure) whenever a server was dropped while its
+    render ran — six times in half an hour of the api deep tier on a rig."""
+    from app.services.dns import agent_bundle_render
+
+    monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1/0")
+    server, _zone = await _agent(db_session)
+    await db_session.commit()
+    server_id = server.id
+    real_store = agent_bundle_render.bundle_store.store
+
+    async def _delete_then_store(db, srv, **kw):  # noqa: ANN001
+        from sqlalchemy import delete as sa_delete
+
+        from app.db import task_session
+
+        async with task_session() as other:
+            await other.execute(sa_delete(DNSServer).where(DNSServer.id == server_id))
+            await other.commit()
+        return await real_store(db, srv, **kw)
+
+    monkeypatch.setattr(agent_bundle_render.bundle_store, "store", _delete_then_store)
+    result = await agent_bundles._run(str(server_id))
+    assert result["status"] == "gone", result

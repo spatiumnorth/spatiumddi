@@ -172,6 +172,12 @@ def enqueue_render(server_id: str) -> bool:
         return False
 
 
+async def _server_exists(db: Any, server_id: uuid.UUID) -> bool:
+    return (
+        await db.execute(select(DNSServer.id).where(DNSServer.id == server_id))
+    ).scalar_one_or_none() is not None
+
+
 async def _render_once(server_id: uuid.UUID) -> dict[str, Any]:
     async with task_session() as db:
         server = await db.get(DNSServer, server_id)
@@ -186,6 +192,10 @@ async def _render_once(server_id: uuid.UUID) -> dict[str, Any]:
             await db.commit()
         except Exception as exc:
             await db.rollback()
+            if not await _server_exists(db, server_id):
+                # Deleted while it rendered (the store's FK is what noticed):
+                # nothing is left to render for, and nothing failed.
+                return {"status": "gone"}
             try:
                 await record_failure(db, server_id, f"{type(exc).__name__}: {exc}")
                 await db.commit()
