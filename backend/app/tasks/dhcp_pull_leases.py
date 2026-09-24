@@ -17,15 +17,14 @@ agentless (``windows_dhcp``, ``fortigate``) and calls
   3. Mirror each lease into IPAM (``IPAddress`` with ``status="dhcp"``
      and ``auto_from_lease=True``) when the lease IP falls within a
      known subnet.
+  4. Absence-delete leases the server stopped reporting (#482, with the
+     zero-wire floor guard) — sparing the shared IPAM mirror while a
+     failover / HA peer still holds the lease (#1110).
 
-Never deletes. Expired leases are cleaned up by the existing
-``dhcp_lease_cleanup`` sweep (state=active + expires_at past grace →
-expired + auto_from_lease IPAM row removed). That keeps the two-way
-contract with the control plane:
-
-  * lease appears on wire  → here mirrors it into DB + IPAM
-  * lease drops off wire   → stays "active" until its TTL passes, then
-                              the sweep handles cleanup uniformly
+For drivers with ``get_scopes`` it also reconciles scopes, pools and
+reservations, and records each Windows server's failover relationships
+and the scopes it holds (#1110). The ``dhcp_lease_cleanup`` sweep still
+reclaims leases that pass their expiry between polls.
 
 Idempotent: re-running is a no-op whenever DB and wire already agree.
 """
@@ -105,7 +104,14 @@ async def _run_pull() -> dict[str, Any]:
             total_statics_synced = 0
             total_pools_removed = 0
             total_statics_removed = 0
+            total_scopes_deferred = 0
             errors: list[str] = []
+            # #1110 — persistent conditions (uncoordinated scopes, drifted
+            # failover partners, denied failover reads). Carried in the audit
+            # payload when a row is written, but never the reason one is: a
+            # condition that holds for a week would otherwise write a row
+            # every tick of that week.
+            warnings: list[str] = []
             wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
 
             for server in servers:
@@ -140,8 +146,10 @@ async def _run_pull() -> dict[str, Any]:
                 total_statics_synced += result.statics_synced
                 total_pools_removed += result.pools_removed
                 total_statics_removed += result.statics_removed
+                total_scopes_deferred += result.scopes_deferred
                 wake_group_ids.update(result.dns_wake_group_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
+                warnings.extend(f"{server.name}: {w}" for w in result.warnings)
 
             ps.dhcp_pull_leases_last_run_at = now
 
@@ -186,7 +194,9 @@ async def _run_pull() -> dict[str, Any]:
                             "statics_synced": total_statics_synced,
                             "pools_removed": total_pools_removed,
                             "statics_removed": total_statics_removed,
+                            "scopes_deferred": total_scopes_deferred,
                             "errors": errors[:20],
+                            "warnings": warnings[:20],
                         },
                     )
                 )
@@ -215,7 +225,9 @@ async def _run_pull() -> dict[str, Any]:
                 scopes_skipped_no_subnet=total_scopes_skipped,
                 pools_synced=total_pools_synced,
                 statics_synced=total_statics_synced,
+                scopes_deferred=total_scopes_deferred,
                 error_count=len(errors),
+                warning_count=len(warnings),
             )
             return {
                 "status": "ran",

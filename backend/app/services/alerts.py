@@ -200,6 +200,46 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # are critical (may not be serving at all).
 RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 
+# Issue #1077 — an agent's durable push spool hit its byte cap during a
+# control-plane outage and discarded its OLDEST queued batches. Subject =
+# the dns_server / dhcp_server row (subject_type "agent", same prefixed id
+# shape as ``agent_config_rejected``).
+#
+# The spool exists so an outage costs nothing; a trim is the one case where
+# it did cost something, and nothing else says so — the time-series panels
+# simply show a hole. Fires while the agent's reported ``last_trim_at`` is
+# inside the last 24 h and auto-resolves after that (trim counters are
+# cumulative, so there is no "recovered" report to key off).
+#
+# Severity from WHAT was trimmed: ``lease_events`` is critical, because Kea
+# lease events are the only way the control plane learns about
+# agent-managed leases — a trimmed one is a lease with no IPAM mirror and no
+# DDNS record until the client renews (the agent's lease-snapshot backstop
+# reconciles most of it, but the alarm must not assume that). Anything else
+# (query / activity logs, metrics, sniffer telemetry) is a stats gap and a
+# warning.
+RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
+
+# Issue #1067 — an agent that is heartbeating reports that its DAEMON is not
+# serving, and has been saying so for longer than a bundle normally takes to
+# arrive. Subject = the dns_server / dhcp_server row.
+#
+# The #882 rule above is about a daemon that is UP and serving the wrong
+# config; this one is about a daemon that is not up at all — a DNS agent whose
+# ``named`` start was deferred because no bundle ever came (#1061 reports
+# ``degraded`` with "start deferred, no bundle yet" on every heartbeat, and
+# the pod restarts on its liveness probe every two minutes), or a Kea whose
+# control socket the DHCP agent cannot reach. Reachability alerting cannot
+# see either: the agent is talking to us perfectly. Where one rule ends and
+# the other begins is ``daemon_state.is_not_serving`` — the agents echo a
+# failed apply into the daemon field too, and that echo stays #882's.
+#
+# The grace covers a normal first boot. Every fresh member defers its daemon
+# for the seconds it takes the first bundle to land, and reports ``degraded``
+# meanwhile; five minutes is many poll cycles past that.
+RULE_TYPE_AGENT_DAEMON_DEGRADED = "agent_daemon_degraded"
+_AGENT_DAEMON_DEGRADED_GRACE = timedelta(minutes=5)
+
 # #1111 — the control plane could not RENDER a DNS agent's config bundle.
 # The mirror image of ``agent_config_rejected``: that one is the agent
 # refusing what it was sent, this one is the control plane failing to
@@ -356,6 +396,18 @@ RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 # on two ordinary correctly-working configurations. Deliberate policy drops
 # are not loss.
 RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
+
+# Issue #1110 — a DHCP scope served by two or more servers that do not
+# coordinate: Windows DHCP members holding it with no failover relationship
+# covering it on both, over overlapping ranges; or a Windows member holding a
+# scope a Kea member of the same group also serves. Each server hands out the
+# same addresses to different clients, and neither reports a problem — both
+# scopes look healthy, both servers answer, and the first symptom is two
+# machines with one address. Subject = the group + scope CIDR (a scope held on
+# Windows need not have a SpatiumDDI row). Reads the topology poll's stored
+# observations through the same report the group's Windows failover panel
+# shows, so the alarm and the panel cannot disagree.
+RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
 # Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
 # Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
@@ -525,10 +577,14 @@ RULE_TYPES = frozenset(
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
+        RULE_TYPE_DHCP_PACKETS_DROPPED,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
+        RULE_TYPE_AGENT_SPOOL_TRIMMED,
+        RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
+        RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
@@ -3370,6 +3426,203 @@ async def _matching_agent_config_rejected_subjects(
     return matches
 
 
+def _fmt_bytes(n: int) -> str:
+    size = float(max(0, n))
+    if size < 1024:
+        return f"{size:.0f} B"
+    for unit in ("KiB", "MiB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} GiB"
+
+
+async def _matching_agent_spool_trimmed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``agent_spool_trimmed`` — every DNS / DHCP server whose agent reported a
+    spool trim within :data:`spool_status.TRIM_RECENT_WINDOW` (#1077).
+
+    Reads ``spool_status`` as the heartbeat stored it; no probing. NULL (never
+    reported — a pre-#1077 agent or an agentless driver) is not a match, for
+    the same reason it is not in ``agent_config_rejected``.
+    """
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.spool_status import (  # noqa: PLC0415
+        CRITICAL_STREAMS,
+        recently_trimmed_streams,
+    )
+
+    now = now or datetime.now(UTC)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for model, kind in ((DNSServer, "DNS"), (DHCPServer, "DHCP")):
+        rows = (
+            (await db.execute(select(model).where(model.spool_status.is_not(None)))).scalars().all()
+        )
+        for row in rows:
+            trimmed = recently_trimmed_streams(row.spool_status, now=now)
+            if not trimmed:
+                continue
+            parts = []
+            for name in sorted(trimmed):
+                s = trimmed[name]
+                rejected = int(s.get("rejected_entries_total") or 0)
+                parts.append(
+                    f"{name} ({int(s.get('trimmed_entries_total') or 0)} batches, "
+                    f"{_fmt_bytes(int(s.get('trimmed_bytes_total') or 0))} trimmed at the cap"
+                    + (f", {rejected} refused by the control plane" if rejected else "")
+                    + " since agent state was created)"
+                )
+            critical = bool(CRITICAL_STREAMS & set(trimmed))
+            consequence = (
+                " Lease events were among them: those leases have no IPAM mirror row and "
+                "no DDNS record until the client renews or the agent's lease snapshot "
+                "reconciles them."
+                if critical
+                else " The control plane will show a gap in those streams for the outage."
+            )
+            message = (
+                f"{kind} server '{row.name}' had to discard queued data: its agent's push "
+                "spool either reached its size cap during a control-plane outage and "
+                "dropped the oldest batches, or gave up on a batch the control plane kept "
+                "refusing (a 4xx, or a 500 that other batches did not get — see the "
+                f"agent log for agent_spool_entry_poisoned). Streams affected in the last "
+                f"24 h: {'; '.join(parts)}.{consequence} If it was the cap, raise "
+                "AGENT_SPOOL_MAX_BYTES on the agent if outages this long are expected."
+            )
+            matches.append(
+                (
+                    f"{model.__tablename__}:{row.id}",
+                    f"{row.name} ({kind})",
+                    message,
+                    "critical" if critical else "warning",
+                )
+            )
+    return matches
+
+
+async def _matching_dhcp_scope_uncoordinated_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``dhcp_scope_uncoordinated`` — every scope the group failover report
+    (#1110) marks ``uncoordinated``, in every group with a Windows member.
+
+    ``unknown`` (a member's failover relationships could not be read) is
+    deliberately not a match: it is a read failure the panel already shows,
+    and paging on it would page on every denied read. Auto-resolves when the
+    poll next reads the scope in a relationship, or on one server only.
+    """
+    from app.models.dhcp import DHCPServer, DHCPServerGroup  # noqa: PLC0415
+    from app.services.dhcp.windows_failover_report import (  # noqa: PLC0415
+        group_failover_report,
+    )
+
+    group_ids = (
+        (
+            await db.execute(
+                select(DHCPServer.server_group_id)
+                .where(
+                    DHCPServer.driver == "windows_dhcp",
+                    DHCPServer.server_group_id.is_not(None),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str, str | None]] = []
+    for gid in group_ids:
+        group = await db.get(DHCPServerGroup, gid)
+        if group is None:
+            continue
+        report = await group_failover_report(db, group)
+        for row in report["scopes"]:
+            if row["verdict"] != "uncoordinated":
+                continue
+            matches.append(
+                (
+                    f"{group.id}:{row['cidr']}",
+                    f"{row['cidr']} ({group.name})",
+                    f"DHCP scope {row['cidr']} in server group '{group.name}': {row['detail']}",
+                    "critical",
+                )
+            )
+    return matches
+
+
+async def _matching_agent_daemon_degraded_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """``agent_daemon_degraded`` — every agent-managed server whose agent
+    reports a daemon that is not serving, and has for longer than the grace
+    (#1067).
+
+    Reads the ``daemon_*`` columns the two heartbeat handlers write; no
+    probing. "Not serving" is ``daemon_state.is_not_serving`` — the same
+    classification the server responses publish as ``daemon_not_serving``,
+    so this rule and the chip cannot disagree. ``daemon_status_since`` is the
+    stamp of the heartbeat that began the current state (a repeated report
+    never moves it), so it is the grace clock and no watermark of our own is
+    needed. Auto-resolves through ``evaluate_all``'s standard diff the moment
+    the agent reports ``ok`` again.
+
+    Not a match: NULL (never reported — a pre-#1061 agent or an agentless
+    driver; unknown is not an alarm), a row in operator-set maintenance mode
+    (#182: the operator is working on it), and a ``degraded`` that is the
+    agent echoing a failed config apply — ``config_apply_*`` from either
+    agent, or Kea's ``dhcp4_config_rejected`` / ``dhcp6_…`` from the DHCP
+    one. #882's rule already carries each of those, with the severity its
+    verdict deserves; firing here too would page twice for one event.
+    """
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.daemon_state import (  # noqa: PLC0415
+        STATUS_OK,
+        is_not_serving,
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    for model, kind in ((DNSServer, "DNS"), (DHCPServer, "DHCP")):
+        rows = (
+            (
+                await db.execute(
+                    select(model).where(
+                        model.daemon_status.is_not(None),
+                        model.daemon_status != STATUS_OK,
+                        model.maintenance_mode.is_(False),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            if not is_not_serving(row.daemon_status, row.daemon_reason):
+                continue
+            since = row.daemon_status_since
+            if since is None or (now - since) <= _AGENT_DAEMON_DEGRADED_GRACE:
+                continue
+            reason = (row.daemon_reason or "").strip()
+            minutes = int((now - since).total_seconds() // 60)
+            message = (
+                f"{kind} server '{row.name}' reports its daemon is "
+                f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
+                f"(since {since.isoformat(timespec='seconds')}). The agent is heartbeating, "
+                "so the server reads reachable and healthy on every other signal while it "
+                "is not serving." + (f" Agent reported: {reason}" if reason else "")
+            )
+            subject_id = f"{model.__tablename__}:{row.id}"
+            matches.append((subject_id, f"{row.name} ({kind})", message, rule.severity))
+    return matches
+
+
 async def _matching_agent_bundle_render_failed_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -4306,6 +4559,8 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
 
 
 _AGENT_CONFIG_REJECTED_RULE_NAME = "Agent config apply rejected"
+_AGENT_SPOOL_TRIMMED_RULE_NAME = "Agent push spool trimmed"
+_AGENT_DAEMON_DEGRADED_RULE_NAME = "Agent daemon not serving"
 
 
 async def seed_node_pressure_alert_rule() -> None:
@@ -4504,6 +4759,140 @@ async def seed_agent_config_rejected_alert_rule() -> None:
                 ),
                 rule_type=RULE_TYPE_AGENT_CONFIG_REJECTED,
                 severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+async def seed_agent_spool_trimmed_alert_rule() -> None:
+    """Seed the #1077 rule, ENABLED by default.
+
+    Silent on every install whose agents never hit their spool cap — which is
+    every install whose control-plane outages are shorter than a few hundred
+    MiB of backlog — and on agents too old to report a spool. When it does
+    speak, data the operator would otherwise assume was replayed is gone, and
+    nothing else says so: the charts just have a hole. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_SPOOL_TRIMMED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_SPOOL_TRIMMED_RULE_NAME,
+                description=(
+                    "Fires when a DNS or DHCP agent's durable push spool reached "
+                    "its size cap during a control-plane outage and discarded its "
+                    "oldest queued batches, so part of the outage's logs, metrics "
+                    "or lease events will never arrive. Critical when Kea lease "
+                    "events were trimmed (leases missing from IPAM and DDNS until "
+                    "renewal), otherwise a warning. Auto-resolves 24 h after the "
+                    "last trim."
+                ),
+                rule_type=RULE_TYPE_AGENT_SPOOL_TRIMMED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+_DHCP_SCOPE_UNCOORDINATED_RULE_NAME = "DHCP scope served uncoordinated"
+
+
+async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
+    """Seed the #1110 rule, ENABLED by default.
+
+    Silent on every install without a Windows DHCP server, and on one with a
+    single Windows server per group; it only speaks when two servers already
+    hand out the same addresses. That is the outage, not an early warning,
+    and nothing else says it: both servers report the scope healthy. Keyed on
+    ``name``; an operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_SCOPE_UNCOORDINATED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_SCOPE_UNCOORDINATED_RULE_NAME,
+                description=(
+                    "Fires for each DHCP scope that two or more servers serve without "
+                    "coordinating: Windows DHCP servers holding it with no failover "
+                    "relationship covering it, over overlapping ranges, or a Windows "
+                    "server holding a scope a Kea server in the same group also serves. "
+                    "Each server can hand the same address to a different client, while "
+                    "both report the scope healthy. Resolves when the scope is put in a "
+                    "failover relationship or left on one server only."
+                ),
+                rule_type=RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+async def seed_agent_daemon_degraded_alert_rule() -> None:
+    """Seed the #1067 rule, ENABLED by default.
+
+    On by default for the same reason as ``agent_config_rejected``: it applies
+    to every install that runs an agent, needs no configuration, and reads a
+    state the agent itself reports about its own daemon. The failure it
+    catches — a registered, heartbeating server whose daemon never started —
+    is invisible on every other signal (the 2026-09-12 measurement read "seen
+    1 minute ago, config ok" for twelve minutes on a member restarting every
+    two), so leaving the alarm off would mean the operator has to already
+    suspect the problem in order to find out about it. The five-minute grace
+    keeps a normal first boot silent.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_DAEMON_DEGRADED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_DAEMON_DEGRADED_RULE_NAME,
+                description=(
+                    "Fires when a DNS or DHCP agent reports on its heartbeat that its "
+                    "daemon is not serving (for example a DNS agent whose named start is "
+                    "deferred because no configuration bundle has arrived) and has been "
+                    "saying so for more than five minutes. The agent keeps heartbeating, "
+                    "so the server stays reachable and healthy on every other signal "
+                    "while it answers nothing. Auto-resolves when the agent reports the "
+                    "daemon ok."
+                ),
+                rule_type=RULE_TYPE_AGENT_DAEMON_DEGRADED,
+                severity="critical",
                 enabled=True,
                 notify_syslog=True,
                 notify_webhook=True,
@@ -5621,6 +6010,7 @@ async def seed_dns_dga_alert_rule() -> None:
 _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
+    RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -5842,6 +6232,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # there is no row and no single node it belongs to, and which
                 # node a replica sits on is already in the message.
                 subject_type = "cluster"
+            elif rule.rule_type == RULE_TYPE_DHCP_SCOPE_UNCOORDINATED:
+                uncoordinated = await _matching_dhcp_scope_uncoordinated_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in uncoordinated]
+                # A scope held on Windows need not have a SpatiumDDI row, so the
+                # subject is "<group id>:<cidr>", not a dhcp_scope id.
+                subject_type = "dhcp_scope"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]
@@ -5850,6 +6246,18 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # same shape ``secret_expiring`` uses for its two credential
                 # tables. Without the prefix a dns_server and a dhcp_server
                 # sharing a UUID would collide into one event.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_AGENT_SPOOL_TRIMMED:
+                trimmed_hits = await _matching_agent_spool_trimmed_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
+                # Same prefixed "<table>:<id>" subject as agent_config_rejected.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_AGENT_DAEMON_DEGRADED:
+                dark = await _matching_agent_daemon_degraded_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dark]
+                # Same shape as agent_config_rejected: the subject_id carries
+                # the source table so a dns_server and a dhcp_server sharing
+                # a UUID never collide into one event.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:
                 unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule)

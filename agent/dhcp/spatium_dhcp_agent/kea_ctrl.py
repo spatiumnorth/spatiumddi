@@ -27,9 +27,15 @@ def send_command(
     arguments: dict[str, Any] | None = None,
     *,
     timeout: float = 10.0,
+    accept_results: tuple[int, ...] = (0,),
 ) -> dict[str, Any]:
     """Send a single command over the Kea control unix socket and return the
-    decoded JSON response."""
+    decoded JSON response.
+
+    ``accept_results`` lists the Kea result codes returned rather than raised.
+    Most commands only succeed on 0, but some answer a legitimate empty result
+    with 3 ("empty") — ``lease4-get-page`` past the last lease, for one.
+    """
     payload: dict[str, Any] = {"command": command}
     if arguments is not None:
         payload["arguments"] = arguments
@@ -54,7 +60,7 @@ def send_command(
     except json.JSONDecodeError as e:
         raise KeaCtrlError(f"non-JSON response from kea: {raw[:200]}") from e
     result = resp.get("result")
-    if result not in (0, None):
+    if result is not None and result not in accept_results:
         raise KeaCtrlError(
             f"kea command {command!r} failed: result={result} text={resp.get('text')!r}"
         )

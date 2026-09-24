@@ -717,7 +717,6 @@ export function CreateServerModal({
                   }
                 >
                   <option value="ntlm">NTLM</option>
-                  <option value="kerberos">Kerberos</option>
                   <option value="basic">Basic</option>
                   <option value="credssp">CredSSP</option>
                 </select>

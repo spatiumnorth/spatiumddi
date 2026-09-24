@@ -256,6 +256,16 @@ def _loop(tmp_path: Path, driver: _Driver) -> SyncLoop:
     return SyncLoop(_Cfg(tmp_path), ["tok"], driver, _Heartbeat())
 
 
+def _assert_echoed(loop: SyncLoop, verdict: str) -> None:
+    """The verdict is echoed into the heartbeat's ``daemon`` field too, and
+    the control plane parses that reason (#1067): ``daemon_state.
+    is_config_apply_verdict`` reads a ``config_apply_`` prefix as a failed
+    apply — #882's to report — rather than a daemon that is not serving.
+    Reword it and every routine revert pages critical as "not serving"."""
+    assert loop.heartbeat.daemon_status["status"] == "degraded"
+    assert loop.heartbeat.daemon_status["reason"].startswith(f"config_apply_{verdict}: ")
+
+
 def test_validate_failure_leaves_daemon_alone(tmp_path: Path) -> None:
     """A staging-tree failure must not bounce a healthy daemon.
 
@@ -277,6 +287,7 @@ def test_validate_failure_leaves_daemon_alone(tmp_path: Path) -> None:
     assert loop.apply_status.status == STATUS_REVERTED
     assert loop.apply_status.failed_etag == "bad"
     assert loop.apply_status.etag == "good"
+    _assert_echoed(loop, STATUS_REVERTED)
 
 
 def test_reload_failure_re_renders_the_previous_bundle(tmp_path: Path) -> None:
@@ -302,6 +313,7 @@ def test_reload_failure_re_renders_the_previous_bundle(tmp_path: Path) -> None:
     assert driver.applied == ["good"]  # the previous bundle was put back
     assert loop.apply_status.status == STATUS_REVERTED
     assert loop.apply_status.etag == "good"
+    _assert_echoed(loop, STATUS_REVERTED)
 
 
 def test_failure_with_no_previous_is_reported_distinctly(tmp_path: Path) -> None:
@@ -315,6 +327,7 @@ def test_failure_with_no_previous_is_reported_distinctly(tmp_path: Path) -> None
     assert loop._apply_with_revert(_bundle("bad"), "bad") is False
     assert loop.apply_status.status == STATUS_NO_PREVIOUS
     assert loop.apply_status.etag is None
+    _assert_echoed(loop, STATUS_NO_PREVIOUS)
 
 
 def test_revert_failure_is_reported_distinctly(tmp_path: Path) -> None:
@@ -328,6 +341,7 @@ def test_revert_failure_is_reported_distinctly(tmp_path: Path) -> None:
     assert loop._apply_with_revert(_bundle("bad"), "bad") is False
     assert loop.apply_status.status == STATUS_REVERT_FAILED
     assert "revert also failed" in (loop.apply_status.error or "")
+    _assert_echoed(loop, STATUS_REVERT_FAILED)
 
 
 def test_success_commits_and_clears_quarantine(tmp_path: Path) -> None:

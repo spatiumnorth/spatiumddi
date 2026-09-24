@@ -32,7 +32,7 @@ plane's own verdict on its last render, kept apart from #882's
 heartbeat).
 
 Revision ID: c4d1e7f90a2b
-Revises: e3b9d7412c5a
+Revises: b7d21c9e4f06
 Create Date: 2026-09-22
 """
 
@@ -44,7 +44,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from alembic import op
 
 revision = "c4d1e7f90a2b"
-down_revision = "e3b9d7412c5a"
+down_revision = "b7d21c9e4f06"
 branch_labels = None
 depends_on = None
 

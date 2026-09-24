@@ -7,8 +7,24 @@ via its ``maxsize`` / ``maxver`` settings — we just follow the
 file like ``tail -F`` and re-open on inode change.
 
 Same shape as the DNS agent's ``QueryLogShipper`` — see that module
-for the resilience design notes (file may not exist yet on first
-boot, control plane unreachable → bounded ring buffer, etc).
+for the tailing notes (file may not exist yet on first boot, rotation,
+etc).
+
+A batch the control plane does not accept is kept in the ``dhcp_log``
+stream of the durable spool (#1077) and replayed, oldest first, once it
+answers again — so a maintenance window no longer loses the window's DHCP
+activity. Kea's lines carry their own timestamps (``kea_parser`` reads the
+time from the line), so a late batch lands on the minute it happened. The
+spool's age limit drops lines the control plane's 24 h log retention would
+prune on arrival anyway. ``AGENT_SPOOL_ENABLED=false`` restores the old
+drop-on-failure behaviour.
+
+The daemon is never blocked: after a failed POST the shipper backs off for
+``BATCH_INTERVAL`` and appends straight to the spool, so a black-holed
+control plane costs a local disk write per batch rather than a connect
+timeout. The in-memory buffer only holds lines read but not yet flushed;
+every full batch is flushed each tick, and the ``MAX_BUFFER_LINES`` trim is
+a last-resort OOM guard.
 """
 
 from __future__ import annotations
@@ -23,6 +39,8 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .push import CPPoster, disabled_spool, drain_for, late_bound
+from .spool import RETRY, Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
@@ -33,20 +51,41 @@ BATCH_INTERVAL = 5.0
 MAX_BUFFER_LINES = 5_000
 TAIL_POLL_INTERVAL = 0.5
 FILE_WAIT_INTERVAL = 5.0
+# Upper bound on batches flushed in one tick, so a large burst can't starve
+# rotation checks / stop() for long.
+MAX_FLUSHES_PER_TICK = MAX_BUFFER_LINES // MAX_BATCH
+# #1077 — how often an idle shipper retries its backlog, and how long one
+# retry may spend replaying before it goes back to tailing.
+DRAIN_INTERVAL = 10.0
+DRAIN_BUDGET = 5.0
+LOG_ENTRIES_PATH = "/api/v1/dhcp/agents/log-entries"
 
 
 class LogShipper:
     """Tail thread + batching POST loop."""
 
-    def __init__(self, cfg: AgentConfig, token_ref: list[str], path: str | None = None) -> None:
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        path: str | None = None,
+        spool: Spool | None = None,
+    ) -> None:
         self.cfg = cfg
         self.token_ref = token_ref
         self.path = Path(path or os.environ.get("DHCP_LOG_PATH") or DEFAULT_DHCP_LOG_PATH)
         self._stop = threading.Event()
         self._buffer: list[str] = []
         self._last_flush = time.monotonic()
+        self._last_drain = 0.0
         self._fh: TextIO | None = None
         self._inode: int | None = None
+        self._shipper = Shipper(
+            spool if spool is not None else disabled_spool("dhcp_log"),
+            CPPoster(cfg, token_ref, LOG_ENTRIES_PATH, late_bound(self, "_cp_client")),
+            event_prefix="dhcp_log_ship",
+            retry_backoff_seconds=BATCH_INTERVAL,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -118,41 +157,58 @@ class LogShipper:
             return True
         return (time.monotonic() - self._last_flush) >= BATCH_INTERVAL
 
-    def _flush(self) -> None:
+    def _flush(self) -> str:
         batch = self._buffer[:MAX_BATCH]
         self._buffer = self._buffer[MAX_BATCH:]
         try:
-            with self._cp_client() as c:
-                resp = c.post(
-                    "/api/v1/dhcp/agents/log-entries",
-                    json={"lines": batch},
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-            if resp.status_code not in (200, 204):
-                log.warning(
-                    "dhcp_log_ship_failed",
-                    status=resp.status_code,
-                    batch_size=len(batch),
-                )
-        except httpx.HTTPError as exc:
-            log.warning("dhcp_log_ship_http_error", error=str(exc), batch_size=len(batch))
+            # Sent now, or queued behind the backlog (spooled on failure).
+            return self._shipper.ship({"lines": batch})
         finally:
             self._last_flush = time.monotonic()
+
+    def _maybe_drain(self) -> None:
+        """Replay the backlog on an idle tick, throttled.
+
+        ``ship`` already drains ahead of every live batch; this covers a
+        server whose Kea has gone quiet, which would otherwise hold its
+        backlog until the next log line. The shipper's retry backoff keeps a
+        still-absent control plane from costing a timeout per attempt.
+        """
+        if not len(self._shipper.spool):
+            return
+        now = time.monotonic()
+        if now - self._last_drain < DRAIN_INTERVAL:
+            return
+        self._last_drain = now
+        drain_for(self._shipper, DRAIN_BUDGET)
+
+    def tick(self) -> float:
+        """One loop iteration. Returns how long to wait before the next."""
+        if self._fh is None and not self._open():
+            self._maybe_drain()
+            return FILE_WAIT_INTERVAL
+        self._read_available()
+        self._check_rotation()
+        if self._should_flush():
+            flushes = 0
+            while self._should_flush() and flushes < MAX_FLUSHES_PER_TICK:
+                self._flush()
+                flushes += 1
+        else:
+            self._maybe_drain()
+        return TAIL_POLL_INTERVAL
 
     def run(self) -> None:
         log.info("dhcp_log_shipper_starting", path=str(self.path))
         while not self._stop.is_set():
-            if self._fh is None:
-                if not self._open():
-                    self._stop.wait(timeout=FILE_WAIT_INTERVAL)
-                    continue
-            self._read_available()
-            self._check_rotation()
-            if self._should_flush():
-                self._flush()
-            self._stop.wait(timeout=TAIL_POLL_INTERVAL)
-        if self._buffer:
-            self._flush()
+            self._stop.wait(timeout=self.tick())
+        # Final flush on shutdown so buffered lines reach the control plane
+        # or the spool rather than dying with the process. Without a spool a
+        # failed POST drops the batch, so stop at the first one rather than
+        # paying a connect timeout per remaining batch during shutdown.
+        while self._buffer:
+            if self._flush() == RETRY and not self._shipper.spool.enabled:
+                break
         self._close()
         log.info("dhcp_log_shipper_stopped")
 

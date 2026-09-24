@@ -511,7 +511,9 @@ def test_agent_metric_columns_match_the_ingest_model() -> None:
     # stores. ``socket_drop`` is not in _STAT_MAP — it comes from procfs, not
     # from Kea — so it is added here explicitly rather than being forgotten.
     agent_columns = set(stat_map.values()) | {"socket_drop"}
-    model_fields = set(DHCPMetricReport.model_fields) - {"bucket_at"}
+    # ``batch_id`` is the #1077 replay-dedupe envelope, stamped by the spool's
+    # Shipper on every push rather than computed by the poller.
+    model_fields = set(DHCPMetricReport.model_fields) - {"bucket_at", "batch_id"}
     assert agent_columns == model_fields, (
         f"agent sends {sorted(agent_columns - model_fields)} the server ignores; "
         f"server expects {sorted(model_fields - agent_columns)} the agent never sends"

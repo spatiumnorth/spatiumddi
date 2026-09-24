@@ -48,6 +48,7 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
+from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -77,6 +78,8 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
@@ -379,7 +382,7 @@ class WindowsCredentialsInput(BaseModel):
     ``has_credentials``.
 
     Mirrors the DHCP-side shape. All fields are optional to support
-    **partial updates**: sending ``{"transport": "kerberos"}`` on an
+    **partial updates**: sending ``{"transport": "credssp"}`` on an
     existing server decrypts the stored blob, merges the transport
     change, and re-encrypts. On first-time set, ``username`` + ``password``
     are still required — the endpoint validates that explicitly.
@@ -388,7 +391,7 @@ class WindowsCredentialsInput(BaseModel):
     username: str | None = None
     password: str | None = None
     winrm_port: int | None = None
-    # transport: ntlm | kerberos | basic | credssp
+    # transport: ntlm | credssp | basic (kerberos: #1128)
     transport: str | None = None
     use_tls: bool | None = None
     verify_tls: bool | None = None
@@ -396,10 +399,9 @@ class WindowsCredentialsInput(BaseModel):
     @field_validator("transport")
     @classmethod
     def _valid_transport(cls, v: str | None) -> str | None:
-        # #426: reject a bogus transport at save (pywinrm only speaks these).
-        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
-            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
-        return v
+        # #426 / #1128: reject a transport this build cannot speak at save,
+        # instead of failing opaquely at the first call.
+        return validate_transport(v)
 
     @field_validator("winrm_port")
     @classmethod
@@ -522,6 +524,25 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1077 — the agent's push spool as last reported on its heartbeat.
+    # NULL when never reported (a pre-#1077 agent, or an agentless driver):
+    # UNKNOWN, never "empty".
+    spool_status: SpoolStatus | None = None
+    # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
+    # ``degraded`` (the agent's own word); NULL when the agent has never
+    # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
+    # the CURRENT state began; a repeated report never moves it.
+    daemon_status: str | None = None
+    daemon_reason: str | None = None
+    daemon_status_since: datetime | None = None
+    # Derived, never stored: ``daemon_state.is_not_serving``, the one reading
+    # of the three fields above that the ``agent_daemon_degraded`` rule, the
+    # server chip, the detail banner and the dashboard all share. ``true`` —
+    # the agent reports a daemon that is not serving. ``false`` — ``ok``, or
+    # a ``degraded`` that is the agent echoing a failed config apply, which
+    # ``config_apply_status`` reports at #882's severity. ``null`` — never
+    # reported.
+    daemon_not_serving: bool | None = None
     # #1111 — the stored agent config bundle: what the long-poll serves and
     # when it was rendered, whether the newest render is behind the changes
     # made since (watermark < dirty_seq), how many renders this server has
@@ -573,6 +594,11 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            spool_status=s.spool_status,
+            daemon_status=s.daemon_status,
+            daemon_reason=s.daemon_reason,
+            daemon_status_since=s.daemon_status_since,
+            daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
             bundle_rendered_by=s.bundle_rendered_by,
@@ -1987,6 +2013,65 @@ async def delete_server(
     collect_wake(dns_server_channel(server.id), dns_group_channel(server.group_id))
     await db.delete(server)
     await db.commit()
+
+
+# ── Agent approval (spatiumddi#1121) ────────────────────────────────────────
+
+
+@router.post(
+    "/groups/{group_id}/servers/{server_id}/approve",
+    response_model=ServerResponse,
+)
+async def approve_server(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ServerResponse:
+    """Clear the agent-approval hold on this DNS server.
+
+    With ``DNS_REQUIRE_AGENT_APPROVAL=true`` the register path holds an agent
+    whose fingerprint changed at ``pending_approval`` (a wiped agent volume
+    legitimately produces a new fingerprint — see ``agent_register`` in
+    ``dns/agents.py``). While held, the agent's config long-poll answers
+    ``{"pending_approval": true, "etag": null}`` and never a bundle, so
+    ``named`` stays deferred. This is the operator's way back in — the DNS
+    twin of ``POST /dhcp/servers/{id}/approve`` — and before it existed the
+    only recovery was a database write or delete-and-re-register.
+
+    The row already carries the NEW fingerprint (register stores it while
+    holding the agent), so approving accepts that identity as-is. Idempotent:
+    approving an already-approved server is a 200 with the row, so a double
+    click cannot fail. The wake is best-effort — a held agent re-polls on its
+    own cadence and the next poll serves the bundle either way.
+    """
+    server = await _require_server(group_id, server_id, db)
+    was_pending = server.pending_approval
+    server.pending_approval = False
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dns.server.approve",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            old_value={"pending_approval": was_pending},
+            new_value={"pending_approval": False},
+            result="success",
+        )
+    )
+    collect_wake(dns_server_channel(server.id))
+    await db.commit()
+    await db.refresh(server)
+    logger.info(
+        "dns_server_approved",
+        server_id=str(server.id),
+        was_pending=was_pending,
+        user_id=str(current_user.id),
+    )
+    return ServerResponse.from_model(server)
 
 
 # ── Maintenance mode (issue #182) ───────────────────────────────────────────

@@ -88,6 +88,11 @@ backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:13
 backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:137
 backend/alembic/versions/79a2e409e774_appliance_slot_telemetry.py:drop_column:138
 backend/alembic/versions/7c299e8a5490_dns_tsig_keys.py:drop_table:62
+backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:163
+backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:164
+backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_column:165
+backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_table:157
+backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_table:162
 backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alter_column_type:39
 backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alter_column_type:54
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:47
@@ -258,6 +263,9 @@ backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:65
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:66
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:70
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:71
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:63
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:64
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:65
 backend/alembic/versions/b7e29c4f5d18_dns_dhcp_tags.py:drop_column:63
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_column:60
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_constraint_fk:61
@@ -373,6 +381,8 @@ backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:289
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:297
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:36
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:37
+backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_column:62
+backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_table:64
 backend/alembic/versions/c5f1a2b3d4e6_firewall_logging_enabled.py:drop_column:37
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:110
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:111

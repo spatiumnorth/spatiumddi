@@ -286,6 +286,13 @@ SECTIONS: tuple[Section, ...] = (
         tables=(
             "dhcp_server_group",
             "dhcp_server",
+            # #1110 — observed Windows failover relationships + per-server
+            # scope presence. Re-read by the next topology poll, but they
+            # FK into dhcp_server, so a selective restore of this section
+            # TRUNCATE-CASCADEs them; listing them restores them with it
+            # (same placement as dns_server_zone_state in the DNS section).
+            "dhcp_failover_relationship",
+            "dhcp_server_scope_state",
             "dhcp_scope",
             "dhcp_pool",
             "dhcp_static_assignment",
@@ -424,6 +431,23 @@ SECTIONS: tuple[Section, ...] = (
             "historical chart data after a disaster recovery."
         ),
         tables=("dns_metric_sample", "dhcp_metric_sample"),
+        volatile=True,
+    ),
+    Section(
+        key="agent_ingest_receipts",
+        label="Agent ingest receipts",
+        description=(
+            "Replay-dedupe receipts for spooled agent pushes (issue #1077): "
+            "which agent batches have already been ingested, so a batch "
+            "replayed after a lost response inserts nothing. Volatile — "
+            "35-day retention, and only the batch in flight at the moment a "
+            "response was lost ever consults it. Excluded from default "
+            "backup: restoring receipts WITHOUT the log / metric / lease rows "
+            "they vouch for would make a replay of those batches read as "
+            "duplicates and be dropped, so an empty table is the safe state "
+            "after a restore."
+        ),
+        tables=("agent_ingest_receipt",),
         volatile=True,
     ),
     Section(
