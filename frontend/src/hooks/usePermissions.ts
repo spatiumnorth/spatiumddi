@@ -86,3 +86,15 @@ export function usePermissions(): {
 
   return { can, isSuperadmin, isLoading: query.isLoading };
 }
+
+/** Props for a write control whose permission check failed (#1155): it
+ *  stays where it is, disabled, with the reason as its tooltip, instead of
+ *  opening a form that ends in "Permission denied". Spread it after the
+ *  control's own ``title`` so the reason replaces that only while denied.
+ *  Pass the same check the server makes for the action behind it. */
+export function permissionGate(
+  allowed: boolean,
+  reason: string,
+): { disabled?: boolean; title?: string } {
+  return allowed ? {} : { disabled: true, title: reason };
+}

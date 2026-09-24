@@ -88,7 +88,7 @@ import {
   type AddressSetUpdate,
   formatApiError,
 } from "@/lib/api";
-import { usePermissions } from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -4191,6 +4191,15 @@ function ReconciliationModal({
   );
 }
 
+// #1155 — why a header write control is disabled for this caller: the
+// tooltip ``permissionGate`` puts on it in place of its own.
+const NEEDS_SPACE_WRITE = "Requires write permission on IP spaces";
+const NEEDS_BLOCK_WRITE = "Requires write permission on IP blocks";
+const NEEDS_SUBNET_WRITE = "Requires write permission on subnets";
+const NEEDS_ADDRESS_WRITE =
+  "Requires write permission on this subnet or on an address set in it";
+const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
+
 // Collapses Clean Orphans / Merge / Resize / Scan with nmap / Split into a
 // single dropdown so the subnet header doesn't accumulate a row of 9+ buttons
 // as we add features. Items are alphabetical to make discovery predictable —
@@ -4201,6 +4210,7 @@ function ReconciliationModal({
 // plus the AI gate. That also gives it the keyboard navigation the local
 // copy never had.
 function ToolsMenu({
+  can,
   onBulkAllocate,
   onCleanOrphans,
   onMerge,
@@ -4210,6 +4220,10 @@ function ToolsMenu({
   onSplit,
   onAskAi,
 }: {
+  /** #1155 — which of the writing tools the caller's grants will pass;
+   *  the rest stay listed, disabled, with the reason as their tooltip.
+   *  Reconcile opens a review and Ask AI reads, so neither is gated. */
+  can: { allocate: boolean; reshape: boolean; scan: boolean };
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
   onMerge: () => void;
@@ -4223,6 +4237,7 @@ function ToolsMenu({
   onAskAi?: () => void;
 }) {
   const aiAvailable = useAiAvailable();
+  const reshape = permissionGate(can.reshape, NEEDS_SUBNET_WRITE);
   return (
     <HeaderMenu
       label="Tools"
@@ -4234,14 +4249,22 @@ function ToolsMenu({
           label: "Bulk allocate…",
           icon: Layers,
           onSelect: onBulkAllocate,
+          ...permissionGate(can.allocate, NEEDS_ADDRESS_WRITE),
         },
         {
           key: "clean-orphans",
           label: "Clean Orphans",
           icon: Trash2,
           onSelect: onCleanOrphans,
+          ...reshape,
         },
-        { key: "merge", label: "Merge…", icon: GitMerge, onSelect: onMerge },
+        {
+          key: "merge",
+          label: "Merge…",
+          icon: GitMerge,
+          onSelect: onMerge,
+          ...reshape,
+        },
         {
           key: "reconcile",
           label: "Reconcile (IP discovery)",
@@ -4253,9 +4276,22 @@ function ToolsMenu({
           label: "Resize…",
           icon: Maximize2,
           onSelect: onResize,
+          ...reshape,
         },
-        { key: "scan", label: "Scan with nmap", icon: Radar, onSelect: onScan },
-        { key: "split", label: "Split…", icon: Scissors, onSelect: onSplit },
+        {
+          key: "scan",
+          label: "Scan with nmap",
+          icon: Radar,
+          onSelect: onScan,
+          ...permissionGate(can.scan, NEEDS_NMAP_WRITE),
+        },
+        {
+          key: "split",
+          label: "Split…",
+          icon: Scissors,
+          onSelect: onSplit,
+          ...reshape,
+        },
         ...(onAskAi && aiAvailable
           ? [
               {
@@ -4298,6 +4334,7 @@ function ActionsMenu({
     icon?: LucideIcon;
     onClick?: () => void;
     title?: string;
+    disabled?: boolean;
   } | null>;
 }) {
   return (
@@ -4312,6 +4349,7 @@ function ActionsMenu({
                 label: it.label,
                 icon: it.icon,
                 title: it.title,
+                disabled: it.disabled,
                 onSelect: it.onClick,
               },
             ]
@@ -4624,6 +4662,19 @@ function SubnetDetail({
   // The full per-IP write decision used by gray-out + checkbox + menu.
   const permitsWriteIp = (address: string): boolean =>
     subnetWritable || ipInWritableSet(address);
+
+  // #1155 — the header's write actions, each on the check the server makes
+  // for it, so a read-only operator is not handed a form that ends in
+  // "Permission denied":
+  //   * Edit — write on subnets at the type level (PUT /subnets/{id}); the
+  //     reshaping tools (resize / split / merge / clean orphans) change the
+  //     subnet itself and ask for the same;
+  //   * Allocate IP, Bulk allocate, Import addresses — write on this subnet
+  //     or on an address set in it (#103), as the allocation routes do;
+  //   * Scan with nmap — the nmap scan permission.
+  const canWriteSubnets = perms.can("write", "subnet");
+  const canAllocate = subnetWritable || writableSets.length > 0;
+  const canScan = perms.can("write", "manage_nmap_scans");
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
@@ -5262,12 +5313,18 @@ function SubnetDetail({
             />
             <SubnetImportExportButton
               subnet={subnet}
+              canImport={canAllocate}
               onCommitted={() => {
                 qc.invalidateQueries({ queryKey: ["addresses"] });
                 qc.invalidateQueries({ queryKey: ["subnets"] });
               }}
             />
             <ToolsMenu
+              can={{
+                allocate: canAllocate,
+                reshape: canWriteSubnets,
+                scan: canScan,
+              }}
               onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
               onMerge={() => setShowMergeSubnet(true)}
@@ -5303,13 +5360,18 @@ function SubnetDetail({
               resourceId={subnet.id}
               label={subnet.network}
             />
-            <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
+            <HeaderButton
+              icon={Pencil}
+              onClick={() => setShowEditSubnet(true)}
+              {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+            >
               Edit
             </HeaderButton>
             <HeaderButton
               variant="primary"
               icon={Plus}
               onClick={() => setShowAddModal(true)}
+              {...permissionGate(canAllocate, NEEDS_ADDRESS_WRITE)}
             >
               Allocate IP
             </HeaderButton>
@@ -10951,7 +11013,10 @@ function SpaceVrfBadges({
   onEdit,
 }: {
   space: IPSpace;
-  onEdit: () => void;
+  /** Omitted for a caller who cannot edit the space (#1155): the "Edit
+   *  Space to add" hint is then left out rather than pointing at a form
+   *  that ends in "Permission denied". */
+  onEdit?: () => void;
 }) {
   const { data: vrfs } = useQuery({
     queryKey: ["vrfs-picker"],
@@ -10981,13 +11046,15 @@ function SpaceVrfBadges({
     return (
       <p className="mt-1 text-xs text-muted-foreground/50">
         VRF / BGP — not configured{" "}
-        <button
-          type="button"
-          onClick={onEdit}
-          className="underline hover:text-muted-foreground"
-        >
-          (Edit Space to add)
-        </button>
+        {onEdit && (
+          <button
+            type="button"
+            onClick={onEdit}
+            className="underline hover:text-muted-foreground"
+          >
+            (Edit Space to add)
+          </button>
+        )}
       </p>
     );
   }
@@ -12437,6 +12504,14 @@ function BlockDetailView({
 
   const qc = useQueryClient();
 
+  // #1155 — the header's write actions, each on the check the server makes
+  // for it: Edit, Add child block and the Resize / Move tools change blocks
+  // (write on IP blocks, as PUT / POST /blocks ask); New Subnet creates one
+  // (write on subnets, as POST /subnets asks).
+  const perms = usePermissions();
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
+
   const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
     string | null
   >(null);
@@ -12673,16 +12748,22 @@ function BlockDetailView({
                       onClick: () => setShowResizeBlock(true),
                       title:
                         "Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported.",
+                      ...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE),
                     },
                     {
                       label: "Move…",
                       onClick: () => setShowMoveBlock(true),
                       title:
                         "Move this block (and everything under it) to a different IP space.",
+                      ...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE),
                     },
                   ]}
                 />
-                <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+                <HeaderButton
+                  icon={Pencil}
+                  onClick={() => setShowEdit(true)}
+                  {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
+                >
                   Edit
                 </HeaderButton>
                 {/* Blocks can nest inside blocks, so "Add child block" is a
@@ -12693,6 +12774,7 @@ function BlockDetailView({
                   icon={Layers}
                   onClick={() => setShowCreateChildBlock(true)}
                   title="Add a block inside this block"
+                  {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
                 >
                   Add child block
                 </HeaderButton>
@@ -12700,6 +12782,7 @@ function BlockDetailView({
                   variant="primary"
                   icon={Plus}
                   onClick={() => setShowCreateSubnet(true)}
+                  {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
                 >
                   New Subnet
                 </HeaderButton>
@@ -13786,6 +13869,13 @@ function SpaceTableView({
   onSpaceDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #1155 — the header's write actions, each on the type-level write the
+  // server asks for: PUT /spaces (Edit Space), POST /blocks (Add block),
+  // POST /subnets (Add Subnet).
+  const perms = usePermissions();
+  const canWriteSpaces = perms.can("write", "ip_space");
+  const canWriteBlocks = perms.can("write", "ip_block");
+  const canWriteSubnets = perms.can("write", "subnet");
   const { data: blocks, isLoading: blocksLoading } = useQuery({
     queryKey: ["blocks", space.id],
     queryFn: () => ipamApi.listBlocks(space.id),
@@ -14093,13 +14183,18 @@ function SpaceTableView({
             >
               Find Free…
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
+            <HeaderButton
+              icon={Pencil}
+              onClick={() => setShowEditSpace(true)}
+              {...permissionGate(canWriteSpaces, NEEDS_SPACE_WRITE)}
+            >
               Edit Space
             </HeaderButton>
             <HeaderButton
               icon={Layers}
               onClick={() => setShowCreateBlock(true)}
               title="Add a top-level block to this space"
+              {...permissionGate(canWriteBlocks, NEEDS_BLOCK_WRITE)}
             >
               Add block
             </HeaderButton>
@@ -14107,6 +14202,7 @@ function SpaceTableView({
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreateSubnet(true)}
+              {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
             >
               Add Subnet
             </HeaderButton>
@@ -14117,7 +14213,10 @@ function SpaceTableView({
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
           )}
-          <SpaceVrfBadges space={space} onEdit={() => setShowEditSpace(true)} />
+          <SpaceVrfBadges
+            space={space}
+            onEdit={canWriteSpaces ? () => setShowEditSpace(true) : undefined}
+          />
         </div>
       </div>
       <div className="flex-1 overflow-auto">
@@ -15691,6 +15790,12 @@ export function IPAMPage() {
     false,
   );
   const qc = useQueryClient();
+  // #1155 — the tree header's writes, on the type-level write the server
+  // asks for: POST /spaces (New IP Space), and the subnet import, which
+  // creates subnets (as POST /subnets does).
+  const perms = usePermissions();
+  const canWriteSpaces = perms.can("write", "ip_space");
+  const canImportSubnets = perms.can("write", "subnet");
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const deepLinkHandled = useRef(false);
@@ -15930,14 +16035,16 @@ export function IPAMPage() {
               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="Import subnets"
               aria-label="Import subnets"
+              {...permissionGate(canImportSubnets, NEEDS_SUBNET_WRITE)}
             >
               <Upload className="h-3.5 w-3.5" />
             </button>
             <button
               onClick={() => setShowCreateSpace(true)}
-              className="rounded p-1 text-muted-foreground hover:text-foreground"
+              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
               title="New IP Space"
               aria-label="New IP Space"
+              {...permissionGate(canWriteSpaces, NEEDS_SPACE_WRITE)}
             >
               <Plus className="h-3.5 w-3.5" />
             </button>
@@ -15980,12 +16087,14 @@ export function IPAMPage() {
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Layers className="mb-2 h-8 w-8 text-muted-foreground/30" />
               <p className="text-xs text-muted-foreground">No IP spaces yet.</p>
-              <button
-                onClick={() => setShowCreateSpace(true)}
-                className="mt-2 text-xs text-primary hover:underline"
-              >
-                Create one
-              </button>
+              {canWriteSpaces && (
+                <button
+                  onClick={() => setShowCreateSpace(true)}
+                  className="mt-2 text-xs text-primary hover:underline"
+                >
+                  Create one
+                </button>
+              )}
             </div>
           )}
           {spaces?.map((space: IPSpace) => (

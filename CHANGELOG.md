@@ -322,6 +322,20 @@ the formatter handles the rest.
   dialog filled in), and an IPv6 subnet no longer puts its gateway in
   the DHCPv4-only option 3.
 
+- **A read-only operator is no longer offered IPAM and DHCP-scope
+  writes that end in "Permission denied" (#1155).** Every user saw
+  the same controls as a superadmin: New IP Space and Import subnets
+  in the IPAM tree; Edit, Add block, Add Subnet, New Subnet, Add child
+  block, Allocate IP, Import IP addresses and the Tools menus' Bulk
+  allocate, Clean Orphans, Merge, Resize, Split, Move and Scan with
+  nmap in the space, block and subnet headers; Create Scope, Add Pool
+  and the scope and pool edit, delete and enable controls in a
+  subnet's DHCP tab. A Viewer filled in the form and met the refusal
+  at submit. Each is now disabled, with the missing permission as its
+  tooltip, unless the caller holds the write the server asks for
+  (`usePermissions`, which already gated the address rows). The
+  server stays the enforcement point.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
