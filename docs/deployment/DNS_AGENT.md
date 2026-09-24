@@ -203,14 +203,43 @@ contributor — records via their zone, zones, views, ACLs, options, TSIG
 keys, update ACLs, sibling servers for the catalog producer pick, new
 pending ops, blocklists, pools, and the platform singletons — to the
 servers it feeds); `bundle_watermark` is the sequence the newest stored
-bundle was rendered at. Current ⇔ `watermark ≥ seq`: one integer
-comparison, no assembly, no content hash. A spurious bump costs one
-render; a missed one is prevented by construction for anything written
-through the ORM. After commit the render is enqueued (the worker coalesces
-duplicates: one render in flight per server, one more after it if a change
-landed meanwhile — that is what turns a thousand-batch seed into a handful
-of renders), and a 30 s beat sweep re-enqueues anything still behind, so a
-lost broker message costs at most one tick.
+bundle was rendered at. Current ⇔ `watermark ≥ seq` **and** the bundle was
+rendered by the running release (`bundle_app_version`): one integer and one
+string comparison, no assembly, no content hash. The release half is what
+makes an upgrade that changes the renderer's output re-render every server
+once, instead of serving the previous release's bytes until something
+unrelated marks it. After commit the render is enqueued (the worker
+coalesces duplicates: one render in flight per server, one more after it if
+a change landed meanwhile — that is what turns a thousand-batch seed into a
+handful of renders), and a 30 s beat sweep re-enqueues anything still
+behind, so a lost broker message costs at most one tick.
+
+*Every process that writes DNS rows must carry the listener.* It is
+installed by importing `bundle_dirty`: `app.main` does so for the api,
+`app.celery_app` for the worker and beat. A process without it commits its
+changes unmarked — the bundle stays "current", and because the ops page is
+gated to its snapshot (below) the new ops never ship either. That is not
+hypothetical: pool health failover, ACME DNS-01, lease-expiry DDNS, IPAM
+auto-sync and blocklist refresh all write from Celery tasks.
+`test_the_worker_process_installs_the_listener` probes the worker's own
+import graph in a fresh interpreter, because the test suite imports
+`app.main` and so always has it. The listener sees only ORM unit-of-work
+writes; a Core `insert()` / `update()` / `delete()` on a bundle input calls
+`bundle_dirty.mark_bundles_dirty()` in the same transaction.
+
+*A mark is not free, so writes the bundle never reads do not mark.* A stale
+bundle is never served — not even its ops page — and renders run one at a
+time fleet-wide, so marks arriving faster than a render completes would
+keep a bundle stale indefinitely and its agents would receive nothing (a
+million-row group renders in about a minute). A dirty contributor therefore
+marks only when a column the bundle renders has a net change: the pool
+health check's timestamps, the `dnssec_synced_at` stamp every agent posts
+after a structural reload, blocklist sync bookkeeping, and every platform
+setting outside the `snmp_` / `ntp_` columns the bundle renders (the beat
+tasks' `*_last_run_at` stamps, the release check) mark nothing. New and
+deleted rows always mark. Geo steering reads the Site a pool member is
+scoped to and that Site's live subnets, so a subnet joining or leaving a
+Site — or changing its prefix — marks the groups whose pools use it.
 
 *The ops page is gated to the bundle's snapshot.* Every body an agent
 holds is a superset of every op it has applied — the inline build had that
@@ -237,7 +266,12 @@ that raises lands on `dns_server.bundle_render_status / _error / _at` —
 deliberately not `config_failed_etag`, which is the agent's #882 verdict
 and is cleared by its next healthy heartbeat — and fires the
 `agent_bundle_render_failed` alert (critical when the server has never had
-a bundle, warning while a previous one is still served). The migration
+a bundle, warning while a previous one is still served). The same rule
+fires when changes have waited 10 minutes with no render landing
+(`dns_server.bundle_dirty_at`, set by the first mark and cleared by a
+render that catches up): an OOM-killed render, a render slot held by a dead
+worker, or a worker that does not consume the `bundles` queue never records
+a failure, and that is the case that most needs seeing. The migration
 release keeps `dns_agent_bundle_inline_fallback` on: a deployment whose
 worker is still one release behind builds a missing or stale bundle inline
 exactly as before, once per version, because it stores what it built.

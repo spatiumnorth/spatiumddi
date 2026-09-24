@@ -100,19 +100,31 @@ the formatter handles the rest.
   rest, the same ETags for the same state — and the long-poll streams
   the stored bytes with the per-server ops page spliced in. A change
   marks the bundle dirty in its own transaction (`bundle_dirty_seq` on
-  `dns_server`), the worker coalesces renders per server, and a 30 s
-  sweep re-enqueues anything left behind. The ops page is gated to the
+  `dns_server`) — in the api and in the worker, whose tasks (pool
+  failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync) write DNS
+  rows too — the worker coalesces renders per server, and a 30 s
+  sweep re-enqueues anything left behind. Only a change to something
+  the bundle renders marks it: the pool health check's timestamps, the
+  agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
+  settings stamps do not, because a stale bundle is never served and
+  marks that outpace renders would leave a large group with nothing.
+  A bundle rendered by a previous release is not current, so an
+  upgrade re-renders each server once. The ops page is gated to the
   bundle's snapshot so a body can never lack a record the agent
   already applied. Render failures surface on the server row
   (`bundle_render_status` / `_error` / `_at`, in the servers API) and
   through the new `agent_bundle_render_failed` alert rule, seeded
-  enabled. The migration release keeps the inline build as a fallback
+  enabled, which also fires when changes have waited 10 minutes with
+  no render landing (`bundle_dirty_at`) — a killed render or a worker
+  not consuming `bundles` never records a failure. The migration
+  release keeps the inline build as a fallback
   (`DNS_AGENT_BUNDLE_INLINE_FALLBACK`, on) for deployments whose worker
   lags a release; default off once the worker path is proven. Agents
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
-  instead of re-sending the whole body. Migration `c4d1e7f90a2b`
-  (additive: one table, eight nullable-or-defaulted columns).
+  instead of re-sending the whole body. Migrations `c4d1e7f90a2b` and
+  `d9a4c27e18f3` (additive: one table, twelve nullable-or-defaulted
+  columns).
 - **The bundle's records query orders by the `(zone_id, name)` index
   prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
   UUID, so the planner sorted the whole table on every build. The
