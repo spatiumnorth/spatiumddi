@@ -7,11 +7,12 @@ import structlog
 from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.security import decode_access_token, hash_api_token
-from app.db import get_db
+from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User, UserSession
 from app.services.api_token_scopes import scope_matches_request
 
@@ -46,6 +47,48 @@ def _path_in_recovery_allowlist(path: str) -> bool:
     so the API ``/api/v1`` prefix (and any mount-point reverse-proxy rewrite)
     doesn't matter — the allowlisted set is unambiguous on its tail."""
     return any(path.rstrip("/").endswith(suffix) for suffix in _FORCE_PW_CHANGE_ALLOWLIST)
+
+
+# #1158 — a token's use is written at most once a minute: the cadence
+# ``get_current_user`` keeps for a session's ``last_seen_at``.
+_TOKEN_LAST_USED_INTERVAL = timedelta(seconds=60)
+
+
+async def _record_api_token_use(token: APIToken, now: datetime) -> None:
+    """Write ``token.last_used_at`` in a transaction of its own (#1158).
+
+    It used to be set on the request's session and left for the handler to
+    commit. Read handlers never commit (``get_db`` only closes the session),
+    so a token used only for reads, the usual monitoring or export
+    integration, showed "Last Used: —" forever. Like the session path's
+    ``last_seen_at``, the write is throttled to once a minute and committed
+    on its own. It uses a short-lived session rather than the request's:
+
+    - a handler that rolls back cannot undo it;
+    - a failed write cannot roll the request's session back.
+
+    That rollback would expire the ``token`` and ``user`` this request has
+    already loaded, and the next attribute read on either would need a lazy
+    load, which async SQLAlchemy refuses. The session path avoids this only
+    because it commits before it loads the User.
+
+    Best-effort: a failure is logged, never a 500.
+    """
+    last = token.last_used_at
+    if last is not None and now - last < _TOKEN_LAST_USED_INTERVAL:
+        return
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(APIToken).where(APIToken.id == token.id).values(last_used_at=now)
+            )
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001 — recording the use is best-effort
+        logger.warning("api_token_last_used_write_failed", token_id=str(token.id), error=str(exc))
+        return
+    # Let this request see its own write without marking the row dirty: a
+    # dirty attribute would make a write handler's commit repeat the UPDATE.
+    set_committed_value(token, "last_used_at", now)
 
 
 async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> User:
@@ -119,10 +162,9 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Password change required before continuing",
         )
-    # Fire-and-forget last-used bump. Failure to write this shouldn't
-    # 500 the request — we commit on the caller's session so if the
-    # caller rolls back, the timestamp rolls with it (acceptable).
-    token.last_used_at = now
+    # Record the use in a transaction of its own (#1158): a read handler
+    # never commits the request's session, so a bump left on it was lost.
+    await _record_api_token_use(token, now)
     await _load_time_bound_grants(db, user)
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.

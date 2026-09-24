@@ -722,6 +722,16 @@ the formatter handles the rest.
   bare IP and over a certificate warning, so it only takes hold on a
   hostname with a trusted certificate.
 
+- **An API token used only for reads now records that it was used
+  (#1158).** `last_used_at` was set on the request's database session
+  and left for the handler to commit. Read handlers never commit, so a
+  monitoring, inventory or export token showed "Last Used: —" forever,
+  while its first write set it. Operators hunting for stale tokens
+  could revoke live ones. The use is now written in a short-lived
+  transaction of its own, at most once a minute per token, the cadence
+  the session path keeps for `last_seen_at`. A handler that rolls back
+  cannot undo it, and a failed write never fails the request.
+
 - **Every shipped image now patches its base image's own packages
   (#1088).** The nightly of 2026-09-14 refused to publish the api
   image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
