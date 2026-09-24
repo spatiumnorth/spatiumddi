@@ -30,10 +30,14 @@ could post a page read before a change after the event for that change,
 rolling the lease back. The tailer additionally holds a step off while it has
 unsent or spooled events, which are all older than any page read now.
 
-DHCPv4 only: the agent has never tailed ``kea-leases6.csv`` either, and the
-control plane's lease ingest is keyed on a MAC that most DHCPv6 leases (DUID-
-identified) do not carry. Adding v6 here alone would make v6 leases appear
-only at snapshot time — a half-feature that reads as a working one.
+DHCPv6 (#1141): one instance per family. The v6 walk uses
+``lease6-get-page`` on kea-dhcp6's own control socket and converts entries
+keyed on DUID + IAID, since most DHCPv6 leases carry no MAC. Only IA_NA
+(address) leases are sent: an IA_TA address is a short-lived privacy
+address, and an IA_PD entry is a delegated PREFIX, not a host address, so
+neither is a lease the control plane mirrors into IPAM. This landed together
+with the ``kea-leases6.csv`` tailer and the DUID-keyed ingest; either alone
+would make v6 leases appear only at snapshot time, or not at all.
 """
 
 from __future__ import annotations
@@ -54,6 +58,10 @@ from .spool import RETRY, SENT, classify_status
 log = structlog.get_logger(__name__)
 
 PAGE_COMMAND = "lease4-get-page"
+PAGE_COMMAND_V6 = "lease6-get-page"
+# ``type`` of the one lease kind the control plane mirrors (see the module
+# docstring for why IA_TA and IA_PD are left out).
+_IA_NA = "IA_NA"
 # Matches the tailer's batch size and the control plane's per-POST ingest
 # expectation (``LeaseEventBatch`` is sized for ~100 events a POST).
 DEFAULT_PAGE_SIZE = 100
@@ -112,13 +120,54 @@ def kea_lease_to_event(lease: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def kea_lease6_to_event(lease: dict[str, Any]) -> dict[str, Any] | None:
+    """One ``lease6-get-page`` entry → the v6 tailer's event shape (#1141).
+
+    Keyed on ``duid`` (+ ``iaid``), the identity Kea itself keys a v6 lease
+    on; ``hw-address`` rides along as ``mac_address`` only when Kea learned
+    one (it is absent from the entry otherwise — measured on Kea 3.0.3). An
+    entry with no DUID, or of a type other than IA_NA, is skipped.
+    """
+    if not isinstance(lease, dict):
+        return None
+    ip = str(lease.get("ip-address") or "").strip()
+    duid = str(lease.get("duid") or "").strip()
+    if not ip or not duid:
+        return None
+    if str(lease.get("type") or _IA_NA) != _IA_NA:
+        return None
+    try:
+        cltt = int(lease.get("cltt") or 0)
+        valid_lft = int(lease.get("valid-lft") or 0)
+        state_code = int(lease.get("state") or 0)
+        iaid = int(lease["iaid"]) if lease.get("iaid") is not None else None
+    except (TypeError, ValueError):
+        return None
+    mac = str(lease.get("hw-address") or "").strip() or None
+    hostname = str(lease.get("hostname") or "").strip() or None
+    ends_at = _iso(cltt + valid_lft) if cltt else None
+    return {
+        "ip_address": ip,
+        "mac_address": mac,
+        "duid": duid,
+        "iaid": iaid,
+        "hostname": hostname,
+        "state": _KEA_STATES.get(state_code, "active"),
+        "starts_at": _iso(cltt) if cltt and valid_lft else None,
+        "ends_at": ends_at,
+        "expires_at": ends_at,
+    }
+
+
 class LeaseSnapshot:
-    """Stepwise, throttled walk of Kea's v4 lease table.
+    """Stepwise, throttled walk of one Kea daemon's lease table.
 
     ``post(payload) -> int`` delivers one ``{"leases": [...]}`` batch and
     returns the HTTP status (a raised :class:`httpx.HTTPError` means
     unreachable). ``fetch`` defaults to the Kea control socket and exists so
-    tests can serve pages without one.
+    tests can serve pages without one. ``family`` picks the daemon's page
+    command and entry conversion (4: ``lease4-get-page``, 6:
+    ``lease6-get-page``); ``socket_path`` must be that daemon's socket.
     """
 
     def __init__(
@@ -130,8 +179,12 @@ class LeaseSnapshot:
         min_interval: float = DEFAULT_MIN_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
         fetch: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        family: int = 4,
     ) -> None:
         self.socket_path = socket_path
+        self.family = family
+        self._command = PAGE_COMMAND_V6 if family == 6 else PAGE_COMMAND
+        self._to_event = kea_lease6_to_event if family == 6 else kea_lease_to_event
         self._post = post
         self.page_size = max(1, int(page_size))
         self.min_interval = min_interval
@@ -167,7 +220,7 @@ class LeaseSnapshot:
         if self.running:
             return
         if not self._due:
-            log.info("lease_snapshot_requested", reason=reason)
+            log.info("lease_snapshot_requested", reason=reason, family=self.family)
         self._due = True
         self._reason = reason
         self._kea_failures = 0
@@ -187,7 +240,7 @@ class LeaseSnapshot:
     def _fetch_from_kea(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return send_command(
             self.socket_path,
-            PAGE_COMMAND,
+            self._command,
             arguments,
             accept_results=(0, _KEA_RESULT_EMPTY),
         )
@@ -221,14 +274,14 @@ class LeaseSnapshot:
             self._last_started = now
             self._due = False
             self._kea_failures = 0
-            log.info("lease_snapshot_started", reason=self._reason)
+            log.info("lease_snapshot_started", reason=self._reason, family=self.family)
 
         args = resp.get("arguments") if isinstance(resp, dict) else None
         raw = args.get("leases") if isinstance(args, dict) else None
         leases = raw if isinstance(raw, list) else []
         empty = isinstance(resp, dict) and resp.get("result") == _KEA_RESULT_EMPTY
 
-        events = [e for e in (kea_lease_to_event(le) for le in leases) if e is not None]
+        events = [e for e in (self._to_event(le) for le in leases) if e is not None]
         self._run_skipped += len(leases) - len(events)
         if events and not self._post_page(events):
             return False
@@ -285,6 +338,7 @@ class LeaseSnapshot:
         log.info(
             "lease_snapshot_completed",
             reason=self._reason,
+            family=self.family,
             leases=self._run_sent,
             skipped=self._run_skipped,
         )

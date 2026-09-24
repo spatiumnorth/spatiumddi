@@ -180,6 +180,10 @@ async def _mac_from_ip(
     lease_q = (
         select(DHCPLease.mac_address, DHCPLease.last_seen_at)
         .where(DHCPLease.ip_address == ip, DHCPLease.state == "active")
+        # A DHCPv6 lease identified by DUID alone carries no MAC to trace to
+        # a switch port (#1141) — and counted here it would read as a second,
+        # ambiguous MAC ("None") and make the resolver decline a good answer.
+        .where(DHCPLease.mac_address.is_not(None))
         .order_by(DHCPLease.last_seen_at.desc())
     )
     if subnet is not None:
