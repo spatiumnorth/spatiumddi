@@ -228,13 +228,16 @@ async def test_the_mark_rolls_back_with_the_change(db_session: AsyncSession) -> 
     before = (await _seqs(db_session, [server]))[server_id]
 
     db_session.add(_record(zone, "never"))
-    await db_session.flush()  # the bump is issued here, inside the transaction
+    await db_session.flush()
     mid = (
         await db_session.execute(
             select(DNSServer.bundle_dirty_seq).where(DNSServer.id == server_id)
         )
     ).scalar_one()
-    assert mid == before + 1, "the bump is part of the transaction"
+    # The bump waits for the commit (it is a row lock on every server it
+    # names — tests/test_dns_agent_bundle_mark_locks.py): after the flush the
+    # change is in the transaction and the mark is only collected.
+    assert mid == before, "a flush collects the mark; the commit issues it"
     await db_session.rollback()
 
     after = (

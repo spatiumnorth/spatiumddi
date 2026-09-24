@@ -10,10 +10,27 @@ So the signal is not the wake bus. ``publish_wake`` is fire-and-forget by
 design (#358: a Redis outage must never 500 a CRUD write) and every one of
 its ~130 publish sites is a place a new mutation path can forget. Instead an
 ``after_flush`` listener looks at what the flush actually wrote — the
-session's ``new`` / ``dirty`` / ``deleted`` lists — maps every model the
-bundle reads to the servers whose bundle it feeds, and issues one
-``UPDATE dns_server SET bundle_dirty_seq = bundle_dirty_seq + 1`` on the
-flush's own connection. The bump commits or rolls back WITH the change.
+session's ``new`` / ``dirty`` / ``deleted`` lists — and maps every model the
+bundle reads to the servers whose bundle it feeds. Those server ids are
+collected per flush; at the outermost commit one
+``UPDATE dns_server SET bundle_dirty_seq = bundle_dirty_seq + 1`` bumps them
+all, on the transaction's own connection, just before COMMIT. The bump
+commits or rolls back WITH the change.
+
+Why at commit and not at the flush: the bump is a row lock on every server
+it names, held until the transaction ends. Taken at the first marking flush,
+a long transaction (a bulk import, a sync task's batch) stalls those
+servers' heartbeats and the long-poll's ``last_config_etag`` commit for its
+whole length, and two transactions marking overlapping server sets in
+different orders deadlock. Taken at commit, in server-id order
+(``SELECT … ORDER BY id FOR NO KEY UPDATE`` — the UPDATE's own lock strength,
+so the key-share locks of op and bundle FK checks never wait on it), the
+locks live for the COMMIT alone and every marker takes them in one order.
+Three details keep that from ever under-marking: ``before_commit`` runs
+BEFORE commit's final autoflush, so the hook flushes first; it also runs at
+every SAVEPOINT release, where it does nothing (the outermost commit issues
+everything); and a flush that still happens after the bump (another
+listener dirtying the session) marks at once, the old way.
 
 EVERY PROCESS THAT WRITES DNS ROWS MUST LOAD THIS MODULE. The listener is
 installed by importing it; ``app.main`` does that for the api and
@@ -97,8 +114,6 @@ from app.models.ownership import Site
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
-
-_PENDING_ATTR = "_spatium_bundle_dirty_server_ids"
 
 # Contributors keyed straight by group_id.
 _GROUP_MODELS: tuple[type, ...] = (DNSZone, DNSView, DNSAcl, DNSServerOptions, DNSTSIGKey)
@@ -307,17 +322,19 @@ def collect_affected(session: Any) -> Affected:
     return aff
 
 
-def mark_dirty(session: Any, aff: Affected) -> list[uuid.UUID]:
-    """Bump ``bundle_dirty_seq`` for every agent-based server ``aff`` names,
-    on the session's current connection (inside the same transaction).
-    Returns the bumped server ids.
+def _resolve(session: Any, aff: Affected) -> tuple[set[uuid.UUID], bool]:
+    """The agent-based servers ``aff`` names, as ids, or ``everyone``.
 
-    A Core UPDATE, so ``DNSServer`` instances already in the session keep
-    their loaded value until refreshed — the long-poll refreshes on every
-    wake and the render reads the row fresh, which is where it matters.
+    Read-only: plain SELECTs on the session's connection, no row lock. Runs
+    at the flush that made the change, while the rows it resolves through
+    are exactly as that flush left them (a zone's group, an ACL's group, the
+    pools scoped to a Site). ``everyone`` is resolved at bump time instead,
+    so a server created later in the same transaction is included.
     """
     if aff.is_empty():
-        return []
+        return set(), False
+    if aff.everyone:
+        return set(), True
     conn = session.connection()
     groups: set[uuid.UUID] = set(aff.groups)
     if aff.zones:
@@ -334,7 +351,7 @@ def mark_dirty(session: Any, aff: Affected) -> list[uuid.UUID]:
             .all()
             if g is not None
         )
-    if aff.sites and not aff.everyone:
+    if aff.sites:
         groups.update(
             conn.execute(
                 select(DNSPool.group_id)
@@ -344,48 +361,121 @@ def mark_dirty(session: Any, aff: Affected) -> list[uuid.UUID]:
             .scalars()
             .all()
         )
-    if aff.everyone:
-        scope = true()
-    else:
-        conds = []
-        if groups:
-            conds.append(DNSServer.group_id.in_(list(groups)))
-        if aff.servers:
-            conds.append(DNSServer.id.in_(list(aff.servers)))
-        if not conds:
-            return []
-        scope = or_(*conds)
-    stmt = (
-        update(DNSServer)
-        .where(scope, DNSServer.driver.not_in(list(AGENTLESS_DRIVERS)))
-        .values(
-            bundle_dirty_seq=DNSServer.bundle_dirty_seq + 1,
-            # When the stored bundle first fell behind. Kept across further
-            # marks; the store clears it (or restarts it, when changes landed
-            # mid-render). What the stalled-render alert measures.
-            bundle_dirty_at=func.coalesce(DNSServer.bundle_dirty_at, func.now()),
+    conds = []
+    if groups:
+        conds.append(DNSServer.group_id.in_(list(groups)))
+    if aff.servers:
+        conds.append(DNSServer.id.in_(list(aff.servers)))
+    if not conds:
+        return set(), False
+    ids = conn.execute(
+        select(DNSServer.id).where(or_(*conds), DNSServer.driver.not_in(list(AGENTLESS_DRIVERS)))
+    ).scalars()
+    return set(ids), False
+
+
+def _bump(session: Any, server_ids: Iterable[uuid.UUID], everyone: bool) -> list[uuid.UUID]:
+    """Bump ``bundle_dirty_seq`` for ``server_ids`` (or every agent-based
+    server), taking the row locks in server-id order first. Returns the
+    bumped ids.
+
+    ``SELECT … ORDER BY id FOR NO KEY UPDATE`` locks row by row in the sorted
+    order (Postgres applies ORDER BY before the locking clause), so any two
+    transactions that mark overlapping servers take the shared rows in the
+    same order and cannot deadlock on them. NO KEY UPDATE is the lock the
+    UPDATE itself takes, so the key-share locks of FK checks (a new op row,
+    a stored bundle) never wait on it.
+
+    A Core UPDATE, so ``DNSServer`` instances already in the session keep
+    their loaded value until refreshed — the long-poll refreshes on every
+    wake and the render reads the row fresh, which is where it matters.
+    """
+    ids = sorted(set(server_ids))
+    if not ids and not everyone:
+        return []
+    conn = session.connection()
+    scope = true() if everyone else DNSServer.id.in_(ids)
+    locked = list(
+        conn.execute(
+            select(DNSServer.id)
+            .where(scope, DNSServer.driver.not_in(list(AGENTLESS_DRIVERS)))
+            .order_by(DNSServer.id)
+            .with_for_update(key_share=True)
         )
-        .returning(DNSServer.id)
+        .scalars()
+        .all()
     )
-    ids = list(conn.execute(stmt).scalars().all())
-    if ids:
-        logger.debug(
-            "dns_agent_bundle_marked_dirty",
-            servers=len(ids),
-            groups=len(groups),
-            everyone=aff.everyone,
+    if not locked:
+        return []
+    bumped = list(
+        conn.execute(
+            update(DNSServer)
+            .where(DNSServer.id.in_(locked))
+            .values(
+                bundle_dirty_seq=DNSServer.bundle_dirty_seq + 1,
+                # When the stored bundle first fell behind. Kept across
+                # further marks; the store clears it (or restarts it, when
+                # changes landed mid-render). What the stalled-render alert
+                # measures.
+                bundle_dirty_at=func.coalesce(DNSServer.bundle_dirty_at, func.now()),
+            )
+            .returning(DNSServer.id)
         )
+        .scalars()
+        .all()
+    )
+    logger.debug("dns_agent_bundle_marked_dirty", servers=len(bumped), everyone=everyone)
+    return bumped
+
+
+def mark_dirty(session: Any, aff: Affected) -> list[uuid.UUID]:
+    """Resolve ``aff`` and bump its servers NOW, on the session's current
+    connection (inside the same transaction). Returns the bumped server ids.
+
+    The listener does not call this per flush; it collects and bumps once at
+    commit (``_before_commit``). This is the immediate form, used for a flush
+    that happens after that bump.
+    """
+    ids, everyone = _resolve(session, aff)
+    return _bump(session, ids, everyone)
+
+
+@dataclass
+class _Marks:
+    """One session's marks for its current outermost transaction."""
+
+    # Resolved at each marking flush, bumped together at commit.
+    servers: set[uuid.UUID] = field(default_factory=set)
+    everyone: bool = False
+    # The outermost commit's bump has been issued: a flush from here on
+    # (another before_commit listener dirtying the session) marks at once.
+    issued: bool = False
+    # Bumped, to be enqueued for render after the commit.
+    bumped: set[uuid.UUID] = field(default_factory=set)
+
+
+_MARKS_KEY = "spatium_bundle_marks"
+
+
+def _marks(session: Any) -> _Marks:
+    marks = session.info.get(_MARKS_KEY)
+    if marks is None:
+        marks = session.info[_MARKS_KEY] = _Marks()
+    return marks
+
+
+def _collect(session: Any, aff: Affected) -> set[uuid.UUID]:
+    """Record ``aff`` for the bump at commit (or bump now, if that bump has
+    already been issued). Returns the server ids it resolved to."""
+    marks = _marks(session)
+    if marks.issued:
+        bumped = mark_dirty(session, aff)
+        marks.bumped.update(bumped)
+        return set(bumped)
+    ids, everyone = _resolve(session, aff)
+    marks.servers.update(ids)
+    marks.everyone = marks.everyone or everyone
     return ids
-
-
-def _remember(session: Any, ids: Iterable[uuid.UUID]) -> None:
-    """Queue ``ids`` for the render enqueue that follows the commit."""
-    ids = list(ids)
-    if not ids:
-        return
-    pending = getattr(session, _PENDING_ATTR, None) or set()
-    pending.update(ids)
-    setattr(session, _PENDING_ATTR, pending)
 
 
 async def mark_bundles_dirty(
@@ -402,8 +492,10 @@ async def mark_bundles_dirty(
     ``update()`` / ``delete()`` on a bundle input bypasses it, and the
     stored bundle then stays "current" without the change — so every such
     site calls this in the same transaction. Same semantics as the
-    listener: commits or rolls back with the caller's transaction, and the
-    renders are enqueued after the commit.
+    listener: the servers are bumped at the caller's commit (and not at all
+    if it rolls back), and the renders are enqueued after it. Returns the
+    server ids the mark resolved to (empty for ``everyone``, which is
+    resolved at commit).
     """
     aff = Affected(
         zones={z for z in zone_ids if z is not None},
@@ -411,13 +503,9 @@ async def mark_bundles_dirty(
         servers={s for s in server_ids if s is not None},
         everyone=everyone,
     )
-
-    def _run(session: Any) -> list[uuid.UUID]:
-        ids = mark_dirty(session, aff)
-        _remember(session, ids)
-        return ids
-
-    return await db.run_sync(_run)
+    if aff.is_empty():
+        return []
+    return sorted(await db.run_sync(lambda session: _collect(session, aff)))
 
 
 # ── Enqueue after commit ───────────────────────────────────────────────────
@@ -476,40 +564,52 @@ def _after_flush(session: Any, flush_context: Any) -> None:  # noqa: ARG001
     # error here has already aborted the transaction, so the write fails
     # either way; raising it here names the real cause instead of the
     # "current transaction is aborted" the commit would report later.
-    _remember(session, mark_dirty(session, aff))
+    _collect(session, aff)
+
+
+def _before_commit(session: Any) -> None:
+    # Fires at every SAVEPOINT release too (``_prepare_impl``: ``_parent is
+    # None or nested``). Marks stay collected until the outermost commit —
+    # issuing them at a release would take the locks for the rest of the
+    # transaction, which is what this hook exists to avoid.
+    if session.in_nested_transaction():
+        return
+    # before_commit runs BEFORE commit's own final flush, so flush here: the
+    # marks of whatever is still pending must be collected before the bump.
+    session.flush()
+    marks = _marks(session)
+    if marks.servers or marks.everyone:
+        marks.bumped.update(_bump(session, marks.servers, marks.everyone))
+        marks.servers = set()
+        marks.everyone = False
+    marks.issued = True
 
 
 def _after_commit(session: Any) -> None:
-    # Fires at a SAVEPOINT release too (``SessionTransaction.commit``:
-    # ``_parent is None or nested``), while the outer transaction — and the
-    # bump — is still uncommitted. A render enqueued there reads the old
-    # sequence, and the real commit then has nothing left to enqueue.
+    # Fires at a SAVEPOINT release too, while the outer transaction — and
+    # the bump — is still uncommitted; only the outermost commit enqueues.
     if session.in_nested_transaction():
         return
-    pending = getattr(session, _PENDING_ATTR, None)
-    if not pending:
-        return
-    setattr(session, _PENDING_ATTR, set())
-    schedule_renders(pending)
+    marks = session.info.pop(_MARKS_KEY, None)
+    if marks is not None and marks.bumped:
+        schedule_renders(marks.bumped)
 
 
-def _after_rollback(session: Any) -> None:
-    # SQLAlchemy dispatches ``after_rollback`` for a SAVEPOINT rollback too
-    # (``SessionTransaction.rollback``: ``_parent is None or nested``). The
-    # outer transaction's marks survive a savepoint rolling back and still
-    # commit, so their renders must still be enqueued; only the outermost
-    # rollback discards them. A mark made inside the savepoint stays queued
-    # too — one render that finds the bundle current, never a missed one.
-    if session.in_nested_transaction():
-        return
-    if getattr(session, _PENDING_ATTR, None):
-        setattr(session, _PENDING_ATTR, set())
+def _after_transaction_end(session: Any, transaction: Any) -> None:
+    # The outermost transaction is over — committed (``_after_commit`` has
+    # already enqueued its renders) or rolled back (its marks, like its
+    # changes, never happened). A SAVEPOINT ending keeps them: marks made
+    # inside a rolled-back savepoint are bumped anyway at the outer commit —
+    # one render that finds the bundle current, never a missed one.
+    if transaction.parent is None:
+        session.info.pop(_MARKS_KEY, None)
 
 
 _LISTENERS = (
     ("after_flush", _after_flush),
+    ("before_commit", _before_commit),
     ("after_commit", _after_commit),
-    ("after_rollback", _after_rollback),
+    ("after_transaction_end", _after_transaction_end),
 )
 
 
