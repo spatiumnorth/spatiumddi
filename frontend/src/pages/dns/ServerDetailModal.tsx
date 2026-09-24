@@ -33,6 +33,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { SpoolChip } from "@/components/SpoolChip";
 import {
   dnsApi,
   logsApi,
@@ -269,6 +270,9 @@ function OverviewTab({
           approved, so this has to be the first thing read. */}
       <ConfigApplyBanner server={server} />
       <DaemonStateBanner server={server} />
+      <div className="flex flex-wrap gap-1.5 empty:hidden">
+        <SpoolChip server={server} />
+      </div>
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
       </div>

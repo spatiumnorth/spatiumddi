@@ -30,10 +30,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPLease, DHCPScope
+from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.lease_history import record_lease_history
 
@@ -107,12 +107,53 @@ async def _resolve_lease_subnet_id(
     return best[1] if best else None
 
 
+async def peer_holds_active_lease(db: AsyncSession, lease: DHCPLease, *, now: datetime) -> bool:
+    """Does ANOTHER server in ``lease``'s server group still hold this address? (#1110)
+
+    Every server reports its own leases, so a failover or HA pair — which
+    replicates lease state between partners — produces one ``dhcp_lease`` row
+    per partner for the same address, while the IPAM mirror and the DDNS
+    records it published are shared: one row, one A/PTR, for the address.
+    Tearing those down because ONE partner stopped reporting the lease (a
+    replication lag, a partner mid-restart, an absence-delete on a poll that
+    only reached one side) takes them away while the other partner is still
+    serving the client — and its next poll recreates both, so the symptom is
+    DDNS records flapping rather than a clean failure.
+
+    A peer counts only while its row is ``active`` and not past its expiry:
+    a dead partner's frozen rows must not keep a mirror alive forever.
+
+    Scoped to the server group, not to the address alone. Scopes in one
+    group cannot overlap (#844), so the same address within a group is the
+    same allocation; the same address in another group is a different
+    network (VRF semantics) and must not keep this one's mirror alive.
+    """
+    group_id = (
+        select(DHCPServer.server_group_id).where(DHCPServer.id == lease.server_id).scalar_subquery()
+    )
+    res = await db.execute(
+        select(DHCPLease.id)
+        .join(DHCPServer, DHCPServer.id == DHCPLease.server_id)
+        .where(
+            DHCPLease.ip_address == lease.ip_address,
+            DHCPLease.server_id != lease.server_id,
+            DHCPLease.state == "active",
+            or_(DHCPLease.expires_at.is_(None), DHCPLease.expires_at > now),
+            # NULL group → ``= NULL`` is never true → no peers, as it should be.
+            DHCPServer.server_group_id == group_id,
+        )
+        .limit(1)
+    )
+    return res.first() is not None
+
+
 async def purge_lease(
     db: AsyncSession,
     lease: DHCPLease,
     *,
     subnet_id: uuid.UUID | None | Any = _UNSET,
     now: datetime | None = None,
+    spare_if_peer_holds: bool = True,
 ) -> bool:
     """Tear one lease + its ``auto_from_lease`` IPAM mirror down.
 
@@ -128,6 +169,15 @@ async def purge_lease(
          the delete),
       6. delete the lease row.
 
+    Steps 2–4 are skipped while another server in the group still holds an
+    active lease on the address (``peer_holds_active_lease``, #1110): the
+    mirror and its DNS records belong to the address, not to this server's
+    copy of the lease. ``spare_if_peer_holds=False`` is for callers removing
+    every copy at once — scope deletion — where the peer that would spare
+    the mirror is itself being deleted in the same call; the mirror has to
+    go, and relying on the order of deletes and autoflush to get there
+    would be an accident rather than a rule.
+
     Returns whether an IPAM mirror row was removed. Does not commit/flush.
     """
     if now is None:
@@ -135,6 +185,17 @@ async def purge_lease(
     sid = await _resolve_lease_subnet_id(db, lease) if subnet_id is _UNSET else subnet_id
 
     mirror_removed = False
+    if (
+        sid is not None
+        and spare_if_peer_holds
+        and await peer_holds_active_lease(db, lease, now=now)
+    ):
+        logger.info(
+            "dhcp_purge_lease_mirror_kept_peer_holds",
+            ip=str(lease.ip_address),
+            server=str(lease.server_id),
+        )
+        sid = None
     if sid is not None:
         mirror = (
             await db.execute(
@@ -190,7 +251,9 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     leases_removed = 0
     mirrors_removed = 0
     for lease in leases:
-        if await purge_lease(db, lease, now=now):
+        # Every copy of every lease in the scope is going, so no copy's peer
+        # outlives it — see ``purge_lease(spare_if_peer_holds=...)``.
+        if await purge_lease(db, lease, now=now, spare_if_peer_holds=False):
             mirrors_removed += 1
         leases_removed += 1
     return leases_removed, mirrors_removed
@@ -198,6 +261,7 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
 
 __all__ = [
     "delete_leases_for_scope",
+    "peer_holds_active_lease",
     "purge_lease",
     "_load_subnet_cache",
     "_resolve_lease_subnet_id",

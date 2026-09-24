@@ -45,6 +45,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
@@ -1808,7 +1809,6 @@ function ServerModal({
                   }
                 >
                   <option value="ntlm">NTLM</option>
-                  <option value="kerberos">Kerberos</option>
                   <option value="basic">Basic</option>
                   <option value="credssp">CredSSP</option>
                 </select>
@@ -5102,6 +5102,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                     </span>
                   )}
                   <ConfigApplyChip server={s} />
+                  <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">

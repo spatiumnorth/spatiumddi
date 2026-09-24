@@ -78,6 +78,7 @@ def test_flush_body_uses_leases_key(monkeypatch) -> None:
         control_plane_url="http://cp",
         httpx_verify=lambda: True,
         kea_lease_file="/tmp/x",
+        kea_control_socket="/tmp/x-sock",
     )
     hb = types.SimpleNamespace(lease_count_since_start=0)
     w = leases_mod.LeaseWatcher(cfg, ["tok"], hb)
@@ -88,3 +89,6 @@ def test_flush_body_uses_leases_key(monkeypatch) -> None:
     assert captured["path"] == "/api/v1/dhcp/agents/lease-events"
     assert "leases" in captured["json"] and "events" not in captured["json"]
     assert captured["json"]["leases"][0]["ip_address"] == "10.0.0.50"
+    # #1077 — every lease batch carries a batch_id the server dedupes on.
+    assert len(captured["json"]["batch_id"]) == 32
+    assert hb.lease_count_since_start == 1

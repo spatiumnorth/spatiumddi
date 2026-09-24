@@ -58,6 +58,7 @@ import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
@@ -67,6 +68,15 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
+import {
+  ServingVerdictTag,
+  WindowsFailoverPanel,
+} from "./WindowsFailoverPanel";
+import {
+  GROUP_FAILOVER_QUERY_KEY,
+  servingByScopeId,
+  useGroupFailover,
+} from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -393,6 +403,7 @@ function GroupDetailView({
   const handleRefresh = () => {
     qc.invalidateQueries({ queryKey: ["dhcp-servers", group.id] });
     qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
+    qc.invalidateQueries({ queryKey: [GROUP_FAILOVER_QUERY_KEY, group.id] });
   };
 
   return (
@@ -534,13 +545,17 @@ function GroupDetailView({
 
       <div className="flex-1 overflow-auto p-6">
         {(!isKea || tab === "servers") && (
-          <GroupServersList
-            servers={servers}
-            onAddServer={onAddServer}
-            onSelectServer={onSelectServer}
-            onEditServer={onEditServer}
-            onDeleteServer={onDeleteServer}
-          />
+          <>
+            <GroupServersList
+              servers={servers}
+              onAddServer={onAddServer}
+              onSelectServer={onSelectServer}
+              onEditServer={onEditServer}
+              onDeleteServer={onDeleteServer}
+            />
+            {/* #1110 — renders nothing for a group without Windows members. */}
+            <WindowsFailoverPanel groupId={group.id} />
+          </>
         )}
         {isKea && tab === "scopes" && <ServerScopesTab groupId={group.id} />}
         {isKea && tab === "pools" && (
@@ -1031,6 +1046,7 @@ function GroupServersList({
                         </span>
                       )}
                       <ConfigApplyChip server={s} />
+                      <SpoolChip server={s} />
                       <DaemonStateChip server={s} />
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
@@ -1228,6 +1244,11 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
     enabled: !!groupId,
   });
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
+  // #1110 — how the group's Windows members serve each scope. The column
+  // only appears on a group that has Windows members.
+  const { data: failover } = useGroupFailover(groupId || undefined);
+  const servingById = servingByScopeId(failover);
+  const showServing = (failover?.windows_member_count ?? 0) > 0;
   const allScopes: (DHCPScope & { subnet_network?: string })[] =
     groupScopes.map((sc) => ({
       ...sc,
@@ -1306,6 +1327,14 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">Enabled</th>
                   <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
                   <th className="px-3 py-2 text-left font-medium">DDNS</th>
+                  {showServing && (
+                    <th
+                      className="px-3 py-2 text-left font-medium"
+                      title="Which Windows DHCP servers in this group hold the scope, and whether a failover relationship coordinates them"
+                    >
+                      Windows
+                    </th>
+                  )}
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -1327,6 +1356,19 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2">
                           {sc.ddns_enabled ? "on" : "off"}
                         </td>
+                        {showServing && (
+                          <td className="px-3 py-2">
+                            {servingById.get(sc.id) ? (
+                              <ServingVerdictTag
+                                serving={servingById.get(sc.id)!}
+                              />
+                            ) : (
+                              <span className="text-xs text-muted-foreground/60">
+                                —
+                              </span>
+                            )}
+                          </td>
+                        )}
                         <td className="px-3 py-2 text-right">
                           <div className="inline-flex items-center justify-end gap-1">
                             <AskAIButton
@@ -2676,6 +2718,8 @@ function ServerDetailView({
       // Also invalidate subnet-level scope queries so the DHCP topology
       // views refresh once scopes / pools / statics get imported.
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
+      // #1110 — the sync re-reads failover relationships + scope presence.
+      qc.invalidateQueries({ queryKey: [GROUP_FAILOVER_QUERY_KEY] });
       const parts: string[] = [];
       // Agent-based no-op note (Kea) takes the whole banner — there are no
       // lease counters to report on that path.
@@ -2708,6 +2752,11 @@ function ServerDetailView({
           scopeBits.push(`${result.statics_synced} reservations changed`);
         if (result.statics_removed)
           scopeBits.push(`${result.statics_removed} reservations removed`);
+        // #1110 — shared with another Windows member that imports them.
+        if (result.scopes_deferred)
+          scopeBits.push(
+            `${result.scopes_deferred} imported from a partner server`,
+          );
         parts.push(scopeBits.join(" / "));
       }
       parts.push(`${result.server_leases} leases on wire`);
@@ -2723,6 +2772,10 @@ function ServerDetailView({
         );
       if (result.errors.length)
         parts.push(`${result.errors.length} error(s): ${result.errors[0]}`);
+      if (result.warnings?.length)
+        parts.push(
+          `${result.warnings.length} warning(s): ${result.warnings[0]}`,
+        );
       setSyncBanner(parts.join(" · "));
     },
     onError: (e) =>

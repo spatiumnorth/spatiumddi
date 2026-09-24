@@ -24,7 +24,11 @@ from app.models.ipam import IPAddress
 # The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
 # longer imports *up* from a task — servers.py:delete_lease used to); the sweep
 # imports them back here.
-from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
+from app.services.dhcp.lease_cleanup import (
+    _load_subnet_cache,
+    _resolve_lease_subnet_id,
+    peer_holds_active_lease,
+)
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.feature_modules import is_module_enabled
 
@@ -76,6 +80,14 @@ async def _sweep() -> tuple[int, int]:
             # the two apart.
             record_lease_history(db, lease, lease_state="expired", expired_at=now_ts)
             lease.state = "expired"
+            # #1110 — a failover / HA partner still holding an active,
+            # unexpired lease on the address owns the shared mirror and DDNS
+            # now; this server's copy aging out does not free the address.
+            # The partner that renewed it has the newer expiry, and this
+            # row is the stale one — typically because this server has
+            # stopped being polled.
+            if await peer_holds_active_lease(db, lease, now=now_ts):
+                continue
             # Remove the mirrored IPAM row if auto_from_lease — but only
             # within this lease's owning subnet. An address-only lookup
             # would delete same-address mirrors in other subnets too.

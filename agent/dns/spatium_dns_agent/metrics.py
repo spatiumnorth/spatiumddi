@@ -8,18 +8,52 @@ on a ``named`` restart counters drop back to zero, which we detect as
 ``delta < 0`` and absorb.
 
 For MVP we report five scalar counters derived from the server-level
-``<counters type="opcode">`` and ``<counters type="qryrcode">`` (or
-equivalent ``<nsstat>`` blocks depending on the BIND build):
+For MVP we report five scalar counters derived from the server-level
+``<counters type="opcode">``, ``<counters type="rcode">`` and
+``<counters type="nsstat">`` blocks (older builds spell some of them
+differently — see ``_COUNTERS``):
 
-    queries_total   — total incoming queries (opcode QUERY)
-    noerror         — QryAuthAns + QryNoauthAns (NOERROR responses)
-    nxdomain        — QryNXDOMAIN
-    servfail        — QrySERVFAIL
+    queries_total   — total incoming queries (opcode QUERY; the nsstat
+                      Requestv4 + Requestv6 on a build without the
+                      opcode table)
+    noerror         — responses sent with rcode NOERROR (the server-level
+                      rcode table's NOERROR; QrySuccess + QryNxrrset on a
+                      build without the table)
+    nxdomain        — responses sent with rcode NXDOMAIN (rcode NXDOMAIN;
+                      QryNXDOMAIN on a build without the table)
+    servfail        — responses sent with rcode SERVFAIL (rcode SERVFAIL;
+                      QrySERVFAIL on a build without the table)
     recursion       — QryRecursion (queries that triggered recursion)
+
+The rcode breakdown is read from the rcode table, never from the nsstat
+answer classes: ``QryAuthAns`` / ``QryNoauthAns`` count every
+authoritative / non-authoritative response whatever its rcode, so a
+``noerror`` derived from them counted each authoritative NXDOMAIN answer
+under ``noerror`` as well as under ``nxdomain`` (#1116).
+    recursion       — QryRecursion (queries that triggered recursion)
+
+The rcode breakdown is read from the rcode table, never from the nsstat
+answer classes: ``QryAuthAns`` / ``QryNoauthAns`` count every
+authoritative / non-authoritative response whatever its rcode, so a
+``noerror`` derived from them counted each authoritative NXDOMAIN answer
+under ``noerror`` as well as under ``nxdomain`` (#1116).
 
 Per-QTYPE + per-zone breakdowns are in the XML too and can be added
 later without a protocol change — the control-plane ingestion path
 just ignores unknown fields today.
+
+Delivery (#1077): each bucket is shipped through a :class:`.spool.Shipper`.
+A bucket the control plane does not accept is spooled to disk under
+``<state_dir>/spool/metrics/`` and replayed oldest-first once it answers,
+carrying its ORIGINAL ``bucket_at``, so a late bucket lands on the minute
+it happened and the time-series panels fill the gap in (the ingest has no
+age guard). The ingest ACCUMULATES per ``(server_id, bucket_at)``, so it is
+the spool's ``batch_id`` — answered as a duplicate on replay — not the
+timestamp that stops a replayed bucket being counted twice. The
+baseline (``_prev``) still advances on a failed report: the delta is kept
+in the spool, not lost, so re-baselining against the old snapshot would
+double-count it. Metrics have no max age — a minute per row is a few MB
+for weeks of backlog.
 """
 
 from __future__ import annotations
@@ -33,28 +67,85 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
 STATS_URL = "http://127.0.0.1:8053/xml/v3/server"
 
-# Column → one or more BIND counter names. When multiple counters
-# contribute, they're summed. Different BIND builds report under
-# slightly different element names; we include both of the common
-# shapes so a typical Alpine/Debian ``named`` lights up out of the box.
-_COUNTERS: dict[str, tuple[str, ...]] = {
-    "queries_total": ("QUERY", "Requestv4", "Requestv6"),
-    "noerror": ("QryAuthAns", "QryNoauthAns", "QrySuccess"),
-    "nxdomain": ("QryNXDOMAIN",),
-    "servfail": ("QrySERVFAIL",),
-    "recursion": ("QryRecursion",),
+# Column → the SPELLINGS of that column, in order of preference. Each
+# spelling is one or more BIND counter names that are summed; the first
+# spelling with any counter present is the column's value and the rest
+# are ignored. Different BIND builds report under different element
+# names, and the spellings exist so a typical Alpine/Debian ``named``
+# lights up out of the box — but they are alternatives, never addends:
+# the opcode table's ``QUERY`` and the nsstat family's ``Requestv4`` /
+# ``Requestv6`` count the SAME requests (by opcode, by address family),
+# and BIND 9.20 publishes both. Summing them counted every query twice
+# on every current BIND (#1064).
+_COUNTERS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "queries_total": (("QUERY",), ("Requestv4", "Requestv6")),
+    # The rcode breakdown's fallback, for a build without the server-level
+    # rcode table (_RCODE_TABLE below is the value when it is there): the
+    # nsstat classes that carry exactly that rcode — NOERROR is an answer
+    # with data (QrySuccess) or without (QryNxrrset, NODATA). Never
+    # QryAuthAns / QryNoauthAns: those count every response whatever its
+    # rcode, NXDOMAIN included (#1116).
+    "noerror": (("QrySuccess", "QryNxrrset"),),
+    "nxdomain": (("QryNXDOMAIN",),),
+    "servfail": (("QrySERVFAIL",),),
+    "recursion": (("QryRecursion",),),
     # Response Rate Limiting (#146 Phase 3). BIND9 publishes these in the
     # same statistics-channels XML under the rate-limiting family:
     # RateDropped = responses dropped, RateSlipped = responses truncated
     # (TC=1) so a legit client can retry over TCP. Both 0 when RRL is off.
-    "rate_dropped": ("RateDropped",),
-    "rate_slipped": ("RateSlipped",),
+    "rate_dropped": (("RateDropped",),),
+    "rate_slipped": (("RateSlipped",),),
 }
+
+
+def _column_value(totals: dict[str, int], spellings: tuple[tuple[str, ...], ...]) -> int:
+    """The first spelling with any of its counters present, summed; 0 when
+    the snapshot carries none of them."""
+    for names in spellings:
+        present = [n for n in names if n in totals]
+        if present:
+            return sum(totals[n] for n in present)
+    return 0
+
+
+# Column → its counter in the server-level ``<counters type="rcode">``
+# table: the responses BIND sent, by rcode — the breakdown itself. Read
+# from the ``<server>`` element only: every view repeats NXDOMAIN /
+# SERVFAIL / REFUSED under ``resstats`` as that view's RESOLVER counters
+# (answers this server received, not sent), so a name-wide sum would
+# fold them in.
+_RCODE_TABLE: dict[str, str] = {
+    "noerror": "NOERROR",
+    "nxdomain": "NXDOMAIN",
+    "servfail": "SERVFAIL",
+}
+
+
+def _server_rcodes(root: ET.Element) -> dict[str, int]:
+    """The server-level rcode table as {name: value}; {} on a build that
+    does not publish one (the nsstat fallback in ``_COUNTERS`` applies)."""
+    out: dict[str, int] = {}
+    server = root.find("server")
+    if server is None:
+        return out
+    for counters in server.findall("counters"):
+        if counters.get("type") != "rcode":
+            continue
+        for el in counters.findall("counter"):
+            name = el.get("name")
+            if not name:
+                continue
+            try:
+                out[name] = int((el.text or "0").strip())
+            except ValueError:
+                continue
+    return out
 
 
 def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
@@ -79,21 +170,32 @@ def _parse_snapshot(xml_bytes: bytes) -> dict[str, int]:
             continue
         totals[name] = totals.get(name, 0) + val
 
-    out: dict[str, int] = {}
-    for col, names in _COUNTERS.items():
-        total = 0
-        for n in names:
-            total += totals.get(n, 0)
-        out[col] = total
+    out = {col: _column_value(totals, spellings) for col, spellings in _COUNTERS.items()}
+    # The rcode breakdown: the rcode table when the build publishes it.
+    rcodes = _server_rcodes(root)
+    for col, name in _RCODE_TABLE.items():
+        if name in rcodes:
+            out[col] = rcodes[name]
     return out
 
 
 class MetricsPoller:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        *,
+        spool: Spool | None = None,
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
         self._stop = threading.Event()
         self._prev: dict[str, int] | None = None
+        # #1077 — no spool given (tests, ad-hoc callers) means a disabled one:
+        # a failed bucket is dropped, exactly the pre-spool behaviour.
+        if spool is None:
+            spool = Spool(cfg.state_dir, "metrics", 0, enabled=False)
+        self.shipper = Shipper(spool, self._post, event_prefix="dns_metrics_report")
 
     def stop(self) -> None:
         self._stop.set()
@@ -132,28 +234,35 @@ class MetricsPoller:
             delta[col] = d
         return delta
 
-    def _report(self, bucket_at: datetime, delta: dict[str, int]) -> None:
-        try:
-            with self._cp_client() as c:
-                resp = c.post(
-                    "/api/v1/dns/agents/metrics",
-                    json={"bucket_at": bucket_at.isoformat(), **delta},
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-            if resp.status_code not in (200, 204):
-                log.warning("dns_metrics_report_failed", status=resp.status_code)
-        except httpx.HTTPError as e:
-            log.warning("dns_metrics_report_http_error", error=str(e))
+    def _post(self, payload: dict) -> int:
+        with self._cp_client() as c:
+            resp = c.post(
+                "/api/v1/dns/agents/metrics",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+            )
+        return resp.status_code
+
+    def _report(self, bucket_at: datetime, delta: dict[str, int]) -> str:
+        """Send one bucket now, or queue it behind any backlog."""
+        return self.shipper.ship({"bucket_at": bucket_at.isoformat(), **delta})
+
+    def tick(self) -> None:
+        """One poll: snapshot, delta, report — or just drain the backlog."""
+        current = self._poll_named()
+        delta = self._compute_delta(current) if current is not None else None
+        if delta is not None:
+            now = datetime.now(UTC).replace(microsecond=0)
+            bucket = now.replace(second=(now.second // 60) * 60)
+            self._report(bucket, delta)  # drains the backlog first
+        elif len(self.shipper.spool):
+            # No bucket this tick (first poll, counter reset, named down):
+            # still give a queued backlog its chance to reach the control plane.
+            self.shipper.drain()
 
     def run(self) -> None:
         while not self._stop.is_set():
-            current = self._poll_named()
-            if current is not None:
-                delta = self._compute_delta(current)
-                if delta is not None:
-                    now = datetime.now(UTC).replace(microsecond=0)
-                    bucket = now.replace(second=(now.second // 60) * 60)
-                    self._report(bucket, delta)
+            self.tick()
             interval = 60.0 + random.uniform(-3, 3)
             self._stop.wait(timeout=max(30.0, interval))
 

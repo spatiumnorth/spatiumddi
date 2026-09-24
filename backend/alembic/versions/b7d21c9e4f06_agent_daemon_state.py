@@ -11,7 +11,7 @@ This migration is the storage that makes the field mean something, the
 same three-column shape on both agent-managed server tables.
 
 Revision ID: b7d21c9e4f06
-Revises: e3b9d7412c5a
+Revises: c5e8a1f3d027
 Create Date: 2026-09-21
 """
 
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "b7d21c9e4f06"
-down_revision = "e3b9d7412c5a"
+down_revision = "c5e8a1f3d027"
 branch_labels = None
 depends_on = None
 

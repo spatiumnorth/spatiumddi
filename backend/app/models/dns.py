@@ -262,6 +262,14 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # the failure is still current or predates the config now saved.
     config_failed_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1077 — the agent's durable push spool, as last reported on the
+    # heartbeat: bytes / entries queued, oldest entry, and cumulative trim
+    # counters (``SpoolManager.status()`` on the agent). NULL means the agent
+    # has never reported one — a pre-#1077 agent or an agentless driver — and
+    # is UNKNOWN, never "empty spool". Only overwritten when a heartbeat
+    # carries the field. Read by the server-list chip and the
+    # ``agent_spool_trimmed`` alert.
+    spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # ── #1067 daemon state ──
     #

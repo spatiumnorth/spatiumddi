@@ -25,6 +25,7 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.drivers._winrm import validate_transport
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.fortigate import test_fortigate_credentials
@@ -35,6 +36,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.spool_status import SpoolStatus
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
@@ -66,7 +68,7 @@ class WindowsCredentialsInput(BaseModel):
 
     All fields are optional to support **partial updates** on edit: if the
     server already has stored credentials, sending just ``{"transport":
-    "kerberos"}`` (for example) decrypts the existing blob, merges the
+    "credssp"}`` (for example) decrypts the existing blob, merges the
     transport change, and re-encrypts. On create, ``username`` + ``password``
     are still required — the create endpoint validates that explicitly.
     """
@@ -74,7 +76,7 @@ class WindowsCredentialsInput(BaseModel):
     username: str | None = None
     password: str | None = None
     winrm_port: int | None = None
-    # transport: ntlm | kerberos | basic | credssp
+    # transport: ntlm | credssp | basic (kerberos: #1128)
     transport: str | None = None
     use_tls: bool | None = None
     verify_tls: bool | None = None
@@ -82,11 +84,9 @@ class WindowsCredentialsInput(BaseModel):
     @field_validator("transport")
     @classmethod
     def _valid_transport(cls, v: str | None) -> str | None:
-        # #426: reject a bogus transport at save instead of failing
-        # opaquely at apply (pywinrm only speaks these four).
-        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
-            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
-        return v
+        # #426 / #1128: reject a transport this build cannot speak at save,
+        # instead of failing opaquely at the first call.
+        return validate_transport(v)
 
     @field_validator("winrm_port")
     @classmethod
@@ -218,6 +218,10 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1077 — the agent's push spool as last reported on its heartbeat.
+    # NULL when never reported (a pre-#1077 agent, or an agentless driver):
+    # UNKNOWN, never "empty".
+    spool_status: SpoolStatus | None = None
     # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
     # ``degraded`` (the agent's own word; anything but ``ok`` is not serving);
     # NULL when the agent has never reported one — UNKNOWN, never "fine".
@@ -289,6 +293,7 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            spool_status=s.spool_status,
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
@@ -401,15 +406,58 @@ class SyncLeasesResponse(BaseModel):
     statics_synced: int = 0
     pools_removed: int = 0
     statics_removed: int = 0
+    # #1110 — scopes this server holds whose import belongs to another member
+    # of its group (one member imports a shared scope; the rest report).
+    scopes_deferred: int = 0
     # MAC deny-filter reconciliation against the group's active blocks.
     # Zero when the server isn't in a group or has no blocks configured.
     mac_blocks_added: int = 0
     mac_blocks_removed: int = 0
     errors: list[str]
+    # #1110 — standing conditions rather than failures of this sync: a scope
+    # two Windows members serve uncoordinated, failover partners whose
+    # configuration has drifted, a failover read that was denied.
+    warnings: list[str] = []
     # Set on the agent-based no-op path (Kea): a human-readable explanation
     # that there was nothing to pull and the agent was nudged to re-poll its
     # config. ``None`` for the normal agentless lease-pull path.
     note: str | None = None
+
+
+# #1110 — Kea serves every scope of its group through the bundle, and Windows
+# serves the scopes the write-through puts on it. The two have no protocol in
+# common: Kea's HA hook and Windows failover cannot coordinate, so a group
+# with both kinds of member hands every Windows-held scope out twice. Refused
+# at the two places a server joins a group from the API; an existing mixed
+# group is surfaced on the group's Windows failover view instead.
+_UNCOORDINATABLE_DRIVERS = frozenset({"kea", "windows_dhcp"})
+
+
+async def _assert_driver_mix_allowed(
+    db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
+) -> None:
+    if group_id is None or driver not in _UNCOORDINATABLE_DRIVERS:
+        return
+    other = "windows_dhcp" if driver == "kea" else "kea"
+    q = select(DHCPServer.name).where(
+        DHCPServer.server_group_id == group_id, DHCPServer.driver == other
+    )
+    if exclude_server_id is not None:
+        q = q.where(DHCPServer.id != exclude_server_id)
+    clash = (await db.execute(q.limit(3))).scalars().all()
+    if clash:
+        kinds = {"kea": "Kea", "windows_dhcp": "Windows DHCP"}
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This server group already has {kinds[other]} members "
+                f"({', '.join(clash)}). Kea and Windows DHCP servers cannot coordinate — "
+                f"Kea's HA and Windows failover do not speak to each other — so a group "
+                f"with both would hand out every scope's addresses from two servers that "
+                f"do not know about each other. Put the {kinds[driver]} server in its own "
+                f"server group."
+            ),
+        )
 
 
 @router.get("", response_model=list[ServerResponse])
@@ -424,6 +472,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
+    await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
     # drivers (FortiGate) speak HTTPS on 443; agent/agentless DHCP daemons use 67.
@@ -511,6 +560,10 @@ async def update_server(
     changes = body.model_dump(
         exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    target_group = changes.get("server_group_id", s.server_group_id)
+    target_driver = changes.get("driver", s.driver)
+    if target_group != s.server_group_id or target_driver != s.driver:
+        await _assert_driver_mix_allowed(db, target_group, target_driver, exclude_server_id=s.id)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -1061,9 +1114,11 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "statics_synced": result.statics_synced,
             "pools_removed": result.pools_removed,
             "statics_removed": result.statics_removed,
+            "scopes_deferred": result.scopes_deferred,
             "mac_blocks_added": mac_added,
             "mac_blocks_removed": mac_removed,
             "errors": result.errors[:20],
+            "warnings": result.warnings[:20],
         },
     )
     await db.commit()
@@ -1083,9 +1138,11 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         statics_synced=result.statics_synced,
         pools_removed=result.pools_removed,
         statics_removed=result.statics_removed,
+        scopes_deferred=result.scopes_deferred,
         mac_blocks_added=mac_added,
         mac_blocks_removed=mac_removed,
         errors=result.errors,
+        warnings=result.warnings,
     )
 
 

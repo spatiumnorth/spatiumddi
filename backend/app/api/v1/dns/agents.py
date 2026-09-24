@@ -45,6 +45,13 @@ from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
 from app.services.agents.daemon_state import apply_reported_daemon_state
+from app.services.agents.ingest_receipt import (
+    BatchId,
+    IngestAck,
+    claim_batch,
+    duplicate_response,
+)
+from app.services.agents.spool_status import apply_reported_spool
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
     hash_token,
@@ -55,6 +62,7 @@ from app.services.dns.agent_token import (
 from app.services.dns.record_ops import ack_op
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
+from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dns-agents"])
@@ -113,6 +121,14 @@ class AgentHeartbeatRequest(BaseModel):
     # a NEWER agent may send fields this control plane predates — both must
     # keep heartbeating. ``apply_reported_status`` validates what it reads.
     config: dict[str, Any] = {}
+    # #1077 — the agent's durable push spool (``SpoolManager.status()``):
+    # bytes / entries queued, oldest entry, cumulative trim counters and a
+    # per-stream breakdown. Loose dict at the edge for the same reason as
+    # ``config``; ``apply_reported_spool`` validates it against
+    # ``SpoolStatus`` and ignores (with a log line) a malformed report rather
+    # than 422-ing the heartbeat. Absent (None) on a pre-#1077 agent, which
+    # leaves the stored value untouched.
+    spool: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     failed_ops_count: int = 0
@@ -521,6 +537,8 @@ async def agent_heartbeat(
     # this model since it was written and read by nothing; a server could be
     # reachable, healthy and serving a config the operator never approved.
     apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
+    # #1077 — spool state. Only written when the heartbeat carries it.
+    apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
     # #1067 — the daemon state. ``body.daemon`` has been declared on this model
     # since it was written and read by nothing: an agent whose ``named`` never
     # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
@@ -901,23 +919,39 @@ class DNSMetricReport(BaseModel):
     recursion: int = 0
     rate_dropped: int = 0
     rate_slipped: int = 0
+    batch_id: BatchId = None
 
 
-@router.post("/metrics")
+class DNSMetricsAck(IngestAck):
+    """Response for ``POST /dns/agents/metrics``."""
+
+
+@router.post("/metrics", response_model=DNSMetricsAck)
 async def agent_metrics(
     body: DNSMetricReport,
     db: DB,
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
-) -> dict[str, str]:
-    """Ingest one sample row from the agent's MetricsPoller thread.
+) -> dict[str, Any]:
+    """Ingest one sample row, accumulating into ``(server_id, bucket_at)``.
 
-    Idempotent on ``(server_id, bucket_at)`` — if the agent retries a
-    POST after a transient failure it overwrites the prior row
-    rather than duplicating. Counters that arrive negative (e.g. a
-    buggy agent) are clamped to zero so the dashboard can't render
-    impossible dips.
+    A second report for a bucket that already exists is ADDED to it rather
+    than replacing it — the same fix #980 made on the DHCP side. These are
+    counter deltas over disjoint intervals, and the agent floors
+    ``bucket_at`` to the minute while its own interval is 60 s ± 3 s of
+    jitter, so roughly one bucket in forty receives two genuinely different
+    deltas; the old last-write-wins overwrite silently discarded one of them.
+
+    Accumulating is only safe because a *retried* body is no longer a second
+    delta: since #1077 the agent spools a failed POST and replays it with the
+    same ``batch_id``, and a replay of a batch already committed is answered
+    as a duplicate before anything is added. A body with no ``batch_id`` (an
+    agent older than #1077, which never retries a metric POST) accumulates
+    unconditionally. Counters that arrive negative (e.g. a buggy agent) are
+    clamped to zero so the dashboard can't render impossible dips.
     """
     server, _ = auth
+    if not await claim_batch(db, server_id=server.id, batch_id=body.batch_id, stream="dns.metrics"):
+        return duplicate_response()
     values = {
         "queries_total": max(0, body.queries_total),
         "noerror": max(0, body.noerror),
@@ -932,9 +966,9 @@ async def agent_metrics(
         db.add(DNSMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values))
     else:
         for k, v in values.items():
-            setattr(existing, k, v)
+            setattr(existing, k, (getattr(existing, k, 0) or 0) + v)
     await db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "duplicate": False}
 
 
 # ── Query log ingestion ──────────────────────────────────────────────
@@ -946,16 +980,38 @@ class QueryLogBatch(BaseModel):
     The agent tails the configured query log file (default
     ``/var/log/named/queries.log``), collects up to ~200 lines or 5 s
     worth of activity, and POSTs them here. The control plane parses
-    each line into structured fields and inserts. Idempotency is not
-    enforced — duplicates are rare (they'd require the agent to
-    retry a partially-applied batch) and harmless (rows have a
-    monotonic ``id`` PK; nothing depends on uniqueness).
+    each line into structured fields and inserts.
+
+    Replays are idempotent per batch (#1077): the agent spools a batch the
+    control plane did not acknowledge and replays it with the same
+    ``batch_id``, and a batch already committed under that id is answered
+    as a duplicate without inserting anything. That is the dedupe the
+    issue asked for — keyed on the batch rather than on the row's
+    ``(ts, client, qname, qtype)``, because a client legitimately repeats
+    an identical query inside one second and a row-level key would erase
+    real traffic. A body without ``batch_id`` (a pre-#1077 agent) is not
+    deduplicated, as before.
     """
 
     lines: list[str]
+    batch_id: BatchId = None
 
 
-@router.post("/query-log-entries")
+class QueryLogAck(IngestAck):
+    """Response for ``POST /dns/agents/query-log-entries``."""
+
+    inserted: int = 0
+    rpz_inserted: int = 0
+    responses_matched: int = 0
+    responses_unmatched: int = 0
+    dropped: int = 0
+    #: Query lines older than the control plane's own query-log retention
+    #: (``prune_logs.DEFAULT_RETENTION_HOURS``) — skipped rather than
+    #: inserted into a table the nightly prune would empty straight away.
+    expired: int = 0
+
+
+@router.post("/query-log-entries", response_model=QueryLogAck)
 async def agent_query_log_entries(
     body: QueryLogBatch,
     db: DB,
@@ -978,10 +1034,22 @@ async def agent_query_log_entries(
     silently dropped — pdns mixes startup banners + status messages
     into the same stderr stream the agent captures, so non-query
     lines are expected and stored as noise without filling the DB.
+
+    Query lines whose own timestamp is older than the query-log retention
+    window are counted as ``expired`` and not inserted (#1077): a replay of
+    a long outage's backlog would otherwise write rows the nightly prune
+    deletes on its next run. The agent drops by spool age too; this is the
+    server-side belt. A line with no parseable timestamp is stamped with
+    the arrival time by the parser and is therefore never expired. RPZ
+    hits are exempt — they are kept for 30 days, not 24 h.
     """
     from app.services.logs import bind9_parser, pdns_parser  # noqa: PLC0415
 
     server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dns.query_log"
+    ):
+        return duplicate_response(inserted=0)
     if server.driver == "powerdns":
         parse_fn = pdns_parser.parse_query_line
     else:
@@ -1021,7 +1089,9 @@ async def agent_query_log_entries(
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
+    expired_cutoff = now - timedelta(hours=QUERY_LOG_RETENTION_HOURS)
     inserted = 0
+    expired = 0
     rpz_inserted = 0
     responses_matched = 0
     # Query rows added in THIS batch, keyed for the response line that
@@ -1085,6 +1155,9 @@ async def agent_query_log_entries(
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
+        if parsed.ts < expired_cutoff:
+            expired += 1
+            continue
         entry = DNSQueryLogEntry(
             server_id=server.id,
             ts=parsed.ts,
@@ -1118,6 +1191,7 @@ async def agent_query_log_entries(
         # symptom of that is an rcode column that is quietly blank.
         "responses_unmatched": len(deferred) - deferred_matched,
         "dropped": dropped,
+        "expired": expired,
     }
 
 
