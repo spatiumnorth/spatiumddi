@@ -307,6 +307,21 @@ the formatter handles the rest.
   needs it. Kerberos was in the same position (the images carry no
   GSSAPI stack) and is no longer offered — see #1128 under Changed.
 
+- **A DHCP scope created from its subnet keeps the subnet's gateway
+  as Routers (option 3) and gets the suggested pool (#1154).** The
+  New DHCP Scope dialog pre-fills Routers and a pool from the subnet,
+  and the DNS, domain, NTP and lease-time defaults from Settings —
+  but one latch covered both and fired on whichever query answered
+  first. The Dashboard caches the settings, so on the ordinary path
+  (Dashboard → IPAM → subnet → DHCP Pools → Create Scope) Routers and
+  the pool stayed empty, and a scope saved as shown handed out leases
+  with no default gateway; a hard reload lost the Settings defaults
+  instead. Each half now applies when its own query answers, never
+  over a value already there. A subnet picked in the dialog
+  pre-fills the same way (picking another replaces only what the
+  dialog filled in), and an IPv6 subnet no longer puts its gateway in
+  the DHCPv4-only option 3.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
