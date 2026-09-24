@@ -19,16 +19,14 @@ from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
-
-# Import for side-effect: registers the SQLAlchemy after_commit listener
-# that forwards audit events to syslog + webhook targets. Must run at app
-# startup so the listener is attached before any request handler writes
-# an AuditLog row.
-from app.services import (
-    audit_forward,  # noqa: F401
-    event_publisher,  # noqa: F401
-)
 from app.services.feature_modules import require_module
+from app.services.session_listeners import install_session_listeners
+
+# SQLAlchemy session listeners (audit forwarding, the typed-event outbox)
+# register on import, so they must be installed before any request handler
+# writes a row. ``app.celery_app`` installs the same list for the worker and
+# beat (#1168).
+install_session_listeners()
 
 logger = structlog.get_logger(__name__)
 

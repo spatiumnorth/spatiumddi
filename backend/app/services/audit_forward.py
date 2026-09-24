@@ -24,7 +24,9 @@ Design notes:
 
 * **Never blocks the commit.** The hook collects audit rows inside
   ``after_flush`` while they still have IDs, then schedules delivery
-  in ``after_commit`` via ``asyncio.create_task``.
+  in ``after_commit`` via ``after_commit_dispatch.dispatch`` — the
+  request loop in the api, a per-process background loop in a Celery
+  worker, where the task's own loop cancelled it on return (#1168).
 * **One task per target per row.** A dead collector isolates to its
   own target; others still see the event.
 * **Legacy flat-config fallback.** When no ``AuditForwardTarget``
@@ -56,6 +58,7 @@ from app.config import settings as _app_settings
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
+from app.services.after_commit_dispatch import dispatch
 
 logger = structlog.get_logger(__name__)
 
@@ -1103,12 +1106,9 @@ def _register_session_listener() -> None:
         if not snapshots:
             return
         setattr(session, _PENDING_ATTR, [])
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("audit_forward_no_loop_dropped", count=len(snapshots))
-            return
-        loop.create_task(_dispatch(snapshots))
+        # #1168 — see ``event_publisher``: a Celery task's loop cancelled
+        # this delivery as the task returned.
+        dispatch("audit_forward", lambda: _dispatch(snapshots), count=len(snapshots))
 
     @event.listens_for(AsyncSession.sync_session_class, "after_rollback")
     def _after_rollback(session: Any) -> None:

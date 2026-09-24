@@ -737,6 +737,29 @@ from celery.signals import task_failure  # noqa: E402
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
 
+# #1168 — the SQLAlchemy session listeners (audit forwarding, the typed-event
+# outbox) register on import. The api installs them from ``app.main``, which
+# a worker never imports; without this a task's audit rows produced no typed
+# webhook events at all — scheduled backups and rolling upgrades included.
+importlib.import_module("app.services.session_listeners").install_session_listeners()
+
+
+from celery.signals import beat_init, worker_init  # noqa: E402
+
+
+@worker_init.connect
+@beat_init.connect
+def _dispatch_after_commit_in_background(**_: object) -> None:
+    """#1168 — in a Celery process, run the listeners' after-commit work on a
+    per-process background loop. A task's own ``asyncio.run`` cancels
+    whatever is still pending when it returns, and a task usually commits
+    last: measured, 0 of 5 typed events reached the outbox that way. Wired
+    to the Celery signals rather than done at import because the api imports
+    this module too, and its request loop is fine as it is. ``worker_init``
+    runs in the prefork master; the loop itself starts lazily per PID, so
+    each forked child gets its own."""
+    importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
+
 
 @task_failure.connect
 def _capture_task_failure(
