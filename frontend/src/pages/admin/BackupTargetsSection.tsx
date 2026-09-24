@@ -66,8 +66,9 @@ export function BackupTargetsSection() {
         <div>
           <h2 className="text-sm font-semibold">Scheduled targets</h2>
           <p className="text-xs text-muted-foreground">
-            Build backups on a cron schedule + write them to a local volume.
-            Operators add S3 / SCP / Azure destinations once those drivers ship.
+            Build backups on a cron schedule and write them to a local volume, a
+            network share or an object store. Add target lists every destination
+            kind this build supports.
           </p>
         </div>
         <button

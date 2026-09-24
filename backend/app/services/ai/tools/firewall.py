@@ -313,7 +313,7 @@ class FindWebUIAccessArgs(BaseModel):
 @register_tool(
     name="find_web_ui_access",
     description=(
-        "Report the appliance Web UI source restriction (#285 Phase 6, superadmin "
+        "Report the appliance Web UI source restriction (superadmin "
         "only). Returns the allow-list of source CIDRs (empty = open to all) that "
         "governs both the per-node HTTP/HTTPS door (nftables :80/:443) and the "
         "MetalLB control-plane VIP (loadBalancerSourceRanges). Use for 'who can "

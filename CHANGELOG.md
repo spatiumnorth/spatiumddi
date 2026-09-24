@@ -175,6 +175,24 @@ the formatter handles the rest.
   `docker compose cp api:/var/lib/spatiumddi/backups ./backups-api`,
   and the same for `worker`.
 
+- **Console copy described shipped features as future work
+  (#1161).** Administration → Backup said destinations beyond a local
+  volume would come "once those drivers ship" above an Add target
+  list of ten, and its "Security model — Phase 1a" note told operators
+  to carry `SECRET_KEY` across installs by hand, which restore's
+  secret rewrap has done for them since it shipped (the note now says
+  what happens if that rewrap stops part-way). AI Providers said the
+  Anthropic, Gemini and Azure drivers "ship in Phase 2"; Kubernetes
+  said its reconciler had not shipped; the Web UI certificate card
+  said an activated certificate is not served yet, when activation
+  deploys it to nginx. Development-phase labels are gone from the
+  appliance, DNS, multicast and VRF pages, the Appliance Operator
+  role's description and five Copilot tool descriptions, and the
+  README counts ten destination kinds. Two guards keep it that way:
+  a Vitest check over every string and JSX text in the frontend, and
+  a backend test over the built-in role and Copilot tool
+  descriptions.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell

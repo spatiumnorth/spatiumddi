@@ -593,7 +593,7 @@ class FindControlPlaneVipArgs(BaseModel):
         "#272). Returns whether MetalLB is enabled, the L2 address pool, "
         "the floating control-plane VIP that fronts the Web UI across "
         "control-plane nodes, and the data-plane resolver VIPs (DNS :53 "
-        "and DHCP relay :67, #272 Phase 10). Read-only — changing a VIP "
+        "and DHCP relay :67). Read-only — changing a VIP "
         "is a high-blast-radius operation (it can sever Web UI / agent / "
         "resolver reachability) and is done in Fleet → Control plane, "
         "not via the Copilot."
@@ -912,7 +912,7 @@ class FindEtcdSnapshotsArgs(BaseModel):
     name="find_etcd_snapshots",
     description=(
         "List recoverable etcd snapshots reported by the appliance "
-        "control-plane seed (superadmin only, #272 Phase 9b). Returns "
+        "control-plane seed (superadmin only). Returns "
         "each snapshot's name / node / size / creation time, plus any "
         "in-flight restore state. Use to answer 'what etcd snapshots can "
         "we recover from?' or 'is a restore running?'. Read-only — a "

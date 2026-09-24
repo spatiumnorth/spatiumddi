@@ -216,7 +216,7 @@ If you skipped the backup and need to roll back: every restore takes a `pre-rest
 
 ## 9. Backup and Restore
 
-The full backup + restore surface lives in **System Admin → Backup**: build-and-download, configured remote destinations (local volume, S3 / S3-compatible, SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google Cloud Storage), scheduled cron + retention, restore-from-file, restore-from-destination, archive proxy-download, selective restore. See [`docs/features/SYSTEM_ADMIN.md`](../features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
+The full backup + restore surface lives in **System Admin → Backup**: build-and-download, configured remote destinations (local volume, S3 / S3-compatible, SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google Cloud Storage, WebDAV, NFS, HTTPS PUT/POST), scheduled cron + retention, restore-from-file, restore-from-destination, archive proxy-download, selective restore. See [`docs/features/SYSTEM_ADMIN.md`](../features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
 
 The shape that's specific to Docker Compose:
 
