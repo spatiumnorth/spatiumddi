@@ -151,6 +151,21 @@ the formatter handles the rest.
 - **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
   pull path stamped `last_seen_at` on the rows it mirrors; the agent's
   lease-event path never did. Both do now.
+- **A subnet that inherits its DNS now gets its reverse zone
+  (#1149).** Getting Started promises the matching `in-addr.arpa` /
+  `ip6.arpa` zone once a subnet has an effective DNS group or zone,
+  but subnet create decided from the request body and the subnet's
+  own columns only — so a subnet left on **Inherit from parent** (the
+  console's default, which sends no DNS fields at all) never got one,
+  and no address in it ever got a PTR. The per-allocation catch-up and
+  the reverse-zone backfill (the first step of **Sync DNS**) had the
+  same blind spot. All three now fall back to the DNS the subnet
+  inherits from its block or space when it names none of its own. A
+  subnet with its own binding resolves exactly as before,
+  `skip_reverse_zone` still opts out at create, and the #844 refusal
+  to share a reverse zone with an overlapping subnet in another IP
+  space applies however the group was found. An existing inheriting
+  subnet gets its reverse zone on its next allocation or **Sync DNS**.
 
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
