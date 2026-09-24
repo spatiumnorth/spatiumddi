@@ -298,21 +298,41 @@ async def test_split_horizon_never_pages_ops_and_the_render_retires_them(
 
 
 @pytest.mark.asyncio
-async def test_a_render_that_raises_is_recorded_on_the_server_row_and_fails_the_poll(
+async def test_an_inline_render_that_raises_holds_the_poll_and_leaves_the_verdict_to_the_worker(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The api's inline attempt is opportunistic: when it raises (at a million
+    records, the api's 30 s command_timeout) the poll falls back to the worker
+    path — the render is enqueued and the poll holds, 304 at the deadline —
+    and the server row is left alone. Recording it as the render verdict fired
+    the render-failed alert while the worker was fine and kept the sweep
+    backing the server off (tests/test_dns_agents_config_inline_fallback.py)."""
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    enqueued: list[list] = []
+
+    async def _fake_enqueue(ids):  # noqa: ANN001
+        enqueued.append(list(ids))
+
+    monkeypatch.setattr(agents_api, "enqueue_renders", _fake_enqueue)
     server, _zone, headers = await _agent(db_session, records=1)
     await db_session.commit()
+    server_id = server.id
 
     async def _boom(db, server, *, rendered_by):  # noqa: ANN001
         raise RuntimeError("synthetic render failure")
 
     monkeypatch.setattr(agents_api, "render_and_store", _boom)
-    with pytest.raises(RuntimeError):
-        await client.get(CONFIG_URL, headers=headers)
+    failures_before = agents_api.AGENT_BUNDLE_INLINE_FAILURES.labels(family="dns")._value.get()
+    held = await client.get(CONFIG_URL, headers=headers)
+    assert held.status_code == 304, held.text
+    assert "etag" not in held.headers
+    assert enqueued == [[server_id]], "the worker's render was requested"
+    assert (
+        agents_api.AGENT_BUNDLE_INLINE_FAILURES.labels(family="dns")._value.get()
+        == failures_before + 1
+    )
     await db_session.refresh(server)
-    assert server.bundle_render_status == store.RENDER_STATUS_FAILED
-    assert "synthetic render failure" in (server.bundle_render_error or "")
+    assert server.bundle_render_status is None, "the row carries no verdict from the api"
+    assert server.bundle_render_error is None
     assert server.bundle_watermark is None

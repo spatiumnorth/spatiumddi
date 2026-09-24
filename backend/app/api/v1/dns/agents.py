@@ -34,7 +34,11 @@ from app.core.agent_wake import (
 )
 from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dns import get_driver as get_dns_driver
-from app.metrics import AGENT_BUNDLE_INLINE_RENDERS, AGENT_BUNDLE_SERVED
+from app.metrics import (
+    AGENT_BUNDLE_INLINE_FAILURES,
+    AGENT_BUNDLE_INLINE_RENDERS,
+    AGENT_BUNDLE_SERVED,
+)
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAgentBundle,
@@ -60,7 +64,7 @@ from app.services.agents.ingest_receipt import (
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns.agent_bundle_render import render_and_store
-from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body, record_failure
+from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
 from app.services.dns.agent_token import (
     hash_token,
@@ -439,22 +443,40 @@ def _bundle_response(
     )
 
 
+class _InlineRenderFailed(Exception):
+    """The api's inline attempt raised; the poll falls back to the worker."""
+
+
 async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     """Migration-release fallback: build in the request as before, store it.
 
     Once per (server, version) — the store is idempotent on the watermark
     and a concurrent render (another replica, or the worker) simply wins;
-    then this poll serves the row that won. A render that raises fails the
-    poll as it always did, and is recorded on the server row.
+    then this poll serves the row that won.
+
+    A render that raises here is the api's opportunistic attempt, not the
+    control plane's verdict on the server's bundle, and is NOT recorded on
+    the server row. At a million records the records query outlives the
+    api's 30 s ``command_timeout`` on every attempt: recorded, each one
+    stamped ``bundle_render_status = failed`` (firing
+    ``agent_bundle_render_failed`` while the worker was rendering fine) and
+    kept the render-missing sweep backing off the server for its 5-minute
+    failed window, re-stamped by every poll — so a lost or crashed worker
+    render of that server was never retried. The failure is logged and
+    counted instead, and the caller holds the poll on the worker's render.
     """
     server_id = server.id  # a rollback expires the instance
     try:
         outcome = await render_and_store(db, server, rendered_by=RENDERED_BY_API)
     except Exception as exc:
         await db.rollback()
-        await record_failure(db, server_id, f"{type(exc).__name__}: {exc}")
-        await db.commit()
-        raise
+        AGENT_BUNDLE_INLINE_FAILURES.labels(family="dns").inc()
+        logger.warning(
+            "dns_agent_bundle_inline_render_failed",
+            server_id=str(server_id),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise _InlineRenderFailed from exc
     # Commit now: the stored row serves every other poller of this server.
     await db.commit()
     if outcome.bundle is not None:
@@ -520,6 +542,7 @@ async def agent_config_longpoll(
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
+    inline_failed = False
     # #358 — subscribe to this agent's wake channels BEFORE the first read so
     # a change (or a render) that commits + publishes during this request
     # can't land in the gap. A wake collapses the re-poll latency; with
@@ -533,9 +556,18 @@ async def agent_config_longpoll(
             await db.refresh(server)
             bundle = await bundle_store.current(db, server)
             if bundle is None:
-                if settings.dns_agent_bundle_inline_fallback:
-                    bundle = await _render_inline(db, server)
-                elif not enqueued:
+                if settings.dns_agent_bundle_inline_fallback and not inline_failed:
+                    try:
+                        bundle = await _render_inline(db, server)
+                    except _InlineRenderFailed:
+                        # Once per poll: hold on the worker's render instead.
+                        inline_failed = True
+                        await db.refresh(server)
+                if (
+                    bundle is None
+                    and not enqueued
+                    and (inline_failed or not settings.dns_agent_bundle_inline_fallback)
+                ):
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:

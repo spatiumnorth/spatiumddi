@@ -50,6 +50,14 @@ AGENT_BUNDLE_INLINE_RENDERS = Counter(
     "Agent config bundles the api rendered inline (migration-release fallback)",
     ["family"],
 )
+# An inline render the api could not finish (at a million records the records
+# query outlives the api's 30 s command_timeout). Counted and logged, never
+# recorded on the server row: that verdict is the worker's.
+AGENT_BUNDLE_INLINE_FAILURES = Counter(
+    "spatiumddi_agent_bundle_inline_failures_total",
+    "Inline (migration-release fallback) renders the api could not finish",
+    ["family"],
+)
 
 # #1051 — the ``path_template`` value for a request no route claimed (a 404,
 # or a path the router never saw). ONE constant bucket, never the raw path:
