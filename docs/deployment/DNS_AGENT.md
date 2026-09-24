@@ -144,6 +144,8 @@ A new platform setting `require_agent_approval: bool` (default **false** for hom
 - No config is served.
 - Heartbeats still accepted (for telemetry).
 
+The hold is cleared through the API with `POST /api/v1/dns/groups/{group_id}/servers/{server_id}/approve` (superadmin; the DNS twin of `POST /api/v1/dhcp/servers/{id}/approve`), which sets `pending_approval=false`, writes a `dns.server.approve` audit event and wakes the agent so its next config poll serves the bundle. The row keeps the fingerprint the agent re-registered with, so approving accepts that identity (spatiumddi#1121).
+
 ### Re-registration
 
 On restart, the agent tries its cached token first. If the control plane returns `401`, it falls back to bootstrap with the PSK. If the PSK has rotated too, the agent logs and enters a retry loop with jittered backoff (cap 5 min).
