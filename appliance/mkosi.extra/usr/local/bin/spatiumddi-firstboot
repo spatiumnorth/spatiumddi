@@ -184,6 +184,18 @@ mkdir -p /var/lib/spatiumddi/pcaps
 chown 1000:1000 /var/lib/spatiumddi/pcaps
 chmod 0700 /var/lib/spatiumddi/pcaps
 
+# /var/lib/spatiumddi/backups — local-volume backup archives at the
+# driver's default path (#1160), plus restore's pre-restore safety dump.
+# The worker writes every scheduled run here and the api writes manual
+# runs, lists, downloads and restores — both pods hostPath-mount it. Same
+# uid-1000 + 0700 reasoning as the two dirs above (kubelet would create
+# it root:root 0755 and every backup write would fail EACCES). The chown
+# is not recursive: the pods write as uid 1000, so everything below is
+# theirs already. Idempotent on every boot.
+mkdir -p /var/lib/spatiumddi/backups
+chown 1000:1000 /var/lib/spatiumddi/backups
+chmod 0700 /var/lib/spatiumddi/backups
+
 # /var/lib/spatiumddi/removable — where the removable-disk mount plane
 # mounts USB backup disks (#989 item 3). Deliberately root-owned 0755
 # and NOT chowned to uid 1000, unlike its two neighbours above: this

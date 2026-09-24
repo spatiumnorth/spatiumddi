@@ -151,6 +151,29 @@ the formatter handles the rest.
 - **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
   pull path stamped `last_seen_at` on the rows it mirrors; the agent's
   lease-event path never did. Both do now.
+- **Local-volume backups landed in each container's own filesystem
+  (#1160).** The release `docker-compose.yml` left the
+  `spatium_backups` volume commented out on the api and the worker,
+  and the chart mounted nothing at `/var/lib/spatiumddi/backups`, the
+  path a `local_volume` target suggests. The path is still writable,
+  so the connection test passed and every run reported success — but
+  scheduled runs execute in the worker, so the api never listed their
+  archives (no download, no restore from the UI), and every archive
+  was lost at the next container recreate, each upgrade included.
+  Compose now mounts `spatium_backups` on both services; the appliance
+  mounts a `/var/lib/spatiumddi/backups` hostPath on both pods, which
+  firstboot hands to the pods' uid. On a multi-node appliance that
+  directory is per node, like the packet-capture store: an archive is
+  listed by the api on the node whose pod wrote it; a network
+  destination is the cluster-wide choice. Test connection now warns
+  when a local-volume path is not on a mounted volume, which covers
+  every other deployment shape. Restore's pre-restore safety dump,
+  written to the same path, now survives too.
+  **Operator action on a Compose upgrade:** archives written before
+  it exist only inside the running api and worker containers; copy
+  them out before the upgrade recreates them —
+  `docker compose cp api:/var/lib/spatiumddi/backups ./backups-api`,
+  and the same for `worker`.
 
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client

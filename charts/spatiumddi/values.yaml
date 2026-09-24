@@ -284,6 +284,22 @@ api:
     # capture needs the mirror-proxy (a tracked follow-up); appliance is
     # single-node so the shared hostPath is correct.
     pcapsDir: /var/lib/spatiumddi/pcaps
+    # #1160 — host dir backing a ``local_volume`` backup target at its
+    # default path (/var/lib/spatiumddi/backups; also where restore puts
+    # its pre-restore safety dump). Mounted on api (manual runs, listing,
+    # download, restore) AND worker (every scheduled run): without it
+    # each pod writes into its own container layer, so scheduled archives
+    # are never listed and every archive is lost when the pod goes.
+    # hostPath like pcapsDir, and for the same reason: the appliance's
+    # storage class is local-path (ReadWriteOnce, node-pinned), and a PVC
+    # shared by api + worker would leave every replica on another node
+    # unschedulable under their hard anti-affinity. On a multi-node
+    # cluster this dir is therefore per node — an archive is kept on the
+    # node whose pod wrote it and listed by the api replica on that node.
+    # A cluster-wide view needs a byte-proxy store like the slot-image
+    # mirror (#296); until then a network destination (NFS, SMB, S3, …)
+    # is the multi-node choice.
+    backupsDir: /var/lib/spatiumddi/backups
     # Slot detection — the api's slot-status/rollback handlers resolve the
     # ACTIVE slot from /proc/cmdline + udev's /run/udev/data records and
     # read the durable default from grubenv (mounted at /boot/efi-host in

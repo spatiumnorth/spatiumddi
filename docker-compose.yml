@@ -71,22 +71,21 @@ services:
     # then set ``DOCKER_GID=<that number>`` in your .env. Common
     # values: 999 (Debian/Ubuntu), 998 or 989 (RHEL/Fedora), varies.
     # Without this the api user (uid 1000) gets EACCES on the socket.
-    #
-    # Backup local-volume target (issue #117) — uncomment the
-    # ``spatium_backups`` line below AND its entry under the
-    # top-level ``volumes:`` block AND the matching line on the
-    # worker service if you create a Backup Target with kind
-    # ``local_volume`` at the default path
-    # ``/var/lib/spatiumddi/backups``. Without this mount, archives
-    # land inside the container's writable layer and disappear on
-    # container recycle. Operators using only remote destinations
-    # (S3 / SCP / Azure / SMB / FTP / GCS) can leave it commented.
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
-    #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
     #   - "${DOCKER_GID:-999}"
     volumes:
+      # Backup local-volume target (issue #117, #1160) — the default
+      # path of a ``local_volume`` Backup Target. The api writes a
+      # manual "Run now" here and lists, downloads and restores
+      # archives from here, while every SCHEDULED run is written by
+      # the worker — so both mount this one volume (MUST stay in sync
+      # with the worker mount below). Restore's pre-restore safety
+      # dump lands here too. Without it each container keeps its own
+      # copy in its writable layer: scheduled archives are never
+      # listed, and all of them are lost on the next recreate.
+      - spatium_backups:/var/lib/spatiumddi/backups
       # Slot-image upload storage for air-gapped appliance upgrades
       # (#170 follow-up). Holds the .raw.xz bytes the operator
       # uploads through the Fleet UI. The api streams them back
@@ -137,18 +136,16 @@ services:
     # also needs the host socket when polling a local daemon.
     # Uncomment alongside the matching entries on the api service
     # above — same ``DOCKER_GID`` comment applies.
-    #
-    # Backup local-volume target (issue #117) — the worker runs the
-    # scheduled backup sweep, so it must mount the same volume the
-    # api lists archives from. Uncomment the spatium_backups line below
-    # alongside the api service.
     volumes:
+      # Backup local-volume target (issue #117, #1160) — the worker runs
+      # every scheduled backup, so it writes to the same volume the api
+      # lists archives from. MUST stay in sync with the api mount above.
+      - spatium_backups:/var/lib/spatiumddi/backups
       # Packet-capture .pcap artifacts (issue #59) — the worker runs the
       # capture, so it writes here; the api reads the same volume on
       # download. MUST stay in sync with the api mount above.
       - spatium_pcaps:/var/lib/spatiumddi/pcaps
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
-    #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
     #   - "${DOCKER_GID:-999}"
     depends_on:
@@ -536,11 +533,10 @@ volumes:
   # keeps BGP sessions up when the control plane is briefly unreachable
   # (non-negotiable #5). Only used by the `looking-glass` profile.
   lg_agent_state:
-  # Backup local-volume target (issue #117). Uncomment when using
-  # a Backup Target with kind ``local_volume``; see the comments
-  # on the api + worker services. Safe to leave commented for
-  # installs using only remote destinations.
-  # spatium_backups:
+  # Backup local-volume target (issue #117, #1160) — the default path of
+  # a ``local_volume`` Backup Target, shared by api + worker (see their
+  # mounts). Stays empty on installs that use only remote destinations.
+  spatium_backups:
   # Slot-image upload storage for air-gap appliance upgrades
   # (#170 follow-up). Holds the .raw.xz bytes the operator uploads
   # through the Fleet UI; served back authenticated under

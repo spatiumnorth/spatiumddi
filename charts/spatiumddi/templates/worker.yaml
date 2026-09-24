@@ -116,6 +116,11 @@ spec:
             # shared hostPath (firstboot chowns it 1000:1000).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #1160 — local-volume backup archives. The worker WRITES every
+            # scheduled run here; the api lists / downloads / restores from
+            # the same hostPath (firstboot chowns it 1000:1000).
+            - name: backups
+              mountPath: /var/lib/spatiumddi/backups
             # #989 item 3 — removable (USB) backup disks. HostToContainer
             # propagation is the whole reason this works: with the DEFAULT
             # private propagation a disk the host mounts AFTER this pod
@@ -141,6 +146,11 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #1160 — local-volume backup archives (shared with the api).
+        - name: backups
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.backupsDir }}
             type: DirectoryOrCreate
         # #989 item 3 — removable (USB) backup disks. DirectoryOrCreate:
         # spatiumddi-firstboot makes it, but a node that has never had a
