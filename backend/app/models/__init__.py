@@ -1,6 +1,7 @@
 from app.models.acme import ACMEAccount
 from app.models.acme_client import ACMEClientAccount, ACMEHTTPChallenge, ACMEOrder
 from app.models.address_set import ADDRESS_SET_RANGE_KINDS, AddressSet
+from app.models.agent_ingest import AgentIngestReceipt
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
@@ -39,6 +40,7 @@ from app.models.cutover import (
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
+    DHCPFailoverRelationship,
     DHCPLease,
     DHCPLeaseHistory,
     DHCPMACBlock,
@@ -47,6 +49,7 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServer,
     DHCPServerGroup,
+    DHCPServerScopeState,
     DHCPStaticAssignment,
 )
 from app.models.dhcp_device_policy import DHCPDevicePolicy
@@ -250,6 +253,8 @@ __all__ = [
     "VRF",
     "DHCPServerGroup",
     "DHCPServer",
+    "DHCPFailoverRelationship",
+    "DHCPServerScopeState",
     "DHCPScope",
     "DHCPPool",
     "DHCPStaticAssignment",
@@ -262,6 +267,7 @@ __all__ = [
     "DHCPConfigOp",
     "DHCPRecordOp",
     "NATMapping",
+    "AgentIngestReceipt",
     "DNSMetricSample",
     "DHCPMetricSample",
     "DNSClientWindow",

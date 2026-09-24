@@ -38,6 +38,12 @@ dependencies = [
     "dnspython>=2.7.0",
     "jinja2>=3.1.4",
     "pywinrm>=0.4.3",
+    # CredSSP transport for WinRM (#1110). pywinrm imports it lazily and the
+    # server form has offered "CredSSP" for years, so without it that choice
+    # failed on every call. It is also the one transport whose logon on the
+    # Windows server can authenticate onward to a failover partner, which
+    # every Add/Set/Remove-DhcpServerv4Failover* cmdlet has to do.
+    "requests-credssp>=2.0.0",
     "pysnmp~=7.1",
     "pyotp>=2.9.0",
     "openai>=1.40.0",
@@ -56,7 +62,7 @@ dependencies = [
     # normalizes internationalized host/record names to their xn-- A-label
     # form. Already present transitively (httpx / requests); pinned direct
     # because app.core.dns_names imports it.
-    "idna>=3.19",
+    "idna>=3.20",
     "boto3>=1.35.0",
     "paramiko>=3.4.0",
     "azure-storage-blob>=12.20.0",

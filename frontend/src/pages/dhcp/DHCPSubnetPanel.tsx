@@ -18,6 +18,7 @@ import {
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal } from "./_shared";
+import { ScopeServingStrip } from "./WindowsFailoverPanel";
 
 function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
   const qc = useQueryClient();
@@ -157,6 +158,9 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
         </div>
       </div>
 
+      {/* #1110 — renders nothing when the scope's group has no Windows members. */}
+      <ScopeServingStrip scopeId={scope.id} />
+
       <div>
         <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/30">
           <button
@@ -245,8 +249,9 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
         <div>
           <h2 className="text-sm font-semibold">DHCP Scopes</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Scopes belong to the server group — every server in the group serves
-            them (one scope per subnet per group).
+            Scopes belong to the server group — every Kea server in the group
+            serves them (one scope per subnet per group). Windows DHCP servers
+            share a scope only through a failover relationship.
           </p>
         </div>
         <button

@@ -66,16 +66,25 @@ async def _make_bind9_server(db: AsyncSession) -> DNSServer:
     return server
 
 
+# Stamped relative to now, not a fixed date: the ingest drops lines already
+# past the 24 h log retention (#1077), so a hard-coded date makes every line
+# here vanish the day after it was written. English month abbreviations are
+# spelled out rather than taken from strftime("%b"), which is locale-dependent.
+_MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+_NOW = datetime.now(UTC) - timedelta(minutes=5)
+_STAMP = f"{_NOW.day:02d}-{_MONTHS[_NOW.month - 1]}-{_NOW.year} {_NOW:%H:%M:%S}"
+
+
 def _query_line(port: int, qname: str, qtype: str = "A") -> str:
     return (
-        f"23-Aug-2026 13:20:09.480 queries: info: client @0x7f83 10.1.2.3#{port} "
+        f"{_STAMP}.480 queries: info: client @0x7f83 10.1.2.3#{port} "
         f"({qname}): view internal: query: {qname} IN {qtype} +E(0)K (127.0.0.1)"
     )
 
 
 def _response_line(port: int, qname: str, rcode: str, answers: int, qtype: str = "A") -> str:
     return (
-        f"23-Aug-2026 13:20:09.490 responses: info: client @0x7f83 10.1.2.3#{port} "
+        f"{_STAMP}.490 responses: info: client @0x7f83 10.1.2.3#{port} "
         f"({qname}): view internal: response: {qname} IN {qtype} {rcode} "
         f"{answers} 1 1 +E(0)K (127.0.0.1)"
     )
