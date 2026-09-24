@@ -21,6 +21,24 @@ Kea memfile CSV format (v4)::
 
 ``state`` values: 0=default (active), 1=declined, 2=expired-reclaimed,
 3=released (Kea 3.0 lease affinity).
+
+DHCPv6 (#1141) — ``kea-leases6.csv`` beside it, tailed the same way (header
+read off a live Kea 3.0.3)::
+
+    address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,
+    iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,state,user_context,
+    hwtype,hwaddr_source,pool_id
+
+A v6 lease is identified by DUID + IAID, not MAC — ``hwaddr`` is usually
+empty — so v6 events carry ``duid`` / ``iaid`` and ``mac_address`` only when
+Kea learned one. Only IA_NA (``lease_type`` 0) is sent; see
+:mod:`.lease_snapshot` for why IA_TA and IA_PD are not.
+
+v6 events are batched SEPARATELY from v4 ones. A control plane older than
+#1141 requires ``mac_address`` and rejects the whole batch with a 422 when
+one event lacks it — and the spool drops a rejected batch whole. Kept
+apart, an older control plane refuses only the v6 batches it could never
+have ingested, and the v4 leases beside them still land.
 """
 
 from __future__ import annotations
@@ -61,6 +79,57 @@ _DRAIN_BUDGET = 5.0
 _STATE_MAP = {"0": "active", "1": "declined", "2": "expired", "3": "released"}
 
 
+# kea-leases6.csv ``lease_type``: 0 = IA_NA. 1 (IA_TA) and 2 (IA_PD) are skipped.
+_LEASE6_IA_NA = "0"
+
+
+def _times(expire_epoch: int, valid_lifetime: int) -> tuple[str | None, str | None]:
+    starts_at = (
+        datetime.fromtimestamp(expire_epoch - valid_lifetime, tz=timezone.utc).isoformat()
+        if expire_epoch and valid_lifetime
+        else None
+    )
+    ends_at = (
+        datetime.fromtimestamp(expire_epoch, tz=timezone.utc).isoformat()
+        if expire_epoch
+        else None
+    )
+    return starts_at, ends_at
+
+
+def _parse_row_v6(row: list[str]) -> dict[str, Any] | None:
+    """One ``kea-leases6.csv`` row → a v6 lease event, or None to skip."""
+    if not row or row[0].startswith("address"):  # header or blank
+        return None
+    if len(row) < 14:
+        return None
+    try:
+        ip = row[0].strip()
+        duid = row[1].strip()
+        if not ip or not duid or row[6].strip() != _LEASE6_IA_NA:
+            return None
+        valid_lifetime = int(row[2]) if row[2] else 0
+        expire_epoch = int(row[3]) if row[3] else 0
+        iaid = int(row[7]) if row[7].strip() else None
+        hostname = row[11].strip() or None
+        mac = row[12].strip() or None
+        state = _STATE_MAP.get(row[13].strip(), "active")
+    except (ValueError, IndexError):
+        return None
+    starts_at, ends_at = _times(expire_epoch, valid_lifetime)
+    return {
+        "ip_address": ip,
+        "mac_address": mac,
+        "duid": duid,
+        "iaid": iaid,
+        "hostname": hostname,
+        "state": state,
+        "starts_at": starts_at,
+        "ends_at": ends_at,
+        "expires_at": ends_at,
+    }
+
+
 def _parse_row(row: list[str]) -> dict[str, Any] | None:
     if not row or row[0].startswith("address"):  # header or blank
         return None
@@ -79,18 +148,7 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
         expire_epoch = int(row[4]) if row[4] else 0
         hostname = row[8].strip() or None
         state = _STATE_MAP.get(row[9].strip(), "active")
-        starts_at = (
-            datetime.fromtimestamp(
-                expire_epoch - valid_lifetime, tz=timezone.utc
-            ).isoformat()
-            if expire_epoch and valid_lifetime
-            else None
-        )
-        ends_at = (
-            datetime.fromtimestamp(expire_epoch, tz=timezone.utc).isoformat()
-            if expire_epoch
-            else None
-        )
+        starts_at, ends_at = _times(expire_epoch, valid_lifetime)
         # #428: emit the server's LeaseEventBatch/LeaseEvent shape exactly —
         # field names ip_address/mac_address (NOT ip/mac) and an explicit
         # expires_at (Kea's CSV `expire` is the absolute reclaim time, same
@@ -118,15 +176,19 @@ class LeaseWatcher:
         heartbeat: Any,
         spool: Spool | None = None,
         snapshot: LeaseSnapshot | None = None,
+        snapshot_v6: LeaseSnapshot | None = None,
     ):
         self.cfg = cfg
         self.token_ref = token_ref
         self.heartbeat = heartbeat
         self._stop = threading.Event()
         self._pending: list[dict[str, Any]] = []
+        # #1141 — v6 events, batched apart from v4 (see the module docstring).
+        self._pending_v6: list[dict[str, Any]] = []
         self._last_flush = time.monotonic()
         self._last_drain = 0.0
-        self._offset = 0
+        # Read offset per tailed file (v4 and v6 CSVs rotate independently).
+        self._offsets: dict[Path, int] = {}
         self._poster = CPPoster(cfg, token_ref, LEASE_EVENTS_PATH, late_bound(self, "_client"))
         self._shipper = Shipper(
             spool if spool is not None else disabled_spool("lease_events"),
@@ -143,9 +205,13 @@ class LeaseWatcher:
         if snapshot is None:
             snapshot = LeaseSnapshot(cfg.kea_control_socket, self._post_snapshot)
         self.snapshot = snapshot
-        # Always once per start: the tailer re-reads only kea-leases4.csv, and
-        # a lease untouched since Kea's last LFC is only in kea-leases4.csv.2.
+        if snapshot_v6 is None:
+            snapshot_v6 = LeaseSnapshot(cfg.kea_control_socket_v6, self._post_snapshot, family=6)
+        self.snapshot_v6 = snapshot_v6
+        # Always once per start: the tailer re-reads only kea-leases{4,6}.csv,
+        # and a lease untouched since Kea's last LFC is only in the .2 file.
         self.snapshot.request("agent_start")
+        self.snapshot_v6.request("agent_start")
 
     def stop(self) -> None:
         self._stop.set()
@@ -183,32 +249,35 @@ class LeaseWatcher:
         return self._poster(payload)
 
     def _flush(self) -> None:
-        if not self._pending:
-            self._last_flush = time.monotonic()
-            return
+        # v4 and v6 never share a batch (module docstring).
+        self._flush_list("_pending")
+        self._flush_list("_pending_v6")
+        self._last_flush = time.monotonic()
+
+    def _flush_list(self, attr: str) -> None:
         # Posted in slices of _BATCH_MAX_EVENTS: the spool-disabled path lets
-        # _pending grow past one batch (tick() skips the per-row flush there),
-        # and LeaseEventBatch caps a POST at 500 events — an oversize body is
-        # a 422, which the spool classifies as REJECTED and drops whole.
-        while self._pending:
-            batch = self._pending[:_BATCH_MAX_EVENTS]
+        # the buffer grow past one batch (tick() skips the per-row flush
+        # there), and LeaseEventBatch caps a POST at 500 events — an oversize
+        # body is a 422, which the spool classifies as REJECTED and drops whole.
+        while getattr(self, attr):
+            pending: list[dict[str, Any]] = getattr(self, attr)
+            batch = pending[:_BATCH_MAX_EVENTS]
             if self._shipper.spool.enabled:
                 # Sent, or durably queued behind the backlog — either way no
                 # longer this process's to lose.
-                self._pending = self._pending[len(batch) :]
+                setattr(self, attr, pending[len(batch) :])
                 outcome = self._shipper.ship({"leases": batch})
                 if outcome == SENT:
                     log.info("lease_events_flushed", count=len(batch))
             else:
                 # Pre-#1077 fallback: keep the batch in memory until it lands.
-                # A RETRY leaves it in _pending for the next flush.
+                # A RETRY leaves it in the buffer for the next flush.
                 outcome = self._shipper.ship({"leases": list(batch)})
                 if outcome == SENT:
                     log.info("lease_events_flushed", count=len(batch))
                 if outcome == RETRY:
                     break
-                self._pending = self._pending[len(batch) :]
-        self._last_flush = time.monotonic()
+                setattr(self, attr, pending[len(batch) :])
 
     def _maybe_drain(self) -> None:
         if not len(self._shipper.spool):
@@ -226,12 +295,14 @@ class LeaseWatcher:
         than a page read now, and replaying them after it would roll leases
         back to a stale state.
         """
-        if self._pending or len(self._shipper.spool):
+        if self._pending or self._pending_v6 or len(self._shipper.spool):
             return
         if self._recovered:
             self._recovered = False
             self.snapshot.request("control_plane_recovered")
+            self.snapshot_v6.request("control_plane_recovered")
         self.snapshot.step()
+        self.snapshot_v6.step()
 
     # ── tailing ──────────────────────────────────────────────────────
 
@@ -242,35 +313,42 @@ class LeaseWatcher:
             size = path.stat().st_size
         except OSError:
             return []
-        if size < self._offset:
+        offset = self._offsets.get(path, 0)
+        if size < offset:
             # File rotated / truncated by Kea LFC
-            self._offset = 0
-        if size == self._offset:
+            offset = 0
+        if size == offset:
+            self._offsets[path] = offset
             return []
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(self._offset)
+            f.seek(offset)
             data = f.read()
-            self._offset = f.tell()
+            self._offsets[path] = f.tell()
         if not data:
             return []
         reader = csv.reader(io.StringIO(data))
         return list(reader)
 
+    def _tail(self, path: Path, parse: Any, attr: str) -> None:
+        for row in self._read_new_rows(path):
+            evt = parse(row)
+            if evt is not None:
+                pending: list[dict[str, Any]] = getattr(self, attr)
+                if len(pending) >= _BATCH_MAX_BUFFER:
+                    drop = _BATCH_MAX_BUFFER // 2
+                    setattr(self, attr, pending[drop:])
+                    log.warning("lease_events_buffer_trimmed", dropped=drop)
+                getattr(self, attr).append(evt)
+            if len(getattr(self, attr)) >= _BATCH_MAX_EVENTS and self._shipper.spool.enabled:
+                self._flush()
+
     def tick(self) -> None:
         """One loop iteration: tail, flush, replay, snapshot."""
-        rows = self._read_new_rows(self.cfg.kea_lease_file)
-        for row in rows:
-            evt = _parse_row(row)
-            if evt is not None:
-                if len(self._pending) >= _BATCH_MAX_BUFFER:
-                    drop = _BATCH_MAX_BUFFER // 2
-                    self._pending = self._pending[drop:]
-                    log.warning("lease_events_buffer_trimmed", dropped=drop)
-                self._pending.append(evt)
-            if len(self._pending) >= _BATCH_MAX_EVENTS and self._shipper.spool.enabled:
-                self._flush()
-        if self._pending and (
-            len(self._pending) >= _BATCH_MAX_EVENTS
+        self._tail(self.cfg.kea_lease_file, _parse_row, "_pending")
+        self._tail(self.cfg.kea_lease_file_v6, _parse_row_v6, "_pending_v6")
+        buffered = len(self._pending) + len(self._pending_v6)
+        if buffered and (
+            buffered >= _BATCH_MAX_EVENTS
             or (time.monotonic() - self._last_flush) >= _BATCH_MAX_SECONDS
         ):
             self._flush()

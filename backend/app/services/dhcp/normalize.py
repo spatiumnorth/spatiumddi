@@ -19,7 +19,7 @@ import ipaddress
 
 from app.core.mac import canonicalize_mac
 
-__all__ = ["canonicalize_mac", "norm_ip", "norm_mac"]
+__all__ = ["canonical_duid", "canonicalize_mac", "norm_duid", "norm_ip", "norm_mac"]
 
 
 def norm_mac(mac: str) -> str:
@@ -38,3 +38,33 @@ def norm_ip(ip: str) -> str:
         return str(ipaddress.ip_address(ip.strip()))
     except ValueError:
         return ip.strip()
+
+
+# RFC 8415 §11.1: a DUID is a 2-octet type code plus at most 128 octets.
+_DUID_MIN_OCTETS = 3
+_DUID_MAX_OCTETS = 130
+
+
+def norm_duid(duid: str) -> str:
+    """Fold a DUID to bare lowercase hex (#1141) — the comparison form, so
+    ``00:01:00:01:…`` and ``000100…`` and ``00-01-00-01-…`` are one client."""
+    return "".join(c for c in duid.lower() if c in "0123456789abcdef")
+
+
+def canonical_duid(duid: str) -> str:
+    """A DUID in the colon-separated lowercase hex form Kea reports and
+    ``dhcp_lease.duid`` stores. Raises ``ValueError`` for anything that is
+    not a whole number of octets within RFC 8415's bounds, or that carries
+    characters other than hex digits and ``:`` / ``-`` / ``.`` separators —
+    a lease identity is keyed on this, so it is refused rather than guessed.
+    """
+    text = duid.strip().lower()
+    if not text or any(c not in "0123456789abcdef:-." for c in text):
+        raise ValueError("DUID must be hex octets")
+    hexdigits = norm_duid(text)
+    if len(hexdigits) % 2:
+        raise ValueError("DUID must be a whole number of octets")
+    octets = len(hexdigits) // 2
+    if not _DUID_MIN_OCTETS <= octets <= _DUID_MAX_OCTETS:
+        raise ValueError(f"DUID must be {_DUID_MIN_OCTETS}-{_DUID_MAX_OCTETS} octets")
+    return ":".join(hexdigits[i : i + 2] for i in range(0, len(hexdigits), 2))
