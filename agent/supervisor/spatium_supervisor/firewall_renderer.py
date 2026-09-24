@@ -28,7 +28,8 @@ data-plane rule here or there (the identity regression test guards it).
 Per-role openings:
 
 * ``dns-bind9`` / ``dns-powerdns``: UDP + TCP / 53.
-* ``dhcp``: UDP / 67, 68.
+* ``dhcp``: UDP / 67, 68, 547 (547: DHCPv6 — on-link Solicit and relayed
+  Relay-Forward, #1139).
 * ``observer`` / ``custom``: no ports.
 
 Control-plane derived (#272 Phase 7b + #285 Phase 1 — CP nodes only):
@@ -167,7 +168,10 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
     "dns-technitium": [53],
-    "dhcp": [67, 68],
+    # 547 is the DHCPv6 server port (#1139): on-link Solicits to ff02::1:2 and
+    # relays' Relay-Forward to the server's address. Kea's v6 server has no
+    # raw-socket mode, so without it every v6 packet dies on the drop policy.
+    "dhcp": [67, 68, 547],
 }
 
 # #285 Phase 1 — control-plane peer ports, split by purpose so each can

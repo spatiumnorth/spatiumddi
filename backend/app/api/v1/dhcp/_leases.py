@@ -31,7 +31,10 @@ class LeaseResponse(BaseModel):
     server_id: uuid.UUID
     scope_id: uuid.UUID | None
     ip_address: str
-    mac_address: str
+    # NULL on most DHCPv6 leases, which are identified by DUID + IAID (#1141).
+    mac_address: str | None
+    duid: str | None = None
+    iaid: int | None = None
     hostname: str | None
     state: str
     starts_at: datetime | None
@@ -88,6 +91,7 @@ def apply_lease_filters(
                 cast(DHCPLease.ip_address, String).ilike(like),
                 cast(DHCPLease.mac_address, String).ilike(like),
                 DHCPLease.hostname.ilike(like),
+                DHCPLease.duid.ilike(like),
             )
         )
     return q

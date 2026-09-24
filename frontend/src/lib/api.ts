@@ -9497,7 +9497,10 @@ export interface DHCPLease {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null on most DHCPv6 leases, which are identified by DUID + IAID (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   state: string; // "active" | "expired" | "released" | "abandoned"
   starts_at: string | null;
@@ -15104,7 +15107,10 @@ export interface DHCPLeaseHistoryRow {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null for a DHCPv6 lease identified by DUID only (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   client_id: string | null;
   started_at: string | null;

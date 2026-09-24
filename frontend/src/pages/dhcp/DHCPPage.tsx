@@ -321,6 +321,33 @@ function GroupSidebar({
  * groups are single-vendor today (Kea OR Windows, not mixed), so the
  * `kea_member_count >= 1` test is sufficient.
  */
+/** A lease's client identity (#1141): the MAC for DHCPv4 (and for the
+ * DHCPv6 leases Kea could derive one for), otherwise the DHCPv6 DUID. DUIDs
+ * run to 40+ characters, so the cell truncates and the tooltip carries the
+ * whole value and the IAID. */
+function LeaseClientId({
+  mac,
+  duid,
+  iaid,
+}: {
+  mac: string | null;
+  duid?: string | null;
+  iaid?: number | null;
+}) {
+  if (mac) return <>{mac}</>;
+  if (!duid) return <span className="text-muted-foreground">—</span>;
+  const title = `DHCPv6 DUID ${duid}${iaid != null ? ` · IAID ${iaid}` : ""}`;
+  return (
+    <span
+      title={title}
+      className="inline-block max-w-[16rem] truncate align-bottom"
+    >
+      <span className="text-muted-foreground">DUID </span>
+      {duid}
+    </span>
+  );
+}
+
 function groupIsKeaManaged(group: DHCPServerGroup): boolean {
   return group.kea_member_count > 0;
 }
@@ -2318,7 +2345,11 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       {l.ip_address}
                     </td>
                     <td className="px-3 py-1.5 font-mono text-xs">
-                      {l.mac_address}
+                      <LeaseClientId
+                        mac={l.mac_address}
+                        duid={l.duid}
+                        iaid={l.iaid}
+                      />
                       {l.is_voip_phone && (
                         <span
                           title={
@@ -2397,11 +2428,20 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                   >
                     Copy IP
                   </ContextMenuItem>
-                  <ContextMenuItem
-                    onSelect={() => copyToClipboard(l.mac_address)}
-                  >
-                    Copy MAC
-                  </ContextMenuItem>
+                  {l.mac_address && (
+                    <ContextMenuItem
+                      onSelect={() => copyToClipboard(l.mac_address ?? "")}
+                    >
+                      Copy MAC
+                    </ContextMenuItem>
+                  )}
+                  {l.duid && (
+                    <ContextMenuItem
+                      onSelect={() => copyToClipboard(l.duid ?? "")}
+                    >
+                      Copy DUID
+                    </ContextMenuItem>
+                  )}
                   {l.hostname && (
                     <ContextMenuItem
                       onSelect={() => copyToClipboard(l.hostname!)}
@@ -2443,7 +2483,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
         <DeleteConfirmModal
           title="Delete Lease"
           description={
-            `Delete the lease for ${del.ip_address} (${del.mac_address})? ` +
+            `Delete the lease for ${del.ip_address} (${del.mac_address ?? `DUID ${del.duid ?? "?"}`})? ` +
             "This removes the lease and its IPAM mirror. A still-active lease " +
             "may be re-learned on the next poll — this is for stray or expired " +
             "leases; deleting the scope clears its leases automatically."
@@ -2599,7 +2639,11 @@ function LeaseHistoryTab({ server }: { server: DHCPServer }) {
                   {row.ip_address}
                 </td>
                 <td className="px-3 py-1.5 font-mono text-xs">
-                  {row.mac_address}
+                  <LeaseClientId
+                    mac={row.mac_address}
+                    duid={row.duid}
+                    iaid={row.iaid}
+                  />
                 </td>
                 <td className="px-3 py-1.5">{row.hostname || "—"}</td>
                 <td className="px-3 py-1.5">
