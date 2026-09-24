@@ -11,10 +11,8 @@ config ok, for as long as it took someone to look at the pod.
 
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -151,8 +149,11 @@ def test_null_is_unknown_not_unhealthy() -> None:
 # ── not serving vs a config-apply echo ────────────────────────────────────
 
 # Every daemon ``reason`` the two agents send, spelled as their sources spell
-# it (pinned by ``test_the_classifier_matches_what_the_agents_actually_send``).
-# ``True`` = the agent echoing a failed config apply, which is #882's to report.
+# it. ``True`` = the agent echoing a failed config apply, which is #882's to
+# report. The other half of this contract is pinned in each agent's own suite
+# (agent/dns/tests/test_config_revert.py, agent/dhcp/tests/test_config_revert.py
+# and test_config_test_preflight.py assert the exact prefixes), which run on
+# every agent change without pulling agent/ into this suite's CI gate (#821).
 _AGENT_REASONS = [
     ("start deferred, no bundle yet", False),  # dns supervisor.py
     ("config_apply_reverted: named-checkconf failed", True),  # dns + dhcp sync.py
@@ -181,32 +182,6 @@ def test_not_serving_is_unknown_on_null_and_matches_only_a_leading_echo() -> Non
     # Only the agent's own prefix counts; a reason that merely mentions one
     # is still a daemon that is not serving.
     assert is_not_serving(STATUS_DEGRADED, "waiting after config_apply_reverted: x") is True
-
-
-_REPO = Path(__file__).resolve().parents[2]
-
-
-def test_the_classifier_matches_what_the_agents_actually_send() -> None:
-    """``is_config_apply_verdict`` parses text two other packages write, so
-    pin their spellings: an agent that rewords a reason must fail here, not
-    quietly turn every routine revert back into a critical 'not serving'
-    page — or hide a daemon that really is down."""
-    dns = _REPO / "agent" / "dns" / "spatium_dns_agent"
-    dhcp = _REPO / "agent" / "dhcp" / "spatium_dhcp_agent"
-    if not dns.is_dir() or not dhcp.is_dir():
-        pytest.skip("agent sources are not in this checkout (the api image ships backend/)")
-    dns_sync = (dns / "sync.py").read_text()
-    dhcp_sync = (dhcp / "sync.py").read_text()
-    assert '"reason": "start deferred, no bundle yet"' in (dns / "supervisor.py").read_text()
-    assert '"reason": f"config_apply_{status.status}: {status.error}"' in dns_sync
-    assert '"reason": f"config_apply_reverted: {truncate_error(str(cause))}"' in dhcp_sync
-    assert '"reason": f"{daemon}_config_rejected: {last_err}"' in dhcp_sync
-    assert '"reason": f"{daemon}_socket_unreachable: {last_err}"' in dhcp_sync
-    daemons = re.findall(r'_reload_socket\(\s*[^,]+,\s*[^,]+,\s*"(\w+)"', dhcp_sync)
-    assert sorted(daemons) == ["dhcp4", "dhcp6"]
-    for pkg in (dns, dhcp):  # the vocabulary behind ``status.status``
-        verdicts = re.findall(r'^STATUS_\w+ = "(\w+)"', (pkg / "config_apply.py").read_text(), re.M)
-        assert sorted(verdicts) == ["no_previous", "ok", "revert_failed", "reverted"]
 
 
 # ── the heartbeat handlers, both families ─────────────────────────────────

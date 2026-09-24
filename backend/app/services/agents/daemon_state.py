@@ -94,10 +94,12 @@ def is_unhealthy(status: str | None) -> bool:
 # agent writes ``config_apply_reverted: <error>`` after a rollback, and
 # otherwise leaves Kea's own refusal in place (``_reload_socket``:
 # ``dhcp4_config_rejected: <error>`` / ``dhcp6_…``) — which is what survives
-# a failed apply with nothing, or nothing that works, to roll back to. Every
-# spelling is pinned against the agent sources in
-# ``tests/test_agent_daemon_state.py``, so a new one fails a test rather than
-# quietly reading as "not serving".
+# a failed apply with nothing, or nothing that works, to roll back to. Both
+# halves of that contract are pinned: each agent's own suite asserts the exact
+# prefixes it emits (``test_config_revert.py``, and the DHCP agent's
+# ``test_config_test_preflight.py``), and ``tests/test_agent_daemon_state.py``
+# asserts this pattern reads every one of them — so a reworded reason fails a
+# test rather than quietly reading as "not serving".
 _CONFIG_APPLY_REASON = re.compile(r"^(?:config_apply_\w+|dhcp[46]_config_rejected):")
 
 
