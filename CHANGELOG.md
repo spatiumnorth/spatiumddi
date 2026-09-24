@@ -128,12 +128,17 @@ the formatter handles the rest.
   sweep re-enqueues anything left behind. Only a change to something
   the bundle renders marks it: the pool health check's timestamps, the
   agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
-  settings stamps do not, because a stale bundle is never served and
-  marks that outpace renders would leave a large group with nothing.
-  A bundle rendered by a previous release is not current, so an
-  upgrade re-renders each server once. The ops page is gated to the
-  bundle's snapshot so a body can never lack a record the agent
-  already applied. Render failures surface on the server row
+  settings stamps do not, because every mark costs a render. The
+  long-poll serves the newest bundle the running release stored, current
+  or not. Under a write storm no render is current until the writes
+  stop, and each one that lands reaches the agents. A bundle rendered by
+  a previous release is never served, so an upgrade re-renders each
+  server once. The ops page, and the queued ops a split-horizon render
+  retires, cover only the ops whose transaction had committed before the
+  render read (its `pg_current_snapshot()`, not the op's `created_at`,
+  which is its transaction's start). So a body can never lack a record
+  the agent already applied, and an ACME DNS-01 wait never sees an op
+  applied that no body carries. Render failures surface on the server row
   (`bundle_render_status` / `_error` / `_at`, in the servers API) and
   through the new `agent_bundle_render_failed` alert rule, seeded
   enabled, which also fires when changes have waited 10 minutes with
@@ -154,9 +159,9 @@ the formatter handles the rest.
   poll and is never recorded as the render verdict. Agents
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
-  instead of re-sending the whole body. Migrations `c4d1e7f90a2b` and
-  `d9a4c27e18f3` (additive: one table, twelve nullable-or-defaulted
-  columns).
+  instead of re-sending the whole body. Migrations `c4d1e7f90a2b`,
+  `d9a4c27e18f3` and `f3a9d61c07e4` (additive: one table, fourteen
+  nullable-or-defaulted columns, no table rewrite).
 - **The bundle's records query orders by the `(zone_id, name)` index
   prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
   UUID, so the planner sorted the whole table on every build. The

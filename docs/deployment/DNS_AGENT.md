@@ -236,12 +236,11 @@ import graph in a fresh interpreter, because the test suite imports
 writes; a Core `insert()` / `update()` / `delete()` on a bundle input calls
 `bundle_dirty.mark_bundles_dirty()` in the same transaction.
 
-*A mark is not free, so writes the bundle never reads do not mark.* A stale
-bundle is never served — not even its ops page — and renders run one at a
-time fleet-wide, so marks arriving faster than a render completes would
-keep a bundle stale indefinitely and its agents would receive nothing (a
-million-row group renders in about a minute). A dirty contributor therefore
-marks only when a column the bundle renders has a net change: the pool
+*A mark is not free, so writes the bundle never reads do not mark.* Every
+mark costs a render, renders run one at a time fleet-wide, and a
+million-row group renders in about half a minute, so a writer that marks on
+bookkeeping keeps renders busy with nothing to deliver. A dirty contributor
+therefore marks only when a column the bundle renders has a net change: the pool
 health check's timestamps, the `dnssec_synced_at` stamp every agent posts
 after a structural reload, blocklist sync bookkeeping, and every platform
 setting outside the `snmp_` / `ntp_` columns the bundle renders (the beat
@@ -250,15 +249,31 @@ deleted rows always mark. Geo steering reads the Site a pool member is
 scoped to and that Site's live subnets, so a subnet joining or leaving a
 Site — or changing its prefix — marks the groups whose pools use it.
 
-*The ops page is gated to the bundle's snapshot.* Every body an agent
-holds is a superset of every op it has applied — the inline build had that
-by construction because the body was built moments before the page, and a
-response now ships only ops created at or before the stored bundle's
-`snapshot_at`. Without the gate a slow render could hand an agent an older
-body with a newer `structural_etag`, and the full re-render (or a restart
-replaying `current.json`) would drop a record the agent had already applied
-over RFC 2136. An op newer than the snapshot rides with the next render,
-whose dirty mark its own commit already made.
+*The ops page carries what the body's render read, nothing newer.* Every
+body an agent holds is a superset of every op it has applied. The inline
+build had that by construction, because the body was built moments before
+the page. A stored body ships only the ops whose transaction had committed
+before its render read. The render takes `pg_current_snapshot()` (stored
+as `dns_agent_bundle.visible_xacts`) in a statement of its own before its
+records query, and each op carries the transaction that queued it
+(`dns_record_op.xact_id`, `pg_current_xact_id()`). An op is covered when
+that transaction is visible in the snapshot.
+
+The op's `created_at` cannot decide this: it is the transaction's START.
+A bulk write that began before a render and committed after its records
+query would pass a time gate with records the body never read. Without the
+gate, the full re-render (or a restart replaying `current.json`) would
+drop a record the agent had already applied over RFC 2136. The same gate
+decides which queued ops a split-horizon render retires as applied, so an
+ACME DNS-01 wait never reads an op as applied that no body carries. An op
+the snapshot does not cover rides with the next render, whose dirty mark
+its own commit made.
+
+Three cases keep the time gate (`created_at <= snapshot_at`):
+- ops and bundles from before these columns;
+- a transaction id this cluster has not reached yet;
+- a snapshot this cluster has not reached yet.
+The last two come from a backup restored onto a new appliance.
 
 *What the agent sees.* Nothing changes in the protocol: weak `ETag` / 304 /
 the body shape / the "200 while ops are pending" fast path /
@@ -269,8 +284,20 @@ next page, and the poll after the last ack answers 304 instead of
 re-sending the whole body. The agent never short-circuits on an unchanged
 ETag (it saves, compares `structural_etag`, drains the ops).
 
-*Staleness is never silent.* A missing or stale bundle is never served: the
-poll holds on the wake the render publishes, 304 at the deadline. A render
+*The newest render is served, current or not.* A long-poll serves the
+newest bundle the running release stored, even when changes have been
+committed since it was rendered. Its render is enqueued and the poll wakes
+when one lands. Under a write storm marks arrive faster than renders
+finish, so no render is current until the writes stop. Serving only a
+current bundle held every agent on its last config for the whole storm: in
+a 250k-record seed a pool failover stayed in `named` for 339 s while 74
+renders landed unserved. Now each render that lands reaches the agents, at
+most one render behind, and the gate above keeps that safe. A bundle
+another release rendered is never served; the sweep re-renders it. With
+nothing stored for this release the poll holds on the wake the render
+publishes, 304 at the deadline.
+
+*Staleness is never silent.* A render
 that raises lands on `dns_server.bundle_render_status / _error / _at` —
 deliberately not `config_failed_etag`, which is the agent's #882 verdict
 and is cleared by its next healthy heartbeat — and fires the
@@ -283,7 +310,8 @@ worker, or a worker that does not consume the `bundles` queue never records
 a failure, and that is the case that most needs seeing. The migration
 release keeps `dns_agent_bundle_inline_fallback` on: a deployment whose
 worker is still one release behind builds a missing or stale bundle inline
-exactly as before, once per version, because it stores what it built. The
+exactly as before, once per version, because it stores what it built (the
+inline render's page is gated like the worker's). The
 fallback is bounded. The api builds a server's bundle only when the server
 has never had one, or when its stale bundle has waited longer than
 `dns_agent_bundle_inline_fallback_after_seconds` (120 s) for the worker;
