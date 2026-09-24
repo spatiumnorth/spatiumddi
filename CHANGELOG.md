@@ -199,6 +199,19 @@ the formatter handles the rest.
   up automatically; **Sync DNS** on a subnet whose zones hold them
   lists them as stale and withdraws them.
 
+- **The subnet delete dialog says what a delete does (#1152).** Its
+  Danger zone text said the subnet's IP address rows are removed;
+  they are not — the addresses you allocated stay with the trashed
+  subnet, come back on restore, and their A/AAAA records keep
+  resolving while it sits in Trash — and the confirmation step named
+  only the subnet and its DHCP scopes. Both now say what happens:
+  the subnet, its scopes and the reverse zone created for it move to
+  Trash; DHCP lease and reservation addresses are removed at once
+  with their DNS records (reservations return with their scope);
+  purging the subnet deletes its addresses and withdraws their DNS
+  records. Copy only — what a trashed subnet should publish is
+  unchanged.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell
