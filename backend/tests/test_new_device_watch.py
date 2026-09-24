@@ -485,7 +485,8 @@ async def test_mac_sightings_endpoint(client: AsyncClient, db_session: AsyncSess
     finally:
         app.dependency_overrides.pop(_auth_agent, None)
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"recorded": 1, "new": 1}
+    # #1077 added the shared ``status`` / ``duplicate`` ack fields.
+    assert resp.json() == {"status": "ok", "duplicate": False, "recorded": 1, "new": 1}
 
     # A 'discovered' IPAM row was auto-created and a 'new' sighting logged.
     ip = (
@@ -516,7 +517,8 @@ async def test_mac_sightings_noop_when_module_off(
     finally:
         app.dependency_overrides.pop(_auth_agent, None)
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"recorded": 0, "new": 0}
+    # #1077 added the shared ``status`` / ``duplicate`` ack fields.
+    assert resp.json() == {"status": "ok", "duplicate": False, "recorded": 0, "new": 0}
     assert (
         await db_session.execute(select(IPAddress).where(IPAddress.address == "10.41.1.81"))
     ).scalar_one_or_none() is None

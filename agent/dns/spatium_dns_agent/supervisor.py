@@ -6,6 +6,7 @@ orchestrator (Docker / K8s) restarts us.
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import threading
@@ -24,6 +25,7 @@ from .heartbeat import HeartbeatClient
 from .ingest import IngestWorker
 from .metrics import MetricsPoller
 from .query_log_shipper import QueryLogShipper
+from .spool import SpoolManager
 from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
@@ -50,6 +52,32 @@ def wait_log_due(ticks_waiting: int) -> bool:
     )
 
 
+#: #1077 — the control plane keeps query logs 24 h (``prune_logs.py``); a
+#: spooled batch older than that would be pruned on arrival.
+DEFAULT_LOG_MAX_AGE_HOURS = 24.0
+
+
+def _log_max_age_seconds() -> float | None:
+    """``AGENT_SPOOL_LOG_MAX_AGE_HOURS`` as seconds; ``0`` disables expiry."""
+    raw = os.environ.get("AGENT_SPOOL_LOG_MAX_AGE_HOURS", "")
+    try:
+        hours = float(raw) if raw.strip() else DEFAULT_LOG_MAX_AGE_HOURS
+    except ValueError:
+        log.warning("agent_spool_log_max_age_invalid", value=raw)
+        hours = DEFAULT_LOG_MAX_AGE_HOURS
+    return hours * 3600 if hours > 0 else None
+
+
+def build_spool_manager(cfg: AgentConfig) -> SpoolManager:
+    """The DNS agent's durable push spool (#1077): one share of
+    ``AGENT_SPOOL_MAX_BYTES`` per stream. Query logs dominate by volume;
+    metrics are one small row a minute, so weeks fit in their share."""
+    manager = SpoolManager(cfg.state_dir)
+    manager.declare("query_log", 0.85, max_age_seconds=_log_max_age_seconds())
+    manager.declare("metrics", 0.15)
+    return manager
+
+
 def _clear_deferred_status(heartbeat) -> None:
     if heartbeat.daemon_status.get("reason") == DEFERRED_DAEMON_STATUS["reason"]:
         heartbeat.daemon_status = {"status": "ok"}
@@ -71,7 +99,8 @@ def run(cfg: AgentConfig) -> int:
     token_ref = [token]
 
     driver = _select_driver(cfg)
-    heartbeat = HeartbeatClient(cfg, token_ref, driver=driver)
+    spools = build_spool_manager(cfg)
+    heartbeat = HeartbeatClient(cfg, token_ref, driver=driver, spool_manager=spools)
     syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
 
     # Spawn daemon before threads so the first poll can reload it if needed
@@ -96,8 +125,8 @@ def run(cfg: AgentConfig) -> int:
     rndc_status: RndcStatusPoller | None = None
     ingest: IngestWorker | None = None
     if cfg.driver == "bind9":
-        metrics = MetricsPoller(cfg, token_ref)
-        query_log = QueryLogShipper(cfg, token_ref)
+        metrics = MetricsPoller(cfg, token_ref, spool=spools.get("metrics"))
+        query_log = QueryLogShipper(cfg, token_ref, spool=spools.get("query_log"))
         rndc_status = RndcStatusPoller(cfg, token_ref)
         # Ingest-back for externally-injected DDNS records (issue #641).
         # BIND9 only — AXFRs dynamic zones from loopback and ships unknown
@@ -119,7 +148,9 @@ def run(cfg: AgentConfig) -> int:
         # (so the unprivileged ``spatium`` user can write it).
         # Override via ``DNS_QUERY_LOG_PATH`` env var in custom deploys.
         pdns_log_path = str(cfg.state_dir / "pdns.log")
-        query_log = QueryLogShipper(cfg, token_ref, path=pdns_log_path)
+        query_log = QueryLogShipper(
+            cfg, token_ref, path=pdns_log_path, spool=spools.get("query_log")
+        )
         threads.append(
             threading.Thread(target=query_log.run, name="query-log", daemon=True),
         )
@@ -202,6 +233,16 @@ def run(cfg: AgentConfig) -> int:
                     waiting = False
                     waiting_ticks = 0
                     _clear_deferred_status(heartbeat)
+                # #1067 — a daemon that is up, and about which nothing else has
+                # been said, is ``ok``. Until now a normal boot (rendered config
+                # present, ``named`` started at once) left ``daemon_status`` as
+                # the empty dict for the life of the process, so the heartbeat
+                # carried ``daemon: {}`` and the control plane, which now keeps
+                # the state, could only read UNKNOWN for a healthy server. Only
+                # the empty dict is filled: a verdict the sync loop set
+                # (``degraded`` on a failed apply) is its to clear.
+                if not heartbeat.daemon_status:
+                    heartbeat.daemon_status = {"status": "ok"}
             elif driver.daemon_launched():
                 # The stop check above closes the 1 s sleep, not the checks
                 # themselves: ``_sig`` runs between bytecodes, so a SIGTERM

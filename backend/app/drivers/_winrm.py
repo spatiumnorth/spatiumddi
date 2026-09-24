@@ -50,6 +50,35 @@ def encoded_command_len(script: str) -> int:
     return len(base64.b64encode(script.encode("utf-16-le")))
 
 
+# The WinRM transports this build can actually speak (#1128). pywinrm names
+# more — ``kerberos`` among them — but Kerberos needs the ``gssapi`` package
+# and the system Kerberos libraries, which have no Linux wheel and are not in
+# the images, plus realm / KDC configuration the control plane has nowhere to
+# take from. It was offered anyway and failed on every call, so it is not
+# offered at all now. Real Kerberos support is tracked in #1128.
+SUPPORTED_TRANSPORTS: tuple[str, ...] = ("ntlm", "credssp", "basic")
+
+KERBEROS_UNSUPPORTED = (
+    "The kerberos WinRM transport is not supported: the images carry no Kerberos "
+    "(GSSAPI) libraries, so it has never been able to connect. Use ntlm, or credssp "
+    "where the server has to reach another one (Windows DHCP failover management). "
+    "Kerberos support is tracked in issue #1128."
+)
+
+
+def validate_transport(value: str | None) -> str | None:
+    """Pydantic field-validator body shared by the DNS and DHCP credential
+    inputs: refuse a transport this build cannot speak, at save rather than at
+    the first call."""
+    if value is None:
+        return None
+    if value == "kerberos":
+        raise ValueError(KERBEROS_UNSUPPORTED)
+    if value not in SUPPORTED_TRANSPORTS:
+        raise ValueError(f"transport must be one of {', '.join(SUPPORTED_TRANSPORTS)}")
+    return value
+
+
 def _warn_insecure_transport(host: str, transport: str, use_tls: bool, verify_tls: bool) -> None:
     """Emit a one-time-ish WARNING when the WinRM transport is insecure,
     matching the #289 hardening on the proxmox / unifi / opnsense / ftp
@@ -70,7 +99,7 @@ def _warn_insecure_transport(host: str, transport: str, use_tls: bool, verify_tl
             host=host,
             hint=(
                 "WinRM basic auth over plain HTTP ships the password "
-                "effectively in cleartext — use ntlm/kerberos or enable TLS."
+                "effectively in cleartext — use ntlm or enable TLS."
             ),
         )
 
@@ -103,6 +132,10 @@ def run_ps(
     import winrm  # noqa: PLC0415
 
     transport = creds.get("transport") or "ntlm"
+    if transport == "kerberos":
+        # A server saved with Kerberos before #1128 — say why, instead of
+        # letting pywinrm fail on the missing library.
+        raise RuntimeError(KERBEROS_UNSUPPORTED + " Edit the server and pick another transport.")
     use_tls = bool(creds.get("use_tls", False))
     verify_tls = bool(creds.get("verify_tls", False))
     port = int(creds.get("winrm_port") or (5986 if use_tls else 5985))

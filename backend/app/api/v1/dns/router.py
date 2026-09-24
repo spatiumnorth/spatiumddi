@@ -48,6 +48,7 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
+from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -77,6 +78,8 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.agents.daemon_state import is_not_serving
+from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
@@ -379,7 +382,7 @@ class WindowsCredentialsInput(BaseModel):
     ``has_credentials``.
 
     Mirrors the DHCP-side shape. All fields are optional to support
-    **partial updates**: sending ``{"transport": "kerberos"}`` on an
+    **partial updates**: sending ``{"transport": "credssp"}`` on an
     existing server decrypts the stored blob, merges the transport
     change, and re-encrypts. On first-time set, ``username`` + ``password``
     are still required — the endpoint validates that explicitly.
@@ -388,7 +391,7 @@ class WindowsCredentialsInput(BaseModel):
     username: str | None = None
     password: str | None = None
     winrm_port: int | None = None
-    # transport: ntlm | kerberos | basic | credssp
+    # transport: ntlm | credssp | basic (kerberos: #1128)
     transport: str | None = None
     use_tls: bool | None = None
     verify_tls: bool | None = None
@@ -396,10 +399,9 @@ class WindowsCredentialsInput(BaseModel):
     @field_validator("transport")
     @classmethod
     def _valid_transport(cls, v: str | None) -> str | None:
-        # #426: reject a bogus transport at save (pywinrm only speaks these).
-        if v is not None and v not in {"ntlm", "kerberos", "basic", "credssp"}:
-            raise ValueError("transport must be one of ntlm, kerberos, basic, credssp")
-        return v
+        # #426 / #1128: reject a transport this build cannot speak at save,
+        # instead of failing opaquely at the first call.
+        return validate_transport(v)
 
     @field_validator("winrm_port")
     @classmethod
@@ -522,6 +524,25 @@ class ServerResponse(BaseModel):
     config_apply_error: str | None = None
     config_failed_etag: str | None = None
     config_apply_at: datetime | None = None
+    # #1077 — the agent's push spool as last reported on its heartbeat.
+    # NULL when never reported (a pre-#1077 agent, or an agentless driver):
+    # UNKNOWN, never "empty".
+    spool_status: SpoolStatus | None = None
+    # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
+    # ``degraded`` (the agent's own word); NULL when the agent has never
+    # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
+    # the CURRENT state began; a repeated report never moves it.
+    daemon_status: str | None = None
+    daemon_reason: str | None = None
+    daemon_status_since: datetime | None = None
+    # Derived, never stored: ``daemon_state.is_not_serving``, the one reading
+    # of the three fields above that the ``agent_daemon_degraded`` rule, the
+    # server chip, the detail banner and the dashboard all share. ``true`` —
+    # the agent reports a daemon that is not serving. ``false`` — ``ok``, or
+    # a ``degraded`` that is the agent echoing a failed config apply, which
+    # ``config_apply_status`` reports at #882's severity. ``null`` — never
+    # reported.
+    daemon_not_serving: bool | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -558,6 +579,11 @@ class ServerResponse(BaseModel):
             config_apply_error=s.config_apply_error,
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
+            spool_status=s.spool_status,
+            daemon_status=s.daemon_status,
+            daemon_reason=s.daemon_reason,
+            daemon_status_since=s.daemon_status_since,
+            daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,

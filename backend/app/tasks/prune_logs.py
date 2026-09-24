@@ -9,6 +9,12 @@ table — we deliberately avoid a longer default).
 
 Symmetric to ``prune_metrics``: tick once a day, delete everything
 past the cutoff. Runs under the default queue.
+
+Also retires agent ingest receipts (#1077) older than
+``RECEIPT_RETENTION_DAYS``. They are replay-dedupe state for the same
+agent pushes these logs arrive by, so their retention lives with the rest
+of agent-shipped data. Every delete here is a plain age cutoff, so the
+task is safe to retry (non-negotiable #9).
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
+from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS, prune_receipts
 
 logger = structlog.get_logger(__name__)
 
@@ -59,13 +66,16 @@ async def _sweep_with_session(db: AsyncSession) -> dict[str, int]:
     dhcp_del = await db.execute(delete(DHCPLogEntry).where(DHCPLogEntry.ts < cutoff))
     rpz_cutoff = datetime.now(UTC) - timedelta(days=RPZ_HIT_RETENTION_DAYS)
     rpz_del = await db.execute(delete(DNSRPZHit).where(DNSRPZHit.ts < rpz_cutoff))
+    receipts_removed = await prune_receipts(db)
     await db.commit()
     return {
         "dns_query_log_removed": dns_del.rowcount or 0,
         "dhcp_log_removed": dhcp_del.rowcount or 0,
         "dns_rpz_hit_removed": rpz_del.rowcount or 0,
+        "agent_ingest_receipt_removed": receipts_removed,
         "retention_hours": DEFAULT_RETENTION_HOURS,
         "rpz_retention_days": RPZ_HIT_RETENTION_DAYS,
+        "receipt_retention_days": RECEIPT_RETENTION_DAYS,
     }
 
 
