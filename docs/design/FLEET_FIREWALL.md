@@ -364,7 +364,7 @@ A node's posture is the union of **two orthogonal axes** (verified roles-and-top
 |---|---|---|---|
 | **Frontend / control node** | primary/member | — | floor + dataplane; 80/443 (+VIP daddr); 6443 (peers∪pod∪svc∪kubeapi, join-window); 2379/2380/10250 (peers); 7946 tcp+udp memberlist (peers, if ≥2+VIP) |
 | **DNS worker** | None | dns-bind9 \| dns-powerdns \| dns-technitium | floor + dataplane; 53 tcp+udp. **No k3s ports** — the exact #16 misplacement risk, closed by absence (etcd/kubelet never opened here) |
-| **DHCP worker** | None | dhcp | floor + dataplane; udp/67 broadcast (`any`); udp/68 return via floor; udp/547 DHCPv6 (`any`); relay-VIP (`daddr=relayVIP`, relay CIDRs) in bridged mode |
+| **DHCP worker** | None | dhcp | floor + dataplane; udp/67 broadcast (`any`); udp/68 return via floor; udp/547 DHCPv6 (`any`); tcp/<HA port> from the group's other Kea members only, when the group is a rendered HA pair (#1167); relay-VIP (`daddr=relayVIP`, relay CIDRs) in bridged mode |
 | **Combined DNS+DHCP worker** | None | dns-* ∪ dhcp | floor + dataplane; 53; 67/68/547 — union |
 | **Promoted CP also serving DNS** | member | dns-bind9 | union of frontend-node + DNS-worker |
 | **Observer** | any | observer | floor + dataplane; node-exporter 9100 scoped to scraper CIDR (default-disabled rule) |
