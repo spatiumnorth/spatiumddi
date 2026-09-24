@@ -152,9 +152,9 @@ async def test_the_sweep_enqueues_stale_agent_based_servers_only(
 async def test_with_redis_a_concurrent_request_coalesces_and_the_holder_renders_again(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    url = "redis://localhost:6379/0"
+    url = settings.redis_url
     if not await _redis_available(url):
-        pytest.skip("no Redis on localhost:6379")
+        pytest.skip(f"no Redis at {url}")
     monkeypatch.setattr(settings, "redis_url", url)
     server, zone = await _agent(db_session)
     await db_session.commit()

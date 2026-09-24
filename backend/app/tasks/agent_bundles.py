@@ -206,37 +206,92 @@ async def _render_once(server_id: uuid.UUID) -> dict[str, Any]:
     }
 
 
-async def _run(server_id_text: str) -> dict[str, Any]:
+async def _close(client: Any) -> None:
+    if client is None:
+        return
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _acquire(
+    client: Any,
+    *,
+    lock_key: str,
+    dirty_key: str,
+    token: str,
+    slot_value: str,
+    lease_ms: int,
+    resumed: bool,
+) -> str:
+    """Take this render's keys: ``held`` (the server's lock and the fleet
+    slot are both this render's), ``coalesced`` or ``deferred``."""
+    owned = False
+    if resumed:
+        # A render deferred for the slot, back with the token its lock still
+        # holds. Only a retry stuck far past its countdown finds the lease
+        # gone; then it takes the lock afresh if nobody else did.
+        owned = bool(await client.eval(_RENEW_IF_OWNER, 1, lock_key, token, str(lease_ms)))
+    if not owned:
+        owned = bool(await client.set(lock_key, token, nx=True, px=lease_ms))
+    if not owned:
+        # Someone renders this server, or waits to: flag the change so the
+        # holder renders once more before it lets go.
+        await client.set(dirty_key, "1", ex=DIRTY_FLAG_SECONDS)
+        return "coalesced"
+    if not await client.set(RENDER_SLOT_KEY, slot_value, nx=True, px=lease_ms):
+        # Keep the server's lock while waiting for the slot: the duplicates
+        # the sweep and every further mark enqueue meanwhile then coalesce
+        # into this one render instead of each starting a retry chain of
+        # its own (they used to multiply for as long as one render held the
+        # slot). The lease was just taken or renewed, so it outlives the
+        # countdown by far.
+        return "deferred"
+    return "held"
+
+
+async def _run(server_id_text: str, lock_token: str | None = None) -> dict[str, Any]:
     server_id = uuid.UUID(server_id_text)
     lock_key = RENDER_LOCK_PREFIX + server_id_text
     dirty_key = RENDER_DIRTY_PREFIX + server_id_text
     lease_ms = _lease_ms()
     # This render's own token: the lock holds it, the slot holds it with the
-    # server id (so the slot still says whose render holds it).
-    token = uuid.uuid4().hex
+    # server id (so the slot still says whose render holds it). A deferred
+    # render comes back with the token its lock already holds.
+    token = lock_token or uuid.uuid4().hex
     slot_value = f"{server_id_text}:{token}"
     client = None
-    have_lock = False
-    have_slot = False
-    keeper: _LeaseKeeper | None = None
+    held = False
     try:
         client = make_async_redis(settings.redis_url, socket_connect_timeout=_CONNECT_TIMEOUT)
-        if not await client.set(lock_key, token, nx=True, px=lease_ms):
-            await client.set(dirty_key, "1", ex=DIRTY_FLAG_SECONDS)
+        status = await _acquire(
+            client,
+            lock_key=lock_key,
+            dirty_key=dirty_key,
+            token=token,
+            slot_value=slot_value,
+            lease_ms=lease_ms,
+            resumed=lock_token is not None,
+        )
+        if status == "coalesced":
+            await _close(client)
             return {"status": "coalesced"}
-        have_lock = True
-        if not await client.set(RENDER_SLOT_KEY, slot_value, nx=True, px=lease_ms):
-            await _release(client, lock_key, token)
-            return {"status": "deferred"}
-        have_slot = True
-        keeper = _LeaseKeeper([(RENDER_SLOT_KEY, slot_value), (lock_key, token)], lease_ms)
-        keeper.start()
+        if status == "deferred":
+            await _close(client)
+            return {"status": "deferred", "lock_token": token}
+        held = True
     except Exception as exc:  # noqa: BLE001 — Redis is advisory here: render anyway
         logger.warning(
             "dns_agent_bundle_lock_unavailable", server_id=server_id_text, error=str(exc)
         )
+        await _close(client)
         client = None
 
+    keeper: _LeaseKeeper | None = None
+    if held:
+        keeper = _LeaseKeeper([(RENDER_SLOT_KEY, slot_value), (lock_key, token)], lease_ms)
+        keeper.start()
     renders = 0
     result: dict[str, Any] = {}
     try:
@@ -257,16 +312,11 @@ async def _run(server_id_text: str) -> dict[str, Any]:
             keeper.stop()
         if client is not None:
             try:
-                if have_slot:
-                    await _release(client, RENDER_SLOT_KEY, slot_value)
-                if have_lock:
-                    await _release(client, lock_key, token)
+                await _release(client, RENDER_SLOT_KEY, slot_value)
+                await _release(client, lock_key, token)
             except Exception:  # noqa: BLE001
                 pass
-            try:
-                await client.aclose()
-            except Exception:  # noqa: BLE001
-                pass
+            await _close(client)
     result["renders"] = renders
     return result
 
@@ -278,12 +328,23 @@ async def _run(server_id_text: str) -> dict[str, Any]:
     soft_time_limit=900,
     time_limit=960,
 )
-def render_dns_bundle(self: object, server_id: str) -> dict[str, Any]:  # type: ignore[type-arg]
-    """Render and store one server's bundle at its current dirty sequence."""
-    result = asyncio.run(_run(server_id))
+def render_dns_bundle(  # type: ignore[type-arg]
+    self: object, server_id: str, lock_token: str | None = None
+) -> dict[str, Any]:
+    """Render and store one server's bundle at its current dirty sequence.
+
+    ``lock_token``: set only on the retry of a render that was deferred for
+    the fleet slot — the server's lock still holds it.
+    """
+    result = asyncio.run(_run(server_id, lock_token=lock_token))
+    token = result.pop("lock_token", None)
     if result.get("status") == "deferred":
         render_dns_bundle.apply_async(
-            args=[server_id], countdown=SLOT_RETRY_SECONDS, retry=False, queue="bundles"
+            args=[server_id],
+            kwargs={"lock_token": token},
+            countdown=SLOT_RETRY_SECONDS,
+            retry=False,
+            queue="bundles",
         )
     logger.info("dns_agent_bundle_render_task", server_id=server_id, **result)
     return result

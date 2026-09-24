@@ -8,6 +8,9 @@ slot and the per-server lock.
 * A holder must never release a key it no longer owns: after a lease ran
   out and another render took the key, an unconditional ``DELETE`` would
   free it under that render and let a third one start beside it.
+* A render deferred because the slot is taken keeps its server's lock, so
+  the duplicates the sweep and every further mark enqueue while it waits
+  coalesce into it instead of each starting a retry chain of its own.
 
 Real Redis (``settings.redis_url``); every test works on its own key names so
 parallel workers never share the one global slot.
@@ -97,6 +100,61 @@ async def redis_keys(monkeypatch: pytest.MonkeyPatch):
         async for key in client.scan_iter(match=f"spatium:test:{tag}:*"):
             await client.delete(key)
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_render_keeps_its_server_lock_so_duplicates_coalesce(
+    db_session: AsyncSession, redis_keys
+) -> None:
+    client, keys = redis_keys
+    server = await _agent(db_session)
+    await db_session.commit()
+    # Another server's render holds the fleet slot.
+    assert await client.set(keys["slot"], "someone-else", ex=60)
+
+    first = await agent_bundles._run(str(server.id))
+    second = await agent_bundles._run(str(server.id))  # the sweep's duplicate, 30 s later
+
+    assert first["status"] == "deferred", first
+    assert second["status"] == "coalesced", (
+        "a second request for a server whose render is already waiting for the "
+        f"slot started a retry chain of its own ({second}); each sweep tick and "
+        "each further mark adds another while one long render holds the slot"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_render_comes_back_with_its_lock_and_renders_when_the_slot_frees(
+    db_session: AsyncSession, redis_keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The task re-enqueues a deferred render ONCE, carrying the token its
+    server's lock holds, and that retry renders once the slot is free."""
+    client, keys = redis_keys
+    server = await _agent(db_session)
+    await db_session.commit()
+    lock_key = keys["lock"] + str(server.id)
+    requeued: list[dict] = []
+    monkeypatch.setattr(
+        agent_bundles.render_dns_bundle,
+        "apply_async",
+        lambda *a, **kw: requeued.append(kw),
+    )
+    assert await client.set(keys["slot"], "someone-else", ex=60)
+
+    first = await asyncio.to_thread(agent_bundles.render_dns_bundle.run, str(server.id))
+    dup = await asyncio.to_thread(agent_bundles.render_dns_bundle.run, str(server.id))
+    assert first["status"] == "deferred" and dup["status"] == "coalesced", (first, dup)
+    assert len(requeued) == 1, f"one retry chain per waiting server, got {requeued!r}"
+    token = requeued[0]["kwargs"]["lock_token"]
+    assert (await client.get(lock_key)) == token.encode(), "the lock waits with the retry"
+
+    await client.delete(keys["slot"])
+    retry = await asyncio.to_thread(
+        agent_bundles.render_dns_bundle.run, str(server.id), lock_token=token
+    )
+    assert retry["status"] == "stored", retry
+    assert await client.get(lock_key) is None, "released after the render"
+    assert len(requeued) == 1
 
 
 @pytest.mark.asyncio
@@ -242,10 +300,17 @@ async def test_a_killed_render_frees_the_fleet_slot_within_one_lease(
 
         deadline = time.monotonic() + lease + 6
         outcome: dict = {}
+        token = None
         while time.monotonic() < deadline:
-            outcome = await agent_bundles._run(str(other.id))
+            # Retry the way the task does: a deferred render comes back with
+            # the token its server's lock holds.
+            if token:
+                outcome = await agent_bundles._run(str(other.id), lock_token=token)
+            else:
+                outcome = await agent_bundles._run(str(other.id))
             if outcome.get("status") != "deferred":
                 break
+            token = outcome.get("lock_token")
             await asyncio.sleep(0.5)
         assert outcome.get("status") == "stored", (
             f"{lease + 6}s after the render holding the fleet slot was SIGKILLed, "
