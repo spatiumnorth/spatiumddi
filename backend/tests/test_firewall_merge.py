@@ -282,6 +282,7 @@ _SEED_MIGRATION_FILES = [
     "f5b8d2c91a06_firewall_builtin_seed.py",
     "6a668dd451d5_dns_technitium_firewall_seed.py",
     "d4a9e37b2c15_kubelet_firewall_rule_seed.py",
+    "e6b2f07a3c91_dhcpv6_firewall_rule_seed.py",
 ]
 
 
