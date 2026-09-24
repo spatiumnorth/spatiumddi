@@ -122,6 +122,18 @@ class Settings(BaseSettings):
     # before, once per (server, version), because it stores what it built.
     # Default off once the worker path is proven.
     dns_agent_bundle_inline_fallback: bool = True
+    # The fallback is bounded (#1111): the api builds a server's bundle
+    # itself only when the server has never had one (the upgrade from a
+    # release before stored bundles), or when its stale bundle has waited
+    # this long for the worker (from ``bundle_dirty_at``, which every render
+    # that lands restarts). While renders keep landing it never builds, so a
+    # change storm costs the api nothing; with no worker rendering, agents
+    # are still served within this bound.
+    dns_agent_bundle_inline_fallback_after_seconds: int = 120
+    # After an inline attempt fails (at a million records the records query
+    # outlives the api's 30 s command_timeout) no replica tries that server
+    # again for this long. One attempt per server at a time across replicas.
+    dns_agent_bundle_inline_fallback_backoff_seconds: int = 600
 
     # DHCP agent
     dhcp_agent_key: str = ""

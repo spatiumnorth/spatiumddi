@@ -33,6 +33,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
+from app.core.redis_client import make_async_redis
 from app.drivers.dns import get_driver as get_dns_driver
 from app.metrics import (
     AGENT_BUNDLE_INLINE_FAILURES,
@@ -486,6 +487,92 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
     return await bundle_store.current(db, server)
 
 
+_INLINE_LOCK_PREFIX = "spatium:bundle:inline:"
+_INLINE_BACKOFF_PREFIX = "spatium:bundle:inline-backoff:"
+# Longer than any inline attempt: the records query alone is capped by the
+# api's 30 s command_timeout, the serialisation and store follow it.
+_INLINE_LOCK_SECONDS = 180
+_RELEASE_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _inline_eligible(server: DNSServer) -> bool:
+    """Whether the api may build this server's bundle itself, now.
+
+    A server that has never had a bundle: yes. Nothing is being raced, and
+    it is the case the fallback exists for (the upgrade from a release
+    before stored bundles brings every server in with none, and its worker
+    may still be that release). A server whose bundle is stale: only once
+    it has waited longer than the bound for the worker. The worker renders
+    every marked bundle within seconds and every render that lands restarts
+    ``bundle_dirty_at``, so while it keeps up no bundle waits past the bound
+    and the api builds nothing, however many changes a storm commits
+    (without the bound a 250k-record seed had the api build the growing
+    bundle 48 times, up to 480k records and 16 s each, beside the worker).
+    A bundle that is stale only because another release rendered it waits
+    for the sweep.
+    """
+    if server.bundle_watermark is None:
+        return True
+    if server.bundle_dirty_at is None:
+        return False
+    waited = (datetime.now(UTC) - server.bundle_dirty_at).total_seconds()
+    return waited >= settings.dns_agent_bundle_inline_fallback_after_seconds
+
+
+async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
+    """The inline fallback, bounded: eligible servers only, one attempt per
+    server at a time across replicas, none during a failed attempt's backoff.
+
+    Returns the bundle it rendered (or the row a concurrent render won with),
+    or ``None`` when it did not try. Raises ``_InlineRenderFailed`` when the
+    attempt failed, after starting the backoff. Redis is advisory: without it
+    the attempt is made unbounded, as the fallback always did.
+    """
+    if not _inline_eligible(server):
+        return None
+    sid = str(server.id)
+    lock_key = _INLINE_LOCK_PREFIX + sid
+    backoff_key = _INLINE_BACKOFF_PREFIX + sid
+    token = uuid.uuid4().hex
+    # Any: the redis stubs type eval() as ``Awaitable[str] | str``.
+    client: Any = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2.0)
+        if await client.exists(backoff_key) or not await client.set(
+            lock_key, token, nx=True, ex=_INLINE_LOCK_SECONDS
+        ):
+            await client.aclose()
+            return None
+    except Exception as exc:  # noqa: BLE001 — advisory: render unbounded
+        logger.warning("dns_agent_bundle_inline_lock_unavailable", error=str(exc))
+        client = None
+    try:
+        return await _render_inline(db, server)
+    except _InlineRenderFailed:
+        if client is not None:
+            try:
+                await client.set(
+                    backoff_key,
+                    "1",
+                    ex=max(1, int(settings.dns_agent_bundle_inline_fallback_backoff_seconds)),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    finally:
+        if client is not None:
+            try:
+                await client.eval(_RELEASE_IF_OWNER, 1, lock_key, token)
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     db: DB,
@@ -532,8 +619,12 @@ async def agent_config_longpoll(
     publishes when it lands, 304 at the deadline. While
     ``settings.dns_agent_bundle_inline_fallback`` is on — the migration
     release, whose worker may still be one release behind — the api renders
-    it inline instead: exactly the old build, once per version, because it
-    stores what it built.
+    it inline instead, exactly the old build, but only where the worker has
+    not (``_inline_eligible``): a bundle stale for longer than
+    ``dns_agent_bundle_inline_fallback_after_seconds``, or a server that has
+    never had one. One attempt per server at a time, none during a failed
+    attempt's backoff, and a failed attempt holds the poll on the worker
+    like the fallback being off.
     """
     server, _payload = auth
     if server.pending_approval:
@@ -542,7 +633,7 @@ async def agent_config_longpoll(
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
-    inline_failed = False
+    inline_tried = False
     # #358 — subscribe to this agent's wake channels BEFORE the first read so
     # a change (or a render) that commits + publishes during this request
     # can't land in the gap. A wake collapses the re-poll latency; with
@@ -556,18 +647,15 @@ async def agent_config_longpoll(
             await db.refresh(server)
             bundle = await bundle_store.current(db, server)
             if bundle is None:
-                if settings.dns_agent_bundle_inline_fallback and not inline_failed:
+                if settings.dns_agent_bundle_inline_fallback and not inline_tried:
                     try:
-                        bundle = await _render_inline(db, server)
+                        bundle = await _bounded_inline(db, server)
+                        inline_tried = bundle is not None
                     except _InlineRenderFailed:
                         # Once per poll: hold on the worker's render instead.
-                        inline_failed = True
+                        inline_tried = True
                         await db.refresh(server)
-                if (
-                    bundle is None
-                    and not enqueued
-                    and (inline_failed or not settings.dns_agent_bundle_inline_fallback)
-                ):
+                if bundle is None and not enqueued:
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:

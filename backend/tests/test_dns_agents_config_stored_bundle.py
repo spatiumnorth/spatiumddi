@@ -92,6 +92,9 @@ async def test_the_first_poll_renders_inline_once_and_serves_the_stored_bytes(
 ) -> None:
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    # The unbounded fallback (the bound is pinned in
+    # test_dns_agents_config_inline_fallback.py): any stale bundle is eligible.
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback_after_seconds", 0)
     server, zone, headers = await _agent(db_session, records=300)
     await db_session.commit()
 
@@ -161,6 +164,9 @@ async def test_pages_share_the_stored_etag_and_the_last_ack_settles_on_304(
 ) -> None:
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    # The unbounded fallback (the bound is pinned in
+    # test_dns_agents_config_inline_fallback.py): any stale bundle is eligible.
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback_after_seconds", 0)
     monkeypatch.setattr(settings, "dns_agent_ops_batch", 4)
     server, zone, headers = await _agent(db_session, records=10)
     base = datetime.now(UTC) - timedelta(minutes=10)
@@ -206,6 +212,9 @@ async def test_an_op_newer_than_the_stored_snapshot_waits_for_the_next_render(
     cached bundle) can never drop a record applied incrementally."""
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    # The unbounded fallback (the bound is pinned in
+    # test_dns_agents_config_inline_fallback.py): any stale bundle is eligible.
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback_after_seconds", 0)
     server, zone, headers = await _agent(db_session, records=3)
     await db_session.commit()
     first = await client.get(CONFIG_URL, headers=headers)
@@ -271,6 +280,9 @@ async def test_split_horizon_never_pages_ops_and_the_render_retires_them(
 ) -> None:
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    # The unbounded fallback (the bound is pinned in
+    # test_dns_agents_config_inline_fallback.py): any stale bundle is eligible.
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback_after_seconds", 0)
     server, zone, headers = await _agent(db_session, records=4, views=True)
     db_session.add(_op(server, zone, "queued", datetime.now(UTC) - timedelta(minutes=1)))
     await db_session.commit()
@@ -309,6 +321,9 @@ async def test_an_inline_render_that_raises_holds_the_poll_and_leaves_the_verdic
     backing the server off (tests/test_dns_agents_config_inline_fallback.py)."""
     monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback", True)
+    # The unbounded fallback (the bound is pinned in
+    # test_dns_agents_config_inline_fallback.py): any stale bundle is eligible.
+    monkeypatch.setattr(settings, "dns_agent_bundle_inline_fallback_after_seconds", 0)
     enqueued: list[list] = []
 
     async def _fake_enqueue(ids):  # noqa: ANN001
