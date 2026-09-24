@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 from httpx import AsyncClient, Response
 from sqlalchemy import text
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -304,3 +305,79 @@ async def test_the_agent_never_drops_an_applied_op_across_stale_bodies_and_a_str
     await _ack(db_session, agent.take(r.json()))
     assert agent.applied == {"a", "c"}
     assert agent.structural_reloads == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_pruned_between_its_read_and_its_body_load_serves_the_newest(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_only: list[list[Any]],
+) -> None:
+    """Under a write storm the api's loop is saturated and a poll can wait
+    seconds between reading the newest bundle and loading its body. The worker
+    keeps two versions per server, so two renders that store in that gap
+    delete the one the poll read. Seen live on the revised head during storm
+    runs (agents/config 500, NoResultFound in load_body). The poll must serve
+    the newest bundle instead, with its ops re-paged against THAT bundle's
+    snapshot: never the page it built for the pruned one."""
+    server, zone, headers = await _agent(db_session)
+    await db_session.commit()
+    server_id = server.id
+    first = await _render(db_session, server)
+    r = await _poll(client, headers, None)
+    assert r.status_code == 200 and etag_matches(r.headers["etag"], first.etag)
+
+    # Change A, rendered: the bundle the next poll reads.
+    await _change(db_session, server, zone, "a")
+    read = await _render(db_session, server)
+
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    real = store.load_body
+    newest: dict[str, str] = {}
+
+    async def _two_renders_then_load(db, bundle):  # noqa: ANN001, ANN202
+        """The first body load waits while two renders store elsewhere (the
+        second prunes ``read``), and a change commits after the second
+        render read (its op is not covered by it)."""
+        if not newest:
+            async with factory() as other:
+                srv = await other.get(DNSServer, server_id)
+                assert srv is not None
+                for name in ("b", "c"):
+                    await _change(other, srv, zone, name)
+                    outcome = await render_and_store(
+                        other, srv, rendered_by=store.RENDERED_BY_WORKER
+                    )
+                    await other.commit()
+                    assert outcome.bundle is not None
+                    newest["etag"] = outcome.etag
+                await _change(other, srv, zone, "d")
+        return await real(db, bundle)
+
+    monkeypatch.setattr(store, "load_body", _two_renders_then_load)
+    try:
+        try:
+            resp = await _poll(client, headers, first.etag)
+        except NoResultFound as exc:
+            pytest.fail(
+                f"the long-poll raised {exc!r}, a 500 to the agent: the bundle it had read "
+                "was pruned by two newer renders before its body was loaded"
+            )
+    finally:
+        await engine.dispose()
+
+    assert resp.status_code == 200, resp.text
+    assert etag_matches(resp.headers["etag"], newest["etag"]), (
+        f"served {resp.headers['etag']}, want the newest render {newest['etag']} "
+        f"(the one read, {read.etag}, was pruned)"
+    )
+    body = resp.json()
+    assert {"a", "b", "c"} <= _names(body) and "d" not in _names(body)
+    shipped = sorted(op["record"]["name"] for op in body["pending_record_ops"])
+    assert shipped == ["a", "b", "c"], (
+        f"ops shipped with the newest body: {shipped}; want its own gated set [a, b, c]: "
+        "not the page built for the pruned bundle ([a]) and not d, committed after "
+        "the newest render read"
+    )

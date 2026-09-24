@@ -487,6 +487,12 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
     return await bundle_store.newest(db, server)
 
 
+# A bundle read by a poll can be pruned before its body is loaded when two
+# newer renders store in between (``bundle_store.load_body``). The poll then
+# serves the newest; this bounds how often one poll re-reads before it falls
+# back to waiting for the next wake.
+_PRUNED_RETRIES = 3
+
 _INLINE_LOCK_PREFIX = "spatium:bundle:inline:"
 _INLINE_BACKOFF_PREFIX = "spatium:bundle:inline-backoff:"
 # Longer than any inline attempt: the records query alone is capped by the
@@ -642,6 +648,7 @@ async def agent_config_longpoll(
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
     inline_tried = False
+    pruned_retries = 0
     # #358 — subscribe to this agent's wake channels BEFORE the first read so
     # a change (or a render) that commits + publishes during this request
     # can't land in the gap. A wake collapses the re-poll latency; with
@@ -684,11 +691,32 @@ async def agent_config_longpoll(
                     )
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
-                    server.last_config_etag = bundle.etag
-                    await db.commit()
+                    # The body before the commit, and never assumed: the
+                    # worker keeps dns_agent_bundle_keep_versions rows per
+                    # server, and under a write storm (the api's loop
+                    # saturated, this request waiting between statements)
+                    # two newer renders can store and prune this bundle
+                    # after it was read. The row being gone means a newer
+                    # render exists: undo this page's in_flight marks (it
+                    # was never shipped) and serve the newest instead of
+                    # answering 500.
                     body_gz = await bundle_store.load_body(db, bundle)
-                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="full").inc()
-                    return _bundle_response(bundle, body_gz, ops, remaining_ops)
+                    if body_gz is not None:
+                        server.last_config_etag = bundle.etag
+                        await db.commit()
+                        AGENT_BUNDLE_SERVED.labels(family="dns", outcome="full").inc()
+                        return _bundle_response(bundle, body_gz, ops, remaining_ops)
+                    await db.rollback()
+                    bundle = None  # expired by the rollback; never read again
+                    # Re-read and re-page from scratch: the page is gated to
+                    # the bundle it ships with, never reused. Bounded; past
+                    # the bound the poll waits for the next wake as usual.
+                    pruned_retries += 1
+                    if (
+                        pruned_retries <= _PRUNED_RETRIES
+                        and deadline - asyncio.get_running_loop().time() > 0
+                    ):
+                        continue
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}

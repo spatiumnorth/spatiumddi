@@ -121,11 +121,16 @@ async def newest(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     ).scalar_one_or_none()
 
 
-async def load_body(db: AsyncSession, bundle: DNSAgentBundle) -> bytes:
-    """The gzip bytes of one stored bundle — read only when answering 200."""
+async def load_body(db: AsyncSession, bundle: DNSAgentBundle) -> bytes | None:
+    """The gzip bytes of one stored bundle — read only when answering 200.
+
+    ``None`` when the row is gone: ``prune`` keeps the newest
+    ``dns_agent_bundle_keep_versions`` per server, so two renders that store
+    after ``bundle`` was read delete it. The caller serves the newer one.
+    """
     return (
         await db.execute(select(DNSAgentBundle.body).where(DNSAgentBundle.id == bundle.id))
-    ).scalar_one()
+    ).scalar_one_or_none()
 
 
 async def store(
