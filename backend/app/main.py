@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
+from app.api.docs import install_api_docs
 from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
@@ -843,8 +844,11 @@ def create_app() -> FastAPI:
         # into an api container that dies at import with a bare AssertionError,
         # before logging is even configured.
         version=settings.version or "dev",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        # /api/docs and /api/redoc are registered by install_api_docs()
+        # below, with their assets served by the api (#1157). FastAPI's own
+        # pages load them from a CDN, which the web tier's CSP refuses.
+        docs_url=None,
+        redoc_url=None,
         openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
@@ -927,6 +931,8 @@ def create_app() -> FastAPI:
         dependencies=[Depends(require_module("network.e911"))],
     )
     app.include_router(api_v1_router, prefix="/api/v1")
+    # The interactive API docs, with self-hosted assets (#1157).
+    install_api_docs(app)
 
     if settings.prometheus_metrics_enabled:
         app.add_route("/metrics", metrics_endpoint)

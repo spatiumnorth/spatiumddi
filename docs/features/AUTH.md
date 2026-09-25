@@ -481,7 +481,9 @@ preclude that.
 **Validation path.** `app/api/deps.py:get_current_user` checks for the
 `sddi_` prefix first; if present it hashes the bearer, looks the row
 up by hash, enforces `is_active` and `expires_at`, then loads the
-owning user and bumps `last_used_at`. JWTs take the original path. A
+owning user and records the use in `last_used_at`. The write is at most
+once a minute per token and commits on its own, so a token used only for
+reads shows its use too (#1158). JWTs take the original path. A
 missing / wrong / revoked token returns the same generic 401 as an
 invalid JWT to avoid confirming token existence to an attacker.
 

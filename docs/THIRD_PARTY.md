@@ -154,12 +154,16 @@ official upstream images instead.
 ## Control-plane backend (Python)
 
 Runs in the **API image**. Authoritative list, with versions:
-`backend/pyproject.toml`.
+`backend/pyproject.toml`. The two API-docs bundles are not Python
+packages: they are vendored in `backend/app/static/api-docs/` and pinned in
+`versions.json`.
 
 | Component | License | What it does here |
 |---|---|---|
 | [Python](https://www.python.org/) 3.12 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
+| [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
 | [Uvicorn](https://www.uvicorn.org/) | BSD 3-Clause | ASGI server |
 | [SQLAlchemy](https://www.sqlalchemy.org/) / [Alembic](https://alembic.sqlalchemy.org/) | MIT | ORM + migrations |
 | [asyncpg](https://github.com/MagicStack/asyncpg) | Apache 2.0 | Async PostgreSQL driver |

@@ -978,6 +978,42 @@ the formatter handles the rest.
 
 ### Security
 
+- **The interactive API docs load through the web port again, and
+  the appliance's HTTPS web tier sends the #400 security headers
+  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
+  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
+  started from an inline `<script>`. The web tier's CSP (#400) allows
+  scripts from the page's own origin only. So on Docker Compose, and
+  on Helm without `frontend.tls.enabled`, the console's API docs
+  links opened blank pages, and an air-gapped install could not load
+  them on any port. The api now serves both bundles itself from
+  `backend/app/static/api-docs/`: byte-for-byte copies of
+  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
+  Swagger's initializer is a static file. Scripts stay `'self'`
+  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
+  search index) and load its footer logo from cdn.redoc.ly, which it
+  hides when offline. **The appliance's TLS config sent none of the
+  #400 headers.** #400 put them in the pre-k3s appliance nginx
+  config, which #194 had already orphaned, so
+  `frontend-tls-config.yaml` never had them. It now sends the same
+  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
+  and Referrer-Policy as the image's template, re-emitted on every
+  location with headers of its own. It also sends
+  `Strict-Transport-Security: max-age=31536000` without
+  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
+  bare IP and over a certificate warning, so it only takes hold on a
+  hostname with a trusted certificate.
+
+- **An API token used only for reads now records that it was used
+  (#1158).** `last_used_at` was set on the request's database session
+  and left for the handler to commit. Read handlers never commit, so a
+  monitoring, inventory or export token showed "Last Used: —" forever,
+  while its first write set it. Operators hunting for stale tokens
+  could revoke live ones. The use is now written in a short-lived
+  transaction of its own, at most once a minute per token, the cadence
+  the session path keeps for `last_seen_at`. A handler that rolls back
+  cannot undo it, and a failed write never fails the request.
+
 - **Every shipped image now patches its base image's own packages
   (#1088).** The nightly of 2026-09-14 refused to publish the api
   image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
