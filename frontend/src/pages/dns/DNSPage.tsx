@@ -1480,7 +1480,7 @@ function ServerModal({
             <code className="rounded bg-violet-500/20 px-1">
               ghcr.io/spatiumnorth/dns-powerdns
             </code>{" "}
-            container alongside this server (Phase 1 ships LMDB embedded
+            container alongside this server (it keeps zones in embedded LMDB
             storage; no external DB needed). Records apply via the local
             PowerDNS REST API on port 8081 (loopback only). The agent generates
             and rotates the API key automatically — leave the field below blank.

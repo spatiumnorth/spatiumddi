@@ -317,8 +317,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface "
-        "(issue #134, Phase 4): TLS cert upload, release manager, "
+        "Full control of the SpatiumDDI OS appliance management surface: "
+        "TLS cert upload, release manager, "
         "container start/stop/restart + live logs, host network + "
         "firewall config, maintenance mode, diagnostic bundle download. "
         "Intended for ops staff who manage the appliance lifecycle "
