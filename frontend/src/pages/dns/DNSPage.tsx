@@ -3593,12 +3593,11 @@ function ZoneDetailView({
   // untouched. Also stands down while a dialog is open, or ``n`` on a
   // modal's own button would stack a second Add Record behind the first.
   //
-  // ``[role="dialog"]`` is the signal because every modal in the app goes
-  // through the shared ``Modal`` primitive, which sets it (the standing
-  // rule is that pages never reintroduce a local one). A custom shape
-  // built on ``useDraggableModal`` + ``MODAL_BACKDROP_CLS`` directly
-  // would not be matched — hence the explicit ``showAddRecord`` check,
-  // which covers the case that actually matters whatever it is built on.
+  // ``[role="dialog"]`` is the signal because every modal in the app sets
+  // it: the shared ``Modal`` primitive, and since #1156 every custom shape
+  // through ``useModalDialog`` (the standing rule is that pages never
+  // reintroduce a local one). The explicit ``showAddRecord`` check still
+  // covers the case that actually matters whatever it is built on.
   useEffect(() => {
     if (isForward || zone.tailscale_tenant_id) return;
     const onKeyDown = (e: KeyboardEvent) => {

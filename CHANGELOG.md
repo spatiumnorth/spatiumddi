@@ -377,6 +377,50 @@ the formatter handles the rest.
   needs it. Kerberos was in the same position (the images carry no
   GSSAPI stack) and is no longer offered — see #1128 under Changed.
 
+- **A DHCP scope created from its subnet keeps the subnet's gateway
+  as Routers (option 3) and gets the suggested pool (#1154).** The
+  New DHCP Scope dialog pre-fills Routers and a pool from the subnet,
+  and the DNS, domain, NTP and lease-time defaults from Settings —
+  but one latch covered both and fired on whichever query answered
+  first. The Dashboard caches the settings, so on the ordinary path
+  (Dashboard → IPAM → subnet → DHCP Pools → Create Scope) Routers and
+  the pool stayed empty, and a scope saved as shown handed out leases
+  with no default gateway; a hard reload lost the Settings defaults
+  instead. Each half now applies when its own query answers, never
+  over a value already there. A subnet picked in the dialog
+  pre-fills the same way (picking another replaces only what the
+  dialog filled in), and an IPv6 subnet no longer puts its gateway in
+  the DHCPv4-only option 3.
+
+- **A read-only operator is no longer offered IPAM and DHCP-scope
+  writes that end in "Permission denied" (#1155).** Every user saw
+  the same controls as a superadmin: New IP Space and Import subnets
+  in the IPAM tree; Edit, Add block, Add Subnet, New Subnet, Add child
+  block, Allocate IP, Import IP addresses and the Tools menus' Bulk
+  allocate, Clean Orphans, Merge, Resize, Split, Move and Scan with
+  nmap in the space, block and subnet headers; Create Scope, Add Pool
+  and the scope and pool edit, delete and enable controls in a
+  subnet's DHCP tab. A Viewer filled in the form and met the refusal
+  at submit. Each is now disabled, with the missing permission as its
+  tooltip, unless the caller holds the write the server asks for
+  (`usePermissions`, which already gated the address rows). The
+  server stays the enforcement point.
+
+- **Every hand-built dialog is announced as a dialog (#1156).**
+  Seventeen dialogs drew their own card instead of using the shared
+  `Modal`: the IPAM tools (Find free space, Split, Merge, Resize, Bulk
+  allocate, Move block, DNS Sync, the address detail, both imports),
+  Factory reset, the backup restore and destination forms, the
+  custom-field and auth-provider editors and the custom-field delete
+  confirm, and the nmap and packet-capture confirms. None had
+  `role="dialog"`, `aria-modal` or an accessible name, their close
+  buttons had no name, and page code that checks for an open dialog
+  could not see them — so **?** opened the shortcuts overlay on top of
+  them. They now take the shared `Modal`'s contract from one hook,
+  `useModalDialog`: named by their heading, modal, focus kept inside,
+  Esc to close, and a named close button (the two backup forms gain
+  one). Their layout is unchanged.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
