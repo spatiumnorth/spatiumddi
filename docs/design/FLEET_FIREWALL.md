@@ -136,7 +136,7 @@ firewall_apply_lag_intervals:  Mapped[int]  = 5            # rendered≠applied 
 ### 2.5 Seeded builtins (migration — idempotent data seed, split from schema; see Phase 3)
 
 - One `fleet` policy (`is_builtin=True`, empty — operators add fleet-wide rules here).
-- Six `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; **10250 also pod∪svc** — `source_kind=kubelet`, seeded by `d4a9e37b2c15` for #993, so the api pod can reach its OWN node's kubelet, which the peer-scoped rule never covers and on a single node is not emitted at all; deliberately NOT the `kubeapi` union, whose operator `kubeapi_expose_cidrs` allowlist must not be extended from the RBAC-guarded apiserver to the kubelet's `/exec` and `/run`; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns`/`dns-technitium` (53 tcp+udp), `dhcp` (67 udp + 68 return), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty). The three DNS-engine policies are byte-identical; `dns-technitium` ships in its own seed migration (`6a668dd451d5`) rather than as an edit to the already-shipped `f5b8d2c91a06`, per the append-only migration rule.
+- Six `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; **10250 also pod∪svc** — `source_kind=kubelet`, seeded by `d4a9e37b2c15` for #993, so the api pod can reach its OWN node's kubelet, which the peer-scoped rule never covers and on a single node is not emitted at all; deliberately NOT the `kubeapi` union, whose operator `kubeapi_expose_cidrs` allowlist must not be extended from the RBAC-guarded apiserver to the kubelet's `/exec` and `/run`; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns`/`dns-technitium` (53 tcp+udp), `dhcp` (67 udp + 68 return; **547 udp** for DHCPv6, seeded by `e6b2f07a3c91` for #1139), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty). The three DNS-engine policies are byte-identical; `dns-technitium` ships in its own seed migration (`6a668dd451d5`) rather than as an edit to the already-shipped `f5b8d2c91a06`, per the append-only migration rule.
 - Builtin aliases: `@k3s_peer_ports`, `@dns_ports`, `@dhcp_ports`, `@web_ports`.
 
 ### 2.6 Two new derived inputs the supervisor must report (verified absent today)
@@ -364,8 +364,8 @@ A node's posture is the union of **two orthogonal axes** (verified roles-and-top
 |---|---|---|---|
 | **Frontend / control node** | primary/member | — | floor + dataplane; 80/443 (+VIP daddr); 6443 (peers∪pod∪svc∪kubeapi, join-window); 2379/2380/10250 (peers); 7946 tcp+udp memberlist (peers, if ≥2+VIP) |
 | **DNS worker** | None | dns-bind9 \| dns-powerdns \| dns-technitium | floor + dataplane; 53 tcp+udp. **No k3s ports** — the exact #16 misplacement risk, closed by absence (etcd/kubelet never opened here) |
-| **DHCP worker** | None | dhcp | floor + dataplane; udp/67 broadcast (`any`); udp/68 return via floor; relay-VIP (`daddr=relayVIP`, relay CIDRs) in bridged mode |
-| **Combined DNS+DHCP worker** | None | dns-* ∪ dhcp | floor + dataplane; 53; 67/68 — union |
+| **DHCP worker** | None | dhcp | floor + dataplane; udp/67 broadcast (`any`); udp/68 return via floor; udp/547 DHCPv6 (`any`); relay-VIP (`daddr=relayVIP`, relay CIDRs) in bridged mode |
+| **Combined DNS+DHCP worker** | None | dns-* ∪ dhcp | floor + dataplane; 53; 67/68/547 — union |
 | **Promoted CP also serving DNS** | member | dns-bind9 | union of frontend-node + DNS-worker |
 | **Observer** | any | observer | floor + dataplane; node-exporter 9100 scoped to scraper CIDR (default-disabled rule) |
 | **Custom** | any | custom | floor + dataplane; custom role policy + `firewall_extra` |
@@ -373,6 +373,8 @@ A node's posture is the union of **two orthogonal axes** (verified roles-and-top
 Composition is the §3.7 merge, de-duplicated so two roles opening 53 emit it once. The DNS engines (`dns-bind9` XOR `dns-powerdns` XOR `dns-technitium`) map to the same 53 overlay. The drop-in header `profile:` reflects both axes.
 
 **DHCP/67 honesty (verified Kea hostNetwork).** `udp/67` is opened from `any` because broadcast DISCOVER has no useful `saddr` to scope; relayed unicast from a giaddr is therefore *already* covered by the same `any` rule (no extra scoping needed). The `locked` posture **cannot** scope DHCP/67 — broadcast is unscopeable — and the UI says so explicitly so an operator does not believe they have locked it down. The host's own DHCP-client return (`udp sport 67 dport 68`) lives in the floor (§3.2) so a DHCP-server appliance that is itself DHCP-addressed keeps renewing its lease; this is verified by an explicit Phase-1 test.
+
+**DHCPv6/547 (#1139).** `udp/547` is opened from `any` for the same reason: an on-link Solicit goes to the `ff02::1:2` multicast group, and a relay's Relay-Forward arrives unicast from whatever address the relay uses. Unlike v4, Kea's v6 server has no raw-socket mode, so without this rule every DHCPv6 packet dies on the drop policy, including the relayed case where Kea does bind the address (#1140). It is always open rather than gated on an IPv6 scope existing, because nothing in the role assignment carries scope families and an idle kea-dhcp6 answers nothing. The host's own DHCPv6-client return (`udp sport 547 dport 546`) sits in the floor next to the v4 one.
 
 **#16 tie-in:** the firewall adds no workload (it's host config), so #16's chart-label clause doesn't directly fire — but keying the role overlays on the *same* tokens as `spatium.io/role-*` means the role assignment that schedules a pod (via label) *also* selects that node's firewall layer (via the compiler), so a workload can't land on a node without its firewall rendering there, and vice versa.
 

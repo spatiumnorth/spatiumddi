@@ -1049,6 +1049,27 @@ def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _v6_interfaces(
+    interfaces: list[str] | tuple[str, ...], unicast: list[tuple[str, str]] | None
+) -> list[str]:
+    """The bundle's interface list plus ``"<iface>/<address>"`` entries.
+
+    Additive: Kea keeps every socket the plain entries open and adds a
+    unicast one per ``iface/addr``. With an explicit interface list rather
+    than ``"*"``, only addresses on the listed interfaces are added — an
+    entry for an unlisted interface would widen what Kea serves.
+    """
+    out = list(interfaces)
+    wildcard = "*" in out
+    for ifname, addr in unicast or []:
+        if not wildcard and ifname not in out:
+            continue
+        entry = f"{ifname}/{addr}"
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
 def render(
     bundle: dict[str, Any],
     *,
@@ -1056,6 +1077,7 @@ def render(
     lease_file: str = "/var/lib/kea/kea-leases4.csv",
     control_socket_v6: str | None = None,
     lease_file_v6: str | None = None,
+    v6_unicast: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Render a ConfigBundle into a Kea config document.
 
@@ -1077,6 +1099,13 @@ def render(
     the ``4`` swapped for ``6`` (``kea4-ctrl-socket`` → ``kea6-ctrl-socket``,
     ``kea-leases4.csv`` → ``kea-leases6.csv``) so the v6 daemon never
     collides with the v4 daemon's socket / lease store.
+
+    ``v6_unicast`` is the host's bindable global IPv6 addresses
+    (``v6_unicast.global_ipv6_addresses``). With v6 scopes present each one
+    becomes an ``"<iface>/<address>"`` entry beside the bundle's interfaces,
+    so kea-dhcp6 opens the unicast socket a relay's Relay-Forward is sent to
+    (#1140). Passed in rather than read here so the render stays a pure
+    function of its arguments.
     """
     server = bundle.get("server", {}) or {}
     interfaces = server.get("interfaces") or ["*"]
@@ -1276,8 +1305,12 @@ def render(
     ctrl6 = control_socket_v6 or control_socket.replace("kea4", "kea6")
     lease6 = lease_file_v6 or lease_file.replace("leases4", "leases6")
     # Idle skeleton binds nothing; an active v6 config binds the bundle's
-    # interfaces just like Dhcp4.
-    v6_interfaces = list(interfaces) if v6_scopes else []
+    # interfaces just like Dhcp4, plus a unicast socket per global address
+    # the agent found on the host (#1140) — ``"*"`` alone binds link-local
+    # and ff02::1:2 only, so a relay's Relay-Forward to the server's global
+    # address had no socket to land on. See ``v6_unicast`` for why the
+    # addresses are detected live rather than configured.
+    v6_interfaces = _v6_interfaces(interfaces, v6_unicast) if v6_scopes else []
     dhcp6: dict[str, Any] = {
         "interfaces-config": {"interfaces": v6_interfaces},
         # Match host reservations on DUID (v6-native, issue #368) then

@@ -36,6 +36,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
@@ -222,6 +223,21 @@ class ServerResponse(BaseModel):
     # NULL when never reported (a pre-#1077 agent, or an agentless driver):
     # UNKNOWN, never "empty".
     spool_status: SpoolStatus | None = None
+    # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
+    # ``degraded`` (the agent's own word); NULL when the agent has never
+    # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
+    # the CURRENT state began; a repeated report never moves it.
+    daemon_status: str | None = None
+    daemon_reason: str | None = None
+    daemon_status_since: datetime | None = None
+    # Derived, never stored: ``daemon_state.is_not_serving``, the one reading
+    # of the three fields above that the ``agent_daemon_degraded`` rule, the
+    # server chip, the detail banner and the dashboard all share. ``true`` —
+    # the agent reports a daemon that is not serving. ``false`` — ``ok``, or
+    # a ``degraded`` that is the agent echoing a failed config apply, which
+    # ``config_apply_status`` reports at #882's severity. ``null`` — never
+    # reported.
+    daemon_not_serving: bool | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -287,6 +303,10 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
+            daemon_status=s.daemon_status,
+            daemon_reason=s.daemon_reason,
+            daemon_status_since=s.daemon_status_since,
+            daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
             created_at=s.created_at,
             modified_at=s.modified_at,
         )

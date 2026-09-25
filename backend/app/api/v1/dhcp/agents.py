@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 
 from app.api.deps import DB
@@ -40,6 +41,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
     IngestAck,
@@ -62,7 +64,7 @@ from app.services.dhcp.agent_token import (
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.lease_cleanup import peer_holds_active_lease
-from app.services.dhcp.normalize import norm_ip, norm_mac
+from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
 
 logger = structlog.get_logger(__name__)
@@ -180,7 +182,14 @@ class HAStatusReport(BaseModel):
 
 class LeaseEvent(BaseModel):
     ip_address: str
-    mac_address: str
+    # Required on a DHCPv4 lease — it is the lease's identity. Optional on a
+    # DHCPv6 one (#1141): Kea records a hardware address only when it can
+    # derive one, so most v6 leases arrive without; it is enrichment there.
+    mac_address: str | None = None
+    # DHCPv6 identity (#1141), required on a v6 lease: the client DUID and
+    # the IA's IAID — what Kea itself keys a v6 lease on.
+    duid: str | None = None
+    iaid: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     hostname: str | None = None
     client_id: str | None = None
     user_class: str | None = None
@@ -200,6 +209,42 @@ class LeaseEvent(BaseModel):
         if v is None:
             return None
         return sanitize_hostname(v) or None
+
+    @field_validator("duid")
+    @classmethod
+    def _canonical_duid(cls, v: str | None) -> str | None:
+        return canonical_duid(v) if v is not None else None
+
+    @model_validator(mode="after")
+    def _has_identity(self) -> LeaseEvent:
+        # An unparseable address keeps the pre-#1141 rule (a MAC is
+        # required) rather than being guessed at.
+        try:
+            family = ipaddress.ip_address(self.ip_address.strip()).version
+        except ValueError:
+            family = 4
+        if family == 6:
+            if not self.duid:
+                raise ValueError("a DHCPv6 lease needs a duid")
+        elif not self.mac_address:
+            raise ValueError("a DHCPv4 lease needs a mac_address")
+        return self
+
+
+def _lease_identity(
+    ip: str, mac: str | None, duid: str | None, iaid: int | None
+) -> tuple[Any, ...]:
+    """What makes two lease reports the same lease (#1110, #1141).
+
+    DHCPv4: the address + the client's MAC. DHCPv6: the address + DUID +
+    IAID — most v6 leases carry no MAC, and one that does must not match a
+    v4-shaped key. Normalised, because the event carries strings and a row
+    read back from the database carries an ``IPv4Address`` / canonical MAC
+    (the #1110 duplicate-row bug).
+    """
+    if duid:
+        return (norm_ip(ip), "duid", norm_duid(duid), iaid)
+    return (norm_ip(ip), "mac", norm_mac(mac or ""))
 
 
 class LeaseEventBatch(BaseModel):
@@ -978,6 +1023,10 @@ async def agent_heartbeat(
     apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
     # #1077 — spool state. Only written when the heartbeat carries it.
     apply_reported_spool(server, body.spool, agent_kind="dhcp", server_id=str(server.id))
+    # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
+    # the same dict, the top-level ``status``; ``daemon`` is the source). Same
+    # gap as the DNS side: declared, accepted, never read.
+    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
@@ -1104,8 +1153,13 @@ async def agent_lease_events(
     # looking until something counts rows per address: a release then only
     # ever reached the new row, leaving the original "active" until its
     # expiry, which kept a Kea HA partner's shared IPAM mirror alive.
-    lease_by_key: dict[tuple[str, str], DHCPLease] = {
-        (norm_ip(str(lease.ip_address)), norm_mac(str(lease.mac_address))): lease
+    lease_by_key: dict[tuple[Any, ...], DHCPLease] = {
+        _lease_identity(
+            str(lease.ip_address),
+            str(lease.mac_address) if lease.mac_address else None,
+            lease.duid,
+            lease.iaid,
+        ): lease
         for lease in existing_leases
     }
 
@@ -1113,7 +1167,7 @@ async def agent_lease_events(
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
     for ev in events:
-        key = (norm_ip(ev.ip_address), norm_mac(ev.mac_address))
+        key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1125,6 +1179,8 @@ async def agent_lease_events(
                 server_id=server.id,
                 ip_address=ev.ip_address,
                 mac_address=ev.mac_address,
+                duid=ev.duid,
+                iaid=ev.iaid,
                 hostname=ev.hostname,
                 client_id=ev.client_id,
                 user_class=ev.user_class,
@@ -1142,6 +1198,10 @@ async def agent_lease_events(
             lease_by_key[key] = lease
         else:
             lease.hostname = ev.hostname
+            if ev.mac_address:
+                # A v6 lease's hardware address can arrive on a later report
+                # than the lease itself; keep it once known (#1141).
+                lease.mac_address = ev.mac_address
             lease.client_id = ev.client_id
             lease.user_class = ev.user_class
             lease.state = ev.state
@@ -1175,17 +1235,24 @@ async def agent_lease_events(
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
         row.hostname = (ev.hostname or row.hostname or "")[:253]
-        row.mac_address = ev.mac_address
+        # A DHCPv6 lease usually has no MAC (#1141) — keep what the row has
+        # rather than blanking it.
+        row.mac_address = ev.mac_address or row.mac_address
         row.status = "dhcp"
         row.auto_from_lease = True
         row.dhcp_lease_id = str(lease.id) if lease.id else None
+        # The lease IS the sighting. The pull path always stamped this
+        # (``pull_leases._refresh_lease_owned_row``); the agent path never
+        # did, so every Kea-sourced row read "Seen: Never" (#1141).
+        row.last_seen_at = now
+        row.last_seen_method = "dhcp"
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
     for ev in events:
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
-        lease = lease_by_key[(norm_ip(ev.ip_address), norm_mac(ev.mac_address))]
+        lease = lease_by_key[_lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)]
         ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
@@ -1199,6 +1266,8 @@ async def agent_lease_events(
                     status="dhcp",
                     auto_from_lease=True,
                     dhcp_lease_id=str(lease.id) if lease.id else None,
+                    last_seen_at=now,
+                    last_seen_method="dhcp",
                 )
                 # #564 — a concurrent Sync-DHCP / static-reservation
                 # writer may have already committed this

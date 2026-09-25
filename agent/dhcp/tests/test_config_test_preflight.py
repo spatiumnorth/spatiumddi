@@ -96,6 +96,9 @@ def test_reload_socket_rejection_surfaces_reason_and_skips_reload(
     assert reloaded == []  # never reload a config Kea rejects
     assert loop.heartbeat.daemon_status["status"] == "degraded"
     assert "pool not in subnet" in loop.heartbeat.daemon_status["reason"]
+    # The exact prefix is a contract: the control plane reads it as a failed
+    # apply (#882's), not as a daemon that is not serving (#1067).
+    assert loop.heartbeat.daemon_status["reason"].startswith("dhcp4_config_rejected: ")
 
 
 def test_reload_socket_happy_path_tests_then_reloads(
@@ -125,7 +128,9 @@ def test_reload_socket_socket_not_ready_retries_then_reports(
     # timeout 0 → the OSError branch breaks immediately (no real wait).
     result = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
     assert result == sync_mod.RELOAD_UNREACHABLE
-    assert "socket_unreachable" in loop.heartbeat.daemon_status["reason"]
+    # Must stay distinct from a config verdict: the control plane reads this
+    # one as a daemon that is not serving (#1067).
+    assert loop.heartbeat.daemon_status["reason"].startswith("dhcp4_socket_unreachable: ")
 
 
 def test_reload_socket_transient_kea_error_retries_then_succeeds(

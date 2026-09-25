@@ -54,6 +54,7 @@ from .config_apply import (
 from .kea_ctrl import KeaCtrlError, config_reload, config_test
 from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
+from .v6_unicast import global_ipv6_addresses
 
 log = structlog.get_logger(__name__)
 
@@ -155,6 +156,13 @@ class SyncLoop:
         # ``previous.json``. Without this the "last-known-GOOD" fallback can
         # end up holding a document no daemon has ever loaded.
         self._reload_confirmed = False
+        # #1140 — the host global IPv6 addresses the last render gave
+        # kea-dhcp6 as unicast sockets, or None when the render served no v6
+        # scope (then the addresses don't matter). ``run`` re-renders when
+        # the live set drifts from this: an entry for an address the host
+        # no longer holds makes kea-dhcp6 refuse its whole config the next
+        # time it loads it.
+        self._v6_unicast_applied: tuple[tuple[str, str], ...] | None = None
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -519,7 +527,11 @@ class SyncLoop:
         # ``leases6`` mirrors the v4 lease file with the family digit
         # swapped (``kea-leases4.csv`` → ``kea-leases6.csv``) so the v6
         # daemon never writes the v4 lease store.
-        lease_file_v6 = str(self.cfg.kea_lease_file).replace("leases4", "leases6")
+        lease_file_v6 = str(self.cfg.kea_lease_file_v6)
+        # #1140 — detected immediately before the write, so the document
+        # names only addresses the host holds now. A stale one would not
+        # just miss a socket: kea-dhcp6 refuses the whole config.
+        v6_unicast = global_ipv6_addresses()
         try:
             rendered = render_kea(
                 inner,
@@ -527,6 +539,7 @@ class SyncLoop:
                 lease_file=str(self.cfg.kea_lease_file),
                 control_socket_v6=str(self.cfg.kea_control_socket_v6),
                 lease_file_v6=lease_file_v6,
+                v6_unicast=v6_unicast,
             )
         except Exception as e:
             # #882 — tag the phase. A render failure never reached Kea, so
@@ -547,6 +560,9 @@ class SyncLoop:
         # Dhcp6 one is an idle skeleton when there are no v6 scopes).
         dhcp4_doc = {"Dhcp4": rendered.get("Dhcp4", {})}
         dhcp6_doc = {"Dhcp6": rendered.get("Dhcp6", {})}
+        self._v6_unicast_applied = (
+            tuple(v6_unicast) if dhcp6_doc["Dhcp6"].get("subnet6") else None
+        )
 
         # Write the combined render to rendered/ (for audit/debug) and
         # then atomically write each split doc to its live config path.
@@ -746,9 +762,39 @@ class SyncLoop:
             if op_id:
                 self.heartbeat.pending_acks.append({"op_id": op_id, "result": "ok"})
 
+    def _recheck_v6_unicast(self) -> None:
+        """Re-render the current bundle when the host's global IPv6
+        addresses no longer match the ones in kea-dhcp6's unicast list (#1140).
+
+        The bundle's ETag cannot say this — the addresses are host state,
+        not control-plane state — so nothing else would re-render. And it
+        matters beyond a missing socket: an address that is gone from the
+        interface makes kea-dhcp6 refuse the whole document the next time
+        it loads it (a container restart), taking DHCPv6 down. Checked once
+        per loop, which the long-poll paces at ~30 s; reading
+        ``/proc/net/if_inet6`` is cheap.
+        """
+        applied = self._v6_unicast_applied
+        etag = self._current_etag
+        if applied is None or etag is None or self._quarantine.blocks(etag):
+            return
+        current = tuple(global_ipv6_addresses())
+        if current == applied:
+            return
+        bundle, cached_etag = load_config(self.cfg.state_dir)
+        if bundle is None or cached_etag != etag:
+            return
+        log.info(
+            "dhcp6_unicast_addresses_changed",
+            before=[f"{i}/{a}" for i, a in applied],
+            after=[f"{i}/{a}" for i, a in current],
+        )
+        self._apply_with_revert(bundle, etag)
+
     def run(self) -> None:
         while not self._stop.is_set():
             self._poll_once()
+            self._recheck_v6_unicast()
             # Safety net: cap poll rate even if the server returns 200s
             # back-to-back (bad bundle state, clock skew, etc.). The long-poll
             # blocks ~30s when etag matches, so this doesn't add latency in

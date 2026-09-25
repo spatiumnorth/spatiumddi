@@ -4913,7 +4913,7 @@ function ApplianceRoleAssignmentSection({
     firewallOpenPorts.push("UDP/53", "TCP/53");
   }
   if (roles.has("dhcp")) {
-    firewallOpenPorts.push("UDP/67", "UDP/68");
+    firewallOpenPorts.push("UDP/67", "UDP/68", "UDP/547");
   }
 
   return (
