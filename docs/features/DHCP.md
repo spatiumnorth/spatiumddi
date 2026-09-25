@@ -452,8 +452,6 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 `create_static` / `update_static` reject (never silently) on:
 - **Duplicate MAC within the server group** — a MAC can be reserved only once
   across every scope in the same group (409).
-- **IP inside a `dynamic` pool on the scope** — the IP must be excluded from any
-  dynamic pool first (409). (Reserved/excluded pools do not block a static.)
 - **IP outside the scope's subnet** — 422 (issue #619). See §16 for the
   rationale.
 - **A body `scope_id`** — 422 (issue #619). The scope comes from the path on
@@ -462,6 +460,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 - **Malformed hostname** — 422. The reservation hostname is operator-entered,
   so it is validated against the RFC 1123 host rule rather than sanitized (see
   `DNS.md` §18).
+
+An IP inside a `dynamic` pool is **not** a conflict: a reservation there is the
+normal way to pin a device, and every driver honours it (#631; see §16).
 
 ---
 
@@ -1181,7 +1182,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
-- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. Three-or-more Kea members is nonsensical for `libdhcp_ha.so` (it only speaks pairs) and should be validated at the CRUD layer.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. A third or later Kea member renders as a `backup` peer (#332): it takes no part in the heartbeat but receives lease updates.
 - Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
@@ -1237,6 +1238,8 @@ Kea's HA hook parses peer URLs with Boost asio, which only accepts IP literals �
 ### Managing HA
 
 HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
+
+**On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: Kea's HA API is unauthenticated unless you configure TLS or basic auth, and it accepts lease updates. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
 
 ---
 

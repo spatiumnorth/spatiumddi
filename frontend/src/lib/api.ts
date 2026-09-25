@@ -3081,6 +3081,12 @@ export interface BackupTestOutcome {
   ok: boolean;
   detail?: string;
   error?: string;
+  /**
+   * The destination works, but not the way an operator would assume
+   * (#1160): e.g. a local-volume path that no volume covers, so archives
+   * live in one container's own filesystem. Shown on the target's row.
+   */
+  warning?: string;
 }
 
 export const backupTargetsApi = {

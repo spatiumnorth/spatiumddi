@@ -351,18 +351,8 @@ function PhasePlaceholder({ spec }: { spec: TabSpec }) {
           <Icon className="h-5 w-5" />
         </div>
         <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <h2 className="text-base font-semibold">{spec.label}</h2>
-            <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
-              Phase {spec.phase}
-            </span>
-          </div>
+          <h2 className="text-base font-semibold">{spec.label}</h2>
           <p className="mt-2 text-sm text-muted-foreground">{spec.summary}</p>
-          <p className="mt-4 text-xs text-muted-foreground">
-            This surface lands in a follow-up commit. The Phase 4a frame ships
-            the gate, permission family, and tab shell so each sub-surface can
-            slot in without re-litigating the navigation.
-          </p>
         </div>
       </div>
     </div>

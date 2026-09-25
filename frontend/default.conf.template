@@ -61,6 +61,9 @@ server {
     #                             X-Frame-Options: DENY for old browsers).
     #   * base-uri / form-action / object-src locked down.
     set $spatium_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+    # /api/redoc's policy (#1157): the one above plus the two things ReDoc
+    # needs on that page only. See ``location = /api/redoc``.
+    set $spatium_redoc_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.redoc.ly; font-src 'self'; connect-src 'self'; worker-src blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
     add_header Content-Security-Policy $spatium_csp always;
     add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -286,6 +289,52 @@ server {
         proxy_set_header   Connection "";
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
+    }
+
+    # ReDoc (#1157) needs two things the server's policy refuses, on this
+    # page only. Its search index runs in a Worker built from a ``blob:``
+    # URL. Its "API docs by Redocly" footer loads a logo from cdn.redoc.ly,
+    # and ReDoc hides the logo if that fails, so an air-gapped install loses
+    # only the logo. Scripts stay ``'self'``: only a script already allowed
+    # to run can create a blob: worker, and an image runs no script.
+    # add_header here replaces the server-level set, so the rest of it is
+    # re-emitted. Must not diverge from
+    # charts/spatiumddi/templates/frontend-tls-config.yaml.
+    location = /api/redoc {
+        add_header Content-Security-Policy $spatium_redoc_csp always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        error_page 502 504 @api_unavailable;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass         $api_upstream;
+        proxy_set_header   Host $http_host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+        proxy_read_timeout 60s;
+    }
+
+    # The API docs' own assets (#1157). /api/docs and /api/redoc load Swagger
+    # UI and ReDoc from here, served by the api, so the pages run under this
+    # server's ``script-src 'self'`` and need no CDN. ``^~`` is load-bearing:
+    # without it the static-asset regex location further down wins for any
+    # ``.js`` / ``.css`` path, looks for the file on this image's own disk,
+    # and returns 404. Must not diverge from
+    # charts/spatiumddi/templates/frontend-tls-config.yaml.
+    location ^~ /api/docs/static/ {
+        error_page 502 504 @api_unavailable;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass         $api_upstream;
+        proxy_set_header   Host $http_host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+        proxy_read_timeout 60s;
     }
 
 

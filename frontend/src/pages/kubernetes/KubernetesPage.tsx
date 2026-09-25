@@ -155,9 +155,9 @@ export function KubernetesPage() {
             </div>
             <p className="mt-1 text-xs text-muted-foreground max-w-3xl">
               Read-only integration. Each cluster is polled by SpatiumDDI;
-              LoadBalancer VIPs, Node IPs, and Ingress hostnames will land in
-              the bound IPAM space and DNS group once the reconciler ships
-              (Phase 1b). SpatiumDDI never writes to the cluster.
+              LoadBalancer VIPs, Node IPs, and Ingress hostnames land in the
+              bound IPAM space and DNS group. SpatiumDDI never writes to the
+              cluster.
             </p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">

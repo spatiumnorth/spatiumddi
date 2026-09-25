@@ -13,6 +13,7 @@ emits.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from spatium_dns_agent.drivers.bind9 import Bind9Driver
@@ -264,3 +265,137 @@ def test_global_zone_renders_into_every_view(tmp_path: Path) -> None:
             "shared 300 IN A 198.51.100.5"
             in (zdir / v / "global.example.db").read_text()
         )
+
+
+# ── #920: the control plane's own transfers select a view by key ────────────
+#
+# BIND picks a view by match-clients BEFORE it consults allow-transfer. The
+# operator's client lists never name the control plane, so its signed drift /
+# sync transfers either matched no view (answered BADKEY, "the key is
+# unknown", for a key that is loaded and granted) or were captured by a broad
+# earlier view and read that view's copy. Each view now carries a transfer key
+# of its own, which the render admits into that view and refuses everywhere
+# else.
+
+_GROUP_KEY = {"name": "spatium-grp", "secret": "Z3JvdXBrZXk=", "algorithm": "hmac-sha256"}
+
+
+def _keyed_bundle() -> dict:
+    """The split-horizon bundle as a #920-aware control plane ships it."""
+    bundle = _split_horizon_bundle()
+    bundle["tsig_keys"] = [dict(_GROUP_KEY)]
+    for view, secret in zip(bundle["views"], ("aW50ZXJuYWw=", "ZXh0ZXJuYWw="), strict=True):
+        view["transfer_key"] = {
+            "name": f"spatium_xfr_{view['name']}",
+            "secret": secret,
+            "algorithm": "hmac-sha256",
+        }
+    return bundle
+
+
+def _view_block(conf: str, name: str) -> str:
+    """The text of one ``view "<name>" { … };`` block."""
+    return conf.split(f'view "{name}" {{', 1)[1].split("\n};\n", 1)[0]
+
+
+def test_each_view_admits_its_own_transfer_key_before_the_operators_clients(
+    tmp_path: Path,
+) -> None:
+    """Own key first, every other view's key refused, then the operator's
+    list unchanged. The refusal is what stops ``external`` (``any``) from
+    capturing a transfer meant for a later view, or ``internal`` from
+    capturing one meant for ``external`` should the api sit in 10/8."""
+    Bind9Driver(state_dir=tmp_path).render(_keyed_bundle())
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+
+    assert (
+        'match-clients { key "spatium_xfr_internal"; !key "spatium_xfr_external"; '
+        "10.0.0.0/8; };" in _view_block(conf, "internal")
+    )
+    assert (
+        'match-clients { key "spatium_xfr_external"; !key "spatium_xfr_internal"; '
+        "any; };" in _view_block(conf, "external")
+    )
+
+
+def test_view_transfer_keys_are_defined_and_granted_but_never_for_updates(
+    tmp_path: Path,
+) -> None:
+    Bind9Driver(state_dir=tmp_path).render(_keyed_bundle())
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    view_key_file = tmp_path / "tsig" / "view-transfer.key"
+
+    # Defined at global scope, above the first view that names them.
+    include = f'include "{view_key_file}";'
+    assert include in conf
+    assert conf.index(include) < conf.index('view "internal"')
+    # Granted transfer — selecting the view is only half of a transfer.
+    assert (
+        'allow-transfer { key "spatium-grp"; key "spatium_xfr_internal"; '
+        'key "spatium_xfr_external"; };' in conf
+    )
+    # ...and nothing else: no zone lets a view key write.
+    for clause in re.findall(r"allow-update \{[^}]*\}", conf):
+        assert "spatium_xfr_" not in clause
+
+
+def test_view_transfer_keys_live_in_their_own_0600_file(tmp_path: Path) -> None:
+    """ddns.key's first key is the loopback identity the record-op path and
+    the ingest worker sign with, so the view keys never go into it."""
+    Bind9Driver(state_dir=tmp_path).render(_keyed_bundle())
+    view_key_file = tmp_path / "tsig" / "view-transfer.key"
+    ddns_key_file = tmp_path / "tsig" / "ddns.key"
+
+    assert view_key_file.stat().st_mode & 0o777 == 0o600
+    text = view_key_file.read_text()
+    assert 'key "spatium_xfr_internal" { algorithm hmac-sha256; secret "aW50ZXJuYWw="; };' in text
+    assert 'key "spatium_xfr_external" { algorithm hmac-sha256; secret "ZXh0ZXJuYWw="; };' in text
+    ddns = ddns_key_file.read_text()
+    assert ddns.count("key ") == 1
+    assert ddns.startswith('key "spatium-grp"')
+
+
+def test_a_view_pinned_to_a_destination_admits_its_key_there_too(tmp_path: Path) -> None:
+    """A view must match on both lists, and BIND checks match-destinations
+    with the request's key as well — so the key goes on both."""
+    bundle = _keyed_bundle()
+    bundle["views"][0]["match_destinations"] = ["192.0.2.53"]
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+
+    assert 'match-destinations { key "spatium_xfr_internal"; 192.0.2.53; };' in _view_block(
+        conf, "internal"
+    )
+    assert "match-destinations" not in _view_block(conf, "external")
+
+
+def test_a_bundle_without_view_transfer_keys_renders_exactly_as_before(
+    tmp_path: Path,
+) -> None:
+    """A control plane that predates #920 ships no transfer_key; the render
+    must be the pre-#920 render, not a half-keyed one."""
+    bundle = _split_horizon_bundle()
+    bundle["tsig_keys"] = [dict(_GROUP_KEY)]
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+
+    assert "match-clients { 10.0.0.0/8; };" in conf
+    assert "match-clients { any; };" in conf
+    assert "view-transfer.key" not in conf
+    assert 'allow-transfer { key "spatium-grp"; };' in conf
+    assert not (tmp_path / "tsig" / "view-transfer.key").exists()
+
+
+def test_the_view_key_file_goes_when_the_views_do(tmp_path: Path) -> None:
+    """No secret outlives the config that needed it."""
+    drv = Bind9Driver(state_dir=tmp_path)
+    drv.render(_keyed_bundle())
+    assert (tmp_path / "tsig" / "view-transfer.key").exists()
+
+    flat = _split_horizon_bundle()
+    flat["tsig_keys"] = [dict(_GROUP_KEY)]
+    flat["views"] = []
+    flat["zones"] = [_zone("example.com.", None, [])]
+    drv.render(flat)
+    assert not (tmp_path / "tsig" / "view-transfer.key").exists()
+    assert "view-transfer.key" not in (tmp_path / "rendered.new" / "named.conf").read_text()

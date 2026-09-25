@@ -88,7 +88,10 @@ node from *Fleet* — same as assigning the BIND9 or Kea role. The supervisor
 injects `LG_AGENT_KEY`, stamps the per-node `spatium.io/role-looking-glass` label,
 and the DaemonSet (`charts/spatiumddi-appliance/templates/looking-glass.yaml`,
 `hostNetwork: true`) schedules onto that node. Nothing to hand-edit — the key and
-the TCP/179 nftables opening are wired by the role assignment.
+the TCP/179 nftables opening are wired by the role assignment. The opening holds
+with fleet firewall enforcement on as well as off: until #1166 only the
+supervisor's own renderer carried it, so switching enforcement on closed 179 and
+dropped every session the router initiated.
 
 Whichever shape you use, the collector self-registers and shows up under *Network
 → Looking Glass* as a collector row; then add peers to it as below.

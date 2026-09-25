@@ -20,6 +20,21 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --namespace spatiumddi --create-namespace
 ```
 
+> **Chart versions up to and including `2026.9.4-1` default to the old
+> image path.** They were published before the project moved to the
+> `spatiumnorth` organization (#1100), so their values name
+> `ghcr.io/spatiumddi/*`, which now answers `denied`. The same image tags
+> are published under `ghcr.io/spatiumnorth/`; add these to install or
+> upgrade one of those versions:
+>
+> ```bash
+>   --set image.repository=spatiumnorth \
+>   --set dnsAgents.image.repository=ghcr.io/spatiumnorth/dns-bind9 \
+>   --set dnsAgents.flavors.powerdns.repository=ghcr.io/spatiumnorth/dns-powerdns \
+>   --set dnsAgents.flavors.technitium.repository=ghcr.io/spatiumnorth/dns-technitium \
+>   --set dhcpAgents.image.repository=ghcr.io/spatiumnorth/dhcp-kea
+> ```
+
 Default login: **`admin` / `admin`** (forced password change on first login).
 
 ## Prerequisites
@@ -229,7 +244,7 @@ dhcpAgents:
 | `frontend.nginxLocalResolvers` | `""` (auto-detect) | DNS resolver IPs for nginx |
 | `worker.replicas` | `2` |  |
 | `worker.concurrency` | `4` |  |
-| `worker.queues` | `"ipam,dns,dhcp,default"` |  |
+| `worker.queues` | `"ipam,dns,dhcp,default,bundles"` |  |
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job as pre-install/pre-upgrade hook |
 | `ingress.*` | disabled |  |

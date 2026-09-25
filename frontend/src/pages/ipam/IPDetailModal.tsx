@@ -41,7 +41,7 @@ import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
@@ -154,7 +154,8 @@ export function IPDetailModal({
   onDelete,
   onTagClick,
 }: IPDetailModalProps) {
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
   const zoneNames = zoneNameById ?? {};
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
@@ -203,7 +204,8 @@ export function IPDetailModal({
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="w-full rounded-lg border bg-card shadow-lg max-h-[90vh] overflow-y-auto max-w-[95vw] sm:max-w-3xl"
+        {...dialogProps}
+        className="w-full rounded-lg border bg-card shadow-lg max-h-[90vh] overflow-y-auto max-w-[95vw] sm:max-w-3xl focus:outline-none"
         style={dialogStyle}
       >
         {/* Header */}
@@ -216,7 +218,7 @@ export function IPDetailModal({
         >
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-mono text-xl font-semibold">
+              <h2 {...titleProps} className="font-mono text-xl font-semibold">
                 {addr.address}
               </h2>
               <button
@@ -354,6 +356,7 @@ export function IPDetailModal({
               onClick={onClose}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="Close"
+              aria-label="Close dialog"
             >
               <X className="h-4 w-4" />
             </button>

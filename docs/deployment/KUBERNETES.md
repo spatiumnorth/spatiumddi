@@ -34,7 +34,7 @@ the rationale is in [`Chart.yaml`](https://github.com/spatiumnorth/spatiumddi/bl
 |---|---|---|---|
 | `api` | Deployment | 2 | FastAPI control plane; HPA-eligible (§5) |
 | `frontend` | Deployment | 2 | nginx + Vite build; proxies `/api/` to the api Service |
-| `worker` | Deployment | 2 | Celery queues `ipam,dns,dhcp,default` |
+| `worker` | Deployment | 2 | Celery queues `ipam,dns,dhcp,default,bundles` (a BYO `worker.queues` override must add `bundles`) |
 | `beat` | Deployment | 1 (`Recreate`) | Singleton scheduler — never run >1 |
 | `migrate` | Job | per Helm revision | `alembic upgrade head`; gates the rest (§4) |
 | `postgresql` | StatefulSet / CNPG `Cluster` | 1 / 3 | `kind: standalone` or `cnpg` (§6) |
@@ -64,6 +64,21 @@ helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace
 ```
+
+> **Chart versions up to and including `2026.9.4-1` default to the old
+> image path.** They were published before the project moved to the
+> `spatiumnorth` organization (#1100), so their values name
+> `ghcr.io/spatiumddi/*`, which now answers `denied`. The same image tags
+> are published under `ghcr.io/spatiumnorth/`; add these to install or
+> upgrade one of those versions:
+>
+> ```bash
+>   --set image.repository=spatiumnorth \
+>   --set dnsAgents.image.repository=ghcr.io/spatiumnorth/dns-bind9 \
+>   --set dnsAgents.flavors.powerdns.repository=ghcr.io/spatiumnorth/dns-powerdns \
+>   --set dnsAgents.flavors.technitium.repository=ghcr.io/spatiumnorth/dns-technitium \
+>   --set dhcpAgents.image.repository=ghcr.io/spatiumnorth/dhcp-kea
+> ```
 
 Default login: **`admin` / `admin`** (a forced password change happens on
 first login). The `NOTES.txt` printed after install tells you how to reach the

@@ -123,12 +123,39 @@ async def test_no_warning_for_a_plain_zone(db_session: AsyncSession, monkeypatch
 
 
 async def test_view_scoped_zone_is_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:
-    """A view-scoped zone warns that the transfer may answer from another view.
+    """A view-scoped zone read WITHOUT addressing its view carries the caveat.
 
     An AXFR is addressed by zone *name*, and under split-horizon several zone
-    rows share one name — so the diff can compare this row against a different
-    view's content. Report that rather than let an operator "fix" it.
+    rows share one name — so a transfer the server matches to a view by the
+    control plane's address can compare this row against a different view's
+    content. Report that rather than let an operator "fix" it. Since #920 an
+    agent-managed server is read through the zone's own view, so the caveat
+    stays only where that cannot happen — here an operator-run BIND9, which
+    SpatiumDDI reaches unsigned and which authorises by address.
     """
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="split.example.com."
+    )
+    server.agent_id = None
+    view = DNSView(group_id=group.id, name="internal", match_clients=["10.0.0.0/8"])
+    db_session.add(view)
+    await db_session.flush()
+    zone.view_id = view.id
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert len(report.warnings) == 1
+    assert "view" in report.warnings[0].lower()
+    assert "ns1" in report.warnings[0]
+
+
+async def test_view_addressed_transfer_carries_no_view_caveat(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#920: an agent-managed server's transfer is signed with the zone's own
+    view key, so the server answers from that view — the caveat would be
+    telling the operator to distrust a comparison that is exactly right."""
     group, _server, zone = await _group_server_zone(
         db_session, server_name="ns1", zone_name="split.example.com."
     )
@@ -140,8 +167,8 @@ async def test_view_scoped_zone_is_flagged(db_session: AsyncSession, monkeypatch
     monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
 
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
-    assert len(report.warnings) == 1
-    assert "view" in report.warnings[0].lower()
+    assert [s.status for s in report.servers] == ["ok"]
+    assert report.warnings == []
 
 
 async def test_view_scoped_records_are_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:
@@ -163,3 +190,71 @@ async def test_view_scoped_records_are_flagged(db_session: AsyncSession, monkeyp
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
     assert len(report.warnings) == 1
     assert "scoped to a specific DNS view" in report.warnings[0]
+
+
+# ── The agent's own NS glue is not drift (found fixing #920) ────────────────
+#
+# The BIND9 agent writes ``ns1 IN A 127.0.0.1`` into every primary zone file,
+# beside the apex ``NS ns1.<zone>`` it also writes, so BIND will load a zone
+# whose NS names an in-zone host. Nobody created that record. Before the
+# transfer worked on the QA seed (#920) nobody saw a real comparison; once it
+# did, every agent-managed zone reported ``ns1 A 127.0.0.1`` as extra on the
+# server, so no zone could ever read in sync.
+
+_AGENT_GLUE = RecordData(name="ns1", record_type="A", value="127.0.0.1", ttl=3600)
+_WWW = RecordData(name="www", record_type="A", value="10.0.0.1", ttl=3600)
+
+
+async def test_the_agents_own_ns_glue_is_not_drift(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="glue.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([_WWW, _AGENT_GLUE]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+
+    (s,) = report.servers
+    assert s.status == "ok"
+    assert (s.drift_count, s.in_sync) == (0, 1)
+
+
+async def test_ns_glue_on_an_operator_run_bind9_is_still_reported(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """Only the agent adds that record. On a server SpatiumDDI never
+    configured, the same record is whatever the operator put there."""
+    group, server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="glue-op.example.com."
+    )
+    server.agent_id = None
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([_AGENT_GLUE]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+
+    (s,) = report.servers
+    assert [(r.name, r.record_type, r.value) for r in s.extra_on_server] == [
+        ("ns1", "A", "127.0.0.1")
+    ]
+
+
+async def test_ns_glue_the_db_really_holds_is_compared_like_any_record(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """If somebody did create ``ns1 A 127.0.0.1``, it is a record like any
+    other: served, and counted in sync — not hidden into 'missing'."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="glue-db.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="ns1", record_type="A", value="127.0.0.1"))
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([_AGENT_GLUE]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+
+    (s,) = report.servers
+    assert (s.drift_count, s.in_sync) == (0, 1)

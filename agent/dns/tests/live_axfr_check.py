@@ -144,6 +144,88 @@ def _xfr(keyname: str | None, secret: str = _SECRET, algorithm: str = "hmac-sha2
         return False, type(exc).__name__
 
 
+def _xfr_www(keyname: str | None, secret: str = _SECRET) -> tuple[bool, str]:
+    """Attempt an AXFR and report WHICH copy came back: (ok, www's A value).
+
+    Under split-horizon the same zone name holds different data per view,
+    so "a transfer succeeded" proves nothing on its own — the value of the
+    ``www`` record is what says which view answered.
+    """
+    import dns.name
+    import dns.query
+    import dns.rdatatype
+    import dns.tsig
+    import dns.zone
+
+    kwargs = {}
+    if keyname is not None:
+        kn = dns.name.from_text(keyname)
+        algo = dns.name.from_text("hmac-sha256")
+        kwargs = {
+            "keyring": {kn: dns.tsig.Key(kn, secret, algorithm=algo)},
+            "keyname": kn,
+            "keyalgorithm": algo,
+        }
+    try:
+        z = dns.zone.from_xfr(
+            dns.query.xfr(
+                "127.0.0.1", dns.name.from_text(_ZONE), port=_PORT, timeout=10, **kwargs
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — every failure mode is a result here
+        return False, type(exc).__name__
+    www = z.get_rdataset("www", dns.rdatatype.A)
+    return True, ",".join(r.to_text() for r in www) if www else "<no www>"
+
+
+# #920 — split-horizon. Every name below is a TEST-NET range, so no view ever
+# matches 127.0.0.1 by address unless it says ``any``.
+_VIEW_SECRETS = {
+    "v-any": "dmlldy1hbnktdHJhbnNmZXIta2V5LXNlY3JldDAx",
+    "v-a": "dmlldy1hLXRyYW5zZmVyLWtleS1zZWNyZXQwMDE=",
+    "v-b": "dmlldy1iLXRyYW5zZmVyLWtleS1zZWNyZXQwMDE=",
+    "v-corp": "dmlldy1jb3JwLXRyYW5zZmVyLWtleS1zZWNyZXQx",
+}
+
+
+def _view_key(view: str) -> str:
+    return f"spatium_xfr_live_{view.replace('-', '_')}"
+
+
+def _views_bundle(views: list[tuple[str, list[str], str]]) -> dict:
+    """``views`` = [(name, match_clients, www address)], in precedence order.
+    The same zone name lives in every view, holding a different ``www``."""
+    base = _bundle()
+    base["views"] = [
+        {
+            "id": None,
+            "name": name,
+            "match_clients": clients,
+            "match_destinations": [],
+            "recursion": False,
+            "order": i,
+            "allow_query": None,
+            "allow_query_cache": None,
+            "transfer_key": {
+                "name": _view_key(name),
+                "secret": _VIEW_SECRETS[name],
+                "algorithm": "hmac-sha256",
+            },
+        }
+        for i, (name, clients, _addr) in enumerate(views)
+    ]
+    template = base["zones"][0]
+    base["zones"] = [
+        {
+            **template,
+            "view_name": name,
+            "records": [{"name": "www", "type": "A", "value": addr, "ttl": 300}],
+        }
+        for name, _clients, addr in views
+    ]
+    return base
+
+
 def _render(bundle: dict) -> tuple[Path, Path]:
     """Render ``bundle`` into a fresh state dir. Returns (state, named.conf)."""
     from spatium_dns_agent.drivers.bind9 import Bind9Driver  # noqa: PLC0415
@@ -269,6 +351,48 @@ def main() -> int:
         "operator key only (no legacy group key)",
         _bundle([{"name": _OPERATOR_KEY, "secret": _SECRET, "algorithm": "hmac-sha256"}]),
         operator_only_expectations,
+    )
+
+    # #920 — a view scoped to the operator's own clients. Before its transfer
+    # key existed, nothing admitted the control plane: the signed request
+    # selected no view and named answered BADKEY for a key it had loaded.
+    def scoped_view_expectations() -> None:
+        ok, detail = _xfr_www(_view_key("v-corp"), _VIEW_SECRETS["v-corp"])
+        check("scoped view: its transfer key reads the zone", ok and detail == "192.0.2.9", detail)
+
+        ok, detail = _xfr_www(None)
+        check("scoped view: unsigned is still REFUSED", not ok, detail)
+
+        ok, detail = _xfr_www(_view_key("v-corp"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        check("scoped view: a wrong secret on the view key is rejected", not ok, detail)
+
+    _run_case(
+        "split-horizon: a view that excludes the transfer source",
+        _views_bundle([("v-corp", ["198.51.100.0/24"], "192.0.2.9")]),
+        scoped_view_expectations,
+    )
+
+    # #920 — a broad view ahead of narrower ones. ``any`` matches 127.0.0.1,
+    # so without the refusals every view key would be answered from v-any's
+    # copy; with them each key reaches its own view.
+    def broad_first_view_expectations() -> None:
+        for view, addr in (("v-any", "192.0.2.1"), ("v-a", "192.0.2.2"), ("v-b", "192.0.2.3")):
+            ok, detail = _xfr_www(_view_key(view), _VIEW_SECRETS[view])
+            check(f"broad first view: {view}'s key reads {view}'s own copy", ok and detail == addr, detail)
+
+        ok, detail = _xfr_www(None)
+        check("broad first view: unsigned is still REFUSED", not ok, detail)
+
+    _run_case(
+        "split-horizon: a broad view ahead of narrower ones",
+        _views_bundle(
+            [
+                ("v-any", ["any"], "192.0.2.1"),
+                ("v-a", ["192.0.2.0/24"], "192.0.2.2"),
+                ("v-b", ["203.0.113.0/24"], "192.0.2.3"),
+            ]
+        ),
+        broad_first_view_expectations,
     )
 
     if _FAILURES:

@@ -21,6 +21,7 @@ import {
   XCircle,
   Loader2,
 } from "lucide-react";
+import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 
@@ -1498,16 +1499,22 @@ function ProviderModal({
 
   const typeHint = null;
 
+  const { dialogProps, titleProps } = useModalDialog(onClose);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
-      <div className="relative z-10 max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl border bg-card shadow-2xl">
+      <div
+        {...dialogProps}
+        className="relative z-10 max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl border bg-card shadow-2xl focus:outline-none"
+      >
         <div className="flex items-center justify-between border-b px-5 py-4">
-          <h2 className="font-semibold">
+          <h2 {...titleProps} className="font-semibold">
             {mode === "create" ? "New Auth Provider" : "Edit Auth Provider"}
           </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="rounded-md p-1 text-muted-foreground hover:bg-accent"
           >
             <X className="h-4 w-4" />
