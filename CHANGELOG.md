@@ -201,6 +201,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Worker task failures now reach Diagnostics (#1193).** None had
+  been recorded since the feature shipped (#123); failures in API
+  requests always were. The Celery `task_failure` hook opened a sync
+  database engine on a `postgresql://` URL, which needs psycopg2, and
+  the backend ships only asyncpg. So every failure logged
+  `diagnostics_capture_failed_sync` and recorded nothing, and because
+  the hook swallows its own errors, nothing else noticed. It now runs
+  the api's capture code on a fresh asyncpg engine, on a short-lived
+  thread of its own.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the
