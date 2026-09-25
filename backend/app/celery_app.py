@@ -75,6 +75,7 @@ celery_app = Celery(
         "app.tasks.schema_check",
         "app.tasks.wol_scheduler",
         "app.tasks.wol_calendar",
+        "app.tasks.agent_bundles",
     ],
 )
 
@@ -148,8 +149,23 @@ celery_app.conf.update(
         "app.tasks.schema_check.*": {"queue": "default"},
         "app.tasks.wol_scheduler.*": {"queue": "default"},
         "app.tasks.wol_calendar.*": {"queue": "default"},
+        # #1111 — DNS agent bundle renders. Their own queue so a 30–60 s
+        # render of a million-row group never sits in front of the
+        # latency-bound ipam/dns/dhcp work, and so an operator can give
+        # them a dedicated worker (concurrency 1, its own memory cap).
+        "app.tasks.agent_bundles.*": {"queue": "bundles"},
     },
     beat_schedule={
+        # #1111 — every 30 s, enqueue a render for any enabled agent-based
+        # DNS server whose newest stored bundle is behind its dirty
+        # sequence (or absent). The mutating transaction already enqueued
+        # one after commit; this is the belt and braces for a lost broker
+        # message or a worker restart mid-render, bounding staleness to
+        # one tick — the class of the long-poll's own 12 s wake tick.
+        "dns-agent-bundle-sweep": {
+            "task": "app.tasks.agent_bundles.render_missing_sweep",
+            "schedule": schedule(run_every=30.0),
+        },
         # Every 60 s, mark DNS agents as ``unreachable`` if their
         # heartbeat hasn't been seen within the staleness window
         # (issue #217 — this entry used to live in a separate
@@ -736,6 +752,15 @@ from celery.signals import task_failure  # noqa: E402
 # Use import_module (not a bound ``import … as _x``) so static analysis
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
+
+# #1111 — the after_flush listener that marks DNS agent bundles dirty in the
+# transaction that changes their inputs. It is installed by importing the
+# module, and nothing a worker imports reaches it otherwise (``app.main``
+# does, for the api only). Without it every DNS write a Celery task makes —
+# pool failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync, blocklist
+# refresh — commits unmarked: the stored bundle stays "current" and the new
+# ops are gated out of every ops page, so agents never receive them.
+importlib.import_module("app.services.dns.bundle_dirty")
 
 
 @task_failure.connect

@@ -191,6 +191,22 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _no_bundle_render_enqueue() -> Iterator[None]:
+    """#1111 — DNS writes mark agent bundles dirty and, after commit, publish
+    a render request to the Celery broker. The suite has no broker, so the
+    publish would fail (harmlessly, but on a thread, per DNS write). Tests of
+    the enqueue path monkeypatch the publisher itself."""
+    from app.config import settings as _settings
+
+    before = _settings.dns_agent_bundle_enqueue_renders
+    _settings.dns_agent_bundle_enqueue_renders = False
+    try:
+        yield
+    finally:
+        _settings.dns_agent_bundle_enqueue_renders = before
+
+
+@pytest.fixture(autouse=True)
 def _all_feature_modules_enabled() -> Iterator[None]:
     """Treat every catalog module as default-ENABLED for the suite.
 

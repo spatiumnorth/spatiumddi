@@ -124,7 +124,7 @@ services:
     restart: unless-stopped
     networks:
       - spatiumddi
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default,bundles
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi

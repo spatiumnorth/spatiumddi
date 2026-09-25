@@ -17,7 +17,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 
@@ -608,6 +608,211 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
     return value
 
 
+# ── Zone apex (issue #1153) ──────────────────────────────────────────────────
+#
+# The one name server the agent ever invents for a zone, and the one address it
+# ever invents for it. BIND loads a zone only if its apex has an NS, and only if
+# every NS inside the zone has an A/AAAA in it — so when a zone names no name
+# server of its own, the agent still has to write one. It is the last resort,
+# never written beside a name server the zone does name, and logged whenever it
+# is served. The control plane's drift / sync filter for this exact glue (#920,
+# ``_AGENT_NS_GLUE``) mirrors these values: keep the two in step.
+_PLACEHOLDER_NS_LABEL = "ns1"
+_PLACEHOLDER_NS_ADDRESS = "127.0.0.1"
+_PLACEHOLDER_RNAME_LABEL = "admin"
+
+# Characters a master-file name cannot carry unescaped. The same set as the
+# control plane's ``contains_zonefile_unsafe`` (backend app/core/dns_names.py),
+# which guards primary_ns / admin_email on write; checked again here because
+# rows written before that guard existed still reach the bundle.
+_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f]')
+
+
+def _absolute_name(value: Any) -> str | None:
+    """``value`` as an absolute domain name, or None if it cannot be one.
+
+    ``primary_ns`` and ``admin_email`` are stored in SOA form with or without
+    the trailing dot — the zone form's placeholders carry it, the importers
+    strip it — and the rest of the product reads both spellings as absolute
+    (the zone export appends the dot). The zone file has to as well: written
+    bare, BIND reads ``ns1.example.com`` relative to the zone and serves
+    ``ns1.example.com.<zone>``.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if (
+        not name
+        or name == "."
+        or not name.isascii()
+        or name.startswith(".")
+        or ".." in name
+        or _ZONEFILE_UNSAFE_RE.search(name)
+    ):
+        return None
+    return name if name.endswith(".") else name + "."
+
+
+def _zone_file_name(value: str, origin: str) -> str:
+    """How BIND reads ``value`` written into the file of zone ``origin``:
+    absolute when it ends in a dot, the apex for ``@`` or nothing, otherwise
+    relative to the apex. Record owners and NS targets are written verbatim,
+    so this is what they mean on the wire."""
+    v = (value or "").strip()
+    if v in ("", "@"):
+        return origin
+    return v if v.endswith(".") else f"{v}.{origin}"
+
+
+def _inside(name: str, origin: str) -> bool:
+    """Whether absolute ``name`` is the apex ``origin`` or below it."""
+    n, o = name.lower(), origin.lower()
+    return n == o or n.endswith("." + o)
+
+
+class ZoneApex(NamedTuple):
+    """What a zone file opens with — see ``_zone_apex``."""
+
+    soa_mname: str
+    soa_rname: str
+    # NS targets written at the apex by the renderer. Empty when the zone has
+    # NS records of its own: those are written with the rest of its records.
+    ns: tuple[str, ...]
+    # Write the placeholder glue ``ns1 IN A 127.0.0.1``.
+    placeholder_glue: bool
+    # ``(kind, detail)`` pairs, logged once per render by ``_log_apex_notes``.
+    notes: tuple[tuple[str, str], ...]
+
+
+def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
+    """The SOA and NS a zone's file opens with (issue #1153).
+
+    The NS set, most specific first:
+
+    1. The zone's own NS records at the apex. They are what the operator
+       declared, and what the delegation wizard copies into the parent, so they
+       are the whole NS set: nothing is written beside them.
+    2. Otherwise ``primary_ns``, if it can resolve: a name outside the zone
+       resolves wherever it lives; a name inside it needs an A/AAAA record in
+       the zone, and none is invented.
+    3. Otherwise the placeholder ``ns1.<zone>``, glued to 127.0.0.1 unless the
+       zone holds an address for ``ns1`` itself. That glue sends every
+       resolver that follows the zone's own NS set to loopback, so it is noted
+       for a warning.
+
+    The SOA MNAME is ``primary_ns``, else the first declared NS, else the
+    placeholder; the RNAME is ``admin_email``, else ``admin.<zone>``. Before
+    this, every zone got the placeholder SOA, NS and glue whatever it held:
+    ``primary_ns`` and ``admin_email`` never reached the agent, and a zone's own
+    NS records were served beside ``ns1.<zone>``.
+    """
+    raw = str(zone.get("name") or "")
+    origin = raw if raw.endswith(".") else raw + "."
+    notes: list[tuple[str, str]] = []
+
+    addressed: set[str] = set()
+    declared_ns: list[str] = []
+    for rec in zone.get("records") or []:
+        rtype = str(rec.get("type") or "").upper()
+        owner = _zone_file_name(str(rec.get("name") or ""), origin)
+        if rtype in ("A", "AAAA"):
+            addressed.add(owner.lower())
+        elif rtype == "NS" and owner.lower() == origin.lower():
+            declared_ns.append(_zone_file_name(str(rec.get("value") or ""), origin))
+
+    primary_ns = _absolute_name(zone.get("primary_ns"))
+    admin = _absolute_name(zone.get("admin_email"))
+    for field, parsed in (("primary_ns", primary_ns), ("admin_email", admin)):
+        if parsed is None and str(zone.get(field) or "").strip():
+            notes.append(("unusable_field", f"{field}={zone.get(field)!r}"))
+
+    placeholder = f"{_PLACEHOLDER_NS_LABEL}.{origin}"
+    apex_ns: tuple[str, ...]
+    if declared_ns:
+        apex_ns = ()
+        ns_set = declared_ns
+    elif primary_ns is not None and (
+        not _inside(primary_ns, origin) or primary_ns.lower() in addressed
+    ):
+        apex_ns = (primary_ns,)
+        ns_set = [primary_ns]
+    else:
+        if primary_ns is not None:
+            notes.append(("unaddressed_primary_ns", primary_ns))
+        apex_ns = (placeholder,)
+        ns_set = [placeholder]
+
+    ns_lower = {n.lower() for n in ns_set}
+    placeholder_glue = (
+        placeholder.lower() in ns_lower and placeholder.lower() not in addressed
+    )
+    if placeholder_glue:
+        notes.append(("placeholder", placeholder))
+    for n in declared_ns:
+        low = n.lower()
+        if _inside(n, origin) and low not in addressed and low != placeholder.lower():
+            notes.append(("unaddressed_ns", n))
+
+    mname = primary_ns or (declared_ns[0] if declared_ns else placeholder)
+    rname = admin or f"{_PLACEHOLDER_RNAME_LABEL}.{origin}"
+    return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
+
+
+_APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
+    "placeholder": (
+        "bind9_zone_apex_ns_is_loopback",
+        (
+            "These zones name no name server of their own (no Primary NS, no "
+            "NS record at the apex), so they are served with the placeholder "
+            "NS ns1.<zone> and its glue ns1 A 127.0.0.1. A resolver that "
+            "follows a zone's own NS set is sent to loopback. Set the zone's "
+            "Primary NS (with an A/AAAA record for it if it is inside the "
+            "zone), or add NS records at the apex."
+        ),
+    ),
+    "unaddressed_primary_ns": (
+        "bind9_zone_primary_ns_has_no_address",
+        (
+            "The zone's Primary NS is inside the zone, but the zone holds no "
+            "A/AAAA record for it, and BIND will not load a zone whose NS has "
+            "no address. The placeholder NS was served instead. Add the "
+            "address record."
+        ),
+    ),
+    "unaddressed_ns": (
+        "bind9_zone_ns_record_has_no_address",
+        (
+            "An NS record at the zone apex names a host inside the zone that "
+            "has no A/AAAA record in it. BIND will not load such a zone. Add "
+            "the address record."
+        ),
+    ),
+    "unusable_field": (
+        "bind9_zone_soa_field_unusable",
+        (
+            "The zone's Primary NS or Admin Email is not a usable domain name "
+            "and was ignored."
+        ),
+    ),
+}
+
+
+def _log_apex_notes(notes: list[tuple[str, str, str]]) -> None:
+    """One warning per kind per render, from ``(zone, kind, detail)`` triples.
+
+    Aggregated rather than per zone: the placeholder is still every zone's
+    apex on an install where nobody has set a Primary NS, and under views a
+    group re-renders on every record change.
+    """
+    by_kind: dict[str, set[str]] = {}
+    for zname, kind, detail in notes:
+        entry = zname if kind == "placeholder" else f"{zname} ({detail})"
+        by_kind.setdefault(kind, set()).add(entry)
+    for kind, entries in by_kind.items():
+        event, text = _APEX_NOTE_LOG[kind]
+        log.warning(event, count=len(entries), sample=sorted(entries)[:5], detail=text)
+
+
 # DNSSEC algorithm name → IANA number (issue #49). Used when parsing
 # ``rndc dnssec -status`` output, which prints the algorithm by name.
 _DNSSEC_ALGO_NUM: dict[str, int] = {
@@ -857,6 +1062,10 @@ class Bind9Driver(DriverBase):
         # where BIND auto-generates + rotates the private keys.
         conf += _render_dnssec_policies(bundle.get("dnssec_policies") or [])
 
+        # ``(zone, kind, detail)`` from every zone file written below — logged
+        # once, aggregated, after the loop (issue #1153).
+        apex_notes: list[tuple[str, str, str]] = []
+
         def _zone_stanza(zone: dict[str, Any], file_prefix: str) -> str:
             """Build one ``zone "..." { ... };`` and write its zone file.
 
@@ -942,7 +1151,8 @@ class Bind9Driver(DriverBase):
             if zone.get("dnssec_enabled"):
                 pol = zone.get("dnssec_policy_name") or "default"
                 dnssec_clause = f'dnssec-policy "{pol}"; inline-signing yes; '
-            self._write_zone_file(new_dir / rel_zfile, zone)
+            for kind, detail in self._write_zone_file(new_dir / rel_zfile, zone):
+                apex_notes.append((zname.rstrip("."), kind, detail))
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"{update_clause}{allow_transfer}{dnssec_clause}}};\n"
@@ -1071,6 +1281,7 @@ class Bind9Driver(DriverBase):
             for bl in blocklists:
                 conf += _rpz_stanza(bl, "")
 
+        _log_apex_notes(apex_notes)
         (new_dir / "named.conf").write_text(conf)
 
         # TSIG keys — written to tsig/ddns.key (stable path). ALL keys in
@@ -1199,21 +1410,26 @@ class Bind9Driver(DriverBase):
             lines.append(f"{digest}.zones IN PTR {text_with_dot}")
         path.write_text("\n".join(lines) + "\n")
 
-    def _write_zone_file(self, path: Path, zone: dict[str, Any]) -> None:
+    def _write_zone_file(
+        self, path: Path, zone: dict[str, Any]
+    ) -> tuple[tuple[str, str], ...]:
+        """Write one primary zone's file; returns its apex notes for the
+        caller to log once per render (``_log_apex_notes``)."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        name = zone.get("name") or ""
         ttl = zone.get("ttl", 3600)
         serial = zone.get("serial") or 1
-        # Auto-emit a self-referential glue A record so BIND9 accepts the
-        # zone even when the user didn't explicitly add `ns1 IN A …`.
-        # 127.0.0.1 is fine for dev; production should set primary_ns + glue
-        # explicitly via the zone create form.
+        # The apex comes from the zone's own primary_ns / admin_email / NS
+        # records (issue #1153). The placeholder ``ns1.<zone>`` + ``ns1 A
+        # 127.0.0.1`` is left only for a zone that names no name server —
+        # BIND will not load a zone without one — and is logged when served.
+        apex = _zone_apex(zone)
         lines = [
             f"$TTL {ttl}",
-            f"@ IN SOA ns1.{name} admin.{name} ( {serial} 3600 600 86400 300 )",
-            f"@ IN NS ns1.{name}",
-            "ns1 IN A 127.0.0.1",
+            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} 3600 600 86400 300 )",
+            *(f"@ IN NS {ns}" for ns in apex.ns),
         ]
+        if apex.placeholder_glue:
+            lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
         for rec in zone.get("records", []) or []:
             rec_ttl = rec.get("ttl") or ttl
             name_field = rec.get("name") or "@"
@@ -1236,6 +1452,7 @@ class Bind9Driver(DriverBase):
                 value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
+        return apex.notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file.
