@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -29,6 +30,13 @@ from app.services import (
     event_publisher,  # noqa: F401
 )
 from app.services.feature_modules import require_module
+
+# #1111 — same idea: the after_flush listener that marks DNS agent bundles
+# dirty in the transaction that changes their inputs must be attached before
+# any request handler writes a DNS row. ``app.celery_app`` loads it the same
+# way for the worker and beat. import_module, not a bound import, so static
+# analysis doesn't flag a side-effect-only import as unused.
+importlib.import_module("app.services.dns.bundle_dirty")
 
 logger = structlog.get_logger(__name__)
 
@@ -537,6 +545,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_daemon_degraded_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_daemon_degraded_alert_rule_seed_skipped", reason=str(exc))
+    # #1111 — the mirror image: the control plane could not RENDER a DNS
+    # agent's bundle. Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_bundle_render_failed_alert_rule,
+        )
+
+        await seed_agent_bundle_render_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
