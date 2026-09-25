@@ -83,6 +83,7 @@ from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
@@ -543,6 +544,26 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #1111 — the stored agent config bundle: what the long-poll serves and
+    # when it was rendered, whether the newest render is behind the changes
+    # made since (watermark < dirty_seq), how many renders this server has
+    # had (the "builds per change" number), and the CONTROL PLANE's own
+    # verdict on its last render — distinct from the agent's #882 verdict
+    # above, which is about applying what it was sent.
+    bundle_etag: str | None = None
+    bundle_built_at: datetime | None = None
+    bundle_rendered_by: str | None = None
+    bundle_watermark: int | None = None
+    bundle_dirty_seq: int = 0
+    bundle_render_count: int = 0
+    bundle_render_status: str | None = None
+    bundle_render_error: str | None = None
+    bundle_render_at: datetime | None = None
+    # The release that rendered the stored bundle (a mismatch with the
+    # running one means the upgrade's re-render is still pending), and when
+    # the stored bundle fell behind — NULL while it is current.
+    bundle_app_version: str | None = None
+    bundle_dirty_at: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -584,6 +605,17 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            bundle_etag=s.bundle_etag,
+            bundle_built_at=s.bundle_built_at,
+            bundle_rendered_by=s.bundle_rendered_by,
+            bundle_watermark=s.bundle_watermark,
+            bundle_dirty_seq=s.bundle_dirty_seq,
+            bundle_render_count=s.bundle_render_count,
+            bundle_render_status=s.bundle_render_status,
+            bundle_render_error=s.bundle_render_error,
+            bundle_render_at=s.bundle_render_at,
+            bundle_app_version=s.bundle_app_version,
+            bundle_dirty_at=s.bundle_dirty_at,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
@@ -4748,8 +4780,18 @@ async def update_zone(
         dnssec_flip = "dnssec_sign" if changes["dnssec_enabled"] else "dnssec_unsign"
         if dnssec_flip == "dnssec_sign":
             await _check_driver_gated_operation(dnssec_flip, group_id, db)
+    # #1153 — the agent renders the SOA MNAME / RNAME (and, for a zone with no
+    # NS records of its own, the apex NS) from these two fields. A new apex
+    # served under the old serial never reaches a secondary: it transfers only
+    # when the serial moves.
+    apex_changed = any(
+        k in changes and (changes[k] or "") != (getattr(zone, k) or "")
+        for k in ("primary_ns", "admin_email")
+    )
     for k, v in changes.items():
         setattr(zone, k, v)
+    if apex_changed:
+        bump_zone_serial(zone)
     if dnssec_flip == "dnssec_sign":
         await enqueue_dnssec_op(db, zone, "dnssec_sign")
     elif dnssec_flip == "dnssec_unsign":
@@ -5126,6 +5168,10 @@ async def _replace_update_acl_rows(
 
     # Replace: drop existing rows, insert the new ordered set (seq = position).
     await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
+    # #1111 — a Core delete is invisible to the bundle dirty-mark listener.
+    # Clearing the ACL to an empty list writes nothing else, so without this
+    # the agents keep serving the revoked ``allow-update``.
+    await mark_bundles_dirty(db, zone_ids=[zone.id])
     for seq, e in enumerate(body.entries):
         db.add(
             DNSZoneUpdateAcl(

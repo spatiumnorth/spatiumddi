@@ -27,6 +27,14 @@ does ``mkdir -p`` before it writes, so a path whose disk is absent
 would be *created* and written to — landing archives on the
 appliance's own ``/var`` while the run reports success. See
 :func:`_assert_removable_disk_present`.
+
+The same ``mkdir -p`` hides a quieter trap on every deployment (#1160):
+a path no volume covers is still writable — it is the container's own
+filesystem — so the probe passes and every run "succeeds", while each
+archive exists only inside the one container that wrote it. Scheduled
+runs execute in the worker, so the api never lists them, and all of them
+are gone at the next recreate. ``test_connection`` warns about that; see
+:func:`_not_on_a_volume_warning`.
 """
 
 from __future__ import annotations
@@ -70,10 +78,12 @@ class LocalVolumeDestination(BackupDestination):
             type="text",
             required=True,
             description=(
-                "Absolute path on the api/worker container. Mount "
-                "this as a docker / k8s volume in production so "
-                "archives survive container recycle. Default dev "
-                "mount: /var/lib/spatiumddi/backups."
+                "Absolute path inside the api and worker containers. It "
+                "must be a volume mounted on both: the worker writes "
+                "scheduled runs and the api lists and restores them. The "
+                "Docker Compose file and the appliance mount "
+                "/var/lib/spatiumddi/backups that way; Test connection "
+                "warns when a path is not on a volume."
             ),
         ),
         ConfigFieldSpec(
@@ -250,7 +260,47 @@ class LocalVolumeDestination(BackupDestination):
                 "ok": False,
                 "error": (f"wrote probe but it didn't appear at {root} — check permissions"),
             }
-        return {"ok": True, "detail": f"wrote + verified + deleted probe under {root}"}
+        outcome: dict[str, Any] = {
+            "ok": True,
+            "detail": f"wrote + verified + deleted probe under {root}",
+        }
+        # After the probe, so ``root`` exists and the walk starts at it.
+        # A warning, not a failure: the write works — until the
+        # container is replaced (#1160).
+        warning = await asyncio.to_thread(_not_on_a_volume_warning, root)
+        if warning:
+            outcome["warning"] = warning
+        return outcome
+
+
+def _not_on_a_volume_warning(root: Path) -> str | None:
+    """Why ``root`` is a trap, or ``None`` when it is on a mounted volume.
+
+    Every supported deployment runs the api and the worker in containers
+    (Docker Compose, Kubernetes, the appliance's k3s). Inside one, the
+    nearest mountpoint of a path no volume covers is ``/`` — the
+    container's own writable layer. Writing there succeeds, which is the
+    whole problem (#1160): the archive exists only in the container that
+    wrote it, so a scheduled run (the worker's) is never listed by the
+    api, and every archive is gone at the next recreate — each upgrade
+    included. The probe cannot see any of that.
+
+    Same :func:`_nearest_mountpoint` walk as the removable-disk guard, so
+    the two agree on what "mounted" means; a path under a mounted parent
+    (a per-target subdirectory of the volume) counts as mounted.
+    """
+    if _nearest_mountpoint(root) != Path("/"):
+        return None
+    return (
+        f"{root} is not on a mounted volume: it is inside this container's "
+        "own filesystem. Archives written here are lost when the container "
+        "is recreated (every upgrade does that), and scheduled runs, which "
+        "the worker performs, land in the worker's filesystem, where they "
+        "are never listed here and cannot be downloaded or restored. Mount "
+        "one volume at this path on both the api and the worker (the "
+        "Docker Compose file's spatium_backups does that for "
+        "/var/lib/spatiumddi/backups), or use a network destination."
+    )
 
 
 def _nearest_mountpoint(path: Path) -> Path:

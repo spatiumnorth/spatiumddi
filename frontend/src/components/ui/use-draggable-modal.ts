@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 /** CSS for the outer flex-center backdrop. Same across every modal. */
 export const MODAL_BACKDROP_CLS =
@@ -142,4 +142,38 @@ export function useFocusTrap<T extends HTMLElement>() {
     };
   }, []);
   return ref;
+}
+
+/**
+ * The shared ``Modal``'s dialog contract, for a shell that draws its own
+ * card (#1156): the custom shapes built on ``useDraggableModal`` +
+ * ``MODAL_BACKDROP_CLS``, and the page-local overlays. ``Modal`` gives its
+ * card ``role="dialog"``, ``aria-modal`` and a name, traps focus, and closes
+ * on Esc. A shell without them was announced as a heading and an unnamed
+ * button, and page code asking "is a dialog open?" — the shortcuts
+ * overlay's stacking guard, the DNS zone's ``n`` shortcut — could not see
+ * it, so a second dialog could open on top.
+ *
+ * Spread ``dialogProps`` on the card, ``titleProps`` on its heading (the
+ * dialog is named by it), and give an icon-only close button
+ * ``aria-label="Close dialog"`` as ``Modal`` does. A shell that drags also
+ * puts ``dialogStyle`` on the card and ``dragHandleProps`` on its title
+ * bar; one that never dragged leaves both off and keeps its layout. Esc
+ * closes either (bound by ``useDraggableModal``).
+ */
+export function useModalDialog(onClose: () => void) {
+  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const ref = useFocusTrap<HTMLDivElement>();
+  const titleId = useId();
+  return {
+    dialogProps: {
+      ref,
+      role: "dialog",
+      "aria-modal": true,
+      "aria-labelledby": titleId,
+    } as const,
+    titleProps: { id: titleId },
+    dialogStyle,
+    dragHandleProps,
+  };
 }

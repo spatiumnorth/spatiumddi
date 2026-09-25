@@ -368,7 +368,7 @@ class FindVrfLearnedRoutesArgs(BaseModel):
     name="find_vrf_learned_routes",
     description=(
         "List BGP Looking Glass routes matched to a VRF by Route-Target "
-        "cross-check (issue #566 Phase 6) — the routes whose "
+        "cross-check — the routes whose "
         "extended-community route target fell in the VRF's import/export "
         "lists at ingest (falling back to whichever route just happens to "
         "fall under the VRF's IPAM block/space when there's no RT hit). "
@@ -404,7 +404,7 @@ class FindMulticastBgpReachabilityArgs(BaseModel):
     description=(
         "Cross-reference multicast PIM domains' rendezvous-point addresses "
         "and multicast groups' producer source subnets against the BGP "
-        "Looking Glass learned RIB (issue #566 Phase 6) — is the RP / "
+        "Looking Glass learned RIB — is the RP / "
         "source actually reachable per the current routing table? Use for "
         "'is our multicast RP reachable?' or 'is this source subnet "
         "actually being routed?' sanity checks."

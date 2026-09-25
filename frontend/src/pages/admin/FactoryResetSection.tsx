@@ -16,7 +16,7 @@ import {
 } from "@/lib/api";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 
 /**
@@ -217,7 +217,8 @@ function ResetModal({
   section: FactoryResetSection;
   onClose: () => void;
 }) {
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
   const qc = useQueryClient();
   const [phrase, setPhrase] = useState("");
   const [password, setPassword] = useState("");
@@ -262,14 +263,18 @@ function ResetModal({
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
+        {...dialogProps}
         style={dialogStyle}
-        className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border bg-card shadow-lg"
+        className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border bg-card shadow-lg focus:outline-none"
       >
         <div
           {...dragHandleProps}
           className={`border-b px-5 py-3 ${dragHandleProps.className}`}
         >
-          <h3 className="flex items-center gap-2 text-sm font-semibold">
+          <h3
+            {...titleProps}
+            className="flex items-center gap-2 text-sm font-semibold"
+          >
             {section.kind === "everything" ? (
               <Flame className="h-4 w-4 text-destructive" />
             ) : (

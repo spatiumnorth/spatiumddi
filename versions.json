@@ -495,6 +495,32 @@
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/alpine", "track": "^3\\.[0-9]+$" },
       "note": "Bumped 3.23 -> 3.24 in #1037, which discharged the hold #975 corrected. It carried the agents Python 3.12 -> 3.14.7 (NOT 3.13, which the dependabot.yml comment claimed for a year) plus pdns 5.0.5 -> 5.0.7, dnsdist -> 2.0.8 and bind -> 9.20.27; Kea stays 3.0.3. The Python move is the sharp part: the agent is installed into /usr/local/lib/python<X.Y>/site-packages and found only via PYTHONPATH, so a base bump without a matching PYTHONPATH builds a clean image that CrashLoopBackOffs with ModuleNotFoundError (#672). PYTHONPATH now interpolates the PYTHON_VERSION arg -- which was declared and referenced by NOTHING in four of these images until #1037 -- and each image asserts `import <agent>` at build time, so a mismatch is a failed build rather than a failed pod. Dependabot still ignores Alpine minors: the next move is a deliberate task for the same reason, not a bot bump."
+    },
+    "swagger-ui": {
+      "version": "5.33.0",
+      "pinned_in": [
+        { "path": "backend/app/static/api-docs/README.md", "match": "swagger-ui-dist@{version}", "count": 2 },
+        {
+          "path": "docs/THIRD_PARTY.md",
+          "match": "[Swagger UI](https://github.com/swagger-api/swagger-ui) {version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "github-release", "repo": "swagger-api/swagger-ui", "track": "^v5\\." },
+      "note": "The swagger-ui-dist browser bundle behind /api/docs, vendored byte-for-byte into backend/app/static/api-docs/ so the page runs under the web tier's script-src 'self' and on an air-gapped install (#1157). Dependabot cannot see it. Bump by re-vendoring as that directory's README says; it records each file's SHA-256, which backend/tests/test_api_docs_self_hosted.py holds the files to. Tracks 5.x, FastAPI's own default major. After a bump, load /api/docs through the web tier and read the browser console: a bundle that starts needing eval, an inline script or another origin shows up there as a CSP violation, not as a test failure."
+    },
+    "redoc": {
+      "version": "2.5.4",
+      "pinned_in": [
+        { "path": "backend/app/static/api-docs/README.md", "match": "redoc@{version}", "count": 2 },
+        {
+          "path": "docs/THIRD_PARTY.md",
+          "match": "[ReDoc](https://github.com/Redocly/redoc) {version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "github-release", "repo": "Redocly/redoc", "track": "^v2\\." },
+      "note": "The redoc standalone bundle behind /api/redoc, vendored the same way and for the same reasons as swagger-ui (#1157). Tracks 2.x, FastAPI's own default major (3.x is still a release candidate on npm's `next` tag). The same after-bump check applies: load /api/redoc through the web tier and read the console."
     }
   },
 

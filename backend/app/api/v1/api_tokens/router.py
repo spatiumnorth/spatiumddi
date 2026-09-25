@@ -16,8 +16,11 @@ we can add them later without a migration.
   stored. Never logged.
 - The DB stores only ``token_hash`` (sha256) and a short ``prefix``
   for identification in the UI.
-- ``last_used_at`` is bumped by the auth middleware on every
-  successful call so operators can tell live tokens from dead ones.
+- ``last_used_at`` records when the token was last used, reads
+  included, to the minute: it is written at most once a minute per
+  token, in a transaction of its own
+  (``app.api.deps._record_api_token_use``, #1158), so operators can
+  tell live tokens from dead ones.
 - Revocation is soft (``is_active=False``). Hard delete is allowed
   too — both just reject future calls with 401.
 """

@@ -97,10 +97,9 @@ function VrfRoutesPanel({ vrf }: { vrf: VRF }) {
     <div className="space-y-2">
       <p className="text-xs text-muted-foreground">
         Every active BGP Looking Glass route whose matched IPAM block or space
-        carries this VRF, or (issue #566 Phase 6) whose VPNv4/VPNv6 Route Target
-        matched this VRF's import/export lists directly. The "Route targets"
-        column highlights which of this VRF's RTs a route's extended communities
-        hit.
+        carries this VRF, or whose VPNv4/VPNv6 Route Target matched this VRF's
+        import/export lists directly. The "Route targets" column highlights
+        which of this VRF's RTs a route's extended communities hit.
       </p>
       <BgpRouteMiniTable items={items} vrfRtContext={rtContext} />
     </div>
