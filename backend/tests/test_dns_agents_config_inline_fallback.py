@@ -268,20 +268,21 @@ async def test_a_server_that_never_had_a_bundle_is_built_inline_at_once(
 
 
 @pytest.mark.asyncio
-async def test_a_bundle_from_another_release_with_nothing_changed_waits_for_the_sweep(
+async def test_a_bundle_from_an_older_renderer_with_nothing_changed_waits_for_the_sweep(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     bounded: None,
     redis_ok: object,
 ) -> None:
-    """An upgrade between two releases that both store bundles: each is
-    re-rendered once by the worker's sweep, not by every polling api."""
+    """An upgrade to a release with a newer renderer revision (#1185): each
+    server is re-rendered once by the worker's sweep, not by every polling
+    api."""
     server, headers = await _agent(db_session)
     await db_session.commit()
     await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
     await db_session.commit()
-    monkeypatch.setattr(settings, "version", "the-next-release")
+    monkeypatch.setattr(store, "RENDERER_REVISION", store.RENDERER_REVISION + 1)
     calls = _count_inline(monkeypatch)
     polled = await client.get(CONFIG_URL, headers=headers)
     assert polled.status_code == 304, polled.text

@@ -129,12 +129,17 @@ the formatter handles the rest.
   the bundle renders marks it: the pool health check's timestamps, the
   agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
   settings stamps do not, because every mark costs a render. The
-  long-poll serves the newest bundle the running release stored, current
-  or not. Under a write storm no render is current until the writes
-  stop, and each one that lands reaches the agents. A bundle rendered by
-  a previous release is never served, so an upgrade re-renders each
-  server once. The ops page, and the queued ops a split-horizon render
-  retires, cover only the ops whose transaction had committed before the
+  long-poll serves the newest stored bundle, current or not. Under a
+  write storm no render is current until the writes stop, and each one
+  that lands reaches the agents. Each bundle records the renderer
+  revision that produced it (#1185). One from an older revision is never
+  served, so an upgrade that changes the renderer re-renders each server
+  once, and one that doesn't re-renders nothing. An older process never
+  replaces a newer render, so the old and new pods of a rolling upgrade
+  don't undo each other's; a test fails when the rendered output changes
+  without a revision bump. The ops page, and the queued ops a
+  split-horizon render retires, cover only the ops whose transaction
+  had committed before the
   render read (its `pg_current_snapshot()`, not the op's `created_at`,
   which is its transaction's start). So a body can never lack a record
   the agent already applied, and an ACME DNS-01 wait never sees an op
@@ -160,8 +165,8 @@ the formatter handles the rest.
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
   instead of re-sending the whole body. Migrations `c4d1e7f90a2b`,
-  `d9a4c27e18f3` and `f3a9d61c07e4` (additive: one table, fourteen
-  nullable-or-defaulted columns, no table rewrite).
+  `d9a4c27e18f3`, `f3a9d61c07e4` and `e6b2d94f1a37` (additive: one
+  table, sixteen nullable-or-defaulted columns, no table rewrite).
 - **The bundle's records query orders by the `(zone_id, name)` index
   prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
   UUID, so the planner sorted the whole table on every build. The
