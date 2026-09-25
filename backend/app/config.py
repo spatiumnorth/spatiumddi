@@ -102,6 +102,38 @@ class Settings(BaseSettings):
     # one response — 500k ops took the api to 4.2 GB and a memcg kill on
     # every poll (appliance sizing campaign, 2026-09-02/03).
     dns_agent_ops_batch: int = 5000
+    # #1111 — the bundle is rendered once per (server, watermark) and stored
+    # in ``dns_agent_bundle``; this many versions per server are kept (the
+    # agent's own N-1 rule, #882), older ones are pruned on store.
+    dns_agent_bundle_keep_versions: int = 2
+    # After a commit that dirtied a bundle, publish the render request to the
+    # worker (the 30 s render-missing sweep is the backstop either way). Off
+    # only for test suites that have no broker.
+    dns_agent_bundle_enqueue_renders: bool = True
+    # The per-server render lock and the fleet-wide render slot are a lease
+    # of this many seconds, renewed every third of it for as long as the
+    # render runs. A render killed mid-flight (the OOM killer never runs its
+    # ``finally``) frees both within one lease, instead of holding every
+    # server's render for as long as a render may take.
+    dns_agent_bundle_render_lease_seconds: int = 60
+    # The long-poll serves stored bundles only. While this is on — the
+    # migration release, whose worker may still be one release behind — a
+    # missing or stale bundle is built inline in the request exactly as
+    # before, once per (server, version), because it stores what it built.
+    # Default off once the worker path is proven.
+    dns_agent_bundle_inline_fallback: bool = True
+    # The fallback is bounded (#1111): the api builds a server's bundle
+    # itself only when the server has never had one (the upgrade from a
+    # release before stored bundles), or when its stale bundle has waited
+    # this long for the worker (from ``bundle_dirty_at``, which every render
+    # that lands restarts). While renders keep landing it never builds, so a
+    # change storm costs the api nothing; with no worker rendering, agents
+    # are still served within this bound.
+    dns_agent_bundle_inline_fallback_after_seconds: int = 120
+    # After an inline attempt fails (at a million records the records query
+    # outlives the api's 30 s command_timeout) no replica tries that server
+    # again for this long. One attempt per server at a time across replicas.
+    dns_agent_bundle_inline_fallback_backoff_seconds: int = 600
 
     # DHCP agent
     dhcp_agent_key: str = ""
