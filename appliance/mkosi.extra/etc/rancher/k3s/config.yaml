@@ -143,3 +143,40 @@ kubelet-arg:
   # Surface log path with a known location so spatium-console + the
   # control-plane log streamer can tail it.
   - log-flush-frequency=5s
+  # Memory-pressure eviction (issue #1124). k3s's own kubelet defaults set
+  # eviction thresholds for the two DISK signals only — nodefs.available and
+  # imagefs.available at 5 % — and drop the kubelet's upstream
+  # memory.available<100Mi. With no memory signal, memory exhaustion never
+  # reaches the kubelet's eviction manager, which evicts by PriorityClass
+  # (#983: observability, then the control plane, then DNS/DHCP); it reaches
+  # the kernel's global OOM killer, which kills by oom_score_adj — and on a
+  # 6 GiB node beside a Guaranteed hog that was the api's uvicorn, reported as
+  # a container restart with reason "Error", not "OOMKilled", because the kill
+  # came from the host and not from the pod's cgroup.
+  #
+  # --eviction-hard REPLACES k3s's map (flags win over the config file), so the
+  # two disk floors are restated here unchanged. The memory threshold is an
+  # absolute quantity, not a percentage: on cgroup v2 the eviction manager has
+  # no memcg notifier and polls every 10 s, so the runway it needs follows the
+  # allocation RATE, not the node size — 512Mi covers about 50 MiB/s for one
+  # poll. It is also what the kubelet takes off Allocatable.
+  - eviction-hard=memory.available<512Mi,nodefs.available<5%,imagefs.available<5%
+  # How long MemoryPressure=True is held after the signal clears. Kubernetes'
+  # default (k3s's too) is 5m, and the node.kubernetes.io/memory-pressure
+  # taint keeps every non-DaemonSet pod — the evicted api's replacement first
+  # of all — off the node for the whole period. On a single-node appliance
+  # that IS the outage. 30s still damps flapping and lets the replacement
+  # schedule within the minute.
+  - eviction-pressure-transition-period=30s
+  # What the node's own daemons hold, taken off Allocatable and off the
+  # kubepods cgroup cap (enforce-node-allocatable=pods is the default; no
+  # cgroup limit is put on the host daemons themselves): k3s's server process
+  # with its embedded containerd and the shims (~1.2 GiB idle on a 6 GiB
+  # node), and systemd, journald, dbus, NetworkManager, chrony and the console
+  # (~0.4 GiB). Together with the hard threshold this reserves 2 GiB — the
+  # platform reserve the control-plane sizing budgets from (#1115) — so on a
+  # 6 GiB node Allocatable is 3883Mi and on 8 GiB 5899Mi, and a pod set that
+  # grows into the reserve meets the eviction manager instead of the kernel.
+  # These three numbers are the knob if a deployment wants a different split.
+  - kube-reserved=memory=1Gi
+  - system-reserved=memory=512Mi

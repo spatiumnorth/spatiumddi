@@ -53,7 +53,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
+from app.services.dhcp.radvd import build_ra_config, render_radvd_conf, resolve_dnssl
 from app.services.e911 import effective_subnet_erls
 from app.services.e911.dhcp_options import kea_option_data
 from app.services.feature_modules import is_module_enabled
@@ -328,11 +328,16 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 lease_time=sc.lease_time,
                 min_lease_time=sc.min_lease_time,
                 max_lease_time=sc.max_lease_time,
-                options=_with_location_options(
-                    location_erls,
+                options=_with_v6_domain_search(
+                    _with_location_options(
+                        location_erls,
+                        subnet,
+                        dict(sc.options or {}),
+                        address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
+                    ),
                     subnet,
-                    dict(sc.options or {}),
                     address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
+                    v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",
                 ),
                 pools=pools,
                 statics=statics,
@@ -670,6 +675,37 @@ async def _assemble_device_policy_classes(
 
 
 __all__ = ["ConfigBundle", "build_config_bundle"]
+
+
+def _with_v6_domain_search(
+    options: dict[str, Any],
+    subnet: Subnet,
+    *,
+    address_family: str,
+    v6_address_mode: str,
+) -> dict[str, Any]:
+    """Default a DHCPv6 scope's domain-search list (option 24) the way the
+    router advertisement's DNSSL already is (#1141).
+
+    ``radvd.resolve_dnssl`` falls back from the scope's ``domain-search`` to
+    its ``domain-name`` to the subnet's ``domain_name``; DHCPv6 had only the
+    first, so a v6 client using stateful or stateless DHCPv6 got no search
+    list from the server while the RA on the same link carried one. Using the
+    same function means the two can never disagree about what the list is.
+
+    A scope that sets ``domain-search`` itself — under either key spelling
+    the renderers accept — keeps it untouched. ``slaac`` scopes render no
+    option-data at all, so nothing is added there (and the bundle stays
+    byte-identical for them).
+    """
+    if address_family != "ipv6" or v6_address_mode == "slaac":
+        return options
+    if options.get("domain-search") or options.get("domain_search"):
+        return options
+    search = resolve_dnssl(options, getattr(subnet, "domain_name", None))
+    if not search:
+        return options
+    return {**options, "domain-search": search}
 
 
 def _with_location_options(

@@ -5211,6 +5211,33 @@ export interface ConfigApplyFields {
   config_apply_at: string | null;
 }
 
+/**
+ * Daemon state an agent reported on its heartbeat (#1067), shared by DNS and
+ * DHCP servers.
+ *
+ * `daemon_status` is the agent's own word: `ok` while the daemon is up,
+ * `degraded` otherwise — a DNS agent waiting for its first bundle, a Kea
+ * whose control socket is unreachable, or either agent echoing a failed
+ * config apply (#882). `null` means the agent has never reported one — a
+ * pre-#1061 agent, or an agentless driver — and renders as unknown, never as
+ * healthy. `daemon_status_since` is when the CURRENT state began; a repeated
+ * report never moves it.
+ *
+ * `daemon_not_serving` is the server's one reading of the three, and the
+ * field to render from: `true` when the daemon is not serving; `false` on
+ * `ok`, or when the `degraded` is a config-apply echo (the config-apply chip
+ * already shows that, at #882's severity, and a reverted daemon IS serving);
+ * `null` when never reported. Re-deriving "not serving" from `daemon_status`
+ * is what put a red chip on every routine revert while the alert, which
+ * reads the same classification as this field, stayed quiet.
+ */
+export interface DaemonStateFields {
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  daemon_not_serving: boolean | null;
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -5248,6 +5275,11 @@ export interface DNSServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7974,6 +8006,11 @@ export interface DHCPServer {
   config_apply_at: string | null;
   /** #1077 — push spool as last reported; `null` = never reported. */
   spool_status: AgentSpoolStatus | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -9460,7 +9497,10 @@ export interface DHCPLease {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null on most DHCPv6 leases, which are identified by DUID + IAID (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   state: string; // "active" | "expired" | "released" | "abandoned"
   starts_at: string | null;
@@ -15067,7 +15107,10 @@ export interface DHCPLeaseHistoryRow {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null for a DHCPv6 lease identified by DUID only (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   client_id: string | null;
   started_at: string | null;

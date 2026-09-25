@@ -24,6 +24,28 @@ the formatter handles the rest.
 
 ### Added
 
+- **DHCPv6 leases reach the control plane (#1141).** Kea's DHCPv6
+  leases never did: the agent tailed `kea-leases4.csv` only and snapshotted
+  with `lease4-get-page` only, and the ingest required a MAC, which is a
+  DHCPv4 identity most DHCPv6 leases don't carry. So a v6 lease was never
+  stored, never mirrored into IPAM ("Seen: Never"), and never produced an
+  AAAA or ip6.arpa PTR. The agent now tails `kea-leases6.csv` and walks
+  `lease6-get-page`, and the ingest keys a v6 lease on **DUID + IAID**:
+  `dhcp_lease.mac_address` is nullable, `duid` / `iaid` are stored, and a
+  CHECK requires one identity or the other. A hardware address Kea learned
+  rides along as enrichment. v6 leases mirror into IPAM and drive DDNS
+  through the same path as v4. Only IA_NA is ingested: IA_TA addresses are
+  short-lived, and an IA_PD lease is a delegated prefix, not a host address
+  (deferred). v6 events travel in batches of their own, so a control plane
+  older than this rejects only the v6 batches it could never ingest and
+  still takes the v4 leases. Every surface that read the lease MAC now
+  copes with there being none: the lease list and history (which show the
+  DUID), the expiry sweep, and the WOL and E911 resolvers. The
+  `find_dhcp_leases` copilot tool returns `duid` / `iaid` and filters on a
+  DUID. Also: a DHCPv6 scope with no domain-search (option 24) now falls
+  back to the scope's domain-name, then the subnet's `domain_name`, exactly
+  as the RA's DNSSL does. Migration `f4c8a2d61b37`.
+
 - **Agents no longer lose what they collected during a control-plane
   outage — stats, logs and Kea lease events are spooled to disk and
   replayed on reconnect (#1077).** Non-negotiable #5 kept the agents
@@ -87,6 +109,12 @@ the formatter handles the rest.
 
 ### Changed
 
+- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
+  2026-09-24 and the backend's requirement had no upper bound, so CI
+  picked it up at once. The test suite passes on it, but its new
+  type annotations fail mypy in 23 files, which blocked every open
+  PR. Adopting 2.1 deliberately, typing work included, is #1187.
+
 - **DNS per-minute metrics now accumulate per bucket, like DHCP
   (#1077).** `POST /dns/agents/metrics` replaced an existing
   `(server, bucket_at)` row instead of adding to it — the same jitter
@@ -108,6 +136,27 @@ the formatter handles the rest.
   Real Kerberos support stays on the roadmap as #1128.
 
 ### Fixed
+
+- **Relayed DHCPv6 never reached Kea on the appliance (#1139,
+  #1140).** Two faults in series, so fixing either alone changed nothing.
+  **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
+  has no raw-socket mode, so every DHCPv6 packet hit the `input` chain's
+  drop policy. The role now opens **547** in all three firewall renderers
+  and the builtin DHCP fleet policy (seed migration `e6b2f07a3c91`). The
+  base config gains the host's own DHCPv6-client return
+  (`udp sport 547 dport 546`) beside the v4 one. **The socket:** with
+  `interfaces: ["*"]` kea-dhcp6 binds link-local and `ff02::1:2` only, and
+  a relay sends its Relay-Forward to the server's global address. The Kea
+  agent now adds an `iface/address` entry per stable global IPv6 address
+  on the host, for groups with v6 scopes. The addresses are detected, not
+  configured, because (measured on Kea 3.0.3) an entry naming an address
+  the interface doesn't hold makes kea-dhcp6 refuse its whole config. For
+  the same reason the agent re-renders whenever the host's address set
+  changes.
+
+- **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
+  pull path stamped `last_seen_at` on the rows it mirrors; the agent's
+  lease-event path never did. Both do now.
 
 - **firstboot no longer runs the words of its own #1042 comment as
   commands (#1132).** `_render_control_helmchart` writes the
@@ -478,6 +527,72 @@ the formatter handles the rest.
   in both nginx templates with a 120 s budget; `appliance/tests` read
   the three budgets from source (proxy > route > supervisor) so they
   cannot drift apart again.
+
+- **A DNS or DHCP agent that is up but not serving now shows as such
+  (#1067).** The agents have always carried a `daemon` object on every
+  heartbeat —
+  `{"status": "degraded", "reason": "start deferred, no bundle yet"}`
+  while a DNS agent waits for its first bundle (#1061), `ok` once the
+  daemon is up — and both heartbeat handlers declared the field and read
+  nothing from it, so a registered, heartbeating server whose `named`
+  never started read `active`, seen seconds ago, config ok, while its pod
+  restarted on the liveness probe every two minutes (measured for twelve
+  minutes on a nested three-node cluster). The state now lands on
+  `dns_server` / `dhcp_server` as `daemon_status`, `daemon_reason` and
+  `daemon_status_since` (the stamp of the heartbeat that began the
+  current state, so the row can say how long), is exposed on both server
+  responses, renders as a chip on the DNS and DHCP server rows and a
+  banner on the server detail, degrades the dashboard's health header,
+  and drives a new `agent_daemon_degraded` alert rule (seeded enabled,
+  critical) once a daemon that is not serving has outlasted a five-minute
+  grace. All of those read one server-side classification,
+  `daemon_not_serving` on both responses: a `degraded` that is the agent
+  echoing a failed config apply (`config_apply_*`, or the DHCP agent's
+  `dhcp4_config_rejected` / `dhcp6_…`) is #882's to report, so it neither
+  pages nor draws a red "not serving" chip beside the config-apply one
+  for a daemon that is up on its last-known-good config. NULL means never
+  reported — a pre-#1061 agent, or an agentless driver — and reads as
+  unknown, never healthy. The DNS agent also now reports `ok` once its
+  daemon is confirmed running instead of an empty object for the life of
+  the process. Migration `b7d21c9e4f06` adds the three nullable columns
+  and a partial index over the unhealthy states to both tables (expand
+  only). `agent_daemon_degraded` and #980's `dhcp_packets_dropped` are
+  also in the rule-type allow-list now: both were seeded and evaluated,
+  but `POST /alerts/rules` refused them with a 422 and the conformity
+  `alert_rule_enabled` check read them as not applicable. A test now
+  fails for the next rule type left out.
+
+- **A DNS agent held `pending_approval` can be approved through the
+  API (#1121).** `DNS_REQUIRE_AGENT_APPROVAL=true` holds a re-registering
+  agent whose fingerprint changed (a wiped agent volume legitimately
+  produces one): its config long-poll answers `pending_approval` and
+  never a bundle, so `named` stays deferred. Nothing cleared the hold —
+  `ServerUpdate` has no approval field and the DNS router had no
+  approve route, while DHCP has had `POST /dhcp/servers/{id}/approve`
+  all along — so the only recovery was a database write or deleting
+  and re-registering the server.
+  `POST /dns/groups/{group_id}/servers/{server_id}/approve`
+  (superadmin) now mirrors the DHCP endpoint: clears the flag, writes a
+  `dns.server.approve` audit event, wakes the agent and returns the
+  server row. Idempotent. The DNS server modal still only shows the flag
+  (the DHCP page has an Approve control); the UI control is follow-up
+  work.
+
+- **The appliance kubelet now evicts on memory before the kernel's OOM
+  killer does (#1124).** k3s's kubelet defaults carry disk eviction
+  thresholds only, so memory exhaustion went straight to the kernel's
+  global OOM killer, which picks by `oom_score_adj`: on a QA node it
+  killed the api's uvicorn while a runaway pod was the cause.
+  `config.yaml` now passes `memory.available<512Mi` (restating k3s's disk
+  floors, since `--eviction-hard` replaces the whole map), a 30 s
+  pressure-transition period instead of 5 min, and
+  `kube-reserved=memory=1Gi` plus `system-reserved=memory=512Mi`, so the
+  kubelet evicts by PriorityClass first. **Upgrade note:** those settings
+  set aside 2 GiB on every node, and pods are scheduled only into the
+  rest. A control plane now needs at least 4 GiB of RAM and a DNS / DHCP
+  appliance at least 3 GiB; a smaller box upgraded to this release comes
+  back with its pods `Pending` on `Insufficient memory`. The recommended
+  sizes (8 GiB control plane, 4 GiB DNS / DHCP) are unaffected.
 
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed

@@ -233,6 +233,16 @@ def run(cfg: AgentConfig) -> int:
                     waiting = False
                     waiting_ticks = 0
                     _clear_deferred_status(heartbeat)
+                # #1067 — a daemon that is up, and about which nothing else has
+                # been said, is ``ok``. Until now a normal boot (rendered config
+                # present, ``named`` started at once) left ``daemon_status`` as
+                # the empty dict for the life of the process, so the heartbeat
+                # carried ``daemon: {}`` and the control plane, which now keeps
+                # the state, could only read UNKNOWN for a healthy server. Only
+                # the empty dict is filled: a verdict the sync loop set
+                # (``degraded`` on a failed apply) is its to clear.
+                if not heartbeat.daemon_status:
+                    heartbeat.daemon_status = {"status": "ok"}
             elif driver.daemon_launched():
                 # The stop check above closes the 1 s sleep, not the checks
                 # themselves: ``_sig`` runs between bytecodes, so a SIGTERM

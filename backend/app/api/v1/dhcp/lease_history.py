@@ -46,7 +46,10 @@ class LeaseHistoryRow(BaseModel):
     server_id: uuid.UUID
     scope_id: uuid.UUID | None
     ip_address: str
-    mac_address: str
+    # NULL for a DHCPv6 lease identified by DUID only (#1141).
+    mac_address: str | None
+    duid: str | None = None
+    iaid: int | None = None
     hostname: str | None
     client_id: str | None
     started_at: datetime | None

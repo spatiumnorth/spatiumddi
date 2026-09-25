@@ -21,6 +21,7 @@ helm or a cluster.
 | `test_host_migrate.py` | `spatium-host-migrate` orchestrator via a patched subprocess |
 | `test_host_runner_stdin_programs.py` | The three runners that piped data into a `python3 -` whose program came from a heredoc — the SSH source-CIDR allowlist failing OPEN, TLS-syslog CAs, image pruning (#1001) |
 | `test_install_done_gate.py` | The headless-install Done-screen gate |
+| `test_k3s_kubelet_eviction.py` | `config.yaml`'s kubelet args give the kubelet a `memory.available` eviction threshold beside k3s's restated disk floors, a short pressure-transition period and node reserves (#1124) |
 | `test_install_ntp_decline.py` | Blanking the installer's **Time source** really disabling NTP — the rendered on-target `chrony.conf` plus firstboot's explicit-decline sentinel (#1002) |
 | `test_preseed_lint.py` | `spatium-install --check-preseed` linter |
 | `test_preseed_security.py` | The #549 preseed installer's security guards (#581) |

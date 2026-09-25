@@ -50,6 +50,13 @@ class AgentConfig:
     heartbeat_interval: float = 30.0
     longpoll_timeout: float = 30.0
 
+    @property
+    def kea_lease_file_v6(self) -> Path:
+        """kea-dhcp6's memfile: the v4 path with the family digit swapped
+        (``kea-leases4.csv`` → ``kea-leases6.csv``), the derivation the
+        render and the lease tailer share so they never disagree (#1141)."""
+        return Path(str(self.kea_lease_file).replace("leases4", "leases6"))
+
     def httpx_verify(self) -> bool | str:
         """Resolve the ``verify=`` argument for ``httpx.Client`` calls.
 

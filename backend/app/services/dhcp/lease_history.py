@@ -42,11 +42,17 @@ def record_lease_history(
     """
     if expired_at is None:
         expired_at = datetime.now(UTC)
+    mac = mac_override if mac_override is not None else lease.mac_address
     row = DHCPLeaseHistory(
         server_id=lease.server_id,
         scope_id=lease.scope_id,
         ip_address=str(lease.ip_address),
-        mac_address=str(mac_override if mac_override is not None else lease.mac_address),
+        # A DHCPv6 lease usually has no MAC (#1141). ``str(None)`` would be
+        # the literal "None", which is not a MACADDR and fails the insert —
+        # the expiry sweep and the purge path would both 500 on a v6 lease.
+        mac_address=str(mac) if mac is not None else None,
+        duid=lease.duid,
+        iaid=lease.iaid,
         hostname=lease.hostname,
         client_id=lease.client_id,
         started_at=lease.starts_at or lease.last_seen_at,
