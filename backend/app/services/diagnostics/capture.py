@@ -6,9 +6,9 @@ Two callers:
   exception handler in :mod:`app.main`. Runs inside an active event
   loop with the async DB session available.
 * ``record_unhandled_exception`` — synchronous variant for the
-  Celery ``task_failure`` signal (Celery is sync; we open a
-  dedicated sync engine connection here rather than dragging async
-  context across the bridge).
+  Celery ``task_failure`` signal. Celery is sync, so it runs the async
+  variant on a short-lived thread with its own event loop and a fresh
+  asyncpg engine.
 
 Both share:
 
@@ -25,9 +25,11 @@ Both share:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+import threading
 import traceback as tb_mod
 from datetime import UTC, datetime
 from typing import Any
@@ -63,6 +65,12 @@ _REDACT_FIELD_RE = re.compile(r"(?i)(password|secret|token|key|credential)")
 _BODY_CAP = 4 * 1024
 _CONTEXT_CAP = 16 * 1024
 _TRACEBACK_CAP = 16 * 1024
+
+# How long the Celery hook waits for a capture. The capture carries on
+# past this on its own thread; the wait only bounds how long a failing
+# task holds its worker slot, which a database outage would otherwise
+# stretch to asyncpg's full connect timeout.
+_SYNC_CAPTURE_WAIT_S = 15.0
 
 
 def _sanitise_dict(d: dict[str, Any], *, redact_headers: bool = False) -> dict[str, Any]:
@@ -252,55 +260,51 @@ def record_unhandled_exception(
 ) -> None:
     """Synchronous variant for Celery's ``task_failure`` signal.
 
-    Opens a one-off sync engine connection rather than carrying async
-    context across the signal boundary. Failure-tolerant for the same
-    reason as the async variant.
+    Runs :func:`record_unhandled_exception_async` on a fresh asyncpg engine
+    (``task_session``), on a short-lived thread with its own event loop. The
+    backend ships no sync PostgreSQL driver: this used to open a
+    ``postgresql://`` engine, which loads psycopg2 (psycopg 3 from
+    SQLAlchemy 2.1), so every worker failure was dropped with a warning
+    (#1193). The thread keeps the capture out of the failing task's event
+    loop state, and lets it run when the signal fires inside a running loop
+    (an eager task, or a test), where ``asyncio.run`` would refuse.
+
+    Failure-tolerant for the same reason as the async variant.
     """
     try:
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import Session
+        from app.db import task_session  # noqa: PLC0415
 
-        from app.config import settings
-
-        # ``database_url`` is async (``postgresql+asyncpg://``); strip
-        # the driver suffix for the sync engine here.
-        sync_url = str(settings.database_url).replace("postgresql+asyncpg://", "postgresql://")
-        engine = create_engine(sync_url, pool_pre_ping=True)
-        try:
-            cls_name = _exception_class_name(exc)
-            message = (str(exc) or cls_name)[:1000]
-            traceback_str = _format_traceback(exc)
-            fingerprint = _compute_fingerprint(cls_name, traceback_str)
-            clean_context = _sanitise_context(context)
-            now = datetime.now(UTC)
-            with Session(engine) as session:
-                result = session.execute(
-                    update(InternalError)
-                    .where(InternalError.fingerprint == fingerprint)
-                    .values(
-                        occurrence_count=InternalError.occurrence_count + 1,
-                        last_seen_at=now,
-                    )
-                    .returning(InternalError.id)
-                )
-                if result.first() is not None:
-                    session.commit()
-                    return
-                row = InternalError(
+        async def _capture() -> None:
+            async with task_session() as db:
+                await record_unhandled_exception_async(
+                    db,
                     service=service,
-                    request_id=request_id,
+                    exc=exc,
                     route_or_task=route_or_task,
-                    exception_class=cls_name,
-                    message=message,
-                    traceback=traceback_str,
-                    context_json=clean_context,
-                    fingerprint=fingerprint,
-                    last_seen_at=now,
+                    request_id=request_id,
+                    context=context,
                 )
-                session.add(row)
-                session.commit()
-        finally:
-            engine.dispose()
+
+        def _run() -> None:
+            try:
+                asyncio.run(_capture())
+            except Exception as inner_exc:
+                logger.warning(
+                    "diagnostics_capture_failed_sync",
+                    error=str(inner_exc),
+                    inner_class=type(inner_exc).__name__,
+                    captured_class=_exception_class_name(exc),
+                )
+
+        thread = threading.Thread(target=_run, name="diagnostics-capture", daemon=True)
+        thread.start()
+        thread.join(_SYNC_CAPTURE_WAIT_S)
+        if thread.is_alive():
+            logger.warning(
+                "diagnostics_capture_slow_sync",
+                waited_s=_SYNC_CAPTURE_WAIT_S,
+                captured_class=_exception_class_name(exc),
+            )
     except Exception as inner_exc:
         logger.warning(
             "diagnostics_capture_failed_sync",
