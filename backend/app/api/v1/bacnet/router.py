@@ -434,8 +434,8 @@ def _token_subnet_scope(user: Any) -> set[uuid.UUID] | None:
     return _token_subnet_scope_uuids(user)
 
 
-def _apply_device_filters(
-    stmt: Select[Any],
+def _apply_device_filters[*Ts](
+    stmt: Select[*Ts],
     *,
     token_scope: set[uuid.UUID] | None,
     tag: list[str],
@@ -445,7 +445,7 @@ def _apply_device_filters(
     is_bbmd: bool | None,
     seen_via: str | None,
     q: str | None,
-) -> Select[Any]:
+) -> Select[*Ts]:
     """Shared WHERE construction for the list page and its count.
 
     Kept in one place so the ``total`` can never drift from the rows

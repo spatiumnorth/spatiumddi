@@ -573,8 +573,8 @@ def _token_subnet_scope(user: Any) -> set[uuid.UUID] | None:
     return _token_subnet_scope_uuids(user)
 
 
-def _apply_ae_filters(
-    stmt: Select[Any],
+def _apply_ae_filters[*Ts](
+    stmt: Select[*Ts],
     *,
     token_scope: set[uuid.UUID] | None,
     tag: list[str],
@@ -585,7 +585,7 @@ def _apply_ae_filters(
     tls_enabled: bool | None,
     unbound: bool | None,
     q: str | None,
-) -> Select[Any]:
+) -> Select[*Ts]:
     """Shared WHERE construction for the list page and its count.
 
     Kept in one place so the ``total`` can never drift from the rows

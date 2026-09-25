@@ -2273,6 +2273,7 @@ async def _matching_bgp_lg_route_flap_subjects(
     matches: list[tuple[str, str, str]] = []
     win_min = int(_BGP_LG_FLAP_WINDOW.total_seconds() // 60)
     for route, peer in rows:
+        assert route.last_flap_at is not None  # the WHERE requires last_flap_at >= since
         display = f"{route.prefix} via {peer.name}"
         message = (
             f"Route {route.prefix} via peer '{peer.name}' (AS{peer.peer_asn}) has flapped "
@@ -5066,7 +5067,7 @@ async def seed_dns_query_anomaly_alert_rules() -> None:
     from app.db import AsyncSessionLocal  # noqa: PLC0415
     from app.models.alerts import AlertRule  # noqa: PLC0415
 
-    seeds = [
+    seeds: list[dict[str, Any]] = [
         {
             "name": _DNS_NXDOMAIN_SPIKE_RULE_NAME,
             "rule_type": RULE_TYPE_DNS_NXDOMAIN_SPIKE,

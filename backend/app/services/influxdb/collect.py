@@ -257,7 +257,9 @@ async def collect_dhcp_scope_lease_points(db: AsyncSession, now: datetime) -> li
         .group_by(DHCPLease.scope_id)
     )
     counts: dict[uuid.UUID, int] = {
-        row[0]: int(row[1]) for row in (await db.execute(counts_stmt)).all()
+        row[0]: int(row[1])
+        for row in (await db.execute(counts_stmt)).all()
+        if row[0] is not None  # excluded by the WHERE; the filter is for mypy
     }
 
     scopes_stmt = (

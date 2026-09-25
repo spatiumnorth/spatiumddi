@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
@@ -247,7 +247,7 @@ async def batch_resource_types(db: AsyncSession, batch_id: uuid.UUID) -> set[str
     """
     types: set[str] = set()
     for resource_type, model in TYPE_TO_MODEL.items():
-        stmt: Any = (
+        stmt: Select[Any] = (
             select(model.id)
             .where(model.deletion_batch_id == batch_id)
             .limit(1)
@@ -283,7 +283,7 @@ async def restore_batch(
     # include_deleted so it can see soft-deleted rows; without that the
     # global filter hides them.
     for resource_type, model in TYPE_TO_MODEL.items():
-        stmt: Any = (
+        stmt: Select[Any] = (
             select(model)
             .where(model.deletion_batch_id == batch_id)
             .execution_options(include_deleted=True)

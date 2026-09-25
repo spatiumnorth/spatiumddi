@@ -17,7 +17,7 @@ import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import String, cast, func, literal, or_, select
+from sqlalchemy import Select, String, cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -997,10 +997,10 @@ async def find_by_tag(db: AsyncSession, user: User, args: FindByTagArgs) -> dict
             ]
             continue
         model, has_soft_delete, render = entry
-        # ``model`` carries ``type`` from the dispatch table, which mypy
-        # can't tighten into a ``Select[Any]`` for a generic select
-        # call — annotate explicitly.
-        stmt: Any = select(model)
+        # ``model`` carries ``type`` from the dispatch table, so mypy
+        # can't infer the select's column type — annotate it as one
+        # column of ``Any``.
+        stmt: Select[Any] = select(model)
         if has_soft_delete:
             stmt = stmt.where(model.deleted_at.is_(None))
         stmt = apply_tag_filter(stmt, model.tags, [tag_param])

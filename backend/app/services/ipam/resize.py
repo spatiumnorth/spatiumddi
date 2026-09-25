@@ -257,7 +257,7 @@ def _advisory_lock_key(resource_id: uuid.UUID, namespace: int) -> tuple[int, int
 
 async def _try_advisory_lock(db: AsyncSession, resource_id: uuid.UUID, namespace: int) -> bool:
     ns, key = _advisory_lock_key(resource_id, namespace)
-    row = (
+    row: bool = (
         await db.execute(
             text("SELECT pg_try_advisory_xact_lock(:ns, :key)"),
             {"ns": ns, "key": key},

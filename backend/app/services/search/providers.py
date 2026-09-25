@@ -1003,13 +1003,13 @@ async def search_custom_fields(db: AsyncSession, s: QueryShape, limit: int) -> l
                 )
             )
         )
-        stmt = _ranked(
+        ranked = _ranked(
             stmt,
             sql_rank(s.raw, *jsonb_cols(IPBlock, block_fields)),
             limit,
             tiebreak=IPBlock.network,
         )
-        for block, space, _rank in (await db.execute(stmt)).all():
+        for block, space, _rank in (await db.execute(ranked)).all():
             quality, label = _custom_field_hit(s.raw, block.custom_fields, block_fields)
             out.append(
                 _annotate(
@@ -1043,13 +1043,13 @@ async def search_custom_fields(db: AsyncSession, s: QueryShape, limit: int) -> l
                 )
             )
         )
-        stmt = _ranked(
+        ranked = _ranked(
             stmt,
             sql_rank(s.raw, *jsonb_cols(Subnet, subnet_fields)),
             limit,
             tiebreak=Subnet.network,
         )
-        for subnet, space, _rank in (await db.execute(stmt)).all():
+        for subnet, space, _rank in (await db.execute(ranked)).all():
             quality, label = _custom_field_hit(s.raw, subnet.custom_fields, subnet_fields)
             out.append(
                 _annotate(

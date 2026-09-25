@@ -19,6 +19,7 @@ Scope per run:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -188,7 +189,9 @@ async def _run_auto_sync() -> dict[str, Any]:
 
             # Only subnets with some DNS/DDNS binding do work (issue #522) —
             # skip the drift computation for the (common) no-binding majority.
-            subnets = list((await db.execute(_CANDIDATE_SUBNET_SQL)).scalars().all())
+            subnets: list[uuid.UUID] = list(
+                (await db.execute(_CANDIDATE_SUBNET_SQL)).scalars().all()
+            )
 
             total_created = 0
             total_updated = 0

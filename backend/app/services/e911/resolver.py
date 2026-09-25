@@ -314,6 +314,7 @@ async def _port_from_mac(
     ).first()
     if neighbour is not None:
         iface_id, seen = neighbour
+        assert iface_id is not None  # the WHERE requires interface_id IS NOT NULL
         window = await _freshness_window(db, iface_id)
         age = _age_seconds(seen, now)
         return iface_id, Evidence(
@@ -602,6 +603,7 @@ async def resolve_location(
         ).first()
         if row is not None:
             interface_id, seen = row
+            assert interface_id is not None  # the WHERE requires interface_id IS NOT NULL
             window = await _freshness_window(db, interface_id)
             age = _age_seconds(seen, now)
             port_evidence = Evidence(
@@ -767,13 +769,13 @@ async def effective_subnet_erls(
     by_subnet: dict[uuid.UUID, EmergencyResponseLocation] = {}
     by_vlan: dict[uuid.UUID, EmergencyResponseLocation] = {}
     by_site: dict[uuid.UUID, EmergencyResponseLocation] = {}
-    for binding, erl in rows:
+    for binding, bound_erl in rows:
         if binding.rule_kind == "subnet" and binding.subnet_id is not None:
-            by_subnet[binding.subnet_id] = erl
+            by_subnet[binding.subnet_id] = bound_erl
         elif binding.rule_kind == "vlan" and binding.vlan_ref_id is not None:
-            by_vlan[binding.vlan_ref_id] = erl
+            by_vlan[binding.vlan_ref_id] = bound_erl
         elif binding.rule_kind == "site_default" and binding.site_id is not None:
-            by_site[binding.site_id] = erl
+            by_site[binding.site_id] = bound_erl
 
     out: dict[uuid.UUID, EmergencyResponseLocation] = {}
     for subnet in subnets:

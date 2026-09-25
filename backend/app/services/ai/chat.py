@@ -35,7 +35,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import desc, func, select
+from sqlalchemy import Select, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.llm import get_driver
@@ -426,7 +426,7 @@ async def gather_dynamic_context(db: AsyncSession, user: User) -> dict[str, Any]
     Soft-deleted rows are excluded — those don't exist for the operator.
     """
 
-    async def _count(stmt: Any) -> int:
+    async def _count(stmt: Select[Any]) -> int:
         return int((await db.execute(stmt)).scalar_one() or 0)
 
     spaces = await _count(
