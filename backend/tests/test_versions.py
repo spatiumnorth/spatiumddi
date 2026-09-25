@@ -40,7 +40,7 @@ def test_release_order(older: str, newer: str) -> None:
     a, b = parse_release(older), parse_release(newer)
     assert a is not None and b is not None
     assert a < b
-    assert not b < a
+    assert sorted([b, a]) == [a, b]
 
 
 def test_build_metadata_does_not_affect_order() -> None:
