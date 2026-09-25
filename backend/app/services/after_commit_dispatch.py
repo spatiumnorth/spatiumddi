@@ -44,8 +44,19 @@ logger = structlog.get_logger(__name__)
 
 _background = False
 _lock = threading.Lock()
-_loop: asyncio.AbstractEventLoop | None = None
-_loop_pid: int | None = None
+
+
+class _LoopState:
+    """The background loop and the PID that started it. Held on an object
+    rather than rebound as module globals, which code scanning reads as
+    assigned and never used."""
+
+    loop: asyncio.AbstractEventLoop | None = None
+    pid: int | None = None
+
+
+_state = _LoopState()
+
 # Strong references: an unreferenced asyncio task can be collected mid-run.
 _tasks: set[asyncio.Task[Any]] = set()
 _futures: set[Future[Any]] = set()
@@ -63,10 +74,10 @@ def using_background_loop() -> bool:
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
-    global _loop, _loop_pid
     with _lock:
-        if _loop is not None and _loop_pid == os.getpid() and _loop.is_running():
-            return _loop
+        current = _state.loop
+        if current is not None and _state.pid == os.getpid() and current.is_running():
+            return current
         loop = asyncio.new_event_loop()
         started = threading.Event()
 
@@ -77,7 +88,7 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
 
         threading.Thread(target=_run, name="after-commit-dispatch", daemon=True).start()
         started.wait(timeout=5)
-        _loop, _loop_pid = loop, os.getpid()
+        _state.loop, _state.pid = loop, os.getpid()
         return loop
 
 
