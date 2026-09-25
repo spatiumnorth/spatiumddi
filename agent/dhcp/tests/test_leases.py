@@ -79,6 +79,7 @@ def test_flush_body_uses_leases_key(monkeypatch) -> None:
         httpx_verify=lambda: True,
         kea_lease_file="/tmp/x",
         kea_control_socket="/tmp/x-sock",
+        kea_control_socket_v6="/tmp/x6-sock",
     )
     hb = types.SimpleNamespace(lease_count_since_start=0)
     w = leases_mod.LeaseWatcher(cfg, ["tok"], hb)

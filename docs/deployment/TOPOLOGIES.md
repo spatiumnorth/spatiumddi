@@ -463,7 +463,7 @@ master switch); when enabled, each node's drop-in is compiled server-side from
 the fleet → role → appliance policy layers:
 
 - **Single VM (1)** — one node carries every role; the merge opens 53 (DNS),
-  67/68 (DHCP), the control-plane ports peer-scoped (here: just itself), and
+  67/68 + 547 (DHCP, v4 + v6), the control-plane ports peer-scoped (here: just itself), and
   the mgmt floor. The all-CP-hardened enforcement gate trivially passes (one
   hardened node).
 - **Control plane + separate DNS/DHCP appliances (2, 3)** — the DNS-only and

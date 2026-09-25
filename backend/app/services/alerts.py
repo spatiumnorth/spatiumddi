@@ -220,6 +220,26 @@ RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 # warning.
 RULE_TYPE_AGENT_SPOOL_TRIMMED = "agent_spool_trimmed"
 
+# Issue #1067 — an agent that is heartbeating reports that its DAEMON is not
+# serving, and has been saying so for longer than a bundle normally takes to
+# arrive. Subject = the dns_server / dhcp_server row.
+#
+# The #882 rule above is about a daemon that is UP and serving the wrong
+# config; this one is about a daemon that is not up at all — a DNS agent whose
+# ``named`` start was deferred because no bundle ever came (#1061 reports
+# ``degraded`` with "start deferred, no bundle yet" on every heartbeat, and
+# the pod restarts on its liveness probe every two minutes), or a Kea whose
+# control socket the DHCP agent cannot reach. Reachability alerting cannot
+# see either: the agent is talking to us perfectly. Where one rule ends and
+# the other begins is ``daemon_state.is_not_serving`` — the agents echo a
+# failed apply into the daemon field too, and that echo stays #882's.
+#
+# The grace covers a normal first boot. Every fresh member defers its daemon
+# for the seconds it takes the first bundle to land, and reports ``degraded``
+# meanwhile; five minutes is many poll cycles past that.
+RULE_TYPE_AGENT_DAEMON_DEGRADED = "agent_daemon_degraded"
+_AGENT_DAEMON_DEGRADED_GRACE = timedelta(minutes=5)
+
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
 # row for a cluster node).
@@ -547,10 +567,12 @@ RULE_TYPES = frozenset(
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
+        RULE_TYPE_DHCP_PACKETS_DROPPED,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
+        RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -3522,6 +3544,74 @@ async def _matching_dhcp_scope_uncoordinated_subjects(
     return matches
 
 
+async def _matching_agent_daemon_degraded_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """``agent_daemon_degraded`` — every agent-managed server whose agent
+    reports a daemon that is not serving, and has for longer than the grace
+    (#1067).
+
+    Reads the ``daemon_*`` columns the two heartbeat handlers write; no
+    probing. "Not serving" is ``daemon_state.is_not_serving`` — the same
+    classification the server responses publish as ``daemon_not_serving``,
+    so this rule and the chip cannot disagree. ``daemon_status_since`` is the
+    stamp of the heartbeat that began the current state (a repeated report
+    never moves it), so it is the grace clock and no watermark of our own is
+    needed. Auto-resolves through ``evaluate_all``'s standard diff the moment
+    the agent reports ``ok`` again.
+
+    Not a match: NULL (never reported — a pre-#1061 agent or an agentless
+    driver; unknown is not an alarm), a row in operator-set maintenance mode
+    (#182: the operator is working on it), and a ``degraded`` that is the
+    agent echoing a failed config apply — ``config_apply_*`` from either
+    agent, or Kea's ``dhcp4_config_rejected`` / ``dhcp6_…`` from the DHCP
+    one. #882's rule already carries each of those, with the severity its
+    verdict deserves; firing here too would page twice for one event.
+    """
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.daemon_state import (  # noqa: PLC0415
+        STATUS_OK,
+        is_not_serving,
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    for model, kind in ((DNSServer, "DNS"), (DHCPServer, "DHCP")):
+        rows = (
+            (
+                await db.execute(
+                    select(model).where(
+                        model.daemon_status.is_not(None),
+                        model.daemon_status != STATUS_OK,
+                        model.maintenance_mode.is_(False),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            if not is_not_serving(row.daemon_status, row.daemon_reason):
+                continue
+            since = row.daemon_status_since
+            if since is None or (now - since) <= _AGENT_DAEMON_DEGRADED_GRACE:
+                continue
+            reason = (row.daemon_reason or "").strip()
+            minutes = int((now - since).total_seconds() // 60)
+            message = (
+                f"{kind} server '{row.name}' reports its daemon is "
+                f"{str(row.daemon_status).replace('_', ' ')} and has for {minutes} min "
+                f"(since {since.isoformat(timespec='seconds')}). The agent is heartbeating, "
+                "so the server reads reachable and healthy on every other signal while it "
+                "is not serving." + (f" Agent reported: {reason}" if reason else "")
+            )
+            subject_id = f"{model.__tablename__}:{row.id}"
+            matches.append((subject_id, f"{row.name} ({kind})", message, rule.severity))
+    return matches
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -4409,6 +4499,7 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
 
 _AGENT_CONFIG_REJECTED_RULE_NAME = "Agent config apply rejected"
 _AGENT_SPOOL_TRIMMED_RULE_NAME = "Agent push spool trimmed"
+_AGENT_DAEMON_DEGRADED_RULE_NAME = "Agent daemon not serving"
 
 
 async def seed_node_pressure_alert_rule() -> None:
@@ -4692,6 +4783,54 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
                     "failover relationship or left on one server only."
                 ),
                 rule_type=RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+async def seed_agent_daemon_degraded_alert_rule() -> None:
+    """Seed the #1067 rule, ENABLED by default.
+
+    On by default for the same reason as ``agent_config_rejected``: it applies
+    to every install that runs an agent, needs no configuration, and reads a
+    state the agent itself reports about its own daemon. The failure it
+    catches — a registered, heartbeating server whose daemon never started —
+    is invisible on every other signal (the 2026-09-12 measurement read "seen
+    1 minute ago, config ok" for twelve minutes on a member restarting every
+    two), so leaving the alarm off would mean the operator has to already
+    suspect the problem in order to find out about it. The five-minute grace
+    keeps a normal first boot silent.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_DAEMON_DEGRADED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_DAEMON_DEGRADED_RULE_NAME,
+                description=(
+                    "Fires when a DNS or DHCP agent reports on its heartbeat that its "
+                    "daemon is not serving (for example a DNS agent whose named start is "
+                    "deferred because no configuration bundle has arrived) and has been "
+                    "saying so for more than five minutes. The agent keeps heartbeating, "
+                    "so the server stays reachable and healthy on every other signal "
+                    "while it answers nothing. Auto-resolves when the agent reports the "
+                    "daemon ok."
+                ),
+                rule_type=RULE_TYPE_AGENT_DAEMON_DEGRADED,
                 severity="critical",
                 enabled=True,
                 notify_syslog=True,
@@ -6006,6 +6145,13 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 trimmed_hits = await _matching_agent_spool_trimmed_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]
                 # Same prefixed "<table>:<id>" subject as agent_config_rejected.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_AGENT_DAEMON_DEGRADED:
+                dark = await _matching_agent_daemon_degraded_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in dark]
+                # Same shape as agent_config_rejected: the subject_id carries
+                # the source table so a dns_server and a dhcp_server sharing
+                # a UUID never collide into one event.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)

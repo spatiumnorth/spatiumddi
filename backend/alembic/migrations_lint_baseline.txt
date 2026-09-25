@@ -263,6 +263,9 @@ backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:65
 backend/alembic/versions/b71d9ae34c50_windows_dhcp_support.py:drop_column:66
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:70
 backend/alembic/versions/b7c2f1a9d4e6_block_allocated_total_ips.py:drop_column:71
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:63
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:64
+backend/alembic/versions/b7d21c9e4f06_agent_daemon_state.py:drop_column:65
 backend/alembic/versions/b7e29c4f5d18_dns_dhcp_tags.py:drop_column:63
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_column:60
 backend/alembic/versions/b7e2a4f91d35_vrf_phase2.py:drop_constraint_fk:61
@@ -764,6 +767,8 @@ backend/alembic/versions/f4a1c9e7b2d8_appliance_host_config_health.py:drop_colum
 backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33
 backend/alembic/versions/f4c81a37e0b2_opnsense_last_sync_warning.py:drop_column:36
+backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:57
+backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:58
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_column:171
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:169
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:178

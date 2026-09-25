@@ -134,7 +134,16 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
             (20, "accept", "tcp", (53,), "any", "both", None, None),
         ],
     ),
-    ("role", "dhcp", True, [(10, "accept", "udp", (67, 68), "any", "both", None, None)]),
+    (
+        "role",
+        "dhcp",
+        True,
+        [
+            (10, "accept", "udp", (67, 68), "any", "both", None, None),
+            # DHCPv6 (#1139) — its own seed migration, e6b2f07a3c91.
+            (20, "accept", "udp", (547,), "any", "both", None, None),
+        ],
+    ),
     (
         "role",
         "control-plane",

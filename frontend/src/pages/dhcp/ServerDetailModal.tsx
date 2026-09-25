@@ -30,6 +30,7 @@ import { Modal } from "@/components/ui/modal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
+import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import {
   dhcpApi,
@@ -258,6 +259,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
           healthy while the agent is running a config the operator never
           approved, so this has to be the first thing read. */}
       <ConfigApplyBanner server={server} />
+      <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
       </div>

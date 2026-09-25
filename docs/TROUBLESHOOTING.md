@@ -214,16 +214,34 @@ appliance DaemonSet and the shipped compose files grant.)
 > only a live cause if the group was deliberately set to Relay-only.
 
 **Firewall.** UDP sockets are also subject to the host's nftables INPUT
-chain (raw sockets bypass it). The DHCP role opens UDP **67 + 68**;
-confirm the rules are present (and haven't drifted):
+chain (raw sockets bypass it). The DHCP role opens UDP **67 + 68**, and
+**547** for DHCPv6 (#1139). DHCPv6 has no raw-socket mode, so every v6
+packet goes through this chain. Confirm the rules are present and
+haven't drifted:
 
 ```bash
-sudo nft list chain inet filter input | grep -E 'dport (67|68)'
+sudo nft list chain inet filter input | grep -E 'dport (67|68|547)'
 ```
 
-You should see `udp dport 67 accept` / `udp dport 68 accept`. If they're
-missing, the per-role firewall didn't apply — re-saving the DHCP role
-assignment in **Fleet** re-renders the drop-in.
+You should see `udp dport 67 accept`, `udp dport 68 accept` and
+`udp dport 547 accept`. If they're missing, the per-role firewall didn't
+apply. Re-saving the DHCP role assignment in **Fleet** re-renders the
+drop-in.
+
+**Relayed DHCPv6 gets no answer.** A relay sends its Relay-Forward to the
+server's *global* IPv6 address, and kea-dhcp6 needs a unicast socket on
+that address (#1140). The agent adds one for every stable global address
+on the host. Confirm the socket exists:
+
+```bash
+ss -ulpn6 | grep 547
+```
+
+You should see the global address, not only `fe80::…%iface` and
+`ff02::1:2`. If it's missing, check that the address is on the host and not
+temporary, deprecated or still tentative (`ip -6 addr`). The agent re-reads
+the addresses on every sync loop, about every 30 s, and logs
+`dhcp6_unicast_addresses_changed` when it re-renders.
 
 ### Networking sanity check
 
