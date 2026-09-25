@@ -35,6 +35,7 @@ Failures are surfaced as ``state="failed"`` with a single-line
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -209,7 +210,7 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     enabled flags + agent keys + group names + control-plane URL).
     """
     control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get("CONTROL_PLANE_URL", "")
-    image_tag = env_vars.get("SPATIUMDDI_VERSION") or os.environ.get("SPATIUMDDI_VERSION", "dev")
+    image_tag = role_image_tag(env_vars)
 
     # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
     # scope (which helm release owns which Deployment), NOT
@@ -341,6 +342,54 @@ def _read_chart_tarball() -> bytes:
     ``FileNotFoundError`` if the bake didn't run — caller surfaces
     this as a ``failed`` LifecycleResult."""
     return _BAKED_CHART_TARBALL.read_bytes()
+
+
+def role_image_tag(env_vars: dict[str, str]) -> str:
+    """The image tag the role release is rendered with — the ONE definition.
+
+    The role env never carries ``SPATIUMDDI_VERSION`` in practice (it holds only
+    role-scoped values, see ``heartbeat``), so this is the supervisor's process
+    env: the entrypoint exports it from the host ``.env``, which firstboot
+    re-stamps from the slot's baked tag on every boot. ``_build_values`` and the
+    heartbeat's apply key both read it here, so the key can never describe a tag
+    other than the one the apply renders.
+    """
+    return env_vars.get("SPATIUMDDI_VERSION") or os.environ.get("SPATIUMDDI_VERSION", "dev")
+
+
+_chart_digest_cache: tuple[tuple[str, int, int], str] | None = None
+
+
+def _chart_digest() -> str:
+    """sha256 of the baked chart tarball, or "" when it cannot be read.
+
+    Cached on the file's (path, size, mtime) so the 30 s heartbeat does not
+    re-hash an unchanged file; the chart only changes with the slot."""
+    global _chart_digest_cache
+    try:
+        st = _BAKED_CHART_TARBALL.stat()
+        stamp = (str(_BAKED_CHART_TARBALL), st.st_size, st.st_mtime_ns)
+        if _chart_digest_cache is not None and _chart_digest_cache[0] == stamp:
+            return _chart_digest_cache[1]
+        digest = hashlib.sha256(_read_chart_tarball()).hexdigest()
+    except OSError:
+        return ""
+    _chart_digest_cache = (stamp, digest)
+    return digest
+
+
+def role_release_fingerprint(env_file: Path) -> str:
+    """What the role apply renders beyond the role env itself (#1203).
+
+    ``apply_role_assignment`` PATCHes the role HelmChart with this slot's chart
+    tarball and ``global.imageTag``. Neither is in the role env, so a heartbeat
+    that keyed its skip on the env alone skipped the apply for ever after a slot
+    upgrade, and the agent DaemonSets kept the previous release's chart and
+    images. Both change only with a slot upgrade, so steady-state heartbeats
+    still skip, and the first heartbeat on a new slot re-applies once.
+    """
+    tag = role_image_tag(_parse_env_file(env_file))
+    return f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
 
 
 def role_label_diff(profiles: list[str]) -> dict[str, str | None]:

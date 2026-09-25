@@ -60,6 +60,7 @@ from .role_orchestrator import (
 from .service_lifecycle import (
     apply_role_assignment,
     reconcile_node_labels,
+    role_release_fingerprint,
     tear_down_supervised_services,
 )
 
@@ -1405,15 +1406,20 @@ def heartbeat_once(
     # failure we log + carry the failure state up to the control
     # plane in the next heartbeat's ``role_switch_state``.
     #
-    # Skip the apply when the rendered env file content hash is
-    # unchanged from the last successful apply. The previous "fire
-    # every heartbeat" shape ran ``docker compose ps`` + ``up -d``
-    # every 60 s even during steady state when nothing had changed.
-    # Each subprocess pair costs ~600 ms on a 1-CPU VM (Go binary
-    # startup + arg parsing + JSON formatting); 60-second cadence × 24h
-    # = ~14 minutes of wasted CPU per day on a fleet that wasn't
-    # transitioning anything. The sidecar hash file is reset on
-    # supervisor restart so a fresh boot always re-applies once.
+    # Skip the apply when nothing it would send has changed since the
+    # last successful apply. The previous "fire every heartbeat" shape
+    # ran ``docker compose ps`` + ``up -d`` every 60 s even during
+    # steady state when nothing had changed. Each subprocess pair costs
+    # ~600 ms on a 1-CPU VM (Go binary startup + arg parsing + JSON
+    # formatting); 60-second cadence × 24h = ~14 minutes of wasted CPU
+    # per day on a fleet that wasn't transitioning anything.
+    #
+    # #1203 — "nothing it would send" is the rendered role env AND the
+    # image tag + chart the apply renders (``_role_apply_key``). The
+    # stamp lives in the persistent state dir and is NOT reset on a
+    # restart, and the role env carries no version, so a key on the env
+    # alone made the first heartbeat on a new slot skip: the agents kept
+    # the previous release's chart and images until a role next changed.
     # #170 Wave E follow-up — if the appliance row was deleted on the
     # control plane and we tripped the revocation threshold above
     # (well, on a prior heartbeat — the 200 path above wouldn't have
@@ -1445,9 +1451,8 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
-        env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-        last_hash = _read_last_apply_hash(cfg.state_dir)
-        if env_hash == last_hash:
+        apply_due, env_hash = _role_apply_due(cfg.state_dir, rendered, env_path)
+        if not apply_due:
             log.info(
                 "supervisor.heartbeat.lifecycle_skipped",
                 reason="env_unchanged",
@@ -1491,11 +1496,33 @@ _LIFECYCLE_STATE_FILE = "role-switch-state"
 _LAST_APPLY_HASH_FILE = "role-compose.env.hash"
 
 
+def _role_apply_key(rendered_env: str, env_path: Path) -> str:
+    """The skip key for the role apply: everything the apply sends (#1203).
+
+    The rendered role env plus ``role_release_fingerprint`` (the image tag and
+    the chart the apply renders). Keyed on the env alone, a slot upgrade never
+    changed the key, because the env carries only role-scoped values. A stamp
+    written by a supervisor that keyed on the env alone never equals this key,
+    so the first heartbeat after upgrading onto this code re-applies once.
+    """
+    material = rendered_env + role_release_fingerprint(env_path)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _role_apply_due(state_dir: Path, rendered_env: str, env_path: Path) -> tuple[bool, str]:
+    """(whether the role apply must run on this heartbeat, its key).
+
+    Due when the key differs from the one stamped after the last successful
+    apply, or when there is no stamp."""
+    key = _role_apply_key(rendered_env, env_path)
+    return key != _read_last_apply_hash(state_dir), key
+
+
 def _read_last_apply_hash(state_dir: Path) -> str | None:
-    """Return the env-file content hash of the last successful
+    """Return the key (``_role_apply_key``) of the last successful
     ``apply_role_assignment``, or ``None`` on first boot / no prior
-    apply / file missing. Used by the heartbeat to skip the
-    subprocess pair when nothing has changed."""
+    apply / file missing. Used by the heartbeat to skip the apply
+    when nothing it would send has changed."""
     path = state_dir / _LAST_APPLY_HASH_FILE
     try:
         return path.read_text(encoding="utf-8").strip() or None
@@ -1504,8 +1531,8 @@ def _read_last_apply_hash(state_dir: Path) -> str | None:
 
 
 def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
-    """Stamp the env-file content hash so subsequent heartbeats can
-    skip the apply when the rendered env is unchanged. Atomic write
+    """Stamp the apply key so subsequent heartbeats can skip the
+    apply when nothing it would send has changed. Atomic write
     so a supervisor crash mid-flush can't leave a torn file that
     would silently skip a real divergence."""
     path = state_dir / _LAST_APPLY_HASH_FILE
