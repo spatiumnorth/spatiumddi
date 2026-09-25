@@ -40,7 +40,10 @@ kubectl apply -f k8s/base/namespace.yaml
 kubectl create secret generic spatiumddi-secrets \
   --from-literal=postgres-password=CHANGEME \
   --from-literal=secret-key=$(openssl rand -hex 32) \
+  --from-literal=metrics-token=$(openssl rand -hex 32) \
   -n spatiumddi
+# metrics-token is the bearer token /metrics accepts (#1159). It's optional:
+# without it, only API tokens can scrape.
 
 # 2. Deploy a standalone PostgreSQL (not HA — for dev/test only)
 kubectl run postgres --image=postgres:16-alpine -n spatiumddi \

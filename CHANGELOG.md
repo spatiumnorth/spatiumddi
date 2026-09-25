@@ -1125,6 +1125,23 @@ the formatter handles the rest.
 
 ### Security
 
+- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
+  reachable from outside: the web port proxies it and Docker Compose
+  publishes the API port. So anyone who could load the login page could
+  read per-route request counts. It now answers only
+  `Authorization: Bearer <token>`, where the token is the new scrape
+  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
+  the same revoked / expired / scope / disabled-owner checks as on any
+  other route. The Helm chart generates the scrape token into its app
+  Secret as `metrics-token` and keeps it across upgrades like
+  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
+  optional Secret key. The appliance console reads it from the chart's
+  Secret, so its API panel keeps working.
+  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
+  token gets 401 after this release. Give it the scrape token or an API
+  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
+  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
+
 - **The interactive API docs load through the web port again, and
   the appliance's HTTPS web tier sends the #400 security headers
   (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
