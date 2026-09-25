@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -11,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
+from app.api.docs import install_api_docs
 from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
@@ -27,6 +29,13 @@ from app.services.session_listeners import install_session_listeners
 # writes a row. ``app.celery_app`` installs the same list for the worker and
 # beat (#1168).
 install_session_listeners()
+
+# #1111 — same idea: the after_flush listener that marks DNS agent bundles
+# dirty in the transaction that changes their inputs must be attached before
+# any request handler writes a DNS row. ``app.celery_app`` loads it the same
+# way for the worker and beat. import_module, not a bound import, so static
+# analysis doesn't flag a side-effect-only import as unused.
+importlib.import_module("app.services.dns.bundle_dirty")
 
 logger = structlog.get_logger(__name__)
 
@@ -307,8 +316,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface "
-        "(issue #134, Phase 4): TLS cert upload, release manager, "
+        "Full control of the SpatiumDDI OS appliance management surface: "
+        "TLS cert upload, release manager, "
         "container start/stop/restart + live logs, host network + "
         "firewall config, maintenance mode, diagnostic bundle download. "
         "Intended for ops staff who manage the appliance lifecycle "
@@ -535,6 +544,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_daemon_degraded_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_daemon_degraded_alert_rule_seed_skipped", reason=str(exc))
+    # #1111 — the mirror image: the control plane could not RENDER a DNS
+    # agent's bundle. Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_bundle_render_failed_alert_rule,
+        )
+
+        await seed_agent_bundle_render_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
@@ -823,8 +842,11 @@ def create_app() -> FastAPI:
         # into an api container that dies at import with a bare AssertionError,
         # before logging is even configured.
         version=settings.version or "dev",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        # /api/docs and /api/redoc are registered by install_api_docs()
+        # below, with their assets served by the api (#1157). FastAPI's own
+        # pages load them from a CDN, which the web tier's CSP refuses.
+        docs_url=None,
+        redoc_url=None,
         openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
@@ -907,6 +929,8 @@ def create_app() -> FastAPI:
         dependencies=[Depends(require_module("network.e911"))],
     )
     app.include_router(api_v1_router, prefix="/api/v1")
+    # The interactive API docs, with self-hosted assets (#1157).
+    install_api_docs(app)
 
     if settings.prometheus_metrics_enabled:
         app.add_route("/metrics", metrics_endpoint)

@@ -59,6 +59,7 @@ from app.models.dicom import DICOMApplicationEntity, DICOMPeer
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
+    DNSAgentBundle,
     DNSBlockList,
     DNSBlockListEntry,
     DNSBlockListException,
@@ -239,6 +240,7 @@ __all__ = [
     "DNSTrustAnchor",
     "DNSAcl",
     "DNSAclEntry",
+    "DNSAgentBundle",
     "DNSBLList",
     "DNSBLListing",
     "DNSBLPinnedIP",

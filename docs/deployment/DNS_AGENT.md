@@ -181,6 +181,150 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Stored bundles — rendered once, served as bytes (#1111)
+
+The bundle the long-poll hands out is **not assembled in the request**. It
+is rendered once per `(server, watermark)` by the Celery worker
+(`app.tasks.agent_bundles`, queue `bundles`) and stored in
+`dns_agent_bundle` — `etag`, `structural_etag`, the compact JSON body
+gzip-compressed — and the long-poll reads one small row per wake, compares
+`If-None-Match` with the stored ETag, splices the per-server ops page in
+front of the stored bytes and streams them. Whatever the group's record
+count, the api never holds the group's record set as Python objects and
+never serialises a multi-megabyte body on the request loop; the DB runs
+the records query once per change, not once per agent per poll. The worker
+has no HTTP liveness probe and its per-task engine carries no
+`command_timeout`, so a render of a million-row group simply runs.
+
+*What says a stored bundle is current.* `dns_server.bundle_dirty_seq` is
+bumped **in the same transaction** as every change that feeds the bundle
+(an `after_flush` listener, `services/dns/bundle_dirty.py`, maps every
+contributor — records via their zone, zones, views, ACLs, options, TSIG
+keys, update ACLs, sibling servers for the catalog producer pick, new
+pending ops, blocklists, pools, and the platform singletons — to the
+servers it feeds; each flush's servers are collected and bumped once, at
+the outermost commit, in server-id order, so the bump's row locks live for
+the COMMIT alone and two writers can never deadlock on them); `bundle_watermark` is the sequence the newest stored
+bundle was rendered at. Current ⇔ `watermark ≥ seq` **and** the bundle was
+rendered by the running release (`bundle_app_version`): one integer and one
+string comparison, no assembly, no content hash. The release half is what
+makes an upgrade that changes the renderer's output re-render every server
+once, instead of serving the previous release's bytes until something
+unrelated marks it. After commit the render is enqueued (the worker
+coalesces duplicates: one render in flight per server, one more after it if
+a change landed meanwhile — that is what turns a thousand-batch seed into a
+handful of renders), and a 30 s beat sweep re-enqueues anything still
+behind, so a lost broker message costs at most one tick. The per-server
+lock and the fleet-wide render slot are a lease
+(`dns_agent_bundle_render_lease_seconds`, 60 s) that the render renews
+while it runs and releases only while it still holds it: a render the OOM
+killer takes mid-flight frees the slot within one lease instead of holding
+every server's render for the render ceiling. A render waiting for the slot
+keeps its server's lock, so the duplicates the sweep and further marks
+enqueue meanwhile coalesce into it.
+
+*Every process that writes DNS rows must carry the listener.* It is
+installed by importing `bundle_dirty`: `app.main` does so for the api,
+`app.celery_app` for the worker and beat. A process without it commits its
+changes unmarked — the bundle stays "current", and because the ops page is
+gated to its snapshot (below) the new ops never ship either. That is not
+hypothetical: pool health failover, ACME DNS-01, lease-expiry DDNS, IPAM
+auto-sync and blocklist refresh all write from Celery tasks.
+`test_the_worker_process_installs_the_listener` probes the worker's own
+import graph in a fresh interpreter, because the test suite imports
+`app.main` and so always has it. The listener sees only ORM unit-of-work
+writes; a Core `insert()` / `update()` / `delete()` on a bundle input calls
+`bundle_dirty.mark_bundles_dirty()` in the same transaction.
+
+*A mark is not free, so writes the bundle never reads do not mark.* Every
+mark costs a render, renders run one at a time fleet-wide, and a
+million-row group renders in about half a minute, so a writer that marks on
+bookkeeping keeps renders busy with nothing to deliver. A dirty contributor
+therefore marks only when a column the bundle renders has a net change: the pool
+health check's timestamps, the `dnssec_synced_at` stamp every agent posts
+after a structural reload, blocklist sync bookkeeping, and every platform
+setting outside the `snmp_` / `ntp_` columns the bundle renders (the beat
+tasks' `*_last_run_at` stamps, the release check) mark nothing. New and
+deleted rows always mark. Geo steering reads the Site a pool member is
+scoped to and that Site's live subnets, so a subnet joining or leaving a
+Site — or changing its prefix — marks the groups whose pools use it.
+
+*The ops page carries what the body's render read, nothing newer.* Every
+body an agent holds is a superset of every op it has applied. The inline
+build had that by construction, because the body was built moments before
+the page. A stored body ships only the ops whose transaction had committed
+before its render read. The render takes `pg_current_snapshot()` (stored
+as `dns_agent_bundle.visible_xacts`) in a statement of its own before its
+records query, and each op carries the transaction that queued it
+(`dns_record_op.xact_id`, `pg_current_xact_id()`). An op is covered when
+that transaction is visible in the snapshot.
+
+The op's `created_at` cannot decide this: it is the transaction's START.
+A bulk write that began before a render and committed after its records
+query would pass a time gate with records the body never read. Without the
+gate, the full re-render (or a restart replaying `current.json`) would
+drop a record the agent had already applied over RFC 2136. The same gate
+decides which queued ops a split-horizon render retires as applied, so an
+ACME DNS-01 wait never reads an op as applied that no body carries. An op
+the snapshot does not cover rides with the next render, whose dirty mark
+its own commit made.
+
+Three cases keep the time gate (`created_at <= snapshot_at`):
+- ops and bundles from before these columns;
+- a transaction id this cluster has not reached yet;
+- a snapshot this cluster has not reached yet.
+The last two come from a backup restored onto a new appliance.
+
+*What the agent sees.* Nothing changes in the protocol: weak `ETag` / 304 /
+the body shape / the "200 while ops are pending" fast path /
+`structural_etag` / the #882 quarantine. The one difference is that the
+ETag is the stored body's and no longer folds the ops page in, so a page
+does not rotate it — the fast path answers 200 with the same ETag and the
+next page, and the poll after the last ack answers 304 instead of
+re-sending the whole body. The agent never short-circuits on an unchanged
+ETag (it saves, compares `structural_etag`, drains the ops).
+
+*The newest render is served, current or not.* A long-poll serves the
+newest bundle the running release stored, even when changes have been
+committed since it was rendered. Its render is enqueued and the poll wakes
+when one lands. Under a write storm marks arrive faster than renders
+finish, so no render is current until the writes stop. Serving only a
+current bundle held every agent on its last config for the whole storm: in
+a 250k-record seed a pool failover stayed in `named` for 339 s while 74
+renders landed unserved. Now each render that lands reaches the agents, at
+most one render behind, and the gate above keeps that safe. A bundle
+another release rendered is never served; the sweep re-renders it. With
+nothing stored for this release the poll holds on the wake the render
+publishes, 304 at the deadline.
+
+*Staleness is never silent.* A render
+that raises lands on `dns_server.bundle_render_status / _error / _at` —
+deliberately not `config_failed_etag`, which is the agent's #882 verdict
+and is cleared by its next healthy heartbeat — and fires the
+`agent_bundle_render_failed` alert (critical when the server has never had
+a bundle, warning while a previous one is still served). The same rule
+fires when changes have waited 10 minutes with no render landing
+(`dns_server.bundle_dirty_at`, set by the first mark and cleared by a
+render that catches up): an OOM-killed render, a render slot held by a dead
+worker, or a worker that does not consume the `bundles` queue never records
+a failure, and that is the case that most needs seeing. The migration
+release keeps `dns_agent_bundle_inline_fallback` on: a deployment whose
+worker is still one release behind builds a missing or stale bundle inline
+exactly as before, once per version, because it stores what it built (the
+inline render's page is gated like the worker's). The
+fallback is bounded. The api builds a server's bundle only when the server
+has never had one, or when its stale bundle has waited longer than
+`dns_agent_bundle_inline_fallback_after_seconds` (120 s) for the worker;
+every render that lands restarts that clock, so a change storm the worker
+keeps up with costs the api nothing (unbounded, a 250k-record seed had the
+api build the growing bundle 48 times beside the worker). One attempt per
+server at a time across replicas, and none for
+`dns_agent_bundle_inline_fallback_backoff_seconds` (600 s) after one fails.
+A failed attempt (at a million records the records query outlives the
+api's 30 s `command_timeout`) is logged and counted
+(`spatiumddi_agent_bundle_inline_failures_total`) and the poll waits for
+the worker's render; it is never recorded as the server's render failure.
+
 ### RFC 2136 `nsupdate` responsibility
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:

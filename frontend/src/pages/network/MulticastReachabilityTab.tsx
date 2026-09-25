@@ -36,8 +36,8 @@ export function MulticastReachabilityTab() {
     <div className="space-y-6">
       <p className="text-xs text-muted-foreground">
         Cross-references PIM rendezvous-point addresses and multicast-group
-        producer source subnets against the BGP Looking Glass learned RIB (issue
-        #566 Phase 6) — read-only, computed live on every load.
+        producer source subnets against the BGP Looking Glass learned RIB —
+        read-only, computed live on every load.
       </p>
       {error && (
         <p className="text-sm text-destructive">Failed to load reachability.</p>

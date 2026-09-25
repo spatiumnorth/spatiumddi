@@ -207,6 +207,13 @@ spec:
             # chowns it 1000:1000). Always mounted (not mirror-gated).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # #1160 — local-volume backup archives at the driver's default
+            # path. api writes manual runs and lists / downloads / restores
+            # here; the worker writes every scheduled run to the same
+            # hostPath (firstboot chowns it 1000:1000). Per node on a
+            # multi-node cluster — see applianceHostMounts.backupsDir.
+            - name: backups
+              mountPath: /var/lib/spatiumddi/backups
             # #989 item 3 — removable (USB) backup disks. HostToContainer
             # propagation is the whole reason this works: with the DEFAULT
             # private propagation a disk the host mounts AFTER this pod
@@ -275,6 +282,11 @@ spec:
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
+            type: DirectoryOrCreate
+        # #1160 — local-volume backup archives (shared with the worker).
+        - name: backups
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.backupsDir }}
             type: DirectoryOrCreate
         # #989 item 3 — removable (USB) backup disks. DirectoryOrCreate:
         # spatiumddi-firstboot makes it, but a node that has never had a

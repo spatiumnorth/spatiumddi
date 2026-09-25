@@ -71,8 +71,10 @@ export function ModalTabs<T extends string>({
 // so call sites that don't pass ``wide`` keep the narrow default.
 //
 // Non-standard modal shapes (with a border-b header + a footer slot, or a
-// ``bg-background`` card) use ``useDraggableModal()`` + ``MODAL_BACKDROP_CLS``
-// directly to pick up the same drag behavior without adopting this API.
+// ``bg-background`` card) use ``useModalDialog()`` + ``MODAL_BACKDROP_CLS``
+// directly to pick up the same drag behavior without adopting this API —
+// and this component's dialog semantics with it (role, ``aria-modal``, a
+// name, the focus trap; #1156).
 export function Modal({
   title,
   onClose,

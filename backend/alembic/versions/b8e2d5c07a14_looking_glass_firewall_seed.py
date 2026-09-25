@@ -17,7 +17,7 @@ the append-only rule. Idempotent: NOT EXISTS / ON CONFLICT DO NOTHING.
 keeps this in lock-step with ``_BUILTIN_SEED``.
 
 Revision ID: b8e2d5c07a14
-Revises: f4c8a2d61b37
+Revises: f3a9d61c07e4
 Create Date: 2026-09-24
 """
 
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b8e2d5c07a14"
-down_revision: str | None = "f4c8a2d61b37"
+down_revision: str | None = "f3a9d61c07e4"
 branch_labels: str | None = None
 depends_on: str | None = None
 

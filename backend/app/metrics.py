@@ -35,6 +35,30 @@ AUTH_TOKEN_USAGE = Counter(
     ["scope"],
 )
 
+# #1111 — the DNS agent config long-poll serves a bundle rendered once per
+# (server, watermark) and stored. How it answered, and how often the
+# migration-release inline fallback had to build one in the api itself.
+# Worker renders are counted on the server row (``bundle_render_count``):
+# the worker is another process and this registry is the api's.
+AGENT_BUNDLE_SERVED = Counter(
+    "spatiumddi_agent_bundle_served_total",
+    "Agent config long-poll answers by outcome (full / not_modified)",
+    ["family", "outcome"],
+)
+AGENT_BUNDLE_INLINE_RENDERS = Counter(
+    "spatiumddi_agent_bundle_inline_renders_total",
+    "Agent config bundles the api rendered inline (migration-release fallback)",
+    ["family"],
+)
+# An inline render the api could not finish (at a million records the records
+# query outlives the api's 30 s command_timeout). Counted and logged, never
+# recorded on the server row: that verdict is the worker's.
+AGENT_BUNDLE_INLINE_FAILURES = Counter(
+    "spatiumddi_agent_bundle_inline_failures_total",
+    "Inline (migration-release fallback) renders the api could not finish",
+    ["family"],
+)
+
 # #1051 — the ``path_template`` value for a request no route claimed (a 404,
 # or a path the router never saw). ONE constant bucket, never the raw path:
 # the label set must stay bounded by the route table, not by what clients
