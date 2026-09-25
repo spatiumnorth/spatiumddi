@@ -109,6 +109,12 @@ the formatter handles the rest.
 
 ### Changed
 
+- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
+  2026-09-24 and the backend's requirement had no upper bound, so CI
+  picked it up at once. The test suite passes on it, but its new
+  type annotations fail mypy in 23 files, which blocked every open
+  PR. Adopting 2.1 deliberately, typing work included, is #1187.
+
 - **DNS per-minute metrics now accumulate per bucket, like DHCP
   (#1077).** `POST /dns/agents/metrics` replaced an existing
   `(server, bucket_at)` row instead of adding to it — the same jitter
