@@ -158,8 +158,12 @@ def test_redoc_page_policy_grants_only_what_redoc_needs(path: Path) -> None:
     spread to any other page."""
     console = _directives(_policy(path))
     redoc = _directives(_policy(path, "spatium_redoc_csp"))
-    assert redoc.pop("img-src") == console.pop("img-src") + ["https://cdn.redoc.ly"]
-    assert redoc.pop("worker-src") == ["blob:"]
+    # Pop outside the asserts: under ``python -O`` an assert is skipped along
+    # with its side effects, and the comparison below needs both removed.
+    redoc_img, console_img = redoc.pop("img-src"), console.pop("img-src")
+    redoc_worker = redoc.pop("worker-src")
+    assert redoc_img == console_img + ["https://cdn.redoc.ly"]
+    assert redoc_worker == ["blob:"]
     assert "worker-src" not in console
     assert (
         redoc == console
