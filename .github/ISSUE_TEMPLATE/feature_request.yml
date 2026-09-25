@@ -1,7 +1,8 @@
 name: Feature request
 description: Suggest a new feature or enhancement
 title: "[feat] "
-labels: ["enhancement", "needs-triage"]
+labels: ["idea"]
+type: Feature
 body:
   - type: dropdown
     id: area

@@ -1,7 +1,10 @@
 name: Bug report
 description: Something is broken or behaves incorrectly
 title: "[bug] "
-labels: ["bug", "needs-triage"]
+labels: ["bug"]
+# New issues are added to the org project by its auto-add workflow and land in
+# Status "Triage" there; see the "Issue tracking" section of CLAUDE.md.
+type: Bug
 body:
   - type: markdown
     attributes:

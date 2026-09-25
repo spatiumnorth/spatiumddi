@@ -2769,6 +2769,35 @@ SpatiumDDI uses **CalVer**: `YYYY.MM.DD-N` where N is the release number for tha
 - Git tags and Docker image tags follow this scheme exactly
 - Release is triggered by pushing a tag matching `[0-9]{4}.[0-9]{2}.[0-9]{2}-*` (see `.github/workflows/release.yml`)
 
+**Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer until that lands. After it, every SemVer version must compare newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so never compare versions as strings; use the shared helper that #1182 introduces.
+
+---
+
+## Issue tracking
+
+Every open issue is on the public org project **[SpatiumDDI](https://github.com/orgs/spatiumnorth/projects/2)**. Anyone can view it; only org owners can change it. Its README has the full triage procedure. Keep private material off it: draft issues on a public project are visible to everyone. Each piece of state has exactly one home:
+
+| What | Where | Values |
+|---|---|---|
+| Release scope | milestone | `1.0.0`. Open bugs and QA / Academy findings are in; a feature is in only when a maintainer adds the milestone. The ship criteria are in [#1181](https://github.com/spatiumnorth/spatiumddi/issues/1181) |
+| Urgency | project field **Priority** | **P0** data loss, a security hole, wrong DNS / DHCP / IPAM answers, or an install or upgrade that never converges · **P1** fix before the release, or move it out with a reason · **P2** may slip to a patch release · **P3** polish |
+| Where it was found | label | `source:qa` (the ddi-pg proving ground) · `source:academy` (building the Academy course) · `source:community` |
+| State | project field **Status** | Triage → Backlog or Todo → In progress → In review → Done. The project's workflows move most of these |
+| Kind and area | issue type and `area:*` / `theme:*` labels | the existing taxonomy |
+
+The QA loop (`spatiumnorth/ddi-pg`) reads two things from issues, and both are easy to break by accident:
+
+- **Assigning an issue to amoona6 hands it to QA.** `/issues-fix-check` works every open issue assigned to that account: it reproduces the issue, fixes it, proves the fix on a stacked build, and opens the PR. Don't assign there as a courtesy.
+- **ddi-pg classifies issues by label.** It reads `roadmap`, `enhancement`, `feature` and `epic` as "not a defect", and a label named exactly `qa` or `harness` as "our harness". So triage only ever *adds* labels, and never creates `qa` or `harness`. Dropping `enhancement` from a QA issue, for example, turns it into a defect the loop will try to fix.
+
+**Merging.** PRs are squash-merged, and the squash message is built from the commit messages, so a commit message becomes permanent history. main requires a PR to be up to date and every review thread resolved, the code-quality bot's included, so bring a PR up to date just before merging it; every merge makes the other open PRs stale again. The merged branch is deleted automatically. When a PR that adds a migration merges, any other open PR with a migration must re-point its `down_revision` at the new head, or CI sees two Alembic heads.
+
+```bash
+gh issue list --milestone 1.0.0                         # release scope
+gh project item-list 2 --owner spatiumnorth --limit 500 --format json \
+  --jq '.items[] | select(.priority=="P0" and .status!="Done") | "#\(.content.number) \(.status) \(.content.title)"'
+```
+
 ---
 
 ## Development Commands
