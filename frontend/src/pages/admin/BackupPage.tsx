@@ -369,9 +369,11 @@ function RestoreBackupCard() {
         )}
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-            Selective restore requires a Phase 2+ archive (custom format). This
-            archive is plain SQL — switch to <em>Full restore</em> or re-export
-            the source install on a Phase 2+ build.
+            Selective restore needs an archive whose database dump is in
+            pg_dump&rsquo;s custom format. This archive&rsquo;s dump is plain
+            SQL (an older build, or <em>Exclude secrets</em> diagnostic mode,
+            wrote it) — switch to <em>Full restore</em>, or take a regular
+            backup of the source install on a current build.
           </div>
         )}
 
@@ -534,7 +536,7 @@ function SecurityNotes() {
     <section className="rounded-lg border border-dashed bg-muted/30 p-4 text-xs text-muted-foreground">
       <div className="mb-2 flex items-center gap-1.5 text-foreground">
         <Lock className="h-3.5 w-3.5" />
-        <span className="font-medium">Security model — Phase 1a</span>
+        <span className="font-medium">Security model</span>
       </div>
       <ul className="ml-5 list-disc space-y-1">
         <li>
@@ -544,16 +546,18 @@ function SecurityNotes() {
           AES-256-GCM with a fresh per-backup salt + nonce.
         </li>
         <li>
-          The DB dump itself is plain SQL inside the zip — encrypt the archive
-          at rest if you don&rsquo;t want operators with read access to the file
-          to see IPAM / DNS / DHCP rows. Phase 1b will add S3 server-side
-          encryption + per-target credentials.
+          The database dump inside the zip is not encrypted — only{" "}
+          <code>secrets.enc</code> is. Encrypt the archive at rest, or keep it
+          at a destination that does, if you don&rsquo;t want operators with
+          read access to the file to see IPAM / DNS / DHCP rows.
         </li>
         <li>
-          Same-install restores work without any further steps. Cross-install
-          restores need you to apply the recovered <code>SECRET_KEY</code> to
-          the destination&rsquo;s environment so encrypted-at-rest columns (auth
-          provider creds, agent PSKs, integration credentials) decrypt cleanly.
+          Same-install restores work without any further steps. A restore into a
+          different install re-encrypts the stored secrets (auth provider creds,
+          agent PSKs, integration credentials) under the destination&rsquo;s own
+          key. If that stops part-way, the restore result says so: recover the
+          source key from the archive&rsquo;s <code>secrets.enc</code> and
+          restore again, or re-enter the affected credentials.
         </li>
         <li>
           <strong>Lose the passphrase, lose the secrets payload.</strong> There

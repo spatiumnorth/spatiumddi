@@ -7,7 +7,7 @@
  * - Preview is a pure read; it shows the blast radius / candidate list
  *   before any mutation.
  * - Commit endpoints take a typed-CIDR confirmation gate (split, merge).
- * - All three modals reuse the shared `useDraggableModal` helper so they
+ * - All three modals reuse the shared `useModalDialog` helper so they
  *   behave like every other heavy modal in the IPAM surface.
  */
 
@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import {
@@ -90,11 +90,13 @@ function ModalShell({
   footer: React.ReactNode;
   width?: string;
 }) {
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="flex max-h-[90vh] w-full max-w-[95vw] flex-col rounded-lg bg-background shadow-xl"
+        {...dialogProps}
+        className="flex max-h-[90vh] w-full max-w-[95vw] flex-col rounded-lg bg-background shadow-xl focus:outline-none"
         style={{ ...dialogStyle, maxWidth: `min(95vw, ${width})` }}
       >
         <div
@@ -104,9 +106,12 @@ function ModalShell({
             dragHandleProps.className,
           )}
         >
-          <h2 className="text-base font-semibold">{title}</h2>
+          <h2 {...titleProps} className="text-base font-semibold">
+            {title}
+          </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />

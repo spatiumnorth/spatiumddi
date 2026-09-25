@@ -432,6 +432,12 @@ async def _apply_delete_subnet(
                     },
                 )
         await db.execute(sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids)))
+        # #1111 — the Core delete is invisible to the bundle dirty-mark
+        # listener, and the ops above mark nothing when the group has no
+        # primary (``enqueue_record_op`` returns without one).
+        from app.services.dns.bundle_dirty import mark_bundles_dirty  # noqa: PLC0415
+
+        await mark_bundles_dirty(db, zone_ids={rec.zone_id for rec in recs})
 
     # spatiumddi#1066 — the subnet's auto-created reverse zone: re-linked to
     # a sibling that still lives in it, else deleted the way the zone-delete

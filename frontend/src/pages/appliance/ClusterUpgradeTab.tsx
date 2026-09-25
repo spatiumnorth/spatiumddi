@@ -93,9 +93,9 @@ const CATEGORY_HINTS: Record<ClusterUpgradeFailureCategory, string> = {
   cnpg_primary_stuck:
     "CNPG primary didn't switch. Check Cluster.status + replica replay lag.",
   node_auto_reverted:
-    "Node reverted to the old slot (Phase 8c). Check /health/live + firstboot logs.",
+    "Node reverted to the old slot. Check /health/live + firstboot logs.",
   node_unreachable_after_apply:
-    "Check supervisor heartbeat + appliance last_upgrade_state. If unreachable, evict + re-pair (#272 Ph9).",
+    "Check supervisor heartbeat + appliance last_upgrade_state. If unreachable, evict + re-pair.",
   supervisor_reported_failed:
     "Slot apply failed on the node. Check spatium-upgrade-slot.log; the upgrade image may be corrupt.",
   node_did_not_rejoin:

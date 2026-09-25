@@ -245,33 +245,112 @@ export function CreateScopeModal({
       "not_on_windows";
   const needsPlacement = !isV6 && windowsMembers.length >= 2 && heldNowhere;
 
-  const [prefilled, setPrefilled] = useState(false);
+  // Pre-fill for a NEW scope (#1154), from two sources, each applied when
+  // ITS query answers:
+  //   * the platform DHCP defaults (Settings → DHCP): DNS servers, domain
+  //     name / search, NTP servers, lease time;
+  //   * the subnet: Routers (option 3) = its gateway, and a suggested pool.
+  // They used to share one latch that fired on whichever answered first.
+  // The Dashboard has usually cached ["settings"] already, so on the
+  // ordinary path (Dashboard → IPAM → subnet → Create Scope) it fired
+  // before the subnet arrived: Routers and the pool stayed empty, and a
+  // scope saved as shown handed out leases with no default gateway. A hard
+  // reload lost the other half instead — the platform defaults.
+  //
+  // Neither half overwrites a value already there (typed, or applied from a
+  // template). Rows are named like DHCPOptionsEditor's own, so a template's
+  // by-name merge replaces them instead of adding a second row per code.
+  //
+  // DHCPOptionsEditor's inputs are uncontrolled (defaultValue + onBlur), so
+  // a pre-fill landing after the operator touched a field would change what
+  // is sent without changing what is shown. It is remounted on each
+  // pre-fill, so the dialog always shows what it will send.
+  const [prefillGeneration, setPrefillGeneration] = useState(0);
+  const [settingsPrefilled, setSettingsPrefilled] = useState(false);
   useEffect(() => {
-    if (editing || prefilled) return;
-    if (!settings && !subnetDetail) return;
-    const next: DHCPOption[] = [];
-    const gw = subnetDetail?.gateway;
-    if (gw) next.push({ code: 3, value: [gw] });
-    if (settings?.dhcp_default_dns_servers?.length)
-      next.push({ code: 6, value: settings.dhcp_default_dns_servers });
-    if (settings?.dhcp_default_domain_name)
-      next.push({ code: 15, value: settings.dhcp_default_domain_name });
-    if (settings?.dhcp_default_domain_search?.length)
-      next.push({ code: 119, value: settings.dhcp_default_domain_search });
-    if (settings?.dhcp_default_ntp_servers?.length)
-      next.push({ code: 42, value: settings.dhcp_default_ntp_servers });
-    if (next.length) setOptions(next);
-    if (settings?.dhcp_default_lease_time)
-      setLeaseTime(String(settings.dhcp_default_lease_time));
+    if (editing || settingsPrefilled || !settings) return;
+    const defaults: DHCPOption[] = [];
+    if (settings.dhcp_default_dns_servers?.length)
+      defaults.push({
+        code: 6,
+        name: "dns-servers",
+        value: settings.dhcp_default_dns_servers,
+      });
+    if (settings.dhcp_default_domain_name)
+      defaults.push({
+        code: 15,
+        name: "domain-name",
+        value: settings.dhcp_default_domain_name,
+      });
+    if (settings.dhcp_default_domain_search?.length)
+      defaults.push({
+        code: 119,
+        name: "domain-search",
+        value: settings.dhcp_default_domain_search,
+      });
+    if (settings.dhcp_default_ntp_servers?.length)
+      defaults.push({
+        code: 42,
+        name: "ntp-servers",
+        value: settings.dhcp_default_ntp_servers,
+      });
+    setOptions((cur) => [
+      ...cur,
+      ...defaults.filter((d) => !cur.some((o) => o.code === d.code)),
+    ]);
+    // Only over the field's own initial value — never over a typed one.
+    const leaseDefault = settings.dhcp_default_lease_time;
+    if (leaseDefault)
+      setLeaseTime((cur) => (cur === "86400" ? String(leaseDefault) : cur));
+    setSettingsPrefilled(true);
+    setPrefillGeneration((g) => g + 1);
+  }, [editing, settingsPrefilled, settings]);
+
+  // The subnet half, keyed by subnet: picking another subnet in the dialog
+  // replaces what this filled in for the last one — never a value the
+  // operator has since changed.
+  const [subnetPrefill, setSubnetPrefill] = useState<{
+    subnetId: string;
+    routers: string[];
+    pool: { start: string; end: string } | null;
+  } | null>(null);
+  useEffect(() => {
+    if (editing || !subnetDetail || subnetPrefill?.subnetId === subnetId)
+      return;
+    const prev = subnetPrefill;
+    // Option 3 is DHCPv4-only (a v6 client learns its router from RAs), as
+    // is the pool suggestion.
+    const gw = subnetDetail.network?.includes(":")
+      ? null
+      : subnetDetail.gateway;
+    const routers = gw ? [gw] : [];
+    setOptions((cur) => {
+      const row = cur.find((o) => o.code === 3);
+      const ours =
+        !row ||
+        (prev !== null &&
+          JSON.stringify(row.value) === JSON.stringify(prev.routers));
+      if (!ours) return cur;
+      const rest = cur.filter((o) => o.code !== 3);
+      return routers.length
+        ? [{ code: 3, name: "routers", value: routers }, ...rest]
+        : rest;
+    });
     // Suggest a pool range: skip the first 10 and last 1 host of the subnet.
     // User can freely edit or clear.
-    const range = suggestRange(subnetDetail);
-    if (range) {
-      setPoolStart(range.start);
-      setPoolEnd(range.end);
+    const pool = suggestRange(subnetDetail);
+    const poolIsOurs =
+      (!poolStart && !poolEnd) ||
+      (prev?.pool != null &&
+        poolStart === prev.pool.start &&
+        poolEnd === prev.pool.end);
+    if (poolIsOurs) {
+      setPoolStart(pool?.start ?? "");
+      setPoolEnd(pool?.end ?? "");
     }
-    setPrefilled(true);
-  }, [editing, prefilled, settings, subnetDetail]);
+    setSubnetPrefill({ subnetId, routers, pool });
+    setPrefillGeneration((g) => g + 1);
+  }, [editing, subnetDetail, subnetId, subnetPrefill, poolStart, poolEnd]);
 
   const mut = useMutation({
     mutationFn: (adoptExisting: boolean) => {
@@ -938,7 +1017,11 @@ export function CreateScopeModal({
               onApply={setOptions}
             />
           </div>
-          <DHCPOptionsEditor value={options} onChange={setOptions} />
+          <DHCPOptionsEditor
+            key={prefillGeneration}
+            value={options}
+            onChange={setOptions}
+          />
         </div>
 
         <PXEProfileSection
