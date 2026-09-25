@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -21,23 +20,14 @@ from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
-
-# Import for side-effect: registers the SQLAlchemy after_commit listener
-# that forwards audit events to syslog + webhook targets. Must run at app
-# startup so the listener is attached before any request handler writes
-# an AuditLog row.
-from app.services import (
-    audit_forward,  # noqa: F401
-    event_publisher,  # noqa: F401
-)
 from app.services.feature_modules import require_module
+from app.services.session_listeners import install_session_listeners
 
-# #1111 — same idea: the after_flush listener that marks DNS agent bundles
-# dirty in the transaction that changes their inputs must be attached before
-# any request handler writes a DNS row. ``app.celery_app`` loads it the same
-# way for the worker and beat. import_module, not a bound import, so static
-# analysis doesn't flag a side-effect-only import as unused.
-importlib.import_module("app.services.dns.bundle_dirty")
+# SQLAlchemy session listeners (audit forwarding, the typed-event outbox, the
+# DNS bundle dirty-mark) register on import, so they must be installed before
+# any request handler writes a row. ``app.celery_app`` installs the same list
+# for the worker and beat (#1168, #1111).
+install_session_listeners()
 
 logger = structlog.get_logger(__name__)
 

@@ -303,7 +303,7 @@ docker compose -f docker-compose.agent-dhcp.yml up -d
 docker compose -f docker-compose.agent-dhcp.yml --profile dhcp-ha up -d
 ```
 
-For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to the other peer's reachable URL. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
+For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to **its own** HA listener URL (`http://<that VM's address>:8000/`). Each server's URL goes into every peer's `peers` list, which is how the partner reaches it. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
 
 #### Optional: passive DHCP fingerprinting
 

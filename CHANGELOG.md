@@ -201,6 +201,56 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Typed webhook events and audit forwarding were lost for anything a
+  Celery task committed (#1168).** Two faults. The worker never loaded
+  `event_publisher`: session listeners register on import, and only the
+  api imported them. And loading it was not enough. Both it and
+  `audit_forward` handed their after-commit work to a bare
+  `loop.create_task`, and in a Celery task that loop is the task's own
+  `asyncio.run`, which cancels pending work when the task returns. A task
+  usually commits last. Measured on a scratch database, five task-shaped
+  `backup_target_run_failed` commits wrote 0 of 5 outbox rows (5 of 5
+  with the fix). So scheduled backups and rolling upgrades sent no
+  `system.backup_*` / `system.upgrade.*` webhooks, and syslog/webhook
+  audit forwarding lost what tasks wrote last. Both processes now
+  install one listener list (a guard fails when a new listener module
+  isn't on it). In Celery processes the after-commit work runs on a
+  per-process background loop, switched on from `worker_init` /
+  `beat_init` and started lazily per PID for prefork children.
+
+- **The worker's liveness probe no longer loads every model (#1189).**
+  The session listeners, now including the DNS bundle dirty-mark from
+  #1111, were installed when `app.celery_app` was imported, and the
+  worker's liveness probe (`celery -A app.celery_app inspect ping`,
+  10 s timeout) imports it on every run. That pulled in the models,
+  the DNS drivers, httpx, cryptography and jinja2: 1,002 modules
+  against 744, and under load a three-node cluster's worker missed the
+  probe 14 times in 28 minutes and restarted once. They are installed
+  from `worker_init` / `beat_init` now, which the prefork pool
+  inherits, and a test fails if a bare import loads them again.
+
+- **Two appliances in one Kea HA group could not reach each other
+  (#1167).** Kea's HA hook listens on the port in each member's own
+  `ha_peer_url`, and no appliance firewall layer opened it under the
+  `input` chain's drop policy. The control plane now puts the port and
+  the group's other Kea members' addresses on the role assignment:
+  the IP in the member's URL, else its appliance's node IPs, else its
+  agent's last address. All three firewall renderers open the port to
+  exactly those sources, never to `any`, because Kea's HA API is
+  unauthenticated by default and accepts lease updates. The rule
+  follows the HA hook's own readiness rule, so the port is open
+  exactly while Kea listens. Also fixed: TOPOLOGIES.md and DOCKER.md
+  told operators to set `ha_peer_url` to the *other* peer's URL. It is
+  each server's *own* listener URL.
+
+- **A looking-glass node lost TCP 179 when fleet firewall enforcement
+  was on (#1166).** Only the supervisor's own renderer opened BGP for
+  the role. The backend port table had no entry and no builtin policy
+  existed, so under enforcement every session the router initiated
+  was dropped. The byte-identity test had no looking-glass case to
+  catch it. Now all three renderers carry it: seed migration
+  `b8e2d5c07a14`, plus two looking-glass cases in the test matrix.
+
 - **Relayed DHCPv6 never reached Kea on the appliance (#1139,
   #1140).** Two faults in series, so fixing either alone changed nothing.
   **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6

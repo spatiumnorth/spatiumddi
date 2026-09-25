@@ -75,7 +75,6 @@ celery_app = Celery(
         "app.tasks.schema_check",
         "app.tasks.wol_scheduler",
         "app.tasks.wol_calendar",
-        "app.tasks.agent_bundles",
     ],
 )
 
@@ -149,23 +148,8 @@ celery_app.conf.update(
         "app.tasks.schema_check.*": {"queue": "default"},
         "app.tasks.wol_scheduler.*": {"queue": "default"},
         "app.tasks.wol_calendar.*": {"queue": "default"},
-        # #1111 — DNS agent bundle renders. Their own queue so a 30–60 s
-        # render of a million-row group never sits in front of the
-        # latency-bound ipam/dns/dhcp work, and so an operator can give
-        # them a dedicated worker (concurrency 1, its own memory cap).
-        "app.tasks.agent_bundles.*": {"queue": "bundles"},
     },
     beat_schedule={
-        # #1111 — every 30 s, enqueue a render for any enabled agent-based
-        # DNS server whose newest stored bundle is behind its dirty
-        # sequence (or absent). The mutating transaction already enqueued
-        # one after commit; this is the belt and braces for a lost broker
-        # message or a worker restart mid-render, bounding staleness to
-        # one tick — the class of the long-poll's own 12 s wake tick.
-        "dns-agent-bundle-sweep": {
-            "task": "app.tasks.agent_bundles.render_missing_sweep",
-            "schedule": schedule(run_every=30.0),
-        },
         # Every 60 s, mark DNS agents as ``unreachable`` if their
         # heartbeat hasn't been seen within the staleness window
         # (issue #217 — this entry used to live in a separate
@@ -753,14 +737,39 @@ from celery.signals import task_failure  # noqa: E402
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
 
-# #1111 — the after_flush listener that marks DNS agent bundles dirty in the
-# transaction that changes their inputs. It is installed by importing the
-# module, and nothing a worker imports reaches it otherwise (``app.main``
-# does, for the api only). Without it every DNS write a Celery task makes —
-# pool failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync, blocklist
-# refresh — commits unmarked: the stored bundle stays "current" and the new
-# ops are gated out of every ops page, so agents never receive them.
-importlib.import_module("app.services.dns.bundle_dirty")
+from celery.signals import beat_init, worker_init  # noqa: E402
+
+
+@worker_init.connect
+@beat_init.connect
+def _install_session_listeners(**_: object) -> None:
+    """Install the SQLAlchemy session listeners in the worker and beat: audit
+    forwarding and the typed-event outbox (#1168), and the DNS bundle
+    dirty-mark (#1111). They register on import, and nothing a worker imports
+    reaches them otherwise (``app.main`` installs them for the api only).
+    Without them a task's audit rows produce no typed webhook events, and a
+    task's DNS writes commit unmarked, so agents never receive them.
+
+    From the signals, not at import (#1189): the worker's liveness probe runs
+    ``celery -A app.celery_app inspect ping``, which imports this module on
+    every run, and the listeners pull in the models, the DNS drivers, httpx,
+    cryptography and jinja2. ``worker_init`` runs in the prefork master before
+    the pool forks, so every child inherits them."""
+    importlib.import_module("app.services.session_listeners").install_session_listeners()
+
+
+@worker_init.connect
+@beat_init.connect
+def _dispatch_after_commit_in_background(**_: object) -> None:
+    """#1168 — in a Celery process, run the listeners' after-commit work on a
+    per-process background loop. A task's own ``asyncio.run`` cancels
+    whatever is still pending when it returns, and a task usually commits
+    last: measured, 0 of 5 typed events reached the outbox that way. Wired
+    to the Celery signals rather than done at import because the api imports
+    this module too, and its request loop is fine as it is. ``worker_init``
+    runs in the prefork master; the loop itself starts lazily per PID, so
+    each forked child gets its own."""
+    importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
 
 
 @task_failure.connect

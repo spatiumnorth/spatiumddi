@@ -131,8 +131,11 @@ Configured via the UI:
   serials so you can spot a slave that hasn't transferred (zone-state pill
   on the zone page).
 - **DHCP Server Group** with HA mode = `hot-standby` (or `load-balancing`
-  for higher throughput). Set `ha_peer_url` on each Kea server to the
-  other peer's reachable URL. The `2026.04.21-2` release shipped the
+  for higher throughput). Set `ha_peer_url` on each Kea server to **its
+  own** HA listener URL, `http://<that server's address>:8000/`; each
+  server's URL is rendered into every peer's `peers` list, which is how
+  the partner finds it. On appliances the firewall then opens that port
+  to the other members only (#1167). The `2026.04.21-2` release shipped the
   three-wave HA story including peer-IP self-healing — DNS changes that
   rename a peer no longer break the HA pair.
 
