@@ -890,6 +890,21 @@ view "guest" {
 - **Deleting a view** leaves its zones in place (they fall back to being
   served from the remaining views) but any list scoped *only* to it stops
   applying anywhere.
+- **SpatiumDDI's own zone transfers pick their view by key, not by
+  address** ([#920](https://github.com/spatiumnorth/spatiumddi/issues/920)).
+  BIND chooses the view before it consults `allow-transfer`, and nothing
+  in a view's `match_clients` names the control plane — so the drift
+  report and *Sync with Servers* sign each transfer with a key that
+  belongs to the view holding that zone's copy. The BIND9 agent admits
+  that key first in its view's `match-clients` (and `match-destinations`,
+  when set) and refuses it in every other view, so a broad `any` view
+  cannot capture a transfer meant for a narrower one. Requests that carry
+  none of these keys — every client, every DDNS update, any transfer an
+  operator runs — are matched by your lists exactly as written. The keys
+  are derived from the group's own TSIG key; they are never shown and need
+  no setup. Before this, a view that did not happen to admit the api's
+  address made both features fail with "The peer didn't know the key we
+  used".
 
 ### 8.1 Content filtering / family filter (issue #878)
 

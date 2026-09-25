@@ -920,6 +920,33 @@ the formatter handles the rest.
   with k3s uninstalling and reinstalling the whole control plane
   every few minutes.
 
+- **Drift and Sync with Servers work on groups with DNS views
+  (#920).** BIND chooses the view for a request by the requester's
+  address before it looks at `allow-transfer`, and a view's client
+  list never names the control plane. So on a group whose views are
+  scoped to real clients, every drift report and every sync failed
+  with "The peer didn't know the key we used" — for a key that was
+  loaded and granted — and where a broad view did match the api's
+  address, it answered with its own copy of a same-named zone. Each
+  rendered view now admits one key of its own, derived from the
+  group's TSIG key and never shown, and refuses every other view's;
+  drift and sync sign with the key of the view that holds the zone.
+  Every other request is matched to a view exactly as before. An
+  agent that predates this is still read with the group key, and the
+  report says when a comparison may come from another view.
+
+- **An agent-managed zone can read in sync, and Sync with Servers no
+  longer imports a record nobody made.** The BIND9 agent writes
+  `ns1 IN A 127.0.0.1` into every zone it serves, so BIND will load a
+  zone whose NS names an in-zone host. The drift report listed that
+  glue as extra on the server on every agent-managed zone, so none
+  ever read in sync, and every sync imported it into the database as
+  an ordinary record. It is now treated like the apex SOA and NS:
+  zone-level apparatus, left out of the comparison and the import —
+  unless the zone really holds that record, which is then compared
+  like any other. Found once the transfer in the entry above went
+  through.
+
 - **A dead-node replace no longer scales the database down (#1059).**
   The replace endpoint drops the replaced row from the committed
   control-plane count at once, so from the seed's next heartbeat —

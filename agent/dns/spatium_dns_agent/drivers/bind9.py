@@ -203,6 +203,57 @@ def _transfer_key_grants(tsig_keys: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+def _view_transfer_keys(views: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``{view name: key}`` for every view the bundle gives a transfer key (#920).
+
+    Under split-horizon BIND picks the view for a request BEFORE it looks at
+    ``allow-transfer``, and it picks by ``match-clients`` — which the operator
+    fills with the clients each view is for. The control plane's own zone
+    transfers (the drift report, sync-with-servers) come from wherever the api
+    runs, an address no operator lists and nobody can know at render time. So
+    on a view that does not happen to admit that address the signed transfer
+    selects no view at all, and BIND answers it BADKEY — "the key is unknown",
+    for a key that is loaded and granted. On a broad view that does admit it,
+    the transfer is answered from that view's copy, which is the wrong copy
+    whenever the zone lives in another view.
+
+    ``match-clients`` can select by TSIG key as well as by address, so each
+    view carries a key of its own (derived by the control plane from the
+    group's key, never typed by anyone) that selects exactly that view. A view
+    without one — a bundle from a control plane that predates it — renders as
+    before.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for view in views or []:
+        name = view.get("name") or ""
+        key = view.get("transfer_key")
+        if name and isinstance(key, dict) and key.get("name") and key.get("secret"):
+            out[name] = key
+    return out
+
+
+def _render_match_clients(view: dict[str, Any], view_keys: dict[str, dict[str, Any]]) -> str:
+    """The body of one view's ``match-clients { … }`` (#920).
+
+    Order is the whole point, because BIND takes the first element that
+    matches. This view's own transfer key selects it. Every OTHER view's
+    transfer key is refused, so an earlier view whose client list happens to
+    match the control plane's address (an ``any`` catch-all, a 10/8) cannot
+    capture a transfer meant for a later one. Then the operator's own list,
+    exactly as before: a request carrying none of these keys — every client,
+    every DDNS update, every transfer an operator runs — is decided by the
+    operator's list alone, as it always was.
+    """
+    vname = view.get("name") or ""
+    items: list[str] = []
+    own = view_keys.get(vname)
+    if own is not None:
+        items.append(f'key "{own["name"]}"')
+    items += [f'!key "{k["name"]}"' for name, k in view_keys.items() if name != vname]
+    items += [str(c) for c in (view.get("match_clients") or ["any"])]
+    return "; ".join(items)
+
+
 def _render_allow_transfer(
     acl: list[Any] | None,
     key_grants: list[str],
@@ -987,15 +1038,6 @@ class Bind9Driver(DriverBase):
         tsig_include = (
             f'include "{self.state_dir / "tsig" / "ddns.key"}";\n' if tsig_keys else ""
         )
-        # Server-wide transfer policy (issue #734). Rendered once here so it
-        # covers every zone type — primary, secondary, stub, RPZ — and so the
-        # control plane can read any zone this server serves. A zone with its
-        # own ``allow_transfer`` override emits its own clause below, which
-        # BIND lets shadow this one entirely.
-        key_grants = _transfer_key_grants(tsig_keys)
-        allow_transfer_opt = _render_allow_transfer(
-            opts.get("allow_transfer"), key_grants
-        )
 
         # Split-horizon (issue #24): when the group defines views, every
         # zone — and every RPZ/response-policy — lives INSIDE a
@@ -1005,6 +1047,26 @@ class Bind9Driver(DriverBase):
         # per-view further down.
         views = bundle.get("views") or []
         has_views = bool(views)
+        # The keys that let the control plane's own transfers select a view
+        # (#920). Their own file and include, beside ddns.key rather than in
+        # it: ddns.key's FIRST key is the loopback identity the record-op path
+        # and the ingest worker sign with, and nothing here may ever displace
+        # it. Defined at global scope, above every view that names them.
+        view_keys = _view_transfer_keys(views) if has_views else {}
+        if view_keys:
+            tsig_include += (
+                f'include "{self.state_dir / "tsig" / "view-transfer.key"}";\n'
+            )
+        # Server-wide transfer policy (issue #734). Rendered once here so it
+        # covers every zone type — primary, secondary, stub, RPZ — and so the
+        # control plane can read any zone this server serves. A zone with its
+        # own ``allow_transfer`` override emits its own clause below, which
+        # BIND lets shadow this one entirely. The view keys are granted with
+        # the rest: selecting a view is only half a transfer.
+        key_grants = _transfer_key_grants([*tsig_keys, *view_keys.values()])
+        allow_transfer_opt = _render_allow_transfer(
+            opts.get("allow_transfer"), key_grants
+        )
 
         # Response-policy block needs to list every RPZ zone we're about to
         # declare, otherwise BIND9 won't consult them on lookups.
@@ -1194,9 +1256,7 @@ class Bind9Driver(DriverBase):
                 vname = view.get("name") or ""
                 if not vname:
                     continue
-                match_clients = "; ".join(
-                    str(c) for c in (view.get("match_clients") or ["any"])
-                )
+                match_clients = _render_match_clients(view, view_keys)
                 recursion_v = "yes" if view.get("recursion", True) else "no"
                 view_bls = [
                     bl for bl in blocklists if bl.get("view_name") == vname
@@ -1213,9 +1273,16 @@ class Bind9Driver(DriverBase):
                     body += _zone_stanza(zone, f"{vname}/")
                 for bl in view_bls:
                     body += _rpz_stanza(bl, f"{vname}/")
-                md = view.get("match_destinations") or []
+                md = [str(m) for m in (view.get("match_destinations") or [])]
+                # A view must match on BOTH lists, and BIND checks this one
+                # with the request's key too — so a view the operator pinned
+                # to one listen address admits its own transfer key here as
+                # well, or the control plane (which dials whichever address
+                # the server row names) is refused by the destination half.
+                if md and vname in view_keys:
+                    md = [f'key "{view_keys[vname]["name"]}"', *md]
                 md_line = (
-                    f"    match-destinations {{ {'; '.join(str(m) for m in md)}; }};\n"
+                    f"    match-destinations {{ {'; '.join(md)}; }};\n"
                     if md
                     else ""
                 )
@@ -1294,25 +1361,15 @@ class Bind9Driver(DriverBase):
         # Issue #249 — atomic write so a crash between write_text +
         # chmod doesn't leave a world-readable secret on disk.
         if tsig_keys:
-            tsig_dir = self.state_dir / "tsig"
-            tsig_dir.mkdir(parents=True, exist_ok=True)
-            tsig_file = tsig_dir / "ddns.key"
-            tsig_tmp = tsig_file.with_suffix(".key.new")
-            payload = "".join(
-                f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
-                f'secret "{k["secret"]}"; }};\n'
-                for k in tsig_keys
-            )
-            fd = os.open(
-                str(tsig_tmp),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                0o600,
-            )
-            try:
-                os.write(fd, payload.encode())
-            finally:
-                os.close(fd)
-            tsig_tmp.replace(tsig_file)
+            self._write_key_file("ddns.key", tsig_keys)
+        # The per-view transfer keys (#920), same atomic 0600 write. Removed
+        # once the bundle stops carrying them (the group lost its views), so
+        # no secret outlives the config that needed it.
+        view_key_file = self.state_dir / "tsig" / "view-transfer.key"
+        if view_keys:
+            self._write_key_file("view-transfer.key", list(view_keys.values()))
+        elif view_key_file.exists():
+            view_key_file.unlink()
 
         # DoT / DoH listener cert (issue #50) — written to the stable
         # tls/ paths the ``tls`` statement above points at. Same atomic
@@ -1323,6 +1380,34 @@ class Bind9Driver(DriverBase):
         # so a partially-written pair can't be picked up by a reload racing
         # this write.
         self._write_listener_cert(tls_cert if has_cert else None)
+
+    def _write_key_file(self, filename: str, keys: list[dict[str, Any]]) -> None:
+        """Write ``key {}`` blocks to ``<state>/tsig/<filename>``, atomically, 0600.
+
+        Created 0600 through ``os.open`` and renamed into place, so the
+        secret is never on disk world-readable, not even between create and
+        chmod (#249), and a reload racing the write reads the old file or the
+        new one, never half of one.
+        """
+        tsig_dir = self.state_dir / "tsig"
+        tsig_dir.mkdir(parents=True, exist_ok=True)
+        path = tsig_dir / filename
+        tmp = path.with_name(path.name + ".new")
+        payload = "".join(
+            f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
+            f'secret "{k["secret"]}"; }};\n'
+            for k in keys
+        )
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, payload.encode())
+        finally:
+            os.close(fd)
+        tmp.replace(path)
 
     def _write_listener_cert(self, tls_cert: dict[str, Any] | None) -> None:
         """Write (or remove) the DoT/DoH listener cert pair.

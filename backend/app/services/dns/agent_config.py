@@ -62,8 +62,10 @@ from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
     records_for_view,
+    view_renders_zone,
 )
 from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -436,16 +438,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         # scoping it's "global" and renders into every operator view.
         # Geo + catch-all views always render the zone (like a global
         # zone) so the catch-all serves the default member set. Per-view
-        # record filtering is delegated to ``records_for_view``.
+        # record filtering is delegated to ``records_for_view``. The rule is
+        # shared with the transfer-key resolver (#920), so the view drift and
+        # sync ask for is always one that holds the zone.
         record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
         zone_view_ids = {z.view_id} if z.view_id is not None else set()
         operator_target_ids = record_view_ids | zone_view_ids
         for vd in view_descs:
-            if (
-                vd["kind"] == "operator"
-                and operator_target_ids
-                and vd["id"] not in operator_target_ids
-            ):
+            if not view_renders_zone(vd, operator_target_ids):
                 continue
             recs = records_for_view(rec_rows, vd, geo)
             zone_payload.append(
@@ -579,7 +579,7 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # view blocks honour BIND's first-match-wins precedence.
     # #430 — per-view query ACL overrides (allow_query / allow_query_cache).
     # None → inherit server-options allow-query (renderer omits the line).
-    views_block = [
+    views_block: list[dict[str, Any]] = [
         {
             "id": str(vd["id"]) if vd["id"] is not None else None,
             "name": vd["name"],
@@ -592,6 +592,24 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         }
         for vd in view_descs
     ]
+    # #920 — the key that lets the control plane's own transfers (drift,
+    # sync-with-servers) select each view. The agent admits it into its view's
+    # match-clients and refuses it in every other; without it a signed transfer
+    # matched no view (BADKEY) or whichever broad view caught the api's
+    # address. Derived from the legacy group key, the same way the resolver
+    # derives the key it signs with (``tsig.view_transfer_key``); a group with
+    # no legacy key ships none, and its views render as before. The secret rides
+    # the bundle body under the same trust model as ``tsig_keys``, and
+    # ``views`` is structural, so a group-key rotation re-renders the views.
+    group_key = legacy_group_key(grp)
+    if group_key is not None:
+        for view_entry in views_block:
+            vkey = view_transfer_key(group_key, view_entry["name"])
+            view_entry["transfer_key"] = {
+                "name": vkey.name,
+                "secret": vkey.secret,
+                "algorithm": vkey.algorithm,
+            }
     # #899 — ship the entries, not just the name. The agent renders these
     # into ``acl "<name>" { … };`` stanzas; before this the block carried
     # ``{id, name}`` only, so an ACL was inert config and any reference to
