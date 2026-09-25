@@ -369,8 +369,11 @@ jobs:
           load: true
           push: false
           tags: scan-target:${{ matrix.image }}
+          # APP_VERSION: the version the supervisor reports (#1183). An
+          # image that declares no such ARG ignores it.
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+            APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
             APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
@@ -424,8 +427,11 @@ jobs:
           tags: |
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:nightly
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.date_tag }}
+          # APP_VERSION: the version the supervisor reports (#1183). An
+          # image that declares no such ARG ignores it.
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+            APP_VERSION=${{ needs.gate.outputs.version }}
             APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
             APT_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}

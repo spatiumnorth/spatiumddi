@@ -284,6 +284,12 @@ class SupervisorCapabilities(BaseModel):
     memory_mb: int | None = None
     storage_type: str | None = None
     host_nics: list[str] = Field(default_factory=list)
+    # The supervisor has sent this in every heartbeat's capabilities, and
+    # until #1183 nothing read it: ``Appliance.supervisor_version`` was
+    # written only at registration, which a registered supervisor never
+    # repeats, so the column kept its first value through every upgrade.
+    # No max_length here: a bad value must not 422 the whole heartbeat.
+    supervisor_version: str | None = None
 
 
 class SupervisorRegisterRequest(BaseModel):
@@ -308,7 +314,7 @@ class SupervisorRegisterRequest(BaseModel):
     supervisor_version: str | None = Field(
         default=None,
         max_length=64,
-        description="Supervisor build version, e.g. '2026.05.14-1'.",
+        description="Supervisor build version, e.g. '2026.09.04-1'.",
     )
     capabilities: SupervisorCapabilities | None = Field(
         default=None,
@@ -1743,6 +1749,9 @@ async def supervisor_heartbeat(
     row.last_seen_ip = _client_ip(request)
     if body.capabilities is not None:
         row.capabilities = body.capabilities.model_dump()
+        reported = body.capabilities.supervisor_version
+        if reported and len(reported) <= 64:  # the column's width
+            row.supervisor_version = reported
 
     # Slot telemetry — only overwrite when the supervisor sent a non-
     # None value. Lets the supervisor send partial heartbeats (e.g.

@@ -21,20 +21,21 @@ Adding a fifth field means touching one function, not remembering two.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.versions import includes_release
 from app.models.appliance import Appliance, ApplianceUpgradeImage
 from app.services.appliance.architecture import architecture_conflict
 
 # The host runner only learned to strip a URL ``#fragment`` before
-# fetching in #386 (2026-06-12). An older runner passes the fragment
-# straight to the downloader and the apply wedges at "in-flight"
-# forever (#419), so the nonce is gated on the supervisor's version.
-URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12"
+# fetching in #386, first released in 2026.06.12-2 (2026.06.12-1 was
+# tagged before it merged). An older runner passes the fragment straight
+# to the downloader and the apply wedges at "in-flight" forever (#419),
+# so the nonce is gated on the appliance's version.
+URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12-2"
 
 
 class SlotImageResolutionError(Exception):
@@ -113,15 +114,23 @@ class SlotImageTarget:
 def supervisor_strips_url_fragment(row: Appliance) -> bool:
     """True if this appliance's runner strips a URL ``#fragment`` (≥ #386).
 
-    CalVer (``YYYY.MM.DD-N``) sorts lexicographically, so a string compare
-    is correct. A dev / unknown / pre-CalVer version stays on the safe
-    clean-URL path — losing only auto-re-fire of the *same* image (a new
-    version already changes the URL), never the ability to upgrade (#419).
+    The runner that strips it is ``spatiumddi-slot-upgrade``, which ships
+    in the slot OS, so the installed appliance version decides. The
+    supervisor's own version is the fallback for a row that has not
+    reported one. Until #1183 the supervisor always reported the frozen
+    ``2026.05.14.1``, and reading it first sent every appliance down the
+    clean-URL path.
+
+    A dev build, a nightly cut on the release's own date, or no version at
+    all stays on the safe clean-URL path. That loses only the re-fire of
+    the *same* image (a new version already changes the URL), never the
+    ability to upgrade (#419).
     """
-    ver = row.supervisor_version or row.installed_appliance_version or ""
-    return (
-        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None and ver >= URL_FRAGMENT_STRIP_MIN_VERSION
-    )
+    for version in (row.installed_appliance_version, row.supervisor_version):
+        verdict = includes_release(version, URL_FRAGMENT_STRIP_MIN_VERSION)
+        if verdict is not None:
+            return verdict
+    return False
 
 
 async def resolve_slot_image_target(

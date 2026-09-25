@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spatium-supervisor"
-version = "2026.05.14.1"
+# Package metadata only. The version the supervisor reports is stamped into
+# the image at build time (spatium_supervisor/__init__.py).
+version = "0.0.0"
 description = "SpatiumDDI appliance supervisor — holds host-side concerns (identity, docker compose, nftables) for a generic 'Application' appliance"
 readme = "README.md"
 requires-python = ">=3.12"

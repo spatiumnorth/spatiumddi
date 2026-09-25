@@ -181,6 +181,7 @@ build: build-supervisor
 build-supervisor:
 	docker build -t spatium-supervisor:dev \
 	             -t ghcr.io/spatiumnorth/spatium-supervisor:dev \
+	             --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) \
 	             -f agent/supervisor/images/supervisor/Dockerfile .
 
 # ── Database ───────────────────────────────────────────────────────────────────

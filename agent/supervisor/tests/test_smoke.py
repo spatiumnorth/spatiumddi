@@ -7,19 +7,38 @@ identity keypair generator, etc.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
-from spatium_supervisor import __version__
+import spatium_supervisor
 from spatium_supervisor.config import SupervisorConfig
 from spatium_supervisor.state import ensure_layout
 
 
-def test_version_is_calver_shape() -> None:
-    parts = __version__.split(".")
-    assert len(parts) >= 3
-    assert parts[0].isdigit() and len(parts[0]) == 4
-    assert parts[1].isdigit() and 1 <= int(parts[1]) <= 12
-    assert parts[2].isdigit() and 1 <= int(parts[2]) <= 31
+def _version_with(monkeypatch, stamp: str | None) -> str:
+    if stamp is None:
+        monkeypatch.delenv("SPATIUM_SUPERVISOR_VERSION", raising=False)
+    else:
+        monkeypatch.setenv("SPATIUM_SUPERVISOR_VERSION", stamp)
+    try:
+        return importlib.reload(spatium_supervisor).__version__
+    finally:
+        monkeypatch.undo()
+        importlib.reload(spatium_supervisor)
+
+
+def test_version_is_the_build_stamp(monkeypatch) -> None:
+    """#1183: the image stamps the release it was built from. The version
+    was a literal nothing rewrote, so every supervisor reported it."""
+    assert _version_with(monkeypatch, "2026.09.25-1") == "2026.09.25-1"
+    assert _version_with(monkeypatch, " 1.0.0\n") == "1.0.0"
+
+
+def test_an_unstamped_build_reports_dev(monkeypatch) -> None:
+    """Not a release-shaped placeholder: the control plane's version gates
+    must read an unstamped build as unknown, never as some old release."""
+    assert _version_with(monkeypatch, None) == "dev"
+    assert _version_with(monkeypatch, "") == "dev"
 
 
 def test_config_defaults_from_empty_env(monkeypatch) -> None:

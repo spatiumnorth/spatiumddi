@@ -282,6 +282,9 @@ jobs:
           file: ./agent/supervisor/images/supervisor/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          # #1183 — the version the supervisor reports to the control plane.
+          build-args: |
+            APP_VERSION=${{ needs.meta.outputs.version }}
           tags: |
             ${{ env.IMAGE_PREFIX }}/spatium-supervisor:${{ needs.meta.outputs.version }}
             ${{ env.IMAGE_PREFIX }}/spatium-supervisor:latest
