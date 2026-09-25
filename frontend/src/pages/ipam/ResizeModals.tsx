@@ -21,7 +21,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, CheckCircle2, X } from "lucide-react";
 import {
   MODAL_BACKDROP_CLS,
-  useDraggableModal,
+  useModalDialog,
 } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import {
@@ -145,11 +145,13 @@ function ModalShell({
   children: React.ReactNode;
   footer: React.ReactNode;
 }) {
-  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+  const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
+    useModalDialog(onClose);
   return (
     <div className={MODAL_BACKDROP_CLS}>
       <div
-        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        {...dialogProps}
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl focus:outline-none"
         style={dialogStyle}
       >
         <div
@@ -159,9 +161,12 @@ function ModalShell({
             dragHandleProps.className,
           )}
         >
-          <h2 className="text-base font-semibold">{title}</h2>
+          <h2 {...titleProps} className="text-base font-semibold">
+            {title}
+          </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />

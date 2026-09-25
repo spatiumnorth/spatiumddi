@@ -79,6 +79,37 @@ data:
         ssl_protocols TLSv1.2 TLSv1.3;
         ssl_prefer_server_ciphers off;
 
+        # ── Security response headers (SECURITY #400, L2; #1157) ───────
+        # The same set, and the same policy, as frontend/default.conf.template
+        # (the CSP rationale is there), plus HSTS. #400 put these in the
+        # pre-k3s appliance config (nginx-appliance.conf), which #194 had
+        # already orphaned and #768 deleted, so this block never sent any of
+        # them. nginx ``add_header`` does NOT inherit into a location that
+        # declares its own, so every location below with an add_header
+        # re-emits the set. Must not diverge from frontend/default.conf.template.
+        set $spatium_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+        # /api/redoc's policy (#1157): see ``location = /api/redoc``.
+        set $spatium_redoc_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.redoc.ly; font-src 'self'; connect-src 'self'; worker-src blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+        add_header Content-Security-Policy $spatium_csp always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        # HSTS as #400 decided it for this block: refuse a downgrade for a
+        # year. It cannot shut anyone out of the console. Browsers never
+        # record HSTS for a bare IP (RFC 6797 §8.1.1), and the appliance is
+        # reached by a node IP or the VIP by default. They also ignore the
+        # header on a connection with a certificate error (§8.1), such as the
+        # untrusted self-signed first-boot certificate. It takes hold only on
+        # a hostname whose certificate the browser trusts. There a later
+        # certificate problem is a hard error instead of a warning that can
+        # be clicked through, and the IP still works. Examples: an ACME or
+        # uploaded certificate that lapsed, or a trusted self-signed one
+        # re-minted when a promote grows its SANs. ``includeSubDomains`` is
+        # left out on purpose: the appliance serves no subdomains of its
+        # hostname, and in a DDI product those names are often other hosts
+        # in a zone the operator runs.
+        add_header Strict-Transport-Security "max-age=31536000" always;
+
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
         # Same nginx-local healthcheck as the :80 block, so a probe
@@ -105,6 +136,13 @@ data:
             default_type text/html;
             add_header Cache-Control "no-store, no-cache, must-revalidate" always;
             add_header X-Upstream-Status $upstream_status always;
+            # Re-emit security headers (SECURITY #400, L2) — a location
+            # with its own add_header does NOT inherit the server-level set.
+            add_header Content-Security-Policy $spatium_csp always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             try_files /_starting.html =503;
         }
 
@@ -125,6 +163,7 @@ data:
             add_header Retry-After 2 always;
             add_header X-Upstream-Status $upstream_status always;
             add_header X-Content-Type-Options "nosniff" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
             if ($upstream_status ~ "504") {
                 return 504 '{"detail":"The api did not answer in time; retry shortly."}';
             }
@@ -198,6 +237,47 @@ data:
             proxy_set_header   Connection "";
             proxy_read_timeout 120s;
             proxy_send_timeout 120s;
+        }
+
+        # ReDoc's page-only policy (#1157): a blob: worker for its search
+        # index and its footer logo on cdn.redoc.ly. Scripts stay 'self'.
+        # frontend/default.conf.template has the reasoning. add_header here
+        # replaces the server-level set, so the rest of it is re-emitted.
+        # Must not diverge from frontend/default.conf.template.
+        location = /api/redoc {
+            add_header Content-Security-Policy $spatium_redoc_csp always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            error_page 502 504 @api_unavailable;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass         $api_upstream;
+            proxy_set_header   Host $http_host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection "";
+            proxy_read_timeout 60s;
+        }
+
+        # The API docs' own assets (#1157), served by the api so /api/docs
+        # and /api/redoc run under ``script-src 'self'`` and need no CDN.
+        # ``^~`` keeps the static-asset regex below from answering these
+        # ``.js`` / ``.css`` paths from this pod's disk (a 404). Must not
+        # diverge from frontend/default.conf.template.
+        location ^~ /api/docs/static/ {
+            error_page 502 504 @api_unavailable;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass         $api_upstream;
+            proxy_set_header   Host $http_host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection "";
+            proxy_read_timeout 60s;
         }
 
         location /api/ {
@@ -284,6 +364,13 @@ data:
         location ~* \.(js|css|woff2?|png|svg|ico)$ {
             expires 1y;
             add_header Cache-Control "public, immutable";
+            # Re-emit security headers (SECURITY #400, L2) — a location
+            # with its own add_header does NOT inherit the server-level set.
+            add_header Content-Security-Policy $spatium_csp always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
         }
 
         gzip on;

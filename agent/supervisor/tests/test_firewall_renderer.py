@@ -49,6 +49,26 @@ def test_role_ports() -> None:
     assert 547 in p.expected_udp_ports
 
 
+
+def test_kea_ha_listener_opens_to_the_pair_only() -> None:
+    """#1167 — the HA hook's listener, scoped to the other Kea members."""
+    p = render_drop_in(
+        {
+            "roles": ["dhcp"],
+            "dhcp_ha_port": 8000,
+            "dhcp_ha_peer_cidrs": ["192.168.0.12/32", "2001:db8::12/128"],
+        }
+    )
+    assert 'ip saddr { 192.168.0.12/32 } tcp dport 8000 accept comment "role:dhcp-ha-v4"' in p.body
+    assert 'ip6 saddr { 2001:db8::12/128 } tcp dport 8000 accept comment "role:dhcp-ha-v6"' in p.body
+    # Every line opening the port is source-scoped — never ``any``.
+    assert all("saddr" in line for line in p.body.splitlines() if "dport 8000" in line)
+    assert 8000 in p.expected_tcp_ports
+    # A stale value on a node without the dhcp role opens nothing.
+    q = render_drop_in({"roles": [], "dhcp_ha_port": 8000, "dhcp_ha_peer_cidrs": ["10.0.0.1/32"]})
+    assert "8000" not in q.body
+
+
 # ── Control-plane peer scoping (the #285 hardening) ──────────────────
 
 

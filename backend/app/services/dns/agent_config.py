@@ -7,6 +7,13 @@ Seam with the driver-abstraction agent:
   fall back to a local TypedDict-based adapter with the same shape so this
   code still builds. When the real module appears, imports resolve to it
   transparently.
+
+#1111 — the assembly is split in two. ``render_bundle_body`` builds
+everything except the ops page and is what the worker render (and the
+migration-release inline fallback) store once per (server, watermark);
+``page_pending_ops`` / ``retire_queued_ops`` are the per-server, per-poll
+half the long-poll applies per request; ``build_config_bundle`` composes
+the two into the whole dict for callers that still want it.
 """
 
 from __future__ import annotations
@@ -14,12 +21,15 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import Boolean, Text, and_, cast, func, literal, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.types import UserDefinedType
 
 from app.config import settings
 from app.core.crypto import decrypt_str
@@ -52,8 +62,10 @@ from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
     records_for_view,
+    view_renders_zone,
 )
 from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -179,12 +191,33 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         return sorted(prepared, key=lambda a: a["name"])
 
 
-async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBundle:
-    """Build the config bundle for a given server from DB state.
+@dataclass(frozen=True)
+class RenderedBody:
+    """The bundle minus its per-poll parts (#1111).
 
-    The driver-abstraction agent will swap this implementation to delegate to
-    ``DNSDriverBase.render_bundle(server)``. For now we inline a minimal build
-    so the agent long-poll endpoint can be exercised end-to-end.
+    ``body`` is the bundle dict WITHOUT ``etag``, ``pending_record_ops`` and
+    ``pending_ops_remaining``. ``etag`` is ``_compute_etag`` over the same
+    canonical payload the inline build always hashed — those two keys
+    present and empty — so a server with nothing pending hashes to exactly
+    what it did before. ``has_views`` says whether an ops page is ever
+    shipped: under split-horizon records are structural and the queued ops
+    are retired by the render instead (``retire_queued_ops``).
+    """
+
+    body: dict[str, Any]
+    etag: str
+    structural_etag: str
+    records: int
+    has_views: bool
+
+
+async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBody:
+    """Build everything in the bundle except the ops page, from DB state.
+
+    This is the assembly ``build_config_bundle`` always did. The worker
+    render (#1111) calls it once per (server, watermark) and stores the
+    result; the long-poll serves the stored bytes and splices the ops page
+    in per request.
     """
     # Options (per group)
     opts_res = await db.execute(
@@ -263,9 +296,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # the sizing campaign's 250k A+PTR zone the build held ~500k instances
     # in the identity map for the life of the request, most of the api's
     # working set on every long-poll (2026-09-02/03). Only the eight fields
-    # the bundle and the view filter read are fetched, ordered by (zone,
-    # id) so the rendered payload — and therefore the ETag — is the same
-    # from one poll to the next.
+    # the bundle and the view filter read are fetched.
+    #
+    # The ordering exists so the rendered payload — and therefore the ETag —
+    # is the same from one poll to the next. #1111: it is now the
+    # ``ix_dns_record_zone_name`` prefix followed by every remaining shipped
+    # column, not ``(zone_id, id)``. Stability needs a total order on what
+    # the payload CARRIES — two rows identical in every shipped column
+    # render identically whichever comes first — so ``id`` buys nothing,
+    # and it cost a lot: no index covers ``(zone_id, id)`` and ``id`` is a
+    # random UUID, so at 1.09 M rows the planner sorted the whole table
+    # (an external merge at the shipped ``work_mem``) inside asyncpg's 30 s
+    # ``command_timeout``, and every poll of every agent answered 503
+    # (seven-node probe, 2026-09-21). With the index prefix the planner can
+    # walk ``(zone_id, name)`` and finish the tie-break with an incremental
+    # sort on the tiny per-name groups instead of sorting the table.
     records_by_zone: dict[Any, list[Any]] = {}
     if zone_ids:
         rec_res = await db.execute(
@@ -282,7 +327,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 DNSRecord.pool_member_id,
             )
             .where(DNSRecord.zone_id.in_(zone_ids))
-            .order_by(DNSRecord.zone_id, DNSRecord.id)
+            .order_by(
+                DNSRecord.zone_id,
+                DNSRecord.name,
+                DNSRecord.record_type,
+                DNSRecord.value,
+                DNSRecord.ttl,
+                DNSRecord.priority,
+                DNSRecord.weight,
+                DNSRecord.port,
+                DNSRecord.view_id,
+                DNSRecord.pool_member_id,
+            )
         )
         for rec in rec_res:
             records_by_zone.setdefault(rec.zone_id, []).append(rec)
@@ -351,6 +407,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # emits a zone-level clause only for a non-None value, because in
             # BIND a zone-level allow-transfer shadows the options one.
             "allow_transfer": getattr(z, "allow_transfer", None),
+            # #1153 — the zone's SOA MNAME / RNAME, and its NS when it has no
+            # NS records of its own. Settable and persisted, never shipped, so
+            # the BIND9 agent served the placeholder ``ns1.<zone>`` (glued to
+            # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
+            "primary_ns": getattr(z, "primary_ns", "") or "",
+            "admin_email": getattr(z, "admin_email", "") or "",
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
@@ -376,16 +438,14 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # scoping it's "global" and renders into every operator view.
         # Geo + catch-all views always render the zone (like a global
         # zone) so the catch-all serves the default member set. Per-view
-        # record filtering is delegated to ``records_for_view``.
+        # record filtering is delegated to ``records_for_view``. The rule is
+        # shared with the transfer-key resolver (#920), so the view drift and
+        # sync ask for is always one that holds the zone.
         record_view_ids = {r.view_id for r in rec_rows if r.view_id is not None}
         zone_view_ids = {z.view_id} if z.view_id is not None else set()
         operator_target_ids = record_view_ids | zone_view_ids
         for vd in view_descs:
-            if (
-                vd["kind"] == "operator"
-                and operator_target_ids
-                and vd["id"] not in operator_target_ids
-            ):
+            if not view_renders_zone(vd, operator_target_ids):
                 continue
             recs = records_for_view(rec_rows, vd, geo)
             zone_payload.append(
@@ -396,99 +456,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 }
             )
 
-    # Pending record ops — every agent-based server in the group
-    # gets its own queue (one op row per server per record change,
-    # see ``record_ops.enqueue_record_op``). The is_primary gate
-    # here was a pre-#170 carryover from the
-    # "primary writes, secondaries AXFR" assumption that doesn't
-    # match the per-server-authoritative shape every supervised
-    # appliance uses today; with the gate in place a secondary's
-    # ops sat in ``state=pending`` forever, never shipped, and the
-    # secondary's bind9 stayed at whatever record set it picked up
-    # from the bundle's ``zone.records`` field at initial cold boot.
-    # Mark in_flight on dispatch so the same op doesn't re-ship on
-    # every long-poll cycle until the agent's next heartbeat acks
-    # it. Failure ack resets to pending (with attempt++); after 5
-    # failures it becomes "failed" and stays out.
-    pending_ops: list[dict[str, Any]] = []
-    pending_ops_remaining = 0
-    # Issue #182: pause pending-op dispatch when the server is in
-    # operator-set maintenance mode. Ops accumulate in ``state=pending``
-    # and ship as soon as the operator resumes — no work is lost.
-    ops_to_dispatch: list[DNSRecordOp] = []
-    if server.maintenance_mode:
-        pass
-    elif has_views:
-        # Split-horizon: the incremental RFC 2136 path can't target a
-        # specific view (an nsupdate to loopback lands in whichever view
-        # matches 127.0.0.1, not necessarily the record's view). Records
-        # are folded into the structural fingerprint below so every record
-        # change triggers a full, view-correct re-render instead. Retire any
-        # queued ops as ``applied`` — the bundle the agent is about to render
-        # already reflects them — so they don't pile up in ``pending``.
-        stale_ops = (
-            (
-                await db.execute(
-                    select(DNSRecordOp).where(
-                        DNSRecordOp.server_id == server.id,
-                        DNSRecordOp.state.in_(QUEUED_OP_STATES),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for op in stale_ops:
-            op.state = "applied"
-        if stale_ops:
-            await db.flush()
-    else:
-        # One PAGE of the queue, oldest first, never the whole backlog. The
-        # agent applies a page and acks it on its next heartbeat; the page
-        # it was shipped is ``in_flight`` meanwhile, so the next long-poll
-        # (which returns immediately while ops are pending) ships the next
-        # page. Unbounded, a bulk seed's backlog — 500k ops for 250k A+PTR
-        # records on one agent server — was materialised whole into every
-        # response: the api reached 4.2 GB and was memcg-killed on each poll,
-        # the bundle never reached the data plane, and the queue could only
-        # be cleared by hand (appliance sizing campaign, 2026-09-02/03).
-        # ``pending_ops_remaining`` tells the agent (and an operator reading
-        # the bundle) how deep the backlog still is.
-        batch = max(1, int(settings.dns_agent_ops_batch))
-        op_res = await db.execute(
-            select(DNSRecordOp)
-            .where(
-                DNSRecordOp.server_id == server.id,
-                DNSRecordOp.state == "pending",
-            )
-            .order_by(DNSRecordOp.created_at, DNSRecordOp.id)
-            .limit(batch)
-        )
-        ops_to_dispatch = list(op_res.scalars().all())
-        if len(ops_to_dispatch) == batch:
-            pending_ops_remaining = int(
-                (
-                    await db.execute(
-                        select(func.count()).where(
-                            DNSRecordOp.server_id == server.id,
-                            DNSRecordOp.state == "pending",
-                        )
-                    )
-                ).scalar_one()
-            ) - len(ops_to_dispatch)
-    for op in ops_to_dispatch:
-        pending_ops.append(
-            {
-                "op_id": str(op.id),
-                "zone_name": op.zone_name,
-                "op": op.op,
-                "record": op.record,
-                "target_serial": op.target_serial,
-            }
-        )
-        op.state = "in_flight"
-    if ops_to_dispatch:
-        await db.flush()
+    # The ops page is not part of the body — see ``page_pending_ops`` /
+    # ``retire_queued_ops`` below (#1111).
 
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
@@ -610,7 +579,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # view blocks honour BIND's first-match-wins precedence.
     # #430 — per-view query ACL overrides (allow_query / allow_query_cache).
     # None → inherit server-options allow-query (renderer omits the line).
-    views_block = [
+    views_block: list[dict[str, Any]] = [
         {
             "id": str(vd["id"]) if vd["id"] is not None else None,
             "name": vd["name"],
@@ -623,6 +592,24 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         }
         for vd in view_descs
     ]
+    # #920 — the key that lets the control plane's own transfers (drift,
+    # sync-with-servers) select each view. The agent admits it into its view's
+    # match-clients and refuses it in every other; without it a signed transfer
+    # matched no view (BADKEY) or whichever broad view caught the api's
+    # address. Derived from the legacy group key, the same way the resolver
+    # derives the key it signs with (``tsig.view_transfer_key``); a group with
+    # no legacy key ships none, and its views render as before. The secret rides
+    # the bundle body under the same trust model as ``tsig_keys``, and
+    # ``views`` is structural, so a group-key rotation re-renders the views.
+    group_key = legacy_group_key(grp)
+    if group_key is not None:
+        for view_entry in views_block:
+            vkey = view_transfer_key(group_key, view_entry["name"])
+            view_entry["transfer_key"] = {
+                "name": vkey.name,
+                "secret": vkey.secret,
+                "algorithm": vkey.algorithm,
+            }
     # #899 — ship the entries, not just the name. The agent renders these
     # into ``acl "<name>" { … };`` stanzas; before this the block carried
     # ``{id, name}`` only, so an ACL was inert config and any reference to
@@ -856,8 +843,6 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "tsig_keys": tsig_keys,
         "forwarders": options_block["forwarders"],
         "blocklists": blocklists_payload,
-        "pending_record_ops": pending_ops,
-        "pending_ops_remaining": pending_ops_remaining,
         "catalog": catalog_block,
         "fleet_upgrade": fleet_upgrade_block,
         "snmp_settings": snmp_block,
@@ -901,6 +886,226 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     structural_etag = _compute_etag(structural)
     bundle_body["structural_etag"] = structural_etag
 
-    etag = _compute_etag(bundle_body)
-    bundle: ConfigBundle = {"etag": etag, **bundle_body}  # type: ignore[misc]
+    # The canonical payload the inline build always hashed had the ops keys
+    # present (and, with nothing pending, empty). Hashing that shape keeps a
+    # stored bundle's ETag identical to the pre-#1111 ETag for the same
+    # state whenever nothing is pending.
+    etag = _compute_etag({**bundle_body, "pending_record_ops": [], "pending_ops_remaining": 0})
+    records = sum(len(z["records"]) for z in zone_payload)
+    return RenderedBody(
+        body=bundle_body,
+        etag=etag,
+        structural_etag=structural_etag,
+        records=records,
+        has_views=has_views,
+    )
+
+
+class _XID8(UserDefinedType[Any]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "xid8"
+
+
+class _PGSnapshot(UserDefinedType[Any]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "pg_snapshot"
+
+
+def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None:
+    """The condition for "a body rendered at this snapshot reflects this op".
+
+    ``visible_xacts`` is the ``pg_current_snapshot()`` the render took before
+    it read anything (``agent_bundle_render``): an op whose transaction is
+    visible in it had committed before the render's records query began,
+    and under READ COMMITTED that query's own, later snapshot sees at least
+    as much, so the body carries the op's record. ``created_at`` cannot say
+    that: it is ``now()``, the op's transaction START, and a bulk write that
+    started before the render and committed after its records query passes
+    ``created_at <= snapshot_at`` with records the body never read.
+
+    An op queued before ``dns_record_op.xact_id`` existed (NULL), and every op
+    against a bundle rendered before ``visible_xacts`` existed, keep that time
+    gate. So does any pair this cluster cannot compare: a transaction id or a
+    snapshot it has not reached yet can only have come from another cluster
+    (both tables are in the DNS backup section, and a restore onto a new
+    appliance starts its transaction ids afresh), where the ids mean nothing
+    here. ``None`` when neither bound is given (no gate).
+    """
+    if visible_xacts is None:
+        return None if up_to is None else DNSRecordOp.created_at <= up_to
+    xid = cast(cast(DNSRecordOp.xact_id, Text), _XID8())
+    snapshot = cast(literal(visible_xacts, Text), _PGSnapshot())
+    reached = func.pg_snapshot_xmax(func.pg_current_snapshot())
+    comparable = and_(
+        DNSRecordOp.xact_id.is_not(None),
+        xid < reached,
+        func.pg_snapshot_xmax(snapshot) <= reached,
+    )
+    visible = func.pg_visible_in_snapshot(xid, snapshot, type_=Boolean)
+    by_time: Any = not_(comparable)
+    if up_to is not None:
+        by_time = and_(by_time, DNSRecordOp.created_at <= up_to)
+    return or_(and_(comparable, visible), by_time)
+
+
+async def retire_queued_ops(
+    db: AsyncSession,
+    server: DNSServer,
+    *,
+    up_to: datetime | None = None,
+    visible_xacts: str | None = None,
+) -> int:
+    """Split-horizon: retire this server's queued ops as ``applied``.
+
+    The incremental RFC 2136 path can't target a specific view (an nsupdate
+    to loopback lands in whichever view matches 127.0.0.1, not necessarily
+    the record's view), so under views records are folded into the
+    structural fingerprint and every record change triggers a full,
+    view-correct re-render. The bundle the agent is about to render already
+    reflects the queued ops, so they are retired rather than left to pile
+    up in ``pending``. A sibling view's op the sweep would otherwise leave
+    behind is covered by ``record_ops.sweep_zone_ops``.
+
+    #1111 — only the ops the render's snapshot covers are retired
+    (``_covered_by``: committed before the render read), so an op whose
+    transaction was still open when the render read is never marked applied
+    by a body that did not see its record. That was reachable by time alone:
+    a bulk write that started before the render and committed after its
+    records query had ``created_at`` inside the window, and its ops were
+    retired unseen — and an ACME DNS-01 wait read them as applied.
+    """
+    conds: list[Any] = [
+        DNSRecordOp.server_id == server.id,
+        DNSRecordOp.state.in_(QUEUED_OP_STATES),
+    ]
+    covered = _covered_by(up_to, visible_xacts)
+    if covered is not None:
+        conds.append(covered)
+    stale_ops = (await db.execute(select(DNSRecordOp).where(*conds))).scalars().all()
+    for op in stale_ops:
+        op.state = "applied"
+    if stale_ops:
+        await db.flush()
+    return len(stale_ops)
+
+
+async def page_pending_ops(
+    db: AsyncSession,
+    server: DNSServer,
+    *,
+    up_to: datetime | None = None,
+    visible_xacts: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
+
+    Every agent-based server in the group gets its own queue (one op row per
+    server per record change, see ``record_ops.enqueue_record_op``). The
+    ``is_primary`` gate here was a pre-#170 carryover from the "primary
+    writes, secondaries AXFR" assumption that doesn't match the
+    per-server-authoritative shape every supervised appliance uses today;
+    with the gate in place a secondary's ops sat in ``state=pending``
+    forever. Marked ``in_flight`` on dispatch so the same op doesn't re-ship
+    on every long-poll cycle until the agent's next heartbeat acks it; a
+    failure ack resets it to pending (attempt++), and after 5 failures it
+    becomes ``failed`` and stays out.
+
+    One PAGE of the queue, never the whole backlog: the agent applies a page
+    and acks it on its next heartbeat; the page it was shipped is
+    ``in_flight`` meanwhile, so the next long-poll (which returns
+    immediately while ops are pending) ships the next page. Unbounded, a
+    bulk seed's backlog — 500k ops for 250k A+PTR records on one server —
+    was materialised whole into every response and the api was memcg-killed
+    on each poll (appliance sizing campaign, 2026-09-02/03). The second
+    value is how deep the backlog still is beyond this page.
+
+    Issue #182: nothing ships while the server is in operator-set
+    maintenance mode; ops accumulate in ``pending`` and ship on resume.
+
+    #1111 — the page is gated to the ops the stored bundle's snapshot
+    covers (``_covered_by``: committed before its render read; ``up_to`` /
+    ``visible_xacts`` are the bundle's ``snapshot_at`` / ``visible_xacts``).
+    Every body an agent holds must be a superset of every op it has applied,
+    or a later structural re-render (or a restart replaying the cached
+    bundle) drops a record the agent already applied incrementally; the
+    inline build had that by construction because the body was built
+    moments before the page, and this is what keeps it once the body is
+    rendered asynchronously. An op the snapshot does not cover rides with
+    the next render — whose dirty mark its own commit already made.
+    """
+    if server.maintenance_mode:
+        return [], 0
+    batch = max(1, int(settings.dns_agent_ops_batch))
+    conds: list[Any] = [DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending"]
+    covered = _covered_by(up_to, visible_xacts)
+    if covered is not None:
+        conds.append(covered)
+    op_res = await db.execute(
+        select(DNSRecordOp)
+        .where(*conds)
+        .order_by(DNSRecordOp.created_at, DNSRecordOp.id)
+        .limit(batch)
+    )
+    ops_to_dispatch = list(op_res.scalars().all())
+    remaining = 0
+    if len(ops_to_dispatch) == batch:
+        remaining = int((await db.execute(select(func.count()).where(*conds))).scalar_one()) - len(
+            ops_to_dispatch
+        )
+    page: list[dict[str, Any]] = []
+    for op in ops_to_dispatch:
+        page.append(
+            {
+                "op_id": str(op.id),
+                "zone_name": op.zone_name,
+                "op": op.op,
+                "record": op.record,
+                "target_serial": op.target_serial,
+            }
+        )
+        op.state = "in_flight"
+    if ops_to_dispatch:
+        await db.flush()
+    return page, remaining
+
+
+def compose_bundle(
+    rendered: RenderedBody, ops: list[dict[str, Any]], remaining: int
+) -> ConfigBundle:
+    """The whole bundle dict, ops page included, in the pre-#1111 shape.
+
+    The ETag covers the composed payload exactly as it always did; with
+    nothing pending that is ``rendered.etag`` already (same canonical
+    payload), so the second walk is skipped in the common case.
+    """
+    body: dict[str, Any] = {
+        **rendered.body,
+        "pending_record_ops": ops,
+        "pending_ops_remaining": remaining,
+    }
+    etag = rendered.etag if not ops and not remaining else _compute_etag(body)
+    bundle: ConfigBundle = {"etag": etag, **body}  # type: ignore[misc]
     return bundle
+
+
+async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBundle:
+    """Build the whole config bundle for a given server from DB state.
+
+    Render the body, then — exactly as before — either retire the queued
+    ops (split-horizon) or ship one page of them, and compose. Callers that
+    serve agents go through the stored bundle instead (#1111); this stays
+    for everything that wants the dict in one call.
+    """
+    rendered = await render_bundle_body(db, server)
+    ops: list[dict[str, Any]] = []
+    remaining = 0
+    if server.maintenance_mode:
+        pass
+    elif rendered.has_views:
+        await retire_queued_ops(db, server)
+    else:
+        ops, remaining = await page_pending_ops(db, server)
+    return compose_bundle(rendered, ops, remaining)

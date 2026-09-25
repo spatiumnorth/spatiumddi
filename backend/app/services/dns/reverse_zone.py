@@ -1,8 +1,8 @@
 """Reverse-zone auto-creation for subnets that have DNS assignment.
 
-When a subnet is created with a DNS assignment (either directly via
-``dns_zone_id``/``dns_group_id`` or via block/space inheritance in a future
-revision), SpatiumDDI creates the corresponding reverse zone
+When a subnet has a DNS assignment — its own ``dns_zone_id`` /
+``dns_group_ids``, or the DNS it inherits from its block chain or space
+(spatiumddi#1149) — SpatiumDDI creates the corresponding reverse zone
 (``*.in-addr.arpa.`` or ``*.ip6.arpa.``) in the assigned server group if one
 does not already exist.
 
@@ -24,6 +24,7 @@ from sqlalchemy import select, text
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import Subnet
+from app.services.dns.sync_check import _effective_dns
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -103,6 +104,31 @@ def compute_reverse_zone_name(network: str) -> str:
     return fqdn if fqdn.endswith(".") else fqdn + "."
 
 
+async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
+    """The server group of the DNS ``subnet`` inherits (spatiumddi#1149): the
+    effective forward zone's group, else the first effective ``dns_group_ids``
+    entry, else ``None``.
+
+    ``_effective_dns`` is the walk the drift check and ``GET
+    /subnets/{id}/effective-dns`` share (subnet → block ancestors → space,
+    honouring each level's inherit toggle), so the reverse zone lands in the
+    group the subnet's forward records and PTR lookups already resolve to
+    (``_resolve_effective_dns`` / ``_resolve_reverse_zone`` in the IPAM
+    router).
+    """
+    group_ids, zone_id = await _effective_dns(db, subnet)
+    if zone_id is not None:
+        zone = await db.get(DNSZone, zone_id)
+        if zone is not None:
+            return zone.group_id
+    for raw in group_ids:
+        try:
+            return uuid.UUID(str(raw))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 async def ensure_reverse_zone_for_subnet(
     db: AsyncSession,
     subnet: Subnet,
@@ -116,20 +142,26 @@ async def ensure_reverse_zone_for_subnet(
     Resolution of the server group:
 
     1. Explicit ``dns_group_id`` argument wins.
-    2. Otherwise fall back to the subnet's ``dns_group_ids`` / ``dns_zone_id``
-       fields when the IPAM model supports them (safe ``getattr`` — the fields
-       were introduced in a parallel Wave 2 migration and may not yet exist).
-    3. If no group can be resolved the call is a no-op and returns ``None``.
+    2. Otherwise the subnet's own ``dns_zone_id`` (or the ``dns_zone_id``
+       argument) names it through the zone's group, then the subnet's own
+       ``dns_group_ids[0]``.
+    3. Otherwise the DNS the subnet inherits — the first block up its chain
+       with inheritance off, else its space — the same walk
+       ``GET /subnets/{id}/effective-dns`` answers with: the effective zone's
+       group, then the effective ``dns_group_ids[0]`` (spatiumddi#1149).
+    4. If no group can be resolved the call is a no-op and returns ``None``.
 
     The function is idempotent: if a reverse zone with the computed FQDN
-    already exists in the resolved group it is returned unchanged.
+    already exists in the resolved group it is returned unchanged (or, #844,
+    refused when an overlapping subnet in another IP space owns it — however
+    the group was resolved).
 
     Writes an ``audit_log`` entry on newly-created zones.
     """
     # 1. Resolve the server group
     group_id = dns_group_id
     if group_id is None:
-        # Direct subnet-level zone assignment (if the column exists)
+        # Direct subnet-level zone assignment
         subnet_zone_id = getattr(subnet, "dns_zone_id", None) or dns_zone_id
         if subnet_zone_id:
             zone = await db.get(DNSZone, subnet_zone_id)
@@ -142,6 +174,15 @@ async def ensure_reverse_zone_for_subnet(
                 group_id = uuid.UUID(str(subnet_groups[0]))
             except (ValueError, TypeError):
                 group_id = None
+    if group_id is None:
+        # spatiumddi#1149 — nothing on the subnet itself: a subnet left on
+        # "Inherit from parent" (the console's default, which sends no DNS
+        # fields at all) takes its block's or space's group, so it gets the
+        # reverse zone Getting Started promises "once the subnet has an
+        # effective DNS group/zone". Consulted only when the subnet names no
+        # DNS of its own, so every subnet that resolved a group before
+        # resolves the same one now.
+        group_id = await _inherited_dns_group(db, subnet)
 
     if group_id is None:
         logger.debug(

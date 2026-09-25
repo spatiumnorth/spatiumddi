@@ -99,6 +99,11 @@ Where the two disagree about a license, THIS file is authoritative.
 ── Backend (Python) ───────────────────────────────────────────────────────
 - Python — PSF License — https://python.org
 - FastAPI — MIT — https://fastapi.tiangolo.com
+- Swagger UI (swagger-ui-dist, vendored for /api/docs; its LICENSE and NOTICE
+  ship beside it in backend/app/static/api-docs/swagger-ui/) — Apache 2.0 —
+  https://github.com/swagger-api/swagger-ui
+- ReDoc (vendored for /api/redoc; its LICENSE ships beside it in
+  backend/app/static/api-docs/redoc/) — MIT — https://github.com/Redocly/redoc
 - Starlette — BSD 3-Clause — https://www.starlette.io
 - Uvicorn — BSD 3-Clause — https://www.uvicorn.org
 - SQLAlchemy — MIT — https://sqlalchemy.org

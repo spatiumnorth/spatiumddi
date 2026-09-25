@@ -34,7 +34,7 @@ the rationale is in [`Chart.yaml`](https://github.com/spatiumnorth/spatiumddi/bl
 |---|---|---|---|
 | `api` | Deployment | 2 | FastAPI control plane; HPA-eligible (§5) |
 | `frontend` | Deployment | 2 | nginx + Vite build; proxies `/api/` to the api Service |
-| `worker` | Deployment | 2 | Celery queues `ipam,dns,dhcp,default` |
+| `worker` | Deployment | 2 | Celery queues `ipam,dns,dhcp,default,bundles` (a BYO `worker.queues` override must add `bundles`) |
 | `beat` | Deployment | 1 (`Recreate`) | Singleton scheduler — never run >1 |
 | `migrate` | Job | per Helm revision | `alembic upgrade head`; gates the rest (§4) |
 | `postgresql` | StatefulSet / CNPG `Cluster` | 1 / 3 | `kind: standalone` or `cnpg` (§6) |

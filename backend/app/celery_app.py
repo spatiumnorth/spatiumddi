@@ -737,6 +737,40 @@ from celery.signals import task_failure  # noqa: E402
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
 
+from celery.signals import beat_init, worker_init  # noqa: E402
+
+
+@worker_init.connect
+@beat_init.connect
+def _install_session_listeners(**_: object) -> None:
+    """Install the SQLAlchemy session listeners in the worker and beat: audit
+    forwarding and the typed-event outbox (#1168), and the DNS bundle
+    dirty-mark (#1111). They register on import, and nothing a worker imports
+    reaches them otherwise (``app.main`` installs them for the api only).
+    Without them a task's audit rows produce no typed webhook events, and a
+    task's DNS writes commit unmarked, so agents never receive them.
+
+    From the signals, not at import (#1189): the worker's liveness probe runs
+    ``celery -A app.celery_app inspect ping``, which imports this module on
+    every run, and the listeners pull in the models, the DNS drivers, httpx,
+    cryptography and jinja2. ``worker_init`` runs in the prefork master before
+    the pool forks, so every child inherits them."""
+    importlib.import_module("app.services.session_listeners").install_session_listeners()
+
+
+@worker_init.connect
+@beat_init.connect
+def _dispatch_after_commit_in_background(**_: object) -> None:
+    """#1168 — in a Celery process, run the listeners' after-commit work on a
+    per-process background loop. A task's own ``asyncio.run`` cancels
+    whatever is still pending when it returns, and a task usually commits
+    last: measured, 0 of 5 typed events reached the outbox that way. Wired
+    to the Celery signals rather than done at import because the api imports
+    this module too, and its request loop is fine as it is. ``worker_init``
+    runs in the prefork master; the loop itself starts lazily per PID, so
+    each forked child gets its own."""
+    importlib.import_module("app.services.after_commit_dispatch").use_background_loop()
+
 
 @task_failure.connect
 def _capture_task_failure(

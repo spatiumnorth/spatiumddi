@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
+from app.api.docs import install_api_docs
 from app.api.health import router as health_router
 from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
@@ -19,16 +20,14 @@ from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
-
-# Import for side-effect: registers the SQLAlchemy after_commit listener
-# that forwards audit events to syslog + webhook targets. Must run at app
-# startup so the listener is attached before any request handler writes
-# an AuditLog row.
-from app.services import (
-    audit_forward,  # noqa: F401
-    event_publisher,  # noqa: F401
-)
 from app.services.feature_modules import require_module
+from app.services.session_listeners import install_session_listeners
+
+# SQLAlchemy session listeners (audit forwarding, the typed-event outbox, the
+# DNS bundle dirty-mark) register on import, so they must be installed before
+# any request handler writes a row. ``app.celery_app`` installs the same list
+# for the worker and beat (#1168, #1111).
+install_session_listeners()
 
 logger = structlog.get_logger(__name__)
 
@@ -309,8 +308,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Appliance Operator": (
-        "Full control of the SpatiumDDI OS appliance management surface "
-        "(issue #134, Phase 4): TLS cert upload, release manager, "
+        "Full control of the SpatiumDDI OS appliance management surface: "
+        "TLS cert upload, release manager, "
         "container start/stop/restart + live logs, host network + "
         "firewall config, maintenance mode, diagnostic bundle download. "
         "Intended for ops staff who manage the appliance lifecycle "
@@ -537,6 +536,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_daemon_degraded_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_daemon_degraded_alert_rule_seed_skipped", reason=str(exc))
+    # #1111 — the mirror image: the control plane could not RENDER a DNS
+    # agent's bundle. Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_bundle_render_failed_alert_rule,
+        )
+
+        await seed_agent_bundle_render_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
@@ -825,8 +834,11 @@ def create_app() -> FastAPI:
         # into an api container that dies at import with a bare AssertionError,
         # before logging is even configured.
         version=settings.version or "dev",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        # /api/docs and /api/redoc are registered by install_api_docs()
+        # below, with their assets served by the api (#1157). FastAPI's own
+        # pages load them from a CDN, which the web tier's CSP refuses.
+        docs_url=None,
+        redoc_url=None,
         openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
@@ -909,6 +921,8 @@ def create_app() -> FastAPI:
         dependencies=[Depends(require_module("network.e911"))],
     )
     app.include_router(api_v1_router, prefix="/api/v1")
+    # The interactive API docs, with self-hosted assets (#1157).
+    install_api_docs(app)
 
     if settings.prometheus_metrics_enabled:
         app.add_route("/metrics", metrics_endpoint)

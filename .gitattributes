@@ -1,0 +1,4 @@
+# Vendored browser bundles for /api/docs and /api/redoc (#1157): the npm
+# packages' own bytes, pinned in versions.json. Collapsed in review diffs.
+backend/app/static/api-docs/swagger-ui/** linguist-vendored linguist-generated
+backend/app/static/api-docs/redoc/** linguist-vendored linguist-generated

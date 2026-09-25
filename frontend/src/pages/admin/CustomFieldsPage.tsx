@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { customFieldsApi, authApi, type CustomField } from "@/lib/api";
 import { Plus, Pencil, Trash2, X, Check } from "lucide-react";
+import { useModalDialog } from "@/components/ui/use-draggable-modal";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
 const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
@@ -71,16 +72,22 @@ function FieldModal({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
+  const { dialogProps, titleProps } = useModalDialog(onClose);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
-      <div className="relative z-10 w-full max-w-lg rounded-xl border bg-card shadow-2xl">
+      <div
+        {...dialogProps}
+        className="relative z-10 w-full max-w-lg rounded-xl border bg-card shadow-2xl focus:outline-none"
+      >
         <div className="flex items-center justify-between border-b px-5 py-4">
-          <h2 className="font-semibold">
+          <h2 {...titleProps} className="font-semibold">
             {mode === "create" ? "New Custom Field" : "Edit Custom Field"}
           </h2>
           <button
             onClick={onClose}
+            aria-label="Close dialog"
             className="text-muted-foreground hover:text-foreground"
           >
             <X className="h-4 w-4" />
@@ -293,6 +300,55 @@ function fieldToForm(field: CustomField): FieldForm {
     display_order: field.display_order,
     description: field.description,
   };
+}
+
+// Its own component (#1156) so the dialog hook's Esc binding and focus trap
+// mount and unmount with the dialog, not with the page.
+function DeleteFieldDialog({
+  field,
+  pending,
+  onConfirm,
+  onClose,
+}: {
+  field: CustomField;
+  pending: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const { dialogProps, titleProps } = useModalDialog(onClose);
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+      <div
+        {...dialogProps}
+        className="relative z-10 w-full max-w-sm rounded-xl border bg-card p-6 shadow-2xl focus:outline-none"
+      >
+        <h2 {...titleProps} className="font-semibold">
+          Delete Custom Field?
+        </h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Delete <span className="font-mono font-medium">{field.name}</span>{" "}
+          from {RESOURCE_LABELS[field.resource_type]}? Existing data stored in
+          this field will be lost.
+        </p>
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md px-4 py-1.5 text-sm text-muted-foreground hover:bg-accent"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={pending}
+            className="rounded-md bg-destructive px-4 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-40"
+          >
+            {pending ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export function CustomFieldsPage() {
@@ -538,38 +594,12 @@ export function CustomFieldsPage() {
 
       {/* Delete confirm */}
       {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div
-            className="absolute inset-0 bg-black/50"
-            onClick={() => setDeleteConfirm(null)}
-          />
-          <div className="relative z-10 w-full max-w-sm rounded-xl border bg-card p-6 shadow-2xl">
-            <h2 className="font-semibold">Delete Custom Field?</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Delete{" "}
-              <span className="font-mono font-medium">
-                {deleteConfirm.name}
-              </span>{" "}
-              from {RESOURCE_LABELS[deleteConfirm.resource_type]}? Existing data
-              stored in this field will be lost.
-            </p>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                onClick={() => setDeleteConfirm(null)}
-                className="rounded-md px-4 py-1.5 text-sm text-muted-foreground hover:bg-accent"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => deleteMutation.mutate(deleteConfirm.id)}
-                disabled={deleteMutation.isPending}
-                className="rounded-md bg-destructive px-4 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-40"
-              >
-                {deleteMutation.isPending ? "Deleting…" : "Delete"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <DeleteFieldDialog
+          field={deleteConfirm}
+          pending={deleteMutation.isPending}
+          onConfirm={() => deleteMutation.mutate(deleteConfirm.id)}
+          onClose={() => setDeleteConfirm(null)}
+        />
       )}
     </div>
   );

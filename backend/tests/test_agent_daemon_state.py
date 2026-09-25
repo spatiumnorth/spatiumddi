@@ -327,6 +327,10 @@ def _dns_model(**daemon: object) -> DNSServer:
         maintenance_mode=False,
         is_trial_boot=False,
         reboot_requested=False,
+        # #1111's stored-bundle counters: NOT NULL with a default that only
+        # applies at flush, and this instance is never flushed.
+        bundle_dirty_seq=0,
+        bundle_render_count=0,
         **daemon,
     )
     _stamped(s)

@@ -79,6 +79,9 @@ _ROLE_PORTS_TCP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
     "dns-technitium": [53],
+    # BGP (#566) — was only in the supervisor's table, so the port vanished
+    # whenever this renderer or the merge drove the node (#1166).
+    "looking-glass": [179],
 }
 _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],
@@ -118,6 +121,36 @@ def _emit_family_rule(
         lines.append(f'ip saddr {{ {", ".join(v4)} }} {rule_suffix} comment "{comment}-v4"')
     if v6:
         lines.append(f'ip6 saddr {{ {", ".join(v6)} }} {rule_suffix} comment "{comment}-v6"')
+
+
+def _dhcp_ha_rule(
+    role_assignment: dict[str, Any], roles: list[str]
+) -> tuple[int, list[str], list[str]] | None:
+    """#1167 — the Kea HA listener: ``(port, v4 peers, v6 peers)``, or None.
+
+    The port is the node's own ``ha_peer_url`` port and the peers are the
+    group's other Kea members, both computed by the control plane
+    (``services/dhcp/ha_firewall``). Scoped to those peers, never ``any``:
+    Kea's HA API is unauthenticated by default and accepts lease updates.
+    Ignored without the dhcp role, a valid port, or a single valid peer, so a
+    stale value on a re-roled node cannot leave the port open. Keep
+    byte-identical across the three renderers.
+    """
+    if "dhcp" not in roles:
+        return None
+    raw = role_assignment.get("dhcp_ha_port")
+    if raw is None:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    v4, v6 = _split_families(role_assignment.get("dhcp_ha_peer_cidrs") or [])
+    if not (v4 or v6):
+        return None
+    return port, v4, v6
 
 
 def compile_firewall_body(
@@ -238,6 +271,14 @@ def compile_firewall_body(
         lines.append(f'udp dport {port} accept comment "role:{profile}"')
     for port in sorted(role_tcp):
         lines.append(f'tcp dport {port} accept comment "role:{profile}"')
+    # #1167 — Kea HA listener, scoped to the group's other Kea members.
+    ha = _dhcp_ha_rule(role_assignment, roles)
+    if ha is not None:
+        ha_port, ha_v4, ha_v6 = ha
+        if not (role_udp or role_tcp):
+            lines.append("")
+            lines.append("# ── Per-role service ports ─────────────────────────────")
+        _emit_family_rule(lines, ha_v4, ha_v6, f"tcp dport {ha_port} accept", "role:dhcp-ha")
 
     if is_cp:
         lines.append("")

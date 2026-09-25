@@ -31,7 +31,6 @@ Design choices:
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -45,6 +44,7 @@ from sqlalchemy.pool import NullPool
 from app.config import settings as _app_settings
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.services.after_commit_dispatch import dispatch
 
 logger = structlog.get_logger(__name__)
 
@@ -307,9 +307,11 @@ async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
 async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
     """Translate audit snapshots → typed events → outbox rows.
 
-    Called from ``after_commit`` via ``asyncio.create_task``, so a
-    failure here doesn't roll back the parent transaction — at worst
-    the event is dropped (logged at warning).
+    Called after the commit through ``after_commit_dispatch.dispatch``
+    (the request loop in the api, a per-process background loop in a
+    Celery worker — #1168), so a failure here doesn't roll back the
+    parent transaction — at worst the event is dropped (logged at
+    warning).
     """
     if not snapshots:
         return
@@ -391,12 +393,14 @@ def _register_session_listener() -> None:
         if not snapshots:
             return
         setattr(session, _PENDING_ATTR, [])
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("event_publisher_no_loop_dropped", count=len(snapshots))
-            return
-        loop.create_task(_publish_outbox_rows(snapshots))
+        # #1168 — not a bare ``loop.create_task``: in a Celery task the loop
+        # is the task's own ``asyncio.run``, which cancelled this write as it
+        # returned. ``dispatch`` uses a per-process background loop there.
+        dispatch(
+            "event_publisher",
+            lambda: _publish_outbox_rows(snapshots),
+            count=len(snapshots),
+        )
 
     @event.listens_for(AsyncSession.sync_session_class, "after_rollback")
     def _after_rollback(session: Any) -> None:

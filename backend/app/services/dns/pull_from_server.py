@@ -34,7 +34,12 @@ from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
 from app.services.dns.record_ops import resolve_primary_server
 from app.services.dns.serial import bump_zone_serial
-from app.services.dns.tsig import resolve_group_transfer_key, transfer_needs_tsig
+from app.services.dns.tsig import (
+    pull_zone_records_signed,
+    resolve_group_transfer_key,
+    resolve_view_transfer_key,
+    transfer_needs_tsig,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -127,18 +132,57 @@ def _key(r: RecordData | DNSRecord, zone_name: str) -> tuple[str, str, str]:
     return (name, rtype, _normalize_value(rtype, r.value, zone_name))
 
 
+#: The address record the BIND9 agent writes into every primary zone file,
+#: beside the apex ``NS ns1.<zone>`` it also writes, so BIND will load a zone
+#: whose NS names an in-zone host (``_write_zone_file`` in
+#: agent/dns/spatium_dns_agent/drivers/bind9.py). Keep the two in step.
+_AGENT_NS_GLUE = RecordData(name="ns1", record_type="A", value="127.0.0.1")
+
+
+def without_agent_ns_glue(
+    on_wire: list[RecordData],
+    server: Any,
+    zone_name: str,
+    db_keys: set[tuple[str, str, str]],
+) -> list[RecordData]:
+    """``on_wire`` minus the agent's own NS glue, when ``server`` is agent-managed BIND9.
+
+    The glue is render apparatus, the same class as the apex SOA and NS the
+    AXFR helper already drops: nobody created it, and SpatiumDDI puts it on
+    every zone the agent serves. Left in, every drift report on an
+    agent-managed BIND9 zone lists ``ns1 A 127.0.0.1`` as extra on the
+    server forever, so no zone ever reads in sync, and every sync-with-servers
+    imports it into the DB as a record an operator never made — which the
+    agent then renders a second time. Found once #920 let the transfer
+    through on the QA seed. A zone whose DB really holds that exact record
+    keeps it, and it is compared like any other. An operator-run BIND9, or any
+    other driver, never had it added, so its records pass through untouched.
+    """
+    if getattr(server, "driver", None) != "bind9" or getattr(server, "agent_id", None) is None:
+        return on_wire
+    glue = _key(_AGENT_NS_GLUE, zone_name)
+    if glue in db_keys:
+        return on_wire
+    return [r for r in on_wire if _key(r, zone_name) != glue]
+
+
 async def _resolve_primary_and_driver(
     db: AsyncSession, zone: DNSZone
-) -> tuple[Any, Any, TsigKey | None]:
+) -> tuple[Any, Any, list[TsigKey | None], str | None]:
     """Shared preamble for both pull and sync: find the zone's primary,
     sanity-check the driver supports pulling records, and resolve the TSIG
-    key its transfers have to be signed with.
+    key(s) its transfers have to be signed with.
 
-    The third element is the key to pass to ``pull_zone_records``, and is
-    None unless :func:`transfer_needs_tsig` says this server's agent granted
-    one. Windows Path A, the cloud providers and an operator's own BIND9 all
+    The third element is the keys to try, in order, through
+    :func:`~app.services.dns.tsig.pull_zone_records_signed`: ``[None]``
+    unless :func:`transfer_needs_tsig` says this server's agent granted one.
+    Windows Path A, the cloud providers and an operator's own BIND9 all
     authorise the read some other way, and signing for them would break a
-    working pull rather than fix a broken one (#734).
+    working pull rather than fix a broken one (#734). For an agent-managed
+    BIND9 whose group renders views, the key of the view holding this zone's
+    copy goes first (#920) — without it the transfer matches no view, or the
+    wrong one — and the group key follows for an agent that predates it. The
+    fourth element is that view's name, or None.
     """
     primary = await resolve_primary_server(db, zone)
     if primary is None:
@@ -152,7 +196,7 @@ async def _resolve_primary_and_driver(
             f"Driver {primary.driver!r} does not support syncing with the authoritative server."
         )
     if not transfer_needs_tsig(primary):
-        return primary, driver, None
+        return primary, driver, [None], None
 
     # #734 — the agent grants allow-transfer to the group key, so an
     # unsigned read is REFUSED. No key means the sync cannot work at all;
@@ -166,7 +210,11 @@ async def _resolve_primary_and_driver(
             "Create a TSIG key on the group and let the agent apply the new "
             "config, then try again."
         )
-    return primary, driver, tsig
+    view_transfer = await resolve_view_transfer_key(db, zone) if primary.driver == "bind9" else None
+    if view_transfer is None:
+        return primary, driver, [tsig], None
+    view_key, view_name = view_transfer
+    return primary, driver, [view_key, tsig], view_name
 
 
 def _additive_import(
@@ -241,13 +289,16 @@ async def pull_zone_from_server(
     task when the admin wants read-only sync; for the UI "Sync with server"
     button see ``sync_zone_with_server``.
     """
-    primary, driver, tsig = await _resolve_primary_and_driver(db, zone)
+    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone)
 
-    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name, tsig=tsig)  # type: ignore[attr-defined]
+    on_wire, _key_used = await pull_zone_records_signed(
+        driver, primary, zone.name, keys, view_name=view_name
+    )
 
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
     db_keys = {_key(r, zone.name) for r in db_rows}
+    on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
     if apply and result.imported:
@@ -424,9 +475,11 @@ async def sync_zone_with_server(
     Never deletes. Returns counts for both phases so the UI can surface
     them in one pass.
     """
-    primary, driver, tsig = await _resolve_primary_and_driver(db, zone)
+    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone)
 
-    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name, tsig=tsig)  # type: ignore[attr-defined]
+    on_wire, _key_used = await pull_zone_records_signed(
+        driver, primary, zone.name, keys, view_name=view_name
+    )
 
     # Snapshot DB state BEFORE the pull so we can compute the push set
     # against the "old" DB. We still import new rows from the pull into
@@ -436,6 +489,7 @@ async def sync_zone_with_server(
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
     db_keys = {_key(r, zone.name) for r in db_rows}
+    on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     pull_result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
     if apply and pull_result.imported:

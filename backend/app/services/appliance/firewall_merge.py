@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from app.services.appliance.firewall import (
+    _dhcp_ha_rule,
     _emit_family_rule,
     _profile_name,
     _split_families,
@@ -144,6 +145,10 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
             (20, "accept", "udp", (547,), "any", "both", None, None),
         ],
     ),
+    # BGP for a passive looking-glass collector (#566) — seeded by
+    # b8e2d5c07a14 (#1166). The supervisor's own renderer always opened it;
+    # this policy did not exist, so fleet enforcement closed the port.
+    ("role", "looking-glass", True, [(10, "accept", "tcp", (179,), "any", "both", None, None)]),
     (
         "role",
         "control-plane",
@@ -636,6 +641,14 @@ def compile_firewall_from_policies(
         lines.append(f'udp dport {port} accept comment "role:{ctx.profile}"')
     for port in sorted(role_tcp):
         lines.append(f'tcp dport {port} accept comment "role:{ctx.profile}"')
+    # #1167 — Kea HA listener, scoped to the group's other Kea members.
+    ha = _dhcp_ha_rule(ra, list(ctx.roles))
+    if ha is not None:
+        ha_port, ha_v4, ha_v6 = ha
+        if not (role_udp or role_tcp):
+            lines.append("")
+            lines.append("# ── Per-role service ports ─────────────────────────────")
+        _emit_family_rule(lines, ha_v4, ha_v6, f"tcp dport {ha_port} accept", "role:dhcp-ha")
 
     # ── Control-plane derived (STRUCTURAL emit, byte-identical). ──
     if ctx.is_cp:

@@ -36,6 +36,32 @@ _MATRIX: list[dict] = [
     {"role_assignment": {"roles": ["dns-bind9"]}},
     {"role_assignment": {"roles": ["dhcp"]}},
     {"role_assignment": {"roles": ["dns-powerdns", "dhcp"]}},
+    # #1166 — looking-glass (tcp/179) existed in the supervisor renderer only.
+    {"role_assignment": {"roles": ["looking-glass"]}},
+    {"role_assignment": {"roles": ["dns-bind9", "dhcp", "looking-glass"]}},
+    # #1167 — the Kea HA listener, scoped to the pair (dual-stack) …
+    {
+        "role_assignment": {
+            "roles": ["dhcp"],
+            "dhcp_ha_port": 8000,
+            "dhcp_ha_peer_cidrs": ["192.168.0.12/32", "2001:db8::12/128", "192.168.0.13/32"],
+        }
+    },
+    # … never on a node without the dhcp role, and never from a junk peer.
+    {
+        "role_assignment": {
+            "roles": ["dns-bind9"],
+            "dhcp_ha_port": 8000,
+            "dhcp_ha_peer_cidrs": ["192.168.0.12/32"],
+        }
+    },
+    {
+        "role_assignment": {
+            "roles": ["dhcp"],
+            "dhcp_ha_port": 8000,
+            "dhcp_ha_peer_cidrs": ["1.2.3.4 }, drop; tcp dport 22 accept; #"],
+        }
+    },
     # single-node CP: pod/service CIDR, no peers
     {
         "role_assignment": {"roles": []},
