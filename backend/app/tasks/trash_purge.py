@@ -20,6 +20,7 @@ import structlog
 from sqlalchemy import and_, delete, or_, select
 
 from app.celery_app import celery_app
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
@@ -292,6 +293,29 @@ async def _sweep() -> dict[str, Any]:
         per_type["dns_record"] = await _purge_dns_records(db, cutoff, purged_zone_ids)
         total_removed += per_type["dns_record"]
 
+        # spatiumddi#1151 — the Subnet DELETE below cascades each purged
+        # subnet's ip_address rows, and dns_record.ip_address_id is SET NULL:
+        # withdraw the LIVE auto-generated records IPAM published for those
+        # addresses first, or they stay in their zones, ownerless and served.
+        # Selected by what the DELETE will destroy — the same predicate — and
+        # no block / space pass can reach a subnet (its FKs are RESTRICT).
+        from app.services.dns.record_ops import retract_address_records  # noqa: PLC0415
+
+        purged_subnet_ids = (
+            (
+                await db.execute(
+                    select(Subnet.id)
+                    .where(Subnet.deleted_at.is_not(None), Subnet.deleted_at < cutoff)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        address_records_retracted, dns_wake_group_ids = await retract_address_records(
+            db, purged_subnet_ids
+        )
+
         for model in _PURGE_MODELS_LEAF_FIRST:
             stmt = (
                 delete(model)
@@ -326,18 +350,24 @@ async def _sweep() -> dict[str, Any]:
                         "purge_days": purge_days,
                         "ipam_mirrors_released": ipam_released,
                         "records_retracted_at_provider": records_retracted,
+                        "address_records_retracted": address_records_retracted,
                         "zones_retract_skipped": zones_skipped,
                     },
                     result="success",
                 )
             )
         await db.commit()
+        # The ops above are committed; wake the agents rather than leave the
+        # withdrawal to their safety tick (a task has no request collector).
+        for gid in dns_wake_group_ids:
+            await publish_wake(dns_group_channel(gid))
 
         return {
             "removed": total_removed,
             "per_type": per_type,
             "ipam_mirrors_released": ipam_released,
             "records_retracted_at_provider": records_retracted,
+            "address_records_retracted": address_records_retracted,
             "zones_retract_skipped": zones_skipped,
             "purge_days": purge_days,
             "skipped": False,

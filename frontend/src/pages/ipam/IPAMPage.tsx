@@ -7944,9 +7944,13 @@ function EditSubnetModal({
             <strong className="font-mono text-foreground">
               {subnet.network}
             </strong>{" "}
-            and its DHCP scopes will be moved to Trash. You can restore them
-            together within 30 days from Administration → Trash; after that the
-            nightly purge removes them for good.
+            and its DHCP scopes will be moved to Trash, with the reverse zone
+            created for it unless another subnet still uses that zone. The
+            addresses you allocated stay with it, and their A/AAAA records keep
+            resolving while it is in Trash. You can restore them together within
+            30 days from Administration → Trash; after that the nightly purge
+            deletes the subnet and its addresses for good and withdraws their
+            DNS records.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -8218,10 +8222,15 @@ function EditSubnetModal({
       {tab === "danger" && onDeleted && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting a subnet moves it and its DHCP scopes to Trash (restorable
-            for 30 days); the IP address rows inside it are removed, and any
-            DHCP-lease DNS records are revoked. The deletion is gated by a
-            confirm in the next step.
+            Deleting a subnet moves it and its DHCP scopes to Trash, restorable
+            together for 30 days, along with the reverse zone created for it
+            (unless another subnet still uses that zone). The addresses you
+            allocated stay with it and come back on restore, and their A/AAAA
+            records keep resolving while it is in Trash. Addresses from DHCP
+            (leases and reservations) are removed straight away with their DNS
+            records; reservations come back with their scope on restore. Purging
+            the subnet from Trash deletes its addresses and withdraws their DNS
+            records. The deletion is gated by a confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}

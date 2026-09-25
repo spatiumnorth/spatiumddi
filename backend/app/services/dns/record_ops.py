@@ -12,6 +12,7 @@ plane applies the change directly at enqueue time and writes the row as
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,11 +20,13 @@ import structlog
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.models.ipam import IPAddress
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 
@@ -633,6 +636,104 @@ async def enqueue_record_ops_bulk(
     # server, resolved once, one add_all + flush (#481 semantics included).
     rows = await _fanout_agent_ops(db, zone, primary, ops)
     return sum(1 for r in rows if r is not None)
+
+
+# Ids per ``IN`` clause: asyncpg refuses a statement with more than 32 767 bind
+# parameters, and a purge sweep can hand over many subnets / many records.
+_RETRACT_CHUNK = 5000
+
+
+async def retract_address_records(
+    db: AsyncSession, subnet_ids: Collection[uuid.UUID]
+) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw every auto-generated DNS record IPAM published for the
+    addresses of ``subnet_ids``, before those subnets are hard-deleted
+    (spatiumddi#1151). Returns ``(records_retracted, dns_group_ids)`` — the
+    groups to wake once the caller has committed.
+
+    A subnet's hard delete cascades its ``ip_address`` rows, but
+    ``dns_record.ip_address_id`` is ON DELETE SET NULL: left to the database,
+    every A / AAAA / PTR / alias IPAM generated for those addresses survives
+    as an ownerless row in a live zone — and on the wire, because in a group
+    without views the agents never re-render records from the bundle, so only
+    a queued delete op takes one out of BIND.
+
+    What is withdrawn, and what is not:
+
+    * ``auto_generated`` records only. A record an operator made by hand is
+      theirs; it keeps its place with ``ip_address_id`` null, as before.
+    * live records only. One already in the trash — the PTRs of an
+      auto-created reverse zone that went to the trash with its subnet
+      (#1066) — is not being served, and keeps riding its own batch.
+    * records bound to these subnets' addresses only. The caller passes the
+      subnets it is about to hard-delete, so every address concerned is
+      really going; a sibling subnet's records in a shared zone are untouched.
+
+    Ops go out per zone in one batch (one serial bump, one RRset resolution),
+    so every op carries the zone's final RRset: a round-robin name losing two
+    of its three members to the purge keeps exactly the third, whatever order
+    the agent drains them in. Agent ops are rows in the caller's transaction,
+    so a rolled-back purge queues nothing; an agentless primary (Windows DNS)
+    is written immediately, as every record op to it is.
+    """
+    ids = list(subnet_ids)
+    if not ids:
+        return 0, set()
+    records: list[DNSRecord] = []
+    for start in range(0, len(ids), _RETRACT_CHUNK):
+        chunk = ids[start : start + _RETRACT_CHUNK]
+        records.extend(
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .where(
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.ip_address_id.in_(
+                            select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
+                        ),
+                    )
+                    .options(selectinload(DNSRecord.zone))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not records:
+        return 0, set()
+
+    by_zone: dict[uuid.UUID, tuple[DNSZone, list[DNSRecord]]] = {}
+    for rec in records:
+        zone = rec.zone
+        if zone is None or zone.deleted_at is not None:
+            continue  # a zone in the trash is not served: nothing on the wire
+        by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
+    wake: set[uuid.UUID] = set()
+    for zone, recs in by_zone.values():
+        target_serial = bump_zone_serial(zone)
+        await enqueue_record_ops_batch(
+            db,
+            zone,
+            [
+                {"op": "delete", "record": record_op_payload(r), "target_serial": target_serial}
+                for r in recs
+            ],
+        )
+        wake.add(zone.group_id)
+
+    # After the enqueue: the RRset stamp reads the zone's live members and
+    # removes each op's own value (rrset._fold), so the victims are still rows.
+    record_ids = [r.id for r in records]
+    for start in range(0, len(record_ids), _RETRACT_CHUNK):
+        await db.execute(
+            sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids[start : start + _RETRACT_CHUNK]))
+        )
+    logger.info(
+        "ipam_address_records_retracted",
+        subnets=len(ids),
+        records=len(records),
+        zones=len(by_zone),
+    )
+    return len(records), wake
 
 
 async def _apply_agentless_batch(

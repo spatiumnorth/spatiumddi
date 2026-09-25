@@ -286,6 +286,67 @@ the formatter handles the rest.
   a backend test over the built-in role and Copilot tool
   descriptions.
 
+- **A subnet that inherits its DNS now gets its reverse zone
+  (#1149).** Getting Started promises the matching `in-addr.arpa` /
+  `ip6.arpa` zone once a subnet has an effective DNS group or zone,
+  but subnet create decided from the request body and the subnet's
+  own columns only — so a subnet left on **Inherit from parent** (the
+  console's default, which sends no DNS fields at all) never got one,
+  and no address in it ever got a PTR. The per-allocation catch-up and
+  the reverse-zone backfill (the first step of **Sync DNS**) had the
+  same blind spot. All three now fall back to the DNS the subnet
+  inherits from its block or space when it names none of its own. A
+  subnet with its own binding resolves exactly as before,
+  `skip_reverse_zone` still opts out at create, and the #844 refusal
+  to share a reverse zone with an overlapping subnet in another IP
+  space applies however the group was found. An existing inheriting
+  subnet gets its reverse zone on its next allocation or **Sync DNS**.
+
+- **A new subnet no longer starts "1 DNS record out of sync"
+  (#1150).** Subnet create adds the network, broadcast and gateway
+  placeholder rows and never published the gateway's PTR, so under a
+  reverse zone every new subnet opened with the gateway's PTR missing
+  — the drift banner on day one, and `gateway.<zone>` unresolvable in
+  reverse until someone ran **Sync DNS**. The gateway's PTR is now
+  published at create (still no forward `gateway.<zone>` A record, by
+  design), into the subnet's auto-created reverse zone or whichever
+  reverse zone covers it; `skip_reverse_zone` still creates no zone.
+  The subnet planner's apply built the same placeholder and ran
+  neither DNS step; a planned subnet now gets its reverse zone and
+  gateway PTR at apply, the same as one created directly.
+
+- **Purging a subnet takes its DNS records off the wire (#1151).** A
+  subnet's addresses cascade away when it is deleted for good, but
+  `dns_record.ip_address_id` is `SET NULL`, and neither Trash purge —
+  **Delete permanently** in Trash, or the daily sweep after the
+  retention window — withdrew anything first. Every A record IPAM had
+  published for those addresses (and their PTRs in a reverse zone a
+  sibling subnet kept, extra-zone records and aliases) stayed in its
+  zone, ownerless, and BIND kept answering for addresses IPAM no
+  longer had. Both paths now withdraw every auto-generated record of
+  the subnet's addresses through the record-op queue before the
+  delete, and wake the agents; the direct permanent delete
+  (`?permanent=true`), which withdrew only each address's primary A,
+  does the same. Only what is really going is touched: records made
+  by hand stay, a sibling subnet's records stay, and a subnet still
+  inside the retention window — or restored from Trash — keeps every
+  record. Records already orphaned by an earlier purge are not swept
+  up automatically; **Sync DNS** on a subnet whose zones hold them
+  lists them as stale and withdraws them.
+
+- **The subnet delete dialog says what a delete does (#1152).** Its
+  Danger zone text said the subnet's IP address rows are removed;
+  they are not — the addresses you allocated stay with the trashed
+  subnet, come back on restore, and their A/AAAA records keep
+  resolving while it sits in Trash — and the confirmation step named
+  only the subnet and its DHCP scopes. Both now say what happens:
+  the subnet, its scopes and the reverse zone created for it move to
+  Trash; DHCP lease and reservation addresses are removed at once
+  with their DNS records (reservations return with their scope);
+  purging the subnet deletes its addresses and withdraws their DNS
+  records. Copy only — what a trashed subnet should publish is
+  unchanged.
+
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
   released; the DHCP agent's state map knew only `0`–`2` and fell
