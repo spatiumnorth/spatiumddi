@@ -7,6 +7,7 @@ import {
   type NmapPortResult,
   type NmapScanRead,
 } from "@/lib/api";
+import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 
 /**
@@ -152,10 +153,16 @@ function StampDiscoveredModal({
     ((stamp.error as { response?: { data?: { detail?: string } } })?.response
       ?.data?.detail ??
       "Failed to stamp hosts");
+  const { dialogProps, titleProps } = useModalDialog(onClose);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-      <div className="w-full max-w-md rounded-lg border bg-card p-5 shadow-xl">
-        <h3 className="text-base font-semibold">Stamp alive hosts into IPAM</h3>
+      <div
+        {...dialogProps}
+        className="w-full max-w-md rounded-lg border bg-card p-5 shadow-xl focus:outline-none"
+      >
+        <h3 {...titleProps} className="text-base font-semibold">
+          Stamp alive hosts into IPAM
+        </h3>
         {!result && !stamp.isPending && (
           <p className="mt-2 text-sm text-muted-foreground">
             For each of the {aliveCount} alive host{aliveCount === 1 ? "" : "s"}

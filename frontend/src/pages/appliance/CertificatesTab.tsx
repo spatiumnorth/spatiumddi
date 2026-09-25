@@ -108,8 +108,7 @@ export function CertificatesTab() {
             The certificate nginx serves on the appliance's HTTPS frontend.
             Upload a PEM cert + private key from an existing CA, or generate a
             CSR locally (key stays on the server) and bring back the signed
-            cert. Phase 4b.2 wires the active row into nginx; until then this
-            stores certs but nginx still uses the self-signed default.
+            cert. Activating a certificate makes nginx serve it.
           </p>
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-2">

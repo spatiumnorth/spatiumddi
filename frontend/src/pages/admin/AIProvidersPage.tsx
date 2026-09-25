@@ -729,10 +729,10 @@ export function AIProvidersPage() {
               <Sparkles className="h-5 w-5" /> AI Providers
             </h1>
             <p className="text-sm text-muted-foreground">
-              Configure LLM providers for the Operator Copilot. Wave 1 ships the
-              OpenAI-compatible driver — works with OpenAI, Ollama, OpenWebUI,
-              vLLM, LM Studio, and most local model servers. Anthropic / Gemini
-              / Azure drivers ship in Phase 2.
+              Configure LLM providers for the Operator Copilot: any
+              OpenAI-compatible server (OpenAI, Ollama, OpenWebUI, vLLM, LM
+              Studio, and most local model servers), Anthropic, Google Gemini or
+              Azure OpenAI.
             </p>
           </div>
           <button

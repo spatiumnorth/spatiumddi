@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -20,8 +21,18 @@ import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal } from "./_shared";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
 
+// #1155 — the scope and pool writes, each on the check the server makes:
+// the DHCP scope and pool routers map POST / PUT to write and DELETE to
+// delete, on ``dhcp_scope`` and ``dhcp_pool``. A control the caller's grants
+// will not pass stays in place, disabled, with the reason as its tooltip.
+const NEEDS_SCOPE_WRITE = "Requires write permission on DHCP scopes";
+const NEEDS_SCOPE_DELETE = "Requires delete permission on DHCP scopes";
+const NEEDS_POOL_WRITE = "Requires write permission on DHCP pools";
+const NEEDS_POOL_DELETE = "Requires delete permission on DHCP pools";
+
 function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
   const qc = useQueryClient();
+  const perms = usePermissions();
   const [edit, setEdit] = useState(false);
   const [del, setDel] = useState(false);
   const mut = useMutation({
@@ -44,13 +55,20 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
       <td className="px-3 py-1.5 text-right">
         <button
           onClick={() => setEdit(true)}
-          className="rounded p-1 text-muted-foreground hover:text-foreground"
+          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
+          title="Edit pool"
+          {...permissionGate(perms.can("write", "dhcp_pool"), NEEDS_POOL_WRITE)}
         >
           <Pencil className="h-3.5 w-3.5" />
         </button>
         <button
           onClick={() => setDel(true)}
-          className="rounded p-1 text-muted-foreground hover:text-destructive"
+          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
+          title="Delete pool"
+          {...permissionGate(
+            perms.can("delete", "dhcp_pool"),
+            NEEDS_POOL_DELETE,
+          )}
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>
@@ -77,6 +95,8 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
 
 function ScopeCard({ scope }: { scope: DHCPScope }) {
   const qc = useQueryClient();
+  const perms = usePermissions();
+  const canWriteScope = perms.can("write", "dhcp_scope");
   const [showPools, setShowPools] = useState(true);
   const [showAddPool, setShowAddPool] = useState(false);
   const [editScope, setEditScope] = useState(false);
@@ -138,20 +158,26 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               type="checkbox"
               checked={scope.enabled}
               onChange={(e) => toggleEnabled.mutate(e.target.checked)}
+              {...permissionGate(canWriteScope, NEEDS_SCOPE_WRITE)}
             />
             {scope.enabled ? "Enabled" : "Disabled"}
           </label>
           <button
             onClick={() => setEditScope(true)}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
+            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
             title="Edit scope"
+            {...permissionGate(canWriteScope, NEEDS_SCOPE_WRITE)}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={() => setDeleteScope(true)}
-            className="rounded p-1 text-muted-foreground hover:text-destructive"
+            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
             title="Delete scope"
+            {...permissionGate(
+              perms.can("delete", "dhcp_scope"),
+              NEEDS_SCOPE_DELETE,
+            )}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -176,7 +202,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
           </button>
           <button
             onClick={() => setShowAddPool(true)}
-            className="flex items-center gap-1 text-xs text-primary hover:underline"
+            className="flex items-center gap-1 text-xs text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:no-underline"
+            {...permissionGate(
+              perms.can("write", "dhcp_pool"),
+              NEEDS_POOL_WRITE,
+            )}
           >
             <Plus className="h-3 w-3" /> Add Pool
           </button>
@@ -238,6 +268,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
  */
 export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
   const [showCreate, setShowCreate] = useState(false);
+  const perms = usePermissions();
   const { data: scopes = [], isLoading } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
@@ -256,7 +287,11 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
         </div>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...permissionGate(
+            perms.can("write", "dhcp_scope"),
+            NEEDS_SCOPE_WRITE,
+          )}
         >
           <Plus className="h-3.5 w-3.5" /> Create Scope
         </button>

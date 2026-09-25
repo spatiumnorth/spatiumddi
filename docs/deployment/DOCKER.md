@@ -216,30 +216,30 @@ If you skipped the backup and need to roll back: every restore takes a `pre-rest
 
 ## 9. Backup and Restore
 
-The full backup + restore surface lives in **System Admin → Backup**: build-and-download, configured remote destinations (local volume, S3 / S3-compatible, SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google Cloud Storage), scheduled cron + retention, restore-from-file, restore-from-destination, archive proxy-download, selective restore. See [`docs/features/SYSTEM_ADMIN.md`](../features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
+The full backup + restore surface lives in **System Admin → Backup**: build-and-download, configured remote destinations (local volume, S3 / S3-compatible, SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google Cloud Storage, WebDAV, NFS, HTTPS PUT/POST), scheduled cron + retention, restore-from-file, restore-from-destination, archive proxy-download, selective restore. See [`docs/features/SYSTEM_ADMIN.md`](../features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
 
 The shape that's specific to Docker Compose:
 
 ### Local-volume target
 
-A `local_volume` destination writes archives to a configured filesystem path on the api / worker container. To survive container recycle, that path **must** be a docker volume. The dev compose mounts `spatium_backups` into both api + worker at `/var/lib/spatiumddi/backups` automatically; the prod compose ships the same shape but commented out — installs that don't use a `local_volume` target leave it disabled, the rest uncomment three lines (one mount on `api`, one on `worker`, one entry under top-level `volumes:`):
+A `local_volume` destination writes archives to a filesystem path inside the containers, and two containers use it: the worker writes every scheduled run, and the api writes a manual **Run now** and lists, downloads and restores archives. So the path **must** be one volume mounted on both. Otherwise each container keeps its own copy in its writable layer: scheduled archives never appear in the target's archive list, and every archive is lost at the next container recreate. `docker-compose.yml` mounts `spatium_backups` on both at `/var/lib/spatiumddi/backups`, the path a new target suggests:
 
 ```yaml
 # docker-compose.yml
 services:
   api:
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro     # already there if you use Docker integration
-      - spatium_backups:/var/lib/spatiumddi/backups      # uncomment for local_volume backup target
+      - spatium_backups:/var/lib/spatiumddi/backups
   worker:
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - spatium_backups:/var/lib/spatiumddi/backups
 volumes:
-  spatium_backups:                                        # uncomment alongside the mounts above
+  spatium_backups:
 ```
 
-The default mount path matches `LocalVolumeDestination`'s default config, so a freshly-created target at `/var/lib/spatiumddi/backups` works out of the box once the volume is enabled.
+To use another path, mount a volume there on **both** services. **Test connection** on the target warns when its path is not on a mounted volume. Restore's `pre-restore-{ts}.zip` safety dump is written to the same directory.
+
+Upgrading from a compose file that had this volume commented out (every release up to and including `2026.09.04-1`): archives written before the upgrade exist only inside the running api and worker containers. Copy them out before the upgrade recreates the containers — `docker compose cp api:/var/lib/spatiumddi/backups ./backups-api`, and the same for `worker`.
 
 ### Out-of-band PostgreSQL dump (fallback only)
 

@@ -8,6 +8,7 @@ import {
   type PcapCaptureRead,
   pcapApi,
 } from "@/lib/api";
+import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import { humanTime } from "@/pages/network/_shared";
 
@@ -859,10 +860,14 @@ function ConfirmBulkDeleteModal({
     (s) => s.status === "queued" || s.status === "running",
   ).length;
   const terminal = captures.length - inFlight;
+  const { dialogProps, titleProps } = useModalDialog(onClose);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-      <div className="w-full max-w-md rounded-lg border bg-card p-5 shadow-xl">
-        <h3 className="text-base font-semibold">
+      <div
+        {...dialogProps}
+        className="w-full max-w-md rounded-lg border bg-card p-5 shadow-xl focus:outline-none"
+      >
+        <h3 {...titleProps} className="text-base font-semibold">
           Delete {captures.length} capture{captures.length === 1 ? "" : "s"}?
         </h3>
         <p className="mt-2 text-sm text-muted-foreground">
