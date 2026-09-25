@@ -218,6 +218,17 @@ the formatter handles the rest.
   per-process background loop, switched on from `worker_init` /
   `beat_init` and started lazily per PID for prefork children.
 
+- **The worker's liveness probe no longer loads every model (#1189).**
+  The session listeners, now including the DNS bundle dirty-mark from
+  #1111, were installed when `app.celery_app` was imported, and the
+  worker's liveness probe (`celery -A app.celery_app inspect ping`,
+  10 s timeout) imports it on every run. That pulled in the models,
+  the DNS drivers, httpx, cryptography and jinja2: 1,002 modules
+  against 744, and under load a three-node cluster's worker missed the
+  probe 14 times in 28 minutes and restarted once. They are installed
+  from `worker_init` / `beat_init` now, which the prefork pool
+  inherits, and a test fails if a bare import loads them again.
+
 - **Two appliances in one Kea HA group could not reach each other
   (#1167).** Kea's HA hook listens on the port in each member's own
   `ha_peer_url`, and no appliance firewall layer opened it under the

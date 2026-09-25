@@ -51,20 +51,10 @@ def test_every_module_that_registers_session_listeners_is_installed() -> None:
     assert stale == [], f"{stale} are listed but no longer register a session listener"
 
 
-def test_the_worker_process_installs_every_listener() -> None:
-    """Probe the worker's own import graph in a fresh interpreter: the Celery
-    app plus every module in its ``include`` list, exactly as ``celery worker``
-    imports them at startup."""
-    probe = (
-        "import sys\n"
-        "from app.celery_app import celery_app\n"
-        "celery_app.loader.import_default_modules()\n"
-        "assert 'app.main' not in sys.modules, 'probe must not load the api'\n"
-        f"wanted = {list(SESSION_LISTENER_MODULES)!r}\n"
-        "print('MISSING ' + ' '.join(m for m in wanted if m not in sys.modules))\n"
-    )
+def _probe(code: str) -> str:
+    """Run ``code`` in a fresh interpreter and return its last stdout line."""
     proc = subprocess.run(  # noqa: S603 — fixed argv, our own interpreter
-        [sys.executable, "-c", probe],
+        [sys.executable, "-c", code],
         cwd=_BACKEND,
         env=os.environ.copy(),
         capture_output=True,
@@ -72,6 +62,36 @@ def test_the_worker_process_installs_every_listener() -> None:
         timeout=180,
     )
     # A probe that could not run is not the negative outcome; say which.
-    assert proc.returncode == 0, f"worker import probe failed to run:\n{proc.stderr[-2000:]}"
-    last = proc.stdout.strip().splitlines()[-1]
+    assert proc.returncode == 0, f"import probe failed to run:\n{proc.stderr[-2000:]}"
+    return proc.stdout.strip().splitlines()[-1]
+
+
+def test_the_worker_process_installs_every_listener() -> None:
+    """Probe the worker's own startup in a fresh interpreter: the Celery app,
+    every module in its ``include`` list, then ``worker_init``, exactly as
+    ``celery worker`` does before its pool forks."""
+    last = _probe(
+        "import sys\n"
+        "from celery.signals import worker_init\n"
+        "from app.celery_app import celery_app\n"
+        "celery_app.loader.import_default_modules()\n"
+        "worker_init.send(sender=None)\n"
+        "assert 'app.main' not in sys.modules, 'probe must not load the api'\n"
+        f"wanted = {list(SESSION_LISTENER_MODULES)!r}\n"
+        "print('MISSING ' + ' '.join(m for m in wanted if m not in sys.modules))\n"
+    )
     assert last == "MISSING", f"the Celery worker does not install: {last[len('MISSING '):]}"
+
+
+def test_importing_the_celery_app_does_not_install_the_listeners() -> None:
+    """#1189: the worker's liveness probe runs ``celery -A app.celery_app inspect
+    ping``, which imports the Celery app on every run. The listeners pull in
+    the models, the DNS drivers, httpx and jinja2, so they are installed from
+    ``worker_init`` / ``beat_init`` and a bare import must not load them."""
+    last = _probe(
+        "import sys\n"
+        "import app.celery_app\n"
+        f"wanted = {list(SESSION_LISTENER_MODULES)!r}\n"
+        "print('LOADED ' + ' '.join(m for m in wanted if m in sys.modules))\n"
+    )
+    assert last == "LOADED", f"importing app.celery_app loads: {last[len('LOADED '):]}"

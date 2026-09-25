@@ -13,8 +13,11 @@ task happened to import its module:
   ``system.backup_failed`` for SCHEDULED backups, and every
   ``system.upgrade.*`` from the rolling-upgrade orchestrator.
 
-Now both processes install this one list (``app.main`` and ``app.celery_app``
-call :func:`install_session_listeners`), and two tests keep it honest:
+Now both processes install this one list: ``app.main`` calls
+:func:`install_session_listeners` at import, and ``app.celery_app`` calls it
+from the ``worker_init`` / ``beat_init`` signals, not at import, because the
+worker's liveness probe imports the Celery app on every run (#1189). The DNS
+bundle dirty-mark (#1111) is on the list too. Two tests keep it honest:
 ``tests/test_session_listeners.py`` fails when a module registering session
 listeners is missing from the list, and probes the worker's own import graph
 in a fresh interpreter — the suite itself imports ``app.main`` (conftest), so
@@ -31,6 +34,7 @@ import importlib
 SESSION_LISTENER_MODULES: tuple[str, ...] = (
     "app.services.audit_forward",
     "app.services.event_publisher",
+    "app.services.dns.bundle_dirty",
 )
 
 

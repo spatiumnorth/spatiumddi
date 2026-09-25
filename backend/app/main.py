@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -24,18 +23,11 @@ from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
 from app.services.session_listeners import install_session_listeners
 
-# SQLAlchemy session listeners (audit forwarding, the typed-event outbox)
-# register on import, so they must be installed before any request handler
-# writes a row. ``app.celery_app`` installs the same list for the worker and
-# beat (#1168).
+# SQLAlchemy session listeners (audit forwarding, the typed-event outbox, the
+# DNS bundle dirty-mark) register on import, so they must be installed before
+# any request handler writes a row. ``app.celery_app`` installs the same list
+# for the worker and beat (#1168, #1111).
 install_session_listeners()
-
-# #1111 — same idea: the after_flush listener that marks DNS agent bundles
-# dirty in the transaction that changes their inputs must be attached before
-# any request handler writes a DNS row. ``app.celery_app`` loads it the same
-# way for the worker and beat. import_module, not a bound import, so static
-# analysis doesn't flag a side-effect-only import as unused.
-importlib.import_module("app.services.dns.bundle_dirty")
 
 logger = structlog.get_logger(__name__)
 

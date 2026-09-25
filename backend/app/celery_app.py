@@ -737,23 +737,25 @@ from celery.signals import task_failure  # noqa: E402
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
 
-# #1168 — the SQLAlchemy session listeners (audit forwarding, the typed-event
-# outbox) register on import. The api installs them from ``app.main``, which
-# a worker never imports; without this a task's audit rows produced no typed
-# webhook events at all — scheduled backups and rolling upgrades included.
-importlib.import_module("app.services.session_listeners").install_session_listeners()
-
-# #1111 — the after_flush listener that marks DNS agent bundles dirty in the
-# transaction that changes their inputs. It is installed by importing the
-# module, and nothing a worker imports reaches it otherwise (``app.main``
-# does, for the api only). Without it every DNS write a Celery task makes —
-# pool failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync, blocklist
-# refresh — commits unmarked: the stored bundle stays "current" and the new
-# ops are gated out of every ops page, so agents never receive them.
-importlib.import_module("app.services.dns.bundle_dirty")
-
-
 from celery.signals import beat_init, worker_init  # noqa: E402
+
+
+@worker_init.connect
+@beat_init.connect
+def _install_session_listeners(**_: object) -> None:
+    """Install the SQLAlchemy session listeners in the worker and beat: audit
+    forwarding and the typed-event outbox (#1168), and the DNS bundle
+    dirty-mark (#1111). They register on import, and nothing a worker imports
+    reaches them otherwise (``app.main`` installs them for the api only).
+    Without them a task's audit rows produce no typed webhook events, and a
+    task's DNS writes commit unmarked, so agents never receive them.
+
+    From the signals, not at import (#1189): the worker's liveness probe runs
+    ``celery -A app.celery_app inspect ping``, which imports this module on
+    every run, and the listeners pull in the models, the DNS drivers, httpx,
+    cryptography and jinja2. ``worker_init`` runs in the prefork master before
+    the pool forks, so every child inherits them."""
+    importlib.import_module("app.services.session_listeners").install_session_listeners()
 
 
 @worker_init.connect
