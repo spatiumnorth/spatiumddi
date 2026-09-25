@@ -51,6 +51,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { releaseVerdict } from "@/lib/versions";
 import {
   formatEta,
   formatMdLevel,
@@ -5364,6 +5365,10 @@ function UpgradeLogTail({ text }: { text: string }) {
   );
 }
 
+// The first release with #386's upgrade-progress telemetry (2026.06.12-1
+// was tagged before it merged).
+const UPGRADE_PROGRESS_MIN_VERSION = "2026.06.12-2";
+
 /**
  * #386 Part C — full upgrade status for the Fleet drilldown. Driven by
  * the supervisor-shipped ``last_upgrade_progress`` (per-phase step + %)
@@ -5387,14 +5392,18 @@ function UpgradeStatusPanel({
   const state = row.last_upgrade_state;
   const failed = state === "failed" || progress?.step === "failed";
   const target = row.desired_appliance_version;
-  // A supervisor older than the #386 (2026.06.12) upgrade-progress telemetry
-  // never reports last_upgrade_progress, so without this the panel sits on
-  // "pending" forever even after the trigger fired. Detect it from the
-  // reported version (CalVer sorts lexicographically) and say so honestly
-  // rather than promising a fire "in ≤30s" that already happened.
-  const supVer = row.supervisor_version ?? row.installed_appliance_version;
-  const predatesProgress =
-    !!supVer && /^\d{4}\.\d{2}\.\d{2}/.test(supVer) && supVer < "2026.06.12";
+  // An appliance older than the #386 upgrade-progress telemetry (first
+  // released in 2026.06.12-2) never reports last_upgrade_progress, so without
+  // this the panel sits on "pending" forever even after the trigger fired.
+  // Say so honestly rather than promising a fire "in ≤30s" that already
+  // happened. The telemetry ships in the slot OS, so its version decides; the
+  // supervisor's is the fallback. An unknown version (a dev build) is not
+  // treated as old. Mirrors the backend's nonce gate (#1183).
+  const progressVerdict = releaseVerdict(
+    [row.installed_appliance_version, row.supervisor_version],
+    UPGRADE_PROGRESS_MIN_VERSION,
+  );
+  const predatesProgress = progressVerdict?.includes === false;
 
   if (failed) {
     return (
@@ -5485,13 +5494,13 @@ function UpgradeStatusPanel({
       {stepIndex === -1 &&
         (predatesProgress ? (
           <p className="mt-1 text-muted-foreground">
-            This appliance&rsquo;s supervisor (<code>{supVer}</code>) predates
+            This appliance (<code>{progressVerdict?.version}</code>) predates
             live upgrade-progress reporting, so this dashboard can&rsquo;t show
             the trigger&rsquo;s status &mdash; the upgrade may already have
             fired. Verify on the host (<code>spatium-upgrade-slot status</code>,{" "}
             <code>journalctl -u spatiumddi-slot-upgrade</code>) or apply the
             slot image by hand, then reboot. Live progress appears here once the
-            appliance is on &ge; 2026.06.12.
+            appliance is on &ge; {UPGRADE_PROGRESS_MIN_VERSION}.
           </p>
         ) : (
           <p className="mt-1 text-muted-foreground">

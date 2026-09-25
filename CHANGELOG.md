@@ -201,6 +201,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Retrying a failed slot upgrade with the same image works again
+  (#1183).** Every supervisor reported the version `2026.05.14.1`, a
+  literal nothing ever updated, and the control plane read it to decide
+  whether an appliance could take the per-apply nonce that makes a
+  repeat apply fire. So no appliance got the nonce, and clicking Apply
+  again after a failed upgrade was silently ignored. The same version
+  made the Fleet upgrade panel tell every operator that their appliance
+  predated live progress reporting.
+  Both checks now read the appliance's installed OS version first,
+  since the code they depend on ships in the slot OS, and fall back to
+  the supervisor's. The supervisor reports the release it was built
+  from, stamped into its image, and the control plane now stores the
+  version from every heartbeat rather than only from registration,
+  which a registered supervisor never repeats. Versions are compared
+  by a shared helper rather than as strings, so the checks keep
+  working under SemVer (#1182). Nightly builds count as including
+  every release tagged before their build date. Dev builds are
+  unknown and keep the safe path. The threshold is now 2026.06.12-2,
+  the first release with the fix it tests for: 2026.06.12-1 was tagged
+  before it merged, and used to count as having it.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the

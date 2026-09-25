@@ -404,9 +404,10 @@ class Appliance(Base):
         String(64), nullable=False, unique=True, index=True
     )
 
-    # Free-form version string reported by the supervisor at register
-    # time, e.g. "2026.05.14-1". Used by the fleet UI's needs-upgrade
-    # banner.
+    # Version string the supervisor reports at registration and in every
+    # heartbeat, e.g. "2026.09.04-1" ("dev" for an unstamped build). Used
+    # by the fleet UI's needs-upgrade banner, and as the fallback when
+    # ``installed_appliance_version`` is unknown (#1183).
     supervisor_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     paired_at: Mapped[datetime] = mapped_column(
