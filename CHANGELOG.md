@@ -22,6 +22,297 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **DHCPv6 leases reach the control plane (#1141).** Kea's DHCPv6
+  leases never did: the agent tailed `kea-leases4.csv` only and snapshotted
+  with `lease4-get-page` only, and the ingest required a MAC, which is a
+  DHCPv4 identity most DHCPv6 leases don't carry. So a v6 lease was never
+  stored, never mirrored into IPAM ("Seen: Never"), and never produced an
+  AAAA or ip6.arpa PTR. The agent now tails `kea-leases6.csv` and walks
+  `lease6-get-page`, and the ingest keys a v6 lease on **DUID + IAID**:
+  `dhcp_lease.mac_address` is nullable, `duid` / `iaid` are stored, and a
+  CHECK requires one identity or the other. A hardware address Kea learned
+  rides along as enrichment. v6 leases mirror into IPAM and drive DDNS
+  through the same path as v4. Only IA_NA is ingested: IA_TA addresses are
+  short-lived, and an IA_PD lease is a delegated prefix, not a host address
+  (deferred). v6 events travel in batches of their own, so a control plane
+  older than this rejects only the v6 batches it could never ingest and
+  still takes the v4 leases. Every surface that read the lease MAC now
+  copes with there being none: the lease list and history (which show the
+  DUID), the expiry sweep, and the WOL and E911 resolvers. The
+  `find_dhcp_leases` copilot tool returns `duid` / `iaid` and filters on a
+  DUID. Also: a DHCPv6 scope with no domain-search (option 24) now falls
+  back to the scope's domain-name, then the subnet's `domain_name`, exactly
+  as the RA's DNSSL does. Migration `f4c8a2d61b37`.
+
+- **Agents no longer lose what they collected during a control-plane
+  outage — stats, logs and Kea lease events are spooled to disk and
+  replayed on reconnect (#1077).** Non-negotiable #5 kept the agents
+  *serving* through an outage; nothing kept them *reporting*. Every
+  shipper dropped a batch the control plane did not accept, and every
+  buffer lived in process memory, so a maintenance window measured in
+  hours lost that window's query logs, DHCP activity and per-minute
+  metrics — and Kea lease events, the only way the control plane
+  learns about agent-managed leases, so those leases never reached
+  `dhcp_lease`, IPAM or DDNS until the client renewed. The DNS and
+  DHCP agents now write each unaccepted batch under
+  `<state dir>/spool/<stream>/`, survive restarts with it, and drain
+  it in order — a live batch never overtakes the backlog — with the
+  original timestamps, so the charts and logs fill the gap in. Bounded
+  by bytes (`AGENT_SPOOL_MAX_BYTES`, default 256 MiB; the oldest
+  batches are trimmed and counted at the cap) and, for log streams, by
+  age (`AGENT_SPOOL_LOG_MAX_AGE_HOURS`, default 24, the control plane's
+  own log retention). The DHCP agent also reconciles leases from a
+  full Kea snapshot (`lease4-get-page`) after each start and recovery,
+  posted to the existing lease-events endpoint — push-plus-pull, the
+  way the Windows path already works.
+  **Replay is idempotent on the server.** Each spooled batch carries a
+  `batch_id`, and every batch-ingest endpoint (DNS metrics and query
+  log; DHCP lease events, activity log, metrics, MAC sightings,
+  fingerprints, rogue-probe offers, RA observations) claims it in the
+  new `agent_ingest_receipt` table in the **same transaction** as the
+  rows it inserts — so the batch in flight when the control plane
+  stopped, committed but with its response lost, is answered
+  `{"duplicate": true}` on replay and inserts nothing. One shared
+  helper, so the check cannot be present in nine handlers and missing
+  from the tenth. A body without `batch_id` (an agent older than this)
+  is ingested exactly as before. A malformed id is a 422. A batch that
+  keeps drawing a plain 500 (a server bug, not an outage) is moved to
+  `spool/<stream>/poison/` after 5 consecutive attempts spanning 10
+  minutes, and only once the control plane has taken the batch queued
+  behind it — so it cannot hold its whole stream hostage, while a 500
+  for *every* body (schema skew mid-upgrade) costs nothing; 502/503/504
+  never count and restart the run. Receipts are
+  kept 35 days and pruned by the nightly log sweep. The query-log and
+  activity-log endpoints also skip lines older than the 24 h retention
+  window (reported as `expired`) rather than inserting rows the next
+  prune deletes; a line with no parseable timestamp is stamped with
+  its arrival time and never expired.
+  **Surfaced, not silent.** The spool rides the heartbeat as `spool`
+  and lands on `dns_server.spool_status` / `dhcp_server.spool_status`
+  (NULL = never reported, which is unknown — not "empty"). The server
+  lists and detail views show an amber *Replaying 3.2 MB backlog* chip
+  while a backlog drains and a red *Spool trimmed* chip for 24 h after
+  the cap forced a drop. New default-**on** alert rule
+  `agent_spool_trimmed`: **critical** when lease events were trimmed,
+  warning for anything else, auto-resolving 24 h after the last trim.
+  MCP: one new read-only tool, `find_agents_with_spool_backlog`
+  (default on — read-only fleet health, no secrets, no off-prem
+  calls); extending `find_agents_with_config_failures` instead was
+  rejected because a config revert and a replay backlog are different
+  questions with different remedies. Not a feature module
+  (non-negotiable #14): it extends the existing agent resources.
+  The nine batch-ingest routes now publish a typed response
+  (`status`, `duplicate`, plus their own counters), which retires
+  them from the untyped-route baseline. Migration `c5e8a1f3d027`.
+
+### Changed
+
+- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
+  2026-09-24 and the backend's requirement had no upper bound, so CI
+  picked it up at once. The test suite passes on it, but its new
+  type annotations fail mypy in 23 files, which blocked every open
+  PR. Adopting 2.1 deliberately, typing work included, is #1187.
+
+- **DNS per-minute metrics now accumulate per bucket, like DHCP
+  (#1077).** `POST /dns/agents/metrics` replaced an existing
+  `(server, bucket_at)` row instead of adding to it — the same jitter
+  collision #980 fixed on the DHCP side: the agent floors `bucket_at`
+  to the minute on a 60 s ± 3 s interval, so about one bucket in forty
+  received two genuinely different deltas and the overwrite discarded
+  one. It accumulates now; that is only safe because a replayed batch
+  is deduplicated by its `batch_id` (above).
+
+- **The Kerberos WinRM transport is no longer offered (#1128).** The
+  Windows DNS and DHCP server forms listed it, but it needs the
+  `gssapi` library and the system Kerberos libraries — neither in
+  the images, and `gssapi` has no Linux wheel — plus realm / KDC
+  configuration the control plane has nowhere to take from, so it
+  failed on every call. It is gone from both forms, the API refuses
+  it at save (422, saying why), and a server saved with it before
+  fails with that explanation instead of a library error; edit it
+  and pick NTLM or CredSSP. NTLM, CredSSP and Basic are unchanged.
+  Real Kerberos support stays on the roadmap as #1128.
+
+### Fixed
+
+- **Relayed DHCPv6 never reached Kea on the appliance (#1139,
+  #1140).** Two faults in series, so fixing either alone changed nothing.
+  **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
+  has no raw-socket mode, so every DHCPv6 packet hit the `input` chain's
+  drop policy. The role now opens **547** in all three firewall renderers
+  and the builtin DHCP fleet policy (seed migration `e6b2f07a3c91`). The
+  base config gains the host's own DHCPv6-client return
+  (`udp sport 547 dport 546`) beside the v4 one. **The socket:** with
+  `interfaces: ["*"]` kea-dhcp6 binds link-local and `ff02::1:2` only, and
+  a relay sends its Relay-Forward to the server's global address. The Kea
+  agent now adds an `iface/address` entry per stable global IPv6 address
+  on the host, for groups with v6 scopes. The addresses are detected, not
+  configured, because (measured on Kea 3.0.3) an entry naming an address
+  the interface doesn't hold makes kea-dhcp6 refuse its whole config. For
+  the same reason the agent re-renders whenever the host's address set
+  changes.
+
+- **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
+  pull path stamped `last_seen_at` on the rows it mirrors; the agent's
+  lease-event path never did. Both do now.
+
+- **A Kea lease in the "released" state was mirrored as active
+  (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
+  released; the DHCP agent's state map knew only `0`–`2` and fell
+  through to `active`, so a released lease kept its IPAM mirror row
+  (and DDNS records) alive until it expired. It is now sent as
+  `released`, which the ingest already treats as not active.
+
+- **Newer agents keep working against an older control plane
+  (#1077).** The heartbeat and lease/MAC-sighting request models are
+  `extra="forbid"`, so a pre-#1077 control plane 422s the new `spool`
+  and `batch_id` fields — and the spool classifies a 422 as a verdict
+  on the body and drops it. Both agents re-send once without the
+  field when the 422 names it, and remember not to send it again, so
+  an agent upgraded ahead of its control plane neither goes stale nor
+  silently discards lease batches. Order of upgrade still recommended:
+  control plane first.
+
+- **Two Windows DHCP servers in one server group no longer end up
+  handing out the same addresses — and failover relationships can be
+  managed from SpatiumDDI (#1110).** SpatiumDDI had
+  no model of a Windows failover relationship. The write-through sent
+  every scope, pool and reservation write to EVERY Windows member of
+  the group, create-or-update: a new scope landed on both servers,
+  and an edit to a scope one server held quietly CREATED it on the
+  other. Two DHCP servers, the same range, no coordination — while
+  both writes returned success, both servers showed the scope, and
+  the UI showed one scope on one group.
+  **Windows failover relationships are now read** —
+  `Get-DhcpServerv4Failover`, on the existing topology poll — along
+  with which scopes each Windows server actually holds, and shown on
+  the group (a *Windows DHCP failover* panel), as a column in the
+  scopes table and as a strip on the IPAM subnet's scope card. REST:
+  `GET /dhcp/server-groups/{id}/failover` and
+  `GET /dhcp/scopes/{id}/failover`. The shared secret is never read.
+  **On a group with two or more Windows members, a write now probes
+  every member live and goes only to the members that hold the
+  scope, update-only** — the "never create it here" check runs in the
+  same PowerShell as the write. A NEW scope goes to ONE member, by
+  the scope's *Windows placement*: into a failover relationship
+  (created on one side and added to it, so Windows copies it to the
+  partner) or on one server only. Without a placement, the one
+  relationship the members share is used; otherwise the create is
+  refused (422) with the choices listed. Activating a scope held by
+  several members that no relationship covers is refused (422).
+  Deleting a scope a failover pair in the group covers takes it out
+  of the relationship on one side (Windows deletes the partner's
+  copy) and deletes it there; a scope whose partner is outside the
+  group is refused (409), because that step deletes a copy on a
+  server SpatiumDDI does not manage. Reservations and exclusions need
+  no probe: the driver skips a member without the scope, and only
+  "no member holds it" is refused.
+  **Relationships are managed from the group's panel** — create,
+  edit, delete, add and remove scopes, and replicate one partner's
+  configuration over the other's — and from REST routes under
+  `/dhcp/server-groups/{id}/failover/relationships` (superadmin,
+  audited, the shared secret never stored, logged or audited). Every
+  `*-DhcpServerv4Failover*` cmdlet runs on one server and acts on its
+  partner from there, so it needs the WinRM logon to make the
+  PowerShell "second hop": only CredSSP can, and any other transport
+  is refused (422) before anything is sent. Where a cmdlet runs is
+  also what it does to the other server — a create or add COPIES the
+  scope from the holder, a removal DELETES the partner's copy and the
+  operator picks which side keeps it, and a load-balance share or
+  hot-standby role is the value of the side it runs on, so an edit
+  names that side (left to pick one itself, the same request could
+  make both partners Active). The first cut shipped every op in one
+  PowerShell script that encoded to ~12,700 characters against
+  WinRM's 7,800-character command-line budget — every call would have
+  been refused before it was sent; a test now pins every op, with
+  maximal inputs, under the budget, and long scope lists go in
+  chunks.
+  **Split scopes are protected.** SpatiumDDI writes one range and one
+  set of exclusions to every server holding a scope, so a new range,
+  or removing an exclusion, could merge two servers' disjoint halves
+  into the outage. Those writes are now simulated per holder and
+  refused (422) when the halves would overlap; everything else goes
+  through.
+  **Kea and Windows servers can no longer share a group** (422 on
+  server create / move): Kea serves every active scope of its group
+  and cannot coordinate with Windows failover. An existing mixed
+  group is flagged on the panel and its shared scopes are reported
+  uncoordinated.
+  **New default-on alert rule, *DHCP scope served uncoordinated***
+  (`dhcp_scope_uncoordinated`, critical): one event per scope two
+  servers serve without coordinating — silent everywhere else, and
+  the only signal there is, since both servers report the scope
+  healthy.
+  **This deliberately deviates from the issue's plan**, which was to
+  write a covered scope to ONE partner and "let Windows replicate".
+  Windows replicates LEASES between failover partners continuously
+  but not CONFIGURATION: option values, exclusions and reservations
+  move only when someone runs `Invoke-DhcpServerv4FailoverReplication`
+  or the console's *Replicate Scope* (Microsoft's own DHCP-team post
+  on this is the reason its auto-sync tool exists). Writing one
+  partner would leave the other serving stale reservations after a
+  failover. Microsoft's IPAM writes both partners, and so does this;
+  replication is offered as an explicit action for drift made in the
+  DHCP console.
+  **The topology poll stopped undoing itself.** Each Windows member's
+  pass merged its own view of the group's scopes — so two partners
+  that disagreed about one reservation (the ordinary state of two
+  servers that do not sync configuration) created it and
+  absence-deleted it again on every poll, along with its IPAM mirror
+  and DNS records. One member now imports each shared scope — the
+  lowest-named member whose last read is under 15 minutes old, so an
+  unreachable partner cannot freeze a scope — and the others are
+  compared against it: a differing configuration hash is reported as
+  drift instead of fought over.
+  **Shared lease teardown waits for the last peer.** A failover or HA
+  pair reports every lease once per partner, but the IPAM mirror and
+  its DDNS records are one row and one A/PTR. `purge_lease`, the
+  expiry sweep and the Kea release/expire event all tore them down
+  when ONE partner stopped reporting the lease — the other's next
+  poll recreated both, so DDNS flapped. They now wait while another
+  server in the same group holds an active, unexpired lease on the
+  address. Scope deletion is exempt, since every copy goes at once.
+  **Found on the way, in the Kea lease-event handler, and fixed
+  because the guard depends on it:** the lookups compared the event's
+  string address with the stored `IPv4Address` (asyncpg decodes INET
+  natively) and never matched. Every renewal event INSERTED another
+  `dhcp_lease` row for the same lease instead of updating the one it
+  had, and a release found no stored IPAM mirror, so the mirror and
+  its DNS records outlived the lease until the expiry sweep. The test
+  client's shared session hid both — the identity map handed the
+  handler the objects the test built, strings and all — so the new
+  tests reload from the database between requests, as production
+  does.
+  **Single-member groups keep the old scope write** (no probe,
+  create-or-update), with three changes to the failure path: a scope
+  delete probes first, so a failover scope gets the explanation
+  rather than Windows' raw error; deleting a scope already gone from
+  the server is now a no-op instead of a 502 that made the scope
+  undeletable in SpatiumDDI; and a reservation for a scope the server
+  does not have is a 409 that says so.
+  1 MCP tool (`find_dhcp_failover_relationships`, read-only, default
+  on); deliberately no `propose_*` write tool — the management routes
+  create and delete scopes on the partner and carry the shared
+  secret — and not a feature module (it extends existing DHCP
+  resources). **Not yet verified against a live
+  Windows failover pair:** the exact JSON `Get-DhcpServerv4Failover`
+  returns, whether it errors or returns nothing on a server with no
+  relationships, and whether `DHCP Users` may run it. The parser
+  reads a failed or unrecognised response as *unknown*, never as
+  *no relationships*, and the write-through refuses rather than
+  guesses on unknown. The management cmdlets follow Microsoft's
+  documented parameters and have not been run against a real pair
+  over CredSSP yet either.
+- **Choosing the CredSSP WinRM transport failed on every call.** The
+  server form has offered it for years, but `requests-credssp` — the
+  library pywinrm imports for it — was never installed, so pywinrm
+  raised before connecting. Now a dependency (MIT; `NOTICE` and
+  `docs/THIRD_PARTY.md`), because #1110's relationship management
+  needs it. Kerberos was in the same position (the images carry no
+  GSSAPI stack) and is no longer offered — see #1128 under Changed.
+
 ### Changed
 
 - **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
@@ -176,6 +467,118 @@ the formatter handles the rest.
   slot-version guards are unchanged, so nothing live can be removed.
 
 ### Fixed
+
+- **DNS agent: `noerror` counted every authoritative NXDOMAIN answer too
+  (#1116).** The poller derived the rcode breakdown from BIND's nsstat
+  answer classes and read `noerror` from `QryAuthAns` + `QryNoauthAns` —
+  every authoritative / non-authoritative response whatever its rcode —
+  so an authoritative NXDOMAIN answer was counted under `noerror` as well
+  as under `nxdomain`, and the dashboard's breakdown summed to more
+  answers than the daemon sent (50 NXDOMAIN answers on the QA fleet:
+  `QryAuthAns` +50, rcode `NOERROR` +0). `noerror`, `nxdomain` and
+  `servfail` now come from the server-level rcode table BIND publishes
+  (`NOERROR` / `NXDOMAIN` / `SERVFAIL`), read from the `<server>` element
+  only, since each view repeats those names as resolver counters; a
+  build without the table falls back to the nsstat classes that carry
+  exactly that rcode (`QrySuccess` + `QryNxrrset`, `QryNXDOMAIN`,
+  `QrySERVFAIL`).
+
+- **DNS agent: `queries_total` counted every query twice on BIND 9.20
+  (#1064).** The poller listed the opcode table's `QUERY` and the
+  nsstat family's `Requestv4`/`Requestv6` under one column so either
+  shape of `named` would light it up, then summed whatever it found —
+  and every current BIND publishes both, so `dns_metric_sample`
+  reported 2.00× the queries the daemon received (the DHCP sampler,
+  whose counters have one spelling, matched kea to the packet in the
+  same window). The spellings are now alternatives in order of
+  preference — the first one present is the value — and the
+  poller's tests carry a 9.20 sample with both. (`noerror` had the
+  same fold; it now reads BIND's rcode table instead — #1116, above.)
+
+- **The storage action route keeps its own answer through the
+  frontend (#1080).** `POST …/appliances/{id}/storage/action` waits
+  up to 90 s for the appliance's supervisor before its own 504, and
+  the supervisor waits 60 s for the host runner before reporting
+  "the host storage runner did not answer within 60s" — but the
+  frontend proxied every `/api/` route with a 60 s read timeout, so
+  nginx answered for the api at 60.000 s every time (its generic
+  "retry shortly" JSON; before #1087 the `405 Not Allowed` page the
+  issue was filed on) and neither message ever reached the operator.
+  Observed live on a single-node QA appliance with the runner's
+  `.path` unit stopped: through the frontend the client got 504 at
+  60.02-60.05 s while the supervisor's report reached the api 60.06 s
+  after the request, ~80 ms after nginx had cut it; the same request
+  made inside the appliance against the api Service answered 200 in
+  60.09 s carrying that report. The route now has its own `location`
+  in both nginx templates with a 120 s budget; `appliance/tests` read
+  the three budgets from source (proxy > route > supervisor) so they
+  cannot drift apart again.
+
+- **A DNS or DHCP agent that is up but not serving now shows as such
+  (#1067).** The agents have always carried a `daemon` object on every
+  heartbeat —
+  `{"status": "degraded", "reason": "start deferred, no bundle yet"}`
+  while a DNS agent waits for its first bundle (#1061), `ok` once the
+  daemon is up — and both heartbeat handlers declared the field and read
+  nothing from it, so a registered, heartbeating server whose `named`
+  never started read `active`, seen seconds ago, config ok, while its pod
+  restarted on the liveness probe every two minutes (measured for twelve
+  minutes on a nested three-node cluster). The state now lands on
+  `dns_server` / `dhcp_server` as `daemon_status`, `daemon_reason` and
+  `daemon_status_since` (the stamp of the heartbeat that began the
+  current state, so the row can say how long), is exposed on both server
+  responses, renders as a chip on the DNS and DHCP server rows and a
+  banner on the server detail, degrades the dashboard's health header,
+  and drives a new `agent_daemon_degraded` alert rule (seeded enabled,
+  critical) once a daemon that is not serving has outlasted a five-minute
+  grace. All of those read one server-side classification,
+  `daemon_not_serving` on both responses: a `degraded` that is the agent
+  echoing a failed config apply (`config_apply_*`, or the DHCP agent's
+  `dhcp4_config_rejected` / `dhcp6_…`) is #882's to report, so it neither
+  pages nor draws a red "not serving" chip beside the config-apply one
+  for a daemon that is up on its last-known-good config. NULL means never
+  reported — a pre-#1061 agent, or an agentless driver — and reads as
+  unknown, never healthy. The DNS agent also now reports `ok` once its
+  daemon is confirmed running instead of an empty object for the life of
+  the process. Migration `b7d21c9e4f06` adds the three nullable columns
+  and a partial index over the unhealthy states to both tables (expand
+  only). `agent_daemon_degraded` and #980's `dhcp_packets_dropped` are
+  also in the rule-type allow-list now: both were seeded and evaluated,
+  but `POST /alerts/rules` refused them with a 422 and the conformity
+  `alert_rule_enabled` check read them as not applicable. A test now
+  fails for the next rule type left out.
+
+- **A DNS agent held `pending_approval` can be approved through the
+  API (#1121).** `DNS_REQUIRE_AGENT_APPROVAL=true` holds a re-registering
+  agent whose fingerprint changed (a wiped agent volume legitimately
+  produces one): its config long-poll answers `pending_approval` and
+  never a bundle, so `named` stays deferred. Nothing cleared the hold —
+  `ServerUpdate` has no approval field and the DNS router had no
+  approve route, while DHCP has had `POST /dhcp/servers/{id}/approve`
+  all along — so the only recovery was a database write or deleting
+  and re-registering the server.
+  `POST /dns/groups/{group_id}/servers/{server_id}/approve`
+  (superadmin) now mirrors the DHCP endpoint: clears the flag, writes a
+  `dns.server.approve` audit event, wakes the agent and returns the
+  server row. Idempotent. The DNS server modal still only shows the flag
+  (the DHCP page has an Approve control); the UI control is follow-up
+  work.
+
+- **The appliance kubelet now evicts on memory before the kernel's OOM
+  killer does (#1124).** k3s's kubelet defaults carry disk eviction
+  thresholds only, so memory exhaustion went straight to the kernel's
+  global OOM killer, which picks by `oom_score_adj`: on a QA node it
+  killed the api's uvicorn while a runaway pod was the cause.
+  `config.yaml` now passes `memory.available<512Mi` (restating k3s's disk
+  floors, since `--eviction-hard` replaces the whole map), a 30 s
+  pressure-transition period instead of 5 min, and
+  `kube-reserved=memory=1Gi` plus `system-reserved=memory=512Mi`, so the
+  kubelet evicts by PriorityClass first. **Upgrade note:** those settings
+  set aside 2 GiB on every node, and pods are scheduled only into the
+  rest. A control plane now needs at least 4 GiB of RAM and a DNS / DHCP
+  appliance at least 3 GiB; a smaller box upgraded to this release comes
+  back with its pods `Pending` on `Insufficient memory`. The recommended
+  sizes (8 GiB control plane, 4 GiB DNS / DHCP) are unaffected.
 
 - **The database's memory limit is sized from the node, with the api
   and the worker (#1115).** The supervisor sizes the api and worker
@@ -2755,6 +3158,22 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
+  `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed
+  for the 35-day prune) — replay dedupe for spooled agent pushes; and
+  nullable JSONB `dns_server.spool_status` / `dhcp_server.spool_status`.
+  No backfill: NULL means the agent has never reported a spool. The
+  receipt table is its own **volatile** backup section
+  (`agent_ingest_receipts`), excluded by default — restoring receipts
+  without the rows they vouch for would make a replay of those batches
+  read as a duplicate and be dropped.
+- `8e317fdd5b12` — #1110: `dhcp_failover_relationship` (Windows
+  failover relationships as each server reports them) and
+  `dhcp_server_scope_state` (which scopes each server holds, keyed by
+  CIDR), plus nullable `dhcp_server.scopes_observed_at` /
+  `.failover_observed_at` / `.failover_error`. No backfill: every row
+  is written by the topology poll, and NULL means never observed —
+  unknown, not "none".
 - `e3b9d7412c5a` — `appliance.desired_removable_mounts` (JSONB, NOT
   NULL, `[]`): the removable (USB) disks a node should keep mounted for
   backups (#989 item 3). No backfill — an install upgrades into the

@@ -321,6 +321,9 @@ async def _batch_lease_macs(
             .where(DHCPLease.ip_address.in_(ip_strs))
             .where(DHCPScope.subnet_id.in_(sub_ids))
             .where(DHCPLease.state == "active")
+            # A DHCPv6 lease identified by DUID alone has no MAC to wake
+            # (#1141); ``str(None)`` would read as the MAC "None".
+            .where(DHCPLease.mac_address.is_not(None))
             .distinct(DHCPLease.ip_address, DHCPScope.subnet_id)
             .order_by(
                 DHCPLease.ip_address,
@@ -337,6 +340,7 @@ async def _batch_lease_macs(
         select(DHCPLease.ip_address, DHCPLease.mac_address)
         .where(DHCPLease.ip_address.in_(ip_strs))
         .where(DHCPLease.state == "active")
+        .where(DHCPLease.mac_address.is_not(None))
         .distinct()
     )
     macs_by_ip: dict[str, set[str]] = defaultdict(set)

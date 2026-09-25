@@ -218,7 +218,30 @@ def test_dhcp_creds_validators_reject_bad_input() -> None:
     with pytest.raises(ValidationError):
         DhcpCreds(winrm_port=99999)
     # Valid values pass.
-    assert DhcpCreds(transport="kerberos", winrm_port=5986).transport == "kerberos"
+    assert DhcpCreds(transport="credssp", winrm_port=5986).transport == "credssp"
+
+
+@pytest.mark.parametrize("module", ["app.api.v1.dhcp.servers", "app.api.v1.dns.router"])
+def test_kerberos_is_refused_with_the_reason(module: str) -> None:
+    """#1128 — the images carry no GSSAPI stack, so Kerberos could never
+    connect. Refused at save, saying why, rather than accepted and failing
+    on every call."""
+    import importlib
+
+    from pydantic import ValidationError
+
+    creds = importlib.import_module(module).WindowsCredentialsInput
+    with pytest.raises(ValidationError, match="#1128"):
+        creds(transport="kerberos")
+    for t in ("ntlm", "credssp", "basic"):
+        assert creds(transport=t).transport == t
+
+
+def test_a_server_saved_with_kerberos_fails_with_the_reason_not_a_library_error() -> None:
+    from app.drivers._winrm import run_ps
+
+    with pytest.raises(RuntimeError, match="not supported.*pick another transport"):
+        run_ps("host", {"username": "u", "password": "p", "transport": "kerberos"}, "1")
 
 
 def test_dns_creds_validators_reject_bad_input() -> None:

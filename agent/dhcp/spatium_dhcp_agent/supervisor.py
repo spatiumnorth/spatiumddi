@@ -28,16 +28,62 @@ from .mac_sighting import MacSightingShipper
 from .metrics import MetricsPoller
 from .peer_resolve import PeerResolveWatcher
 from .ra_sniffer import RASnifferShipper
+from .spool import SpoolManager
 from .sync import SyncLoop, clear_ready_marker
 
 log = structlog.get_logger(__name__)
+
+#: #1077 — the control plane keeps DHCP activity logs 24 h (``prune_logs.py``);
+#: a spooled batch older than that would be pruned on arrival.
+DEFAULT_LOG_MAX_AGE_HOURS = 24.0
+
+#: Stream → share of ``AGENT_SPOOL_MAX_BYTES``. Relative weights; the manager
+#: normalises them. Activity logs dominate by volume. Lease events are the
+#: correctness stream (the control plane has no other way to learn a Kea
+#: lease), so they get a generous share and no age limit. Metrics are one
+#: small row a minute — weeks fit in their share. The rogue-DHCP probe and the
+#: HA-state poller are absent on purpose: both push a reading of the present
+#: that the next cycle regenerates, so replaying one late would be wrong.
+SPOOL_SHARES: dict[str, float] = {
+    "dhcp_log": 0.55,
+    "lease_events": 0.25,
+    "metrics": 0.05,
+    "mac_sightings": 0.05,
+    "fingerprints": 0.04,
+    "ra_observations": 0.06,
+}
+
+
+def _log_max_age_seconds() -> float | None:
+    """``AGENT_SPOOL_LOG_MAX_AGE_HOURS`` as seconds; ``0`` disables expiry."""
+    raw = os.environ.get("AGENT_SPOOL_LOG_MAX_AGE_HOURS", "")
+    try:
+        hours = float(raw) if raw.strip() else DEFAULT_LOG_MAX_AGE_HOURS
+    except ValueError:
+        log.warning("agent_spool_log_max_age_invalid", value=raw)
+        hours = DEFAULT_LOG_MAX_AGE_HOURS
+    return hours * 3600 if hours > 0 else None
+
+
+def build_spool_manager(cfg: AgentConfig) -> SpoolManager:
+    """The DHCP agent's durable push spool (#1077), one stream per shipper.
+
+    Every stream is declared whether or not its shipper is enabled, so turning
+    a sniffer on later never re-divides the byte budget under a backlog.
+    """
+    manager = SpoolManager(cfg.state_dir)
+    for stream, share in SPOOL_SHARES.items():
+        age = _log_max_age_seconds() if stream == "dhcp_log" else None
+        manager.declare(stream, share, max_age_seconds=age)
+    return manager
 
 
 def run(cfg: AgentConfig) -> int:
     _agent_id, token = ensure_token(cfg)
     token_ref = [token]
 
-    heartbeat = HeartbeatClient(cfg, token_ref)
+    spools = build_spool_manager(cfg)
+    heartbeat = HeartbeatClient(cfg, token_ref, spool_manager=spools)
     ha_poller = HAStatusPoller(cfg, token_ref)
     # Construct the watcher first (SyncLoop needs the reference in its
     # ``__init__``), then arm it once the SyncLoop exists. Issue #265 —
@@ -54,9 +100,9 @@ def run(cfg: AgentConfig) -> int:
             bundle, reload_kea=reload_kea
         )
     )
-    leases = LeaseWatcher(cfg, token_ref, heartbeat)
-    metrics = MetricsPoller(cfg, token_ref)
-    log_shipper = LogShipper(cfg, token_ref)
+    leases = LeaseWatcher(cfg, token_ref, heartbeat, spool=spools.get("lease_events"))
+    metrics = MetricsPoller(cfg, token_ref, spool=spools.get("metrics"))
+    log_shipper = LogShipper(cfg, token_ref, spool=spools.get("dhcp_log"))
 
     # Passive DHCP fingerprinting is opt-in (Phase 2 device profiling).
     # Default off because:
@@ -70,7 +116,9 @@ def run(cfg: AgentConfig) -> int:
     fingerprint_enabled = os.environ.get("DHCP_FINGERPRINT_ENABLED", "0") == "1"
     fingerprint_shipper: DhcpFingerprintShipper | None = None
     if fingerprint_enabled:
-        fingerprint_shipper = DhcpFingerprintShipper(cfg, token_ref)
+        fingerprint_shipper = DhcpFingerprintShipper(
+            cfg, token_ref, spool=spools.get("fingerprints")
+        )
         log.info("dhcp_fingerprint_enabled")
 
     # Active rogue-DHCP probe (issue #370) — opt-in for the same CAP_NET_RAW +
@@ -89,7 +137,9 @@ def run(cfg: AgentConfig) -> int:
     mac_sighting_enabled = os.environ.get("DHCP_MAC_SIGHTING_ENABLED", "0") == "1"
     mac_sighting_shipper: MacSightingShipper | None = None
     if mac_sighting_enabled:
-        mac_sighting_shipper = MacSightingShipper(cfg, token_ref)
+        mac_sighting_shipper = MacSightingShipper(
+            cfg, token_ref, spool=spools.get("mac_sightings")
+        )
         log.info("dhcp_mac_sighting_enabled")
 
     # Passive IPv6 Router-Advertisement sniffer (issue #524) — opt-in for the
@@ -99,7 +149,9 @@ def run(cfg: AgentConfig) -> int:
     ra_sniffer_enabled = os.environ.get("DHCP_RA_SNIFFER_ENABLED", "0") == "1"
     ra_sniffer_shipper: RASnifferShipper | None = None
     if ra_sniffer_enabled:
-        ra_sniffer_shipper = RASnifferShipper(cfg, token_ref)
+        ra_sniffer_shipper = RASnifferShipper(
+            cfg, token_ref, spool=spools.get("ra_observations")
+        )
         log.info("dhcp_ra_sniffer_enabled")
 
     threads = [

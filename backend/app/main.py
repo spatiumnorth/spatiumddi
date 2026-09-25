@@ -504,6 +504,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_config_rejected_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_config_rejected_alert_rule_seed_skipped", reason=str(exc))
+    # Agent push-spool-trimmed alert rule — singleton, ENABLED by default
+    # (issue #1077). Silent unless an agent's outage spool hit its byte cap
+    # and discarded data. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_spool_trimmed_alert_rule,
+        )
+
+        await seed_agent_spool_trimmed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_spool_trimmed_alert_rule_seed_skipped", reason=str(exc))
+    # Uncoordinated DHCP scope alert rule — singleton, ENABLED by default
+    # (issue #1110). Silent unless two servers already serve one scope
+    # without coordinating. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dhcp_scope_uncoordinated_alert_rule,
+        )
+
+        await seed_dhcp_scope_uncoordinated_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Agent daemon-not-serving alert rule — singleton, ENABLED by default
+    # (issue #1067). Fires when an agent has reported a daemon that is not
+    # ``ok`` for longer than a bundle normally takes to arrive. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_daemon_degraded_alert_rule,
+        )
+
+        await seed_agent_daemon_degraded_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_daemon_degraded_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.

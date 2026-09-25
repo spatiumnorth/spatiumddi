@@ -153,6 +153,59 @@ scopes; v4 scopes ignore these columns and always serve addresses +
 options. Changing the mode shifts the agent ConfigBundle ETag, so the
 Kea agent re-pulls and re-renders.
 
+#### DHCPv6 behind a relay, the firewall, and v6 leases (issues #1139–#1141)
+
+**Unicast sockets (#1140).** `interfaces: ["*"]` makes kea-dhcp6 bind each
+interface's link-local address and the `ff02::1:2` group, and nothing
+else. A relay does not send there. It sends its Relay-Forward to the server
+address it was configured with, which is a global unicast address, so a
+relayed Solicit reached the NIC and found no socket. When a group has IPv6
+scopes, the Kea agent now adds an `"<iface>/<address>"` entry for each
+stable global IPv6 address it finds on the host (`/proc/net/if_inet6`;
+temporary, deprecated, tentative and dad-failed addresses are skipped). The
+render is `["*", "ens18/2001:db8:87::40"]`: the wildcard sockets stay and
+the unicast one is added.
+
+The addresses are detected, never configured. Measured on kea-dhcp6
+3.0.3: an entry naming an address the interface does not hold makes Kea
+refuse the whole config, which takes DHCPv6 down. So the agent reads them
+immediately before each render, and re-renders when the set changes. The
+bundle ETag cannot see host addresses, so nothing else would. To check a
+node:
+
+```bash
+ss -ulpn6 | grep 547    # expect the global address, not only fe80::…%iface and ff02::1:2
+```
+
+**Firewall (#1139).** The appliance's `dhcp` role opens UDP **547** as well
+as 67/68. Kea's v6 server has no raw-socket mode, so every DHCPv6 packet
+goes through the `input` chain, and without the rule it hit the drop
+policy. The port is always open, not gated on a v6 scope existing:
+nothing in the role assignment carries scope families, and an idle
+kea-dhcp6 answers nothing. The host's own DHCPv6-client return
+(`udp sport 547 dport 546`) is in the base config's floor, next to the v4
+one.
+
+**Leases (#1141).** The agent tails `kea-leases6.csv` beside the v4 file
+and walks `lease6-get-page` on start and after an outage. A v6 lease is
+identified by **DUID + IAID**, so `dhcp_lease.mac_address` is nullable,
+`duid` / `iaid` are stored, and a CHECK requires one identity or the other.
+Kea records a hardware address on a v6 lease only when it can derive one.
+When it does, it rides along as enrichment. v6 leases mirror into IPAM,
+drive DDNS (AAAA + ip6.arpa PTR, through the same path as v4) and satisfy
+`dns_track_dynamic_leases`. Only **IA_NA** is ingested. IA_TA addresses are
+short-lived privacy addresses. An IA_PD lease delegates a *prefix*, which
+is not a host address the mirror can hold, so it is deferred. The agent
+sends v6 events in batches of their own: a control plane older than
+#1141 requires a MAC and 422s a batch containing a MAC-less event. Kept
+apart, the v4 leases beside them still land.
+
+**Domain search (#1141).** A stateful or stateless v6 scope that sets no
+`domain-search` (option 24) now gets one by the same fallback the RA's
+DNSSL uses (`radvd.resolve_dnssl`): the scope's `domain-name`, then the
+subnet's `domain_name`. The two can no longer disagree. A scope's own
+`domain-search` always wins.
+
 ### DHCPPool Model (Dynamic Ranges)
 
 Each scope can have **multiple pools**, each with its own range and optional class restrictions.
@@ -777,6 +830,7 @@ Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server,
 ```
 DHCPLease (not persisted long-term — cached in Redis, written to DB for history)
   ip_address, mac_address, hostname
+  duid, iaid            -- DHCPv6 identity (#1141); mac_address is NULL on most v6 leases
   scope_id, server_id   -- per-server (each Kea owns its own memfile)
   starts_at, ends_at, expires_at
   state: enum(active, expired, released, abandoned)
@@ -835,7 +889,9 @@ Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar
 2. Agent logs: `"Control plane unreachable — operating from cached config"`
 3. Agent continues serving from cached config — **DHCP service is NOT interrupted**
 4. Agent retries connectivity every 60 seconds
-5. On reconnect: agent reports "gap period" lease events in bulk
+5. On reconnect: agent replays every push it spooled during the gap — lease
+   events, activity log, metrics — in order, then reconciles leases from a
+   full Kea snapshot (see *Push spool* below, #1077)
 
 ### Cache Format
 
@@ -891,6 +947,68 @@ the Kubernetes readiness marker. The agent now reports the verdict on its
 heartbeat (`config` field → `dhcp_server.config_apply_*`), which drives the
 server-row chip, the `agent_config_rejected` alert rule and the
 `find_agents_with_config_failures` Copilot tool.
+
+The heartbeat's `daemon` field — `{"status": "ok"}` after a good reload,
+`{"status": "degraded", "reason": ...}` when a control socket is
+unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
+/ `daemon_reason` / `daemon_status_since` since #1067 (it was declared and
+read by nothing before), is exposed on the server row, drives a chip and a
+detail banner, and feeds the `agent_daemon_degraded` alert rule once a
+daemon that is not serving has stayed that way past a five-minute grace. A
+rejected config is not that: `config-test` refuses without disturbing the
+running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
+Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
+reported by `agent_config_rejected`. The server response's
+`daemon_not_serving` is `false` for it, and that one field is what the
+chip, the banner and the alert read.
+
+### Push spool + lease snapshot (issue #1077)
+
+Kea lease events are the **only** way the control plane learns about
+agent-managed leases — `KeaDriver.get_leases()` is a stub and the scheduled
+lease pull deliberately skips agent-based drivers. So before #1077 an outage
+long enough to overflow the agent's 5,000-event memory buffer, or any agent
+restart during one, left leases with no `dhcp_lease` row, no IPAM mirror and
+no DDNS record until the client happened to renew.
+
+Two mechanisms close that, push-plus-pull like the Windows path:
+
+* **Durable spool.** Every push the control plane does not accept is written
+  under `<state dir>/spool/<stream>/` (`/var/lib/spatium-dhcp-agent/spool/`)
+  and replayed in order on reconnect, surviving agent restarts. Streams:
+  `lease_events`, `dhcp_log`, `metrics`, `mac_sightings`, `fingerprints`,
+  `ra_observations`. The rogue-DHCP probe and HA status are deliberately
+  **not** spooled — they are current-state readings with no observation
+  time, and replaying a stale one would be wrong rather than late. Same
+  settings as the DNS agent: `AGENT_SPOOL_ENABLED` (default `true`),
+  `AGENT_SPOOL_MAX_BYTES` (default 256 MiB, split across streams; oldest
+  batches trimmed at the cap — keep it well under the agent state volume,
+  1 Gi `storage.agentState` in the Helm chart), `AGENT_SPOOL_LOG_MAX_AGE_HOURS`
+  (default 24; applies to the activity log only). See
+  [`DNS_AGENT.md` §3](../deployment/DNS_AGENT.md) for ordering and replay
+  semantics.
+* **Lease snapshot backstop.** After each agent start and each recovery from
+  an outage (at most once per 5 minutes) the agent pages Kea's full lease
+  table over the control socket (`lease4-get-page`, 100 leases per POST) and
+  posts it to the existing `POST /dhcp/agents/lease-events` endpoint. That
+  ingest is an upsert, so the snapshot reconciles whatever the spool missed —
+  including leases trimmed at the cap. DHCPv4 only.
+
+Every spooled batch carries a `batch_id`; the control plane records it in
+`agent_ingest_receipt` in the same transaction as the rows, so a batch whose
+response was lost is acknowledged `{"duplicate": true}` on replay and inserts
+nothing. That is load-bearing for metrics, which **accumulate** per bucket
+since #980 — an undeduplicated replay would double a minute of packet counts
+and packet loss. The activity-log endpoint also skips lines older than its
+24 h retention (`expired` in the response). The agent reports lease state
+`released` (Kea 3.0 CSV state 3) as such; the ingest treats it like any other
+non-active state and tears down the auto IPAM mirror + DDNS.
+
+The spool's state rides the heartbeat as `spool` → `dhcp_server.spool_status`
+(NULL = never reported), shown as an amber *Replaying … backlog* or red
+*Spool trimmed* chip on the server row. The default-on `agent_spool_trimmed`
+alert fires for 24 h after a trim, **critical** when `lease_events` were among
+the batches dropped; `find_agents_with_spool_backlog` is the Copilot tool.
 
 ---
 
@@ -1064,7 +1182,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
 - Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
 - A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. Three-or-more Kea members is nonsensical for `libdhcp_ha.so` (it only speaks pairs) and should be validated at the CRUD layer.
-- Mixed groups (Kea + Windows DHCP read-only) are allowed — only the Kea members participate in HA.
+- Mixed groups (Kea + Windows DHCP) are **refused** (#1110): creating or moving a server into a group that already has the other kind is a `422`. Kea serves every active scope of its group and cannot coordinate with Windows failover, so a scope both serve would be two uncoordinated DHCP servers. A mixed group that predates the refusal is flagged on the group's Windows failover panel, and each shared scope is reported uncoordinated. Two or more *Windows* members are handled by §15.8.
 
 ### Modes
 
@@ -1124,7 +1242,7 @@ HA is configured on the server group, not a separate page. Edit the group under 
 
 ## 15. Windows DHCP — Path A (read-only)
 
-SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's implementation (Path A) is WinRM-driven and focused on **lease mirroring** — SpatiumDDI polls the Windows server for its active leases and reflects them into IPAM, but does not push config bundles. Path B (full scope/reservation CRUD via WinRM) is on the roadmap.
+SpatiumDDI supports Windows Server DHCP as an **agentless** backend, driven over WinRM. It polls each Windows server for its leases and scopes and reflects them into IPAM, and writes scope / pool / reservation edits through to the server per object (it does not push config bundles — Windows has no whole-config entry point). A group with more than one Windows member is covered in §15.8.
 
 ### 15.1 What's implemented
 
@@ -1135,6 +1253,8 @@ SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's imp
 | Per-object scope CRUD | ✅ | `Add-DhcpServerv4Scope` / `Remove-DhcpServerv4Scope`. |
 | Per-object reservation CRUD | ✅ | `Add-DhcpServerv4Reservation` / `Remove-DhcpServerv4Reservation`. |
 | Per-object exclusion CRUD | ✅ | `Add-DhcpServerv4ExclusionRange` / `Remove-DhcpServerv4ExclusionRange`. |
+| Read failover relationships | ✅ | `Get-DhcpServerv4Failover`, on the lease-sync poll (#1110). |
+| Manage failover relationships | ✅ | `Add-` / `Set-` / `Remove-DhcpServerv4Failover`, `Add-` / `Remove-DhcpServerv4FailoverScope`, `Invoke-DhcpServerv4FailoverReplication` (#1110). Needs the CredSSP WinRM transport. |
 | Bundle push (`/sync`) | ❌ | `READ_ONLY_DRIVERS` — rejected by the API. Windows DHCP is cmdlet-driven, not config-file-driven. |
 | `reload` / `restart` / `validate_config` | ❌ | Not applicable to Windows; raise `NotImplementedError`. |
 
@@ -1158,6 +1278,7 @@ Stored on `DHCPServer.credentials_encrypted` as a Fernet-encrypted JSON dict:
 Service account requirements:
 - **Read-only lease mirroring**: member of the Windows `DHCP Users` local group.
 - **Per-object scope/reservation/exclusion CRUD**: member of `DHCP Administrators`.
+- **Managing failover relationships**: `DHCP Administrators` on **both** partners, and `"transport": "credssp"` — each cmdlet runs on one server and acts on its partner from there (see §15.8).
 
 See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
 
@@ -1200,15 +1321,29 @@ Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
 
 - Scope options pushed from SpatiumDDI instead of being managed in the Windows DHCP MMC.
 - Client class / policy rendering.
-- DHCP failover pair configuration from SpatiumDDI.
 
-The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers.
+The per-object writes (`apply_scope`, `apply_reservation`, `apply_exclusion`) are wired: the scope / pool / static endpoints write through before committing (`services.dhcp.windows_writethrough`). What remains is the list above.
 
 ### 15.7 Migrating off Windows DHCP entirely (issue #756)
 
 Everything above treats Windows as a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, ships **disabled**, `/api/v1/migration/cutover`, superadmin) drives the switch per scope: parity against the live server (lease time, pools, reservations, options), the lease handover, the switch itself, and a decommission checklist.
 
 Two things matter here. The **lease handover** exists because the DHCP importer (§8) deliberately skips live leases — so a naive switch hands clients to a Kea with an empty lease database, and the first renewal offers a fresh pool address to a client still using the one Windows gave it. The handover promotes each live Windows lease to a reservation (stamped `import_source="windows_cutover"`) so a renewing client keeps the address it already holds. And the **switch is ordered**: the Windows scope is deactivated *before* the managed scope is activated, so the two never answer the same subnet at once; if the managed side then fails to come up, the Windows scope is re-activated. Rollback reverses it, with the recovery-time expectation stated as the scope's lease time. See [MIGRATION.md](MIGRATION.md#windows--spatiumddi-cutover-756).
+
+### 15.8 Two or more Windows servers in one group (issue #1110)
+
+Two Windows DHCP servers only share a scope safely inside a **failover relationship** that covers it; without one they hand out the same addresses. So on a group with two or more Windows members:
+
+- Writes go only to the members that already **hold** the scope, and never create it anywhere else. A covered scope is written to **both** partners — Windows failover syncs leases between partners, not configuration.
+- A **new** scope goes to one member, by its **Windows placement**: into a failover relationship (created on one side and added to it, so Windows copies it to the partner) or on one server only. Without a placement, the one relationship the members share is used; otherwise the create is **refused (422)** with the choices. Activating a scope several members hold with no relationship covering it is **refused (422)**.
+- **Deleting** a scope a failover pair in the group covers takes it out of the relationship and then deletes it; a scope whose partner is outside the group is **refused (409)**.
+- A **split scope** (no relationship, the servers' parts kept apart) is left alone unless a change would make the parts overlap — then it is **refused (422)**.
+- **Relationships are managed from the group's panel** — create, edit, delete, add or remove scopes, replicate one partner's configuration over the other's — over the CredSSP WinRM transport, which is the only one that can reach the partner from the server a cmdlet runs on.
+- The lease-sync poll records each server's relationships and the scopes it holds; one member imports each shared scope and the others are compared against it for drift.
+- A lease's shared IPAM mirror and DDNS records are not torn down while another server in the group still holds the lease.
+- The default-on **DHCP scope served uncoordinated** alert rule (`dhcp_scope_uncoordinated`, critical) fires per scope two servers serve without coordinating.
+
+The group page shows it all under **Windows DHCP failover**; the scopes table and the IPAM subnet's scope card carry a **Windows** badge. REST: `GET /dhcp/server-groups/{id}/failover`, `GET /dhcp/scopes/{id}/failover`, and the management routes under `/dhcp/server-groups/{id}/failover/relationships` (superadmin, audited — never the shared secret); MCP: `find_dhcp_failover_relationships` (read-only — deliberately no `propose_*` for relationship changes). Setup and every refusal: [WINDOWS.md](../deployment/WINDOWS.md#more-than-one-windows-dhcp-server-in-a-group). Internals: [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#failover-relationships-and-multi-member-groups-1110).
 
 ## 16. Rules & constraints
 

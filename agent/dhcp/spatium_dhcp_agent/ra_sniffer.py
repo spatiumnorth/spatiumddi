@@ -29,6 +29,8 @@ import httpx
 import structlog
 
 from .config import AgentConfig
+from .push import CPPoster, disabled_spool, late_bound
+from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
 
@@ -128,6 +130,7 @@ class RASnifferShipper:
         cfg: AgentConfig,
         token_ref: list[str],
         iface: str | None = None,
+        spool: Spool | None = None,
     ) -> None:
         self.cfg = cfg
         self.token_ref = token_ref
@@ -142,6 +145,19 @@ class RASnifferShipper:
         self._sniffer: Any = None
         self._lock = threading.Lock()
         self._last_flush = time.monotonic()
+        # #1077 — a batch the control plane does not take is spooled to disk
+        # and replayed in order, instead of dropped.
+        self._shipper = Shipper(
+            spool if spool is not None else disabled_spool("ra_observations"),
+            CPPoster(
+                cfg,
+                token_ref,
+                "/api/v1/dhcp/agents/ra-observations",
+                late_bound(self, "_cp_client"),
+            ),
+            event_prefix="ra_sniffer_ship",
+            retry_backoff_seconds=BATCH_INTERVAL,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -226,29 +242,10 @@ class RASnifferShipper:
         if not batch:
             return
         payload = {"observations": [obs.to_payload() for obs in batch]}
-        try:
-            with self._cp_client() as c:
-                resp = c.post(
-                    "/api/v1/dhcp/agents/ra-observations",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
-                )
-        except httpx.HTTPError as exc:
-            log.warning(
-                "ra_sniffer_ship_http_error", error=str(exc), batch_size=len(batch)
-            )
-            self._last_flush = time.monotonic()
-            return
-        if resp.status_code in (401, 404):
-            log.warning(
-                "ra_sniffer_unauthorized",
-                status=resp.status_code,
-                hint="heartbeat thread will trigger rebootstrap",
-            )
-        elif resp.status_code not in (200, 204):
-            log.warning(
-                "ra_sniffer_ship_failed", status=resp.status_code, batch_size=len(batch)
-            )
+        # Sent now, or spooled behind the backlog for replay. A 401 / 404 is
+        # retried rather than dropped: the heartbeat thread is the canonical
+        # re-bootstrap trigger, and the batch is good once the token is.
+        self._shipper.ship(payload)
         self._last_flush = time.monotonic()
 
     def run(self) -> None:
@@ -262,6 +259,10 @@ class RASnifferShipper:
         while not self._stop.is_set():
             if self._should_flush():
                 self._flush()
+            elif len(self._shipper.spool):
+                # Idle tick with a backlog; the shipper's retry backoff
+                # throttles this while the control plane is still away.
+                self._shipper.drain()
             self._stop.wait(timeout=1.0)
         if self._sniffer is not None:
             try:

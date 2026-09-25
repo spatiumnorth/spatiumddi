@@ -57,6 +57,8 @@ import { CreateServerModal } from "./CreateServerModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
+import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
@@ -66,6 +68,15 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
+import {
+  ServingVerdictTag,
+  WindowsFailoverPanel,
+} from "./WindowsFailoverPanel";
+import {
+  GROUP_FAILOVER_QUERY_KEY,
+  servingByScopeId,
+  useGroupFailover,
+} from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -310,6 +321,33 @@ function GroupSidebar({
  * groups are single-vendor today (Kea OR Windows, not mixed), so the
  * `kea_member_count >= 1` test is sufficient.
  */
+/** A lease's client identity (#1141): the MAC for DHCPv4 (and for the
+ * DHCPv6 leases Kea could derive one for), otherwise the DHCPv6 DUID. DUIDs
+ * run to 40+ characters, so the cell truncates and the tooltip carries the
+ * whole value and the IAID. */
+function LeaseClientId({
+  mac,
+  duid,
+  iaid,
+}: {
+  mac: string | null;
+  duid?: string | null;
+  iaid?: number | null;
+}) {
+  if (mac) return <>{mac}</>;
+  if (!duid) return <span className="text-muted-foreground">—</span>;
+  const title = `DHCPv6 DUID ${duid}${iaid != null ? ` · IAID ${iaid}` : ""}`;
+  return (
+    <span
+      title={title}
+      className="inline-block max-w-[16rem] truncate align-bottom"
+    >
+      <span className="text-muted-foreground">DUID </span>
+      {duid}
+    </span>
+  );
+}
+
 function groupIsKeaManaged(group: DHCPServerGroup): boolean {
   return group.kea_member_count > 0;
 }
@@ -392,6 +430,7 @@ function GroupDetailView({
   const handleRefresh = () => {
     qc.invalidateQueries({ queryKey: ["dhcp-servers", group.id] });
     qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
+    qc.invalidateQueries({ queryKey: [GROUP_FAILOVER_QUERY_KEY, group.id] });
   };
 
   return (
@@ -533,13 +572,17 @@ function GroupDetailView({
 
       <div className="flex-1 overflow-auto p-6">
         {(!isKea || tab === "servers") && (
-          <GroupServersList
-            servers={servers}
-            onAddServer={onAddServer}
-            onSelectServer={onSelectServer}
-            onEditServer={onEditServer}
-            onDeleteServer={onDeleteServer}
-          />
+          <>
+            <GroupServersList
+              servers={servers}
+              onAddServer={onAddServer}
+              onSelectServer={onSelectServer}
+              onEditServer={onEditServer}
+              onDeleteServer={onDeleteServer}
+            />
+            {/* #1110 — renders nothing for a group without Windows members. */}
+            <WindowsFailoverPanel groupId={group.id} />
+          </>
         )}
         {isKea && tab === "scopes" && <ServerScopesTab groupId={group.id} />}
         {isKea && tab === "pools" && (
@@ -1030,6 +1073,8 @@ function GroupServersList({
                         </span>
                       )}
                       <ConfigApplyChip server={s} />
+                      <SpoolChip server={s} />
+                      <DaemonStateChip server={s} />
                     </div>
                     <p className="text-xs text-muted-foreground truncate">
                       <span className="font-mono">
@@ -1226,6 +1271,11 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
     enabled: !!groupId,
   });
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
+  // #1110 — how the group's Windows members serve each scope. The column
+  // only appears on a group that has Windows members.
+  const { data: failover } = useGroupFailover(groupId || undefined);
+  const servingById = servingByScopeId(failover);
+  const showServing = (failover?.windows_member_count ?? 0) > 0;
   const allScopes: (DHCPScope & { subnet_network?: string })[] =
     groupScopes.map((sc) => ({
       ...sc,
@@ -1304,6 +1354,14 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">Enabled</th>
                   <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
                   <th className="px-3 py-2 text-left font-medium">DDNS</th>
+                  {showServing && (
+                    <th
+                      className="px-3 py-2 text-left font-medium"
+                      title="Which Windows DHCP servers in this group hold the scope, and whether a failover relationship coordinates them"
+                    >
+                      Windows
+                    </th>
+                  )}
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -1325,6 +1383,19 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2">
                           {sc.ddns_enabled ? "on" : "off"}
                         </td>
+                        {showServing && (
+                          <td className="px-3 py-2">
+                            {servingById.get(sc.id) ? (
+                              <ServingVerdictTag
+                                serving={servingById.get(sc.id)!}
+                              />
+                            ) : (
+                              <span className="text-xs text-muted-foreground/60">
+                                —
+                              </span>
+                            )}
+                          </td>
+                        )}
                         <td className="px-3 py-2 text-right">
                           <div className="inline-flex items-center justify-end gap-1">
                             <AskAIButton
@@ -2274,7 +2345,11 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       {l.ip_address}
                     </td>
                     <td className="px-3 py-1.5 font-mono text-xs">
-                      {l.mac_address}
+                      <LeaseClientId
+                        mac={l.mac_address}
+                        duid={l.duid}
+                        iaid={l.iaid}
+                      />
                       {l.is_voip_phone && (
                         <span
                           title={
@@ -2353,11 +2428,20 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                   >
                     Copy IP
                   </ContextMenuItem>
-                  <ContextMenuItem
-                    onSelect={() => copyToClipboard(l.mac_address)}
-                  >
-                    Copy MAC
-                  </ContextMenuItem>
+                  {l.mac_address && (
+                    <ContextMenuItem
+                      onSelect={() => copyToClipboard(l.mac_address ?? "")}
+                    >
+                      Copy MAC
+                    </ContextMenuItem>
+                  )}
+                  {l.duid && (
+                    <ContextMenuItem
+                      onSelect={() => copyToClipboard(l.duid ?? "")}
+                    >
+                      Copy DUID
+                    </ContextMenuItem>
+                  )}
                   {l.hostname && (
                     <ContextMenuItem
                       onSelect={() => copyToClipboard(l.hostname!)}
@@ -2399,7 +2483,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
         <DeleteConfirmModal
           title="Delete Lease"
           description={
-            `Delete the lease for ${del.ip_address} (${del.mac_address})? ` +
+            `Delete the lease for ${del.ip_address} (${del.mac_address ?? `DUID ${del.duid ?? "?"}`})? ` +
             "This removes the lease and its IPAM mirror. A still-active lease " +
             "may be re-learned on the next poll — this is for stray or expired " +
             "leases; deleting the scope clears its leases automatically."
@@ -2555,7 +2639,11 @@ function LeaseHistoryTab({ server }: { server: DHCPServer }) {
                   {row.ip_address}
                 </td>
                 <td className="px-3 py-1.5 font-mono text-xs">
-                  {row.mac_address}
+                  <LeaseClientId
+                    mac={row.mac_address}
+                    duid={row.duid}
+                    iaid={row.iaid}
+                  />
                 </td>
                 <td className="px-3 py-1.5">{row.hostname || "—"}</td>
                 <td className="px-3 py-1.5">
@@ -2674,6 +2762,8 @@ function ServerDetailView({
       // Also invalidate subnet-level scope queries so the DHCP topology
       // views refresh once scopes / pools / statics get imported.
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
+      // #1110 — the sync re-reads failover relationships + scope presence.
+      qc.invalidateQueries({ queryKey: [GROUP_FAILOVER_QUERY_KEY] });
       const parts: string[] = [];
       // Agent-based no-op note (Kea) takes the whole banner — there are no
       // lease counters to report on that path.
@@ -2706,6 +2796,11 @@ function ServerDetailView({
           scopeBits.push(`${result.statics_synced} reservations changed`);
         if (result.statics_removed)
           scopeBits.push(`${result.statics_removed} reservations removed`);
+        // #1110 — shared with another Windows member that imports them.
+        if (result.scopes_deferred)
+          scopeBits.push(
+            `${result.scopes_deferred} imported from a partner server`,
+          );
         parts.push(scopeBits.join(" / "));
       }
       parts.push(`${result.server_leases} leases on wire`);
@@ -2721,6 +2816,10 @@ function ServerDetailView({
         );
       if (result.errors.length)
         parts.push(`${result.errors.length} error(s): ${result.errors[0]}`);
+      if (result.warnings?.length)
+        parts.push(
+          `${result.warnings.length} warning(s): ${result.warnings[0]}`,
+        );
       setSyncBanner(parts.join(" · "));
     },
     onError: (e) =>

@@ -32,6 +32,7 @@ from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.device_policy import compile_device_policy
+from app.services.dhcp.normalize import canonical_duid
 from app.services.dhcp.stats import STATS_WINDOW_SECONDS, active_lease_count
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
@@ -156,6 +157,14 @@ class FindDHCPLeasesArgs(BaseModel):
         default=None,
         description="Filter by exact IP address.",
     )
+    duid: str | None = Field(
+        default=None,
+        description=(
+            "Filter by exact DHCPv6 client DUID (hex, with or without ':' "
+            "separators). DHCPv6 leases are identified by DUID and usually "
+            "carry no MAC."
+        ),
+    )
     hostname_search: str | None = Field(
         default=None,
         description="Substring match on the lease's reported client hostname.",
@@ -179,10 +188,11 @@ class FindDHCPLeasesArgs(BaseModel):
 @register_tool(
     name="find_dhcp_leases",
     description=(
-        "Find DHCP leases. Filterable by server, scope, MAC, IP, "
-        "hostname substring, state, or fingerbank device class. Returns "
-        "lease metadata (IP / MAC / mac_vendor / device_class / "
-        "device_name / hostname / state / starts_at / ends_at). Use "
+        "Find DHCP leases. Filterable by server, scope, MAC, IP, DHCPv6 "
+        "DUID, hostname substring, state, or fingerbank device class. "
+        "Returns lease metadata (IP / MAC / DUID / IAID / mac_vendor / "
+        "device_class / device_name / hostname / state / starts_at / "
+        "ends_at); a DHCPv6 lease usually has a DUID and no MAC. Use "
         "for questions like 'what's the lease for MAC X?', 'what's "
         "leased on subnet Y?', or 'show me the phones on this network'."
     ),
@@ -204,6 +214,12 @@ async def find_dhcp_leases(
         stmt = stmt.where(
             func.host(DHCPLease.ip_address) == func.host(cast(literal(args.ip_address), INET))
         )
+    if args.duid:
+        try:
+            duid = canonical_duid(args.duid)
+        except ValueError:
+            return []  # not a DUID, so no lease has it
+        stmt = stmt.where(DHCPLease.duid == duid)
     if args.hostname_search:
         like = f"%{args.hostname_search.lower()}%"
         stmt = stmt.where(func.lower(DHCPLease.hostname).like(like))
@@ -215,7 +231,7 @@ async def find_dhcp_leases(
         ).where(DHCPFingerprint.fingerbank_device_class == args.device_class)
     stmt = stmt.order_by(DHCPLease.ends_at.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
-    vendors = await bulk_lookup_vendors(db, [str(le.mac_address) for le in rows])
+    vendors = await bulk_lookup_vendors(db, [str(le.mac_address) for le in rows if le.mac_address])
     # Batch-fetch fingerprints for the result MACs (one query) so each lease
     # can report its fingerbank device class/name without a per-row lookup.
     macs = [str(le.mac_address) for le in rows if le.mac_address]
@@ -228,7 +244,8 @@ async def find_dhcp_leases(
             fps[normalize_mac_key(str(fp.mac_address))] = fp
     out: list[dict[str, Any]] = []
     for le in rows:
-        mac_key = normalize_mac_key(str(le.mac_address))
+        # A DHCPv6 lease usually has no MAC (#1141) — never "None".
+        mac_key = normalize_mac_key(str(le.mac_address)) if le.mac_address else None
         vendor = vendors.get(mac_key) if mac_key else None
         fp = fps.get(mac_key) if mac_key else None
         out.append(
@@ -237,7 +254,9 @@ async def find_dhcp_leases(
                 "server_id": str(le.server_id),
                 "scope_id": str(le.scope_id) if le.scope_id else None,
                 "ip_address": str(le.ip_address),
-                "mac_address": str(le.mac_address),
+                "mac_address": str(le.mac_address) if le.mac_address else None,
+                "duid": le.duid,
+                "iaid": le.iaid,
                 "mac_vendor": vendor,
                 "is_voip_phone": is_voip_phone_vendor(vendor),
                 "device_class": fp.fingerbank_device_class if fp else None,
@@ -797,6 +816,89 @@ async def find_dhcp_pool_occupancy(
         )
     out.sort(key=lambda r: r["occupancy_percent"], reverse=True)
     return out[: args.limit]
+
+
+# ── find_dhcp_failover_relationships (issue #1110) ────────────────────
+#
+# Deliberately no ``propose_*`` counterpart for the Phase 2 management routes
+# (non-negotiable #13, explicit decision): creating, removing or re-scoping a
+# relationship creates and DELETES scopes on the partner server, and creating
+# one carries the relationship's shared secret — the broad-blast-radius,
+# secret-bearing shape that guidance keeps off the copilot.
+
+
+class FindDHCPFailoverRelationshipsArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None,
+        description=(
+            "Limit to one DHCP server group (UUID). Omit to cover every group "
+            "with a Windows DHCP member."
+        ),
+    )
+    only_at_risk: bool = Field(
+        default=False,
+        description=(
+            "Return only scopes that are NOT safely served — held by several "
+            "Windows servers with no failover relationship, or whose "
+            "coordination could not be read, or failover partners whose "
+            "configuration has drifted."
+        ),
+    )
+
+
+@register_tool(
+    name="find_dhcp_failover_relationships",
+    description=(
+        "Windows DHCP failover relationships as each Windows server reports "
+        "them (Get-DhcpServerv4Failover): name, mode (LoadBalance / "
+        "HotStandby), per-side role, state and load-balance share, MCLT, and "
+        "the scopes each covers — plus, per scope, which Windows servers of the "
+        "group hold it and a verdict: single_server, failover, "
+        "failover_one_sided (partner not in the group), split_scope, or "
+        "uncoordinated (two servers can hand out the same address). Use for "
+        "'are my Windows DHCP servers in failover?', 'which scopes could get "
+        "duplicate addresses?', or 'are the partners' configs in sync?'. From "
+        "the topology poll's stored observations, not a live read. Windows "
+        "failover syncs leases between partners but NOT configuration. A group "
+        "that also has Kea members lists them in kea_members; a scope both a Kea "
+        "and a Windows member serve is reported uncoordinated. Read-only: "
+        "relationships are created and changed from the group's Windows failover "
+        "panel or its REST routes, never from chat."
+    ),
+    args_model=FindDHCPFailoverRelationshipsArgs,
+    category="dhcp",
+    module="core.dhcp",
+)
+async def find_dhcp_failover_relationships(
+    db: AsyncSession, user: User, args: FindDHCPFailoverRelationshipsArgs
+) -> list[dict[str, Any]]:
+    # The same report the group view renders, run through the same response
+    # model so timestamps and ids come out as the REST route emits them.
+    from app.api.v1.dhcp._failover_schemas import GroupFailoverResponse  # noqa: PLC0415
+    from app.services.dhcp.windows_failover_report import (  # noqa: PLC0415
+        group_failover_report,
+    )
+
+    stmt = (
+        select(DHCPServerGroup)
+        .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+        .where(DHCPServer.driver == "windows_dhcp")
+        .distinct()
+        .order_by(DHCPServerGroup.name)
+    )
+    if args.group_id:
+        stmt = stmt.where(DHCPServerGroup.id == args.group_id)
+    groups = (await db.execute(stmt)).scalars().all()
+    out: list[dict[str, Any]] = []
+    for group in groups:
+        report = GroupFailoverResponse.model_validate(
+            await group_failover_report(db, group)
+        ).model_dump(mode="json")
+        if args.only_at_risk:
+            report["scopes"] = [s for s in report["scopes"] if not s["safe"] or s.get("drift")]
+        report["group_name"] = group.name
+        out.append(report)
+    return out
 
 
 # ── find_dhcp_responders (issue #370) ─────────────────────────────────

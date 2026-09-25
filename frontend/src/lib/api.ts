@@ -4913,7 +4913,8 @@ export interface WindowsDNSCredentials {
   username: string;
   password: string;
   winrm_port?: number;
-  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  // Kerberos is not offered: the images carry no GSSAPI stack (#1128).
+  transport?: "ntlm" | "basic" | "credssp";
   use_tls?: boolean;
   verify_tls?: boolean;
 }
@@ -5165,12 +5166,76 @@ export type ConfigApplyStatus =
   /** Failed with no previously-working config to fall back to. */
   | "no_previous";
 
+/** One stream of an agent's durable push spool (#1077). */
+export interface AgentSpoolStreamStatus {
+  enabled: boolean;
+  entries: number;
+  bytes: number;
+  cap_bytes: number;
+  oldest_at: string | null;
+  trimmed_entries_total: number;
+  trimmed_bytes_total: number;
+  last_trim_at: string | null;
+  expired_entries_total: number;
+  rejected_entries_total: number;
+  write_failures_total: number;
+}
+
+/**
+ * An agent's durable push spool as last reported on its heartbeat (#1077):
+ * pushes the control plane has not acknowledged yet, queued on the agent's
+ * disk and replayed in order on reconnect. The `*_total` counters are
+ * cumulative across agent restarts.
+ *
+ * `null` on the server row means the agent has never reported one — a
+ * pre-#1077 agent or an agentless driver. That is unknown, not "empty".
+ */
+export interface AgentSpoolStatus {
+  enabled: boolean;
+  cap_bytes: number;
+  bytes: number;
+  entries: number;
+  oldest_at: string | null;
+  trimmed_entries_total: number;
+  trimmed_bytes_total: number;
+  last_trim_at: string | null;
+  expired_entries_total: number;
+  streams: Record<string, AgentSpoolStreamStatus>;
+}
+
 /** Config-apply fields shared by DNS servers, DHCP servers and LG collectors. */
 export interface ConfigApplyFields {
   config_apply_status: ConfigApplyStatus | null;
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+}
+
+/**
+ * Daemon state an agent reported on its heartbeat (#1067), shared by DNS and
+ * DHCP servers.
+ *
+ * `daemon_status` is the agent's own word: `ok` while the daemon is up,
+ * `degraded` otherwise — a DNS agent waiting for its first bundle, a Kea
+ * whose control socket is unreachable, or either agent echoing a failed
+ * config apply (#882). `null` means the agent has never reported one — a
+ * pre-#1061 agent, or an agentless driver — and renders as unknown, never as
+ * healthy. `daemon_status_since` is when the CURRENT state began; a repeated
+ * report never moves it.
+ *
+ * `daemon_not_serving` is the server's one reading of the three, and the
+ * field to render from: `true` when the daemon is not serving; `false` on
+ * `ok`, or when the `degraded` is a config-apply echo (the config-apply chip
+ * already shows that, at #882's severity, and a reverted daemon IS serving);
+ * `null` when never reported. Re-deriving "not serving" from `daemon_status`
+ * is what put a red chip on every routine revert while the alert, which
+ * reads the same classification as this field, stayed quiet.
+ */
+export interface DaemonStateFields {
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  daemon_not_serving: boolean | null;
 }
 
 export interface DNSServer {
@@ -5208,6 +5273,13 @@ export interface DNSServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  /** #1077 — push spool as last reported; `null` = never reported. */
+  spool_status: AgentSpoolStatus | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7932,6 +8004,13 @@ export interface DHCPServer {
   config_apply_error: string | null;
   config_failed_etag: string | null;
   config_apply_at: string | null;
+  /** #1077 — push spool as last reported; `null` = never reported. */
+  spool_status: AgentSpoolStatus | null;
+  daemon_status: string | null;
+  daemon_reason: string | null;
+  daemon_status_since: string | null;
+  /** #1067 — derived; render from this, see `DaemonStateFields`. */
+  daemon_not_serving: boolean | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -7977,7 +8056,8 @@ export interface WindowsDHCPCredentials {
   username: string;
   password: string;
   winrm_port?: number;
-  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  // Kerberos is not offered: the images carry no GSSAPI stack (#1128).
+  transport?: "ntlm" | "basic" | "credssp";
   use_tls?: boolean;
   verify_tls?: boolean;
 }
@@ -8039,10 +8119,155 @@ export interface DHCPLeaseSyncResult {
   statics_removed?: number;
   mac_blocks_added?: number;
   mac_blocks_removed?: number;
+  /** #1110 — scopes this server holds whose import belongs to another
+   *  Windows member of its group (one member imports a shared scope). */
+  scopes_deferred?: number;
   errors: string[];
+  /** #1110 — standing conditions, not failures of this sync: a scope two
+   *  Windows members serve uncoordinated, failover partners whose
+   *  configuration drifted, a failover read that was denied. */
+  warnings?: string[];
   // Present on the agent-based (Kea) no-op path: explains that leases stream
   // live and config converges via the agent, so there was nothing to pull.
   note?: string | null;
+}
+
+/** #1110 — how a group's Windows DHCP members serve one scope. Values of
+ *  `services.dhcp.windows_failover.Verdict`, plus `no_windows_members`. */
+export type DHCPServingVerdict =
+  | "not_on_windows"
+  | "single_server"
+  | "failover"
+  | "failover_one_sided"
+  | "split_scope"
+  | "uncoordinated"
+  | "unknown"
+  | "no_windows_members";
+
+export interface DHCPScopeServingServer {
+  server_id: string;
+  server_name: string;
+  /** null = this member's scopes have never been read — unknown, not "no". */
+  holds: boolean | null;
+  is_active: boolean | null;
+  relationship_name: string | null;
+  /** Several holders: does this member's config match the imported view? */
+  in_sync: boolean | null;
+  observed_at: string | null;
+  stale: boolean;
+  /** This member's view is the one the topology poll imports. */
+  reconcile_owner: boolean;
+}
+
+export interface DHCPScopeServing {
+  scope_id: string | null;
+  cidr: string;
+  verdict: DHCPServingVerdict;
+  /** No two servers can hand out the same address under this verdict. */
+  safe: boolean;
+  detail: string;
+  relationship_name: string | null;
+  relationship_mode: string | null;
+  drift: boolean | null;
+  servers: DHCPScopeServingServer[];
+}
+
+export interface DHCPFailoverMember {
+  server_id: string;
+  server_name: string;
+  host: string;
+  scopes_observed_at: string | null;
+  /** Last SUCCESSFUL failover read — null means never read, not "none". */
+  failover_observed_at: string | null;
+  failover_error: string | null;
+  fresh: boolean;
+  relationship_count: number;
+}
+
+export interface DHCPFailoverSide {
+  server_id: string;
+  server_name: string;
+  partner_server: string;
+  partner_server_id: string | null;
+  server_role: string | null;
+  state: string | null;
+  load_balance_percent: number | null;
+  reserve_percent: number | null;
+  modified_at: string;
+}
+
+export interface DHCPFailoverRelationship {
+  name: string;
+  mode: string | null;
+  max_client_lead_time_seconds: number | null;
+  state_switch_interval_seconds: number | null;
+  auto_state_transition: boolean | null;
+  enable_auth: boolean | null;
+  scope_ids: string[];
+  sides: DHCPFailoverSide[];
+  complete: boolean;
+  partner_outside_group: string | null;
+}
+
+export interface DHCPGroupFailover {
+  group_id: string;
+  windows_member_count: number;
+  /** Kea members of the same group — non-empty means a mixed group, where
+   *  every active scope a Windows member also holds is served twice. */
+  kea_members: string[];
+  members: DHCPFailoverMember[];
+  relationships: DHCPFailoverRelationship[];
+  scopes: DHCPScopeServing[];
+}
+
+/** #1110 Phase 2 — relationship management. Every action runs one cmdlet on
+ *  one member, which reaches the partner from there: the member's WinRM
+ *  transport must be CredSSP, or the API answers 422. */
+export type DHCPFailoverMode = "LoadBalance" | "HotStandby";
+
+export interface DHCPFailoverTuning {
+  server_role?: "Active" | "Standby" | null;
+  load_balance_percent?: number | null;
+  reserve_percent?: number | null;
+  max_client_lead_time_seconds?: number | null;
+  auto_state_transition?: boolean | null;
+  state_switch_interval_seconds?: number | null;
+  /** Sent to Windows, never stored or returned. */
+  shared_secret?: string | null;
+}
+
+export interface DHCPFailoverRelationshipCreate extends DHCPFailoverTuning {
+  name: string;
+  server_id: string;
+  partner_server_id: string;
+  mode: DHCPFailoverMode;
+  scope_ids: string[];
+}
+
+export interface DHCPFailoverRelationshipUpdate extends DHCPFailoverTuning {
+  mode?: DHCPFailoverMode | null;
+  /** The side the change runs on — required with a share or a role, which
+   *  Windows applies to that server (the partner gets the complement). */
+  server_id?: string | null;
+}
+
+export interface DHCPFailoverActionResult {
+  action:
+    | "create"
+    | "update"
+    | "delete"
+    | "add_scopes"
+    | "remove_scopes"
+    | "replicate";
+  relationship: string;
+  ran_on_server_id: string;
+  ran_on_server_name: string;
+  partner_server_id: string | null;
+  partner_server_name: string | null;
+  scope_ids: string[];
+  /** The action happened; re-reading a server afterwards did not. */
+  warnings: string[];
+  failover: DHCPGroupFailover;
 }
 
 export interface DHCPOption {
@@ -8333,6 +8558,79 @@ export const dhcpApi = {
   // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
   // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
   deleteGroup: (id: string) => api.delete(`/dhcp/server-groups/${id}`),
+  // #1110 — Windows failover as the group's members report it (stored
+  // observations from the topology poll, never a live read).
+  getGroupFailover: (id: string) =>
+    api
+      .get<DHCPGroupFailover>(`/dhcp/server-groups/${id}/failover`)
+      .then((r) => r.data),
+  getScopeFailover: (scopeId: string) =>
+    api
+      .get<DHCPScopeServing>(`/dhcp/scopes/${scopeId}/failover`)
+      .then((r) => r.data),
+  createFailoverRelationship: (
+    groupId: string,
+    body: DHCPFailoverRelationshipCreate,
+  ) =>
+    api
+      .post<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships`,
+        body,
+      )
+      .then((r) => r.data),
+  updateFailoverRelationship: (
+    groupId: string,
+    name: string,
+    body: DHCPFailoverRelationshipUpdate,
+  ) =>
+    api
+      .patch<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships/${encodeURIComponent(name)}`,
+        body,
+      )
+      .then((r) => r.data),
+  deleteFailoverRelationship: (
+    groupId: string,
+    name: string,
+    keepServerId?: string,
+  ) =>
+    api
+      .delete<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships/${encodeURIComponent(name)}`,
+        { params: keepServerId ? { keep_server_id: keepServerId } : {} },
+      )
+      .then((r) => r.data),
+  addFailoverScopes: (groupId: string, name: string, scopeIds: string[]) =>
+    api
+      .post<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships/${encodeURIComponent(name)}/scopes`,
+        { scope_ids: scopeIds },
+      )
+      .then((r) => r.data),
+  removeFailoverScope: (
+    groupId: string,
+    name: string,
+    scopeId: string,
+    keepServerId?: string,
+  ) =>
+    api
+      .delete<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships/${encodeURIComponent(name)}/scopes/${encodeURIComponent(scopeId)}`,
+        { params: keepServerId ? { keep_server_id: keepServerId } : {} },
+      )
+      .then((r) => r.data),
+  replicateFailover: (
+    groupId: string,
+    name: string,
+    sourceServerId: string,
+    scopeIds: string[] = [],
+  ) =>
+    api
+      .post<DHCPFailoverActionResult>(
+        `/dhcp/server-groups/${groupId}/failover/relationships/${encodeURIComponent(name)}/replicate`,
+        { source_server_id: sourceServerId, scope_ids: scopeIds },
+      )
+      .then((r) => r.data),
 
   listServers: (groupId?: string) =>
     api
@@ -9199,7 +9497,10 @@ export interface DHCPLease {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null on most DHCPv6 leases, which are identified by DUID + IAID (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   state: string; // "active" | "expired" | "released" | "abandoned"
   starts_at: string | null;
@@ -14806,7 +15107,10 @@ export interface DHCPLeaseHistoryRow {
   server_id: string;
   scope_id: string | null;
   ip_address: string;
-  mac_address: string;
+  // null for a DHCPv6 lease identified by DUID only (#1141).
+  mac_address: string | null;
+  duid?: string | null;
+  iaid?: number | null;
   hostname: string | null;
   client_id: string | null;
   started_at: string | null;

@@ -14,6 +14,7 @@ from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
+from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
 
@@ -24,6 +25,7 @@ class HeartbeatClient:
         cfg: AgentConfig,
         token_ref: list[str],
         driver: DriverBase | None = None,
+        spool_manager: SpoolManager | None = None,
     ):
         # token_ref is a 1-element list so the sync loop can swap the token in place
         self.cfg = cfg
@@ -45,6 +47,16 @@ class HeartbeatClient:
         self.driver = driver
         self._daemon_version_cached: str | None = None
         self._daemon_version_attempts = 0
+        # #1077 — the durable push spool; its status() rides the heartbeat's
+        # ``spool`` field so the control plane can show a backlog replaying
+        # (and alert on trims) instead of a silent hole that fills in later.
+        self.spool_manager = spool_manager
+        # Set when the control plane 422s the ``spool`` field. Its heartbeat
+        # request model is ``extra="forbid"``, so a control plane older than
+        # #1077 rejects the whole heartbeat — which would turn a new agent
+        # against an old control plane into a stale server. Mirrors the DHCP
+        # agent's fallback.
+        self._spool_field_unsupported = False
 
     # A failing probe must not be retried forever. Unlike the DHCP agent's
     # ``_kea_version``, which polls a control socket that is legitimately down
@@ -111,6 +123,11 @@ class HeartbeatClient:
             "ops_ack": self.pending_acks,
             "failed_ops_count": self.failed_ops_count,
         }
+        if self.spool_manager is not None and not self._spool_field_unsupported:
+            try:
+                body["spool"] = self.spool_manager.status()
+            except Exception as exc:  # noqa: BLE001 — telemetry must never cost liveness
+                log.warning("heartbeat_spool_status_failed", error=str(exc))
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
@@ -123,6 +140,15 @@ class HeartbeatClient:
                     json=body,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
+                if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
+                    log.warning("heartbeat_spool_field_unsupported")
+                    self._spool_field_unsupported = True
+                    body.pop("spool")
+                    resp = c.post(
+                        "/api/v1/dns/agents/heartbeat",
+                        json=body,
+                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    )
             if resp.status_code == 200:
                 data = resp.json()
                 self.pending_acks.clear()
