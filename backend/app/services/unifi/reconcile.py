@@ -43,6 +43,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
+from app.services.integration_ownership import owned_by_other_integration, owning_integration
 from app.services.unifi.client import (
     UnifiClient,
     UnifiClientConfig,
@@ -734,18 +735,7 @@ async def _apply_addresses(
             # Otherwise pick the most-recently-modified candidate
             # that's eligible for adoption (not owned by another
             # integration / another unifi controller). Adopt only it.
-            eligible = [
-                r
-                for r in rows
-                if r.unifi_controller_id is None
-                and r.kubernetes_cluster_id is None
-                and r.docker_host_id is None
-                and r.proxmox_node_id is None
-                and r.tailscale_tenant_id is None
-                and r.panos_firewall_id is None
-                and r.fortinet_firewall_id is None
-                and r.meraki_org_id is None
-            ]
+            eligible = [r for r in rows if owning_integration(r) is None]
             if not eligible:
                 if any(
                     r.unifi_controller_id and r.unifi_controller_id != controller.id for r in rows
@@ -753,16 +743,7 @@ async def _apply_addresses(
                     summary.warnings.append(
                         f"address {addr} owned by another UniFi controller; not claiming"
                     )
-                elif any(
-                    r.kubernetes_cluster_id
-                    or r.docker_host_id
-                    or r.proxmox_node_id
-                    or r.tailscale_tenant_id
-                    or r.panos_firewall_id
-                    or r.fortinet_firewall_id
-                    or r.meraki_org_id
-                    for r in rows
-                ):
+                elif any(owned_by_other_integration(r, "unifi_controller_id") for r in rows):
                     summary.warnings.append(
                         f"address {addr} owned by another integration; not claiming"
                     )
