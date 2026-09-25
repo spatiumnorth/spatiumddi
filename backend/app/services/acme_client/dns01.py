@@ -110,7 +110,10 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
     Raises :class:`DNS01SolveError` if no managed zone covers ``fqdn`` or
     if an agent failed / timed out applying the record.
     """
-    from app.services.acme import wait_for_ops_applied  # noqa: PLC0415 — avoid cycle
+    from app.services.acme import (  # noqa: PLC0415 — avoid cycle
+        apply_timeout_for,
+        wait_for_ops_applied,
+    )
 
     challenge_fqdn = _challenge_fqdn(fqdn)
     resolved = await _resolve_zone(db, challenge_fqdn)
@@ -178,12 +181,16 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
                 f"zone {zone.name!r} has no enabled primary DNS server — "
                 f"cannot publish the DNS-01 challenge record"
             )
-        states = await wait_for_ops_applied(wait_ids)
+        # Scaled with the group's render time (#1184): at a million
+        # records one render takes about 30 s, and a fixed 30 s wait
+        # failed intermittently.
+        timeout = await apply_timeout_for(db, wait_ids)
+        states = await wait_for_ops_applied(wait_ids, timeout=timeout)
         not_applied = {str(i): s for i, s in states.items() if s != "applied"}
         if not_applied:
             raise DNS01SolveError(
                 f"TXT record for {challenge_fqdn!r} was not applied by all DNS "
-                f"agents (op states: {not_applied})"
+                f"agents within {timeout:.0f} s (op states: {not_applied})"
             )
     except DNS01SolveError:
         # Tear down the committed record so a failed solve doesn't orphan

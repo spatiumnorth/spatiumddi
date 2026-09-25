@@ -360,8 +360,10 @@ async def update_txt(
     """acme-dns /update — set a TXT record for this account's subdomain.
 
     Blocks until the record has been applied on the zone's primary
-    DNS server (up to :data:`DEFAULT_APPLY_TIMEOUT_SECONDS` seconds)
-    so the ACME CA's subsequent DNS poll finds the record live.
+    DNS server, so the ACME CA's subsequent DNS poll finds the record
+    live. The wait scales with the server's render time (#1184): at
+    least 30 s, at most 55 s, under the 60 s at which the web frontend's
+    nginx ends the request.
 
     Behavior:
       * If ``txt`` is empty, this is a no-op (returns 200 with the
@@ -416,13 +418,17 @@ async def update_txt(
         # Either way we don't block on an op we never enqueued.
         return ACMEUpdateResponse(txt=body.txt)
 
+    timeout = await acme_svc.apply_timeout_for(
+        db, [op.id], cap=acme_svc.PROVIDER_MAX_APPLY_TIMEOUT_SECONDS
+    )
     try:
-        state = await acme_svc.wait_for_op_applied(op.id)
+        state = await acme_svc.wait_for_op_applied(op.id, timeout=timeout)
     except acme_svc.ACMEApplyTimeout:
         logger.warning(
             "acme_update_apply_timeout",
             account_id=str(account.id),
             op_id=str(op.id),
+            timeout_s=timeout,
         )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
