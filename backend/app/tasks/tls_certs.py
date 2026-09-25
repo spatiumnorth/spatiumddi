@@ -27,6 +27,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import delete, or_, select
+from sqlalchemy.dialects.postgresql import distinct_on
 
 from app.celery_app import celery_app
 from app.db import task_session
@@ -220,7 +221,7 @@ async def _prune_async() -> dict[str, Any]:
             (
                 await db.execute(
                     select(TLSCertProbe.id)
-                    .distinct(TLSCertProbe.target_id)
+                    .ext(distinct_on(TLSCertProbe.target_id))
                     .where(TLSCertProbe.ok.is_(True))
                     .order_by(TLSCertProbe.target_id, TLSCertProbe.probed_at.desc())
                 )

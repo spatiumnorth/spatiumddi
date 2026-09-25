@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Select, select
+from sqlalchemy.dialects.postgresql import distinct_on
 
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.dhcp import DHCPLease, DHCPScope
@@ -286,7 +287,7 @@ async def _batch_history_macs(db: AsyncSession, ip_ids: list[uuid.UUID]) -> dict
     stmt = (
         select(IpMacHistory.ip_address_id, IpMacHistory.mac_address)
         .where(IpMacHistory.ip_address_id.in_(ip_ids))
-        .distinct(IpMacHistory.ip_address_id)
+        .ext(distinct_on(IpMacHistory.ip_address_id))
         .order_by(IpMacHistory.ip_address_id, IpMacHistory.last_seen.desc())
     )
     return {row[0]: str(row[1]) for row in (await db.execute(stmt)).all()}
@@ -324,7 +325,7 @@ async def _batch_lease_macs(
             # A DHCPv6 lease identified by DUID alone has no MAC to wake
             # (#1141); ``str(None)`` would read as the MAC "None".
             .where(DHCPLease.mac_address.is_not(None))
-            .distinct(DHCPLease.ip_address, DHCPScope.subnet_id)
+            .ext(distinct_on(DHCPLease.ip_address, DHCPScope.subnet_id))
             .order_by(
                 DHCPLease.ip_address,
                 DHCPScope.subnet_id,
