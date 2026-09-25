@@ -16,6 +16,11 @@ resolution dropped ``app.tasks.agent_bundles`` from ``include``, with its
 worker discarded every render it was sent. Agents received a change only when
 the api's bounded inline fallback built the bundle, two minutes after it.
 
+A registered task can still be stranded. A task whose module has no
+``task_routes`` entry, sent without an explicit queue, goes to Celery's
+default queue, ``celery``, and no worker consumes that. Five modules were in
+that state, including the rolling-upgrade driver and five beat entries (#1200).
+
 The suite imports ``app.main`` (conftest), so these probe the worker's own
 startup in a fresh interpreter, as ``tests/test_session_listeners.py`` does.
 """
@@ -33,6 +38,11 @@ from typing import Any
 from app.tasks.agent_bundles import TASK_RENDER, TASK_SWEEP
 
 _BACKEND = Path(__file__).resolve().parents[1]
+
+# The queues every deploy target starts the worker with (``-Q``):
+# charts/spatiumddi/values.yaml ``worker.queues``, k8s/base/worker.yaml and
+# docker-compose.yml. A task routed anywhere else is published and never run.
+_WORKER_QUEUES = frozenset({"ipam", "dns", "dhcp", "default", "bundles"})
 
 # The worker's startup, exactly as ``celery worker`` does it before its pool
 # forks; then every module under ``app/tasks`` is imported, so the tasks that
@@ -97,6 +107,23 @@ def test_every_beat_entry_names_a_task_a_started_worker_registers() -> None:
         if entry["task"] not in worker["started"]
     )
     assert orphans == [], f"beat sends {orphans}, which a started worker discards"
+
+
+def test_every_task_a_started_worker_registers_routes_to_a_queue_it_consumes() -> None:
+    """#1200: a task with no route goes to Celery's default queue, ``celery``,
+    which no worker consumes, so it is published and never run: no error, no
+    log line, just a Redis list that grows."""
+    worker = _worker()
+    stranded = sorted(
+        f"{name} -> {queue}"
+        for name, queue in worker["queues"].items()
+        if queue not in _WORKER_QUEUES
+    )
+    assert stranded == [], (
+        f"{stranded} are published to a queue no worker consumes (the worker runs "
+        f"-Q {','.join(sorted(_WORKER_QUEUES))}): add a task_routes entry for their "
+        "module in app/celery_app.py"
+    )
 
 
 def test_the_bundle_renders_run_on_the_bundles_queue_and_are_swept() -> None:

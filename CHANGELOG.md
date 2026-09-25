@@ -215,6 +215,21 @@ the formatter handles the rest.
   fresh interpreter and fails when a task the code defines, or one beat
   sends, is not registered in it.
 
+- **Five task modules were published to a queue no worker consumes
+  (#1200).** With `task_default_queue` unset, a task whose module has
+  no `task_routes` entry goes to Celery's default queue, `celery`, and
+  every deploy target's worker consumes only
+  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
+  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
+  had no route. So the Looking Glass collector stale sweep and route
+  re-resolve, the conformity evaluator, the revoked-appliance prune and
+  the daily DNSBL sweep never ran, and a rolling upgrade run started or
+  resumed through the api was enqueued to a list nothing reads. All
+  five now route to `default`. Messages already stranded on `celery` are
+  not replayed; `DEL celery` in the broker's Redis database (1 by
+  default) removes them. A test fails when a task routes to a queue the
+  worker does not consume.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the

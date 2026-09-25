@@ -149,6 +149,17 @@ celery_app.conf.update(
         "app.tasks.schema_check.*": {"queue": "default"},
         "app.tasks.wol_scheduler.*": {"queue": "default"},
         "app.tasks.wol_calendar.*": {"queue": "default"},
+        # #1200 — these five had no route, and ``task_default_queue`` is
+        # unset, so their tasks went to Celery's default queue ``celery``,
+        # which no worker consumes (``-Q ipam,dns,dhcp,default,bundles``):
+        # every beat send and every ``.delay()`` of them was published and
+        # never run. tests/test_celery_worker_tasks.py fails when a task
+        # routes to a queue the worker does not consume.
+        "app.tasks.looking_glass.*": {"queue": "default"},
+        "app.tasks.conformity.*": {"queue": "default"},
+        "app.tasks.prune_revoked_appliances.*": {"queue": "default"},
+        "app.tasks.upgrade_orchestrator.*": {"queue": "default"},
+        "app.tasks.dnsbl_sweep.*": {"queue": "default"},
         # #1111 — DNS agent bundle renders. Their own queue so a 30–60 s
         # render of a million-row group never sits in front of the
         # latency-bound ipam/dns/dhcp work, and so an operator can give
