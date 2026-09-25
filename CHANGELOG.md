@@ -565,6 +565,22 @@ the formatter handles the rest.
   `docs/THIRD_PARTY.md`), because #1110's relationship management
   needs it. Kerberos was in the same position (the images carry no
   GSSAPI stack) and is no longer offered — see #1128 under Changed.
+- **The docs still described the pre-#631 dynamic-pool guard
+  (#1162).** Getting Started §9 said allocating inside a dynamic pool
+  "is refused", and IPAM.md's status line and allocation-UI notes said
+  a 422 answers it with the submit button disabled. Since #631 a
+  manual allocation there answers a force-overridable `409`
+  (`requires_confirmation`, a `dynamic_pool` warning naming the pool)
+  and the modal offers **Allocate anyway**; the docs now say so, as
+  IPAM.md's own rules table always did. DHCP.md's conflict list still
+  said a reservation inside a dynamic pool is refused until the pool
+  excludes it — #631 removed that 409, and its "exclude it first"
+  advice was the harmful part; the list now says in-pool reservations
+  are allowed. §9 also says what New Scope pre-fills, including its
+  suggested initial pool (the tenth host address to the last usable
+  one), and its worked example now replaces that suggestion: kept, the
+  dynamic pool would take in `10.20.21.10`, the address step 10
+  allocates, and step 10 would stop to ask for confirmation.
 
 - **A DHCP scope created from its subnet keeps the subnet's gateway
   as Routers (option 3) and gets the suggested pool (#1154).** The
@@ -741,6 +757,21 @@ the formatter handles the rest.
   default and pins the daily release check and the appliance
   slot-image catalogue to the old path. Update the value, or remove
   the line to take the default.
+  **Pinned releases pull from the old path (#1163).** Every release
+  up to and including `2026.09.04-1` names its images under
+  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
+  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
+  taken from such a tag, or from a checkout older than this change,
+  fails at `docker compose pull` — `git pull` for the current file,
+  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
+  copy. Every published chart version up to and including
+  `2026.9.4-1` defaults to the old path too: install or upgrade those
+  with `--set image.repository=spatiumnorth` plus
+  `dnsAgents.image.repository`,
+  `dnsAgents.flavors.powerdns.repository`,
+  `dnsAgents.flavors.technitium.repository` and
+  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
+  names (the chart README lists them).
 - **The release check reported a permanently up-to-date install when
   its repo had moved.** GitHub answers `301` for a renamed repo, which
   an org rename makes routine — and httpx does not follow redirects by
