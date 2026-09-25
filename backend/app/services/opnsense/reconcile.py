@@ -21,8 +21,8 @@ Notable specifics:
   ``auto_from_lease=True`` (Kea-shape parity); static reservations →
   ``status="reserved"``; ARP → ``status="opnsense-arp"``.
 * **Sibling-integration ownership guard.** A row already owned by
-  another integration (Proxmox / Kubernetes / Docker / Tailscale /
-  UniFi / Cloud) is never claimed or duplicated.
+  another integration (any in ``app.services.integration_ownership``)
+  is never claimed or duplicated.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
+from app.services.integration_ownership import owned_by_other_integration, owning_integration
 from app.services.opnsense.client import (
     OPNsenseClient,
     OPNsenseClientError,
@@ -349,18 +350,7 @@ async def _apply_blocks_and_subnets(
         net_key = str(s.network)
         if s.opnsense_router_id == router.id:
             current_subnets[net_key] = s
-        elif (
-            s.opnsense_router_id is None
-            and s.proxmox_node_id is None
-            and s.kubernetes_cluster_id is None
-            and s.docker_host_id is None
-            and s.tailscale_tenant_id is None
-            and s.unifi_controller_id is None
-            and s.cloud_endpoint_id is None
-            and s.panos_firewall_id is None
-            and s.fortinet_firewall_id is None
-            and s.meraki_org_id is None
-        ):
+        elif owning_integration(s) is None:
             operator_subnets[net_key] = s
         else:
             foreign_subnets[net_key] = s
@@ -541,17 +531,7 @@ async def _apply_addresses(
                 )
                 unclaimable.add(str(row.address))
                 continue
-            if (
-                row.proxmox_node_id is not None
-                or row.kubernetes_cluster_id is not None
-                or row.docker_host_id is not None
-                or row.tailscale_tenant_id is not None
-                or row.unifi_controller_id is not None
-                or row.cloud_endpoint_id is not None
-                or row.panos_firewall_id is not None
-                or row.fortinet_firewall_id is not None
-                or row.meraki_org_id is not None
-            ):
+            if owned_by_other_integration(row, "opnsense_router_id"):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"
                 )

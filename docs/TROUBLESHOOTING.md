@@ -308,6 +308,70 @@ blockers — they're cleaned up automatically on delete.
 
 ---
 
+## An IP address is owned by two integrations
+
+**Symptom** — An address that two integrations both see (a host that is a
+UniFi client *and* an OPNsense DHCP lease, a VM's LAN IP seen by Proxmox and
+UniFi, a macvlan container seen by Docker and UniFi) stopped updating: its
+hostname or MAC is stale, or it stayed in IPAM after the host went away.
+
+Before #1135 an integration mirror could claim an address another
+integration already owned. The claim also set `user_modified_at`, which
+marks a row as edited by hand, so from then on neither integration updated
+it, neither deleted it when the host disappeared, and deleting either
+integration's target deleted the row. New claims are now refused with the
+warning *"owned by another integration; not claiming"*, but rows claimed
+before the upgrade stay as they are. They aren't cleaned up automatically,
+because a claim's `user_modified_at` can't be told apart from a real
+operator edit, and clearing it would let an integration overwrite edits
+someone made by hand.
+
+**Find them** (any `psql` session on the SpatiumDDI database; on Docker
+Compose, `docker compose exec -T postgres psql -U spatiumddi spatiumddi`):
+
+```sql
+SELECT a.id, a.address, a.hostname, a.user_modified_at,
+       concat_ws(', ',
+         CASE WHEN a.kubernetes_cluster_id IS NOT NULL THEN 'kubernetes' END,
+         CASE WHEN a.docker_host_id IS NOT NULL THEN 'docker' END,
+         CASE WHEN a.proxmox_node_id IS NOT NULL THEN 'proxmox' END,
+         CASE WHEN a.tailscale_tenant_id IS NOT NULL THEN 'tailscale' END,
+         CASE WHEN a.unifi_controller_id IS NOT NULL THEN 'unifi' END,
+         CASE WHEN a.cloud_endpoint_id IS NOT NULL THEN 'cloud' END,
+         CASE WHEN a.opnsense_router_id IS NOT NULL THEN 'opnsense' END,
+         CASE WHEN a.netbird_instance_id IS NOT NULL THEN 'netbird' END,
+         CASE WHEN a.panos_firewall_id IS NOT NULL THEN 'paloalto' END,
+         CASE WHEN a.fortinet_firewall_id IS NOT NULL THEN 'fortinet' END,
+         CASE WHEN a.meraki_org_id IS NOT NULL THEN 'meraki' END
+       ) AS owned_by
+FROM ip_address a
+WHERE num_nonnulls(
+        a.kubernetes_cluster_id, a.docker_host_id, a.proxmox_node_id,
+        a.tailscale_tenant_id, a.unifi_controller_id, a.cloud_endpoint_id,
+        a.opnsense_router_id, a.netbird_instance_id, a.panos_firewall_id,
+        a.fortinet_firewall_id, a.meraki_org_id) >= 2
+ORDER BY a.address;
+```
+
+**Fix one** — Decide which integration should own the address: usually the
+one that hands it out, such as the DHCP server for a LAN lease. Clear the
+other integration's column. If nobody has edited the row by hand, clear
+`user_modified_at` as well, so the remaining integration keeps it current
+again:
+
+```sql
+-- e.g. keep OPNsense, drop the UniFi claim
+UPDATE ip_address
+SET unifi_controller_id = NULL, user_modified_at = NULL
+WHERE id = '<id from the query>';
+```
+
+Leave `user_modified_at` alone if someone did edit the row, or their
+hostname, description and MAC will be overwritten on the next sync. Edits
+made in SQL bypass the audit log.
+
+---
+
 ## `/health/platform` says `celery-beat` is unhealthy
 
 **Read the component name as a symptom, not a diagnosis.** Beat only

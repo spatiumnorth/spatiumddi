@@ -41,6 +41,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
+from app.services.integration_ownership import owned_by_other_integration, owning_integration
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
@@ -533,16 +534,7 @@ async def _apply_blocks_and_subnets(
         net_key = str(s.network)
         if s.proxmox_node_id == node.id:
             current_subnets[net_key] = s
-        elif (
-            s.proxmox_node_id is None
-            and s.kubernetes_cluster_id is None
-            and s.docker_host_id is None
-            and s.tailscale_tenant_id is None
-            and s.unifi_controller_id is None
-            and s.panos_firewall_id is None
-            and s.fortinet_firewall_id is None
-            and s.meraki_org_id is None
-        ):
+        elif owning_integration(s) is None:
             operator_subnets[net_key] = s
         else:
             foreign_subnets[net_key] = s
@@ -584,10 +576,9 @@ async def _apply_blocks_and_subnets(
             summary.subnets_matched += 1
             continue
 
-        # Another integration (Kubernetes / Docker / Tailscale / UniFi)
-        # already owns this CIDR. We don't duplicate it and we don't
-        # try to wrest it away — the operator should resolve the
-        # cross-integration overlap deliberately.
+        # Another integration already owns this CIDR. We don't duplicate
+        # it and we don't try to wrest it away — the operator should
+        # resolve the cross-integration overlap deliberately.
         if net_str in foreign_subnets:
             summary.warnings.append(
                 f"subnet {net_str} already exists, owned by another integration; not creating duplicate"
@@ -722,13 +713,7 @@ async def _apply_addresses(
                     f"address {row.address} owned by another Proxmox endpoint; not claiming"
                 )
                 continue
-            if (
-                row.kubernetes_cluster_id is not None
-                or row.docker_host_id is not None
-                or row.panos_firewall_id is not None
-                or row.fortinet_firewall_id is not None
-                or row.meraki_org_id is not None
-            ):
+            if owned_by_other_integration(row, "proxmox_node_id"):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"
                 )
