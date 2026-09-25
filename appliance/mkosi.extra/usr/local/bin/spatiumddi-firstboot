@@ -1393,6 +1393,16 @@ fi
 # schedulable, and nothing is lost permanently: firstboot re-renders this
 # manifest from scratch on every boot, so the ranking comes back on the first
 # boot where bootstrap is healthy.
+#
+# #1123 — this is the SECOND line now, not the first. Unranking the control
+# chart alone does not keep the UI up when the CNPG operator also has to be
+# re-created: the operator ships in spatium-bootstrap and names the same class,
+# so its pods are refused too, and the control chart's install then fails on
+# the operator's webhook. reassert_control_plane_class runs before this on the
+# readyz path and has spatium-bootstrap put the class back when the class is
+# all that is missing; stripping is what remains when it cannot (bootstrap not
+# deployed or its install Job not completed, the apiserver not answering, the
+# class not back in time).
 _strip_control_priority_class() {
     # Tolerant of indentation on purpose — the pattern has to keep matching
     # what _render_control_helmchart emits, and that pairing is asserted by
@@ -1560,6 +1570,85 @@ place_deferred_tls_manifest() {
     echo "Placed self-signed TLS Secret manifest at $TLS_CERT_MANIFEST"
 }
 
+# #1123 — put spatium-control-plane back BEFORE the control chart is released.
+#
+# release_control_manifest's degraded path covers the CONTROL chart only. The
+# same class is named by spatium-bootstrap's own workloads — the CloudNativePG
+# operator (``cnpg.priorityClassName`` in the spatiumddi-appliance chart) and
+# the supervisor DaemonSet — and nothing degrades those. With the class gone,
+# the operator's pods cannot be re-created once they are lost (a node loss
+# evicts them within ~20 s on a cluster; a drain or a pressure eviction does it
+# on one node): the ReplicaSet is refused at admission, cnpg-webhook-service
+# has no endpoints, the control chart's Cluster CR is refused by the mutating
+# webhook, and helm-controller's default ``reinstall`` policy uninstalls
+# spatium-control on every retry. The UI never comes up, unranked or not.
+#
+# The class is spatium-bootstrap's own object, so that release is what puts it
+# back: re-running its helm-install Job (the lever spatiumddi-helm-stuck-recover
+# already pulls) upgrades a deployed release in place, and the upgrade creates
+# whatever object of the release is missing. Guarded so it only ever acts on
+# the one state it exists for:
+#   * an explicit NotFound — an apiserver that did not answer proves nothing;
+#   * spatium-bootstrap ``deployed`` — a first boot's release is still
+#     installing, and creates the class itself during the webhook wait below;
+#   * its install Job COMPLETED — the one state in which a re-run is ours to
+#     start. A running Job is mid-helm (deleting it leaves the release
+#     pending-upgrade); a retrying, failed or just-created one is
+#     helm-controller's own run. The release check cannot tell those apart:
+#     after a failed or interrupted upgrade Helm keeps the previous revision
+#     ``deployed`` (it supersedes a revision only once the next one succeeds)
+#     while klipper-helm acts on the latest, so deleting that Job would fire
+#     the reinstall policy in the middle of a boot. That state is left to
+#     helm-controller's retries and helm-stuck-recover; this only waits.
+# Silent unless it acts. The not-deployed case is EVERY first boot — the
+# release is still installing and creates the class itself during the webhook
+# wait below — so a WARN there would be a false alarm on every install; if the
+# class is still missing when the chart is released, release_control_manifest
+# says so, and points at spatium-bootstrap.
+# Bounded, and never fatal: when the class does not come back the control
+# chart is still released unranked below, exactly as before.
+reassert_control_plane_class() {
+    local out up
+    node_is_cluster_member && return 0
+    [ -f "${CONTROL_MANIFEST}.deferred" ] || [ -f "$CONTROL_MANIFEST" ] || return 0
+    out=$(/usr/local/bin/k3s kubectl get priorityclass spatium-control-plane -o name 2>&1) && return 0
+    case "$out" in
+        *NotFound*|*"not found"*) ;;
+        *) return 0 ;;
+    esac
+    /usr/local/bin/k3s kubectl -n spatium get secret \
+        -l owner=helm,name=spatium-bootstrap,status=deployed -o name 2>/dev/null \
+        | grep -q . || return 0
+    if [ "$(/usr/local/bin/k3s kubectl -n kube-system get job helm-install-spatium-bootstrap \
+            -o jsonpath='{.status.succeeded}' 2>/dev/null)" = 1 ]; then
+        echo "PriorityClass spatium-control-plane is absent — re-running the spatium-bootstrap release to re-create it…"
+        /usr/local/bin/k3s kubectl -n kube-system delete job helm-install-spatium-bootstrap \
+            --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    else
+        echo "PriorityClass spatium-control-plane is absent — spatium-bootstrap's install Job has not completed; waiting for helm-controller's own run…"
+    fi
+    up=0
+    for _ in $(seq 1 36); do   # up to 3 min
+        if /usr/local/bin/k3s kubectl get priorityclass spatium-control-plane >/dev/null 2>&1; then
+            up=1
+            break
+        fi
+        sleep 5
+    done
+    if [ "$up" != 1 ]; then
+        echo "WARN: spatium-bootstrap did not re-create PriorityClass spatium-control-plane within 3 min." >&2
+        return 0
+    fi
+    echo "PriorityClass spatium-control-plane re-created by spatium-bootstrap."
+    # Every create refused while the class was gone put its controller on the
+    # ReplicaSet / StatefulSet / DaemonSet controllers' exponential backoff —
+    # up to ~16 min before the next attempt. An update event re-queues it now;
+    # the annotation is metadata only and changes no pod template.
+    /usr/local/bin/k3s kubectl -n spatium annotate replicasets,statefulsets,daemonsets --all \
+        "spatium.io/priority-class-reasserted=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite \
+        >/dev/null 2>&1 || true
+}
+
 place_deferred_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
@@ -1602,6 +1691,7 @@ if [ "$ready" = 1 ]; then
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     place_deferred_tls_manifest
+    reassert_control_plane_class || true
     place_deferred_control_manifest
     commit_slot_if_healthy
     # #779 — immediate first verdict on Web UI firewall reachability, so a

@@ -796,6 +796,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A boot with the control-plane PriorityClass missing no longer
+  loops the control plane (#1123).** `spatium-control-plane` is
+  rendered by the `spatium-bootstrap` release, and firstboot's
+  degraded path (#983) released the control chart without it when
+  it was absent — but that release's own CloudNativePG operator
+  names the same class, and nothing degraded it. Once the operator's
+  pods had to be re-created (a cluster node loss evicts them within
+  ~20 s; a drain or a pressure eviction does it on one node), its
+  ReplicaSet was refused at admission, `cnpg-webhook-service` had no
+  endpoints, the unranked control chart's `Cluster` was refused by
+  that webhook, and helm-controller's `reinstall` policy uninstalled
+  and reinstalled `spatium-control` on every retry: the Web UI never
+  came up, unranked or otherwise. firstboot now has
+  `spatium-bootstrap` put the class back before it releases the
+  control chart — on an explicit NotFound, with the release
+  `deployed` and its helm-install Job completed, it re-runs that
+  Job (the lever `spatiumddi-helm-stuck-recover` already uses; a
+  running or retrying Job is left to helm-controller), waits up to
+  3 min for the class, then re-queues every ReplicaSet, StatefulSet and
+  DaemonSet in `spatium` with a metadata-only annotation so the
+  creates the apiserver refused are retried now rather than on the
+  controllers' exponential backoff (up to ~16 min). Releasing the
+  control chart unranked stays as the fallback when the class does
+  not come back.
+
 - **DNS agent: `noerror` counted every authoritative NXDOMAIN answer too
   (#1116).** The poller derived the rcode breakdown from BIND's nsstat
   answer classes and read `noerror` from `QryAuthAns` + `QryNoauthAns` —
