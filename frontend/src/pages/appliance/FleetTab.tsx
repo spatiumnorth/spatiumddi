@@ -4312,7 +4312,7 @@ function PodLogsModal({
     <Modal title={`Pod logs · ${appliance.hostname}`} onClose={onClose} wide>
       <div className="space-y-2 text-sm">
         <p className="text-xs text-muted-foreground">
-          Snapshot via the kubeapi proxy (Phase 4 channel) — same as{" "}
+          Snapshot via the kubeapi proxy — same as{" "}
           <code>kubectl logs --tail={tailLines}</code>. For continuous
           follow-mode, ssh to the appliance + run <code>kubectl logs -f</code>{" "}
           directly.

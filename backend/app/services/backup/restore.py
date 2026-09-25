@@ -560,8 +560,9 @@ async def apply_backup_restore(
 
     if selective and dump_format != "custom":
         raise BackupRestoreError(
-            "selective restore requires a Phase 2+ archive (dump_format=custom). "
-            "This archive is plain SQL — only full restore is supported."
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
         )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:

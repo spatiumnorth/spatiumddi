@@ -11,11 +11,14 @@ import hmac
 import json
 import os
 import uuid
+import zlib
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
@@ -23,15 +26,23 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
     dns_wake_channels,
     wake_subscription,
 )
 from app.core.http_etag import etag_matches, format_etag
+from app.core.redis_client import make_async_redis
 from app.drivers.dns import get_driver as get_dns_driver
+from app.metrics import (
+    AGENT_BUNDLE_INLINE_FAILURES,
+    AGENT_BUNDLE_INLINE_RENDERS,
+    AGENT_BUNDLE_SERVED,
+)
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DNSAgentBundle,
     DNSKey,
     DNSRecordOp,
     DNSServer,
@@ -52,13 +63,17 @@ from app.services.agents.ingest_receipt import (
     duplicate_response,
 )
 from app.services.agents.spool_status import apply_reported_spool
-from app.services.dns.agent_config import build_config_bundle
+from app.services.dns import agent_bundle_store as bundle_store
+from app.services.dns.agent_bundle_render import render_and_store
+from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
+from app.services.dns.agent_config import page_pending_ops
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
     needs_rotation,
     verify_agent_token,
 )
+from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
@@ -376,6 +391,194 @@ async def agent_register(
     )
 
 
+_BODY_CHUNK = 64 * 1024
+
+
+def _bundle_prefix(etag: str, ops: list[dict[str, Any]], remaining: int) -> bytes:
+    """The per-poll head of the response: ``etag`` and the ops page, in the
+    #958 wire shape. This ``json.dumps`` of at most ``dns_agent_ops_batch``
+    small dicts is the only serialisation left on the request loop."""
+    return (
+        b'{"etag":'
+        + json.dumps(etag).encode("utf-8")
+        + b',"pending_record_ops":'
+        + encode_body(ops)
+        + b',"pending_ops_remaining":'
+        + str(int(remaining)).encode("ascii")
+        + b","
+    )
+
+
+def _iter_bundle_bytes(prefix: bytes, body_gz: bytes) -> Iterator[bytes]:
+    """Stream ``prefix`` + the stored body minus its opening brace.
+
+    The stored body is a JSON object, so dropping its first byte and
+    concatenating yields one object with the per-poll keys first. A sync
+    iterator: Starlette runs it in its threadpool, so gunzipping a 26 MB
+    body never blocks the event loop and never exists whole in memory.
+    """
+    yield prefix
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    opened = False
+    for offset in range(0, len(body_gz), _BODY_CHUNK):
+        out = inflater.decompress(body_gz[offset : offset + _BODY_CHUNK])
+        if not opened and out:
+            out = out[1:]
+            opened = True
+        if out:
+            yield out
+    tail = inflater.flush()
+    if not opened and tail:
+        tail = tail[1:]
+    if tail:
+        yield tail
+
+
+def _bundle_response(
+    bundle: DNSAgentBundle, body_gz: bytes, ops: list[dict[str, Any]], remaining: int
+) -> StreamingResponse:
+    return StreamingResponse(
+        _iter_bundle_bytes(_bundle_prefix(bundle.etag, ops, remaining), body_gz),
+        media_type="application/json",
+        headers={"ETag": format_etag(bundle.etag)},
+    )
+
+
+class _InlineRenderFailed(Exception):
+    """The api's inline attempt raised; the poll falls back to the worker."""
+
+
+async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
+    """Migration-release fallback: build in the request as before, store it.
+
+    Once per (server, version) — the store is idempotent on the watermark
+    and a concurrent render (another replica, or the worker) simply wins;
+    then this poll serves the row that won.
+
+    A render that raises here is the api's opportunistic attempt, not the
+    control plane's verdict on the server's bundle, and is NOT recorded on
+    the server row. At a million records the records query outlives the
+    api's 30 s ``command_timeout`` on every attempt: recorded, each one
+    stamped ``bundle_render_status = failed`` (firing
+    ``agent_bundle_render_failed`` while the worker was rendering fine) and
+    kept the render-missing sweep backing off the server for its 5-minute
+    failed window, re-stamped by every poll — so a lost or crashed worker
+    render of that server was never retried. The failure is logged and
+    counted instead, and the caller holds the poll on the worker's render.
+    """
+    server_id = server.id  # a rollback expires the instance
+    try:
+        outcome = await render_and_store(db, server, rendered_by=RENDERED_BY_API)
+    except Exception as exc:
+        await db.rollback()
+        AGENT_BUNDLE_INLINE_FAILURES.labels(family="dns").inc()
+        logger.warning(
+            "dns_agent_bundle_inline_render_failed",
+            server_id=str(server_id),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise _InlineRenderFailed from exc
+    # Commit now: the stored row serves every other poller of this server.
+    await db.commit()
+    if outcome.bundle is not None:
+        AGENT_BUNDLE_INLINE_RENDERS.labels(family="dns").inc()
+        return outcome.bundle
+    await db.refresh(server)
+    return await bundle_store.newest(db, server)
+
+
+# A bundle read by a poll can be pruned before its body is loaded when two
+# newer renders store in between (``bundle_store.load_body``). The poll then
+# serves the newest; this bounds how often one poll re-reads before it falls
+# back to waiting for the next wake.
+_PRUNED_RETRIES = 3
+
+_INLINE_LOCK_PREFIX = "spatium:bundle:inline:"
+_INLINE_BACKOFF_PREFIX = "spatium:bundle:inline-backoff:"
+# Longer than any inline attempt: the records query alone is capped by the
+# api's 30 s command_timeout, the serialisation and store follow it.
+_INLINE_LOCK_SECONDS = 180
+_RELEASE_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _inline_eligible(server: DNSServer) -> bool:
+    """Whether the api may build this server's bundle itself, now.
+
+    A server that has never had a bundle: yes. Nothing is being raced, and
+    it is the case the fallback exists for (the upgrade from a release
+    before stored bundles brings every server in with none, and its worker
+    may still be that release). A server whose bundle is stale: only once
+    it has waited longer than the bound for the worker. The worker renders
+    every marked bundle within seconds and every render that lands restarts
+    ``bundle_dirty_at``, so while it keeps up no bundle waits past the bound
+    and the api builds nothing, however many changes a storm commits
+    (without the bound a 250k-record seed had the api build the growing
+    bundle 48 times, up to 480k records and 16 s each, beside the worker).
+    A bundle that is stale only because another release rendered it waits
+    for the sweep.
+    """
+    if server.bundle_watermark is None:
+        return True
+    if server.bundle_dirty_at is None:
+        return False
+    waited = (datetime.now(UTC) - server.bundle_dirty_at).total_seconds()
+    return waited >= settings.dns_agent_bundle_inline_fallback_after_seconds
+
+
+async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
+    """The inline fallback, bounded: eligible servers only, one attempt per
+    server at a time across replicas, none during a failed attempt's backoff.
+
+    Returns the bundle it rendered (or the row a concurrent render won with),
+    or ``None`` when it did not try. Raises ``_InlineRenderFailed`` when the
+    attempt failed, after starting the backoff. Redis is advisory: without it
+    the attempt is made unbounded, as the fallback always did.
+    """
+    if not _inline_eligible(server):
+        return None
+    sid = str(server.id)
+    lock_key = _INLINE_LOCK_PREFIX + sid
+    backoff_key = _INLINE_BACKOFF_PREFIX + sid
+    token = uuid.uuid4().hex
+    # Any: the redis stubs type eval() as ``Awaitable[str] | str``.
+    client: Any = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2.0)
+        if await client.exists(backoff_key) or not await client.set(
+            lock_key, token, nx=True, ex=_INLINE_LOCK_SECONDS
+        ):
+            await client.aclose()
+            return None
+    except Exception as exc:  # noqa: BLE001 — advisory: render unbounded
+        logger.warning("dns_agent_bundle_inline_lock_unavailable", error=str(exc))
+        client = None
+    try:
+        return await _render_inline(db, server)
+    except _InlineRenderFailed:
+        if client is not None:
+            try:
+                await client.set(
+                    backoff_key,
+                    "1",
+                    ex=max(1, int(settings.dns_agent_bundle_inline_fallback_backoff_seconds)),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    finally:
+        if client is not None:
+            try:
+                await client.eval(_RELEASE_IF_OWNER, 1, lock_key, token)
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     db: DB,
@@ -388,6 +591,54 @@ async def agent_config_longpoll(
     Returns 304 if the server's current bundle matches If-None-Match.
     Otherwise holds the connection up to LONGPOLL_TIMEOUT_SECONDS waiting for
     any change, then returns the current bundle with a new ETag.
+
+    #1111 — the bundle is no longer assembled here. It is rendered once per
+    (server, watermark) by the worker (``app.tasks.agent_bundles``) and
+    stored in ``dns_agent_bundle``; this handler reads one small row per
+    wake, compares ``If-None-Match`` with the stored ETag, splices the
+    per-server ops page in front of the stored bytes and streams them. No
+    assembly and no 26 MB string on the request loop whatever the group's
+    record count, and one build per change instead of one per agent per
+    change (it used to be one per agent per wake, and one per PAGE while
+    ops were pending).
+
+    The agents' contract is unchanged: weak ETag / 304 / the body shape /
+    the "200 while ops are pending" fast path / ``structural_etag`` / the
+    #882 quarantine. One deliberate difference: the ETag is the stored
+    body's and no longer folds the ops page in, so a page does not rotate
+    it — the fast path answers 200 with the same ETag and the next page,
+    and the poll after the last ack answers 304 instead of re-sending the
+    whole body. The agent never short-circuits on an unchanged ETag (it
+    saves, compares ``structural_etag``, drains the ops), so nothing on its
+    side changes.
+
+    The ops page is gated to what the stored bundle's snapshot covers: an
+    op whose transaction had not committed when its render read rides with
+    the next render, whose dirty mark its own commit made. Every body an
+    agent holds is therefore a superset of every op it has applied — the
+    invariant the inline build had by construction, and what keeps a later
+    structural re-render (or a restart replaying the cached bundle) from
+    dropping a record the agent already applied incrementally.
+
+    The newest bundle this release stored is served even when changes have
+    been committed since it was rendered (``bundle_store.newest``). Under a
+    write storm marks arrive faster than renders finish, so no render is
+    current until the writes stop; serving only a current one held every
+    agent on its last config for the whole storm. Now each render the
+    worker lands reaches the agents, at most one render behind; that is
+    safe because of the gate above. A bundle that is not current also has
+    its render enqueued (the worker coalesces duplicates), and the poll
+    holds on the wake the worker publishes when one lands. With nothing
+    stored for this release the poll holds, 304 at the deadline.
+
+    While ``settings.dns_agent_bundle_inline_fallback`` is on (the
+    migration release, whose worker may still be one release behind), the
+    api renders inline, exactly the old build, but only where the worker
+    has not (``_inline_eligible``): a bundle stale for longer than
+    ``dns_agent_bundle_inline_fallback_after_seconds``, or a server that
+    has never had one. One attempt per server at a time, none during a
+    failed attempt's backoff, and a failed attempt leaves the poll on the
+    worker's renders like the fallback being off.
     """
     server, _payload = auth
     if server.pending_approval:
@@ -395,64 +646,82 @@ async def agent_config_longpoll(
         return {"pending_approval": True, "etag": None}
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
-    # #358 — subscribe to this agent's wake channels BEFORE the first
-    # bundle build so a mutation that commits + publishes during this
-    # request can't land in the gap. A wake collapses the re-poll
-    # latency; with Redis down the subscription degrades to the old
-    # ``LONGPOLL_POLL_INTERVAL`` sleep, so behaviour is unchanged.
+    enqueued = False
+    inline_tried = False
+    pruned_retries = 0
+    # #358 — subscribe to this agent's wake channels BEFORE the first read so
+    # a change (or a render) that commits + publishes during this request
+    # can't land in the gap. A wake collapses the re-poll latency; with
+    # Redis down the subscription degrades to the old poll interval.
     async with wake_subscription(dns_wake_channels(server)) as wake:
         while True:
-            # Pick up server-row column changes a wake may be signalling
-            # (group_id, etc.) — build_config_bundle re-queries zones /
-            # records fresh, but server attributes are read off this
-            # cached instance (expire_on_commit=False, no in-loop commit).
+            # The server row carries the dirty sequence and the watermark of
+            # the newest stored bundle; refresh it so a change committed on
+            # any replica, or the worker's store, is seen here
+            # (expire_on_commit=False, no in-loop commit).
             await db.refresh(server)
-            bundle = await build_config_bundle(db, server)
-            etag = bundle["etag"]
-            # Early return if there are pending ops (fast-path per §3)
-            has_pending_ops = bool(bundle.get("pending_record_ops"))
-            if not etag_matches(if_none_match, etag) or has_pending_ops:
-                server.last_config_etag = etag
-                await db.commit()
-                # Serialise ONCE and hand the bytes back. Returning the dict
-                # sends it through FastAPI's jsonable_encoder, which walks and
-                # copies the whole structure — for a 250k-record group that is
-                # 500k record dicts duplicated on the request loop before the
-                # JSON is even written, the difference between a bundle that
-                # fits the api's memory limit and one that is memcg-killed
-                # (appliance sizing campaign, 2026-09-03: the api still hit
-                # 4.18 GB twice serving the first bundle after the paged-ops
-                # and one-query-records fixes). json.dumps of the same dict
-                # is what the ETag already hashes.
-                #
-                # #958 — the kwargs are Starlette ``JSONResponse.render``'s,
-                # not ``json.dumps``'s. They are not cosmetic: the stock
-                # defaults put a space after every ``,`` and ``:``, which on
-                # the 250k-record bundle this path exists to shrink is
-                # +3.5 MB (+13.5%) of string built in-process, and escape
-                # non-ASCII to ``\uXXXX`` (six bytes a character instead of
-                # two) so an IDN or a UTF-8 record value inflates further.
-                # ``allow_nan=False`` restores the guardrail: Python's own
-                # ``json.loads`` ACCEPTS bare ``NaN``, so a stray float would
-                # round-trip control plane → agent unnoticed and fail only on
-                # a strict parser. With these, the body is byte-identical to
-                # what FastAPI sent before the switch.
-                return Response(
-                    content=json.dumps(
-                        bundle,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        separators=(",", ":"),
-                        default=str,
-                    ),
-                    media_type="application/json",
-                    headers={"ETag": format_etag(etag)},
-                )
+            # The newest bundle this release stored, current or not: under a
+            # write storm no render is current until the writes stop, and
+            # each one that lands is served as it lands (docstring).
+            bundle = await bundle_store.newest(db, server)
+            if not bundle_store.is_current(server):
+                if settings.dns_agent_bundle_inline_fallback and not inline_tried:
+                    try:
+                        rendered = await _bounded_inline(db, server)
+                        inline_tried = rendered is not None
+                        if rendered is not None:
+                            bundle = rendered
+                    except _InlineRenderFailed:
+                        # Once per poll: the worker's renders serve it instead.
+                        inline_tried = True
+                        await db.refresh(server)
+                        bundle = await bundle_store.newest(db, server)
+                if not enqueued and not bundle_store.is_current(server):
+                    await enqueue_renders([server.id])
+                    enqueued = True
+            if bundle is not None:
+                ops: list[dict[str, Any]] = []
+                remaining_ops = 0
+                if bundle.ships_ops:
+                    ops, remaining_ops = await page_pending_ops(
+                        db,
+                        server,
+                        up_to=bundle.snapshot_at,
+                        visible_xacts=bundle.visible_xacts,
+                    )
+                # Early return if there are pending ops (fast-path per §3)
+                if not etag_matches(if_none_match, bundle.etag) or ops:
+                    # The body before the commit, and never assumed: the
+                    # worker keeps dns_agent_bundle_keep_versions rows per
+                    # server, and under a write storm (the api's loop
+                    # saturated, this request waiting between statements)
+                    # two newer renders can store and prune this bundle
+                    # after it was read. The row being gone means a newer
+                    # render exists: undo this page's in_flight marks (it
+                    # was never shipped) and serve the newest instead of
+                    # answering 500.
+                    body_gz = await bundle_store.load_body(db, bundle)
+                    if body_gz is not None:
+                        server.last_config_etag = bundle.etag
+                        await db.commit()
+                        AGENT_BUNDLE_SERVED.labels(family="dns", outcome="full").inc()
+                        return _bundle_response(bundle, body_gz, ops, remaining_ops)
+                    await db.rollback()
+                    bundle = None  # expired by the rollback; never read again
+                    # Re-read and re-page from scratch: the page is gated to
+                    # the bundle it ships with, never reused. Bounded; past
+                    # the bound the poll waits for the next wake as usual.
+                    pruned_retries += 1
+                    if (
+                        pruned_retries <= _PRUNED_RETRIES
+                        and deadline - asyncio.get_running_loop().time() > 0
+                    ):
+                        continue
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                response.status_code = 304
-                response.headers["ETag"] = format_etag(etag)
-                return Response(status_code=304, headers={"ETag": format_etag(etag)})
+                headers = {"ETag": format_etag(bundle.etag)} if bundle is not None else {}
+                AGENT_BUNDLE_SERVED.labels(family="dns", outcome="not_modified").inc()
+                return Response(status_code=304, headers=headers)
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 

@@ -229,7 +229,7 @@ dhcpAgents:
 | `frontend.nginxLocalResolvers` | `""` (auto-detect) | DNS resolver IPs for nginx |
 | `worker.replicas` | `2` |  |
 | `worker.concurrency` | `4` |  |
-| `worker.queues` | `"ipam,dns,dhcp,default"` |  |
+| `worker.queues` | `"ipam,dns,dhcp,default,bundles"` |  |
 | `beat.*` | see values.yaml | Singleton scheduler |
 | `migrate.enabled` | `true` | Alembic Job as pre-install/pre-upgrade hook |
 | `ingress.*` | disabled |  |

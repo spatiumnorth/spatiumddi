@@ -62,7 +62,7 @@ spec:
             - --loglevel=info
             - --concurrency=4
             - -Q
-            - ipam,dns,dhcp,default
+            - ipam,dns,dhcp,default,bundles
           env:
             - name: POSTGRES_PASSWORD
               valueFrom:
