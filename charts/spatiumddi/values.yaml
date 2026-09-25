@@ -73,7 +73,10 @@ nameOverride: ""
 # upgrades. Override only if you're consolidating secret management.
 auth:
   secretKey: ""
-  existingSecret: ""             # must carry key `secret-key`
+  existingSecret: ""             # must carry key `secret-key`; `metrics-token` optional
+  # #1159 — bearer token /metrics accepts (any API token works too). Empty =
+  # generated on first install and kept across upgrades, like secretKey.
+  metricsToken: ""
 
 # ── API ──────────────────────────────────────────────────────────────────────
 api:

@@ -81,7 +81,9 @@ frontend:
 ```
 
 The frontend Pod's embedded nginx proxies `/api/` (plus `/health` and
-`/metrics`) to the api Service — same shape as Docker Compose. The
+`/metrics`) to the api Service — same shape as Docker Compose. `/metrics`
+answers only a bearer token: the scrape token the chart generates into its
+app Secret as `metrics-token`, or any API token (#1159). The
 upstream host + port come from values; the cluster DNS resolver is
 auto-detected from `/etc/resolv.conf` at container start. Defaults
 work out of the box (`{{ fullname }}-api` on `api.service.port`).

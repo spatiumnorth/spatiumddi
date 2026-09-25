@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.metrics import (
     REQUEST_COUNT,
     UNMATCHED_PATH,
@@ -82,11 +84,15 @@ def test_unmatched_paths_share_one_bucket() -> None:
     assert leaked == [], leaked
 
 
-def test_metrics_endpoint_renders_and_does_not_count_itself() -> None:
+def test_metrics_endpoint_renders_and_does_not_count_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1159 — the endpoint needs a bearer token now.
+    monkeypatch.setattr(settings, "prometheus_metrics_token", "labels-test-token")
     client = TestClient(_app())
     before = _count("GET", "/metrics", "200")
 
-    response = client.get("/metrics")
+    response = client.get("/metrics", headers={"Authorization": "Bearer labels-test-token"})
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")

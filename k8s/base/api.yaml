@@ -62,6 +62,14 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: secret-key
+            # #1159 — /metrics scrape token. Optional: without it only API
+            # tokens can scrape.
+            - name: PROMETHEUS_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: metrics-token
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
             - name: REDIS_URL
