@@ -442,7 +442,7 @@ frontend:
   affinity: {}
   podAnnotations: {}
 
-# ── Worker (Celery queues: ipam, dns, dhcp, default) ─────────────────────────
+# ── Worker (Celery queues: ipam, dns, dhcp, default, bundles) ─────────────────────────
 worker:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
@@ -470,7 +470,9 @@ worker:
   # here to replace the default entirely.
   topologySpreadConstraints: []
   concurrency: 4
-  queues: "ipam,dns,dhcp,default"
+  # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
+  # own worker (concurrency 1, its own memory cap) on large-record estates.
+  queues: "ipam,dns,dhcp,default,bundles"
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 1Gi }

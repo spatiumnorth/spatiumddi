@@ -107,6 +107,70 @@ the formatter handles the rest.
   (`status`, `duplicate`, plus their own counters), which retires
   them from the untyped-route baseline. Migration `c5e8a1f3d027`.
 
+- **DNS agent config bundles are rendered once, in the worker, and
+  served as stored bytes (#1111).** `GET /api/v1/dns/agents/config`
+  used to assemble the whole group — every record of every zone — in
+  the api request path, once per agent long-poll that observed a
+  change and once per page while ops were pending, with peak memory
+  proportional to the record count; at 1.09 M `dns_record` rows the
+  records query no longer fit asyncpg's 30 s `command_timeout` and
+  every poll of every agent answered 503 for as long as anyone
+  watched. The bundle is now rendered once per (server, watermark) by
+  a Celery task on a new `bundles` queue (add it to the worker's `-Q`
+  list on BYO deployments; the chart, `k8s/base` and both compose files
+  carry it) and stored in the new `dns_agent_bundle` table — gzip at
+  rest, the same ETags for the same state — and the long-poll streams
+  the stored bytes with the per-server ops page spliced in. A change
+  marks the bundle dirty in its own transaction (`bundle_dirty_seq` on
+  `dns_server`) — in the api and in the worker, whose tasks (pool
+  failover, ACME DNS-01, lease-expiry DDNS, IPAM auto-sync) write DNS
+  rows too — the worker coalesces renders per server, and a 30 s
+  sweep re-enqueues anything left behind. Only a change to something
+  the bundle renders marks it: the pool health check's timestamps, the
+  agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
+  settings stamps do not, because every mark costs a render. The
+  long-poll serves the newest bundle the running release stored, current
+  or not. Under a write storm no render is current until the writes
+  stop, and each one that lands reaches the agents. A bundle rendered by
+  a previous release is never served, so an upgrade re-renders each
+  server once. The ops page, and the queued ops a split-horizon render
+  retires, cover only the ops whose transaction had committed before the
+  render read (its `pg_current_snapshot()`, not the op's `created_at`,
+  which is its transaction's start). So a body can never lack a record
+  the agent already applied, and an ACME DNS-01 wait never sees an op
+  applied that no body carries. Render failures surface on the server row
+  (`bundle_render_status` / `_error` / `_at`, in the servers API) and
+  through the new `agent_bundle_render_failed` alert rule, seeded
+  enabled, which also fires when changes have waited 10 minutes with
+  no render landing (`bundle_dirty_at`) — a killed render or a worker
+  not consuming `bundles` never records a failure. The dirty mark's row
+  locks are taken once, at commit, in server-id order (held from the first
+  marking flush to the end of the transaction they stalled heartbeats and
+  deadlocked concurrent writers), and a savepoint's release or rollback
+  no longer pre-empts or drops the render enqueue. The render slot and
+  per-server lock are a 60 s lease renewed while the render runs and
+  released only by their holder, and a render waiting for the slot keeps
+  its lock so duplicates coalesce into it. The migration release keeps the
+  inline build as a fallback (`DNS_AGENT_BUNDLE_INLINE_FALLBACK`, on) for
+  deployments whose worker lags a release, bounded: only for a server that
+  has never had a bundle or whose bundle has waited more than 120 s for the
+  worker, one attempt per server at a time, 10 minutes of backoff after a
+  failure; a failed attempt waits for the worker instead of failing the
+  poll and is never recorded as the render verdict. Agents
+  need no change; one deliberate difference is that a page of ops no
+  longer rotates the ETag, so the poll after the last ack answers 304
+  instead of re-sending the whole body. Migrations `c4d1e7f90a2b`,
+  `d9a4c27e18f3` and `f3a9d61c07e4` (additive: one table, fourteen
+  nullable-or-defaulted columns, no table rewrite).
+- **The bundle's records query orders by the `(zone_id, name)` index
+  prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
+  UUID, so the planner sorted the whole table on every build. The
+  order is now the index prefix plus every other shipped column — a
+  total order over what the payload carries, so the ETag stays stable
+  without `id`. Every agent's ETag rotates once on the first poll after
+  upgrade (one full-body fetch; a full re-render only under
+  split-horizon, where records are structural).
+
 ### Changed
 
 - **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on

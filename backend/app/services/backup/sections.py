@@ -252,6 +252,10 @@ SECTIONS: tuple[Section, ...] = (
             "dns_server_options",
             "dns_server_runtime_state",
             "dns_server_zone_state",
+            # #1111 — the per-server stored config bundle (bytes + the dirty
+            # watermark it was rendered at); cascades from dns_server, so it
+            # restores and truncates with the server it belongs to.
+            "dns_agent_bundle",
             "dns_zone",
             "dns_record",
             "dns_view",
