@@ -19,17 +19,19 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import DB, SuperAdmin
+from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSRecord, DNSZone
+from app.models.ipam import Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
     remove_ipam_for_scope_statics,
 )
 from app.services.dhcp.windows_writethrough import push_scope_restore
-from app.services.dns.record_ops import push_records_restore
+from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -348,7 +350,10 @@ async def permanent_delete_from_trash(
 
     It does still have to release the IPAM mirror of any reservation it is about
     to destroy: the rows go via FK CASCADE, which runs no Python, so nothing else
-    would (#618).
+    would (#618). The same goes for a subnet's addresses and the DNS records
+    IPAM published for them: the addresses cascade, the records only lose their
+    ``ip_address_id`` (SET NULL) and stay published — so they are withdrawn
+    first (spatiumddi#1151).
     """
 
     if type not in SOFT_DELETE_RESOURCE_TYPES:
@@ -368,6 +373,8 @@ async def permanent_delete_from_trash(
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
     label = _row_label(target)
+    records_retracted = 0
+    dns_wake_group_ids: set[uuid.UUID] = set()
     if isinstance(target, DHCPScope):
         # Delete the reservation mirror rows (not just free them) so the IPs fold
         # back into free gaps, and purge any dynamic leases still pointing here —
@@ -375,6 +382,13 @@ async def permanent_delete_from_trash(
         # first soft-delete normally already cleaned both up).
         await remove_ipam_for_scope_statics(db, target.id)
         await delete_leases_for_scope(db, target.id)
+    elif isinstance(target, Subnet):
+        # spatiumddi#1151 — the subnet's addresses go with it (FK CASCADE); the
+        # auto-generated A / AAAA / PTR / alias records IPAM published for them
+        # would survive as ownerless rows the agents keep serving. Withdraw
+        # them first, through the record-op queue. (A block or space can't
+        # reach addresses from here: subnet.block_id / space_id are RESTRICT.)
+        records_retracted, dns_wake_group_ids = await retract_address_records(db, [target.id])
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -385,7 +399,13 @@ async def permanent_delete_from_trash(
             resource_id=str(target.id),
             resource_display=label,
             result="success",
+            new_value=({"dns_records_retracted": records_retracted} if records_retracted else None),
         )
     )
     await db.delete(target)
     await db.commit()
+    # This router carries no wake_publishing dependency, so the enqueue's
+    # collect_wake had no collector; tell the agents now the ops are committed
+    # instead of leaving them to the safety tick.
+    for gid in dns_wake_group_ids:
+        await publish_wake(dns_group_channel(gid))

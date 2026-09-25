@@ -310,13 +310,16 @@ def test_the_worker_process_installs_the_listener() -> None:
     installed whatever the worker does — which is how the worker running
     WITHOUT it went unnoticed: pool failover, ACME DNS-01, lease-expiry
     DDNS and IPAM auto-sync all write from Celery tasks. So probe the
-    worker's own import graph in a fresh interpreter: import the Celery app
-    and every module in its ``include`` list, exactly as ``celery worker``
-    does at startup, and ask whether the listener module is loaded."""
+    worker's own startup in a fresh interpreter: import the Celery app and
+    every module in its ``include`` list, then send ``worker_init``, exactly
+    as ``celery worker`` does before its pool forks (#1189), and ask whether
+    the listener module is loaded."""
     probe = (
         "import sys\n"
+        "from celery.signals import worker_init\n"
         "from app.celery_app import celery_app\n"
         "celery_app.loader.import_default_modules()\n"
+        "worker_init.send(sender=None)\n"
         "assert 'app.main' not in sys.modules, 'probe must not load the api'\n"
         "print('LOADED' if 'app.services.dns.bundle_dirty' in sys.modules else 'MISSING')\n"
     )
@@ -332,7 +335,7 @@ def test_the_worker_process_installs_the_listener() -> None:
     assert proc.returncode == 0, f"worker import probe failed to run:\n{proc.stderr[-2000:]}"
     assert proc.stdout.strip().splitlines()[-1] == "LOADED", (
         "a Celery worker does not install the bundle dirty-mark listener; "
-        "import it from app.celery_app"
+        "list it in app.services.session_listeners.SESSION_LISTENER_MODULES"
     )
 
 

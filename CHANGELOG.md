@@ -201,6 +201,56 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Typed webhook events and audit forwarding were lost for anything a
+  Celery task committed (#1168).** Two faults. The worker never loaded
+  `event_publisher`: session listeners register on import, and only the
+  api imported them. And loading it was not enough. Both it and
+  `audit_forward` handed their after-commit work to a bare
+  `loop.create_task`, and in a Celery task that loop is the task's own
+  `asyncio.run`, which cancels pending work when the task returns. A task
+  usually commits last. Measured on a scratch database, five task-shaped
+  `backup_target_run_failed` commits wrote 0 of 5 outbox rows (5 of 5
+  with the fix). So scheduled backups and rolling upgrades sent no
+  `system.backup_*` / `system.upgrade.*` webhooks, and syslog/webhook
+  audit forwarding lost what tasks wrote last. Both processes now
+  install one listener list (a guard fails when a new listener module
+  isn't on it). In Celery processes the after-commit work runs on a
+  per-process background loop, switched on from `worker_init` /
+  `beat_init` and started lazily per PID for prefork children.
+
+- **The worker's liveness probe no longer loads every model (#1189).**
+  The session listeners, now including the DNS bundle dirty-mark from
+  #1111, were installed when `app.celery_app` was imported, and the
+  worker's liveness probe (`celery -A app.celery_app inspect ping`,
+  10 s timeout) imports it on every run. That pulled in the models,
+  the DNS drivers, httpx, cryptography and jinja2: 1,002 modules
+  against 744, and under load a three-node cluster's worker missed the
+  probe 14 times in 28 minutes and restarted once. They are installed
+  from `worker_init` / `beat_init` now, which the prefork pool
+  inherits, and a test fails if a bare import loads them again.
+
+- **Two appliances in one Kea HA group could not reach each other
+  (#1167).** Kea's HA hook listens on the port in each member's own
+  `ha_peer_url`, and no appliance firewall layer opened it under the
+  `input` chain's drop policy. The control plane now puts the port and
+  the group's other Kea members' addresses on the role assignment:
+  the IP in the member's URL, else its appliance's node IPs, else its
+  agent's last address. All three firewall renderers open the port to
+  exactly those sources, never to `any`, because Kea's HA API is
+  unauthenticated by default and accepts lease updates. The rule
+  follows the HA hook's own readiness rule, so the port is open
+  exactly while Kea listens. Also fixed: TOPOLOGIES.md and DOCKER.md
+  told operators to set `ha_peer_url` to the *other* peer's URL. It is
+  each server's *own* listener URL.
+
+- **A looking-glass node lost TCP 179 when fleet firewall enforcement
+  was on (#1166).** Only the supervisor's own renderer opened BGP for
+  the role. The backend port table had no entry and no builtin policy
+  existed, so under enforcement every session the router initiated
+  was dropped. The byte-identity test had no looking-glass case to
+  catch it. Now all three renderers carry it: seed migration
+  `b8e2d5c07a14`, plus two looking-glass cases in the test matrix.
+
 - **Relayed DHCPv6 never reached Kea on the appliance (#1139,
   #1140).** Two faults in series, so fixing either alone changed nothing.
   **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
@@ -285,6 +335,81 @@ the formatter handles the rest.
   a Vitest check over every string and JSX text in the frontend, and
   a backend test over the built-in role and Copilot tool
   descriptions.
+
+- **A subnet that inherits its DNS now gets its reverse zone
+  (#1149).** Getting Started promises the matching `in-addr.arpa` /
+  `ip6.arpa` zone once a subnet has an effective DNS group or zone,
+  but subnet create decided from the request body and the subnet's
+  own columns only — so a subnet left on **Inherit from parent** (the
+  console's default, which sends no DNS fields at all) never got one,
+  and no address in it ever got a PTR. The per-allocation catch-up and
+  the reverse-zone backfill (the first step of **Sync DNS**) had the
+  same blind spot. All three now fall back to the DNS the subnet
+  inherits from its block or space when it names none of its own. A
+  subnet with its own binding resolves exactly as before,
+  `skip_reverse_zone` still opts out at create, and the #844 refusal
+  to share a reverse zone with an overlapping subnet in another IP
+  space applies however the group was found. An existing inheriting
+  subnet gets its reverse zone on its next allocation or **Sync DNS**.
+
+- **A new subnet no longer starts "1 DNS record out of sync"
+  (#1150).** Subnet create adds the network, broadcast and gateway
+  placeholder rows and never published the gateway's PTR, so under a
+  reverse zone every new subnet opened with the gateway's PTR missing
+  — the drift banner on day one, and `gateway.<zone>` unresolvable in
+  reverse until someone ran **Sync DNS**. The gateway's PTR is now
+  published at create (still no forward `gateway.<zone>` A record, by
+  design), into the subnet's auto-created reverse zone or whichever
+  reverse zone covers it; `skip_reverse_zone` still creates no zone.
+  The subnet planner's apply built the same placeholder and ran
+  neither DNS step; a planned subnet now gets its reverse zone and
+  gateway PTR at apply, the same as one created directly.
+
+- **Purging a subnet takes its DNS records off the wire (#1151).** A
+  subnet's addresses cascade away when it is deleted for good, but
+  `dns_record.ip_address_id` is `SET NULL`, and neither Trash purge —
+  **Delete permanently** in Trash, or the daily sweep after the
+  retention window — withdrew anything first. Every A record IPAM had
+  published for those addresses (and their PTRs in a reverse zone a
+  sibling subnet kept, extra-zone records and aliases) stayed in its
+  zone, ownerless, and BIND kept answering for addresses IPAM no
+  longer had. Both paths now withdraw every auto-generated record of
+  the subnet's addresses through the record-op queue before the
+  delete, and wake the agents; the direct permanent delete
+  (`?permanent=true`), which withdrew only each address's primary A,
+  does the same. Only what is really going is touched: records made
+  by hand stay, a sibling subnet's records stay, and a subnet still
+  inside the retention window — or restored from Trash — keeps every
+  record. Records already orphaned by an earlier purge are not swept
+  up automatically; **Sync DNS** on a subnet whose zones hold them
+  lists them as stale and withdraws them.
+
+- **The subnet delete dialog says what a delete does (#1152).** Its
+  Danger zone text said the subnet's IP address rows are removed;
+  they are not — the addresses you allocated stay with the trashed
+  subnet, come back on restore, and their A/AAAA records keep
+  resolving while it sits in Trash — and the confirmation step named
+  only the subnet and its DHCP scopes. Both now say what happens:
+  the subnet, its scopes and the reverse zone created for it move to
+  Trash; DHCP lease and reservation addresses are removed at once
+  with their DNS records (reservations return with their scope);
+  purging the subnet deletes its addresses and withdraws their DNS
+  records. Copy only — what a trashed subnet should publish is
+  unchanged.
+
+- **firstboot no longer runs the words of its own #1042 comment as
+  commands (#1132).** `_render_control_helmchart` writes the
+  `spatium-control` HelmChart through an unquoted here-document, so
+  the shell expands everything inside it, and the #1042 comment there
+  wrapped ten words in single backticks. `/bin/sh` ran each one as a
+  command substitution, as root, on every boot: ten `...: not found`
+  lines per boot in `/var/log/spatiumddi/firstboot.log`, and the
+  comment reached the live HelmChart with those words deleted. No
+  command by those names is on the appliance's `PATH`, so nothing
+  ran. The words are now quoted, so the comment renders as written
+  and the HelmChart object is unchanged. A new test renders the chart
+  under dash and scans every unquoted here-document in firstboot for
+  a backtick substitution.
 
 - **A Kea lease in the "released" state was mirrored as active
   (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
@@ -943,6 +1068,42 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **The interactive API docs load through the web port again, and
+  the appliance's HTTPS web tier sends the #400 security headers
+  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
+  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
+  started from an inline `<script>`. The web tier's CSP (#400) allows
+  scripts from the page's own origin only. So on Docker Compose, and
+  on Helm without `frontend.tls.enabled`, the console's API docs
+  links opened blank pages, and an air-gapped install could not load
+  them on any port. The api now serves both bundles itself from
+  `backend/app/static/api-docs/`: byte-for-byte copies of
+  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
+  Swagger's initializer is a static file. Scripts stay `'self'`
+  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
+  search index) and load its footer logo from cdn.redoc.ly, which it
+  hides when offline. **The appliance's TLS config sent none of the
+  #400 headers.** #400 put them in the pre-k3s appliance nginx
+  config, which #194 had already orphaned, so
+  `frontend-tls-config.yaml` never had them. It now sends the same
+  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
+  and Referrer-Policy as the image's template, re-emitted on every
+  location with headers of its own. It also sends
+  `Strict-Transport-Security: max-age=31536000` without
+  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
+  bare IP and over a certificate warning, so it only takes hold on a
+  hostname with a trusted certificate.
+
+- **An API token used only for reads now records that it was used
+  (#1158).** `last_used_at` was set on the request's database session
+  and left for the handler to commit. Read handlers never commit, so a
+  monitoring, inventory or export token showed "Last Used: —" forever,
+  while its first write set it. Operators hunting for stale tokens
+  could revoke live ones. The use is now written in a short-lived
+  transaction of its own, at most once a minute per token, the cadence
+  the session path keeps for `last_seen_at`. A handler that rolls back
+  cannot undo it, and a failed write never fails the request.
 
 - **Every shipped image now patches its base image's own packages
   (#1088).** The nightly of 2026-09-14 refused to publish the api

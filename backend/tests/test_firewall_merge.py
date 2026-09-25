@@ -243,6 +243,7 @@ def test_builtin_set_shape() -> None:
         "dns-powerdns",
         "dns-technitium",
         "dhcp",
+        "looking-glass",
         "control-plane",
         "observer",
         "custom",
@@ -283,6 +284,7 @@ _SEED_MIGRATION_FILES = [
     "6a668dd451d5_dns_technitium_firewall_seed.py",
     "d4a9e37b2c15_kubelet_firewall_rule_seed.py",
     "e6b2f07a3c91_dhcpv6_firewall_rule_seed.py",
+    "b8e2d5c07a14_looking_glass_firewall_seed.py",
 ]
 
 

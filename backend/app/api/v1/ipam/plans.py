@@ -659,6 +659,10 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
     created_blocks: list[str] = []
     created_subnets: list[str] = []
 
+    # Lazy: the IPAM router includes this module's router at import time.
+    from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+    from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet  # noqa: PLC0415
+
     async def materialise(
         node: PlanNode,
         parent_block_id: uuid.UUID | None,
@@ -757,6 +761,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             # Placeholder network/broadcast/gateway rows, mirroring create_subnet
             # (#505). Multicast leaves and v4 /31+/32 / v6 /127+/128 get none.
             is_v6 = isinstance(node_net, ipaddress.IPv6Network)
+            gw_row: IPAddress | None = None
             if node_kind != "multicast" and node_net.prefixlen < (127 if is_v6 else 31):
                 db.add(
                     IPAddress(
@@ -778,18 +783,27 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
                         )
                     )
                 gw_addr = gateway or str(node_net.network_address + 1)
-                db.add(
-                    IPAddress(
-                        subnet_id=subnet.id,
-                        address=gw_addr,
-                        status="reserved",
-                        description="Gateway",
-                        hostname="gateway",
-                        created_by_user_id=current_user.id,
-                    )
+                gw_row = IPAddress(
+                    subnet_id=subnet.id,
+                    address=gw_addr,
+                    status="reserved",
+                    description="Gateway",
+                    hostname="gateway",
+                    created_by_user_id=current_user.id,
                 )
+                db.add(gw_row)
                 subnet.gateway = gw_addr
                 await db.flush()
+            # spatiumddi#1150 — the two DNS steps create_subnet runs, so a
+            # planned subnet is in sync with DNS from apply rather than from
+            # its first allocation: the reverse zone its effective DNS names
+            # (explicit or inherited, #1149), then the gateway placeholder's
+            # PTR. Apply never ran either, so the reverse zone waited for the
+            # first allocation's catch-up and the gateway's PTR was missing
+            # from then on.
+            await ensure_reverse_zone_for_subnet(db, subnet, current_user)
+            if gw_row is not None:
+                await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
 
     await materialise(tree, None, is_root=True)
 

@@ -59,7 +59,6 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.models.auth import User
 from app.services.ai.operations import (
@@ -291,7 +290,6 @@ async def _apply_delete_subnet(
     db: AsyncSession, user: User, args: DeleteSubnetArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_subnet."""
-    from sqlalchemy import delete as sa_delete
 
     from app.api.deps import require_superadmin
     from app.api.v1.ipam.router import (
@@ -302,8 +300,7 @@ async def _apply_delete_subnet(
     )
     from app.drivers.dhcp import is_agentless
     from app.models.dhcp import DHCPConfigOp, DHCPScope, DHCPServer
-    from app.models.dns import DNSRecord
-    from app.models.ipam import IPAddress, Subnet
+    from app.models.ipam import Subnet
     from app.services.dhcp.config_bundle import build_config_bundle
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope
     from app.services.dhcp.windows_writethrough import push_scope_delete
@@ -392,52 +389,17 @@ async def _apply_delete_subnet(
             if not is_agentless(srv.driver):
                 agent_servers_to_refresh[srv.id] = srv
 
-    addr_result = await db.execute(
-        select(IPAddress.dns_record_id).where(
-            IPAddress.subnet_id == args.subnet_id,
-            IPAddress.dns_record_id.isnot(None),
-        )
-    )
-    record_ids = [rid for rid in addr_result.scalars().all() if rid is not None]
-    if record_ids:
-        # Enqueue a delete op per record through the record-ops chokepoint BEFORE
-        # dropping the rows. Agent-based zones re-converge via the full-zone
-        # bundle, but an agentless (Windows DNS) primary is only retracted by an
-        # explicit op — a bare sa_delete left those A/PTR records live on the
-        # server (#512).
-        from app.services.dns.record_ops import enqueue_record_op  # noqa: PLC0415
+    # Withdraw the DNS records IPAM published for the subnet's addresses BEFORE
+    # the cascade drops the addresses — dns_record.ip_address_id is SET NULL, so
+    # a record left to the database stays served, ownerless. Through the
+    # record-ops chokepoint: an agentless (Windows DNS) primary is only
+    # retracted by an explicit op (#512), and in a no-views group neither is an
+    # agent. spatiumddi#1151: every auto-generated record of every address — this
+    # used to take only the primary A ``ip.dns_record_id`` names, leaving PTRs
+    # in a hand-made or shared reverse zone, extra-zone A / AAAA and aliases.
+    from app.services.dns.record_ops import retract_address_records  # noqa: PLC0415
 
-        recs = (
-            (
-                await db.execute(
-                    select(DNSRecord)
-                    .where(DNSRecord.id.in_(record_ids))
-                    .options(selectinload(DNSRecord.zone))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for rec in recs:
-            if rec.zone is not None:
-                await enqueue_record_op(
-                    db,
-                    rec.zone,
-                    "delete",
-                    {
-                        "name": rec.name,
-                        "type": rec.record_type,
-                        "value": rec.value,
-                        "ttl": rec.ttl,
-                    },
-                )
-        await db.execute(sa_delete(DNSRecord).where(DNSRecord.id.in_(record_ids)))
-        # #1111 — the Core delete is invisible to the bundle dirty-mark
-        # listener, and the ops above mark nothing when the group has no
-        # primary (``enqueue_record_op`` returns without one).
-        from app.services.dns.bundle_dirty import mark_bundles_dirty  # noqa: PLC0415
-
-        await mark_bundles_dirty(db, zone_ids={rec.zone_id for rec in recs})
+    _records_retracted, dns_wake_group_ids = await retract_address_records(db, [subnet.id])
 
     # spatiumddi#1066 — the subnet's auto-created reverse zone: re-linked to
     # a sibling that still lives in it, else deleted the way the zone-delete
@@ -446,7 +408,8 @@ async def _apply_delete_subnet(
     from app.core.agent_wake import collect_wake, dns_group_channel  # noqa: PLC0415
     from app.services.dns.reverse_zone import retire_auto_reverse_zones  # noqa: PLC0415
 
-    _retired, _relinked, dns_wake_group_ids = await retire_auto_reverse_zones(db, subnet)
+    _retired, _relinked, zone_wake_group_ids = await retire_auto_reverse_zones(db, subnet)
+    dns_wake_group_ids |= zone_wake_group_ids
 
     db.add(
         _audit(
