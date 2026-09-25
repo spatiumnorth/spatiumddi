@@ -597,13 +597,19 @@ async def test_a_rolled_back_savepoint_keeps_the_outer_transactions_mark_and_ren
     monkeypatch.setattr(settings, "dns_agent_bundle_enqueue_renders", True)
     monkeypatch.setattr(bundle_dirty, "_enqueue_sync", lambda ids: captured.extend(ids))
 
-    db_session.add(_record(zone, "outer"))
-    await db_session.flush()
-    with pytest.raises(RuntimeError):
+    async def _failing_savepoint() -> None:
         async with db_session.begin_nested():
             db_session.add(_record(zone, "inner"))
             await db_session.flush()
             raise RuntimeError("the savepoint's work fails")
+
+    db_session.add(_record(zone, "outer"))
+    await db_session.flush()
+    # The failing savepoint runs in its own coroutine: code scanning doesn't see
+    # pytest.raises swallow an exception raised inline, so it reported the rest
+    # of this test as unreachable.
+    with pytest.raises(RuntimeError):
+        await _failing_savepoint()
     await db_session.commit()
     for _ in range(20):
         if captured:
