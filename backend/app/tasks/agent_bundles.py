@@ -52,6 +52,7 @@ from app.core.redis_client import make_async_redis, make_sync_redis
 from app.db import task_session
 from app.drivers.dns import AGENTLESS_DRIVERS
 from app.models.dns import DNSServer
+from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import (
     RENDER_STATUS_FAILED,
@@ -374,9 +375,11 @@ async def _sweep() -> dict[str, int]:
                         or_(
                             DNSServer.bundle_watermark.is_(None),
                             DNSServer.bundle_watermark < DNSServer.bundle_dirty_seq,
-                            # Rendered by another release: the upgrade's
-                            # one re-render per server (``is_current``).
-                            DNSServer.bundle_app_version.is_distinct_from(settings.version),
+                            # Rendered by an older renderer revision: the
+                            # upgrade's one re-render per server
+                            # (``is_current``). A newer one is left alone.
+                            DNSServer.bundle_renderer_revision.is_(None),
+                            DNSServer.bundle_renderer_revision < bundle_store.RENDERER_REVISION,
                         ),
                         or_(
                             DNSServer.bundle_render_status.is_distinct_from(RENDER_STATUS_FAILED),
@@ -407,8 +410,8 @@ async def _sweep() -> dict[str, int]:
 @celery_app.task(name=TASK_SWEEP)
 def render_missing_sweep() -> dict[str, int]:
     """Every 30 s: enqueue a render for any enabled agent-based server whose
-    newest stored bundle is behind its dirty sequence, was rendered by
-    another release, or is absent."""
+    newest stored bundle is behind its dirty sequence, came from an older
+    renderer revision, or is absent."""
     return asyncio.run(_sweep())
 
 
