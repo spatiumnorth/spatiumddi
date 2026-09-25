@@ -201,6 +201,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The worker renders DNS agent bundles again (#1197).** #1170's merge
+  of main dropped three things #1122 had added to `app/celery_app.py`:
+  `app.tasks.agent_bundles` from the worker's `include` list, the
+  `bundles` route, and the 30 s render-missing sweep. A started worker
+  had no render task registered, so it discarded every render it was
+  sent ("Received unregistered task"), and beat never swept. Agents got
+  a DNS change only when the api's bounded inline fallback built the
+  bundle, 120 s after the change, and never with the fallback off; after
+  an upgrade, an agent-based server last rendered by the previous
+  release was served nothing new until a change marked it and those
+  120 s had passed. All three are back. A test now starts a worker in a
+  fresh interpreter and fails when a task the code defines, or one beat
+  sends, is not registered in it.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the
