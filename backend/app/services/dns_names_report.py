@@ -70,7 +70,7 @@ class _CategoryReport:
 async def _scan_category(
     db: AsyncSession,
     report: _CategoryReport,
-    stmt: Select[Any],
+    stmt: Select,
     check: Callable[[str], Any],
     *,
     has_context: bool = False,

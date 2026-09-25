@@ -514,7 +514,7 @@ async def _check_ip_collisions(
 
     if hostname and forward_zone_id:
         host_lower = hostname.strip().lower()
-        q = (
+        fqdn_q = (
             select(IPAddress, DNSZone.name, Subnet.network)
             .join(DNSZone, DNSZone.id == IPAddress.forward_zone_id)
             .join(Subnet, Subnet.id == IPAddress.subnet_id)
@@ -522,8 +522,8 @@ async def _check_ip_collisions(
             .where(IPAddress.forward_zone_id == forward_zone_id)
         )
         if exclude_ip_id is not None:
-            q = q.where(IPAddress.id != exclude_ip_id)
-        for ip, zone_name, subnet_network in (await db.execute(q)).all():
+            fqdn_q = fqdn_q.where(IPAddress.id != exclude_ip_id)
+        for ip, zone_name, subnet_network in (await db.execute(fqdn_q)).all():
             warnings.append(
                 {
                     "kind": "fqdn_collision",
@@ -1029,7 +1029,7 @@ async def _resolve_reverse_zone(
     # matchable — a space can't be attributed to them, and refusing would
     # break legit single-tenant setups; ``ensure_reverse_zone_for_subnet``
     # re-links dangling zones on the next allocation.
-    res = await db.execute(
+    candidates = await db.execute(
         select(DNSZone, Subnet.space_id, Subnet.network)
         .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
         .where(
@@ -1039,15 +1039,15 @@ async def _resolve_reverse_zone(
     )
     # Choose the longest matching suffix (most specific)
     best: DNSZone | None = None
-    for z, linked_space_id, linked_network in res.all():
-        zname = z.name.rstrip(".") + "."
+    for zone, linked_space_id, linked_network in candidates.all():
+        zname = zone.name.rstrip(".") + "."
         if rev_pointer.endswith("." + zname) or rev_pointer == zname:
             if (
                 linked_space_id is not None
                 and linked_space_id != subnet.space_id
                 and cidrs_overlap(linked_network, subnet.network)
             ):
-                key = (str(subnet.id), str(z.id))
+                key = (str(subnet.id), str(zone.id))
                 # Per-IP call site: warn once per (subnet, zone) pair per
                 # process, debug after — bulk syncs would otherwise emit one
                 # warning per IP per run, forever.
@@ -1056,14 +1056,14 @@ async def _resolve_reverse_zone(
                 log_fn(
                     "reverse_zone_cross_space_skipped",
                     subnet_id=str(subnet.id),
-                    zone_id=str(z.id),
-                    zone=z.name,
+                    zone_id=str(zone.id),
+                    zone=zone.name,
                     note="zone is linked to an overlapping subnet in another "
                     "IP space; PTR would leak across tenants (#844)",
                 )
                 continue
-            if best is None or len(z.name) > len(best.name):
-                best = z
+            if best is None or len(zone.name) > len(best.name):
+                best = zone
     return best
 
 
@@ -6869,7 +6869,8 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
         .where(*conds)
         .group_by(DNSRecord.ip_address_id)
     )
-    return {row[0]: row[1] for row in (await db.execute(q)).all()}
+    # ``ip_address_id IN (...)`` never matches NULL; the filter is for mypy.
+    return {row[0]: row[1] for row in (await db.execute(q)).all() if row[0] is not None}
 
 
 async def _nat_mapping_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[str, int]:

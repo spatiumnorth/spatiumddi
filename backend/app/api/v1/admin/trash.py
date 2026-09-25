@@ -16,7 +16,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
@@ -128,7 +128,7 @@ async def list_trash(
     # global filter hides them.
     for resource_type in types_to_query:
         model = TYPE_TO_MODEL[resource_type]
-        stmt: Any = (
+        stmt: Select[Any] = (
             select(model)
             .where(model.deleted_at.is_not(None))
             .execution_options(include_deleted=True)
@@ -171,13 +171,13 @@ async def list_trash(
         # list deliberately doesn't browse, but that must still be counted or
         # the blast radius under-reports (#617).
         for model in TYPE_TO_MODEL.values():
-            res = await db.execute(
+            count_stmt: Select[int] = (
                 select(func.count())
                 .select_from(model)
                 .where(model.deletion_batch_id == batch_id)
                 .execution_options(include_deleted=True)
             )
-            size += int(res.scalar_one() or 0)
+            size += int((await db.execute(count_stmt)).scalar_one() or 0)
         batch_size_cache[batch_id] = size
 
     for item in items:
@@ -231,7 +231,7 @@ async def restore_row(
         )
 
     model = TYPE_TO_MODEL[type]
-    stmt: Any = (
+    stmt: Select[Any] = (
         select(model)
         .where(model.id == row_id, model.deleted_at.is_not(None))
         .execution_options(include_deleted=True)
@@ -363,7 +363,7 @@ async def permanent_delete_from_trash(
         )
 
     model = TYPE_TO_MODEL[type]
-    stmt: Any = (
+    stmt: Select[Any] = (
         select(model)
         .where(model.id == row_id, model.deleted_at.is_not(None))
         .execution_options(include_deleted=True)

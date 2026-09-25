@@ -70,11 +70,11 @@ def parse_tag_param(raw: str) -> tuple[str, str | None]:
     return key, value or None
 
 
-def apply_tag_filter(
-    stmt: Select,
+def apply_tag_filter[*Ts](
+    stmt: Select[*Ts],
     tags_column,
     tag_params: Iterable[str] | None,
-) -> Select:
+) -> Select[*Ts]:
     """ANDs each ``tag=`` query param onto the select as a JSONB clause.
 
     ``tags_column`` is the actual ORM column (e.g. ``Subnet.tags``)

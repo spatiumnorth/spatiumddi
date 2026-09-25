@@ -196,7 +196,7 @@ async def pull_leases_from_server(
         # the reconciler silently converging on nothing. ``clock_timestamp()``,
         # not ``now()`` — the latter is transaction-start time and would drift
         # earlier the longer this transaction runs.
-        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+        snapshot_at: datetime = (await db.execute(select(func.clock_timestamp()))).scalar_one()
         scopes_ok = True
         try:
             wire_scopes = await driver.get_scopes(server)

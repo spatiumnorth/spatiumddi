@@ -40,7 +40,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.dhcp import DHCPLease, DHCPScope
@@ -195,7 +195,7 @@ async def _rows_for_selector(
     structural = [Subnet.kind == "unicast", Subnet.deleted_at.is_(None)]
     readable = await _readable_subnet_ids(db, user, structural)
 
-    def _scoped(stmt: Any) -> Any:
+    def _scoped[*Ts](stmt: Select[*Ts]) -> Select[*Ts]:
         if readable is not None:
             stmt = stmt.where(Subnet.id.in_(readable))
         return stmt

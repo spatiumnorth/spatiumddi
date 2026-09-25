@@ -222,8 +222,8 @@ async def admin_usage_stats(db: AsyncSession) -> AdminUsageStats:
                 "user_id": str(uid),
                 "username": uname,
                 "messages": int(msgs),
-                "tokens_in": int(tin),
-                "tokens_out": int(tout),
+                "tokens_in": int(tin or 0),
+                "tokens_out": int(tout or 0),
                 "cost_usd": str(Decimal(cost or 0)),
             }
             for uid, uname, msgs, tin, tout, cost in top_rows

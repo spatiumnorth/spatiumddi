@@ -290,7 +290,8 @@ async def _seen_map(
             IPAddress.last_seen_at >= since,
         )
     )
-    return {row[0]: row[1] for row in rows.all()}
+    # ``last_seen_at IS NOT NULL`` is in the WHERE; the filter is for mypy.
+    return {row[0]: row[1] for row in rows.all() if row[1] is not None}
 
 
 async def seen_since(

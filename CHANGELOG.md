@@ -173,11 +173,18 @@ the formatter handles the rest.
 
 ### Changed
 
-- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
-  2026-09-24 and the backend's requirement had no upper bound, so CI
-  picked it up at once. The test suite passes on it, but its new
-  type annotations fail mypy in 23 files, which blocked every open
-  PR. Adopting 2.1 deliberately, typing work included, is #1187.
+- **The backend now requires SQLAlchemy 2.1.1 or later (#1187).**
+  2.1.0 reached PyPI on 2026-09-24 and its new type annotations failed
+  mypy, so #1186 capped the requirement below 2.1. This lifts the cap.
+  One 2.1 change reaches the backend at runtime: the session now
+  flushes pending changes before every statement, including raw
+  `text()` queries, so those queries see rows added earlier in the
+  same transaction, as ORM queries already did. The rest is typing.
+  2.1 types the results of an untyped query (a `text()` query, or a
+  select built from `Any`) as `Never`, and mypy stops checking code
+  it can only reach through a `Never`. Without the fixes, most of the
+  Trash restore and permanent-delete handlers would have gone
+  unchecked. mypy now checks the same code on 2.1 as it did on 2.0.
 
 - **DNS per-minute metrics now accumulate per bucket, like DHCP
   (#1077).** `POST /dns/agents/metrics` replaced an existing

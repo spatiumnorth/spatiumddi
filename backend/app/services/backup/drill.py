@@ -546,8 +546,9 @@ async def _assert_alembic_head(session: AsyncSession, out: list[Assertion]) -> s
     from app.core.schema_check import expected_alembic_head  # noqa: PLC0415
 
     try:
-        rows = (await session.execute(text("SELECT version_num FROM alembic_version"))).scalars()
-        versions = list(rows)
+        versions: list[str] = list(
+            (await session.execute(text("SELECT version_num FROM alembic_version"))).scalars()
+        )
     except Exception as exc:  # noqa: BLE001 — any DB error is a finding
         out.append(
             Assertion(

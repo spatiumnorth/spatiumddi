@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.nmap.schemas import NmapPreset
@@ -106,7 +106,7 @@ async def list_nmap_scans(
         stmt = stmt.where(NmapScan.preset == args.preset)
     if args.since:
         stmt = stmt.where(NmapScan.started_at >= args.since)
-    stmt = stmt.order_by(desc(NmapScan.started_at).nullslast()).limit(args.limit)
+    stmt = stmt.order_by(NmapScan.started_at.desc().nullslast()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
 
     out: list[dict[str, Any]] = []

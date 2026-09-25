@@ -57,6 +57,7 @@ import ipaddress
 import re
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -997,7 +998,8 @@ async def get_vrf_rt_matches(vrf_id: uuid.UUID, db: DB, _: CurrentUser) -> VrfRt
     import_set = set(vrf.import_targets or [])
     export_set = set(vrf.export_targets or [])
 
-    rows = (
+    # 2.1 types a select of a ``list`` column as untyped, so say what it is.
+    rows: Sequence[list[Any]] = (
         (
             await db.execute(
                 select(BGPLGRoute.ext_communities).where(
