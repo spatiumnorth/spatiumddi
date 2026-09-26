@@ -301,17 +301,34 @@ def test_syslog_ca_blob_cannot_escape_the_managed_dir(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 # 3. spatiumddi-image-prune — the inventory must reach the selector
 # --------------------------------------------------------------------------
-PRUNE_MARKER = 'python3 - "$SLOT_VERSIONS" "$IMAGES_JSON"'
+PRUNE_MARKER = 'python3 - "$SLOT_VERSIONS" "$IMAGES_JSON" "$SLOT_IMAGE_TAGS" "$ACTIVE_IMAGE_TAG_FILE"'
 
 _SP = "ghcr.io/spatiumnorth/"
 
 
-def _run_prune(tmp_path: Path, images: dict, slots: dict) -> subprocess.CompletedProcess[str]:
-    """Run the selector with a stubbed ``k3s`` so the in-use query resolves."""
+def _run_prune(
+    tmp_path: Path,
+    images: dict,
+    slots: dict,
+    tags: dict | None = None,
+    active_tag: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the selector with a stubbed ``k3s`` so the in-use query resolves.
+
+    ``tags`` is slot-image-tags.json and ``active_tag`` the running slot's
+    baked spatiumddi-version (#1202); either left None is simply absent, as on
+    an appliance whose sync-versions predates the sidecar.
+    """
     images_json = tmp_path / "images.json"
     images_json.write_text(json.dumps(images), encoding="utf-8")
     slot_versions = tmp_path / "slot-versions.json"
     slot_versions.write_text(json.dumps(slots), encoding="utf-8")
+    slot_tags = tmp_path / "slot-image-tags.json"
+    if tags is not None:
+        slot_tags.write_text(json.dumps(tags), encoding="utf-8")
+    active_file = tmp_path / "spatiumddi-version"
+    if active_tag is not None:
+        active_file.write_text(active_tag + "\n", encoding="utf-8")
 
     # The selector shells out to `k3s crictl ps` for the in-use set; #555 makes
     # a failure there bail entirely, so the stub has to answer.
@@ -327,6 +344,8 @@ def _run_prune(tmp_path: Path, images: dict, slots: dict) -> subprocess.Complete
         {
             "SLOT_VERSIONS": str(slot_versions),
             "IMAGES_JSON": str(images_json),
+            "SLOT_IMAGE_TAGS": str(slot_tags),
+            "ACTIVE_IMAGE_TAG_FILE": str(active_file),
             "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
         },
     )
@@ -368,6 +387,83 @@ def test_prune_keeps_everything_when_slot_versions_are_unknown(tmp_path: Path) -
     """The fail-safe still holds — it just no longer fires on every run."""
     images = {"images": [{"id": "sha256:stale", "repoTags": [_SP + "api:2026.01.01-1"]}]}
     res = _run_prune(tmp_path, images, {"slot_a": "unknown", "slot_b": ""})
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == ""
+
+
+# --------------------------------------------------------------------------
+# 3b. #1202 — a nightly slot's images are kept by the tag they carry
+# --------------------------------------------------------------------------
+# The strings are the ones the 2026.09.04-1 -> nightly-2026.09.24 upgrade wrote:
+# slot-versions.json records each slot's APPLIANCE_VERSION, and a nightly's is
+# not its image tag (.github/workflows/nightly.yml passes the two apart).
+_NIGHTLY_SLOTS = {"slot_a": "2026.09.04-1", "slot_b": "0.0.0-nightly-20260924+7490f61"}
+_NIGHTLY_TAGS = {"slot_a": "2026.09.04-1", "slot_b": "nightly-20260924"}
+
+
+def _upgraded_inventory() -> dict:
+    return {
+        "images": [
+            {"id": "sha256:sup_new", "repoTags": [_SP + "spatium-supervisor:nightly-20260924"]},
+            {"id": "sha256:kea_new", "repoTags": [_SP + "dhcp-kea:nightly-20260924"]},
+            # Built from parts: a literal `…-api:<date tag>` reads as a key to
+            # the pre-push secret scan.
+            {"id": "sha256:api_new", "repoTags": [_SP + "spatiumddi-api:" + _NIGHTLY_TAGS["slot_b"]]},
+            {"id": "sha256:sup_old", "repoTags": ["ghcr.io/spatiumddi/spatium-supervisor:2026.09.04-1"]},
+            {"id": "sha256:api_old", "repoTags": ["ghcr.io/spatiumddi/spatiumddi-api:2026.09.04-1"]},
+            {"id": "sha256:stale", "repoTags": ["ghcr.io/spatiumddi/spatiumddi-api:2026.08.12-1"]},
+        ]
+    }
+
+
+def test_prune_keeps_the_committed_nightly_slots_images_by_their_tag(tmp_path: Path) -> None:
+    """#1202: right after the trial commit nothing holds the new slot's images
+    yet. Matched on the appliance version alone, every one of them was deleted
+    ("removed 8/8"), and spatium-supervisor (pull policy Never) never came back.
+    With each slot's image tag, only the genuinely stale release goes."""
+    res = _run_prune(tmp_path, _upgraded_inventory(), _NIGHTLY_SLOTS, tags=_NIGHTLY_TAGS)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split() == ["sha256:stale"], res.stdout
+
+
+def test_the_running_slots_baked_tag_protects_it_without_the_sidecar(tmp_path: Path) -> None:
+    """A slot-image-tags.json an older sync-versions never wrote must not
+    re-open #1202 for the slot being committed: its own baked tag covers it."""
+    res = _run_prune(tmp_path, _upgraded_inventory(), _NIGHTLY_SLOTS, active_tag="nightly-20260924")
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split() == ["sha256:stale"], res.stdout
+
+
+def test_a_previous_nightly_slot_stays_bootable_too(tmp_path: Path) -> None:
+    """Nightly to nightly: neither slot's appliance version is a tag, so the
+    rollback slot's images need the sidecar as much as the committed slot's."""
+    images = {
+        "images": [
+            {"id": "sha256:n24", "repoTags": [_SP + "spatium-supervisor:nightly-20260924"]},
+            {"id": "sha256:n23", "repoTags": [_SP + "spatium-supervisor:nightly-20260923"]},
+            {"id": "sha256:n20", "repoTags": [_SP + "spatium-supervisor:nightly-20260920"]},
+        ]
+    }
+    res = _run_prune(
+        tmp_path,
+        images,
+        {"slot_a": "0.0.0-nightly-20260923+c13d8eb", "slot_b": "0.0.0-nightly-20260924+7490f61"},
+        tags={"slot_a": "nightly-20260923", "slot_b": "nightly-20260924"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split() == ["sha256:n20"], res.stdout
+
+
+def test_known_tags_never_license_a_prune_the_versions_refuse(tmp_path: Path) -> None:
+    """The fail-safe is the versions' call: unknown slot versions prune
+    nothing, whatever tags are known."""
+    res = _run_prune(
+        tmp_path,
+        _upgraded_inventory(),
+        {"slot_a": "unknown", "slot_b": ""},
+        tags=_NIGHTLY_TAGS,
+        active_tag="nightly-20260924",
+    )
     assert res.returncode == 0, res.stderr
     assert res.stdout.strip() == ""
 

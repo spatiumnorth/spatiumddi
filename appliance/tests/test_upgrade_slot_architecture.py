@@ -240,3 +240,86 @@ def test_the_wrapper_names_the_refusal_distinctly() -> None:
     runner = RUNNER.read_text(encoding="utf-8")
     assert 'apply_rc" -eq 5' in runner
     assert "different CPU architecture" in runner
+
+
+# ── #1202: the image tag each slot runs ────────────────────────────
+
+
+def test_probe_reads_the_slots_baked_image_tag_in_the_same_mount(
+    slot_cli, monkeypatch, tmp_path
+) -> None:
+    """A nightly's appliance version is not its image tag, so the slot's
+    baked spatiumddi-version has to be read too. One mount, both answers."""
+    _mount_stub(
+        slot_cli, monkeypatch, tmp_path,
+        'APPLIANCE_VERSION="0.0.0-nightly-20260924+7490f61"\n',
+    )
+    baked = tmp_path / "usr" / "lib" / "spatiumddi"
+    baked.mkdir(parents=True)
+    (baked / "spatiumddi-version").write_text("nightly-20260924\n")
+    mounts: list[list[str]] = []
+    real_run = slot_cli.run
+    monkeypatch.setattr(slot_cli, "run",
+                        lambda argv, **kw: mounts.append(argv) or real_run(argv, **kw))
+    fields, tag = slot_cli.slot_probe({"partlabel": "root_a", "device": "/dev/x"})
+    assert fields == {"APPLIANCE_VERSION": "0.0.0-nightly-20260924+7490f61"}
+    assert tag == "nightly-20260924"
+    assert [a[0] for a in mounts].count("mount") == 1
+    # ...and the fields-only view is unchanged for every existing caller.
+    assert slot_cli.slot_release_fields({"partlabel": "root_a", "device": "/dev/x"}) == fields
+
+
+def test_probe_of_an_unmountable_slot_has_no_tag(slot_cli, monkeypatch, tmp_path) -> None:
+    _mount_stub(slot_cli, monkeypatch, tmp_path, None)
+    assert slot_cli.slot_probe({"partlabel": "root_a", "device": "/dev/x"}) == (None, "")
+
+
+def test_sync_writes_each_slots_image_tag_beside_the_versions(
+    slot_cli, monkeypatch, tmp_path
+) -> None:
+    """#1202: slot-versions.json keeps its shape (every reader parses slot_a /
+    slot_b); the tags go into the sibling slot-image-tags.json the prune reads.
+    The strings are the ones the 2026.09.04-1 -> nightly upgrade had."""
+    active = {"partlabel": "root_b", "device": "/dev/b", "fslabel": "root_b"}
+    inactive = {"partlabel": "root_a", "device": "/dev/a", "fslabel": "root_a"}
+    monkeypatch.setattr(slot_cli, "detect_active_inactive", lambda: (active, inactive))
+    monkeypatch.setattr(slot_cli, "_read_active_appliance_version",
+                        lambda: "0.0.0-nightly-20260924+7490f61")
+    root = tmp_path / "root"
+    (root / "usr" / "lib" / "spatiumddi").mkdir(parents=True)
+    (root / "usr" / "lib" / "spatiumddi" / "spatiumddi-version").write_text("nightly-20260924\n")
+    monkeypatch.setattr(slot_cli, "_ACTIVE_ROOT", root)
+    probes: list[str] = []
+    monkeypatch.setattr(slot_cli, "slot_probe", lambda slot: probes.append(slot["partlabel"])
+                        or ({"APPLIANCE_VERSION": "2026.09.04-1"}, "2026.09.04-1"))
+    versions_file = tmp_path / "state" / "slot-versions.json"
+    tags_file = tmp_path / "state" / "slot-image-tags.json"
+    monkeypatch.setattr(slot_cli, "_SLOT_VERSIONS_FILE", versions_file)
+    monkeypatch.setattr(slot_cli, "_SLOT_IMAGE_TAGS_FILE", tags_file)
+
+    got = slot_cli.sync_slot_versions()
+
+    import json
+    assert got == {"slot_a": "2026.09.04-1", "slot_b": "0.0.0-nightly-20260924+7490f61"}
+    assert json.loads(versions_file.read_text()) == got
+    assert json.loads(tags_file.read_text()) == {"slot_a": "2026.09.04-1",
+                                                 "slot_b": "nightly-20260924"}
+    assert probes == ["root_a"], "only the inactive slot is mounted, and only once"
+
+
+def test_sync_never_mounts_a_slot_without_a_filesystem_label(
+    slot_cli, monkeypatch, tmp_path
+) -> None:
+    """The 'unknown' sentinel is decided before any mount, exactly as before."""
+    active = {"partlabel": "root_a", "device": "/dev/a", "fslabel": "root_a"}
+    inactive = {"partlabel": "root_b", "device": "/dev/b", "fslabel": ""}
+    monkeypatch.setattr(slot_cli, "detect_active_inactive", lambda: (active, inactive))
+    monkeypatch.setattr(slot_cli, "_read_active_appliance_version", lambda: "2026.09.04-1")
+    monkeypatch.setattr(slot_cli, "_ACTIVE_ROOT", tmp_path / "no-such-root")
+    monkeypatch.setattr(slot_cli, "slot_probe",
+                        lambda slot: pytest.fail("a label-less slot must not be mounted"))
+    monkeypatch.setattr(slot_cli, "_SLOT_VERSIONS_FILE", tmp_path / "v.json")
+    monkeypatch.setattr(slot_cli, "_SLOT_IMAGE_TAGS_FILE", tmp_path / "t.json")
+    assert slot_cli.sync_slot_versions() == {"slot_a": "2026.09.04-1", "slot_b": "unknown"}
+    import json
+    assert json.loads((tmp_path / "t.json").read_text()) == {}

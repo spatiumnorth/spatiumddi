@@ -17,6 +17,13 @@
 #   * KEEP every image referenced by a live (running/created) container.
 #   * KEEP every `ghcr.io/{spatiumnorth,spatiumddi}/*` image tagged with EITHER slot's
 #     installed version (from slot-versions.json) — both slots stay bootable.
+#   * KEEP every one tagged with EITHER slot's IMAGE TAG (slot-image-tags.json,
+#     plus the running slot's own baked tag) — #1202: a nightly's appliance
+#     version is `0.0.0-nightly-YYYYMMDD+sha` but its images are tagged
+#     `nightly-YYYYMMDD`, so matching the version alone deleted the slot just
+#     committed (spatium-supervisor then ErrImageNeverPull, the agents left on
+#     the previous release). Tags only ever ADD protection: the version
+#     fail-safe below still decides whether anything is pruned at all.
 #   * KEEP all non-SpatiumDDI images (k3s / coredns / pause / postgres /
 #     redis / metallb / cnpg …) — those are managed by kubelet image-GC.
 #   * REMOVE the rest: older `ghcr.io/{spatiumnorth,spatiumddi}/*` releases (3rd-oldest+)
@@ -36,6 +43,8 @@ LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/image-prune.log"
 LOCK=/run/spatiumddi-image-prune.lock
 SLOT_VERSIONS=/var/lib/spatiumddi/release-state/slot-versions.json
+SLOT_IMAGE_TAGS=/var/lib/spatiumddi/release-state/slot-image-tags.json
+ACTIVE_IMAGE_TAG_FILE=/usr/lib/spatiumddi/spatiumddi-version
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 
@@ -73,7 +82,7 @@ IMAGES_JSON=$(mktemp /tmp/spatium-image-prune.XXXXXX)
 trap 'rm -f "$IMAGES_JSON"' EXIT
 k3s crictl images -o json > "$IMAGES_JSON" 2>/dev/null || true
 mapfile -t TO_REMOVE < <(
-    python3 - "$SLOT_VERSIONS" "$IMAGES_JSON" <<'PYEOF'
+    python3 - "$SLOT_VERSIONS" "$IMAGES_JSON" "$SLOT_IMAGE_TAGS" "$ACTIVE_IMAGE_TAG_FILE" <<'PYEOF'
 import json, subprocess, sys
 
 slot_versions_path = sys.argv[1]
@@ -97,6 +106,30 @@ except Exception:
 # Fail-safe: can't determine the two slot versions → prune nothing.
 if not keep_versions:
     sys.exit(0)
+
+# #1202 — and the image tags the slots actually run. A release stamps its
+# appliance version and its image tag with one value, so the versions above
+# already cover it; a nightly does not (0.0.0-nightly-YYYYMMDD+sha vs
+# nightly-YYYYMMDD). Read from sync-versions' sibling sidecar and from the
+# running slot's own baked tag, so the slot just committed is protected even
+# by a sidecar an older sync-versions wrote. Only ever added AFTER the
+# fail-safe: a known tag never licenses a prune the versions would refuse.
+try:
+    with open(sys.argv[3], encoding="utf-8") as fh:
+        tags = json.load(fh)
+    for k in ("slot_a", "slot_b"):
+        t = (tags.get(k) or "").strip() if isinstance(tags, dict) else ""
+        if t and t not in ("unknown", "unstamped"):
+            keep_versions.add(t)
+except Exception:
+    pass
+try:
+    with open(sys.argv[4], encoding="utf-8") as fh:
+        t = fh.read().strip()
+    if t:
+        keep_versions.add(t)
+except Exception:
+    pass
 
 # Image refs (ids + names) in use by any live container — never remove these
 # (protects the running release, incl. a dev tag deployed for testing).

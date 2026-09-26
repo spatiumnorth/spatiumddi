@@ -132,14 +132,34 @@ def host_architecture() -> str | None:
     }.get(raw)
 
 
-def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
-    """Mount the slot read-only and parse its appliance-release file.
+# #1202 — the image tag a slot's workloads run: its baked
+# ``SPATIUMDDI_VERSION`` (bake-images.sh writes it, firstboot pins the chart
+# to it). NOT always the APPLIANCE_VERSION the release file carries: a
+# release stamps both with one value, but a nightly's appliance version is
+# ``0.0.0-nightly-YYYYMMDD+sha`` while its images are tagged
+# ``nightly-YYYYMMDD`` (.github/workflows/nightly.yml passes the two apart).
+_IMAGE_TAG_REL = "usr/lib/spatiumddi/spatiumddi-version"
 
-    Returns the parsed ``KEY=value`` pairs, ``{}`` when the slot mounts
-    but carries no release file (empty / staging slot), or None when it
-    cannot be mounted at all. One mount serves every caller — the
-    version label and the #1026 architecture check both want fields out
-    of the same file, and probing twice would mean mounting twice.
+
+def _read_image_tag(root: Path) -> str:
+    """The baked image tag under ``root`` ("" when absent or unreadable)."""
+    try:
+        return (root / _IMAGE_TAG_REL).read_text().strip()
+    except OSError:
+        return ""
+
+
+def slot_probe(slot: dict[str, str]) -> tuple[dict[str, str] | None, str]:
+    """Mount the slot read-only ONCE and read both what it is and what it
+    runs: ``(release fields, image tag)``.
+
+    The fields are ``slot_release_fields``' answer (the parsed ``KEY=value``
+    pairs, ``{}`` when the slot mounts but carries no release file, None
+    when it cannot be mounted at all). The image tag is the slot's baked
+    ``SPATIUMDDI_VERSION`` ("" when absent), which is what the image prune
+    must keep for that slot (#1202). One mount serves every caller — the
+    version label, the #1026 architecture check and the image tag all read
+    the same slot, and probing twice would mean mounting twice.
     """
     mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
     mountpoint.mkdir(parents=True, exist_ok=True)
@@ -147,7 +167,8 @@ def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
         try:
             run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
         except subprocess.CalledProcessError:
-            return None
+            return None, ""
+        tag = _read_image_tag(mountpoint)
         for rel in (
             "etc/spatiumddi/appliance-release",
             "usr/lib/etc.image/spatiumddi/appliance-release",
@@ -162,8 +183,8 @@ def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
                     continue
                 key, _, value = line.partition("=")
                 fields[key.strip()] = value.strip().strip('"')
-            return fields
-        return {}
+            return fields, tag
+        return {}, tag
     finally:
         try:
             run(["umount", str(mountpoint)], check=False)
@@ -180,6 +201,27 @@ def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
             pass
 
 
+def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
+    """Mount the slot read-only and parse its appliance-release file.
+
+    Returns the parsed ``KEY=value`` pairs, ``{}`` when the slot mounts
+    but carries no release file (empty / staging slot), or None when it
+    cannot be mounted at all. ``slot_probe``'s first half, for the callers
+    that only want the fields.
+    """
+    return slot_probe(slot)[0]
+
+
+def _version_label(slot: dict[str, str], fields: dict[str, str] | None) -> str:
+    """``slot_version_label`` over fields already read (no second mount)."""
+    if not slot.get("fslabel"):
+        return "unknown"
+    if fields is None:
+        return "unreadable"
+    version = fields.get("APPLIANCE_VERSION")
+    return version if version else "unstamped"
+
+
 def slot_version_label(slot: dict[str, str]) -> str:
     """The slot's APPLIANCE_VERSION, or a sentinel describing why not.
 
@@ -190,11 +232,7 @@ def slot_version_label(slot: dict[str, str]) -> str:
     """
     if not slot.get("fslabel"):
         return "unknown"
-    fields = slot_release_fields(slot)
-    if fields is None:
-        return "unreadable"
-    version = fields.get("APPLIANCE_VERSION")
-    return version if version else "unstamped"
+    return _version_label(slot, slot_release_fields(slot))
 
 
 
@@ -889,6 +927,9 @@ def _patch_grub_cfg_slot_label(partlabel: str, version: str,
 # state/. Updated by sync_slot_versions() called from cmd_apply and
 # cmd_status, plus on every boot by spatiumddi-firstboot.
 _SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi/release-state/slot-versions.json")
+# #1202 — each slot's image tag (see _IMAGE_TAG_REL), for spatiumddi-image-prune.
+_SLOT_IMAGE_TAGS_FILE = Path("/var/lib/spatiumddi/release-state/slot-image-tags.json")
+_ACTIVE_ROOT = Path("/")
 _ACTIVE_RELEASE_FILE = Path("/etc/spatiumddi/appliance-release")
 
 
@@ -929,16 +970,33 @@ def sync_slot_versions() -> dict[str, str]:
 
     versions: dict[str, str] = {}
     versions[slot_versions_key(active)] = _read_active_appliance_version()
-    versions[slot_versions_key(inactive)] = slot_version_label(inactive)
+    # One mount of the inactive slot yields its version label AND its baked
+    # image tag (#1202); a slot with no filesystem label is never mounted.
+    fields, inactive_tag = slot_probe(inactive) if inactive.get("fslabel") else (None, "")
+    versions[slot_versions_key(inactive)] = _version_label(inactive, fields)
 
-    try:
-        _SLOT_VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _SLOT_VERSIONS_FILE.with_suffix(".new")
-        tmp.write_text(json.dumps(versions, indent=2, sort_keys=True) + "\n")
-        tmp.replace(_SLOT_VERSIONS_FILE)
-    except OSError as exc:
-        print(f"WARN: couldn't write {_SLOT_VERSIONS_FILE}: {exc}", file=sys.stderr)
+    # #1202 — the image tag each slot runs, beside (not inside) the version
+    # sidecar: spatiumddi-image-prune keeps a slot's images by the tag they
+    # carry, which for a nightly is not the appliance version above. A sibling
+    # file leaves slot-versions.json exactly as every reader of it expects.
+    tags = {slot_versions_key(active): _read_image_tag(_ACTIVE_ROOT),
+            slot_versions_key(inactive): inactive_tag}
+
+    _write_sidecar(_SLOT_VERSIONS_FILE, versions)
+    _write_sidecar(_SLOT_IMAGE_TAGS_FILE, {k: v for k, v in tags.items() if v})
     return versions
+
+
+def _write_sidecar(path: Path, data: dict[str, str]) -> None:
+    """Atomic JSON write (.new + rename); a failure warns and never raises —
+    the readers degrade gracefully when a sidecar is missing."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".new")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"WARN: couldn't write {path}: {exc}", file=sys.stderr)
 
 
 def cmd_sync_versions(_args) -> int:
@@ -1160,7 +1218,8 @@ def main() -> int:
 
     sub.add_parser("sync-versions",
                    help="refresh /var/lib/spatiumddi/release-state/slot-versions.json "
-                        "(both slots' installed APPLIANCE_VERSION). Called by "
+                        "(both slots' installed APPLIANCE_VERSION) and slot-image-tags.json "
+                        "(the image tag each slot runs, #1202). Called by "
                         "spatiumddi-firstboot at every boot + at the end of apply.")
 
     args = parser.parse_args()
