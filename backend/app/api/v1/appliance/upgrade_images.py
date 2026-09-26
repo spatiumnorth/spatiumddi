@@ -603,8 +603,8 @@ async def upload_upgrade_image(
         min_length=1,
         max_length=64,
         description=(
-            "The CalVer tag this upgrade image carries "
-            "(e.g. 2026.05.14-1). Used by the supervisor's "
+            "The release tag this upgrade image carries "
+            "(e.g. 2026.05.14-1, or 1.0.0 from 1.0.0 on). Used by the supervisor's "
             "auto-clear logic — installed_appliance_version must "
             "match this once the upgrade lands."
         ),

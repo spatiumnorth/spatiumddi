@@ -4,7 +4,7 @@ Mounted at ``/api/v1/upgrades``.
 
 Read-only (Phase A):
 
-    GET   /preflight?target=<calver-tag>   — run safety checks; no
+    GET   /preflight?target=<release-tag>  — run safety checks; no
                                               writes; no lease acquired.
     GET   /lease                           — current mutex state for
                                               surfacing "an upgrade is
@@ -88,7 +88,7 @@ async def get_preflight(target: str) -> PreflightReportOut:
     if not target or len(target) > 64:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "target must be a 1-64 char CalVer tag (e.g. 2026.06.01-1)",
+            "target must be a 1-64 char release tag (e.g. 2026.06.01-1 or 1.0.0)",
         )
     report = await preflight.run_all(target_version=target)
     return PreflightReportOut(**report.to_dict())
@@ -136,7 +136,7 @@ class PlanRequest(BaseModel):
       uses. Air-gap-friendly: no per-node egress.
 
     The version label is always required so preflight's version_path
-    check can compare CalVer tuples + auto-clear logic on the appliance
+    check can compare release versions + auto-clear logic on the appliance
     row can detect "installed matches desired" without sniffing the
     binary.
     """
@@ -144,7 +144,10 @@ class PlanRequest(BaseModel):
     target_version: str = Field(
         min_length=1,
         max_length=64,
-        description="CalVer tag the cluster will be upgraded to.",
+        description=(
+            "Release tag the cluster will be upgraded to: CalVer "
+            "(2026.06.01-1) before 1.0.0, SemVer (1.0.0) from it."
+        ),
     )
     slot_image_url: str | None = Field(
         default=None,
