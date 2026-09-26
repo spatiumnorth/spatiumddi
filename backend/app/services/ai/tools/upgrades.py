@@ -38,8 +38,9 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
 class FindUpgradePreflightArgs(BaseModel):
     target_version: str = Field(
         description=(
-            "CalVer tag to evaluate the upgrade path against, e.g. "
-            "``2026.06.01-1``. Must be a 1-64 char string."
+            "Release tag to evaluate the upgrade path against: CalVer "
+            "(``2026.06.01-1``) before 1.0.0, SemVer (``1.0.0``) from it. "
+            "Must be a 1-64 char string."
         ),
         min_length=1,
         max_length=64,
@@ -53,8 +54,9 @@ class FindUpgradePreflightArgs(BaseModel):
         "the given target version (superadmin only, read-only). Returns "
         "the same structured report the Fleet UI's preflight panel shows: "
         "quorum (cluster size + Ready state), CNPG replication lag, "
-        "``/var`` disk headroom, version-path validity (CalVer parse + "
-        "forward-jump + 90-day-gap warning), and whether another upgrade "
+        "``/var`` disk headroom, version-path validity (the target must be "
+        "a release newer than the running one, CalVer or SemVer, with a "
+        "warning when two CalVer tags are more than 90 days apart), and whether another upgrade "
         "is already in flight (Lease holder). Use to answer 'is the "
         "cluster ready for an upgrade to <tag>?', 'which check is "
         "blocking the next upgrade?', or 'what's the replication lag "

@@ -18,7 +18,9 @@ Checks shipped in Phase A:
 * ``check_disk_headroom`` — ``/var`` partition has room for the slot
   image + a safety margin.
 * ``check_version_path`` — target tag is a valid forward jump from
-  ``settings.version``; no skip-release across the supported skew window.
+  ``settings.version``, compared with ``app.core.versions`` (CalVer before
+  1.0.0, SemVer from it, #1182); no skip-release across the supported skew
+  window.
 * ``check_kea_ha_version_skew`` — a Kea HA pair on pre-3.0 cannot be
   upgraded node-at-a-time (3.0's HA hook won't talk to a < 2.7 peer);
   warn the operator before they start. Scoped to appliance nodes and to
@@ -44,7 +46,6 @@ What we **don't** check here that Phases C/D will own:
 
 from __future__ import annotations
 
-import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
@@ -55,6 +56,7 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
+from app.core.versions import includes_release, parse_release
 from app.db import AsyncSessionLocal
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -91,15 +93,8 @@ class PreflightResult:
     detail: dict[str, Any]
 
 
-# CalVer tag format: YYYY.MM.DD-N.  See CLAUDE.md "Version Scheme".
-_CALVER_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})-(\d+)$")
-
-
-def _parse_calver(tag: str) -> tuple[int, int, int, int] | None:
-    m = _CALVER_RE.match(tag)
-    if not m:
-        return None
-    return tuple(int(g) for g in m.groups())  # type: ignore[return-value]
+# The skip-release warning's threshold, in days between two CalVer tags.
+_SKIP_RELEASE_WARN_DAYS = 90
 
 
 # ── Individual checks ─────────────────────────────────────────────────
@@ -364,40 +359,62 @@ def check_version_path(
 ) -> PreflightResult:
     """Target is a valid forward jump from the current version.
 
+    Versions are compared with :mod:`app.core.versions` (#1182), never as
+    strings: CalVer (``YYYY.MM.DD-N``) until 1.0.0, SemVer from then on,
+    and every SemVer release newer than every CalVer one.
+
     Rules:
 
-    * Both versions must be CalVer-shaped (YYYY.MM.DD-N).
+    * The target must be a release. A dev or nightly build, or a
+      placeholder like ``0.1.0``, is not one.
     * Target > current (no rollback through the upgrade flow — that's
-      a separate slot-rollback button).
-    * Skip-release: warn when the gap is > 90 days. We don't refuse
-      because the appliance supports it via two rolling upgrades back
-      to back, but the operator should know.
+      a separate slot-rollback button). SemVer → CalVer is backward.
+    * A current version that is not a release (a dev or nightly build)
+      can't be validated: warn, unless it is a nightly that already has
+      the target, which is a rollback and fails.
+    * Skip-release: warn when two CalVer tags are more than 90 days
+      apart. We don't refuse because the appliance supports it via two
+      rolling upgrades back to back, but the operator should know. A
+      jump that involves a SemVer version has no dates to compare, so
+      it gets no such warning (#1182).
     """
     current = current_version or settings.version or "dev"
-    if current == "dev":
-        return PreflightResult(
-            name="version_path",
-            level="warn",
-            message=(
-                "current version is 'dev' — can't validate the upgrade path. "
-                "Rolling upgrade from a dev build is unsupported; do a full "
-                "redeploy from a tagged release first."
-            ),
-            detail={"current": current, "target": target_version},
-        )
-    cur_parts = _parse_calver(current)
-    tgt_parts = _parse_calver(target_version)
-    if cur_parts is None or tgt_parts is None:
+    base_detail: dict[str, Any] = {"current": current, "target": target_version}
+    target = parse_release(target_version)
+    if target is None:
         return PreflightResult(
             name="version_path",
             level="fail",
             message=(
-                f"version parse failed (current={current!r}, "
-                f"target={target_version!r}); both must match YYYY.MM.DD-N"
+                f"target {target_version!r} is not a release version: expected "
+                "YYYY.MM.DD-N before 1.0.0 or MAJOR.MINOR.PATCH from 1.0.0"
             ),
-            detail={"current": current, "target": target_version},
+            detail=base_detail,
         )
-    if tgt_parts <= cur_parts:
+    running = parse_release(current)
+    if running is None:
+        if includes_release(current, target_version):
+            return PreflightResult(
+                name="version_path",
+                level="fail",
+                message=(
+                    f"current build {current!r} already includes {target_version}; "
+                    "rolling upgrade only moves forward — use slot rollback to revert"
+                ),
+                detail=base_detail,
+            )
+        return PreflightResult(
+            name="version_path",
+            level="warn",
+            message=(
+                f"current version {current!r} is not a release (a dev or nightly "
+                "build) — can't validate the upgrade path. Rolling upgrade from "
+                "an untagged build is unsupported; do a full redeploy from a "
+                "tagged release first."
+            ),
+            detail=base_detail,
+        )
+    if target <= running:
         return PreflightResult(
             name="version_path",
             level="fail",
@@ -406,33 +423,39 @@ def check_version_path(
                 f"{current}; rolling upgrade only moves forward — use "
                 "slot rollback to revert"
             ),
-            detail={"current": current, "target": target_version},
+            detail=base_detail,
         )
-    # Calendar gap in days.  Rough — counts calendar days only and
-    # treats each month as 30 days for the warn threshold (we don't
-    # need true date arithmetic for "is this a big jump").
-    cur_days = cur_parts[0] * 365 + cur_parts[1] * 30 + cur_parts[2]
-    tgt_days = tgt_parts[0] * 365 + tgt_parts[1] * 30 + tgt_parts[2]
-    gap_days = tgt_days - cur_days
-    if gap_days > 90:
+    if running.tagged_on is None or target.tagged_on is None:
+        # At least one side is SemVer: there is no date to measure a gap
+        # with. What should count as skipping releases under SemVer is
+        # still open (#1182); until then the jump is reported as forward.
+        crossing = running.tagged_on is not None
+        return PreflightResult(
+            name="version_path",
+            level="ok",
+            message=(
+                "forward jump across the switch from CalVer to SemVer"
+                if crossing
+                else f"forward jump from {current} to {target_version}"
+            ),
+            detail={**base_detail, "gap_days": None},
+        )
+    gap_days = (target.tagged_on - running.tagged_on).days
+    if gap_days > _SKIP_RELEASE_WARN_DAYS:
         return PreflightResult(
             name="version_path",
             level="warn",
             message=(
-                f"target is ~{gap_days} days newer than current "
-                "(>90 d); consider an intermediate stop"
+                f"target is {gap_days} days newer than current "
+                f"(>{_SKIP_RELEASE_WARN_DAYS} d); consider an intermediate stop"
             ),
-            detail={
-                "current": current,
-                "target": target_version,
-                "gap_days": gap_days,
-            },
+            detail={**base_detail, "gap_days": gap_days},
         )
     return PreflightResult(
         name="version_path",
         level="ok",
-        message=f"forward jump of ~{gap_days} days",
-        detail={"current": current, "target": target_version, "gap_days": gap_days},
+        message=f"forward jump of {gap_days} days",
+        detail={**base_detail, "gap_days": gap_days},
     )
 
 

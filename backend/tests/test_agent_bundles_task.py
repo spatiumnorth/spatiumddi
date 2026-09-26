@@ -191,9 +191,11 @@ async def test_with_redis_a_concurrent_request_coalesces_and_the_holder_renders_
 
 
 @pytest.mark.asyncio
-async def test_the_sweep_re_renders_a_bundle_from_another_release(
+async def test_the_sweep_re_renders_a_bundle_from_an_older_renderer_revision(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """#1185: a new release re-renders only when the renderer revision moved,
+    and an older process's sweep leaves a newer render alone."""
     monkeypatch.setattr(settings, "redis_url", "redis://127.0.0.1:1/0")
     server, _ = await _agent(db_session)
     await db_session.commit()
@@ -206,9 +208,16 @@ async def test_the_sweep_re_renders_a_bundle_from_another_release(
     assert (await agent_bundles._sweep())["stale"] == 0
 
     monkeypatch.setattr(settings, "version", "next-release")
+    assert (await agent_bundles._sweep())["stale"] == 0, "same renderer, nothing to redo"
+
+    old = store.RENDERER_REVISION
+    monkeypatch.setattr(store, "RENDERER_REVISION", old + 1)
     assert (await agent_bundles._sweep())["stale"] == 1
     assert captured == [str(server.id)]
     assert (await agent_bundles._run(str(server.id)))["status"] == "stored"
+
+    monkeypatch.setattr(store, "RENDERER_REVISION", old)
+    assert (await agent_bundles._sweep())["stale"] == 0, "an older sweep keeps a newer render"
 
 
 @pytest.mark.asyncio
