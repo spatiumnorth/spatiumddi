@@ -201,6 +201,35 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The worker renders DNS agent bundles again (#1197).** #1170's merge
+  of main dropped three things #1122 had added to `app/celery_app.py`:
+  `app.tasks.agent_bundles` from the worker's `include` list, the
+  `bundles` route, and the 30 s render-missing sweep. A started worker
+  had no render task registered, so it discarded every render it was
+  sent ("Received unregistered task"), and beat never swept. Agents got
+  a DNS change only when the api's bounded inline fallback built the
+  bundle, 120 s after the change, and never with the fallback off; after
+  an upgrade, an agent-based server last rendered by the previous
+  release was served nothing new until a change marked it and those
+  120 s had passed. All three are back. A test now starts a worker in a
+  fresh interpreter and fails when a task the code defines, or one beat
+  sends, is not registered in it.
+
+- **Five task modules were published to a queue no worker consumes
+  (#1200).** With `task_default_queue` unset, a task whose module has
+  no `task_routes` entry goes to Celery's default queue, `celery`, and
+  every deploy target's worker consumes only
+  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
+  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
+  had no route. So the Looking Glass collector stale sweep and route
+  re-resolve, the conformity evaluator, the revoked-appliance prune and
+  the daily DNSBL sweep never ran, and a rolling upgrade run started or
+  resumed through the api was enqueued to a list nothing reads. All
+  five now route to `default`. Messages already stranded on `celery` are
+  not replayed; `DEL celery` in the broker's Redis database (1 by
+  default) removes them. A test fails when a task routes to a queue the
+  worker does not consume.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the
