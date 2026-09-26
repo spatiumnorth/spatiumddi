@@ -173,6 +173,23 @@ the formatter handles the rest.
 
 ### Changed
 
+- **The update check and the upgrade preflight understand SemVer
+  (#1182).** Both compared versions as strings, which the switch to
+  SemVer at 1.0.0 breaks: `"1.0.0" > "2026.09.04-1"` is false, so no
+  install would have been offered 1.0.0, and the preflight's CalVer
+  parser failed it outright, disabling Plan. Both now use the shared
+  version helper from #1183. Every SemVer release is newer than every
+  CalVer one, SemVer compares numerically with pre-release precedence,
+  and a dev build, `latest` or a `0.x` placeholder is unknown rather
+  than a version. The preflight's skip-release warning now counts
+  calendar days, and it does not apply to a jump involving a SemVer
+  version, which has no date. Two existing bugs are gone with the
+  string compare: a same-day release numbered `-10` or higher was not
+  offered over `-2` to `-9`, and an install running `latest`, the
+  `.env.example` default, was never offered an update at all. This is
+  the comparison half of #1182, which the last CalVer release has to
+  carry. The release workflow and docs changes follow separately.
+
 - **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
   2026-09-24 and the backend's requirement had no upper bound, so CI
   picked it up at once. The test suite passes on it, but its new

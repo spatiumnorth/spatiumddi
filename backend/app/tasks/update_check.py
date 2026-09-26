@@ -7,13 +7,15 @@ disable the check entirely (air-gapped deployments, forks). Queries
 the unauthenticated rate limit (60/hour/IP) is plenty for a once-a-day
 check and we intentionally don't require a token.
 
-**Version comparison.** SpatiumDDI uses CalVer (``YYYY.MM.DD-N``) —
-lexicographic compare on the full string gives the correct ordering
-for same-length dates, so we just string-compare after stripping a
-leading ``v`` on either side. ``dev`` (the default for unversioned
-local builds) compares as less than any real CalVer tag, so dev
-deployments always see ``update_available=True`` once a release
-exists — that's fine, the user already knows they're on dev.
+**Version comparison.** Through :mod:`app.core.versions` (#1182), never
+as strings: releases are CalVer (``YYYY.MM.DD-N``) until 1.0.0 and SemVer
+from it, and ``"1.0.0" > "2026.09.04-1"`` is false as a string. A running
+build that is not a release (``dev``, ``latest``, ``dev-<sha>-<rand>``, a
+``0.x`` placeholder) is unknown, and sees ``update_available=True`` once a
+release exists — the operator already knows they're on an untagged build.
+A nightly has every CalVer release tagged before the day it was built, so
+it is offered only the ones tagged later; a SemVer tag carries no date, so
+a nightly is always offered one.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.versions import includes_release, parse_release
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
@@ -37,7 +40,8 @@ _HTTP_TIMEOUT_SECONDS = 10
 
 
 def _normalize(v: str | None) -> str:
-    """Strip a leading ``v`` and whitespace; preserve ``dev`` unchanged."""
+    """Strip whitespace and a leading ``v``: a tag may be published as
+    ``v2026.09.04-1`` or ``v1.0.0``."""
     if not v:
         return ""
     return v.strip().lstrip("v")
@@ -46,22 +50,21 @@ def _normalize(v: str | None) -> str:
 def _is_newer(latest: str, running: str) -> bool:
     """Return True when ``latest`` is strictly newer than ``running``.
 
-    ``running == "dev"`` is treated as "always outdated" once any real
-    version exists — the local-build fallback should surface the update
-    pill so the operator knows a tagged release is out.
+    ``latest`` must name a release, or there is nothing to offer. A
+    ``running`` build that is not a release is treated as outdated unless
+    it is a nightly known to include ``latest``: the local-build fallback
+    should surface the update pill so the operator knows a tagged release
+    is out.
     """
-    r = _normalize(running)
     lat = _normalize(latest)
-    if not lat:
+    latest_release = parse_release(lat)
+    if latest_release is None:
         return False
-    if not r or r == "dev":
-        return True
-    # CalVer lexicographic compare works because dates are fixed-width
-    # (YYYY.MM.DD) and the release number suffix only ever increases
-    # within a day. The ``-`` separator sorts before digits so
-    # ``2026.04.22-10`` > ``2026.04.22-2`` holds. (If CalVer ever gets
-    # double-digit release numbers on the same day we'll revisit.)
-    return lat > r
+    run = _normalize(running)
+    running_release = parse_release(run)
+    if running_release is not None:
+        return latest_release > running_release
+    return includes_release(run, lat) is not True
 
 
 async def _run_check() -> dict[str, Any]:

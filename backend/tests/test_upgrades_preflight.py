@@ -4,9 +4,9 @@
 Pure-Python — every check is independent + most don't actually need
 the DB or kubeapi. We exercise:
 
-* ``check_version_path`` — CalVer parse + forward-jump + 90-day-gap.
+* ``check_version_path`` — release parse (CalVer + SemVer, #1182) +
+  forward-jump + 90-day-gap.
 * ``check_disk_headroom`` — shutil.disk_usage threshold math.
-* ``_parse_calver`` — tag parser corner cases.
 * ``run_all`` overall verdict logic (worst-level wins, can_start
   derivation).
 * Lease state parsing via ``mutex._parse_lease`` — RFC3339 +
@@ -67,13 +67,17 @@ def test_version_path_dev_current_warns() -> None:
     assert "dev" in r.message
 
 
-def test_version_path_unparseable_target_fails() -> None:
+@pytest.mark.parametrize(
+    "target",
+    ["latest", "dev", "0.1.0", "0.0.0-nightly-20260924+7490f61", "v2026.05.22-1", ""],
+)
+def test_version_path_target_that_is_not_a_release_fails(target: str) -> None:
     r = preflight.check_version_path(
-        target_version="latest",
+        target_version=target,
         current_version="2026.05.22-2",
     )
     assert r.level == "fail"
-    assert "parse" in r.message.lower()
+    assert "not a release version" in r.message
 
 
 def test_version_path_large_gap_warns() -> None:
@@ -95,12 +99,82 @@ def test_version_path_minor_bump_ok() -> None:
     assert r.level == "ok"
 
 
-def test_parse_calver_corner_cases() -> None:
-    assert preflight._parse_calver("2026.05.22-1") == (2026, 5, 22, 1)
-    assert preflight._parse_calver("dev") is None
-    assert preflight._parse_calver("2026-05-22") is None
-    assert preflight._parse_calver("2026.5.22-1") is None  # need 2-digit month
-    assert preflight._parse_calver("v2026.05.22-1") is None
+def test_version_path_gap_is_measured_in_real_days() -> None:
+    # Was a 365/30 approximation; now calendar days between the tags.
+    r = preflight.check_version_path(
+        target_version="2026.03.01-1",
+        current_version="2026.02.01-1",
+    )
+    assert r.level == "ok"
+    assert r.detail["gap_days"] == 28
+
+
+# ── check_version_path across the switch to SemVer (#1182) ────────────
+
+
+def test_version_path_calver_to_first_semver_is_forward() -> None:
+    """The 1.0.0 upgrade itself: the CalVer parser used to fail it, which
+    disabled the Plan button and 409'd POST /upgrades/plan."""
+    r = preflight.check_version_path(target_version="1.0.0", current_version="2026.09.04-1")
+    assert r.level == "ok"
+    assert "SemVer" in r.message
+    # No date to measure a gap with, so no skip-release warning, however
+    # old the CalVer release.
+    assert r.detail["gap_days"] is None
+    old = preflight.check_version_path(target_version="1.0.0", current_version="2026.04.16-1")
+    assert old.level == "ok"
+
+
+def test_version_path_semver_to_calver_is_backward() -> None:
+    r = preflight.check_version_path(target_version="2026.12.31-9", current_version="1.0.0")
+    assert r.level == "fail"
+    assert "not newer" in r.message
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "level"),
+    [
+        ("1.0.0", "1.0.1", "ok"),
+        ("1.0.9", "1.0.10", "ok"),  # "1.0.10" > "1.0.9" is false as a string
+        ("1.0.0-rc.1", "1.0.0", "ok"),  # a pre-release precedes its release
+        ("1.0.0", "1.0.0-rc.2", "fail"),
+        ("1.2.0", "1.1.9", "fail"),
+        ("1.0.0", "1.0.0", "fail"),
+    ],
+)
+def test_version_path_semver_ordering(current: str, target: str, level: str) -> None:
+    r = preflight.check_version_path(target_version=target, current_version=current)
+    assert r.level == level, r.message
+
+
+@pytest.mark.parametrize("current", ["latest", "dev-abc1234-x9", "0.1.0", "unknown"])
+def test_version_path_placeholder_current_warns(current: str) -> None:
+    """Placeholders are unknown, never versions: ``latest`` used to be a
+    parse failure, and ``0.1.0`` would parse as a real SemVer release."""
+    r = preflight.check_version_path(target_version="2026.06.01-1", current_version=current)
+    assert r.level == "warn"
+    assert "not a release" in r.message
+
+
+def test_version_path_nightly_current() -> None:
+    older = preflight.check_version_path(
+        target_version="2026.09.04-1",
+        current_version="0.0.0-nightly-20260820+abc1234",
+    )
+    assert older.level == "warn"
+    # A nightly built after the target was tagged already has it.
+    newer = preflight.check_version_path(
+        target_version="2026.09.04-1",
+        current_version="0.0.0-nightly-20260924+7490f61",
+    )
+    assert newer.level == "fail"
+    assert "already includes" in newer.message
+    # A SemVer tag carries no date, so a nightly can't be placed against it.
+    semver = preflight.check_version_path(
+        target_version="1.0.0",
+        current_version="0.0.0-nightly-20260924+7490f61",
+    )
+    assert semver.level == "warn"
 
 
 # ── check_disk_headroom ───────────────────────────────────────────────
