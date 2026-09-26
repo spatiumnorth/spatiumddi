@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
     prometheus_metrics_enabled: bool = True
+    # #1159 — /metrics needs ``Authorization: Bearer <token>``: this scrape
+    # token, or any valid API token. The web port proxies /metrics and Docker
+    # Compose publishes the api port, so an anonymous endpoint was readable by
+    # anyone who could reach the login page. The Helm chart generates the
+    # scrape token into its app Secret; Compose reads it from .env.
+    prometheus_metrics_token: str = ""
+    # False restores anonymous scraping. Not recommended: see above.
+    prometheus_metrics_require_auth: bool = True
 
     # DNS agent
     dns_agent_key: str = ""
