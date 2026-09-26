@@ -129,12 +129,17 @@ the formatter handles the rest.
   the bundle renders marks it: the pool health check's timestamps, the
   agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
   settings stamps do not, because every mark costs a render. The
-  long-poll serves the newest bundle the running release stored, current
-  or not. Under a write storm no render is current until the writes
-  stop, and each one that lands reaches the agents. A bundle rendered by
-  a previous release is never served, so an upgrade re-renders each
-  server once. The ops page, and the queued ops a split-horizon render
-  retires, cover only the ops whose transaction had committed before the
+  long-poll serves the newest stored bundle, current or not. Under a
+  write storm no render is current until the writes stop, and each one
+  that lands reaches the agents. Each bundle records the renderer
+  revision that produced it (#1185). One from an older revision is never
+  served, so an upgrade that changes the renderer re-renders each server
+  once, and one that doesn't re-renders nothing. An older process never
+  replaces a newer render, so the old and new pods of a rolling upgrade
+  don't undo each other's; a test fails when the rendered output changes
+  without a revision bump. The ops page, and the queued ops a
+  split-horizon render retires, cover only the ops whose transaction
+  had committed before the
   render read (its `pg_current_snapshot()`, not the op's `created_at`,
   which is its transaction's start). So a body can never lack a record
   the agent already applied, and an ACME DNS-01 wait never sees an op
@@ -160,8 +165,8 @@ the formatter handles the rest.
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
   instead of re-sending the whole body. Migrations `c4d1e7f90a2b`,
-  `d9a4c27e18f3` and `f3a9d61c07e4` (additive: one table, fourteen
-  nullable-or-defaulted columns, no table rewrite).
+  `d9a4c27e18f3`, `f3a9d61c07e4` and `e6b2d94f1a37` (additive: one
+  table, sixteen nullable-or-defaulted columns, no table rewrite).
 - **The bundle's records query orders by the `(zone_id, name)` index
   prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
   UUID, so the planner sorted the whole table on every build. The
@@ -221,6 +226,45 @@ the formatter handles the rest.
   unknown and keep the safe path. The threshold is now 2026.06.12-2,
   the first release with the fix it tests for: 2026.06.12-1 was tagged
   before it merged, and used to count as having it.
+
+- **Worker task failures now reach Diagnostics (#1193).** None had
+  been recorded since the feature shipped (#123); failures in API
+  requests always were. The Celery `task_failure` hook opened a sync
+  database engine on a `postgresql://` URL, which needs psycopg2, and
+  the backend ships only asyncpg. So every failure logged
+  `diagnostics_capture_failed_sync` and recorded nothing, and because
+  the hook swallows its own errors, nothing else noticed. It now runs
+  the api's capture code on a fresh asyncpg engine, on a short-lived
+  thread of its own.
+
+- **The worker renders DNS agent bundles again (#1197).** #1170's merge
+  of main dropped three things #1122 had added to `app/celery_app.py`:
+  `app.tasks.agent_bundles` from the worker's `include` list, the
+  `bundles` route, and the 30 s render-missing sweep. A started worker
+  had no render task registered, so it discarded every render it was
+  sent ("Received unregistered task"), and beat never swept. Agents got
+  a DNS change only when the api's bounded inline fallback built the
+  bundle, 120 s after the change, and never with the fallback off; after
+  an upgrade, an agent-based server last rendered by the previous
+  release was served nothing new until a change marked it and those
+  120 s had passed. All three are back. A test now starts a worker in a
+  fresh interpreter and fails when a task the code defines, or one beat
+  sends, is not registered in it.
+
+- **Five task modules were published to a queue no worker consumes
+  (#1200).** With `task_default_queue` unset, a task whose module has
+  no `task_routes` entry goes to Celery's default queue, `celery`, and
+  every deploy target's worker consumes only
+  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
+  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
+  had no route. So the Looking Glass collector stale sweep and route
+  re-resolve, the conformity evaluator, the revoked-appliance prune and
+  the daily DNSBL sweep never ran, and a rolling upgrade run started or
+  resumed through the api was enqueued to a list nothing reads. All
+  five now route to `default`. Messages already stranded on `celery` are
+  not replayed; `DEL celery` in the broker's Redis database (1 by
+  default) removes them. A test fails when a task routes to a queue the
+  worker does not consume.
 
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
