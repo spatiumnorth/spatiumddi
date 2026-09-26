@@ -94,8 +94,8 @@ class SystemUpgradeRun(Base, UUIDPrimaryKeyMixin):
     )
 
     # Target version the operator is moving the cluster to. Free-form
-    # CalVer tag (``2026.06.01-1``); the linter/parser lives in the
-    # preflight check, not the column.
+    # release tag (``2026.06.01-1``, or SemVer from 1.0.0); the preflight
+    # check validates it with ``app.core.versions``, not the column.
     target_version: Mapped[str] = mapped_column(String(64), nullable=False)
 
     # What's running today, captured at preflight time. We capture per-

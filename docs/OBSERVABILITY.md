@@ -587,6 +587,40 @@ The API service exposes a Prometheus scrape endpoint at `/metrics` on
 the main API port (gated by the `prometheus_metrics_enabled` setting,
 default on; registered in `backend/app/main.py`).
 
+**Scraping needs a bearer token (#1159).** The web port proxies
+`/metrics` and Docker Compose publishes the API port, so the endpoint is
+reachable from outside the deployment, and it answers only
+`Authorization: Bearer <token>`. Either token works:
+
+- **The scrape token**, `PROMETHEUS_METRICS_TOKEN`. The Helm chart
+  generates it into its app Secret as `metrics-token` (or takes
+  `auth.metricsToken`) and keeps it across upgrades like `SECRET_KEY`.
+  Docker Compose reads it from `.env`. With `auth.existingSecret`, add a
+  `metrics-token` key to that Secret yourself.
+- **Any valid API token.** It goes through the same checks as on every
+  other route: a revoked or expired token, one whose scopes don't allow the
+  request, or one whose owner is disabled is refused. A dedicated
+  read-only token per scraper is easy to revoke.
+
+A Prometheus scrape job reads the token from a file:
+
+```yaml
+scrape_configs:
+  - job_name: spatiumddi
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/spatiumddi-metrics-token
+    static_configs:
+      - targets: ["spatiumddi.example.com:443"]
+    scheme: https
+```
+
+The appliance console's API panel reads the scrape token from the
+chart's Secret. `PROMETHEUS_METRICS_REQUIRE_AUTH=false` serves `/metrics`
+to anyone again; it isn't recommended for any deployment whose web port
+or API port is reachable.
+
 > **Implemented today:** only the **API-request family** below, defined
 > and emitted in `backend/app/metrics.py` via a Starlette middleware on
 > every request. The IPAM / DHCP / DNS / Celery / Database families that

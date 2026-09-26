@@ -678,6 +678,8 @@ backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:96
 backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:97
 backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:98
 backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:99
+backend/alembic/versions/e6b2d94f1a37_dns_agent_bundle_renderer_revision.py:drop_column:41
+backend/alembic/versions/e6b2d94f1a37_dns_agent_bundle_renderer_revision.py:drop_column:42
 backend/alembic/versions/e6f12b9a3c84_tailscale_phase2_dns.py:drop_column:45
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:66
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:67

@@ -357,6 +357,14 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
     secretKeyRef:
       name: {{ include "spatiumddi.appSecretName" . }}
       key: secret-key
+# #1159 — the /metrics scrape token. Optional: a Secret supplied through
+# auth.existingSecret may not carry it, and then only API tokens can scrape.
+- name: PROMETHEUS_METRICS_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: metrics-token
+      optional: true
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
 {{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}

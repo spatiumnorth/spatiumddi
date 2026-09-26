@@ -302,19 +302,19 @@ function PlanFormPanel() {
     <section className="rounded-lg border bg-card p-4">
       <h3 className="text-sm font-semibold">Plan an upgrade</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Run preflight against a target CalVer tag, review the verdict, then plan
-        + start. The orchestrator acquires the Lease at start time; nothing
+        Run preflight against a target release tag, review the verdict, then
+        plan + start. The orchestrator acquires the Lease at start time; nothing
         happens to the cluster until you click Start.
       </p>
 
       <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1">
           <span className="text-xs font-medium text-muted-foreground">
-            Target version (CalVer)
+            Target version
           </span>
           <input
             type="text"
-            placeholder="2026.06.01-1"
+            placeholder="2026.06.01-1 or 1.0.0"
             value={targetVersion}
             onChange={(e) => setTargetVersion(e.target.value)}
             className="rounded-md border bg-background px-2 py-1 font-mono text-sm"

@@ -205,12 +205,21 @@ pending ops, blocklists, pools, and the platform singletons — to the
 servers it feeds; each flush's servers are collected and bumped once, at
 the outermost commit, in server-id order, so the bump's row locks live for
 the COMMIT alone and two writers can never deadlock on them); `bundle_watermark` is the sequence the newest stored
-bundle was rendered at. Current ⇔ `watermark ≥ seq` **and** the bundle was
-rendered by the running release (`bundle_app_version`): one integer and one
-string comparison, no assembly, no content hash. The release half is what
-makes an upgrade that changes the renderer's output re-render every server
-once, instead of serving the previous release's bytes until something
-unrelated marks it. After commit the render is enqueued (the worker
+bundle was rendered at. Current ⇔ `watermark ≥ seq` **and** the bundle came
+from this process's renderer revision or a newer one
+(`bundle_renderer_revision ≥ RENDERER_REVISION`, #1185): two integer
+comparisons, no assembly, no content hash. The revision half is what makes
+an upgrade that changes the renderer's output re-render every server once,
+instead of serving the previous renderer's bytes until something unrelated
+marks it. It replaced an equality check on the release string
+(`bundle_app_version`, now diagnostic only), which re-rendered every server
+on every release and let the old and new pods of a rolling upgrade replace
+each other's renders every 30 s. Now a release that leaves the renderer
+alone re-renders nothing, and an older process never replaces a newer
+render: it serves it. `RENDERER_REVISION` lives in
+`services/dns/agent_bundle_store.py`, and
+`tests/test_dns_agent_bundle_revision.py` fails when the rendered output
+changes without a bump. After commit the render is enqueued (the worker
 coalesces duplicates: one render in flight per server, one more after it if
 a change landed meanwhile — that is what turns a thousand-batch seed into a
 handful of renders), and a 30 s beat sweep re-enqueues anything still
@@ -292,10 +301,10 @@ finish, so no render is current until the writes stop. Serving only a
 current bundle held every agent on its last config for the whole storm: in
 a 250k-record seed a pool failover stayed in `named` for 339 s while 74
 renders landed unserved. Now each render that lands reaches the agents, at
-most one render behind, and the gate above keeps that safe. A bundle
-another release rendered is never served; the sweep re-renders it. With
-nothing stored for this release the poll holds on the wake the render
-publishes, 304 at the deadline.
+most one render behind, and the gate above keeps that safe. A bundle from
+an older renderer revision is never served; the sweep re-renders it. With
+nothing current stored for this revision the poll holds on the wake the
+render publishes, 304 at the deadline.
 
 *Staleness is never silent.* A render
 that raises lands on `dns_server.bundle_render_status / _error / _at` —

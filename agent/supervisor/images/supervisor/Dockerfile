@@ -116,3 +116,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
   CMD pgrep -f spatium-supervisor >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-supervisor-entrypoint"]
+
+# #1183 — the version the supervisor reports: the release tag from
+# release.yml, the nightly stamp from nightly.yml, the dev stamp from
+# ``make build-supervisor``. A build that passes nothing reports "dev".
+# Last, so a new version only rebuilds this layer.
+ARG APP_VERSION=dev
+ENV SPATIUM_SUPERVISOR_VERSION=${APP_VERSION}

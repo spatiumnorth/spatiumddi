@@ -11,7 +11,7 @@ import json
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -199,45 +199,124 @@ async def test_record_failure_surfaces_on_the_server_row_and_is_cleared_by_a_goo
     assert server.bundle_render_error is None
 
 
-@pytest.mark.asyncio
-async def test_a_bundle_rendered_by_another_release_is_not_current_and_is_replaced(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A release that changes what the renderer emits must re-render every
-    server once, not serve the previous release's bytes until something
-    unrelated marks it. Same watermark, so the row is replaced in place."""
-    server, _zone = await _agent(db_session, records=3)
-    await db_session.commit()
-    first = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
-    await db_session.commit()
-    assert store.is_current(server)
-
-    monkeypatch.setattr(settings, "version", "next-release")
-    assert not store.is_current(server), "rendered by another release"
-    assert await store.current(db_session, server) is None
-
-    again = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
-    await db_session.commit()
-    assert again.stored, "a different release's row at this watermark is replaced"
-    assert again.watermark == first.watermark
-    assert again.etag == first.etag, "same state, same ETag"
-    assert server.bundle_app_version == "next-release"
-    assert store.is_current(server)
+async def _revisions(db: AsyncSession, server: DNSServer) -> list[int | None]:
     rows = (
         (
-            await db_session.execute(
-                select(DNSAgentBundle).where(DNSAgentBundle.server_id == server.id)
+            await db.execute(
+                select(DNSAgentBundle)
+                .where(DNSAgentBundle.server_id == server.id)
+                .order_by(DNSAgentBundle.dirty_watermark)
             )
         )
         .scalars()
         .all()
     )
-    assert [r.app_version for r in rows] == ["next-release"]
+    return [r.renderer_revision for r in rows]
 
-    # The same release rendering the same watermark again is still a no-op.
+
+@pytest.mark.asyncio
+async def test_a_newer_renderer_revision_replaces_an_older_render(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release that changes what the renderer emits bumps the revision and
+    re-renders every server once, rather than serving the older renderer's
+    bytes until something unrelated marks it. Same watermark, so the row is
+    replaced in place (#1185)."""
+    server, _zone = await _agent(db_session, records=3)
+    await db_session.commit()
+    first = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert store.is_current(server)
+    assert server.bundle_renderer_revision == store.RENDERER_REVISION
+
+    # A new release that leaves the renderer alone re-renders nothing: the
+    # release string no longer decides.
+    monkeypatch.setattr(settings, "version", "next-release")
+    assert store.is_current(server)
+
+    monkeypatch.setattr(store, "RENDERER_REVISION", store.RENDERER_REVISION + 1)
+    assert not store.is_current(server), "rendered by an older revision"
+    assert await store.current(db_session, server) is None
+
+    again = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert again.stored, "an older revision's row at this watermark is replaced"
+    assert again.watermark == first.watermark
+    assert again.etag == first.etag, "same state, same ETag"
+    assert server.bundle_renderer_revision == store.RENDERER_REVISION
+    assert store.is_current(server)
+    assert await _revisions(db_session, server) == [store.RENDERER_REVISION]
+
+    # The same revision rendering the same watermark again is still a no-op.
     dup = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_API)
     await db_session.commit()
     assert not dup.stored
+
+
+@pytest.mark.asyncio
+async def test_an_older_renderer_never_replaces_a_newer_render(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rolling upgrade: the new pods render at revision 2 while old pods at
+    revision 1 still run. Under the ``app_version`` equality check each side
+    replaced the other's row every 30 s. Now the old pods treat the newer
+    render as current and serve it, and a render they finish at the same
+    watermark writes nothing."""
+    server, zone = await _agent(db_session, records=3)
+    await db_session.commit()
+    old = store.RENDERER_REVISION
+    monkeypatch.setattr(store, "RENDERER_REVISION", old + 1)
+    newer = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert newer.stored
+
+    monkeypatch.setattr(store, "RENDERER_REVISION", old)
+    assert store.is_current(server), "a newer revision is current for an older process"
+    served = await store.newest(db_session, server)
+    assert served is not None and served.renderer_revision == old + 1
+    late = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_API)
+    await db_session.commit()
+    assert not late.stored, "an older render never replaces a newer one"
+    assert await _revisions(db_session, server) == [old + 1]
+
+    # A change the old pod renders first is stored (it is newer data), and the
+    # new pod re-renders that watermark once. No ping-pong.
+    _add_record(db_session, zone, "after-upgrade")
+    await db_session.commit()
+    await db_session.refresh(server)
+    assert (await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_API)).stored
+    await db_session.commit()
+    monkeypatch.setattr(store, "RENDERER_REVISION", old + 1)
+    assert not store.is_current(server)
+    assert (await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)).stored
+    await db_session.commit()
+    monkeypatch.setattr(store, "RENDERER_REVISION", old)
+    assert store.is_current(server)
+    assert not (
+        await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_API)
+    ).stored
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_from_before_the_revision_is_stale(db_session: AsyncSession) -> None:
+    """Rows stored before #1185 carry NULL: each server re-renders once."""
+    server, _zone = await _agent(db_session, records=3)
+    await db_session.commit()
+    await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    server.bundle_renderer_revision = None
+    await db_session.execute(
+        update(DNSAgentBundle)
+        .where(DNSAgentBundle.server_id == server.id)
+        .values(renderer_revision=None)
+    )
+    await db_session.commit()
+    assert not store.is_current(server)
+    assert await store.newest(db_session, server) is None
+    again = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert again.stored
+    assert await _revisions(db_session, server) == [store.RENDERER_REVISION]
 
 
 @pytest.mark.asyncio
