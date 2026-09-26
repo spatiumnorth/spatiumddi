@@ -201,6 +201,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The change-report PDF answered 500 for an `until` near year 1,
+  and every 500 lost its request id (#1201).** With no `since`,
+  `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
+  raised `OverflowError` for any `until` in the first 30 days of year
+  1. The window now starts at the earliest representable instant. An
+  `until` that is before year 1 in UTC (`0001-01-01T00:00:00+05:00`)
+  is a 422, as it already was when sent as `since`. Separately, the
+  unhandled-exception handler read the request id from the client's
+  headers only, so a client that sent none got a 500 with no
+  `X-Request-ID`, and the log line and Diagnostics row said
+  `request_id: null`. It now uses the id the request was logged under
+  and returns it on the response.
+
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
   `event_publisher`: session listeners register on import, and only the
