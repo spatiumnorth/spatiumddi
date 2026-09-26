@@ -136,12 +136,12 @@ async def test_a_previous_release_request_blocked_on_an_altered_table_does_not_k
     # env.py takes the URL from DATABASE_URL, exactly as the migrate Job does.
     monkeypatch.setenv("DATABASE_URL", sa_url)
 
-    outcome: dict[str, BaseException] = {}
+    outcome: dict[str, Exception] = {}
 
     def upgrade() -> None:
         try:
             command.upgrade(cfg, "head")
-        except BaseException as exc:  # noqa: BLE001 — reported by the assertion
+        except Exception as exc:  # noqa: BLE001 — reported by the assertion
             outcome["error"] = exc
 
     request = await asyncpg.connect(raw_url)  # the previous release's request
