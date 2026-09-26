@@ -805,6 +805,11 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        # For the unhandled-exception handler (#1201): it runs in Starlette's
+        # ServerErrorMiddleware, outside this one, so neither the header set
+        # below nor this frame's locals reach its response. ``request.state``
+        # lives on the ASGI scope, which that handler's Request shares.
+        request.state.request_id = request_id
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(
             request_id=request_id,
@@ -1202,7 +1207,13 @@ def create_app() -> FastAPI:
             record_unhandled_exception_async,
         )
 
-        request_id = request.headers.get("X-Request-ID")
+        # The id RequestContextMiddleware generated, not only one the client
+        # sent (#1201): this used to read the request header alone, so a
+        # client that sent none got a 500 with no X-Request-ID and a log line
+        # and Diagnostics row carrying ``request_id: null``.
+        request_id = getattr(request.state, "request_id", None) or request.headers.get(
+            "X-Request-ID"
+        )
         try:
             sanitised_headers = {
                 k: v
@@ -1241,6 +1252,7 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal Server Error"},
+            headers={"X-Request-ID": request_id} if request_id else None,
         )
 
     # The 422 the document declares is not the only 422 the API returns.
