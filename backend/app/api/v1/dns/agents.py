@@ -519,8 +519,8 @@ def _inline_eligible(server: DNSServer) -> bool:
     and the api builds nothing, however many changes a storm commits
     (without the bound a 250k-record seed had the api build the growing
     bundle 48 times, up to 480k records and 16 s each, beside the worker).
-    A bundle that is stale only because another release rendered it waits
-    for the sweep.
+    A bundle that is stale only because an older renderer revision
+    rendered it waits for the sweep.
     """
     if server.bundle_watermark is None:
         return True

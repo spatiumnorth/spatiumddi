@@ -273,10 +273,14 @@ username and password. No JWT.
 ```
 
 **Blocking behaviour:** the endpoint blocks until the TXT write is
-acknowledged by the zone's primary DNS server (default timeout
-30 s). On healthy systems this typically resolves in 1-5 s. If the
-agent is unreachable the endpoint returns 504; LE / ACME clients
-retry automatically.
+acknowledged by the zone's primary DNS server. On healthy systems
+this typically resolves in 1-5 s. The timeout is 30 s, or longer on a
+server whose renders are slow: an agent receives the record with its
+next render, which takes about 30 s at a million records, so the wait
+is two of that server's slowest recent renders plus 10 s, capped at
+55 s so it ends before the web frontend's 60 s proxy timeout (#1184).
+If the agent is unreachable or the wait runs out, the endpoint
+returns 504; LE / ACME clients retry automatically.
 
 **Wildcard certs:** at most the two most recent values are kept at
 the same subdomain. A third `/update` evicts the oldest. This
@@ -328,7 +332,7 @@ next attempt.
 - **Rate limiting.** The v1 release does not ship a rate limiter
   specifically for `/api/v1/acme/`. Operators running the surface
   publicly should front it with a WAF or proxy-level rate limit.
-  The `wait_for_op_applied` loop caps at 30 s so even an aggressive
+  The `wait_for_op_applied` loop caps at 55 s so even an aggressive
   attacker can't tie up more than a fixed number of connections per
   second.
 - **Audit log.** Every register / update / delete writes an
@@ -436,7 +440,11 @@ cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
    same `record_ops` pipeline the rest of DNS uses
    (`enqueue_record_op` + `bump_zone_serial` + `wait_for_op_applied`),
    and the solve **blocks until the DNS agent acknowledges the op as
-   applied** — so the record is live before the CA validates. A
+   applied** — so the record is live before the CA validates. The wait
+   scales with the group's render time (#1184): one render per server in
+   the group, plus the one that may already be running, from the slowest
+   render the servers have stored, plus 10 s. It is at least 30 s and at
+   most 5 minutes. A
    best-effort dnspython lookup runs afterward but never gates
    success. If no managed primary zone covers the FQDN, the order
    fails with a clear `last_error`.

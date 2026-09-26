@@ -45,6 +45,7 @@ from app.services.docker.client import (
     DockerClient,
     DockerClientError,
 )
+from app.services.integration_ownership import owned_by_other_integration
 
 logger = structlog.get_logger(__name__)
 
@@ -445,13 +446,7 @@ async def _apply_addresses(
                     f"address {row.address} owned by another Docker host; not claiming"
                 )
                 continue
-            if (
-                row.kubernetes_cluster_id is not None
-                or row.proxmox_node_id is not None
-                or row.panos_firewall_id is not None
-                or row.fortinet_firewall_id is not None
-                or row.meraki_org_id is not None
-            ):
+            if owned_by_other_integration(row, "docker_host_id"):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"
                 )

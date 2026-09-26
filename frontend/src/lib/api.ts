@@ -1095,7 +1095,19 @@ export interface BlockMoveIntegrationBlocker {
   kind: "block" | "subnet" | "ip_address";
   resource_id: string;
   network: string;
-  integration: "kubernetes" | "docker" | "proxmox" | "tailscale";
+  // Every integration that owns IPAM rows (backend integration_ownership.py).
+  integration:
+    | "kubernetes"
+    | "docker"
+    | "proxmox"
+    | "tailscale"
+    | "unifi"
+    | "cloud"
+    | "opnsense"
+    | "netbird"
+    | "paloalto"
+    | "fortinet"
+    | "meraki";
 }
 
 export interface BlockMovePreviewResponse {

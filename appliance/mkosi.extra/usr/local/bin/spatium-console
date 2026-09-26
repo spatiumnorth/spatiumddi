@@ -38,6 +38,8 @@ import termios
 import threading
 import time
 import tty
+import base64
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -496,6 +498,48 @@ def fetch_etcd_health(timeout: float = 2.0) -> dict:
 _API_REQ_PREV: tuple[float, float] | None = None
 
 
+# #1159 — /metrics needs a bearer token. The chart generates one into its
+# app Secret (``metrics-token``); the console reads it with the same kubectl
+# the svc lookup uses and caches it. It is looked up again after a 401, so a
+# rotated token is picked up without a restart.
+_METRICS_TOKEN_CACHE: dict = {"fetched": False, "token": None}
+
+
+def _metrics_scrape_token(refresh: bool = False) -> str | None:
+    """The /metrics scrape token from the chart's app Secret, or None when no
+    Secret in the namespace carries one (an api too old to need it)."""
+    if _METRICS_TOKEN_CACHE["fetched"] and not refresh:
+        return _METRICS_TOKEN_CACHE["token"]
+    token = None
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/k3s", "kubectl", "get", "secret", "-n", "spatium",
+                "-l", "app.kubernetes.io/name=spatiumddi", "-o", "json",
+            ],
+            env={**os.environ, "KUBECONFIG": "/etc/rancher/k3s/k3s.yaml"},
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            for item in json.loads(proc.stdout).get("items") or []:
+                encoded = (item.get("data") or {}).get("metrics-token")
+                if encoded:
+                    token = base64.b64decode(encoded).decode("utf-8").strip() or None
+                    break
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        token = None
+    _METRICS_TOKEN_CACHE["fetched"] = True
+    _METRICS_TOKEN_CACHE["token"] = token
+    return token
+
+
+def _get_api_metrics(api_ip: str, token: str | None, timeout: float) -> str:
+    request = urllib.request.Request(f"http://{api_ip}:8000/metrics")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    return urllib.request.urlopen(request, timeout=timeout).read().decode("utf-8", "replace")
+
+
 def fetch_api_metrics(api_ip: str, timeout: float = 3.0) -> dict:
     """Spatium API request metrics from ClusterIP:8000/metrics (~12 ms,
     stdlib urllib). Returns {rate, active, total}; ``rate`` is requests/sec
@@ -503,9 +547,12 @@ def fetch_api_metrics(api_ip: str, timeout: float = 3.0) -> dict:
     {} on any error → the API box renders dim "n/a"."""
     global _API_REQ_PREV
     try:
-        raw = urllib.request.urlopen(
-            f"http://{api_ip}:8000/metrics", timeout=timeout
-        ).read().decode("utf-8", "replace")
+        try:
+            raw = _get_api_metrics(api_ip, _metrics_scrape_token(), timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+            raw = _get_api_metrics(api_ip, _metrics_scrape_token(refresh=True), timeout)
     except Exception:
         return {}
     total = 0.0

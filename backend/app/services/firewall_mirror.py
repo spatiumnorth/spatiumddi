@@ -19,7 +19,9 @@ Each vendor reconciler:
 
 Ownership guard (NN: a mirror never claims another integration's rows): a row
 carrying ANY of ``INTEGRATION_OWNERSHIP_FKS`` other than the current owner's is
-off-limits. ``other_ownership_fks(owner)`` returns exactly that guard set.
+off-limits. ``other_ownership_fks(owner)`` returns exactly that guard set. The
+FK set lives in ``app.services.integration_ownership``, which every other
+integration reconciler uses too (#1135).
 """
 
 from __future__ import annotations
@@ -33,29 +35,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
+from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 
 _BIGINT_MAX = 2**63 - 1
-
-# Every per-integration provenance FK an IPAM/NAT/object row can carry. A
-# firewall mirror must not claim a row owned by any OTHER of these. Kept in one
-# place so adding a vendor is a single-line change here (the pre-#606
-# reconcilers still hold their own inline copies; migrating them is a
-# follow-up).
-INTEGRATION_OWNERSHIP_FKS: frozenset[str] = frozenset(
-    {
-        "kubernetes_cluster_id",
-        "docker_host_id",
-        "proxmox_node_id",
-        "tailscale_tenant_id",
-        "unifi_controller_id",
-        "cloud_endpoint_id",
-        "opnsense_router_id",
-        "netbird_instance_id",
-        "panos_firewall_id",
-        "fortinet_firewall_id",
-        "meraki_org_id",
-    }
-)
 
 
 @dataclass(frozen=True)

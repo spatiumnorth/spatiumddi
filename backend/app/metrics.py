@@ -1,3 +1,4 @@
+import hmac
 import re
 import time
 
@@ -6,6 +7,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+
+from app.config import settings
 
 # API metrics
 REQUEST_COUNT = Counter(
@@ -164,8 +167,45 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
             REQUEST_DURATION.labels(method=method, path_template=path_label).observe(duration)
 
 
+async def _scrape_authorized(request: Request) -> bool:
+    """#1159 — may this request read /metrics?
+
+    Only with ``Authorization: Bearer <token>``, where the token is the
+    configured scrape token (``PROMETHEUS_METRICS_TOKEN``) or any valid API
+    token. An API token goes through the same checks as on every other route:
+    revoked, expired, out of scope, owner disabled or owner forced to change
+    their password all refuse it, and its use is recorded.
+    """
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    credential = credential.strip()
+    if scheme.lower() != "bearer" or not credential:
+        return False
+    configured = settings.prometheus_metrics_token.strip()
+    if configured and hmac.compare_digest(credential.encode(), configured.encode()):
+        return True
+    # Imported here: the API-token path needs the models and the database,
+    # which this module, imported for the middleware alone, otherwise doesn't.
+    from fastapi import HTTPException
+
+    from app.api.deps import _API_TOKEN_PREFIX, _resolve_api_token
+    from app.db import AsyncSessionLocal
+
+    if not credential.startswith(_API_TOKEN_PREFIX):
+        return False
+    async with AsyncSessionLocal() as db:
+        try:
+            await _resolve_api_token(db, credential, request)
+        except HTTPException:
+            return False
+    return True
+
+
 async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint at /metrics.
+
+    #1159 — refused with 401 unless the request carries the scrape token or
+    an API token (see :func:`_scrape_authorized`), unless
+    ``PROMETHEUS_METRICS_REQUIRE_AUTH`` is false.
 
     #1051 — rendered in a worker thread, not on the event loop.
     ``generate_latest`` is pure Python and walks every series in the
@@ -178,5 +218,12 @@ async def metrics_endpoint(request: Request) -> Response:
     probes and the requests between GIL slices instead of going dark for the
     duration.
     """
+    if settings.prometheus_metrics_require_auth and not await _scrape_authorized(request):
+        return Response(
+            content="/metrics requires a bearer token: the scrape token or an API token\n",
+            status_code=401,
+            media_type="text/plain",
+            headers={"WWW-Authenticate": 'Bearer realm="metrics"'},
+        )
     data = await run_in_threadpool(generate_latest)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)

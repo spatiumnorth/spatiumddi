@@ -29,10 +29,11 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.integration_ownership import INTEGRATION_OWNERSHIP, owning_integration
 
 # Advisory-lock namespace for block-move. Distinct from the resize
 # namespaces so a move and a resize on the *same* block don't
@@ -62,7 +63,7 @@ class IntegrationBlocker:
     kind: str  # "block" | "subnet" | "ip_address"
     resource_id: str  # uuid as str
     network: str  # CIDR or IP for human display
-    integration: str  # "kubernetes" | "docker" | "proxmox" | "tailscale"
+    integration: str  # an ``INTEGRATION_OWNERSHIP`` name, e.g. "unifi"
 
 
 @dataclass
@@ -166,6 +167,17 @@ async def _collect_descendants(
     return descendant_block_ids, descendant_subnet_ids, address_count
 
 
+def _owned_by_any(model: Any) -> Any:
+    """SQL: some integration owns this row."""
+    return or_(*(getattr(model, fk).is_not(None) for fk in INTEGRATION_OWNERSHIP))
+
+
+def _with_owners(*columns: Any, model: Any) -> Any:
+    """SELECT ``columns`` plus every ownership FK, so the result rows can go
+    straight to ``owning_integration``."""
+    return select(*columns, *(getattr(model, fk) for fk in INTEGRATION_OWNERSHIP))
+
+
 async def _collect_integration_blockers(
     db: AsyncSession,
     moved_block_id: uuid.UUID,
@@ -178,57 +190,50 @@ async def _collect_integration_blockers(
     space on its next sweep, leaving the move as a silent no-op
     that desynchronises provenance. Refuse the commit instead.
 
-    The reconciler-owned rows are detected by the four integration
-    FKs that exist on every IPAM table:
-      * kubernetes_cluster_id
-      * docker_host_id
-      * proxmox_node_id
-      * tailscale_tenant_id
+    Every integration ownership FK counts (``app.services.
+    integration_ownership``). Until #1135 this checked four of them, so a
+    block holding UniFi / OPNsense / Cloud / NetBird / firewall-owned rows
+    moved, and the reconciler re-created them in the source space.
+    ``include_deleted`` keeps the old raw SQL's behaviour: soft-deleted
+    rows move with the block, so they block it too.
     """
-    block_ids = [str(moved_block_id), *descendant_block_ids]
-    blockers: list[IntegrationBlocker] = []
-
-    for kind, sql, params in (
+    block_ids = [uuid.UUID(i) for i in (str(moved_block_id), *descendant_block_ids)]
+    subnet_ids = [uuid.UUID(i) for i in descendant_subnet_ids]
+    queries: list[tuple[str, Any]] = [
         (
             "block",
-            """
-            SELECT id, network::text,
-                   kubernetes_cluster_id, docker_host_id,
-                   proxmox_node_id, tailscale_tenant_id
-            FROM ip_block
-            WHERE id = ANY(CAST(:ids AS uuid[]))
-              AND (kubernetes_cluster_id IS NOT NULL
-                OR docker_host_id IS NOT NULL
-                OR proxmox_node_id IS NOT NULL
-                OR tailscale_tenant_id IS NOT NULL)
-            """,
-            {"ids": block_ids},
-        ),
-        (
-            "subnet",
-            """
-            SELECT id, network::text,
-                   kubernetes_cluster_id, docker_host_id,
-                   proxmox_node_id, tailscale_tenant_id
-            FROM subnet
-            WHERE id = ANY(CAST(:ids AS uuid[]))
-              AND (kubernetes_cluster_id IS NOT NULL
-                OR docker_host_id IS NOT NULL
-                OR proxmox_node_id IS NOT NULL
-                OR tailscale_tenant_id IS NOT NULL)
-            """,
-            {"ids": descendant_subnet_ids},
-        ),
-    ):
-        if not params["ids"]:
-            continue
-        rows = (await db.execute(text(sql), params)).fetchall()
-        for row in rows:
-            integration = (
-                "kubernetes"
-                if row[2]
-                else "docker" if row[3] else "proxmox" if row[4] else "tailscale"
+            _with_owners(IPBlock.id, IPBlock.network, model=IPBlock).where(
+                IPBlock.id.in_(block_ids), _owned_by_any(IPBlock)
+            ),
+        )
+    ]
+    if subnet_ids:
+        queries.append(
+            (
+                "subnet",
+                _with_owners(Subnet.id, Subnet.network, model=Subnet).where(
+                    Subnet.id.in_(subnet_ids), _owned_by_any(Subnet)
+                ),
             )
+        )
+        # Also surface integration-owned IPAddress rows under the moved
+        # subtree. Same blast radius — IP rows owned by an integration
+        # would get re-created in the source space on the next sweep.
+        queries.append(
+            (
+                "ip_address",
+                _with_owners(IPAddress.id, IPAddress.address, model=IPAddress)
+                .where(IPAddress.subnet_id.in_(subnet_ids), _owned_by_any(IPAddress))
+                .limit(50),
+            )
+        )
+
+    blockers: list[IntegrationBlocker] = []
+    for kind, stmt in queries:
+        rows = (await db.execute(stmt.execution_options(include_deleted=True))).all()
+        for row in rows:
+            integration = owning_integration(row)
+            assert integration is not None  # the WHERE requires an owner
             blockers.append(
                 IntegrationBlocker(
                     kind=kind,
@@ -237,43 +242,6 @@ async def _collect_integration_blockers(
                     integration=integration,
                 )
             )
-
-    # Also surface integration-owned IPAddress rows under the moved
-    # subtree. Same blast radius — IP rows owned by an integration
-    # would get re-created in the source space on the next sweep.
-    if descendant_subnet_ids:
-        rows = (
-            await db.execute(
-                text("""
-                    SELECT id, address::text,
-                           kubernetes_cluster_id, docker_host_id,
-                           proxmox_node_id, tailscale_tenant_id
-                    FROM ip_address
-                    WHERE subnet_id = ANY(CAST(:ids AS uuid[]))
-                      AND (kubernetes_cluster_id IS NOT NULL
-                        OR docker_host_id IS NOT NULL
-                        OR proxmox_node_id IS NOT NULL
-                        OR tailscale_tenant_id IS NOT NULL)
-                    LIMIT 50
-                    """),
-                {"ids": descendant_subnet_ids},
-            )
-        ).fetchall()
-        for row in rows:
-            integration = (
-                "kubernetes"
-                if row[2]
-                else "docker" if row[3] else "proxmox" if row[4] else "tailscale"
-            )
-            blockers.append(
-                IntegrationBlocker(
-                    kind="ip_address",
-                    resource_id=str(row[0]),
-                    network=str(row[1]),
-                    integration=integration,
-                )
-            )
-
     return blockers
 
 
@@ -431,12 +399,7 @@ async def assemble_move_plan(
             "Source and target spaces have different VRFs — moved block will "
             "inherit the target space's VRF unless it overrides via vrf_id."
         )
-    if (
-        moved_block.kubernetes_cluster_id
-        or moved_block.docker_host_id
-        or moved_block.proxmox_node_id
-        or moved_block.tailscale_tenant_id
-    ):
+    if owning_integration(moved_block) is not None:
         # Caught by integration-blocker collection above too; this
         # warning is the heads-up version surfaced even when the
         # operator hasn't drilled into the blocker list.
