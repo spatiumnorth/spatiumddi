@@ -223,6 +223,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **After a slot upgrade, the node's DNS, DHCP and looking-glass
+  agents run the new release (#1203).** They kept the previous
+  release's images and chart until a role, group or key next changed.
+  The supervisor skips re-applying the role release while nothing it
+  would send has changed, but it judged that from the role settings
+  alone, which carry no image tag or chart. The skip marker also
+  survives a slot upgrade, so the new supervisor skipped from its first
+  heartbeat. The check now also covers the image tag and the chart the
+  release is rendered with. Both change only with a slot upgrade, so
+  the first heartbeat on a new slot re-applies once and steady state
+  still skips.
+
+- **Upgrading to a nightly build no longer deletes the new slot's own
+  images (#1202).** The image prune that runs once the new slot is
+  committed kept only images tagged with a slot's appliance version. A
+  release uses one value for both, but a nightly's appliance version is
+  `0.0.0-nightly-YYYYMMDD+sha` while its images are tagged
+  `nightly-YYYYMMDD`. So the prune removed every new-slot image no
+  container was using yet, and spatium-supervisor, which never pulls
+  its image, stayed in `ErrImageNeverPull`. An air-gapped appliance
+  could not recover. The prune now also keeps images carrying either
+  slot's image tag, recorded in a new
+  `release-state/slot-image-tags.json` beside `slot-versions.json`,
+  which is unchanged.
+
 - **An upgrade no longer deadlocks its own database migration
   (#1204).** The migration ran every Alembic revision in a single
   transaction, so each `ALTER TABLE` kept its exclusive lock until the
