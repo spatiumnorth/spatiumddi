@@ -24,6 +24,7 @@ timeout branch by giving a non-existent op-id.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -40,7 +41,7 @@ from app.core.acme_auth import (
 from app.core.security import create_access_token, hash_password
 from app.models.acme import ACMEAccount
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.dns import DNSAgentBundle, DNSRecord, DNSServer, DNSServerGroup, DNSZone
 from app.services import acme as acme_svc
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -351,6 +352,46 @@ async def test_update_writes_txt_and_acks(client: AsyncClient, db_session: Async
     ).scalar_one()
     assert rec.value == "NwKm_first_token"
     assert rec.ttl == acme_svc.ACME_TXT_TTL
+
+
+@pytest.mark.asyncio
+async def test_update_wait_scales_with_the_primary_render_time(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1184 — the primary receives the TXT with its next render, so the wait
+    is two of its renders plus the margin, capped under nginx's 60 s."""
+    _, token = await _make_user(db_session)
+    zone, creds = await _register_account(client, db_session, token)
+    server = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == zone.group_id))
+    ).scalar_one()
+    db_session.add(
+        DNSAgentBundle(
+            server_id=server.id,
+            dirty_watermark=1,
+            snapshot_at=datetime.now(UTC),
+            etag="e",
+            structural_etag="s",
+            ships_ops=True,
+            body=b"",
+            body_bytes=0,
+            body_gzip_bytes=0,
+            records=0,
+            render_ms=20_000,
+            rendered_by="worker",
+        )
+    )
+    await db_session.commit()
+    wait = AsyncMock(return_value="applied")
+    with patch.object(acme_svc, "wait_for_op_applied", new=wait):
+        resp = await client.post(
+            "/api/v1/acme/update",
+            json={"subdomain": creds["subdomain"], "txt": "slow_render_token"},
+            headers={"X-Api-User": creds["username"], "X-Api-Key": creds["password"]},
+        )
+    assert resp.status_code == 200, resp.text
+    assert wait.await_args is not None
+    assert wait.await_args.kwargs["timeout"] == 2 * 20 + acme_svc.APPLY_TIMEOUT_MARGIN_SECONDS
 
 
 @pytest.mark.asyncio

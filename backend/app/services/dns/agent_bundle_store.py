@@ -14,10 +14,10 @@ Two integers on ``dns_server`` decide whether a stored bundle is current
 every change that feeds the bundle (``services.dns.bundle_dirty``), and
 ``bundle_watermark`` is the sequence the newest stored bundle was rendered
 at. No assembly and no content hash are involved in that check. The bundle
-must also have been rendered by the running release
-(``bundle_app_version``): what the renderer emits changes between releases,
-and a bundle rendered by the previous one would otherwise be served until
-something unrelated marked the server.
+must also come from a renderer at least as new as the running one
+(``bundle_renderer_revision`` against :data:`RENDERER_REVISION`): what the
+renderer emits changes between releases, and a bundle from an older renderer
+would otherwise be served until something unrelated marked the server.
 """
 
 from __future__ import annotations
@@ -49,14 +49,34 @@ DYNAMIC_KEYS: tuple[str, ...] = ("etag", "pending_record_ops", "pending_ops_rema
 
 _MAX_ERROR = 2000
 
+# The revision of what the renderer emits (#1185). Bump it in the same change
+# as anything that alters the bundle body for the same database state: the
+# body assembly in ``agent_config.render_bundle_body``, a helper it calls, or
+# the wire encoding below. ``tests/test_dns_agent_bundle_revision.py`` renders
+# a fixed group and fails when the output changes without a bump, because a
+# forgotten bump serves the old renderer's bytes after an upgrade.
+#
+# Compared with ``>=``, never as a release string: a process treats a render
+# from its own revision or a newer one as current, so an older process never
+# replaces a newer render during a rolling upgrade (which the ``app_version``
+# equality check before #1185 did every 30 s), and a release that leaves the
+# renderer alone re-renders nothing.
+RENDERER_REVISION = 1
+
+
+def _serves(revision: int | None) -> bool:
+    """A render from ``revision`` can be served by this process. NULL is a
+    render from before the revision existed, which is stale."""
+    return revision is not None and revision >= RENDERER_REVISION
+
 
 def is_current(server: DNSServer) -> bool:
     """True when the newest stored bundle reflects every change made so far
-    and was rendered by the running release."""
+    and came from this process's renderer revision or a newer one."""
     return (
         server.bundle_watermark is not None
         and server.bundle_watermark >= server.bundle_dirty_seq
-        and server.bundle_app_version == settings.version
+        and _serves(server.bundle_renderer_revision)
     )
 
 
@@ -104,18 +124,19 @@ async def newest(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     unserved. A stored render is as safe to serve as a current one: its ops
     page carries only the ops its snapshot covers (``agent_config
     ._covered_by``), so the body reflects every op shipped with it, and what
-    committed after it rides the next render. A bundle another release
-    rendered is not served (its output may differ from this release's); the
-    sweep re-renders it.
+    committed after it rides the next render. A bundle from an older
+    renderer revision is not served (its output may differ from this
+    process's); the sweep re-renders it. One from a newer revision is: it is
+    what the rest of the rolling upgrade will serve.
     """
-    if server.bundle_watermark is None or server.bundle_app_version != settings.version:
+    if server.bundle_watermark is None or not _serves(server.bundle_renderer_revision):
         return None
     return (
         await db.execute(
             select(DNSAgentBundle).where(
                 DNSAgentBundle.server_id == server.id,
                 DNSAgentBundle.dirty_watermark == server.bundle_watermark,
-                DNSAgentBundle.app_version == settings.version,
+                DNSAgentBundle.renderer_revision >= RENDERER_REVISION,
             )
         )
     ).scalar_one_or_none()
@@ -151,12 +172,13 @@ async def store(
     """Insert one rendered bundle and mirror it onto the server row.
 
     Returns ``None`` — and writes nothing — when a row for
-    ``(server, dirty_watermark)`` rendered by this release already exists:
-    a concurrent render (two api replicas building inline, or the api
-    racing the worker during the migration release) simply lost, and the
-    caller serves the row that won. A row at that watermark rendered by a
-    DIFFERENT release is replaced in place — that is the re-render an
-    upgrade forces. The mirror columns only ever move forward, so a slow
+    ``(server, dirty_watermark)`` from this renderer revision or a newer one
+    already exists: a concurrent render (two api replicas building inline, or
+    the api racing the worker during the migration release) simply lost, and
+    the caller serves the row that won. A row at that watermark from an OLDER
+    revision is replaced in place — that is the re-render an upgrade forces —
+    and a newer one never is, so the old pods of a rolling upgrade cannot
+    undo the new pods' renders. The mirror columns only ever move forward, so a slow
     render that finishes after a newer one cannot roll the served bundle
     back. The render counter is incremented in SQL so it is exact under
     that race.
@@ -176,6 +198,7 @@ async def store(
         "render_ms": render_ms,
         "rendered_by": rendered_by,
         "app_version": app_version,
+        "renderer_revision": RENDERER_REVISION,
     }
     insert_stmt = pg_insert(DNSAgentBundle).values(
         id=uuid.uuid4(), server_id=server.id, dirty_watermark=dirty_watermark, **payload
@@ -185,7 +208,10 @@ async def store(
             insert_stmt.on_conflict_do_update(
                 constraint="uq_dns_agent_bundle_server_watermark",
                 set_={**payload, "built_at": func.now()},
-                where=DNSAgentBundle.app_version != insert_stmt.excluded.app_version,
+                where=or_(
+                    DNSAgentBundle.renderer_revision.is_(None),
+                    DNSAgentBundle.renderer_revision < insert_stmt.excluded.renderer_revision,
+                ),
             ).returning(DNSAgentBundle.id, DNSAgentBundle.built_at)
         )
     ).one_or_none()
@@ -224,6 +250,7 @@ async def store(
             bundle_built_at=built_at,
             bundle_rendered_by=rendered_by,
             bundle_app_version=app_version,
+            bundle_renderer_revision=RENDERER_REVISION,
             # Caught up: nothing is waiting. Still behind — changes landed
             # while this render ran — restart the clock from now, so the
             # stalled-render alert measures time without a render landing,
@@ -250,7 +277,7 @@ async def store(
         render_ms=render_ms,
         rendered_by=rendered_by,
     )
-    # populate_existing: a re-render by another release REPLACES the row in
+    # populate_existing: a re-render by a newer revision REPLACES the row in
     # place (same id), and an instance of the old one may already sit in
     # this session's identity map — returned as-is it would carry the old
     # ETag and snapshot.
@@ -299,6 +326,7 @@ async def record_failure(db: AsyncSession, server_id: uuid.UUID, error: str) -> 
 
 
 __all__ = [
+    "RENDERER_REVISION",
     "DYNAMIC_KEYS",
     "RENDERED_BY_API",
     "RENDERED_BY_WORKER",

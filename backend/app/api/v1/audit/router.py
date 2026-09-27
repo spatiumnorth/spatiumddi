@@ -108,13 +108,21 @@ async def export_change_report_pdf(
     router-level ``read:audit_log`` permission."""
     now = datetime.now(UTC)
     until = until or now
-    since = since or (until - timedelta(days=30))
     # Coerce naive client-supplied datetimes to UTC so the comparison
     # against the timezone-aware ``timestamp`` column is well-defined.
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=UTC)
     if until.tzinfo is None:
         until = until.replace(tzinfo=UTC)
+    if since is None:
+        # #1201: an ``until`` within 30 days of year 1 steps the default
+        # before ``datetime.min``, which raises OverflowError, a 500. "The 30
+        # days before it" then means everything, so start at the earliest
+        # instant a datetime holds.
+        try:
+            since = until - timedelta(days=30)
+        except OverflowError:
+            since = datetime.min.replace(tzinfo=UTC)
+    elif since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
     pdf_bytes = await generate_change_report_pdf(db, since=since, until=until)
     fname = f"spatiumddi-change-report-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
     return Response(
