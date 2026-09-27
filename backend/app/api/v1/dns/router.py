@@ -559,10 +559,12 @@ class ServerResponse(BaseModel):
     bundle_render_status: str | None = None
     bundle_render_error: str | None = None
     bundle_render_at: datetime | None = None
-    # The release that rendered the stored bundle (a mismatch with the
-    # running one means the upgrade's re-render is still pending), and when
-    # the stored bundle fell behind — NULL while it is current.
+    # The release and renderer revision that rendered the stored bundle
+    # (#1185): a revision below the running one means the upgrade's
+    # re-render is still pending. And when the stored bundle fell behind —
+    # NULL while it is current.
     bundle_app_version: str | None = None
+    bundle_renderer_revision: int | None = None
     bundle_dirty_at: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
@@ -615,6 +617,7 @@ class ServerResponse(BaseModel):
             bundle_render_error=s.bundle_render_error,
             bundle_render_at=s.bundle_render_at,
             bundle_app_version=s.bundle_app_version,
+            bundle_renderer_revision=s.bundle_renderer_revision,
             bundle_dirty_at=s.bundle_dirty_at,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,

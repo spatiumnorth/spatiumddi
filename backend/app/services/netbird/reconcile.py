@@ -38,6 +38,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.netbird import NetbirdInstance
+from app.services.integration_ownership import owned_by_other_integration
 from app.services.netbird.client import (
     NetbirdClient,
     NetbirdClientError,
@@ -49,21 +50,6 @@ logger = structlog.get_logger(__name__)
 
 _BIGINT_MAX = 2**63 - 1
 _STATUS = "netbird-peer"
-
-# Sibling integration provenance columns on IPAddress. A row carrying
-# any of these is owned by another mirror and must not be claimed.
-_OTHER_INTEGRATION_FKS = (
-    "kubernetes_cluster_id",
-    "docker_host_id",
-    "proxmox_node_id",
-    "tailscale_tenant_id",
-    "unifi_controller_id",
-    "cloud_endpoint_id",
-    "opnsense_router_id",
-    "panos_firewall_id",
-    "fortinet_firewall_id",
-    "meraki_org_id",
-)
 
 
 @dataclass(frozen=True)
@@ -301,7 +287,7 @@ async def _apply_addresses(
                     f"address {row.address} owned by another NetBird instance; not claiming"
                 )
                 continue
-            if any(getattr(row, fk) is not None for fk in _OTHER_INTEGRATION_FKS):
+            if owned_by_other_integration(row, "netbird_instance_id"):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"
                 )

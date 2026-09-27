@@ -129,12 +129,17 @@ the formatter handles the rest.
   the bundle renders marks it: the pool health check's timestamps, the
   agents' DNSSEC-state stamp and the beat tasks' `*_last_run_at`
   settings stamps do not, because every mark costs a render. The
-  long-poll serves the newest bundle the running release stored, current
-  or not. Under a write storm no render is current until the writes
-  stop, and each one that lands reaches the agents. A bundle rendered by
-  a previous release is never served, so an upgrade re-renders each
-  server once. The ops page, and the queued ops a split-horizon render
-  retires, cover only the ops whose transaction had committed before the
+  long-poll serves the newest stored bundle, current or not. Under a
+  write storm no render is current until the writes stop, and each one
+  that lands reaches the agents. Each bundle records the renderer
+  revision that produced it (#1185). One from an older revision is never
+  served, so an upgrade that changes the renderer re-renders each server
+  once, and one that doesn't re-renders nothing. An older process never
+  replaces a newer render, so the old and new pods of a rolling upgrade
+  don't undo each other's; a test fails when the rendered output changes
+  without a revision bump. The ops page, and the queued ops a
+  split-horizon render retires, cover only the ops whose transaction
+  had committed before the
   render read (its `pg_current_snapshot()`, not the op's `created_at`,
   which is its transaction's start). So a body can never lack a record
   the agent already applied, and an ACME DNS-01 wait never sees an op
@@ -160,8 +165,8 @@ the formatter handles the rest.
   need no change; one deliberate difference is that a page of ops no
   longer rotates the ETag, so the poll after the last ack answers 304
   instead of re-sending the whole body. Migrations `c4d1e7f90a2b`,
-  `d9a4c27e18f3` and `f3a9d61c07e4` (additive: one table, fourteen
-  nullable-or-defaulted columns, no table rewrite).
+  `d9a4c27e18f3`, `f3a9d61c07e4` and `e6b2d94f1a37` (additive: one
+  table, sixteen nullable-or-defaulted columns, no table rewrite).
 - **The bundle's records query orders by the `(zone_id, name)` index
   prefix (#1111).** `(zone_id, id)` had no index and `id` is a random
   UUID, so the planner sorted the whole table on every build. The
@@ -172,6 +177,23 @@ the formatter handles the rest.
   split-horizon, where records are structural).
 
 ### Changed
+
+- **The update check and the upgrade preflight understand SemVer
+  (#1182).** Both compared versions as strings, which the switch to
+  SemVer at 1.0.0 breaks: `"1.0.0" > "2026.09.04-1"` is false, so no
+  install would have been offered 1.0.0, and the preflight's CalVer
+  parser failed it outright, disabling Plan. Both now use the shared
+  version helper from #1183. Every SemVer release is newer than every
+  CalVer one, SemVer compares numerically with pre-release precedence,
+  and a dev build, `latest` or a `0.x` placeholder is unknown rather
+  than a version. The preflight's skip-release warning now counts
+  calendar days, and it does not apply to a jump involving a SemVer
+  version, which has no date. Two existing bugs are gone with the
+  string compare: a same-day release numbered `-10` or higher was not
+  offered over `-2` to `-9`, and an install running `latest`, the
+  `.env.example` default, was never offered an update at all. This is
+  the comparison half of #1182, which the last CalVer release has to
+  carry. The release workflow and docs changes follow separately.
 
 - **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
   2026-09-24 and the backend's requirement had no upper bound, so CI
@@ -200,6 +222,132 @@ the formatter handles the rest.
   Real Kerberos support stays on the roadmap as #1128.
 
 ### Fixed
+
+- **An upgrade no longer deadlocks its own database migration
+  (#1204).** The migration ran every Alembic revision in a single
+  transaction, so each `ALTER TABLE` kept its exclusive lock until the
+  last revision committed. The previous release keeps serving while
+  the migration runs, and its ordinary traffic (agent heartbeats,
+  health probes, API reads) could hold one table while waiting on a
+  table the migration had already altered. When a later revision
+  reached the first table, PostgreSQL found the deadlock and aborted
+  the migration. Upgrading a QA appliance from 2026.09.04-1 failed
+  this way on every attempt, with three different pairs of tables: the
+  migrate Job gave up, and the new api, worker and beat waited for it
+  indefinitely while the previous release kept serving. Each revision
+  now runs in its own transaction and releases its locks when it
+  commits. If one fails, the schema stays at the last revision that
+  committed, and the next attempt resumes from there. The migration
+  runs from the release being upgraded to, so this applies to the
+  upgrade from 2026.09.04-1 itself.
+
+- **The change-report PDF answered 500 for an `until` near year 1,
+  and every 500 lost its request id (#1201).** With no `since`,
+  `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
+  raised `OverflowError` for any `until` in the first 30 days of year
+  1. The window now starts at the earliest representable instant. An
+  `until` that is before year 1 in UTC (`0001-01-01T00:00:00+05:00`)
+  is a 422, as it already was when sent as `since`. Separately, the
+  unhandled-exception handler read the request id from the client's
+  headers only, so a client that sent none got a 500 with no
+  `X-Request-ID`, and the log line and Diagnostics row said
+  `request_id: null`. It now uses the id the request was logged under
+  and returns it on the response.
+
+- **Integration mirrors no longer claim addresses another integration
+  owns (#1135).** Each mirror should skip an IP address another
+  integration already owns and warn "owned by another integration; not
+  claiming". The UniFi, OPNsense, Proxmox, Kubernetes, Docker,
+  Tailscale and Cloud mirrors each kept their own list of the other
+  integrations, and every list had fallen behind as integrations were
+  added: UniFi, for one, didn't know about OPNsense, the common homelab
+  pairing. A claimed address was also marked as edited by hand, so from
+  then on neither integration kept it current, neither removed it when
+  the host went away, and deleting either integration's target deleted
+  it. All mirrors now use one shared list, and a test fails if a new
+  integration's column is missing from it or if a guard anywhere lists
+  the columns by hand.
+  Block move had the same gap. It refused to move a block holding rows
+  owned by four integrations, but not by the other seven, whose
+  reconcilers then re-created the moved rows in the old space.
+  Addresses already claimed twice before this upgrade are not changed:
+  a claim can't be told apart from a real operator edit.
+  `docs/TROUBLESHOOTING.md` has a query that lists them and says how
+  to fix each one.
+
+- **ACME DNS-01 no longer times out on very large DNS groups
+  (#1184).** Since #1111 a DNS agent receives a change with the next
+  render of its whole bundle, and QA measured one render of a
+  1.09M-record group at about 30 s. The ACME TXT record's fixed 30 s
+  apply wait therefore failed intermittently: the certificate order
+  failed, or the acme-dns `/update` endpoint answered 504. The wait now
+  scales with the renders the target servers have stored. Renders share
+  one worker slot, so it waits for the render already running plus one
+  per server, from the slowest recent render, plus 10 s. It never goes
+  below 30 s, so smaller groups are unchanged, and it is capped at
+  5 minutes for the built-in certificate client. `/update` is capped at
+  55 s, because it waits inside an HTTP request and the web frontend
+  ends those at 60 s.
+
+- **Retrying a failed slot upgrade with the same image works again
+  (#1183).** Every supervisor reported the version `2026.05.14.1`, a
+  literal nothing ever updated, and the control plane read it to decide
+  whether an appliance could take the per-apply nonce that makes a
+  repeat apply fire. So no appliance got the nonce, and clicking Apply
+  again after a failed upgrade was silently ignored. The same version
+  made the Fleet upgrade panel tell every operator that their appliance
+  predated live progress reporting.
+  Both checks now read the appliance's installed OS version first,
+  since the code they depend on ships in the slot OS, and fall back to
+  the supervisor's. The supervisor reports the release it was built
+  from, stamped into its image, and the control plane now stores the
+  version from every heartbeat rather than only from registration,
+  which a registered supervisor never repeats. Versions are compared
+  by a shared helper rather than as strings, so the checks keep
+  working under SemVer (#1182). Nightly builds count as including
+  every release tagged before their build date. Dev builds are
+  unknown and keep the safe path. The threshold is now 2026.06.12-2,
+  the first release with the fix it tests for: 2026.06.12-1 was tagged
+  before it merged, and used to count as having it.
+
+- **Worker task failures now reach Diagnostics (#1193).** None had
+  been recorded since the feature shipped (#123); failures in API
+  requests always were. The Celery `task_failure` hook opened a sync
+  database engine on a `postgresql://` URL, which needs psycopg2, and
+  the backend ships only asyncpg. So every failure logged
+  `diagnostics_capture_failed_sync` and recorded nothing, and because
+  the hook swallows its own errors, nothing else noticed. It now runs
+  the api's capture code on a fresh asyncpg engine, on a short-lived
+  thread of its own.
+
+- **The worker renders DNS agent bundles again (#1197).** #1170's merge
+  of main dropped three things #1122 had added to `app/celery_app.py`:
+  `app.tasks.agent_bundles` from the worker's `include` list, the
+  `bundles` route, and the 30 s render-missing sweep. A started worker
+  had no render task registered, so it discarded every render it was
+  sent ("Received unregistered task"), and beat never swept. Agents got
+  a DNS change only when the api's bounded inline fallback built the
+  bundle, 120 s after the change, and never with the fallback off; after
+  an upgrade, an agent-based server last rendered by the previous
+  release was served nothing new until a change marked it and those
+  120 s had passed. All three are back. A test now starts a worker in a
+  fresh interpreter and fails when a task the code defines, or one beat
+  sends, is not registered in it.
+
+- **Five task modules were published to a queue no worker consumes
+  (#1200).** With `task_default_queue` unset, a task whose module has
+  no `task_routes` entry goes to Celery's default queue, `celery`, and
+  every deploy target's worker consumes only
+  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
+  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
+  had no route. So the Looking Glass collector stale sweep and route
+  re-resolve, the conformity evaluator, the revoked-appliance prune and
+  the daily DNSBL sweep never ran, and a rolling upgrade run started or
+  resumed through the api was enqueued to a list nothing reads. All
+  five now route to `default`. Messages already stranded on `celery` are
+  not replayed; `DEL celery` in the broker's Redis database (1 by
+  default) removes them. A test fails when a task routes to a queue the
+  worker does not consume.
 
 - **Typed webhook events and audit forwarding were lost for anything a
   Celery task committed (#1168).** Two faults. The worker never loaded
@@ -1124,6 +1272,23 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
+  reachable from outside: the web port proxies it and Docker Compose
+  publishes the API port. So anyone who could load the login page could
+  read per-route request counts. It now answers only
+  `Authorization: Bearer <token>`, where the token is the new scrape
+  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
+  the same revoked / expired / scope / disabled-owner checks as on any
+  other route. The Helm chart generates the scrape token into its app
+  Secret as `metrics-token` and keeps it across upgrades like
+  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
+  optional Secret key. The appliance console reads it from the chart's
+  Secret, so its API panel keeps working.
+  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
+  token gets 401 after this release. Give it the scrape token or an API
+  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
+  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
 
 - **The interactive API docs load through the web port again, and
   the appliance's HTTPS web tier sends the #400 security headers

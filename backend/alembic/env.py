@@ -22,6 +22,31 @@ if db_url := os.environ.get("DATABASE_URL"):
 
 target_metadata = Base.metadata
 
+# #1204 — one transaction PER REVISION, never one for the whole chain.
+#
+# The previous release keeps serving while this runs: the new api / worker /
+# beat wait on ``wait-for-migrate``, the old pods do not. With the whole chain
+# in one transaction, every ACCESS EXCLUSIVE lock a revision takes (each
+# ``ALTER TABLE``) is held until the LAST revision commits. An old-release
+# request that touches an already-altered table then blocks while holding
+# locks on tables a later revision still has to alter; when the migration
+# reaches one of those, it closes the cycle and PostgreSQL aborts the
+# migration. Upgrading 2026.09.04-1 -> 7490f61b did exactly that on every
+# attempt: e.g. c93f1a72e408 altered ``dhcp_server_group`` and three revisions
+# later f7c3a91e50b4's ``ALTER TABLE appliance`` deadlocked against an old
+# request holding ``appliance`` and waiting on ``dhcp_server_group``, with
+# three different table pairs on one appliance. Per revision, a revision's
+# locks are released when it commits, so no lock outlives the revision that
+# took it and that cycle cannot form across revisions.
+#
+# The trade-off: a failure mid-chain now leaves the schema at the last
+# revision that committed, not at the start. ``alembic_version`` records it,
+# the next attempt resumes from there, and the previous release meanwhile runs
+# against those completed revisions — as it already does, against ALL of them,
+# between a successful migration and the new pods taking over. A revision the
+# previous release's code cannot run against needs that care either way.
+TRANSACTION_PER_MIGRATION = True
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
@@ -31,6 +56,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -41,6 +67,7 @@ def do_run_migrations(connection: Connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
     with context.begin_transaction():
         context.run_migrations()

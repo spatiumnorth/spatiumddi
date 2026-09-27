@@ -46,7 +46,7 @@ infrastructure rather than application surface:
 | `/health/startup` | Same logic as `/health/ready`, for slow-start k8s containers | none |
 | `/health/platform` | Per-component rollup (db / redis / celery workers / beat) for the dashboard | none |
 | `/.well-known/acme-challenge/{token}` | HTTP-01 ACME challenge (issue #438) | none |
-| `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | none |
+| `/metrics` | Prometheus exposition (when `PROMETHEUS_METRICS_ENABLED`) | bearer: the scrape token (`PROMETHEUS_METRICS_TOKEN`) or any API token (#1159) |
 
 `/api/v1` is the only API version. When the surface changes shape in a
 non-additive way a `/api/v2` prefix would be introduced alongside it;

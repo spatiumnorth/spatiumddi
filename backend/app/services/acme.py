@@ -22,13 +22,13 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import and_, delete, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import AsyncSessionLocal
 from app.models.acme import ACMEAccount
-from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
+from app.models.dns import DNSAgentBundle, DNSRecord, DNSRecordOp, DNSZone
 
 log = structlog.get_logger(__name__)
 
@@ -44,11 +44,19 @@ ACME_TXT_TTL = 60
 # a third /update for the same subdomain evicts the oldest value.
 MAX_TXT_VALUES_PER_SUBDOMAIN = 2
 
-# How long /update blocks while waiting for the agent to apply the
-# record. LE will retry challenges that fail, but it's polite to
-# give a confident 200 only after the record is actually live.
+# How long to wait for the agents to apply a TXT record. LE will retry
+# challenges that fail, but it's polite to give a confident answer only
+# after the record is actually live. This is the floor: a large group's
+# own render time raises it (``apply_timeout_for``, #1184).
 DEFAULT_APPLY_TIMEOUT_SECONDS = 30.0
 APPLY_POLL_INTERVAL_SECONDS = 0.5
+# Past the renders: the agent's fetch, apply and acknowledgement.
+APPLY_TIMEOUT_MARGIN_SECONDS = 10.0
+# The embedded ACME client waits in a Celery task, which has no time limit.
+MAX_APPLY_TIMEOUT_SECONDS = 300.0
+# The provider's /update waits inside the HTTP request, and the web
+# frontend's nginx ends an /api/ request at 60 s (``proxy_read_timeout``).
+PROVIDER_MAX_APPLY_TIMEOUT_SECONDS = 55.0
 
 
 class ACMEError(Exception):
@@ -311,6 +319,43 @@ async def apply_txt_delete(db: AsyncSession, account: ACMEAccount) -> list[DNSRe
 # ── Wait-for-apply ──────────────────────────────────────────────────
 
 
+async def apply_timeout_for(
+    db: AsyncSession,
+    op_ids: list[uuid.UUID],
+    *,
+    cap: float = MAX_APPLY_TIMEOUT_SECONDS,
+) -> float:
+    """How long to wait for ``op_ids`` to apply, in seconds (#1184).
+
+    An agent receives a change with the first render of its bundle that
+    starts after the change committed, and every server's render goes
+    through one fleet-wide slot. So the worst case is the render already
+    in the slot plus one render per target server: ``servers + 1`` times
+    the slowest render those servers have stored, plus a margin. At a
+    million records one render takes about 30 s, which put a fixed 30 s
+    wait on the edge.
+
+    Never below :data:`DEFAULT_APPLY_TIMEOUT_SECONDS`: a server with no
+    stored render (an agentless driver, or one not rendered yet) keeps the
+    old wait. Never above ``cap``.
+    """
+    if not op_ids:
+        return DEFAULT_APPLY_TIMEOUT_SECONDS
+    servers = select(DNSRecordOp.server_id).where(DNSRecordOp.id.in_(op_ids))
+    rendered, slowest_ms = (
+        await db.execute(
+            select(
+                func.count(func.distinct(DNSAgentBundle.server_id)),
+                func.max(DNSAgentBundle.render_ms),
+            ).where(DNSAgentBundle.server_id.in_(servers))
+        )
+    ).one()
+    if not slowest_ms:
+        return DEFAULT_APPLY_TIMEOUT_SECONDS
+    scaled = (rendered + 1) * slowest_ms / 1000 + APPLY_TIMEOUT_MARGIN_SECONDS
+    return min(max(DEFAULT_APPLY_TIMEOUT_SECONDS, scaled), cap)
+
+
 async def wait_for_op_applied(
     op_id: uuid.UUID,
     *,
@@ -454,6 +499,10 @@ async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24
 
 
 __all__ = [
+    "APPLY_TIMEOUT_MARGIN_SECONDS",
+    "DEFAULT_APPLY_TIMEOUT_SECONDS",
+    "MAX_APPLY_TIMEOUT_SECONDS",
+    "PROVIDER_MAX_APPLY_TIMEOUT_SECONDS",
     "ACMEApplyFailed",
     "ACMEApplyTimeout",
     "ACMEAuthError",
@@ -461,6 +510,7 @@ __all__ = [
     "ACMESubdomainMismatch",
     "ACME_TXT_TTL",
     "MAX_TXT_VALUES_PER_SUBDOMAIN",
+    "apply_timeout_for",
     "apply_txt_delete",
     "apply_txt_update",
     "authenticate",
