@@ -223,6 +223,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An upgrade no longer deadlocks its own database migration
+  (#1204).** The migration ran every Alembic revision in a single
+  transaction, so each `ALTER TABLE` kept its exclusive lock until the
+  last revision committed. The previous release keeps serving while
+  the migration runs, and its ordinary traffic (agent heartbeats,
+  health probes, API reads) could hold one table while waiting on a
+  table the migration had already altered. When a later revision
+  reached the first table, PostgreSQL found the deadlock and aborted
+  the migration. Upgrading a QA appliance from 2026.09.04-1 failed
+  this way on every attempt, with three different pairs of tables: the
+  migrate Job gave up, and the new api, worker and beat waited for it
+  indefinitely while the previous release kept serving. Each revision
+  now runs in its own transaction and releases its locks when it
+  commits. If one fails, the schema stays at the last revision that
+  committed, and the next attempt resumes from there. The migration
+  runs from the release being upgraded to, so this applies to the
+  upgrade from 2026.09.04-1 itself.
+
 - **The change-report PDF answered 500 for an `until` near year 1,
   and every 500 lost its request id (#1201).** With no `since`,
   `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
