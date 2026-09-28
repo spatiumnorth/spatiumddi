@@ -540,5 +540,7 @@ def test_alpine_upstream_failures_are_errors_not_answers(
 
 
 def test_alpine_cdn_is_an_allowed_host(lint: types.ModuleType) -> None:
-    assert "dl-cdn.alpinelinux.org" in lint._ALLOWED_HOSTS
+    # A set comparison, not ``"host" in …``: the latter is the shape CodeQL
+    # reads as URL substring sanitisation (it is set membership here).
+    assert {"dl-cdn.alpinelinux.org"} <= lint._ALLOWED_HOSTS
     assert lint._GITHUB_API_HOST != "dl-cdn.alpinelinux.org", "the token must never go to the CDN"
