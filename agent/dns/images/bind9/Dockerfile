@@ -32,11 +32,14 @@ FROM alpine:3.24 AS runtime
 # they pin the fixed version AND, by changing the string, guarantee the
 # layer is rebuilt. When a new CVE lands, bump the bound here.
 #
-# * ``bind`` / ``bind-tools`` ``>=9.20.26-r0`` — CVE-2026-11331,
-#   -11605, -11622, -11721, -12617, -13204, -13321 (7 HIGH, all fixed
-#   in 9.20.26-r0). Caught by CI on PR #716, whose only connection to
-#   BIND was touching a sibling file under ``agent/dns/``: the image had
-#   been building from a cached layer carrying 9.20.23-r0.
+# * ``bind`` / ``bind-tools`` ``>=9.20.29-r0`` — CVE-2026-19666, -19667,
+#   -76163, -77692, -80274, -81563, -81736 (7 HIGH remote DoS, all fixed
+#   in 9.20.29-r0; #1218). The release 2026.09.04-1 shipped 9.20.26.
+#   The previous floor, 9.20.26-r0, covered CVE-2026-11331, -11605,
+#   -11622, -11721, -12617, -13204, -13321, caught by CI on PR #716 after
+#   the image had been building from a cached layer carrying 9.20.23-r0.
+#   The floor is also a ``versions.json`` component (``bind``, #1240), so
+#   the weekly upstream check reports when Alpine ships a newer build.
 # * ``libcrypto3`` / ``libssl3`` ``>=3.5.7-r0`` — CVE-2026-45447 (HIGH,
 #   OpenSSL). The 3.24 base already satisfies this one; the bound is
 #   kept because it still busts a pre-3.24 cache layer.
@@ -50,7 +53,7 @@ ARG APK_SNAPSHOT=dev
 RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk upgrade --no-cache \
  && apk add --no-cache \
-      'bind>=9.20.26-r0' 'bind-tools>=9.20.26-r0' \
+      'bind>=9.20.29-r0' 'bind-tools>=9.20.29-r0' \
       tini su-exec \
       python3 py3-pip \
       libcap \

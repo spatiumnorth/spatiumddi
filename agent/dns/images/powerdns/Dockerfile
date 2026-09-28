@@ -63,8 +63,10 @@ FROM alpine:3.24 AS runtime
 # explicit lower bounds — they pin the fixed version AND guarantee the
 # rebuild. Bump the bound when a new CVE lands.
 #
-# * ``bind-tools`` ``>=9.20.26-r0`` — 7 HIGH CVEs fixed in that release
-#   (see the bind9 image's Dockerfile for the list). Only ``dig`` is
+# * ``bind-tools`` ``>=9.20.29-r0`` — 7 HIGH CVEs fixed in that release
+#   (#1218; see the bind9 image's Dockerfile for the list).
+# * ``pdns`` ``>=5.0.7-r0`` — no CVE; a floor so the version is a
+#   ``versions.json`` component (#1240) the weekly upstream check can see. Only ``dig`` is
 #   wanted here, but pdns also drags ``bind-libs`` transitively for the
 #   DNS-name parser, and both come from the same source package.
 # * ``libcrypto3`` / ``libssl3`` ``>=3.5.7-r0`` — CVE-2026-45447 (HIGH,
@@ -80,8 +82,8 @@ ARG APK_SNAPSHOT=dev
 RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk upgrade --no-cache \
  && apk add --no-cache \
-      pdns pdns-backend-lmdb \
-      'bind-tools>=9.20.26-r0' \
+      'pdns>=5.0.7-r0' pdns-backend-lmdb \
+      'bind-tools>=9.20.29-r0' \
       tini su-exec \
       python3 py3-pip \
       libcap \

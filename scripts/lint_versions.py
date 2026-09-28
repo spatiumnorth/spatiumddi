@@ -207,14 +207,14 @@ def check(manifest: dict[str, Any], root: pathlib.Path) -> tuple[list[str], int]
 #: closed; asserting it anyway keeps a malformed ``upstream.repo`` from
 #: steering a request somewhere else.
 _ALLOWED_HOSTS = frozenset(
-    {"api.github.com", "hub.docker.com", "quay.io", "rubygems.org"}
+    {"api.github.com", "hub.docker.com", "quay.io", "rubygems.org", "dl-cdn.alpinelinux.org"}
 )
 
 #: The one host that gets the token.
 _GITHUB_API_HOST = "api.github.com"
 
 
-def _http_json(url: str, token: str | None = None) -> Any:
+def _http_bytes(url: str, token: str | None = None) -> bytes:
     import urllib.parse
     import urllib.request
 
@@ -231,7 +231,12 @@ def _http_json(url: str, token: str | None = None) -> Any:
     if token and host == _GITHUB_API_HOST:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — https + allowlist above
-        return json.loads(resp.read().decode("utf-8"))
+        data: bytes = resp.read()
+        return data
+
+
+def _http_json(url: str, token: str | None = None) -> Any:
+    return json.loads(_http_bytes(url, token).decode("utf-8"))
 
 
 def _latest_github(repo: str, track: str | None, token: str | None) -> str:
@@ -278,13 +283,64 @@ def _latest_quay(repo: str, track: str | None) -> str:
     return _latest_tag([str(t["name"]) for t in page.get("tags", [])], track)
 
 
-def resolve_upstream(entry: dict[str, Any], token: str | None) -> str | None:
+def parse_apkindex(text: str) -> dict[str, str]:
+    """``{package: version}`` from an Alpine ``APKINDEX``.
+
+    The index is blank-line-separated records of ``X:value`` lines; ``P:`` is
+    the package name and ``V:`` its full version, release suffix included
+    (``9.20.29-r0``). The suffix matters: a security rebuild is often only an
+    ``-rN`` bump, and a floor written against ``-r0`` must see ``-r1``.
+    """
+    versions: dict[str, str] = {}
+    for record in text.split("\n\n"):
+        fields = dict(line.split(":", 1) for line in record.splitlines() if ":" in line[:2])
+        name, version = fields.get("P"), fields.get("V")
+        if name and version:
+            versions[name] = version
+    return versions
+
+
+def _latest_alpine(repo: str, branch: str | None) -> str:
+    """Current version of an Alpine package on the branch the images build on.
+
+    ``repo`` is ``<repository>/<package>`` (``main/bind``). The branch is the
+    manifest's own ``alpine`` component, never a second copy of it here, so
+    bumping Alpine moves the lookup with it. x86_64's index is read because
+    Alpine builds every architecture from the same APKBUILD at the same
+    version.
+    """
+    import gzip
+    import io
+    import tarfile
+
+    if not branch:
+        raise LookupError("alpine-package upstream needs the manifest's `alpine` component")
+    repository, _, package = repo.partition("/")
+    if not repository or not package:
+        raise LookupError(f"alpine-package repo must be <repository>/<package>, got {repo!r}")
+    url = f"https://dl-cdn.alpinelinux.org/alpine/v{branch}/{repository}/x86_64/APKINDEX.tar.gz"
+    blob = _http_bytes(url)
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(blob)), mode="r:") as tar:
+        member = tar.extractfile("APKINDEX")
+        if member is None:
+            raise LookupError(f"{url} has no APKINDEX member")
+        index = parse_apkindex(member.read().decode("utf-8", errors="replace"))
+    if package not in index:
+        raise LookupError(f"{package} is not in Alpine v{branch}/{repository}")
+    return index[package]
+
+
+def resolve_upstream(
+    entry: dict[str, Any], token: str | None, alpine_branch: str | None = None
+) -> str | None:
     """Latest upstream version, or None when the entry declares no upstream."""
     upstream = entry.get("upstream") or {}
     kind = upstream.get("kind", "none")
     track = upstream.get("track")
     if kind == "none":
         return None
+    if kind == "alpine-package":
+        return _latest_alpine(upstream["repo"], alpine_branch)
     if kind == "github-release":
         return _latest_github(upstream["repo"], track, token)
     if kind == "dockerhub":
@@ -318,12 +374,44 @@ def _comparable(value: str) -> str:
     return digits[-1] if digits else value
 
 
+def _version_key(value: str) -> tuple[int, ...] | None:
+    """An orderable key for the version ``_comparable`` extracts, or None.
+
+    An Alpine release suffix (``-r3``) is kept as a last component, so
+    ``9.20.29-r1`` orders after ``9.20.29-r0``. None when there is no number
+    to order by (``latest``).
+    """
+    match = None
+    for match in re.finditer(r"(\d+(?:\.\d+)+)(?:-r(\d+))?", value):
+        pass
+    if match is not None:
+        return (*(int(p) for p in match.group(1).split(".")), int(match.group(2) or 0))
+    digits = re.findall(r"\d+", value)
+    return (int(digits[-1]),) if digits else None
+
+
+def is_behind(latest: str, current: str) -> bool:
+    """True when upstream is NEWER than the pin.
+
+    Not "different": a pin can be ahead of what an upstream query returns (a
+    release published to npm but not as a GitHub release, say), and reporting
+    that as "behind" invites a downgrade. When either side has no number to
+    order by, fall back to "differs", which is all that can be said.
+    """
+    latest_key, current_key = _version_key(latest), _version_key(current)
+    if latest_key is None or current_key is None:
+        return _comparable(latest) != _comparable(current)
+    return latest_key > current_key
+
+
 def _dockerhub_tag_digest(repo: str, tag: str) -> str:
     return str(_http_json(f"https://hub.docker.com/v2/repositories/{repo}/tags/{tag}")["digest"])
 
 
 def check_upstream(manifest: dict[str, Any], token: str | None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    # Alpine-packaged daemons are looked up on the branch the images build on.
+    alpine_branch = (manifest["components"].get("alpine") or {}).get("version")
     for name, entry in manifest["components"].items():
         row: dict[str, Any] = {
             "name": name,
@@ -335,13 +423,13 @@ def check_upstream(manifest: dict[str, Any], token: str | None) -> list[dict[str
             "digest_mismatch": False,
         }
         try:
-            latest = resolve_upstream(entry, token)
+            latest = resolve_upstream(entry, token, alpine_branch)
         except Exception as exc:  # noqa: BLE001 — advisory; one failure must not stop the sweep
             row["error"] = f"{type(exc).__name__}: {exc}"
         else:
             row["latest"] = latest
             if latest is not None:
-                row["behind"] = _comparable(latest) != _comparable(entry["version"])
+                row["behind"] = is_behind(latest, entry["version"])
 
         # A digest-pinned component has TWO ways to be wrong, and the offline
         # lint can only see one: bumping `version` while leaving `digest`

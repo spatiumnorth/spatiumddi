@@ -67,11 +67,11 @@ to their control channels, it does not link against them.
 
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
-| [ISC BIND 9](https://www.isc.org/bind/) | `>= 9.20.26` (Alpine) | MPL 2.0 | DNS agent image | `agent/dns/images/bind9/Dockerfile` |
-| [PowerDNS Authoritative Server](https://www.powerdns.com/) | Alpine `pdns` | GPL v2 | DNS agent image | `agent/dns/images/powerdns/Dockerfile` |
+| [ISC BIND 9](https://www.isc.org/bind/) | `>= 9.20.29-r0` (Alpine) | MPL 2.0 | DNS agent image | `agent/dns/images/bind9/Dockerfile` |
+| [PowerDNS Authoritative Server](https://www.powerdns.com/) | `>= 5.0.7-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/powerdns/Dockerfile` |
 | [Technitium DNS Server](https://technitium.com/dns/) | 15.4.0 (digest-pinned) | GPL v3 | DNS agent image | `agent/dns/images/technitium/Dockerfile` |
-| [PowerDNS dnsdist](https://dnsdist.org/) | Alpine `dnsdist` | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
-| [ISC Kea DHCP](https://www.isc.org/kea/) | Alpine `kea`, v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
+| [PowerDNS dnsdist](https://dnsdist.org/) | `>= 2.0.8-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
+| [ISC Kea DHCP](https://www.isc.org/kea/) | `>= 3.0.3-r0` (Alpine), v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [radvd](https://radvd.litech.org/) | Alpine `radvd` | BSD-style | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [GoBGP](https://github.com/osrg/gobgp) | 4.9.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
 | [BIND `dig` / `nsupdate`](https://www.isc.org/bind/) | `bind-tools` | MPL 2.0 | DNS + supervisor + API images | several Dockerfiles |

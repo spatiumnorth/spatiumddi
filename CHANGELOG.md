@@ -223,6 +223,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The version-pin check now sees the Alpine-packaged daemons, and
+  no longer reports a pin as behind when it is ahead (#1240).**
+  BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
+  `versions.json` tracked none of them, so their drift was invisible
+  to `make versions-check` and the weekly upstream report. That is
+  how #1218's CVEs reached a release. Each is now a component, with
+  its Dockerfile floor (`>=`) as the version and a new
+  `alpine-package` upstream that reads Alpine's package index for the
+  branch the images build on. It compares the full version, so an
+  `-rN` security rebuild shows up too. PowerDNS and dnsdist, which
+  were installed unpinned, gain floors at their current versions
+  (5.0.7-r0 and 2.0.8-r0), so nothing changes in the images. The
+  upstream report also compared versions for *inequality*, so a pin
+  ahead of what upstream returns (redoc 2.5.4 against a 2.5.3 GitHub
+  release) was listed as "behind", which invites a downgrade. It now
+  orders them.
+
 - **After a slot upgrade, the node's DNS, DHCP and looking-glass
   agents run the new release (#1203).** They kept the previous
   release's images and chart until a role, group or key next changed.
@@ -1297,6 +1314,17 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
+  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
+  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
+  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
+  They are triggered by malformed DNS64 responses, a crafted
+  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
+  SVCB/HTTPS records. The `dns-powerdns` image carries the same
+  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
+  9.20.29-r0, which also forces a rebuild of any cached package layer
+  that still has the old version. Upgrade: pull the new DNS images.
 
 - **`/metrics` needs a bearer token (#1159).** It was anonymous, and
   reachable from outside: the web port proxies it and Docker Compose
