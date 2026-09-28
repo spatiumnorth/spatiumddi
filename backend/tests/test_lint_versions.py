@@ -448,3 +448,99 @@ def test_only_allowlisted_https_hosts_are_fetched(
     assert ok is allowed, why
     if allowed:
         assert (host == lint._GITHUB_API_HOST) == ("api.github.com" == host)
+
+
+# ── ordering, not inequality (#1240) ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("current", "latest", "behind", "why"),
+    [
+        ("2.5.4", "v2.5.3", False, "pin AHEAD of the upstream query is not behind (redoc)"),
+        ("9.20.26-r0", "9.20.29-r0", True, "an Alpine patch release"),
+        ("9.20.29-r0", "9.20.29-r1", True, "an Alpine -rN rebuild, often a security fix"),
+        ("9.20.29-r1", "9.20.29-r0", False, "a newer rebuild pinned than the index shows"),
+        ("9.20.29-r0", "9.20.29-r0", False, "identical"),
+        ("v1.36.4+k3s1", "v1.37.0+k3s1", True, "k3s minor"),
+        ("v0.0.21", "frr-k8s-chart-0.0.26", True, "the 'k8s' trap still ignored"),
+        ("16-alpine", "18-alpine", True, "no dotted run: digits"),
+        ("latest", "latest", False, "no number at all falls back to 'differs'"),
+    ],
+)
+def test_behind_means_upstream_is_newer(
+    lint: types.ModuleType, current: str, latest: str, behind: bool, why: str
+) -> None:
+    """``behind`` used to be ``!=``: a pin ahead of upstream (redoc 2.5.4 vs a
+    2.5.3 GitHub release) was reported "behind", which invites a downgrade."""
+    assert lint.is_behind(latest, current) is behind, why
+
+
+# ── the Alpine package index upstream (#1240) ────────────────────────────────
+
+_APKINDEX = (
+    "C:Q1abc=\nP:bind\nV:9.20.29-r0\nA:x86_64\nT:The ISC DNS server\n\n"
+    "C:Q1def=\nP:bind-tools\nV:9.20.29-r0\nA:x86_64\n\n"
+    "C:Q1ghi=\nP:kea\nV:3.0.3-r0\nA:x86_64\n"
+)
+
+
+def test_apkindex_records_parse_to_full_versions(lint: types.ModuleType) -> None:
+    """The ``-rN`` suffix must survive: a floor written against ``-r0`` has to
+    see a security rebuild that only bumps it to ``-r1``."""
+    assert lint.parse_apkindex(_APKINDEX) == {
+        "bind": "9.20.29-r0",
+        "bind-tools": "9.20.29-r0",
+        "kea": "3.0.3-r0",
+    }
+
+
+def _apkindex_blob(text: str) -> bytes:
+    import gzip
+    import io
+    import tarfile
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        data = text.encode()
+        info = tarfile.TarInfo("APKINDEX")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue())
+
+
+def test_alpine_upstream_reads_the_index_for_the_manifests_branch(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetched: list[str] = []
+
+    def fake_bytes(url: str, token: str | None = None) -> bytes:
+        fetched.append(url)
+        return _apkindex_blob(_APKINDEX)
+
+    monkeypatch.setattr(lint, "_http_bytes", fake_bytes)
+    entry = {"upstream": {"kind": "alpine-package", "repo": "main/bind"}}
+    assert lint.resolve_upstream(entry, None, "3.24") == "9.20.29-r0"
+    assert fetched == ["https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/APKINDEX.tar.gz"]
+
+
+@pytest.mark.parametrize(
+    ("repo", "branch", "why"),
+    [
+        ("main/bind", None, "no alpine branch in the manifest must be an error, not a guess"),
+        ("main/nosuchpkg", "3.24", "a package absent from the index is an error"),
+        ("bind", "3.24", "repo must be <repository>/<package>"),
+    ],
+)
+def test_alpine_upstream_failures_are_errors_not_answers(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, repo: str, branch: str | None, why: str
+) -> None:
+    monkeypatch.setattr(lint, "_http_bytes", lambda url, token=None: _apkindex_blob(_APKINDEX))
+    with pytest.raises(LookupError):
+        lint.resolve_upstream({"upstream": {"kind": "alpine-package", "repo": repo}}, None, branch)
+
+
+def test_alpine_cdn_is_an_allowed_host(lint: types.ModuleType) -> None:
+    # A set comparison, not ``"host" in …``: the latter is the shape CodeQL
+    # reads as URL substring sanitisation (it is set membership here).
+    assert {"dl-cdn.alpinelinux.org"} <= lint._ALLOWED_HOSTS
+    assert lint._GITHUB_API_HOST != "dl-cdn.alpinelinux.org", "the token must never go to the CDN"
