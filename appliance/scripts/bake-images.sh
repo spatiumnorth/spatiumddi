@@ -96,7 +96,7 @@ OBSERVABILITY_IMAGES=(
     # Agent landing page — always-on nginx serving the rendered
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
     # 1.31.5-alpine matching values.yaml's ``agentLanding.image.tag``.
-    "nginx:1.31.5-alpine"
+    "nginx:1.31.6-alpine"
     # Phase 11 (#183) — Redis datastore for the control plane.
     # Tag follows the umbrella chart's ``redis.image.tag`` default.
     # NOTE: the standalone ``postgres:16-alpine`` image is intentionally
@@ -106,7 +106,7 @@ OBSERVABILITY_IMAGES=(
     # + operator are baked in CNPG_IMAGES below. The chart's standalone
     # StatefulSet path stays for non-appliance docker/k8s users, but the
     # appliance never renders it, so its image is dead weight in the ISO.
-    "redis:8.10.1-alpine"
+    "redis:8.10.2-alpine"
 )
 
 # #272 Phase 5 — MetalLB (control-plane HTTPS VIP + Phase 10 DNS/DHCP
@@ -174,7 +174,7 @@ METALLB_IMAGES=(
 #   helm dependency update charts/spatiumddi-appliance
 #   helm show chart charts/spatiumddi-appliance/charts/cloudnative-pg-*.tgz | grep appVersion
 CNPG_IMAGES=(
-    "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0"
+    "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1"
     "ghcr.io/cloudnative-pg/postgresql:16"
 )
 

@@ -13,7 +13,7 @@
        k3s; no LoadBalancer to fall back on (klipper-lb is disabled),
        so hostNetwork is the simplest path.
 
-       Image: stock ``nginx:1.31.5-alpine``, preloaded into containerd
+       Image: stock ``nginx:1.31.6-alpine``, preloaded into containerd
        at bake time alongside the SpatiumDDI service images. */}}
 {{- if .Values.agentLanding.enabled }}
 apiVersion: apps/v1

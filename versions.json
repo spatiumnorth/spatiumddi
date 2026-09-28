@@ -71,6 +71,7 @@
   "components": {
     "k3s": {
       "version": "v1.36.4+k3s1",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): v1.37 is a Kubernetes MINOR, which is not slot-revertible (see note) and lands on the clustering/upgrade path the freeze holds. Bump with a 1.1.0 slot-image cut, together with kind-node and kubeconform-k8s-target.",
       "pinned_in": [
         { "path": "Makefile", "match": "K3S_VERSION ?= {version}", "count": 1 },
         { "path": "appliance/scripts/fetch-k3s.sh", "match": "K3S_VERSION:-{version}", "count": 1 },
@@ -204,7 +205,7 @@
     },
 
     "cloudnative-pg-chart": {
-      "version": "0.29.0",
+      "version": "0.29.1",
       "pinned_in": [
         {
           "path": "charts/spatiumddi-appliance/Chart.yaml",
@@ -218,7 +219,7 @@
     },
 
     "cloudnative-pg-operator": {
-      "version": "1.30.0",
+      "version": "1.30.1",
       "pinned_in": [
         {
           "path": "appliance/scripts/bake-images.sh",
@@ -251,7 +252,7 @@
     },
 
     "nginx": {
-      "version": "1.31.5-alpine",
+      "version": "1.31.6-alpine",
       "pinned_in": [
         { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
         { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
@@ -268,7 +269,7 @@
     },
 
     "redis": {
-      "version": "8.10.1-alpine",
+      "version": "8.10.2-alpine",
       "pinned_in": [
         { "path": "docker-compose.yml", "match": "image: redis:{version}", "count": 1 },
         { "path": "docker-compose.dev.yml", "match": "image: redis:{version}", "count": 1 },
@@ -357,6 +358,7 @@
 
     "technitium": {
       "version": "15.4.0",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): 15.4.0 -> 15.5.x is a minor release, not a patch, and the freeze takes only bug and security fixes. Move it after 1.0.0, tag and digest together.",
       "digest": "sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41",
       "pinned_in": [
         {
@@ -384,7 +386,7 @@
     },
 
     "etcd-patroni": {
-      "version": "v3.5.33",
+      "version": "v3.5.34",
       "pinned_in": [
         {
           "path": "k8s/ha/postgres-docker-compose.yaml",

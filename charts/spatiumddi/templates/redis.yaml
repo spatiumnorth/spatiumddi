@@ -3,7 +3,7 @@
 {{- $secretName := printf "%s-redis" (include "spatiumddi.fullname" .) -}}
 # ─────────────────────────────────────────────────────────────────────────────
 # In-chart Redis — single-node StatefulSet using the official
-# ``redis:8.10.1-alpine`` image. Sized for a small lab / single-VM
+# ``redis:8.10.2-alpine`` image. Sized for a small lab / single-VM
 # deployment. Real production HA installs flip ``redis.kind=sentinel``
 # (#272 Phase 3 — templates/redis-sentinel.yaml) or set
 # ``redis.enabled=false`` and point ``externalRedis`` at a
