@@ -223,6 +223,33 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **PowerDNS serves each record's configured TTL, and a zone it refuses
+  fails the apply (#1225).** The PowerDNS agent's full reconcile, which
+  runs on every agent start and every structural change, stamped the
+  ZONE's TTL on every rrset, so after a restart every record was served at
+  the zone default: measured against a real PowerDNS, records configured
+  at 60 s, 86400 s and 0 all answered 3600, while the incremental
+  record-op path honoured them. Each rrset now carries its records' TTL; a
+  record with none inherits the zone's, 0 stays 0, and records at one name
+  and type that disagree resolve to the lowest, the same rule the control
+  plane applies to the rrset it ships with a record op, so against a current
+  control plane the two paths agree. (A pre-#773 control plane sends ops
+  without that rrset, and the op path's own fallback for a record with no
+  TTL is still 3600.) Zone names are now matched case-insensitively:
+  PowerDNS stores them lowercased, so a zone configured as `Case.Test` was
+  re-created on every reconcile after the first, answered 409, and was
+  skipped, which left its records unreconciled. Separately,
+  a zone PowerDNS refused to create or patch was logged and skipped, so
+  #882's apply status reported `ok` for a zone that was never served (also
+  measured: a CNAME beside other data at one name, refused with 422,
+  reported OK). The reconcile still attempts every zone, then fails the
+  apply with PowerDNS's own reason, so the revert and the
+  `agent_config_rejected` alert fire. The same goes for three more silent
+  paths: a failed zone listing (which used to treat every existing zone as
+  new), an unreadable rendered payload, and dynamic-update ACL metadata or
+  TSIG keys PowerDNS refused, where a failed CLEAR left a zone accepting
+  updates the operator had turned off.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
