@@ -103,10 +103,29 @@ def test_dhcpv6_has_its_own_vocabulary() -> None:
         validate_options({"code:43": "01"}, address_family="ipv6")
 
 
-def test_a_client_class_accepts_either_family() -> None:
+def test_a_client_class_is_checked_as_the_dhcp4_it_always_renders_into() -> None:
     validate_options({"routers": ["10.0.0.1"]}, address_family="any")
-    validate_options({"dns-servers": ["2001:db8::53"]}, address_family="any")
     validate_options({"dns-servers": ["10.0.0.53"]}, address_family="any")
+    # Dhcp4 always carries the class, so an IPv6 ``dns-servers`` would reach
+    # it as ``domain-name-servers`` and fail the whole config.
+    with pytest.raises(ValueError, match="not an IPv4 address"):
+        validate_options({"dns-servers": ["2001:db8::53"]}, address_family="any")
+
+
+def test_an_aliased_stored_key_still_counts_as_unchanged() -> None:
+    stored = {"domain-name-servers": "bogus"}
+    validate_options({"dns-servers": "bogus"}, previous=stored)
+
+
+def test_a_retyped_raw_code_is_not_lost_to_the_stale_name() -> None:
+    from app.services.dhcp.option_validation import normalize_options
+
+    assert normalize_options([{"code": 132, "name": "code:43", "value": "x"}]) == {"code:132": "x"}
+    assert normalize_options([{"code": 43, "name": "code:43", "value": "01"}]) == {"code:43": "01"}
+    # A canonical name keeps its key whatever the code — v6 codes differ.
+    assert normalize_options([{"code": 23, "name": "dns-servers", "value": ["2001:db8::1"]}]) == {
+        "dns-servers": ["2001:db8::1"]
+    }
 
 
 def test_an_unchanged_grandfathered_option_does_not_block_an_edit() -> None:

@@ -124,8 +124,10 @@ does not know was silently dropped by the agent.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
-equivalent and all raw codes. A client class renders into both the
-DHCPv4 and the DHCPv6 config, so it accepts a name either family knows.
+equivalent and all raw codes. A client class renders into the DHCPv4
+config always, and into the DHCPv6 config when the group has v6 scopes, so
+its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
+refused, because Dhcp4 would reject it.
 Raw `option_data` is refused: it is for internal producers such as the
 E911 location options (#972).
 

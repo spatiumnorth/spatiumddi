@@ -78,6 +78,21 @@ OPTION_NAME_ALIASES: dict[str, str] = {
 _RAW_CODE = re.compile(r"^code:(\d+)$")
 _WINDOWS_CODE = re.compile(r"^opt-(\d+)$")
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
+_NAME_TO_CODE: dict[str, int] = {v: k for k, v in CODE_TO_NAME.items()}
+
+
+def option_key_code(key: str) -> int | None:
+    """The DHCP option code a stored key stands for, or ``None``.
+
+    Covers the canonical names, their aliases, and the ``code:NN`` /
+    ``opt-NN`` raw spellings, so a raw code reads back under its own number
+    rather than as ``0``.
+    """
+    canon = OPTION_NAME_ALIASES.get(key, key)
+    if canon in _NAME_TO_CODE:
+        return _NAME_TO_CODE[canon]
+    m = _RAW_CODE.fullmatch(key) or _WINDOWS_CODE.fullmatch(key)
+    return int(m.group(1)) if m else None
 
 
 def _is_unset(value: Any) -> bool:
@@ -264,8 +279,23 @@ def normalize_options(raw: Any) -> dict[str, Any]:
             code_int = int(code) if code not in (None, "", 0, "0") else None
         except (TypeError, ValueError):
             code_int = None
-        if name and (name in _V4_CHECKS or name in _V6_CHECKS or _is_code_key(name)):
-            key = name
+        known = name is not None and (
+            name in _V4_CHECKS or name in _V6_CHECKS or _is_code_key(name)
+        )
+        # A raw-code name (``code:43``) that disagrees with the entry's code
+        # yields to the code: the options editor updates ``code`` as the
+        # operator retypes it and leaves the old name behind, so keying by the
+        # name would silently discard the change. Canonical names are left
+        # alone — their code differs by family (v6 ``dns-servers`` is 23).
+        if (
+            known
+            and code_int is not None
+            and _is_code_key(str(name))
+            and option_key_code(str(name)) != code_int
+        ):
+            known = False
+        if known:
+            key = str(name)
         elif code_int is not None:
             key = CODE_TO_NAME.get(code_int) or f"code:{code_int}"
         elif name:
@@ -287,8 +317,6 @@ def _supported(address_family: str) -> str:
 
 def _check_one(key: str, value: Any, address_family: str) -> None:
     """Raise ``ValueError`` naming ``key`` when it cannot be rendered."""
-    families = ("ipv4", "ipv6") if address_family == "any" else (address_family,)
-
     if key == "option_data":
         raise ValueError(
             "option 'option_data' (raw Kea option-data) cannot be set over the API; "
@@ -298,7 +326,7 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
     raw = _RAW_CODE.fullmatch(key)
     if raw:
         code = int(raw.group(1))
-        if "ipv4" not in families:
+        if address_family == "ipv6":
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
         if code not in _KEA_VENDOR_OPTION_DEFS:
             supported = ", ".join(f"code:{c}" for c in sorted(_KEA_VENDOR_OPTION_DEFS))
@@ -320,12 +348,16 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
             raise ValueError(f"option '{key}': option codes run 1..254")
         return
 
-    checks = [
-        table[key]
-        for fam, table in (("ipv4", _V4_CHECKS), ("ipv6", _V6_CHECKS))
-        if fam in families and key in table
-    ]
-    if not checks:
+    # A client class ("any") renders into Dhcp4 unconditionally, and into
+    # Dhcp6 only when the group has v6 scopes, so a key Dhcp4 knows must be
+    # valid there: an IPv6 ``dns-servers`` would reach Dhcp4 as
+    # ``domain-name-servers`` and take the whole config down. Dhcp4's table
+    # is therefore consulted first for "any", and v6 only for a v6-only key.
+    tables = {"ipv4": (_V4_CHECKS,), "ipv6": (_V6_CHECKS,)}.get(
+        address_family, (_V4_CHECKS, _V6_CHECKS)
+    )
+    check = next((t[key] for t in tables if key in t), None)
+    if check is None:
         if address_family == "ipv6" and key in _V4_CHECKS:
             raise ValueError(f"option '{key}': has no DHCPv6 equivalent")
         raise ValueError(
@@ -335,14 +367,10 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
         )
     if _is_unset(value):
         return
-    errors: list[str] = []
-    for check in checks:
-        try:
-            check(value)
-            return
-        except ValueError as exc:
-            errors.append(str(exc))
-    raise ValueError(f"option '{key}': {errors[0]}")
+    try:
+        check(value)
+    except ValueError as exc:
+        raise ValueError(f"option '{key}': {exc}") from None
 
 
 def validate_options(
@@ -354,13 +382,16 @@ def validate_options(
     """Raise ``ValueError`` naming the first option that cannot be rendered.
 
     ``address_family`` is ``ipv4``, ``ipv6``, or ``any`` for a client class,
-    which renders into both Dhcp4 and Dhcp6.
+    which always renders into Dhcp4 and so is checked against Dhcp4 first.
 
     A key whose value is unchanged from ``previous`` is skipped, so an edit
     that round-trips a grandfathered option — stored before this check existed,
     or brought in by an importer — is not blocked by it (the #597 stance).
     """
-    prev = previous or {}
+    # Compare against the stored map under canonical names, so a row stored
+    # under a legacy alias (``domain-name-servers``, #583) that the write
+    # normalised still counts as unchanged.
+    prev = {OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in (previous or {}).items()}
     for key, value in options.items():
         if key in prev and prev[key] == value:
             continue

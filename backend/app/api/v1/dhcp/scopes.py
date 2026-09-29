@@ -29,11 +29,10 @@ from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.option_validation import (
-    CODE_TO_NAME,
-    OPTION_NAME_ALIASES,
+    normalize_options,
+    option_key_code,
     validate_options,
 )
-from app.services.dhcp.option_validation import normalize_options as _normalize_options
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -407,14 +406,6 @@ class ScopeUpdate(BaseModel):
         return _validate_relay_addresses(v)
 
 
-_NAME_TO_CODE = {v: k for k, v in CODE_TO_NAME.items()}
-# Existing rows may still be stored under the legacy alias (#583); map it
-# to code 6 on readback so the DNS Servers field populates on edit.
-for _alias, _canon in OPTION_NAME_ALIASES.items():
-    if _canon in _NAME_TO_CODE:
-        _NAME_TO_CODE[_alias] = _NAME_TO_CODE[_canon]
-
-
 class ScopeResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -470,14 +461,10 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
     opts: list[dict[str, Any]] = []
     if isinstance(raw, dict):
         for name, val in raw.items():
-            code = _NAME_TO_CODE.get(name, 0)
-            if not code and name.startswith(("code:", "opt-")):
-                # A raw code reads back under its own number, so the options
-                # editor shows "43", not "0" (#1228).
-                try:
-                    code = int(name.split(":" if name.startswith("code:") else "-", 1)[1])
-                except ValueError:
-                    code = 0
+            # Legacy aliases (#583) resolve to their code so the field
+            # populates on edit, and a raw ``code:43`` / ``opt-43`` reads back
+            # under its own number rather than "0" (#1228).
+            code = option_key_code(name) or 0
             opts.append({"code": code, "name": name, "value": val})
     elif isinstance(raw, list):
         opts = list(raw)
@@ -669,7 +656,7 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
-    _create_options = _normalize_options(body.options)
+    _create_options = normalize_options(body.options)
     validate_dhcp_options(_create_options, address_family=address_family)
     scope = DHCPScope(
         subnet_id=subnet_id,
@@ -815,7 +802,7 @@ async def update_scope(
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
     if "options" in changes:
-        normalized = _normalize_options(changes["options"])
+        normalized = normalize_options(changes["options"])
         # Validate only options that CHANGED from the stored value (#597
         # review, #1228) — the scope form round-trips the full options dict,
         # so re-validating an unchanged grandfathered value would block an

@@ -74,8 +74,8 @@ async def create_class(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A client class with that name exists")
-    # A client class renders into Dhcp4 AND Dhcp6, so a name either family
-    # knows is accepted (#1228).
+    # A client class always renders into Dhcp4 (and into Dhcp6 when the
+    # group has v6 scopes); "any" checks it as the Dhcp4 it must load in.
     body.options = normalize_options(body.options)
     validate_dhcp_options(body.options, address_family="any")
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())

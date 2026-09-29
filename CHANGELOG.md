@@ -267,7 +267,8 @@ the formatter handles the rest.
   option template checks the merged result against the scope's family.
   A pick from the custom-options catalogue is now stored under the code
   it can be delivered as (`code:43`), instead of a catalogue name the
-  agent would drop.
+  agent would drop. This applies in the option-template and client-class
+  editors too, which used to key such a pick by its name or `option-NN`.
 
 - **A slot upgrade survives its image download being cut short
   (#1216).** The runner read the image until the connection stopped

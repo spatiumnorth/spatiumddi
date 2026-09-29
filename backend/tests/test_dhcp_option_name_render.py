@@ -24,9 +24,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.api.v1.dhcp.scopes import _normalize_options
 from app.drivers.dhcp.base import ConfigBundle, ScopeDef, ServerOptionsDef
 from app.drivers.dhcp.kea import KeaDriver, _render_option_data
+from app.services.dhcp.option_validation import normalize_options as _normalize_options
 
 
 def _bundle(options: dict) -> ConfigBundle:

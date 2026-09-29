@@ -185,12 +185,14 @@ async def update_template(
             raise HTTPException(status_code=409, detail="A template with that name exists")
     family = payload.get("address_family", tpl.address_family)
     if "options" in payload or family != tpl.address_family:
-        options = normalize_options(payload["options"]) if "options" in payload else tpl.options
+        # The stored map is normalised too: a template saved before #1228
+        # may carry an alias (``domain-name-servers``) the check rejects.
+        options = normalize_options(payload["options"] if "options" in payload else tpl.options)
         # Validate only changed options (#597, #1228) so a round-tripped
         # grandfathered value doesn't block an unrelated edit — unless the
         # family changed, which makes every option new to the template.
         validate_dhcp_options(
-            options or {},
+            options,
             address_family=family,
             previous=(tpl.options or {}) if family == tpl.address_family else None,
         )
@@ -273,7 +275,10 @@ async def apply_template_to_scope(
             detail="Template and scope belong to different groups",
         )
     current = dict(scope.options or {})
-    tpl_options = dict(tpl.options or {})
+    # Normalised so a template stored before #1228 under an alias the agent
+    # renders (``domain-name-servers``, ``interface-mtu``) is not refused as
+    # an unknown option, and so it overwrites the canonical key it aliases.
+    tpl_options = normalize_options(tpl.options)
     overwritten = sorted(k for k in tpl_options if k in current and current[k] != tpl_options[k])
     if body.mode == "replace":
         new_options: dict[str, Any] = dict(tpl_options)
