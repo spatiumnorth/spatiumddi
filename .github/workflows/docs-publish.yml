@@ -40,7 +40,10 @@ on:
     # already published when it landed on main) but it makes a release
     # deterministically republish, and the job no-ops when nothing changed.
     tags:
-      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*" # e.g. 2026.04.13-1
+      # The same globs as release.yml: CalVer until 1.0.0, SemVer after it
+      # (#1182).
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
     # NOTE: deliberately no `paths:` filter. A paths filter applies to tag
     # pushes as well, and a tag push carries no changed-file list, so the
     # filter would never match and releases would silently stop publishing.

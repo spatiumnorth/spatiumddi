@@ -30,6 +30,11 @@ touched. So this asserts both, over the SAME image list the nightly matrix
 builds from — a new image is covered the moment it is added there, rather
 than when somebody remembers to add it here.
 
+It also asserts that release.yml publishes exactly that list (#1226). The
+release workflow carries its own copy because it builds, scans and pushes
+from it; an image missing from that copy would keep building every night
+and silently stop being released.
+
 stdlib-only, no network, no docker. Exit 1 on any finding.
 """
 
@@ -42,10 +47,11 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 NIGHTLY = REPO_ROOT / ".github" / "workflows" / "nightly.yml"
+RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
-# The nightly's images list is a heredoc of JSON inside the gate step — one
-# source of truth for which images exist (see the comment above it there).
-# Parsed rather than duplicated, so this linter cannot fall behind the matrix.
+# The images list is a heredoc of JSON inside a step of each workflow (the
+# nightly's gate, the release's meta). Parsed rather than duplicated, so this
+# linter cannot fall behind the matrix.
 _IMAGES_BLOCK = re.compile(
     r"cat > /tmp/images\.json <<'IMAGES_EOF'\n(.*?)\n\s*IMAGES_EOF", re.DOTALL
 )
@@ -122,16 +128,36 @@ def _shipped_body(body: str, target: str) -> str:
     return "\n".join("\n".join(stages[i][2]) for i in chain)
 
 
-def _images() -> list[dict[str, str]]:
-    match = _IMAGES_BLOCK.search(NIGHTLY.read_text())
+def _images(workflow: pathlib.Path) -> list[dict[str, str]]:
+    match = _IMAGES_BLOCK.search(workflow.read_text())
     if not match:
         raise SystemExit(
-            f"{NIGHTLY}: could not find the images.json heredoc — if the gate step was "
+            f"{workflow}: could not find the images.json heredoc — if the step was "
             "restructured, update this linter rather than letting it silently check nothing"
         )
     # The heredoc body is indented inside the YAML block scalar.
     body = "\n".join(line.strip() for line in match.group(1).splitlines())
     return json.loads(body)
+
+
+def _list_drift(nightly: list[dict[str, str]], release: list[dict[str, str]]) -> list[str]:
+    """How the release's image list differs from the nightly's, entry by entry."""
+    by_name = {image["image"]: image for image in nightly}
+    released = {image["image"]: image for image in release}
+    findings = [
+        f"{name}: built by the nightly but not published by release.yml"
+        for name in sorted(by_name.keys() - released.keys())
+    ]
+    findings += [
+        f"{name}: published by release.yml but not built by the nightly"
+        for name in sorted(released.keys() - by_name.keys())
+    ]
+    findings += [
+        f"{name}: release.yml builds {released[name]} but the nightly builds {by_name[name]}"
+        for name in sorted(by_name.keys() & released.keys())
+        if released[name] != by_name[name]
+    ]
+    return findings
 
 
 def _strip_trailing_comment(line: str) -> str:
@@ -175,9 +201,9 @@ def _strip_comments(text: str) -> str:
 
 
 def main() -> int:
-    findings: list[str] = []
+    findings: list[str] = _list_drift(_images(NIGHTLY), _images(RELEASE))
 
-    for image in _images():
+    for image in _images(NIGHTLY):
         rel = image["file"].lstrip("./")
         path = REPO_ROOT / rel
         if not path.is_file():

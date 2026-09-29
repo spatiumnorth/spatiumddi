@@ -1315,6 +1315,33 @@ the formatter handles the rest.
 
 ### Security
 
+- **A release publishes nothing until CI, Trivy and main have all said yes
+  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
+  pushed `:latest` alongside each version tag before the ISO, the
+  OpenAPI export or the GitHub release had finished. So #1218's BIND
+  image shipped with 7 HIGH CVEs that nothing on the release path looked
+  for; a release that failed part-way had already moved every compose
+  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
+  covers tags, anyone with write access could release any commit. Now a
+  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
+  to pass on the tagged commit; every image is built and scanned with
+  Trivy + `trivy-gate.sh` (the nightly's gate) before anything, including
+  the chart, is pushed; and `:latest` moves in a final job, after the
+  GitHub release exists, by copying the release's manifest rather than
+  rebuilding it. The release workflow also stops assuming CalVer (#1182
+  step 3): it accepts SemVer tags and publishes a SemVer pre-release
+  (`1.0.0-rc.1`) as a GitHub pre-release that never becomes `:latest`,
+  and the previous release, the CHANGELOG section and whether a tag
+  becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering. The shell it replaces got all three
+  wrong across the switch: `sort -V` ranks every `2026.*` tag above every
+  `1.*` one, and the CHANGELOG lookup was a prefix match that returns
+  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
+  one no longer takes over `:latest` or the stable download URLs.
+  `scripts/lint_image_upgrades.py` now also fails when the release's
+  image list and the nightly's differ, so an image cannot keep building
+  every night and silently stop being released.
+
 - **Pinned images brought current; the CloudNativePG operator and
   Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
   the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG

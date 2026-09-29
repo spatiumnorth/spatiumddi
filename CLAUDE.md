@@ -2767,7 +2767,7 @@ SpatiumDDI uses **CalVer**: `YYYY.MM.DD-N` where N is the release number for tha
 - `2026.04.13-1` — first release on April 13, 2026
 - `2026.04.13-2` — hotfix on the same day
 - Git tags and Docker image tags follow this scheme exactly
-- Release is triggered by pushing a tag matching `[0-9]{4}.[0-9]{2}.[0-9]{2}-*` (see `.github/workflows/release.yml`)
+- Release is triggered by pushing a tag (see `.github/workflows/release.yml`). It publishes nothing until three gates pass ([#1226](https://github.com/spatiumnorth/spatiumddi/issues/1226)): the tag is a release tag on `main` and `ci.yml` passed on that commit (it waits up to an hour for a running CI); every image passes Trivy + `trivy-gate.sh`; and `:latest` moves last, only after the GitHub release exists. The tag decisions (validity, previous release, whether it becomes latest) live in `scripts/release_version.py`, on top of `backend/app/core/versions.py`'s ordering
 
 **Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer until that lands. After it, every SemVer version must compare newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so never compare versions as strings; use the shared helper that #1182 introduces.
 

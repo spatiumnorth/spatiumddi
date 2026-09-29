@@ -16,6 +16,10 @@ or a way the linter could have looked like it passed while checking nothing:
   * and if the nightly's images heredoc is ever restructured, the linter must
     say so rather than find zero images and report success — the failure mode
     this whole class of guard keeps producing.
+
+#1226 added the release workflow's own copy of the list, which it builds,
+scans and pushes from; an image that drops off it keeps building every night
+and silently stops being released, so the two must match entry for entry.
 """
 
 from __future__ import annotations
@@ -71,13 +75,17 @@ def _run(
     tmp_path: pathlib.Path,
     dockerfile: str | None,
     nightly: str = _NIGHTLY_TEMPLATE,
+    release: str | None = None,
 ) -> int:
-    (tmp_path / ".github" / "workflows").mkdir(parents=True)
-    (tmp_path / ".github" / "workflows" / "nightly.yml").write_text(nightly)
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "nightly.yml").write_text(nightly)
+    (workflows / "release.yml").write_text(nightly if release is None else release)
     if dockerfile is not None:
         (tmp_path / "Dockerfile").write_text(dockerfile)
     monkeypatch.setattr(lint, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(lint, "NIGHTLY", tmp_path / ".github" / "workflows" / "nightly.yml")
+    monkeypatch.setattr(lint, "NIGHTLY", workflows / "nightly.yml")
+    monkeypatch.setattr(lint, "RELEASE", workflows / "release.yml")
     return lint.main()
 
 
@@ -237,6 +245,51 @@ def test_a_restructured_heredoc_raises_rather_than_passing(
             tmp_path,
             _GOOD_DOCKERFILE,
             nightly="jobs:\n  gate:\n    steps:\n      - run: echo no heredoc here\n",
+        )
+
+
+_SECOND_IMAGE = (
+    '{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"},\n'
+    '            {"image": "other", "context": ".", "file": "./Dockerfile", "target": "runtime"}'
+)
+_ONE_IMAGE = '{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}'
+
+
+@pytest.mark.parametrize(
+    ("nightly", "release"),
+    [
+        # An image the nightly builds and the release no longer publishes.
+        (_NIGHTLY_TEMPLATE.replace(_ONE_IMAGE, _SECOND_IMAGE), _NIGHTLY_TEMPLATE),
+        # The other direction: published by a release, never built nightly,
+        # so a regression in it surfaces only when a release is cut.
+        (_NIGHTLY_TEMPLATE, _NIGHTLY_TEMPLATE.replace(_ONE_IMAGE, _SECOND_IMAGE)),
+        # Same name, different build: the #732 shape, a release that drops
+        # the api's ``target: runtime`` and ships the dev stage.
+        (_NIGHTLY_TEMPLATE, _NIGHTLY_TEMPLATE.replace('"target": "runtime"', '"target": ""')),
+    ],
+    ids=["missing-from-release", "missing-from-nightly", "different-target"],
+)
+def test_the_release_list_must_match_the_nightly_list(
+    lint: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    nightly: str,
+    release: str,
+) -> None:
+    (tmp_path / "Dockerfile").write_text(_GOOD_DOCKERFILE)
+    assert _run(lint, monkeypatch, tmp_path, None, nightly=nightly, release=release) == 1
+
+
+def test_a_release_without_the_heredoc_raises(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    with pytest.raises(SystemExit):
+        _run(
+            lint,
+            monkeypatch,
+            tmp_path,
+            _GOOD_DOCKERFILE,
+            release="jobs:\n  meta:\n    steps:\n      - run: echo no heredoc here\n",
         )
 
 
