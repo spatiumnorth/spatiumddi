@@ -32,6 +32,7 @@ from app.models.appliance import (
     ApplianceCertificate,
 )
 from app.models.audit import AuditLog
+from app.services.appliance import tls_pins
 from app.services.appliance.deployment import deploy_and_reload
 from app.services.appliance.tls import (
     KEY_TYPES,
@@ -679,3 +680,6 @@ async def _activate_only(db: DB, target: ApplianceCertificate) -> None:
     )
     target.is_active = True
     target.activated_at = now
+    # Supervisors re-pin against the served-certificate list (#1219);
+    # don't make them wait out its cache to learn about this one.
+    tls_pins.clear_cache()

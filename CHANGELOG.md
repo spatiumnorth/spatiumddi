@@ -1315,6 +1315,37 @@ the formatter handles the rest.
 
 ### Security
 
+- **Appliance supervisors verify the control plane's TLS certificate
+  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
+  the supervisor unconditionally, calling it trust-on-first-use, and nothing
+  was pinned: every register, heartbeat and proxy poll ran with no
+  verification at all. The heartbeat response carries the platform-wide DNS
+  and DHCP agent keys and the slot image URL plus the sha256 that is its only
+  integrity check, so anyone on the path could read the keys and serve a node
+  a root filesystem of their choosing. Now the supervisor pins the
+  certificate the control plane presents at first contact and verifies every
+  connection against it in the TLS handshake (a self-signed control plane
+  works, and the hostname need not match an operator-typed IP). A rotated
+  certificate (re-minted on member join or VIP change, uploaded, or renewed
+  by ACME) is adopted only if the appliance CA, which every approved
+  supervisor already holds, vouches for it through a new unauthenticated
+  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
+  certificates, signed by the CA. That list names the TLS Secret's
+  certificate as well as the active one, so #1215's revert to the first-boot
+  certificate does not strand supervisors. Once approved, a supervisor also
+  checks that its first-contact pin is on the list, which catches an
+  interception present at pairing (unless it also replaced the CA). The
+  k8s, nettool, pcap and storage proxy loops go through the same pinned
+  trust; before, they verified against system CAs, so against a self-signed
+  control plane they could not connect at all. An `http://` URL is followed
+  to its `https://` redirect and that certificate pinned. Still open: the
+  DNS, DHCP and looking-glass role pods on an appliance skip verification
+  toward the control plane, which needs the pinned certificate passed
+  through to them (tracked separately).
+  **Upgrade note:** an already-paired appliance takes its pin at its first
+  contact after the upgrade, then checks it against the CA's list; a
+  mismatch is logged as `supervisor.tls.pin_not_vouched`.
+
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
   `manage_nmap_scans`, which the builtin Network Editor role holds, and

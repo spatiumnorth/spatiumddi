@@ -51,6 +51,7 @@ from app.models.appliance import (
 from app.models.audit import AuditLog
 from app.services.acme_client import dns01, http01
 from app.services.acme_client.engine import ACMEClient, ACMEProtocolError
+from app.services.appliance import tls_pins
 from app.services.appliance.deployment import deploy_and_reload
 from app.services.appliance.tls import (
     CSRSubject,
@@ -442,6 +443,9 @@ async def _make_sole_active(db: AsyncSession, target: ApplianceCertificate) -> N
     )
     target.is_active = True
     target.activated_at = datetime.now(tz=tzinfo)
+    # Supervisors re-pin against the served-certificate list (#1219);
+    # don't make them wait out its cache to learn about this one.
+    tls_pins.clear_cache()
 
 
 __all__ = ["run_order"]
