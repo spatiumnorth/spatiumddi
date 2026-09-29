@@ -285,6 +285,12 @@ else
     # a different image, not retry this one.
     if [ "$apply_rc" -eq 5 ]; then
         fail "apply refused: the image is built for a different CPU architecture than this node (rc=5) — the active slot is untouched; fetch the image for this node's architecture"
+    # rc=6 is #1216: the image download was cut short and the retries did
+    # not recover it. Named separately because it is neither a bad image
+    # nor a bad disk — nothing was written, and retrying the upgrade once
+    # the path to the image is stable again is the whole remedy.
+    elif [ "$apply_rc" -eq 6 ]; then
+        fail "apply failed: the image download was interrupted and did not complete after retries (rc=6) — nothing was written to the inactive slot; retry the upgrade (see slot-upgrade.log)"
     else
         fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write / architecture)"
     fi

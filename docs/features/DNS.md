@@ -653,6 +653,25 @@ DNSRecord
   last_modified_at
 ```
 
+**A zone never holds the same record twice** ([#1230](https://github.com/spatiumnorth/spatiumddi/issues/1230)).
+Two records are identical when they share view, owner name (compared
+case-insensitively, as DNS does), type, value and `priority` / `weight` /
+`port`. TTL is not part of it: it belongs to the RRset, not to one member.
+Creating or editing a record into an identical one is a `409` naming the
+record it duplicates; bulk create skips it and reports
+`identical record already exists` in `skipped`, so re-submitting a batch is
+idempotent; the Copilot's `create_dns_record` refuses it too. A record in the
+trash does not count.
+
+The reason is a wrong answer, not tidiness. Every record op carries the whole
+RRset the server should end up with (#773), and a delete used to drop the
+deleted record's *value* from it — taking an identical twin's copy with it,
+so the server stopped answering for a record the zone still listed. A delete
+now drops the deleted *row* (the op payload names it as `record_id`), so twins
+that already exist — made before this check, or by an import or the IPAM sync,
+which do not refuse — keep serving whichever copy is deleted. The wire never
+carries the same RR twice.
+
 ---
 
 ## 6. Incremental DNS Updates (No Restarts)
