@@ -83,8 +83,10 @@ def test_name_wins_over_code_when_both_present() -> None:
     }
 
 
-def test_unknown_code_falls_back_to_option_n() -> None:
-    assert _normalize_options([{"code": 252, "value": "x"}]) == {"option-252": "x"}
+def test_unknown_code_falls_back_to_a_raw_code_key() -> None:
+    # #1228 — was ``option-252``, a name no renderer knows. ``code:NN`` is the
+    # spelling the renderer emits, and the one the option check can judge.
+    assert _normalize_options([{"code": 252, "value": "x"}]) == {"code:252": "x"}
 
 
 def test_entry_with_neither_name_nor_code_is_skipped() -> None:

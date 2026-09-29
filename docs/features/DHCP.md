@@ -90,8 +90,7 @@ DHCPScope
     "domain-search": ["internal.example.com", "example.com"],
     "tftp-server-name": "10.0.0.10",   -- for PXE
     "bootfile-name": "pxelinux.0",
-    "vendor-class-identifier": "...",
-    custom_options: { "176": "..." }   -- vendor-specific options by code
+    "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
   ddns_enabled: bool
   ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
@@ -102,6 +101,43 @@ DHCPScope
   ra_other_flag: bool                -- intended RA O-flag (router-side intent)
   last_pushed_at: timestamp
 ```
+
+#### Which options are accepted (#1228)
+
+Every options map is checked when saved. That covers scope options, pool
+and reservation `options_override`, option templates, client classes and
+device policies. A write Kea could not load is a `422` naming the option.
+The check exists because one bad value makes Kea reject the **whole**
+config for the server group, not just that option. A name the renderer
+does not know was silently dropped by the agent.
+
+| Key | Value |
+|---|---|
+| `routers`, `dns-servers`, `ntp-servers`, `tftp-server-address` | IPv4 addresses, as a list or a comma-separated string |
+| `broadcast-address` | one IPv4 address |
+| `domain-name` / `domain-search` | an FQDN / a list of FQDNs |
+| `tftp-server-name`, `bootfile-name` | a non-blank string with no control characters |
+| `mtu` | an integer from 68 to 65535 |
+| `time-offset` | a signed 32-bit integer |
+| `code:NN` | a raw DHCPv4 code, for the codes SpatiumDDI ships an `option-def` for: 43, 123, 132, 150, 160, 161, 176 and 242. Binary codes (43, 123) take plain even-length hex, with no `0x` and no `:` separators. Kea rejects both forms |
+| `opt-NN` | the Windows importer's spelling. Only the Windows driver reads it, so only the code range is checked |
+
+DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
+`domain-search` and `bootfile-name`. They refuse options with no DHCPv6
+equivalent and all raw codes. A client class renders into both the
+DHCPv4 and the DHCPv6 config, so it accepts a name either family knows.
+Raw `option_data` is refused: it is for internal producers such as the
+E911 location options (#972).
+
+`domain-name-servers`, `interface-mtu` and `boot-file-name` are stored as
+their canonical names. The custom-options editor sends a catalogue name
+(`vendor-encapsulated-options`) with its code. It is stored as `code:43`,
+the form that can be delivered, and read back under code 43.
+
+**Existing rows are not re-checked** unless a write changes the option,
+so a scope saved before this check stays editable. Applying an option
+template checks the merged result against the scope's address family.
+The value rules were measured against `kea-dhcp4 -t` (Kea 3.0.3).
 
 #### Dynamic-lease DNS drift (`dns_track_dynamic_leases`)
 

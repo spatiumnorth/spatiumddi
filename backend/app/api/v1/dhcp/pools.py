@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
     compute_pool_occupancy_batch,
@@ -213,6 +215,9 @@ async def create_pool(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    if body.options_override:
+        body.options_override = normalize_options(body.options_override)
+        validate_dhcp_options(body.options_override, address_family=scope.address_family or "ipv4")
 
     if body.pool_type == "pd":
         # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
@@ -296,11 +301,18 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         if overlap:
             raise HTTPException(status_code=409, detail=overlap)
     changes = body.model_dump(exclude_none=True)
+    scope = await db.get(DHCPScope, pool.scope_id)
+    if changes.get("options_override"):
+        changes["options_override"] = normalize_options(changes["options_override"])
+        validate_dhcp_options(
+            changes["options_override"],
+            address_family=(scope.address_family if scope else None) or "ipv4",
+            previous=pool.options_override or {},
+        )
     for k, v in changes.items():
         setattr(pool, k, v)
     await db.flush()
     await push_pool_change(db, pool, action="update", prev_start=prev_start, prev_end=prev_end)
-    scope = await db.get(DHCPScope, pool.scope_id)
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
