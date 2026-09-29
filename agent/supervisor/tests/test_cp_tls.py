@@ -179,6 +179,7 @@ class SwappableServer:
         certfile.write_text(cert.pem)
         keyfile.write_text(cert.key_pem)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile, keyfile)
         self._ctx = ctx
 
@@ -188,6 +189,7 @@ class SwappableServer:
 
     def current_pem(self) -> str:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with socket.create_connection(("127.0.0.1", self.httpd.server_address[1])) as raw:
@@ -210,7 +212,7 @@ def server(tmp_path: Path) -> Iterator[SwappableServer]:
 def _reset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SPATIUM_INSECURE_SKIP_TLS_VERIFY", raising=False)
     monkeypatch.setattr(cp_tls, "_redirects", {})
-    monkeypatch.setattr(cp_tls, "_vouch_checked", False)
+    monkeypatch.setattr(cp_tls, "_state", {"vouch_checked": False, "skip_warned": False})
 
 
 def _state(tmp_path: Path) -> Path:
@@ -314,7 +316,9 @@ def test_an_http_url_is_sent_to_its_https_target_not_over_http(
         def _redirect(self) -> None:
             seen.append(f"{self.command} {self.path}")
             self.send_response(301)
-            self.send_header("Location", server.url + self.path)
+            # A fixed target: the only request this server should ever see
+            # is the bare probe of "/".
+            self.send_header("Location", server.url + "/")
             self.end_headers()
 
         do_GET = do_POST = _redirect  # noqa: N815

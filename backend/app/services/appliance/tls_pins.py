@@ -55,7 +55,8 @@ _PSS = padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32)
 # the very next request. Only a change to the Secret alone (#1215) waits out
 # the TTL.
 _CACHE_TTL_S = 30.0
-_cache: tuple[float, tuple[str, frozenset[str]], dict[str, str]] | None = None
+# (built_at, key, signed list); a dict entry rather than a rebound global.
+_cache: dict[str, tuple[float, tuple[str, frozenset[str]], dict[str, str]]] = {}
 
 
 def cert_sha256(cert_pem: str) -> str:
@@ -115,14 +116,14 @@ async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
     """The served-certificate list, signed by the appliance CA, or None when
     there is no CA yet (nothing has been approved, so no supervisor holds a
     CA to verify with)."""
-    global _cache
     ca = await db.get(ApplianceCA, 1)
     if ca is None:
         return None
     rows = await _active_row_fingerprints(db)
     key = (ca.cert_pem, frozenset(rows))
-    if _cache is not None and _cache[1] == key and time.monotonic() - _cache[0] < _CACHE_TTL_S:
-        return _cache[2]
+    hit = _cache.get("pin_set")
+    if hit is not None and hit[1] == key and time.monotonic() - hit[0] < _CACHE_TTL_S:
+        return hit[2]
     deployed = await _deployed_fingerprint()
     if deployed is not None:
         rows.add(deployed)
@@ -143,12 +144,11 @@ async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
         "algorithm": PIN_SET_ALGORITHM,
         "ca_cert_sha256": hashlib.sha256(ca_der).hexdigest(),
     }
-    _cache = (time.monotonic(), key, signed)
+    _cache["pin_set"] = (time.monotonic(), key, signed)
     return signed
 
 
 def clear_cache() -> None:
     """Forget the cached list (tests). Activation needs no call: the cache is
     keyed on the active rows, so a newly activated certificate misses it."""
-    global _cache
-    _cache = None
+    _cache.clear()

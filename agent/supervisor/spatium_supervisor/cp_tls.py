@@ -81,8 +81,10 @@ _lock = threading.Lock()
 # ``http://`` URL -> the ``https://`` it redirects to (or None: it does not).
 _redirects: dict[str, str | None] = {}
 # Whether the first-contact pin has been checked against the CA this process.
-_vouch_checked = False
-_skip_warned = False
+# Per-process flags, in a mutable holder rather than ``global`` rebinding:
+# whether the first-contact pin has been checked against the CA, and whether
+# the skip-verify warning has been logged.
+_state = {"vouch_checked": False, "skip_warned": False}
 
 
 class PinSetError(Exception):
@@ -145,6 +147,7 @@ def pinned_context(pem: str) -> ssl.SSLContext:
     operator may well have typed an IP the certificate does not name.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(cadata=pem)
@@ -158,6 +161,7 @@ def presented_leaf_pem(url: str, timeout: float = _CONNECT_TIMEOUT_S) -> str:
     host = parts.hostname or ""
     port = parts.port or 443
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
@@ -237,11 +241,10 @@ def client(
     the wire in cleartext before the 301, and httpx would also turn the
     redirected POST into a GET.
     """
-    global _skip_warned
     kwargs.setdefault("follow_redirects", True)
     if skip_verify():
-        if not _skip_warned:
-            _skip_warned = True
+        if not _state["skip_warned"]:
+            _state["skip_warned"] = True
             log.warning(
                 "supervisor.tls_verify_disabled",
                 reason="SPATIUM_INSECURE_SKIP_TLS_VERIFY=1",
@@ -456,8 +459,7 @@ def check_pin_vouched_once(state_dir: Path, url: str) -> None:
     """Once per process, after approval: is the first-contact pin one the CA
     vouches for? Catches an interception that was present at pairing (unless
     it also replaced the CA). Retried on a transient failure."""
-    global _vouch_checked
-    if _vouch_checked or skip_verify():
+    if _state["vouch_checked"] or skip_verify():
         return
     target = tls_url(url)
     pins = load_pins(state_dir)
@@ -469,10 +471,10 @@ def check_pin_vouched_once(state_dir: Path, url: str) -> None:
     except (httpx.HTTPError, PinSetUnavailable):
         return  # transient: try again next loop
     except PinSetError as exc:
-        _vouch_checked = True
+        _state["vouch_checked"] = True
         log.error("supervisor.tls.pin_unverifiable", reason=str(exc))
         return
-    _vouch_checked = True
+    _state["vouch_checked"] = True
     pinned = _pinned_fingerprints(pins)
     if pinned & vouched:
         log.info(
