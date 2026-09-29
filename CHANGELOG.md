@@ -223,6 +223,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting one of two identical DNS records no longer takes the
+  record off the server (#1230).** Nothing stopped a record being stored
+  twice: `POST …/records` did no duplicate check, so an Ansible retry, a
+  flaky network or a double click made a second identical row. Every
+  record op carries the whole RRset the server should end up with
+  (#773), and a delete dropped the deleted record's *value* from it,
+  taking the twin's copy too. The server stopped answering for a
+  record the zone, and the UI, still listed. Two fixes:
+  - A delete now drops the deleted *row*, named in the op payload as
+    `record_id`, so an identical row that stays keeps the value on the
+    wire. This covers twins that already exist, with no data migration,
+    on every delete path that has the row (single, bulk, trash purge,
+    IPAM sync) and on agent and agentless drivers alike. The wire never
+    carries the same RR twice.
+  - Creating or editing a record into an identical one (same view,
+    owner name case-insensitively, type, value and priority / weight /
+    port; TTL is the RRset's) is a `409` naming the existing record.
+    Bulk create skips it as `identical record already exists`, which
+    also makes re-submitting a batch idempotent. The Copilot's
+    `create_dns_record` refuses it. A record in the trash does not
+    count.
+
 - **A slot upgrade survives its image download being cut short
   (#1216).** The runner read the image until the connection stopped
   sending and never compared the bytes with `Content-Length`. So a
