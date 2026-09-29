@@ -205,14 +205,13 @@ async def get_current_user(
             detail="Invalid or expired token",
         )
 
-    # Issue #72 — session viewer / force-logout. Tokens minted after
-    # the session-viewer landing carry a ``jti`` claim that maps to a
-    # ``UserSession`` row. We reject if that row is revoked or expired,
-    # which is the force-logout effect: the superadmin flips
-    # ``revoked``, every in-flight access token using that jti starts
-    # 401-ing on the next request. Tokens without a ``jti`` (legacy or
-    # in-flight at deploy time) are allowed through — they expire on
-    # their own short TTL.
+    # Issue #72 — session viewer / force-logout. Every access token carries
+    # a ``jti`` claim that maps to a ``UserSession`` row. We reject if that
+    # row is revoked or expired, which is the force-logout effect: the
+    # superadmin flips ``revoked``, every in-flight access token using that
+    # jti starts 401-ing on the next request. A token with no ``jti`` has
+    # already been refused by ``decode_access_token`` (#1222); the test
+    # suite alone lets one through.
     jti = payload.get("jti")
     if jti is not None:
         session = await db.get(UserSession, jti)

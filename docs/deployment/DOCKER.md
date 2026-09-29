@@ -38,7 +38,7 @@ cd spatiumddi
 cp .env.example .env
 
 # Edit .env — at minimum change POSTGRES_PASSWORD and SECRET_KEY
-# SECRET_KEY: openssl rand -hex 32
+# SECRET_KEY: openssl rand -hex 32  (the api refuses to boot without a real one)
 nano .env
 
 # Build images
@@ -65,7 +65,9 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | Variable | Default | Description |
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
-| `SECRET_KEY` | (none) | JWT signing key — **must change** (use `openssl rand -hex 32`) |
+| `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything containing `change` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
+| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
+| `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
 | `API_PORT` | `8000` | Host port for the API (set to `127.0.0.1:8000:8000` to restrict to localhost) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
@@ -211,6 +213,30 @@ docker compose up -d --force-recreate api worker beat frontend
 ```
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
+
+### Rotating `SECRET_KEY`
+
+Needed when an install has been running on the `.env.example` placeholder or another weak key: from #1222 the api refuses to start on one, and an upgrade stops there with an error pointing here. It is also how you rotate a key you suspect has leaked.
+
+`SECRET_KEY` does two jobs. It signs session tokens, which simply stop verifying, so everyone signs in again. And unless `CREDENTIAL_ENCRYPTION_KEY` is set, it is the source of the key every stored credential is encrypted with (LDAP binds, integration tokens, AI provider keys, TSIG secrets, backup-target passwords). Those have to be re-encrypted for the new key before the api uses them, or they all become unreadable:
+
+```bash
+docker compose stop api worker beat
+
+# Keep the key being replaced, then put a new one in .env.
+OLD_SECRET_KEY="$(grep '^SECRET_KEY=' .env | cut -d= -f2-)"
+sed -i "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" .env
+
+# Re-encrypt every stored credential from the old key to the new one.
+docker compose run --rm -e OLD_SECRET_KEY="$OLD_SECRET_KEY" api \
+  python -m app.core.rotate_secret_key
+
+docker compose up -d api worker beat
+```
+
+The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If you are changing `CREDENTIAL_ENCRYPTION_KEY` at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY`. If it is set and unchanged, stored credentials never depended on `SECRET_KEY` and the command says there is nothing to do.
+
+If the install ran on a **placeholder** key, anyone who knew it could sign requests as any user. After rotating, review **Admin → API tokens** and the users and superadmins list, and check the audit log for changes you do not recognise: a token or account created with a forged session survives the rotation.
 
 ---
 

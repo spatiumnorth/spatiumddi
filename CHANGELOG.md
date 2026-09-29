@@ -1315,6 +1315,42 @@ the formatter handles the rest.
 
 ### Security
 
+- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
+  `SECRET_KEY` signs every session token and, unless
+  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
+  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
+  both shipped a committed placeholder, and the boot check only warned (and
+  did not recognise the k8s one at all). On such an install any signed-in
+  user could mint a superadmin token, since user ids are visible in the
+  audit log, and a database dump decrypted every stored LDAP, integration
+  and AI provider secret. Now the api refuses to start on either
+  placeholder, on a key under 32 characters, or on one that reads like a
+  placeholder, and says how to generate a key and how to move an existing
+  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
+  instead; `docker-compose.dev.yml` sets it and nothing else should.
+  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
+  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
+  falling back to a different key. Helm and the appliance already generate
+  their own keys and are unaffected.
+  **Upgrade note:** an install that has been running on the placeholder
+  stops at boot. Follow "Rotating `SECRET_KEY`" in
+  `docs/deployment/DOCKER.md`: set a new key, then run
+  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
+  starting the api. It re-encrypts every stored credential for the new key
+  (the same walk a cross-install restore uses), is idempotent, and records
+  an audit row; everyone signs in again. Deliberately not "generate a key
+  on first start": compose could only persist it in Postgres, next to the
+  credentials it protects, so a dump would decrypt them anyway. Because
+  anyone could have signed requests on a placeholder key, the doc also
+  says to review API tokens, users and the audit log afterwards.
+  Also: an access token that names no session (`jti`) is refused. Every
+  login has minted one since `2026.05.07-1`, so such a token can only be
+  forged, and it also escaped force-logout. And force-logout now reaches
+  the nmap scan stream, which checked its own token without looking at
+  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
+  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
+  the placeholder.
+
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
   `manage_nmap_scans`, which the builtin Network Editor role holds, and

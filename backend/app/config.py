@@ -3,13 +3,46 @@ import sys
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Sentinel default for ``secret_key``. Production deployments MUST
-# override this via the ``SECRET_KEY`` env var (or ``.env``) — the
-# model validator below emits a loud stderr warning whenever the
-# sentinel is in use, and hard-fails the boot when
-# ``STRICT_SECRET_KEY=true`` is set (recommended for any non-dev
-# deployment).
+# Sentinel default for ``secret_key``. Every deployment MUST override it
+# via the ``SECRET_KEY`` env var (or ``.env``): the model validator below
+# refuses to boot on it, or on any other weak key, unless
+# ``ALLOW_INSECURE_SECRET_KEY=true`` (#1222).
 _SECRET_KEY_DEV_SENTINEL = "change-me-to-a-random-32-char-string"
+
+# Every placeholder this repository has ever shipped for SECRET_KEY. The
+# k8s one is a DIFFERENT string from .env.example's, and so used to get no
+# warning at all (#1222).
+_KNOWN_SECRET_KEY_PLACEHOLDERS = frozenset(
+    {
+        _SECRET_KEY_DEV_SENTINEL,
+        "CHANGEME-generate-with-openssl-rand-hex-32",
+    }
+)
+
+# ``openssl rand -hex 32`` gives 64; 32 is the floor the error asks for.
+_SECRET_KEY_MIN_LENGTH = 32
+
+
+def secret_key_problem(key: str) -> str | None:
+    """Why ``key`` must not sign tokens, or None if it may.
+
+    SECRET_KEY signs every session JWT and, unless
+    ``CREDENTIAL_ENCRYPTION_KEY`` is set, derives the Fernet key for every
+    stored credential. On a known key, any logged-in user can mint a
+    superadmin token (user ids are visible in the audit log), and a
+    database dump decrypts every stored LDAP / integration / AI secret.
+    """
+    if key in _KNOWN_SECRET_KEY_PLACEHOLDERS:
+        return "it is a placeholder committed to the SpatiumDDI repository"
+    # "change" plus a separator: every placeholder reads like one
+    # ("change-me-...", "CHANGEME-generate-..."), and neither generator a
+    # deployment uses can produce it. `openssl rand -hex` cannot spell
+    # "change" at all, and Helm's randAlphaNum emits no separators.
+    if "change" in key.lower() and not key.isalnum():
+        return "it looks like a placeholder (it contains 'change')"
+    if len(key) < _SECRET_KEY_MIN_LENGTH:
+        return f"it is shorter than {_SECRET_KEY_MIN_LENGTH} characters"
+    return None
 
 
 class Settings(BaseSettings):
@@ -168,22 +201,25 @@ class Settings(BaseSettings):
     # so forks can point their update check at their own repo.
     github_repo: str = "spatiumnorth/spatiumddi"
 
-    # When ``True`` (recommended for any non-dev deployment), the boot
-    # fails fast if ``SECRET_KEY`` is still set to the .env.example
-    # sentinel. Default ``False`` so a fresh ``cp .env.example .env``
-    # first-time setup boots and the operator can log in to fix it,
-    # but every boot with the sentinel still emits a loud stderr
-    # warning regardless of this flag. See #216.
+    # Boot on a placeholder or weak SECRET_KEY (see ``secret_key_problem``)
+    # with a warning instead of refusing. For local development only:
+    # docker-compose.dev.yml sets it, nothing else should. #216 chose
+    # warn-by-default; #1222 reversed that, because the warning was the
+    # only thing between a default install and forgeable superadmin tokens.
+    allow_insecure_secret_key: bool = False
+
+    # Deprecated (#1222): refusing a weak SECRET_KEY is now the default.
+    # Still read so an existing ``.env`` carrying it keeps parsing; it has
+    # no effect.
     strict_secret_key: bool = False
 
     # #565 — when ``True``, the Celery worker refuses to process tasks
-    # while the DB schema is behind the bundled Alembic head (mirrors
-    # ``strict_secret_key``'s opt-in shape). Default ``False`` so a
-    # transient mid-rollout window (code up before ``alembic upgrade
-    # head`` finishes) doesn't hard-stop the worker — the schema drift
-    # is logged loudly + raised as an ``AlertEvent`` regardless. Set to
-    # ``True`` in environments where a stale-schema task run is worse
-    # than a deferred one.
+    # while the DB schema is behind the bundled Alembic head. Default
+    # ``False`` so a transient mid-rollout window (code up before
+    # ``alembic upgrade head`` finishes) doesn't hard-stop the worker —
+    # the schema drift is logged loudly + raised as an ``AlertEvent``
+    # regardless. Set to ``True`` in environments where a stale-schema
+    # task run is worse than a deferred one.
     strict_schema_check: bool = False
 
     # #296 Phase B — slot-image mirror config.
@@ -357,30 +393,32 @@ class Settings(BaseSettings):
         return entries or ["*"]
 
     @model_validator(mode="after")
-    def _check_secret_key_default(self) -> "Settings":
-        # The sentinel JWT-signing key in ``.env.example`` MUST NOT
-        # reach a production deploy. Emit a loud warning every boot;
-        # hard-fail when ``STRICT_SECRET_KEY=true`` is set.
-        if self.secret_key == _SECRET_KEY_DEV_SENTINEL:
-            if self.strict_secret_key:
-                raise ValueError(
-                    "SECRET_KEY is still set to the .env.example default and "
-                    "STRICT_SECRET_KEY=true. Generate a real key with "
-                    "`openssl rand -hex 32` and set SECRET_KEY in .env."
-                )
-            # Skip the stderr spam under pytest — Settings() is built at
-            # import time, so the sentinel (which every test DB uses) would
-            # print on every collection. ``pytest`` is always in
-            # sys.modules by the time the app imports during a test run.
-            if "pytest" not in sys.modules:
-                print(
-                    "WARNING: SECRET_KEY is still the .env.example sentinel. "
-                    "Set SECRET_KEY=<openssl rand -hex 32> in .env. "
-                    "Enable STRICT_SECRET_KEY=true in non-dev deployments to "
-                    "make this a hard error.",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    def _check_secret_key(self) -> "Settings":
+        # Refuse to boot on a placeholder or weak SECRET_KEY (#1222).
+        problem = secret_key_problem(self.secret_key)
+        if problem is None:
+            return self
+        if not self.allow_insecure_secret_key:
+            raise ValueError(
+                f"SECRET_KEY is not safe to use: {problem}. It signs every session "
+                "token, so anyone who knows it can sign in as any user. Generate one "
+                "with `openssl rand -hex 32` and set SECRET_KEY. If this install already "
+                "has data, run `python -m app.core.rotate_secret_key` with OLD_SECRET_KEY "
+                "set to the key you are replacing, before starting the api, so stored "
+                "credentials are re-encrypted under the new key "
+                "(docs/deployment/DOCKER.md, 'Rotating SECRET_KEY'). For local development "
+                "only, ALLOW_INSECURE_SECRET_KEY=true boots with a warning instead."
+            )
+        # Skip the stderr spam under pytest — Settings() is built at import
+        # time, so it would print on every collection.
+        if "pytest" not in sys.modules:
+            print(
+                f"WARNING: SECRET_KEY is not safe to use ({problem}); booting anyway "
+                "because ALLOW_INSECURE_SECRET_KEY=true. Never set that outside local "
+                "development.",
+                file=sys.stderr,
+                flush=True,
+            )
         return self
 
 

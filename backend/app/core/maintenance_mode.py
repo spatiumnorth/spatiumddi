@@ -219,8 +219,8 @@ async def _bearer_is_effective_superadmin(token: str, method: str, path: str) ->
                 # Tokens minted after the session-viewer landing carry a ``jti``
                 # claim mapping to a ``UserSession`` row; a force-logged-out
                 # superadmin (``revoked``) whose JWT is still unexpired must NOT
-                # bypass maintenance mode. No-jti legacy tokens pass through (same
-                # treatment as the auth dep) — they expire on their own short TTL.
+                # bypass maintenance mode. A token with no ``jti`` was already
+                # refused by ``decode_access_token`` (#1222).
                 jti = payload.get("jti")
                 if jti is not None:
                     from datetime import UTC  # noqa: PLC0415

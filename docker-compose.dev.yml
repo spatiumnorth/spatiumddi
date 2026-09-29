@@ -79,6 +79,9 @@ services:
       - "${API_PORT:-8000}:8000"
     env_file: .env
     environment:
+      # Dev only: boot on the .env.example placeholder SECRET_KEY with a
+      # warning. docker-compose.yml deliberately does not set this (#1222).
+      ALLOW_INSECURE_SECRET_KEY: "true"
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
@@ -143,6 +146,9 @@ services:
     command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default,bundles
     env_file: .env
     environment:
+      # Dev only: boot on the .env.example placeholder SECRET_KEY with a
+      # warning. docker-compose.yml deliberately does not set this (#1222).
+      ALLOW_INSECURE_SECRET_KEY: "true"
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
@@ -196,6 +202,9 @@ services:
     command: celery -A app.celery_app beat --loglevel=info
     env_file: .env
     environment:
+      # Dev only: boot on the .env.example placeholder SECRET_KEY with a
+      # warning. docker-compose.yml deliberately does not set this (#1222).
+      ALLOW_INSECURE_SECRET_KEY: "true"
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
@@ -236,6 +245,9 @@ services:
     command: alembic upgrade head
     env_file: .env
     environment:
+      # Dev only: boot on the .env.example placeholder SECRET_KEY with a
+      # warning. docker-compose.yml deliberately does not set this (#1222).
+      ALLOW_INSECURE_SECRET_KEY: "true"
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
     depends_on:
       postgres:

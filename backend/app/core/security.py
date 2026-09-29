@@ -49,6 +49,19 @@ def verify_password(plain: str, hashed: str) -> bool:
 # ── JWT ────────────────────────────────────────────────────────────────────────
 
 
+# Every access token has carried a ``jti`` naming its ``UserSession`` since
+# #72 (2026.05.07-1): both places that mint one pass it. So a token without
+# one was not minted by this server. It can only be forged, and a forged
+# token would also escape force-logout, which works by revoking the session
+# the jti names. Such tokens are refused (#1222).
+#
+# The test suite sets this to True: its fixtures mint tokens with no session
+# row, and making every one of them create a session proves nothing a
+# dedicated test does not. It is a module attribute, not a setting, so no
+# environment variable or config file can turn it on.
+ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION = False
+
+
 def create_access_token(
     subject: str,
     extra: dict[str, Any] | None = None,
@@ -57,10 +70,9 @@ def create_access_token(
 ) -> str:
     """Mint an access JWT. ``jti`` ties the token to a ``UserSession``
     row so a superadmin can force-logout an in-flight token by
-    flipping ``UserSession.revoked`` (issue #72). Tokens issued before
-    that landing carry no ``jti``; the auth dep treats those as still
-    valid (legacy compatibility) so existing sessions don't all 401
-    the moment the rolling deploy crosses two API instances."""
+    flipping ``UserSession.revoked`` (issue #72). Every real login passes
+    one; a token minted without it is refused by
+    :func:`decode_access_token` outside the test suite (#1222)."""
     expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "access"}
     if jti is not None:
@@ -82,6 +94,8 @@ def decode_access_token(token: str) -> dict[str, Any]:
     payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
     if payload.get("type") != "access":
         raise JWTError("Not an access token")
+    if payload.get("jti") is None and not ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION:
+        raise JWTError("Access token names no session")
     return payload
 
 

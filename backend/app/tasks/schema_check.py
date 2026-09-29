@@ -22,7 +22,7 @@ This module reuses the framework-agnostic
    where a one-shot startup check would miss a later divergence.
 3. **Opt-in strict mode** — ``STRICT_SCHEMA_CHECK=true`` makes the
    ``task_prerun`` gate ``Reject(requeue=True)`` tasks while the schema
-   is behind (mirrors ``STRICT_SECRET_KEY``). Default off so a
+   is behind. Default off so a
    transient mid-rollout window doesn't hard-stop the worker.
 
 Because the check compares packaged migration files against the DB's
