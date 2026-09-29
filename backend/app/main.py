@@ -18,6 +18,7 @@ from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
+from app.core.request_meta import TrustedProxyMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -910,6 +911,14 @@ def create_app() -> FastAPI:
         TrustedHostMiddleware,
         allowed_hosts=settings.trusted_hosts_list,
     )
+
+    # #1221 — resolve the client address and scheme from X-Real-IP /
+    # X-Forwarded-Proto ONLY when the TCP peer is a trusted proxy. Added after
+    # TrustedHost so it runs outermost: everything below (request id, the
+    # login throttle, audit rows, the refresh cookie's Secure flag) sees the
+    # resolved values. uvicorn runs with --no-proxy-headers for this to see
+    # the real peer (backend/Dockerfile).
+    app.add_middleware(TrustedProxyMiddleware, trusted=settings.trusted_proxy_networks)
 
     # Routes
     app.include_router(health_router)

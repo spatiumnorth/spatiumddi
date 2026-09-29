@@ -1315,6 +1315,27 @@ the formatter handles the rest.
 
 ### Security
 
+- **A client can no longer choose the source IP the API records
+  and rate-limits (#1221).** Compose published the API on every
+  interface, and the API believed `X-Real-IP` from any caller. nginx
+  overwrites that header, but a client talking to `:8000` directly set
+  its own. That bypassed the per-IP login throttle and the ACME
+  `allowfrom` gate, and wrote any address it liked into audit rows,
+  reopening #626 by another path. Now uvicorn runs with
+  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
+  `X-Forwarded-Proto` only when the real TCP peer is in the new
+  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
+  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
+  longer read at all. Compose also publishes the API on `127.0.0.1`
+  only (`API_BIND`). Browsers and remote agents already go through
+  the frontend, and the looking-glass collector's host networking
+  uses localhost. **Upgrade note:** if you reach `:8000` from another
+  machine, set `API_BIND=0.0.0.0`, and preferably narrow
+  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
+  whose nodes have public addresses, add them to
+  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
+  browser, as the client.
+
 - **Pinned images brought current; the CloudNativePG operator and
   Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
   the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG

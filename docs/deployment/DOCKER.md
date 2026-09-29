@@ -19,7 +19,7 @@
 |---|---|---|---|
 | 8077 | Frontend (nginx) | HTTP | Host-published default; configurable via `HTTP_PORT` env var (container listens on 80) |
 | 443 | Frontend (nginx) | HTTPS | When TLS is configured (see §5) |
-| 8000 | API (uvicorn) | HTTP | Configurable via `API_PORT` env var; internal only in production |
+| 8000 | API (uvicorn) | HTTP | Published on `127.0.0.1` only by default (`API_BIND`, `API_PORT`); browsers and remote agents use the frontend |
 | 5432 | PostgreSQL | TCP | Internal only — never expose externally |
 | 6379 | Redis | TCP | Internal only — never expose externally |
 
@@ -67,7 +67,9 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
 | `SECRET_KEY` | (none) | JWT signing key — **must change** (use `openssl rand -hex 32`) |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
-| `API_PORT` | `8000` | Host port for the API (set to `127.0.0.1:8000:8000` to restrict to localhost) |
+| `API_PORT` | `8000` | Host port for the API |
+| `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
+| `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |

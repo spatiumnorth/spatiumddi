@@ -76,7 +76,12 @@ services:
     networks:
       - spatiumddi
     ports:
-      - "${API_PORT:-8000}:8000"
+      # Localhost only by default (#1221): the api believes X-Real-IP from
+      # private-range peers, so a LAN client reaching it directly could set
+      # its own IP. Browsers and remote agents go through the frontend;
+      # host-network services here (looking-glass) use 127.0.0.1. See
+      # API_BIND in .env.example before widening it.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi

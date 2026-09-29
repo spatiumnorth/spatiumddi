@@ -218,10 +218,11 @@ class PasswordPolicyResponse(BaseModel):
 
 def _client_ip(request: Request) -> str | None:
     # Auth-surface source IP: the per-IP login throttle (#4) gates on this,
-    # and it also lands in the login audit rows + ``last_login_ip``. Use the
-    # spoofing-resistant value (X-Real-IP, not the forgeable
-    # X-Forwarded-For-derived peer) so neither the throttle nor the audit
-    # trail can be evaded / poisoned by a client-supplied header (#626).
+    # and it also lands in the login audit rows + ``last_login_ip``. The
+    # spoofing-resistant value: X-Real-IP only from a trusted proxy peer,
+    # otherwise the TCP peer itself (#626, #1221), so neither the throttle
+    # nor the audit trail can be evaded or poisoned by a client-supplied
+    # header.
     return get_trusted_client_ip(request)
 
 
