@@ -459,10 +459,13 @@ class Settings(BaseSettings):
         # Skip the stderr spam under pytest — Settings() is built at import
         # time, so it would print on every collection.
         if "pytest" not in sys.modules:
+            # The reason is left out on purpose: it is derived from the key,
+            # and CodeQL rightly treats anything derived from a secret as
+            # sensitive in a log line. The refusal above carries it.
             print(
-                f"WARNING: SECRET_KEY is not safe to use ({weakness}); booting anyway "
-                "because ALLOW_INSECURE_SECRET_KEY=true. Never set that outside local "
-                "development.",
+                "WARNING: SECRET_KEY is a placeholder or too weak to sign tokens; "
+                "booting anyway because ALLOW_INSECURE_SECRET_KEY=true. Never set "
+                "that outside local development.",
                 file=sys.stderr,
                 flush=True,
             )

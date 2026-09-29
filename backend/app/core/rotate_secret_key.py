@@ -74,11 +74,12 @@ async def _audit(outcome: RewrapOutcome) -> None:
 
 async def rotate(old_secret_key: str, old_credential_key: str) -> int:
     """Re-encrypt stored credentials for the new key. Returns an exit code."""
-    weakness = signing_key_weakness(settings.secret_key)
-    if weakness is not None:
+    if signing_key_weakness(settings.secret_key) is not None:
+        # No reason in the message: it is derived from the key, and a line
+        # printed from a secret is one CodeQL flags. The boot refusal names it.
         print(
-            f"SECRET_KEY (the NEW key) is not safe to use: {weakness}. "
-            "Set it to `openssl rand -hex 32` first.",
+            "SECRET_KEY (the NEW key) is a placeholder, under 32 characters, or "
+            "reads like a placeholder. Set it to `openssl rand -hex 32` first.",
             file=sys.stderr,
         )
         return 2
