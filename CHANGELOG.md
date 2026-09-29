@@ -223,6 +223,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot upgrade survives its image download being cut short
+  (#1216).** The runner read the image until the connection stopped
+  sending and never compared the bytes with `Content-Length`. So a
+  download cut mid-transfer left a partial image, and the apply failed
+  as "checksum mismatch", which reads as a corrupt image. A rolling
+  cluster upgrade can cut it: the frontend pod that serves a node its
+  image is replaced mid-download (#1215). The runner now counts the
+  bytes. A short, dropped or stalled transfer, and an HTTP 408, 429 or
+  5xx answer, gets up to five attempts, with backoff of 5, 10, 20 and
+  40 s, and a retry resumes with `Range` where the server allows it. A
+  4xx answer, a certificate the node cannot verify and a full disk fail
+  at once. A download that never completes fails with its own message:
+  the image download was interrupted, nothing was written to the
+  inactive slot, and the upgrade can be retried.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
