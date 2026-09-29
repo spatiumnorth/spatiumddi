@@ -26,9 +26,10 @@ for as long as it has existed:
 
 Neither failure announces itself: the build is green, the image is published,
 and the only symptom is a Trivy report weeks later blaming packages nobody
-touched. So this asserts both, over the SAME image list the nightly matrix
-builds from — a new image is covered the moment it is added there, rather
-than when somebody remembers to add it here.
+touched. So this asserts both, over the SAME image list the nightly and
+release matrices build from (``.github/images.json``) — a new image is
+covered the moment it is added there, rather than when somebody remembers to
+add it here.
 
 stdlib-only, no network, no docker. Exit 1 on any finding.
 """
@@ -41,14 +42,8 @@ import re
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-NIGHTLY = REPO_ROOT / ".github" / "workflows" / "nightly.yml"
-
-# The nightly's images list is a heredoc of JSON inside the gate step — one
-# source of truth for which images exist (see the comment above it there).
-# Parsed rather than duplicated, so this linter cannot fall behind the matrix.
-_IMAGES_BLOCK = re.compile(
-    r"cat > /tmp/images\.json <<'IMAGES_EOF'\n(.*?)\n\s*IMAGES_EOF", re.DOTALL
-)
+# The one list of shipped images, read by nightly.yml and release.yml too.
+IMAGES = REPO_ROOT / ".github" / "images.json"
 
 # A package-manager upgrade of everything already installed. `apt-get upgrade`
 # and `apt-get dist-upgrade` both qualify; `apt-get install` deliberately does
@@ -123,15 +118,17 @@ def _shipped_body(body: str, target: str) -> str:
 
 
 def _images() -> list[dict[str, str]]:
-    match = _IMAGES_BLOCK.search(NIGHTLY.read_text())
-    if not match:
+    try:
+        images = json.loads(IMAGES.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{IMAGES}: cannot read the image list ({exc})") from exc
+    # An empty list would make every check below vacuous and print success.
+    if not isinstance(images, list) or not images:
         raise SystemExit(
-            f"{NIGHTLY}: could not find the images.json heredoc — if the gate step was "
-            "restructured, update this linter rather than letting it silently check nothing"
+            f"{IMAGES}: expected a non-empty JSON list of images — a linter that checks "
+            "nothing must not report success"
         )
-    # The heredoc body is indented inside the YAML block scalar.
-    body = "\n".join(line.strip() for line in match.group(1).splitlines())
-    return json.loads(body)
+    return images
 
 
 def _strip_trailing_comment(line: str) -> str:
@@ -181,7 +178,7 @@ def main() -> int:
         rel = image["file"].lstrip("./")
         path = REPO_ROOT / rel
         if not path.is_file():
-            findings.append(f"{rel}: listed in the nightly matrix but not on disk")
+            findings.append(f"{rel}: listed in .github/images.json but not on disk")
             continue
 
         try:

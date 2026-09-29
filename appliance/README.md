@@ -206,7 +206,7 @@ NotFound: content digest sha256:… : not found
 `BAKE_SAVE_PLATFORM` (which the cross target sets) adds
 `docker save --platform` and an unconditional `docker pull --platform` for
 third-party images. That second half matters as much as the first: on a
-dev laptop `redis:8.10.1-alpine` and `nginx:…` are usually already present
+dev laptop `redis:8.10.2-alpine` and `nginx:…` are usually already present
 **as arm64** from the dev compose stack, they satisfy
 `docker image inspect`, and without the pin they would be baked silently —
 the appliance's Redis then crash-loops with `exec format error`.

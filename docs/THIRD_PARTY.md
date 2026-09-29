@@ -67,11 +67,11 @@ to their control channels, it does not link against them.
 
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
-| [ISC BIND 9](https://www.isc.org/bind/) | `>= 9.20.26` (Alpine) | MPL 2.0 | DNS agent image | `agent/dns/images/bind9/Dockerfile` |
-| [PowerDNS Authoritative Server](https://www.powerdns.com/) | Alpine `pdns` | GPL v2 | DNS agent image | `agent/dns/images/powerdns/Dockerfile` |
+| [ISC BIND 9](https://www.isc.org/bind/) | `>= 9.20.29-r0` (Alpine) | MPL 2.0 | DNS agent image | `agent/dns/images/bind9/Dockerfile` |
+| [PowerDNS Authoritative Server](https://www.powerdns.com/) | `>= 5.0.7-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/powerdns/Dockerfile` |
 | [Technitium DNS Server](https://technitium.com/dns/) | 15.4.0 (digest-pinned) | GPL v3 | DNS agent image | `agent/dns/images/technitium/Dockerfile` |
-| [PowerDNS dnsdist](https://dnsdist.org/) | Alpine `dnsdist` | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
-| [ISC Kea DHCP](https://www.isc.org/kea/) | Alpine `kea`, v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
+| [PowerDNS dnsdist](https://dnsdist.org/) | `>= 2.0.8-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
+| [ISC Kea DHCP](https://www.isc.org/kea/) | `>= 3.0.3-r0` (Alpine), v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [radvd](https://radvd.litech.org/) | Alpine `radvd` | BSD-style | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [GoBGP](https://github.com/osrg/gobgp) | 4.9.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
 | [BIND `dig` / `nsupdate`](https://www.isc.org/bind/) | `bind-tools` | MPL 2.0 | DNS + supervisor + API images | several Dockerfiles |
@@ -103,7 +103,7 @@ Notes worth carrying:
 | [metrics-server](https://github.com/kubernetes-sigs/metrics-server) | in k3s bundle, **disabled** | Apache 2.0 | Appliance OS | `config.yaml` `disable:` list |
 | [MetalLB](https://metallb.io/) | chart + images 0.15.3 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb/Chart.yaml` |
 | [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
-| [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.0 (operator 1.30.0) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
+| [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.1 (operator 1.30.1) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Bare-metal HA overlay | `k8s/ha/` |
 | [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Patroni HA overlay | `k8s/ha/` |
 
@@ -128,14 +128,14 @@ assume from their presence:
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
 | [PostgreSQL](https://www.postgresql.org/) | 16-alpine | PostgreSQL License | Compose + Helm chart | `docker-compose.yml` |
-| [Redis](https://redis.io/) | 8.10.1-alpine | RSALv2 / SSPLv1 / AGPLv3 (Redis 8+) | Compose + Helm chart | `docker-compose.yml` |
+| [Redis](https://redis.io/) | 8.10.2-alpine | RSALv2 / SSPLv1 / AGPLv3 (Redis 8+) | Compose + Helm chart | `docker-compose.yml` |
 | [Prometheus node-exporter](https://github.com/prometheus/node_exporter) | v1.12.1, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
 | [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) | v2.20.0, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
 | [prometheus-client](https://github.com/prometheus/client_python) | see manifest | Apache 2.0 AND BSD 2-Clause | API image | `backend/pyproject.toml` |
 
 **On Redis's license:** Redis relicensed away from BSD at 7.4 (RSALv2 + SSPLv1)
 and added an AGPLv3 option at 8.0. SpatiumDDI ships the stock upstream
-`redis:8.10.1-alpine` image unmodified and talks to it as a network service over
+`redis:8.10.2-alpine` image unmodified and talks to it as a network service over
 its own protocol — no Redis code is linked into or vendored by SpatiumDDI.
 
 Operators who would rather not run that license family can point the deployment
@@ -326,7 +326,7 @@ Apache license covers it.
 | [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.4.0 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
-| [nginx](https://nginx.org/) | 1.31.5-alpine | BSD 2-Clause | Frontend runtime |
+| [nginx](https://nginx.org/) | 1.31.6-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |
 | [tini](https://github.com/krallin/tini) | Alpine/Debian pkg | MIT | PID 1 in every agent image |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |

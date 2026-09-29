@@ -20,7 +20,7 @@ FROM alpine:3.24 AS runtime
 ARG APK_SNAPSHOT=dev
 RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
     && apk upgrade --no-cache \
-    && apk add --no-cache dnsdist libcap bash tini \
+    && apk add --no-cache 'dnsdist>=2.0.8-r0' libcap bash tini \
     # uid/gid PINNED (#50) — must match the powerdns image, whose agent
     # writes the DoT/DoH listener key at mode 0600 into the volume this
     # container mounts read-only. See the matching note there.

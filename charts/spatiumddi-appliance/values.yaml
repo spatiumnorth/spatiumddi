@@ -450,7 +450,7 @@ agentLanding:
   priorityClassName: ""
   image:
     repository: nginx
-    tag: 1.31.5-alpine
+    tag: 1.31.6-alpine
   # #965 — token request so no pod in this chart is BestEffort (the CI
   # render check refuses one). A static nginx page needs nothing more.
   resources:

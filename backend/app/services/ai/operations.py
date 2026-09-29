@@ -394,7 +394,10 @@ class RunNmapScanArgs(BaseModel):
     extra_args: str | None = Field(
         default=None,
         description=(
-            "Optional extra nmap flags. Validated server-side — " "dangerous flags are rejected."
+            "Optional extra nmap flags, checked against an allowlist: scan "
+            "type, host discovery, ports, timing, service / OS detection, and "
+            "--script with named non-intrusive scripts (no categories). "
+            "Options that read or write files, add targets, or spoof are refused."
         ),
     )
 

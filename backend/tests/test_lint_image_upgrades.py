@@ -13,7 +13,8 @@ or a way the linter could have looked like it passed while checking nothing:
     comments merely describe an upgrade it does not perform;
   * an ``ARG`` never referenced in the RUN text does not change that text, so
     it changes no cache key and busts nothing;
-  * and if the nightly's images heredoc is ever restructured, the linter must
+  * and if the image list (``.github/images.json``, shared by the nightly and
+    the release since #1226) is ever emptied or unreadable, the linter must
     say so rather than find zero images and report success — the failure mode
     this whole class of guard keeps producing.
 """
@@ -35,17 +36,7 @@ pytestmark = pytest.mark.skipif(
     reason="image-upgrade linter not present in this checkout",
 )
 
-_NIGHTLY_TEMPLATE = """\
-jobs:
-  gate:
-    steps:
-      - run: |
-          cat > /tmp/images.json <<'IMAGES_EOF'
-          [
-            {"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}
-          ]
-          IMAGES_EOF
-"""
+_IMAGES = '[{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}]'
 
 _GOOD_DOCKERFILE = """\
 FROM alpine:3.24 AS runtime
@@ -70,14 +61,14 @@ def _run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     dockerfile: str | None,
-    nightly: str = _NIGHTLY_TEMPLATE,
+    images: str = _IMAGES,
 ) -> int:
-    (tmp_path / ".github" / "workflows").mkdir(parents=True)
-    (tmp_path / ".github" / "workflows" / "nightly.yml").write_text(nightly)
+    (tmp_path / ".github").mkdir(parents=True)
+    (tmp_path / ".github" / "images.json").write_text(images)
     if dockerfile is not None:
         (tmp_path / "Dockerfile").write_text(dockerfile)
     monkeypatch.setattr(lint, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(lint, "NIGHTLY", tmp_path / ".github" / "workflows" / "nightly.yml")
+    monkeypatch.setattr(lint, "IMAGES", tmp_path / ".github" / "images.json")
     return lint.main()
 
 
@@ -224,25 +215,21 @@ def test_an_image_missing_from_disk_is_reported(
     assert _run(lint, monkeypatch, tmp_path, None) == 1
 
 
-def test_a_restructured_heredoc_raises_rather_than_passing(
-    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize("images", ["[]", "{}", "not json"])
+def test_an_empty_or_unreadable_image_list_raises_rather_than_passing(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, images: str
 ) -> None:
     """Finding zero images must not read as success. A guard that evaluates
     nothing looks exactly like one that passed — which is the failure this
     repo keeps rediscovering (#1030 most recently)."""
     with pytest.raises(SystemExit):
-        _run(
-            lint,
-            monkeypatch,
-            tmp_path,
-            _GOOD_DOCKERFILE,
-            nightly="jobs:\n  gate:\n    steps:\n      - run: echo no heredoc here\n",
-        )
+        _run(lint, monkeypatch, tmp_path, _GOOD_DOCKERFILE, images=images)
 
 
 def test_the_real_tree_passes(lint: types.ModuleType) -> None:
-    """The linter against the repo it ships in — every image the nightly
-    builds. Skipped in the dev container, which copies only backend/."""
-    if not (_REPO_ROOT / ".github" / "workflows" / "nightly.yml").is_file():
+    """The linter against the repo it ships in — every image the nightly and
+    the release build. Skipped in the dev container, which copies only
+    backend/."""
+    if not (_REPO_ROOT / ".github" / "images.json").is_file():
         pytest.skip("full checkout not present in this image")
     assert lint.main() == 0

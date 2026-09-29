@@ -1,4 +1,4 @@
-# Publish docs/ to the org-root Pages site on every release tag.
+# Publish docs/ to the org-root Pages site on every push to main.
 #
 # The documentation is served from TWO GitHub Pages sites:
 #
@@ -36,16 +36,15 @@ on:
     # Every main push, so the published site is never staler than the branch.
     branches:
       - main
-    # Release tags too. Redundant in the common case (the tagged commit was
-    # already published when it landed on main) but it makes a release
-    # deterministically republish, and the job no-ops when nothing changed.
-    tags:
-      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*" # e.g. 2026.04.13-1
-    # NOTE: deliberately no `paths:` filter. A paths filter applies to tag
-    # pushes as well, and a tag push carries no changed-file list, so the
-    # filter would never match and releases would silently stop publishing.
-    # Filtering is unnecessary anyway: the job exits early and green when
-    # docs/ produced no diff.
+    # NOT on release tags (#1226). A tag push was a redundant republish when
+    # the tag was main's head, and harmful otherwise: a tag on an older main
+    # commit rolled the site back behind main, and a tag on an unmerged
+    # branch (which release.yml refuses) published unreviewed docs to
+    # www.spatiumddi.com. Nothing here gates a tag the way release.yml does,
+    # and main already publishes every commit.
+    #
+    # NOTE: deliberately no `paths:` filter. The job exits early and green
+    # when docs/ produced no diff, so filtering buys nothing.
   # Manual re-run, e.g. after fixing the site repo by hand or rotating the key.
   workflow_dispatch:
     inputs:
@@ -57,7 +56,7 @@ on:
 permissions:
   contents: read
 
-# Never let two releases race each other into the site repo.
+# Never let two publishes race each other into the site repo.
 concurrency:
   group: docs-publish
   cancel-in-progress: false
@@ -66,7 +65,7 @@ env:
   # Kept at the old repo NAME on purpose: renaming the org moved this repo to
   # the spatiumnorth owner but left it called `spatiumddi.github.io`, and that
   # is the only site repo that exists. Pointing at `spatiumnorth.github.io`
-  # before creating/renaming it fails the clone on every main push and tag.
+  # before creating/renaming it fails the clone on every main push.
   TARGET_REPO: git@github.com:spatiumnorth/spatiumddi.github.io.git
   # The branch GitHub Pages is configured to serve on the site repo.
   TARGET_BRANCH: main
@@ -146,8 +145,8 @@ jobs:
 
           Its entire contents are mirrored from the `docs/` directory of
           [spatiumnorth/spatiumddi](https://github.com/spatiumnorth/spatiumddi) by
-          the `docs-publish` workflow, which runs on every release tag. Any
-          commit made here by hand will be overwritten by the next release.
+          the `docs-publish` workflow, which runs on every push to main. Any
+          commit made here by hand will be overwritten by the next one.
 
           To change the documentation, edit `docs/` in the main repository.
           EOF

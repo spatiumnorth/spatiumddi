@@ -25,7 +25,7 @@
 The umbrella chart is a single self-contained `application` chart — it has
 **no subchart dependencies**. PostgreSQL and Redis ship as plain
 `StatefulSet` + `Service` templates owned by the chart, using the official
-`postgres:16-alpine` and `redis:8.10.1-alpine` images (the same ones
+`postgres:16-alpine` and `redis:8.10.2-alpine` images (the same ones
 `docker-compose.yml` uses). The Bitnami subcharts the chart used historically
 were dropped after Bitnami pruned its public Docker Hub namespace in late 2025;
 the rationale is in [`Chart.yaml`](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/Chart.yaml).

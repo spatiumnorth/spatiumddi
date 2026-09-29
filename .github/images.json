@@ -1,0 +1,11 @@
+[
+  {"image": "spatiumddi-api", "context": "./backend", "file": "./backend/Dockerfile", "target": "runtime"},
+  {"image": "spatiumddi-frontend", "context": "./frontend", "file": "./frontend/Dockerfile", "target": ""},
+  {"image": "dns-bind9", "context": ".", "file": "./agent/dns/images/bind9/Dockerfile", "target": ""},
+  {"image": "dns-powerdns", "context": ".", "file": "./agent/dns/images/powerdns/Dockerfile", "target": ""},
+  {"image": "dns-technitium", "context": ".", "file": "./agent/dns/images/technitium/Dockerfile", "target": ""},
+  {"image": "dns-dnsdist", "context": ".", "file": "./agent/dns/images/dnsdist/Dockerfile", "target": ""},
+  {"image": "dhcp-kea", "context": ".", "file": "./agent/dhcp/images/kea/Dockerfile", "target": ""},
+  {"image": "spatium-supervisor", "context": ".", "file": "./agent/supervisor/images/supervisor/Dockerfile", "target": ""},
+  {"image": "looking-glass", "context": ".", "file": "./agent/looking-glass/images/gobgp/Dockerfile", "target": ""}
+]

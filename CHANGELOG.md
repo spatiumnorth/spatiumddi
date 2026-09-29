@@ -223,6 +223,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The version-pin check now sees the Alpine-packaged daemons, and
+  no longer reports a pin as behind when it is ahead (#1240).**
+  BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
+  `versions.json` tracked none of them, so their drift was invisible
+  to `make versions-check` and the weekly upstream report. That is
+  how #1218's CVEs reached a release. Each is now a component, with
+  its Dockerfile floor (`>=`) as the version and a new
+  `alpine-package` upstream that reads Alpine's package index for the
+  branch the images build on. It compares the full version, so an
+  `-rN` security rebuild shows up too. PowerDNS and dnsdist, which
+  were installed unpinned, gain floors at their current versions
+  (5.0.7-r0 and 2.0.8-r0), so nothing changes in the images. The
+  upstream report also compared versions for *inequality*, so a pin
+  ahead of what upstream returns (redoc 2.5.4 against a 2.5.3 GitHub
+  release) was listed as "behind", which invites a downgrade. It now
+  orders them.
+
 - **After a slot upgrade, the node's DNS, DHCP and looking-glass
   agents run the new release (#1203).** They kept the previous
   release's images and chart until a role, group or key next changed.
@@ -1297,6 +1314,98 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
+  read files through a scan (#1223).** The scan endpoint is gated on
+  `manage_nmap_scans`, which the builtin Network Editor role holds, and
+  `extra_args` was checked only for shell metacharacters and for `/` in
+  `--script` values. So a delegated user could pass `-iL <file>`: nmap
+  reads it as a target list and prints every line it cannot resolve
+  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
+  back, which was verified in the api container as the api user. Also
+  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
+  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
+  target or `-iR` (past target validation and the #722 do-not-probe
+  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
+  intrusive script. Now every token must be an allowed option with a
+  value of the right shape: scan type, host discovery, port selection,
+  timing, service / OS detection, `--reason` / `--open`, and `--script`
+  with script **names** that nmap's own `script.db` puts in none of the
+  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
+  `fuzzer` categories. Category names, wildcards and expressions are
+  refused, because no category is clean: nmap's `safe` category holds 33
+  scripts that are also `external` or `intrusive` (`whois-ip` queries
+  third-party WHOIS servers, against non-negotiable #17), and `default`
+  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
+  in favour of the presets that already offer them. The copilot's scan
+  proposal goes through the same check, and so does a scan already queued
+  with old arguments, since the worker re-validates before it runs.
+
+- **A release publishes nothing until CI, Trivy and main have all said yes
+  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
+  pushed `:latest` alongside each version tag before the ISO, the
+  OpenAPI export or the GitHub release had finished. So #1218's BIND
+  image shipped with 7 HIGH CVEs that nothing on the release path looked
+  for; a release that failed part-way had already moved every compose
+  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
+  covers tags, anyone with write access could release any commit. Now a
+  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
+  to pass on the tagged commit. Each image is built once, pushed by
+  digest with no tag, and both architectures are pulled from that digest
+  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
+  ever scanned amd64); only when every image passes is that same digest
+  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
+  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
+  a final job after the GitHub release exists, all images or none: it
+  records where each `:latest` pointed, retries each move, and puts back
+  the ones already moved if one still fails. Release runs are no longer
+  serialised, because GitHub cancels a queued run when another queues
+  behind it and `meta` can now wait an hour; "is this the newest
+  release" is re-checked right before GitHub's latest release and
+  `:latest` are set instead. The workflow also stops assuming CalVer
+  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
+  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
+  `:latest`, and the previous release, the CHANGELOG section and whether
+  a tag becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering, ranking only tags on `main` that have
+  a published release (`.github/scripts/release-tags.sh`), so a stray tag
+  cannot freeze `:latest`. The shell it replaces got all three wrong
+  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
+  one, and the CHANGELOG lookup was a prefix match that returns
+  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
+  one no longer takes over `:latest` or the stable download URLs, or
+  uploads the un-versioned copies behind them. Release candidates no
+  longer take slots in the asset pruner's keep window (eight candidates
+  would have pushed eight final releases' ISOs out early); a candidate
+  keeps its ISO until a final release supersedes it. The image list is
+  one file, `.github/images.json`, read by both workflows and the
+  image-upgrade linter. And `docs-publish.yml` no longer runs on release
+  tags: a tag on an older commit rolled the docs site back behind
+  `main`, and a tag off `main` published unreviewed docs.
+
+- **Pinned images brought current; the CloudNativePG operator and
+  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
+  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
+  operator image 1.30.0, which the appliance bakes for an air-gapped
+  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
+  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
+  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
+  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
+  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
+  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
+  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
+  release.
+
+- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
+  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
+  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
+  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
+  They are triggered by malformed DNS64 responses, a crafted
+  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
+  SVCB/HTTPS records. The `dns-powerdns` image carries the same
+  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
+  9.20.29-r0, which also forces a rebuild of any cached package layer
+  that still has the old version. Upgrade: pull the new DNS images.
 
 - **`/metrics` needs a bearer token (#1159).** It was anonymous, and
   reachable from outside: the web port proxies it and Docker Compose

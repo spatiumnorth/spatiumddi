@@ -52,7 +52,9 @@
     "              where the copies must be exhaustive (three etcd services, three",
     "              redis containers) -- without it, bumping two of three passes.",
     "  upstream    how --check-upstream resolves the current release. `kind`:",
-    "              github-release | dockerhub | quay | rubygems | none.",
+    "              github-release | dockerhub | quay | rubygems |",
+    "              alpine-package (repo `<repository>/<package>`, on the",
+    "              `alpine` component's branch) | none.",
     "  hold        present when the pin is deliberately BEHIND upstream. The",
     "              string is the reason; --check-upstream reports these",
     "              separately so a known hold never reads as neglect.",
@@ -71,6 +73,7 @@
   "components": {
     "k3s": {
       "version": "v1.36.4+k3s1",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): v1.37 is a Kubernetes MINOR, which is not slot-revertible (see note) and lands on the clustering/upgrade path the freeze holds. Bump with a 1.1.0 slot-image cut, together with kind-node and kubeconform-k8s-target.",
       "pinned_in": [
         { "path": "Makefile", "match": "K3S_VERSION ?= {version}", "count": 1 },
         { "path": "appliance/scripts/fetch-k3s.sh", "match": "K3S_VERSION:-{version}", "count": 1 },
@@ -204,7 +207,7 @@
     },
 
     "cloudnative-pg-chart": {
-      "version": "0.29.0",
+      "version": "0.29.1",
       "pinned_in": [
         {
           "path": "charts/spatiumddi-appliance/Chart.yaml",
@@ -218,7 +221,7 @@
     },
 
     "cloudnative-pg-operator": {
-      "version": "1.30.0",
+      "version": "1.30.1",
       "pinned_in": [
         {
           "path": "appliance/scripts/bake-images.sh",
@@ -251,7 +254,7 @@
     },
 
     "nginx": {
-      "version": "1.31.5-alpine",
+      "version": "1.31.6-alpine",
       "pinned_in": [
         { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
         { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
@@ -268,7 +271,7 @@
     },
 
     "redis": {
-      "version": "8.10.1-alpine",
+      "version": "8.10.2-alpine",
       "pinned_in": [
         { "path": "docker-compose.yml", "match": "image: redis:{version}", "count": 1 },
         { "path": "docker-compose.dev.yml", "match": "image: redis:{version}", "count": 1 },
@@ -357,6 +360,7 @@
 
     "technitium": {
       "version": "15.4.0",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): 15.4.0 -> 15.5.x is a minor release, not a patch, and the freeze takes only bug and security fixes. Move it after 1.0.0, tag and digest together.",
       "digest": "sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41",
       "pinned_in": [
         {
@@ -384,7 +388,7 @@
     },
 
     "etcd-patroni": {
-      "version": "v3.5.33",
+      "version": "v3.5.34",
       "pinned_in": [
         {
           "path": "k8s/ha/postgres-docker-compose.yaml",
@@ -495,6 +499,43 @@
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/alpine", "track": "^3\\.[0-9]+$" },
       "note": "Bumped 3.23 -> 3.24 in #1037, which discharged the hold #975 corrected. It carried the agents Python 3.12 -> 3.14.7 (NOT 3.13, which the dependabot.yml comment claimed for a year) plus pdns 5.0.5 -> 5.0.7, dnsdist -> 2.0.8 and bind -> 9.20.27; Kea stays 3.0.3. The Python move is the sharp part: the agent is installed into /usr/local/lib/python<X.Y>/site-packages and found only via PYTHONPATH, so a base bump without a matching PYTHONPATH builds a clean image that CrashLoopBackOffs with ModuleNotFoundError (#672). PYTHONPATH now interpolates the PYTHON_VERSION arg -- which was declared and referenced by NOTHING in four of these images until #1037 -- and each image asserts `import <agent>` at build time, so a mismatch is a failed build rather than a failed pod. Dependabot still ignores Alpine minors: the next move is a deliberate task for the same reason, not a bot bump."
+    },
+    "bind": {
+      "version": "9.20.29-r0",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile", "match": "'bind>={version}' 'bind-tools>={version}'", "count": 1 },
+        { "path": "agent/dns/images/powerdns/Dockerfile", "match": "'bind-tools>={version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "[ISC BIND 9](https://www.isc.org/bind/) | `>= {version}` (Alpine)", "count": 1 }
+      ],
+      "upstream": { "kind": "alpine-package", "repo": "main/bind" },
+      "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild. Raised 9.20.26-r0 -> 9.20.29-r0 for seven HIGH remote-DoS CVEs (#1218); the released 2026.09.04-1 image carried 9.20.26 because nothing reported the drift."
+    },
+    "pdns": {
+      "version": "5.0.7-r0",
+      "pinned_in": [
+        { "path": "agent/dns/images/powerdns/Dockerfile", "match": "'pdns>={version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "[PowerDNS Authoritative Server](https://www.powerdns.com/) | `>= {version}` (Alpine)", "count": 1 }
+      ],
+      "upstream": { "kind": "alpine-package", "repo": "community/pdns" },
+      "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
+    },
+    "dnsdist": {
+      "version": "2.0.8-r0",
+      "pinned_in": [
+        { "path": "agent/dns/images/dnsdist/Dockerfile", "match": "'dnsdist>={version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "[PowerDNS dnsdist](https://dnsdist.org/) | `>= {version}` (Alpine)", "count": 1 }
+      ],
+      "upstream": { "kind": "alpine-package", "repo": "community/dnsdist" },
+      "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
+    },
+    "kea": {
+      "version": "3.0.3-r0",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile", "match": "'kea>={version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "[ISC Kea DHCP](https://www.isc.org/kea/) | `>= {version}` (Alpine), v4 + v6", "count": 1 }
+      ],
+      "upstream": { "kind": "alpine-package", "repo": "main/kea" },
+      "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
     },
     "swagger-ui": {
       "version": "5.33.0",
