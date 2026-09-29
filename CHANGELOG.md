@@ -1315,6 +1315,32 @@ the formatter handles the rest.
 
 ### Security
 
+- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
+  read files through a scan (#1223).** The scan endpoint is gated on
+  `manage_nmap_scans`, which the builtin Network Editor role holds, and
+  `extra_args` was checked only for shell metacharacters and for `/` in
+  `--script` values. So a delegated user could pass `-iL <file>`: nmap
+  reads it as a target list and prints every line it cannot resolve
+  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
+  back, which was verified in the api container as the api user. Also
+  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
+  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
+  target or `-iR` (past target validation and the #722 do-not-probe
+  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
+  intrusive script. Now every token must be an allowed option with a
+  value of the right shape: scan type, host discovery, port selection,
+  timing, service / OS detection, `--reason` / `--open`, and `--script`
+  with script **names** that nmap's own `script.db` puts in none of the
+  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
+  `fuzzer` categories. Category names, wildcards and expressions are
+  refused, because no category is clean: nmap's `safe` category holds 33
+  scripts that are also `external` or `intrusive` (`whois-ip` queries
+  third-party WHOIS servers, against non-negotiable #17), and `default`
+  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
+  in favour of the presets that already offer them. The copilot's scan
+  proposal goes through the same check, and so does a scan already queued
+  with old arguments, since the worker re-validates before it runs.
+
 - **A release publishes nothing until CI, Trivy and main have all said yes
   (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
   pushed `:latest` alongside each version tag before the ISO, the
