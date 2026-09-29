@@ -61,7 +61,11 @@ class _Server:
     Plans: ("full",) = 200 with the whole body, Range ignored;
     ("cut", n) = 200 promising the whole body, n bytes sent, then closed;
     ("range",) = 206 from the requested offset when a Range is asked for,
-    else like "full"; ("status", code) = that error status.
+    else like "full"; ("range_lc",) = the same, its ``content-range``
+    header name in lower case; ("range_short", end) = 206 from the
+    requested offset but stopping at ``end``; ("range_at", start) = 206
+    from ``start`` whatever was asked; ("range_whole",) = 206 with the
+    whole body whatever was asked; ("status", code) = that error status.
 
     With ``tls`` the server speaks HTTPS with that context; the first
     ``drop_first`` connections are closed before their handshake. Every
@@ -85,16 +89,27 @@ class _Server:
                 if kind == "status":
                     self.send_error(plan[1])
                     return
-                start = 0
-                if kind == "range" and self.headers.get("Range"):
-                    start = int(self.headers["Range"].split("=")[1].rstrip("-"))
+                asked = self.headers.get("Range")
+                offset = int(asked.split("=")[1].rstrip("-")) if asked else None
+                span = None  # the 206's [start, end) of BODY
+                if kind in ("range", "range_lc") and offset is not None:
+                    span = (offset, len(BODY))
+                elif kind == "range_short" and offset is not None:
+                    span = (offset, plan[1])
+                elif kind == "range_at":
+                    span = (plan[1], len(BODY))
+                elif kind == "range_whole":
+                    span = (0, len(BODY))
+                start, end = span or (0, len(BODY))
+                if span:
                     self.send_response(206)
                     self.send_header(
-                        "Content-Range", f"bytes {start}-{len(BODY) - 1}/{len(BODY)}"
+                        "content-range" if kind == "range_lc" else "Content-Range",
+                        f"bytes {start}-{end - 1}/{len(BODY)}",
                     )
                 else:
                     self.send_response(200)
-                body = BODY[start:]
+                body = BODY[start:end]
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 if kind == "cut":
@@ -254,6 +269,59 @@ def test_a_local_write_error_is_raised_at_once(slot_cli, serve, tmp_path, monkey
     monkeypatch.setattr("builtins.open", refuse)
     with pytest.raises(slot_cli._LocalWriteError, match="No space left"):
         slot_cli.fetch_to(s.url, dst)
+    assert len(s.requests) == 1
+
+
+# ── a resume is kept only when it continues the partial file ─────────
+
+
+def test_a_resume_answered_from_another_offset_is_not_saved_as_the_whole_file(
+    slot_cli, serve, tmp_path, capsys
+):
+    """A 206 that does not start at the byte asked for can neither continue
+    the partial file nor stand for the whole image. It used to be written
+    from byte 0 as the whole file, which the checksum then failed as
+    "checksum mismatch" (rc 3). Now the partial file is discarded and the
+    next attempt asks for the whole image."""
+    s = serve(("cut", 400_000), ("range_at", 200_000), ("full",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert [r.get("Range") for r in s.requests] == [None, "bytes=400000-", None]
+    out = capsys.readouterr().out
+    assert "resume from byte 400000" in out
+    assert "bytes 200000-1048575/1048576" in out
+
+
+def test_a_resumed_range_that_stops_short_is_resumed_again(slot_cli, serve, tmp_path):
+    """A 206 is counted against the whole file's length (the ``/n`` of its
+    Content-Range), not its own Content-Length, so a range that stops
+    before the end is not taken for the rest of the file."""
+    s = serve(("cut", 400_000), ("range_short", 700_000), ("range",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert [r.get("Range") for r in s.requests] == [None, "bytes=400000-", "bytes=700000-"]
+
+
+def test_a_resume_is_kept_whatever_the_header_case(slot_cli, serve, tmp_path):
+    """Header names are case-insensitive, and an ASGI server (the api that
+    serves a node's own image) sends ``content-range`` in lower case. The
+    resume is kept: two requests, no restart."""
+    s = serve(("cut", 400_000), ("range_lc",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert len(s.requests) == 2
+
+
+def test_a_206_with_the_whole_file_is_kept(slot_cli, serve, tmp_path):
+    """Even unasked, a 206 that starts at byte 0 and runs to the end is the
+    whole image, and is kept."""
+    s = serve(("range_whole",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
     assert len(s.requests) == 1
 
 

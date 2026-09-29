@@ -345,10 +345,26 @@ class _LocalWriteError(RuntimeError):
     help, so this is never treated as a transfer problem."""
 
 
-def _range_start(content_range: str | None) -> int | None:
-    """The first byte of a ``Content-Range: bytes a-b/n`` header, else None."""
-    m = re.match(r"\s*bytes\s+(\d+)-", content_range or "")
-    return int(m.group(1)) if m else None
+class _UnusableRange(Exception):
+    """The server answered a resume with a 206 that does not continue the
+    partial file. The partial file is discarded, so the next attempt asks
+    for the whole image."""
+
+    def __init__(self, have: int, content_range: str | None) -> None:
+        super().__init__(
+            f"the server answered a resume from byte {have} with "
+            f"Content-Range {content_range or '(none)'}; starting over"
+        )
+
+
+_CONTENT_RANGE_RE = re.compile(r"\s*bytes\s+(\d+)-\d+/(\d+)\s*$", re.IGNORECASE)
+
+
+def _content_range(value: str | None) -> tuple[int, int] | None:
+    """``(first byte, whole file's length)`` of a ``Content-Range: bytes
+    a-b/n`` header, else None."""
+    m = _CONTENT_RANGE_RE.match(value or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _fetch_http_once(
@@ -360,7 +376,8 @@ def _fetch_http_once(
     with ``Range``: kept and appended to when the server answers 206 from
     exactly that offset, rewritten from the start when it answers 200 (the
     multi-node path proxies the mirror with a plain GET, so it always
-    does). Raises DownloadIncomplete on a short body.
+    does). Any other 206 discards it and raises _UnusableRange. Raises
+    DownloadIncomplete on a short body, counted against the whole file.
     """
     have = dst.stat().st_size if dst.exists() else 0
     req = urllib.request.Request(src)
@@ -368,15 +385,25 @@ def _fetch_http_once(
         req.add_header("Range", f"bytes={have}-")
     with urllib.request.urlopen(req, context=ctx, timeout=_FETCH_READ_TIMEOUT_SECONDS) as r:
         status = getattr(r, "status", 200)
-        if have and status == 206 and _range_start(r.headers.get("Content-Range")) == have:
-            mode, done = "ab", have
-        else:
-            mode, done = "wb", 0
         try:
             length = int(r.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             length = 0
-        total = done + length if length else 0
+        if status == 206:
+            # Kept only when it continues the partial file: it starts at the
+            # byte asked for, and names the whole file's length to count the
+            # bytes against. Written from byte 0, any other range passes for
+            # the whole image and the checksum fails it as a mismatch (rc 3),
+            # the misreport #1216 removes. So it is discarded instead, and the
+            # next attempt asks for the whole image (no Range).
+            content_range = r.headers.get("Content-Range")
+            span = _content_range(content_range)
+            if span is None or span[0] != have:
+                dst.unlink(missing_ok=True)
+                raise _UnusableRange(have, content_range)
+            mode, done, total = ("ab" if have else "wb"), have, span[1]
+        else:
+            mode, done, total = "wb", 0, length
         try:
             f = open(dst, mode)
         except OSError as exc:
@@ -477,7 +504,7 @@ def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = Fals
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
                 raise
             last = exc
-        except (DownloadIncomplete, http.client.HTTPException, OSError) as exc:
+        except (DownloadIncomplete, _UnusableRange, http.client.HTTPException, OSError) as exc:
             # OSError covers a reset, any other TLS error and the read
             # timeout; http.client.HTTPException covers IncompleteRead on a
             # chunked body and a malformed response.
