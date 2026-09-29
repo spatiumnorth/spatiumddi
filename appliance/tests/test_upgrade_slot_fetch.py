@@ -18,8 +18,12 @@ throwaway self-signed certificate.
 
 from __future__ import annotations
 
+import builtins
+import errno
 import http.server
 import importlib.util
+import io
+import os
 import shutil
 import ssl
 import subprocess
@@ -65,7 +69,9 @@ class _Server:
     header name in lower case; ("range_short", end) = 206 from the
     requested offset but stopping at ``end``; ("range_at", start) = 206
     from ``start`` whatever was asked; ("range_whole",) = 206 with the
-    whole body whatever was asked; ("status", code) = that error status.
+    whole body whatever was asked; ("stall", n) = 200 promising the whole
+    body, n bytes sent, then nothing until the server closes;
+    ("status", code) = that error status.
 
     With ``tls`` the server speaks HTTPS with that context; the first
     ``drop_first`` connections are closed before their handshake. Every
@@ -76,6 +82,7 @@ class _Server:
         self.plans = list(plans)
         self.requests: list[dict[str, str]] = []
         self.connections = 0
+        self.release = threading.Event()  # ends a "stall"
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -117,6 +124,12 @@ class _Server:
                     self.wfile.flush()
                     self.close_connection = True  # FIN after n bytes, as a killed nginx
                     return
+                if kind == "stall":
+                    self.wfile.write(body[: plan[1]])
+                    self.wfile.flush()
+                    server.release.wait(30)  # the connection stays open, silent
+                    self.close_connection = True
+                    return
                 self.wfile.write(body)
 
         class Quiet(http.server.ThreadingHTTPServer):
@@ -142,6 +155,7 @@ class _Server:
         self.thread.start()
 
     def close(self):
+        self.release.set()
         self.httpd.shutdown()
         self.httpd.server_close()
 
@@ -272,6 +286,46 @@ def test_a_local_write_error_is_raised_at_once(slot_cli, serve, tmp_path, monkey
     assert len(s.requests) == 1
 
 
+def test_a_full_disk_at_the_final_flush_is_raised_at_once(slot_cli, serve, tmp_path, monkeypatch):
+    """Closing the staged file flushes its last buffered bytes, which can
+    meet a full disk too. That is a local write error like any other,
+    raised at once, not transfer trouble retried until rc 6."""
+    s = serve(("full",))
+    dst = tmp_path / "slot.raw.xz"
+
+    class FullDisk(io.RawIOBase):
+        def writable(self):
+            return True
+
+        def write(self, b):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    real_open = builtins.open
+
+    def open_on_a_full_disk(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and Path(file) == dst:
+            # A buffer larger than the body holds every write(); only the
+            # flush when the file closes reaches the disk.
+            return io.BufferedWriter(FullDisk(), buffer_size=2 * len(BODY))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", open_on_a_full_disk)
+    with pytest.raises(slot_cli._LocalWriteError, match="No space left"):
+        slot_cli.fetch_to(s.url, dst)
+    assert len(s.requests) == 1
+
+
+def test_a_stalled_read_is_still_retried(slot_cli, serve, tmp_path, monkeypatch):
+    """A read that stops moving times out. That is transfer trouble, and is
+    retried: only the file's own calls count as local write errors."""
+    monkeypatch.setattr(slot_cli, "_FETCH_READ_TIMEOUT_SECONDS", 0.5)
+    s = serve(("stall", 400_000), ("full",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert len(s.requests) == 2
+
+
 # ── a resume is kept only when it continues the partial file ─────────
 
 
@@ -349,7 +403,9 @@ def test_an_unwrapped_certificate_error_is_raised_at_once(slot_cli, tmp_path, mo
 
     def refuse(*args, **kwargs):
         calls.append(1)
-        raise ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        raise ssl.SSLCertVerificationError(
+            1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+        )
 
     monkeypatch.setattr(slot_cli, "_fetch_http_once", refuse)
     with pytest.raises(ssl.SSLCertVerificationError):

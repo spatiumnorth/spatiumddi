@@ -408,7 +408,7 @@ def _fetch_http_once(
             f = open(dst, mode)
         except OSError as exc:
             raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
-        with f:
+        try:
             last_pct = -5
             while True:
                 chunk = r.read(1024 * 1024)
@@ -427,6 +427,14 @@ def _fetch_http_once(
                         if attempt > 1:
                             detail += f" (attempt {attempt} of {_FETCH_ATTEMPTS})"
                         _write_progress("downloading", pct, detail)
+        finally:
+            # Closing flushes the last buffered bytes, so it can meet a full
+            # disk too. Only the file's own calls are wrapped: an error from
+            # r.read() is transfer trouble, and is retried.
+            try:
+                f.close()
+            except OSError as exc:
+                raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
         if total and done < total:
             raise DownloadIncomplete(done, total)
 
