@@ -1337,8 +1337,13 @@ the formatter handles the rest.
   interception present at pairing (unless it also replaced the CA). The
   k8s, nettool, pcap and storage proxy loops go through the same pinned
   trust; before, they verified against system CAs, so against a self-signed
-  control plane they could not connect at all. An `http://` URL is followed
-  to its `https://` redirect and that certificate pinned. Still open: the
+  control plane they could not connect at all. An `http://` URL is probed
+  once for the `https://` it redirects to, that certificate is pinned, and
+  every request goes straight to the `https://` target, so the pairing code
+  and session token no longer cross the wire in cleartext before the
+  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
+  the CA, so an appliance moved to a rebuilt control plane pins the new one
+  rather than refusing it forever. Still open: the
   DNS, DHCP and looking-glass role pods on an appliance skip verification
   toward the control plane, which needs the pinned certificate passed
   through to them (tracked separately).

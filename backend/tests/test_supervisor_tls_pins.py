@@ -152,8 +152,10 @@ async def test_the_list_is_cached_briefly_then_refreshed(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """The endpoint is unauthenticated and reads the Secret through the kube
-    API, so a signed list is reused; ``clear_cache`` (called on activation)
-    makes a new certificate visible straight away."""
+    API, so a signed list is reused; but the cache is keyed on the active
+    rows, so a certificate activated by ANY process (the Celery worker's ACME
+    renewal, the startup bootstrap) is listed on the next request, with no
+    cache-clear call that only reaches the process that made it."""
     await ensure_ca(db_session)
     await db_session.commit()
     first = _cert_pem("first.test")
@@ -161,7 +163,6 @@ async def test_the_list_is_cached_briefly_then_refreshed(
     one = (await client.get(_URL)).json()
     assert (await client.get(_URL)).json() == one, "cached"
 
-    tls_pins.clear_cache()
     second = _cert_pem("second.test")
     await _active_cert(db_session, second)
     data = json.loads(base64.b64decode((await client.get(_URL)).json()["payload"]))

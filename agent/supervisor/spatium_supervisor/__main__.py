@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import os
 import signal
-import ssl
 import sys
 import time
 
@@ -250,7 +249,7 @@ def _maybe_register(
         if cp_tls.is_verification_failure(exc):
             cp_tls.try_repin(cfg.state_dir, cfg.control_plane_url)
         return cfg
-    except (OSError, ssl.SSLError) as exc:
+    except OSError as exc:  # ssl.SSLError is an OSError
         # First contact could not reach the control plane to take a pin.
         log.warning("supervisor.register.unreachable", error=str(exc))
         return cfg

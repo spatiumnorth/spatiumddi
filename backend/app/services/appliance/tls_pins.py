@@ -46,11 +46,16 @@ PIN_SET_ALGORITHM = "rsa-pss-sha256"
 _PSS = padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32)
 
 # The endpoint is unauthenticated and building the list reads the TLS Secret
-# through the Kubernetes API, so a signed list is reused for this long rather
-# than letting an anonymous caller turn requests into apiserver calls. A
-# supervisor re-pinning after a rotation waits at most this long.
+# through the Kubernetes API and signs with the CA key, so a signed list is
+# reused for this long rather than letting an anonymous caller turn requests
+# into apiserver calls. The cache is keyed on the CA and on the ACTIVE
+# ``ApplianceCertificate`` rows (two cheap DB reads per request), so a new
+# certificate activated anywhere -- the api, the Celery worker running an ACME
+# renewal, the startup bootstrap re-minting a self-signed one -- is listed on
+# the very next request. Only a change to the Secret alone (#1215) waits out
+# the TTL.
 _CACHE_TTL_S = 30.0
-_cache: tuple[float, dict[str, str]] | None = None
+_cache: tuple[float, tuple[str, frozenset[str]], dict[str, str]] | None = None
 
 
 def cert_sha256(cert_pem: str) -> str:
@@ -60,28 +65,7 @@ def cert_sha256(cert_pem: str) -> str:
     return hashlib.sha256(leaf.public_bytes(Encoding.DER)).hexdigest()
 
 
-async def served_cert_fingerprints(db: AsyncSession) -> list[str]:
-    """Fingerprints of the certificates the Web UI serves right now.
-
-    Two sources, because they can disagree. The active ``ApplianceCertificate``
-    is what the api deploys into the cluster-wide TLS Secret; the Secret is
-    what every node's frontend actually serves. They differ when something
-    other than the api rewrites the Secret, which #1215 does: a k3s restart
-    puts the first-boot certificate back. Listing only the row would make a
-    supervisor refuse the certificate every node is really serving, and lose
-    its control plane over a cert nobody changed on purpose. Both are written
-    only by the control plane itself, so both are safe to vouch for.
-    """
-    fingerprints: set[str] = set()
-    try:
-        deployed = await asyncio.to_thread(read_deployed_cert)
-    except Exception:  # noqa: BLE001 — the row still answers without it
-        deployed = None
-    if deployed is not None:
-        try:
-            fingerprints.add(cert_sha256(deployed[0]))
-        except ValueError:
-            pass  # an unparseable Secret vouches for nothing; the row still counts
+async def _active_row_fingerprints(db: AsyncSession) -> set[str]:
     rows = (
         (
             await db.execute(
@@ -91,8 +75,40 @@ async def served_cert_fingerprints(db: AsyncSession) -> list[str]:
         .scalars()
         .all()
     )
-    fingerprints.update(cert_sha256(row.cert_pem) for row in rows if row.cert_pem)
-    return sorted(fingerprints)
+    fingerprints: set[str] = set()
+    for row in rows:
+        if not row.cert_pem:
+            continue
+        try:
+            fingerprints.add(cert_sha256(row.cert_pem))
+        except ValueError:
+            # An unparseable row vouches for nothing. It must not 500 the
+            # endpoint, or every supervisor loses the ability to re-pin.
+            continue
+    return fingerprints
+
+
+async def _deployed_fingerprint() -> str | None:
+    """The certificate in the TLS Secret, listed ALONGSIDE the active row.
+
+    The active ``ApplianceCertificate`` is what the api deploys into the
+    cluster-wide TLS Secret; the Secret is what every node's frontend actually
+    serves. They differ when something other than the api rewrites the Secret,
+    which #1215 does: a k3s restart puts the first-boot certificate back.
+    Listing only the row would make a supervisor refuse the certificate every
+    node is really serving. Both are written only by the control plane itself,
+    so both are safe to vouch for.
+    """
+    try:
+        deployed = await asyncio.to_thread(read_deployed_cert)
+    except Exception:  # noqa: BLE001 — the rows still answer without it
+        return None
+    if deployed is None:
+        return None
+    try:
+        return cert_sha256(deployed[0])
+    except ValueError:
+        return None  # an unparseable Secret vouches for nothing; the rows still count
 
 
 async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
@@ -100,15 +116,20 @@ async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
     there is no CA yet (nothing has been approved, so no supervisor holds a
     CA to verify with)."""
     global _cache
-    if _cache is not None and time.monotonic() - _cache[0] < _CACHE_TTL_S:
-        return _cache[1]
     ca = await db.get(ApplianceCA, 1)
     if ca is None:
         return None
+    rows = await _active_row_fingerprints(db)
+    key = (ca.cert_pem, frozenset(rows))
+    if _cache is not None and _cache[1] == key and time.monotonic() - _cache[0] < _CACHE_TTL_S:
+        return _cache[2]
+    deployed = await _deployed_fingerprint()
+    if deployed is not None:
+        rows.add(deployed)
     payload = json.dumps(
         {
             "version": 1,
-            "certs_sha256": await served_cert_fingerprints(db),
+            "certs_sha256": sorted(rows),
             "issued_at": datetime.now(UTC).isoformat(),
         },
         sort_keys=True,
@@ -122,11 +143,12 @@ async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
         "algorithm": PIN_SET_ALGORITHM,
         "ca_cert_sha256": hashlib.sha256(ca_der).hexdigest(),
     }
-    _cache = (time.monotonic(), signed)
+    _cache = (time.monotonic(), key, signed)
     return signed
 
 
 def clear_cache() -> None:
-    """Forget the cached list (tests, and after a certificate is activated)."""
+    """Forget the cached list (tests). Activation needs no call: the cache is
+    keyed on the active rows, so a newly activated certificate misses it."""
     global _cache
     _cache = None

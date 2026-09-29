@@ -298,17 +298,26 @@ def test_an_in_cluster_http_url_has_no_certificate(tmp_path: Path) -> None:
     assert cp_tls.tls_url("http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000") is None
 
 
-def test_an_http_url_is_followed_to_its_https_redirect(server, tmp_path: Path) -> None:
-    """The installer allows http:// for labs, and the frontend redirects it."""
+def test_an_http_url_is_sent_to_its_https_target_not_over_http(
+    server, tmp_path: Path
+) -> None:
+    """The installer allows http:// for labs, and the frontend redirects it.
+    The request body (a pairing code, a session token) must never cross the
+    wire in cleartext first, so the http origin is only probed with a bare GET
+    to learn the target, and every real request goes straight to https."""
+    seen: list[str] = []
 
     class Redirect(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a: Any) -> None:
             pass
 
-        def do_GET(self) -> None:  # noqa: N802
+        def _redirect(self) -> None:
+            seen.append(f"{self.command} {self.path}")
             self.send_response(301)
             self.send_header("Location", server.url + self.path)
             self.end_headers()
+
+        do_GET = do_POST = _redirect  # noqa: N815
 
     plain = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
@@ -316,8 +325,14 @@ def test_an_http_url_is_followed_to_its_https_redirect(server, tmp_path: Path) -
         url = f"http://127.0.0.1:{plain.server_address[1]}"
         assert cp_tls.tls_url(url) == server.url + "/"
         state = _state(tmp_path)
+        server.requests.clear()
         with cp_tls.client(state, url) as c:
-            assert c.get(url + "/x").status_code == 200
+            resp = c.post(
+                url + "/api/v1/appliance/supervisor/heartbeat", json={"session_token": "s"}
+            )
+        assert resp.status_code == 200
+        assert server.requests == ["/api/v1/appliance/supervisor/heartbeat"], "POST, over https"
+        assert seen == ["GET /"], "only the bare probe ever touched http"
         assert cp_tls.load_pins(state) is not None
     finally:
         plain.shutdown()

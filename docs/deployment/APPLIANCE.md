@@ -3167,7 +3167,13 @@ the operator installing a CA anywhere:
    the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
 
 An `http://` control-plane URL (acceptable for labs, per the installer) is
-followed to the `https://` it redirects to, and that certificate is pinned.
+probed once with a bare `GET /` to learn the `https://` it redirects to; that
+certificate is pinned, and every real request goes straight to the `https://`
+target. So the pairing code and the session token never cross the network in
+cleartext, even when the URL was typed as `http://`.
+Re-pairing with `spatium-pair` forgets the pinned certificate and the CA, so
+an appliance moved to a rebuilt or different control plane pins the new one
+on its next contact.
 `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` still turns verification off, with a
 warning; the appliance chart no longer sets it (before #1219 it did,
 unconditionally, and nothing was pinned in its place).

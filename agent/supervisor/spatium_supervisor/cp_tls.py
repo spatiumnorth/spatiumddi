@@ -89,6 +89,11 @@ class PinSetError(Exception):
     """A signed certificate list that cannot be trusted."""
 
 
+class PinSetUnavailable(PinSetError):
+    """The control plane could not produce the list right now (a 5xx, say,
+    while the api restarts): worth asking again, unlike a bad signature."""
+
+
 # ── the pin ──────────────────────────────────────────────────────────────────
 
 
@@ -223,9 +228,14 @@ def client(
     when nothing is pinned yet. Without it (the proxy loops), an unpinned
     supervisor gets ordinary system-CA verification, which a self-signed
     control plane fails, so those loops wait for registration to take the
-    pin rather than taking it themselves. ``follow_redirects`` defaults on,
-    as it always has here: an ``http://`` URL reaches the ``https://`` it
-    redirects to, verified against the same pin.
+    pin rather than taking it themselves.
+
+    An ``http://`` URL whose server redirects to ``https://`` is not sent
+    over http at all: requests for that origin go straight to the pinned
+    ``https://`` target. Following the redirect instead would put the body
+    (the pairing code on register, the session token on every heartbeat) on
+    the wire in cleartext before the 301, and httpx would also turn the
+    redirected POST into a GET.
     """
     global _skip_warned
     kwargs.setdefault("follow_redirects", True)
@@ -251,7 +261,32 @@ def client(
         if not first_contact:
             return httpx.Client(**kwargs)
         pins = _pin_first_contact(state_dir, target)
+    if urlsplit(url).scheme.lower() == "http":
+        transport = _UpgradeToHttps(
+            httpx.HTTPTransport(verify=pinned_context(pins)), httpx.URL(url), httpx.URL(target)
+        )
+        return httpx.Client(transport=transport, **kwargs)
     return httpx.Client(verify=pinned_context(pins), **kwargs)
+
+
+class _UpgradeToHttps(httpx.BaseTransport):
+    """Send requests for an ``http://`` origin to its ``https://`` target."""
+
+    def __init__(self, inner: httpx.BaseTransport, src: httpx.URL, dst: httpx.URL) -> None:
+        self._inner = inner
+        self._src = (src.host, src.port)
+        self._dst = dst
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.scheme == "http" and (request.url.host, request.url.port) == self._src:
+            request.url = request.url.copy_with(
+                scheme="https", host=self._dst.host, port=self._dst.port
+            )
+            request.headers["Host"] = self._dst.netloc.decode("ascii")
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 def _pin_first_contact(state_dir: Path, target: str) -> str:
@@ -336,6 +371,8 @@ def _fetch_vouched(target: str, trust_pem: str, ca_pem: str) -> set[str]:
     """Fetch the signed list over a connection pinned to ``trust_pem``."""
     with httpx.Client(verify=pinned_context(trust_pem), timeout=_CONNECT_TIMEOUT_S) as c:
         resp = c.get(_origin(target) + PIN_SET_PATH)
+    if resp.status_code >= 500:
+        raise PinSetUnavailable(f"the control plane answered HTTP {resp.status_code}")
     if resp.status_code != 200:
         raise PinSetError(f"the control plane answered HTTP {resp.status_code}")
     try:
@@ -362,7 +399,18 @@ def try_repin(state_dir: Path, url: str) -> bool:
             return False
         new_fp = cert_sha256(presented)
         if old is not None and new_fp in _pinned_fingerprints(old):
-            # Same certificate: the failure was something else (it expired, say).
+            # Same certificate: the failure was something else. Say so, or a
+            # pinned certificate that has EXPIRED leaves the supervisor offline
+            # with nothing but a generic heartbeat failure in its log.
+            log.error(
+                "supervisor.tls.pinned_certificate_rejected",
+                sha256=display_fingerprint(new_fp),
+                detail=(
+                    "The control plane presents the pinned certificate, yet the "
+                    "handshake still fails verification: most likely it has "
+                    "expired. Renew or replace it under Appliance -> TLS."
+                ),
+            )
             return False
         ca_pem = _load_ca(state_dir)
         if ca_pem is None:
@@ -418,8 +466,8 @@ def check_pin_vouched_once(state_dir: Path, url: str) -> None:
         return
     try:
         vouched = _fetch_vouched(target, pins, ca_pem)
-    except httpx.HTTPError:
-        return  # try again next loop
+    except (httpx.HTTPError, PinSetUnavailable):
+        return  # transient: try again next loop
     except PinSetError as exc:
         _vouch_checked = True
         log.error("supervisor.tls.pin_unverifiable", reason=str(exc))
