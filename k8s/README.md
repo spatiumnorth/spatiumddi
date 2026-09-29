@@ -81,28 +81,38 @@ be re-encrypted for the new key before the api reads them:
 NS=spatiumddi
 kubectl -n $NS scale deploy/api deploy/worker deploy/beat --replicas=0
 
-# Keep the key being replaced, then write a new one.
+# Keep the key being replaced in its own secret, then write a new one. The
+# `&&` matters: if the old-key secret already exists, a rotation is in
+# progress and generating ANOTHER new key would strand whatever the Job has
+# already moved. Re-apply the Job instead.
 kubectl -n $NS get secret spatiumddi-secrets -o jsonpath='{.data.secret-key}' \
-  | base64 -d > /tmp/old-secret-key
-kubectl -n $NS create secret generic spatiumddi-old-secret-key \
-  --from-file=secret-key=/tmp/old-secret-key
-rm /tmp/old-secret-key
-kubectl -n $NS patch secret spatiumddi-secrets --type merge \
-  -p "{\"stringData\":{\"secret-key\":\"$(openssl rand -hex 32)\"}}"
+  | base64 -d \
+  | kubectl -n $NS create secret generic spatiumddi-old-secret-key \
+      --from-file=secret-key=/dev/stdin \
+  && kubectl -n $NS patch secret spatiumddi-secrets --type merge \
+      -p "{\"stringData\":{\"secret-key\":\"$(openssl rand -hex 32)\"}}"
 
 # Re-encrypt every stored credential from the old key to the new one.
 kubectl apply -f k8s/ops/rotate-secret-key-job.yaml
 kubectl -n $NS wait --for=condition=complete job/spatiumddi-rotate-secret-key --timeout=300s
 kubectl -n $NS logs job/spatiumddi-rotate-secret-key
+```
 
+Only when the log ends with `Done.`, clean up and scale back up. Until then
+`spatiumddi-old-secret-key` is the only copy of the old key, and every stored
+credential is unreadable without it:
+
+```bash
+NS=spatiumddi
 kubectl -n $NS delete job/spatiumddi-rotate-secret-key secret/spatiumddi-old-secret-key
 kubectl -n $NS scale deploy/api deploy/worker --replicas=2
 kubectl -n $NS scale deploy/beat --replicas=1
 ```
 
 The log reports how many values were re-encrypted; the rotation also writes an
-audit row. If the Job fails, its log says why, and re-applying it after the fix
-is safe: values already under the new key are skipped. After moving off a
+audit row. If the Job fails, its log says why: fix it, delete the Job (keep
+`spatiumddi-old-secret-key`) and apply it again. That is safe, because values
+already under the new key are skipped. After moving off a
 placeholder, review API tokens, users and the audit log, as anyone who knew the
 placeholder could have signed requests as any user. The Helm chart generates
 its own key and needs none of this.

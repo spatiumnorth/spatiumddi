@@ -118,7 +118,13 @@ async def live_access_session(db: Any, payload: dict[str, Any]) -> Any:
     jti = payload.get("jti")
     if jti is None:
         return None
-    session = await db.get(UserSession, jti)
+    # A jti that is not a UUID cannot name a session. Looked up as-is, the
+    # database rejects the bind and the caller sees a 500, not a 401.
+    try:
+        session_id = uuid.UUID(str(jti))
+    except ValueError as exc:
+        raise JWTError("Session revoked or expired") from exc
+    session = await db.get(UserSession, session_id)
     if session is None or session.revoked or session.expires_at <= datetime.now(UTC):
         raise JWTError("Session revoked or expired")
     if str(session.user_id) != str(payload.get("sub")):

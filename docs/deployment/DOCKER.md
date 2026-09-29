@@ -65,7 +65,7 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | Variable | Default | Description |
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
-| `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything containing `change` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
+| `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything that reads like a placeholder, such as `change-me…` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
 | `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
 | `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
@@ -223,19 +223,45 @@ Needed when an install has been running on the `.env.example` placeholder or ano
 ```bash
 docker compose stop api worker beat
 
-# Keep the key being replaced, then put a new one in .env.
-export OLD_SECRET_KEY="$(grep '^SECRET_KEY=' .env | cut -d= -f2-)"
-sed -i "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" .env
+# Keep the key being replaced IN A FILE, not only in this shell: once .env
+# holds the new key, this file is the only copy of the old one, and every
+# stored credential is unreadable without it. Strip quotes, because compose
+# reads SECRET_KEY="abc" as abc. With no SECRET_KEY line at all, the install
+# has been running on the built-in default, which is the placeholder.
+# A second run must not overwrite the saved key with the new one, so it
+# refuses while a rotation is in progress.
+if [ -e .env.old-secret-key ]; then
+  echo "A rotation is in progress (.env.old-secret-key exists): rerun only the" \
+       "docker compose run line below." >&2
+else
+  NEW_SECRET_KEY="$(openssl rand -hex 32)"
+  if grep -q '^SECRET_KEY=' .env; then
+    ( umask 077; grep '^SECRET_KEY=' .env | tail -n 1 | cut -d= -f2- \
+        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" > .env.old-secret-key )
+    # -i.bak works with both GNU and BSD (macOS) sed.
+    sed -i.bak "s|^SECRET_KEY=.*|SECRET_KEY=${NEW_SECRET_KEY}|" .env && rm -f .env.bak
+  else
+    ( umask 077; printf '%s\n' 'change-me-to-a-random-32-char-string' > .env.old-secret-key )
+    echo "SECRET_KEY=${NEW_SECRET_KEY}" >> .env
+  fi
+  unset NEW_SECRET_KEY
+fi
 
 # Re-encrypt every stored credential from the old key to the new one.
 # `-e OLD_SECRET_KEY` with no value passes it through from this shell, so
 # the key never appears on a command line.
-docker compose run --rm -e OLD_SECRET_KEY api \
+OLD_SECRET_KEY="$(cat .env.old-secret-key)" docker compose run --rm -e OLD_SECRET_KEY api \
   python -m app.core.rotate_secret_key
-unset OLD_SECRET_KEY
+```
 
+Only when that command ends with `Done.`, remove the saved key and start the stack:
+
+```bash
+rm .env.old-secret-key
 docker compose up -d api worker beat
 ```
+
+If it reports `NOT COMPLETE`, leave `.env.old-secret-key` where it is: it is the only copy of the old key. Fix what the output names and run the `docker compose run` line again.
 
 The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, stored credentials never depended on `SECRET_KEY`: the command finds every value already under the current key and moves nothing.
 

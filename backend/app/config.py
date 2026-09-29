@@ -1,5 +1,6 @@
 import base64
 import binascii
+import re
 import sys
 
 from pydantic import model_validator
@@ -43,9 +44,12 @@ def signing_key_weakness(key: str) -> str | None:
     # and Helm's randAlphaNum emits no separators and would spell
     # "changeme" about once in 16 billion keys. Bare "change" in an
     # all-alphanumeric key is allowed for that reason: at six letters it
-    # turns up in roughly one random key in 15 million.
+    # turns up in roughly one random key in 15 million. "change" must also
+    # start a word, so a passphrase like "corp-exchange-..." is not refused.
     lowered = key.lower()
-    if "changeme" in lowered or ("change" in lowered and not key.isalnum()):
+    if "changeme" in lowered or (
+        re.search(r"(?<![a-z])change", lowered) is not None and not key.isalnum()
+    ):
         return "it looks like a placeholder (it contains 'change')"
     if len(key) < _SECRET_KEY_MIN_LENGTH:
         return f"it is shorter than {_SECRET_KEY_MIN_LENGTH} characters"
@@ -444,9 +448,10 @@ class Settings(BaseSettings):
                 f"SECRET_KEY is not safe to use: {weakness}. It signs every session "
                 "token, so anyone who knows it can sign in as any user. Generate one "
                 "with `openssl rand -hex 32` and set SECRET_KEY. If this install already "
-                "has data, run `python -m app.core.rotate_secret_key` with OLD_SECRET_KEY "
-                "set to the key you are replacing, before starting the api, so stored "
-                "credentials are re-encrypted under the new key "
+                "has data, first set SECRET_KEY to the NEW key, then run "
+                "`python -m app.core.rotate_secret_key` with OLD_SECRET_KEY set to the "
+                "key you are replacing, before starting the api, so stored credentials "
+                "are re-encrypted under the new key "
                 "('Rotating SECRET_KEY' in docs/deployment/DOCKER.md, or k8s/README.md for "
                 "k8s/base). For local development "
                 "only, ALLOW_INSECURE_SECRET_KEY=true boots with a warning instead."

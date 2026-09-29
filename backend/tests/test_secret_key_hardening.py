@@ -64,6 +64,8 @@ def test_a_generated_key_boots() -> None:
     assert signing_key_weakness(_GOOD_KEY) is None
     # Helm's randAlphaNum 64 can spell "change" by chance; no separator, no refusal.
     assert signing_key_weakness("aB3" + "Change" + "x9Q" * 18) is None
+    # "change" inside a word is not a placeholder.
+    assert signing_key_weakness("corp-exchange-server-signing-key-7f3a9c2e") is None
     assert Settings(secret_key=_GOOD_KEY, allow_insecure_secret_key=False).secret_key == _GOOD_KEY
 
 
@@ -193,6 +195,16 @@ async def test_force_logout_reaches_the_nmap_stream(db_session: AsyncSession) ->
     with pytest.raises(HTTPException) as exc:
         await _resolve_user_from_query_token(db_session, token, request)
     assert exc.value.status_code == 401
+
+
+async def test_a_jti_that_is_not_a_uuid_is_a_401_not_a_500(
+    production_token_rule: None, db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A signed token whose jti cannot name a session is refused, not a crash."""
+    user = await _local_user(db_session)
+    token = create_access_token(str(user.id), jti="not-a-uuid")
+    resp = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
 
 
 async def test_a_session_of_another_user_is_refused(
