@@ -224,17 +224,20 @@ Needed when an install has been running on the `.env.example` placeholder or ano
 docker compose stop api worker beat
 
 # Keep the key being replaced, then put a new one in .env.
-OLD_SECRET_KEY="$(grep '^SECRET_KEY=' .env | cut -d= -f2-)"
+export OLD_SECRET_KEY="$(grep '^SECRET_KEY=' .env | cut -d= -f2-)"
 sed -i "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" .env
 
 # Re-encrypt every stored credential from the old key to the new one.
-docker compose run --rm -e OLD_SECRET_KEY="$OLD_SECRET_KEY" api \
+# `-e OLD_SECRET_KEY` with no value passes it through from this shell, so
+# the key never appears on a command line.
+docker compose run --rm -e OLD_SECRET_KEY api \
   python -m app.core.rotate_secret_key
+unset OLD_SECRET_KEY
 
 docker compose up -d api worker beat
 ```
 
-The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If you are changing `CREDENTIAL_ENCRYPTION_KEY` at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY`. If it is set and unchanged, stored credentials never depended on `SECRET_KEY` and the command says there is nothing to do.
+The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, stored credentials never depended on `SECRET_KEY`: the command finds every value already under the current key and moves nothing.
 
 If the install ran on a **placeholder** key, anyone who knew it could sign requests as any user. After rotating, review **Admin → API tokens** and the users and superadmins list, and check the audit log for changes you do not recognise: a token or account created with a forged session survives the rotation.
 

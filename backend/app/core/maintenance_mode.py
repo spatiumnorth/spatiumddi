@@ -168,9 +168,13 @@ async def _bearer_is_effective_superadmin(token: str, method: str, path: str) ->
     from sqlalchemy.orm import selectinload  # noqa: PLC0415
 
     from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
-    from app.core.security import decode_access_token, hash_api_token  # noqa: PLC0415
+    from app.core.security import (  # noqa: PLC0415
+        decode_access_token,
+        hash_api_token,
+        live_access_session,
+    )
     from app.db import AsyncSessionLocal  # noqa: PLC0415
-    from app.models.auth import APIToken, Group, User, UserSession  # noqa: PLC0415
+    from app.models.auth import APIToken, Group, User  # noqa: PLC0415
     from app.services.api_token_scopes import scope_matches_request  # noqa: PLC0415
 
     # Eager-load groups → roles so the synchronous ``is_effective_superadmin``
@@ -215,20 +219,15 @@ async def _bearer_is_effective_superadmin(token: str, method: str, path: str) ->
                     user_id = payload["sub"]
                 except (JWTError, KeyError):
                     return False
-                # Session gate — mirror deps.get_current_user (deps.py:130-137).
-                # Tokens minted after the session-viewer landing carry a ``jti``
-                # claim mapping to a ``UserSession`` row; a force-logged-out
-                # superadmin (``revoked``) whose JWT is still unexpired must NOT
-                # bypass maintenance mode. A token with no ``jti`` was already
-                # refused by ``decode_access_token`` (#1222).
-                jti = payload.get("jti")
-                if jti is not None:
-                    from datetime import UTC  # noqa: PLC0415
-                    from datetime import datetime as _dt
-
-                    session = await db.get(UserSession, jti)
-                    if session is None or session.revoked or session.expires_at <= _dt.now(UTC):
-                        return False
+                # Session gate — the same ``live_access_session`` the auth dep
+                # uses. A force-logged-out superadmin (``revoked``) whose JWT is
+                # still unexpired must NOT bypass maintenance mode, nor may a
+                # token whose session belongs to another user. A token with no
+                # ``jti`` was already refused by ``decode_access_token`` (#1222).
+                try:
+                    await live_access_session(db, payload)
+                except JWTError:
+                    return False
                 user = (
                     await db.execute(select(User).where(User.id == user_id).options(*_user_opts))
                 ).scalar_one_or_none()

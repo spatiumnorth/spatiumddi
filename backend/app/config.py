@@ -1,3 +1,5 @@
+import base64
+import binascii
 import sys
 
 from pydantic import model_validator
@@ -34,14 +36,40 @@ def secret_key_problem(key: str) -> str | None:
     """
     if key in _KNOWN_SECRET_KEY_PLACEHOLDERS:
         return "it is a placeholder committed to the SpatiumDDI repository"
-    # "change" plus a separator: every placeholder reads like one
-    # ("change-me-...", "CHANGEME-generate-..."), and neither generator a
-    # deployment uses can produce it. `openssl rand -hex` cannot spell
-    # "change" at all, and Helm's randAlphaNum emits no separators.
-    if "change" in key.lower() and not key.isalnum():
+    # A placeholder reads like one: "change" plus a separator
+    # ("change-me-...", "CHANGEME-generate-..."), or "changeme" run together
+    # ("ChangeMeChangeMe..."). Neither generator a deployment uses produces
+    # either in practice: `openssl rand -hex` cannot spell "change" at all,
+    # and Helm's randAlphaNum emits no separators and would spell
+    # "changeme" about once in 16 billion keys. Bare "change" in an
+    # all-alphanumeric key is allowed for that reason: at six letters it
+    # turns up in roughly one random key in 15 million.
+    lowered = key.lower()
+    if "changeme" in lowered or ("change" in lowered and not key.isalnum()):
         return "it looks like a placeholder (it contains 'change')"
     if len(key) < _SECRET_KEY_MIN_LENGTH:
         return f"it is shorter than {_SECRET_KEY_MIN_LENGTH} characters"
+    return None
+
+
+def credential_key_problem(key: str) -> str | None:
+    """Why ``key`` cannot be the CREDENTIAL_ENCRYPTION_KEY, or None if it can.
+
+    Empty is fine (the key is then derived from SECRET_KEY). Anything else
+    must be what ``Fernet`` accepts: 32 bytes, url-safe base64. Checked at
+    boot rather than on first use, because ``app.core.crypto`` builds its
+    Fernet lazily, so a bad key would otherwise boot and then fail every
+    encrypt / decrypt with an error callers read as "undecryptable".
+    """
+    raw = key.strip()
+    if not raw:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(raw.encode())
+    except (binascii.Error, ValueError):
+        return "it is not url-safe base64"
+    if len(decoded) != 32:
+        return f"it decodes to {len(decoded)} bytes, not 32"
     return None
 
 
@@ -394,6 +422,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_secret_key(self) -> "Settings":
+        # Refuse to boot on a malformed CREDENTIAL_ENCRYPTION_KEY (#1222):
+        # falling back to the SECRET_KEY-derived key would encrypt under a
+        # different key than the operator configured.
+        cred_problem = credential_key_problem(self.credential_encryption_key)
+        if cred_problem is not None and not self.allow_insecure_secret_key:
+            raise ValueError(
+                f"CREDENTIAL_ENCRYPTION_KEY is not a valid Fernet key: {cred_problem}. "
+                'Generate one with `python3 -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"`, or leave it empty to derive '
+                "the key from SECRET_KEY. If stored credentials were written while this "
+                "value was malformed, they are under the SECRET_KEY-derived key: leave "
+                "it empty to keep reading them."
+            )
         # Refuse to boot on a placeholder or weak SECRET_KEY (#1222).
         problem = secret_key_problem(self.secret_key)
         if problem is None:
@@ -406,7 +447,8 @@ class Settings(BaseSettings):
                 "has data, run `python -m app.core.rotate_secret_key` with OLD_SECRET_KEY "
                 "set to the key you are replacing, before starting the api, so stored "
                 "credentials are re-encrypted under the new key "
-                "(docs/deployment/DOCKER.md, 'Rotating SECRET_KEY'). For local development "
+                "('Rotating SECRET_KEY' in docs/deployment/DOCKER.md, or k8s/README.md for "
+                "k8s/base). For local development "
                 "only, ALLOW_INSECURE_SECRET_KEY=true boots with a warning instead."
             )
         # Skip the stderr spam under pytest — Settings() is built at import

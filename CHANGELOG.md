@@ -1334,7 +1334,8 @@ the formatter handles the rest.
   their own keys and are unaffected.
   **Upgrade note:** an install that has been running on the placeholder
   stops at boot. Follow "Rotating `SECRET_KEY`" in
-  `docs/deployment/DOCKER.md`: set a new key, then run
+  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
+  with a one-off Job in `k8s/ops/`): set a new key, then run
   `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
   starting the api. It re-encrypts every stored credential for the new key
   (the same walk a cross-install restore uses), is idempotent, and records
@@ -1345,7 +1346,9 @@ the formatter handles the rest.
   says to review API tokens, users and the audit log afterwards.
   Also: an access token that names no session (`jti`) is refused. Every
   login has minted one since `2026.05.07-1`, so such a token can only be
-  forged, and it also escaped force-logout. And force-logout now reaches
+  forged, and it also escaped force-logout. The session a token names must
+  also belong to the token's user, or a forger could pair their own live
+  session with a superadmin's id. And force-logout now reaches
   the nmap scan stream, which checked its own token without looking at
   the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
   so `kubectl apply -f k8s/base/` no longer overwrites a real secret with

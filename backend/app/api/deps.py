@@ -11,9 +11,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
-from app.core.security import decode_access_token, hash_api_token
+from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.db import AsyncSessionLocal, get_db
-from app.models.auth import APIToken, User, UserSession
+from app.models.auth import APIToken, User
 from app.services.api_token_scopes import scope_matches_request
 
 logger = structlog.get_logger(__name__)
@@ -211,15 +211,16 @@ async def get_current_user(
     # superadmin flips ``revoked``, every in-flight access token using that
     # jti starts 401-ing on the next request. A token with no ``jti`` has
     # already been refused by ``decode_access_token`` (#1222); the test
-    # suite alone lets one through.
-    jti = payload.get("jti")
-    if jti is not None:
-        session = await db.get(UserSession, jti)
-        if session is None or session.revoked or session.expires_at <= datetime.now(UTC):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session revoked or expired",
-            )
+    # suite alone lets one through. The session must also belong to the
+    # token's ``sub`` (``live_access_session``).
+    try:
+        session = await live_access_session(db, payload)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session revoked or expired",
+        )
+    if session is not None:
         # Bump ``last_seen_at`` no more than once per minute per
         # session — gives the admin viewer a recent timestamp without
         # a write on every authenticated request.

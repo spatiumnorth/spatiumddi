@@ -21,8 +21,13 @@ value already under the new key is counted and left alone, so a re-run
 after an interruption is safe.
 
 When ``CREDENTIAL_ENCRYPTION_KEY`` is set and unchanged, the Fernet key does
-not depend on SECRET_KEY and there is nothing to re-encrypt. If it is being
-changed too, pass the old one as ``OLD_CREDENTIAL_ENCRYPTION_KEY``.
+not depend on SECRET_KEY: every value is found already under the new key and
+left alone. If it is being changed too, pass the old one as
+``OLD_CREDENTIAL_ENCRYPTION_KEY``. Left unset, the old install is taken to
+have had NO credential key (values under the key derived from
+OLD_SECRET_KEY), which is the common case of adding a credential key while
+rotating. Defaulting to the CURRENT credential key instead would make that
+case report "nothing to re-encrypt" and strand every stored credential.
 
 Keys are read from the environment, never from argv, so they do not land in
 shell history or the process list.
@@ -101,7 +106,12 @@ async def rotate(old_secret_key: str, old_credential_key: str) -> int:
         )
         return 0
 
-    await _audit(outcome)
+    audited = True
+    try:
+        await _audit(outcome)
+    except Exception as exc:  # noqa: BLE001 — report, never mask the outcome below
+        audited = False
+        print(f"Could not record the audit row: {exc!r}", file=sys.stderr)
     print(
         f"Re-encrypted {outcome.rewrapped_rows} stored values and "
         f"{outcome.rewrapped_jsonb_fields} embedded ones; "
@@ -111,11 +121,19 @@ async def rotate(old_secret_key: str, old_credential_key: str) -> int:
         print(
             f"NOT COMPLETE: {outcome.failed_rows} values could be decrypted with neither "
             f"key{' and the walk stopped early' if outcome.aborted else ''}. Check "
-            "OLD_SECRET_KEY, then run this again; values already moved are skipped.",
+            "OLD_SECRET_KEY (and OLD_CREDENTIAL_ENCRYPTION_KEY, if the old install set "
+            "one), then run this again; values already moved are skipped.",
             file=sys.stderr,
         )
         for failure in outcome.failures[:20]:
             print(f"  {failure}", file=sys.stderr)
+        return 1
+    if not audited:
+        print(
+            "Credentials were re-encrypted, but the audit row was not written. "
+            "Run this again once the database is reachable; it moves nothing twice.",
+            file=sys.stderr,
+        )
         return 1
     print("Done. Start the stack; everyone signs in again.")
     return 0
@@ -127,10 +145,17 @@ def main() -> int:
         print(__doc__, file=sys.stderr)
         print("OLD_SECRET_KEY is not set.", file=sys.stderr)
         return 2
-    old_credential = os.environ.get(
-        "OLD_CREDENTIAL_ENCRYPTION_KEY", settings.credential_encryption_key
-    )
-    return asyncio.run(rotate(old, old_credential))
+    return asyncio.run(rotate(old, old_credential_key_from_env()))
+
+
+def old_credential_key_from_env() -> str:
+    """The credential key the old install used, from the environment.
+
+    Unset means "the old install had no credential key", NOT "unchanged":
+    see the module docstring. An unchanged key is still handled correctly,
+    because the walk finds every value already under the new key.
+    """
+    return os.environ.get("OLD_CREDENTIAL_ENCRYPTION_KEY", "")
 
 
 if __name__ == "__main__":

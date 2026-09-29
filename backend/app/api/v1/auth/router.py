@@ -807,8 +807,8 @@ def _current_session_jti(request: Request) -> str | None:
 
     Returns None for API-token auth, or anything that fails to decode
     (including a token with no ``jti``, #1222) — in which case we simply
-    revoke every session,
-    which is the safe direction (the caller just has to log in again)."""
+    revoke every session, which is the safe direction (the caller just has
+    to log in again)."""
     header = request.headers.get("authorization") or ""
     scheme, _, raw = header.partition(" ")
     if scheme.lower() != "bearer" or not raw:

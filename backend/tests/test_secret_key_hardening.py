@@ -50,6 +50,7 @@ _PASSWORD = "Sup3r-secret!"
         "change-me-to-a-random-32-char-string",  # .env.example
         "CHANGEME-generate-with-openssl-rand-hex-32",  # k8s/base, which never warned
         "please-Change-this-before-going-to-production-ok",
+        "ChangeMeChangeMeChangeMeChangeMe1",  # no separator, but still a placeholder
         "short-but-random-7f3a9c",
         "",
     ],
@@ -96,6 +97,24 @@ def test_a_malformed_credential_key_stops_the_boot(monkeypatch: pytest.MonkeyPat
             crypto._fernet()
     finally:
         crypto._fernet.cache_clear()
+
+
+def test_a_malformed_credential_key_is_refused_at_boot() -> None:
+    """``crypto._fernet`` is lazy, so the check has to live in Settings or a
+    bad key boots and then fails every credential read at runtime."""
+    with pytest.raises(ValidationError, match="CREDENTIAL_ENCRYPTION_KEY"):
+        Settings(
+            secret_key=_GOOD_KEY,
+            credential_encryption_key="3f" * 32,  # hex, not a Fernet key
+            allow_insecure_secret_key=False,
+        )
+    good = Fernet.generate_key().decode()
+    assert (
+        Settings(
+            secret_key=_GOOD_KEY, credential_encryption_key=good, allow_insecure_secret_key=False
+        ).credential_encryption_key
+        == good
+    )
 
 
 # ── tokens that name no session ──────────────────────────────────────────────
@@ -177,6 +196,26 @@ async def test_force_logout_reaches_the_nmap_stream(db_session: AsyncSession) ->
     assert exc.value.status_code == 401
 
 
+async def test_a_session_of_another_user_is_refused(
+    production_token_rule: None, db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A signer pairing their own live session with someone else's user id."""
+    victim = await _local_user(db_session)
+    attacker = await _local_user(db_session)
+    session = UserSession(
+        user_id=attacker.id,
+        refresh_token_hash=uuid.uuid4().hex,
+        created_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+        revoked=False,
+    )
+    db_session.add(session)
+    await db_session.commit()
+    token = create_access_token(str(victim.id), jti=str(session.id))
+    resp = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
+
+
 # ── rotation ─────────────────────────────────────────────────────────────────
 
 
@@ -243,3 +282,32 @@ async def test_rotation_reencrypts_stored_credentials(
 
     # Idempotent: a second run moves nothing and still succeeds.
     assert await rotate_secret_key.rotate(old, "") == 0
+
+
+async def test_adding_a_credential_key_while_rotating_moves_the_values(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, new_key: str
+) -> None:
+    """OLD_CREDENTIAL_ENCRYPTION_KEY left unset must mean "there was none",
+    not "same as the new one", or this reports nothing to do and strands
+    every credential."""
+    old = "change-me-to-a-random-32-char-string"
+    pinned = Fernet.generate_key().decode()
+    monkeypatch.setattr(settings, "credential_encryption_key", pinned)
+    monkeypatch.delenv("OLD_CREDENTIAL_ENCRYPTION_KEY", raising=False)
+    provider = AIProvider(
+        name=f"rot-{uuid.uuid4().hex[:6]}",
+        kind="openai_compat",
+        api_key_encrypted=_fernet_from_keys(old, "").encrypt(b"sk-live-secret"),
+    )
+    db_session.add(provider)
+    await db_session.commit()
+
+    old_credential = rotate_secret_key.old_credential_key_from_env()
+    assert old_credential == ""
+    assert await rotate_secret_key.rotate(old, old_credential) == 0
+
+    await db_session.refresh(provider)
+    assert provider.api_key_encrypted is not None
+    assert (
+        _fernet_from_keys(new_key, pinned).decrypt(provider.api_key_encrypted) == b"sk-live-secret"
+    )

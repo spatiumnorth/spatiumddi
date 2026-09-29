@@ -46,7 +46,8 @@ kubectl create secret generic spatiumddi-secrets \
 # without it, only API tokens can scrape.
 # secret-key must be a real key: the api refuses to boot on a placeholder or
 # anything under 32 characters (#1222). k8s/base/secrets.yaml.example shows
-# the shape but is not applied by `kubectl apply -f k8s/base/`.
+# the shape but is not applied by `kubectl apply -f k8s/base/`. Replacing the
+# key of an install that has data: see "Rotating SECRET_KEY" below.
 
 # 2. Deploy a standalone PostgreSQL (not HA — for dev/test only)
 kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
@@ -64,6 +65,47 @@ kubectl apply -f k8s/base/api.yaml
 kubectl apply -f k8s/base/worker.yaml
 kubectl apply -f k8s/base/frontend.yaml
 ```
+
+## Rotating SECRET_KEY
+
+Needed when the install has been running on the old `k8s/base/secrets.yaml`
+placeholder (`CHANGEME-generate-with-openssl-rand-hex-32`): from #1222 the api
+refuses to boot on it, so an upgrade crash-loops with an error pointing here.
+Also how to rotate a key you suspect has leaked.
+
+`SECRET_KEY` signs session tokens (everyone just signs in again) and is the
+source of the key every stored credential is encrypted with, so those have to
+be re-encrypted for the new key before the api reads them:
+
+```bash
+NS=spatiumddi
+kubectl -n $NS scale deploy/api deploy/worker deploy/beat --replicas=0
+
+# Keep the key being replaced, then write a new one.
+kubectl -n $NS get secret spatiumddi-secrets -o jsonpath='{.data.secret-key}' \
+  | base64 -d > /tmp/old-secret-key
+kubectl -n $NS create secret generic spatiumddi-old-secret-key \
+  --from-file=secret-key=/tmp/old-secret-key
+rm /tmp/old-secret-key
+kubectl -n $NS patch secret spatiumddi-secrets --type merge \
+  -p "{\"stringData\":{\"secret-key\":\"$(openssl rand -hex 32)\"}}"
+
+# Re-encrypt every stored credential from the old key to the new one.
+kubectl apply -f k8s/ops/rotate-secret-key-job.yaml
+kubectl -n $NS wait --for=condition=complete job/spatiumddi-rotate-secret-key --timeout=300s
+kubectl -n $NS logs job/spatiumddi-rotate-secret-key
+
+kubectl -n $NS delete job/spatiumddi-rotate-secret-key secret/spatiumddi-old-secret-key
+kubectl -n $NS scale deploy/api deploy/worker --replicas=2
+kubectl -n $NS scale deploy/beat --replicas=1
+```
+
+The log reports how many values were re-encrypted; the rotation also writes an
+audit row. If the Job fails, its log says why, and re-applying it after the fix
+is safe: values already under the new key are skipped. After moving off a
+placeholder, review API tokens, users and the audit log, as anyone who knew the
+placeholder could have signed requests as any user. The Helm chart generates
+its own key and needs none of this.
 
 ## High Availability (production)
 

@@ -99,6 +99,33 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return payload
 
 
+async def live_access_session(db: Any, payload: dict[str, Any]) -> Any:
+    """The live ``UserSession`` a decoded access token names, or raise.
+
+    The one session gate for every path that accepts an access token (the
+    auth dependency, the nmap stream, the maintenance-mode bypass), so they
+    cannot disagree. Raises :class:`JWTError` when the session is missing,
+    revoked or expired (force-logout, #72), or belongs to a different user
+    than the token's ``sub``. That last check is what makes a jti worth
+    requiring (#1222): without it, anyone able to sign a token could put
+    their OWN live session's jti next to a superadmin's user id.
+
+    Returns None only for a token with no ``jti``, which
+    :func:`decode_access_token` has already refused outside the test suite.
+    """
+    from app.models.auth import UserSession  # noqa: PLC0415 — keep security import-light
+
+    jti = payload.get("jti")
+    if jti is None:
+        return None
+    session = await db.get(UserSession, jti)
+    if session is None or session.revoked or session.expires_at <= datetime.now(UTC):
+        raise JWTError("Session revoked or expired")
+    if str(session.user_id) != str(payload.get("sub")):
+        raise JWTError("Session belongs to another user")
+    return session
+
+
 # ── MFA challenge tokens (issue #69) ──────────────────────────────────────────
 #
 # Short-lived JWT minted by ``/auth/login`` when a user has TOTP enabled. Only
