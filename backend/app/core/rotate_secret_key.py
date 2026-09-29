@@ -39,7 +39,7 @@ import asyncio
 import os
 import sys
 
-from app.config import secret_key_problem, settings
+from app.config import settings, signing_key_weakness
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 
@@ -74,10 +74,10 @@ async def _audit(outcome: RewrapOutcome) -> None:
 
 async def rotate(old_secret_key: str, old_credential_key: str) -> int:
     """Re-encrypt stored credentials for the new key. Returns an exit code."""
-    problem = secret_key_problem(settings.secret_key)
-    if problem is not None:
+    weakness = signing_key_weakness(settings.secret_key)
+    if weakness is not None:
         print(
-            f"SECRET_KEY (the NEW key) is not safe to use: {problem}. "
+            f"SECRET_KEY (the NEW key) is not safe to use: {weakness}. "
             "Set it to `openssl rand -hex 32` first.",
             file=sys.stderr,
         )

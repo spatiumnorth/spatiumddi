@@ -25,7 +25,7 @@ _KNOWN_SECRET_KEY_PLACEHOLDERS = frozenset(
 _SECRET_KEY_MIN_LENGTH = 32
 
 
-def secret_key_problem(key: str) -> str | None:
+def signing_key_weakness(key: str) -> str | None:
     """Why ``key`` must not sign tokens, or None if it may.
 
     SECRET_KEY signs every session JWT and, unless
@@ -229,7 +229,7 @@ class Settings(BaseSettings):
     # so forks can point their update check at their own repo.
     github_repo: str = "spatiumnorth/spatiumddi"
 
-    # Boot on a placeholder or weak SECRET_KEY (see ``secret_key_problem``)
+    # Boot on a placeholder or weak SECRET_KEY (see ``signing_key_weakness``)
     # with a warning instead of refusing. For local development only:
     # docker-compose.dev.yml sets it, nothing else should. #216 chose
     # warn-by-default; #1222 reversed that, because the warning was the
@@ -436,12 +436,12 @@ class Settings(BaseSettings):
                 "it empty to keep reading them."
             )
         # Refuse to boot on a placeholder or weak SECRET_KEY (#1222).
-        problem = secret_key_problem(self.secret_key)
-        if problem is None:
+        weakness = signing_key_weakness(self.secret_key)
+        if weakness is None:
             return self
         if not self.allow_insecure_secret_key:
             raise ValueError(
-                f"SECRET_KEY is not safe to use: {problem}. It signs every session "
+                f"SECRET_KEY is not safe to use: {weakness}. It signs every session "
                 "token, so anyone who knows it can sign in as any user. Generate one "
                 "with `openssl rand -hex 32` and set SECRET_KEY. If this install already "
                 "has data, run `python -m app.core.rotate_secret_key` with OLD_SECRET_KEY "
@@ -455,7 +455,7 @@ class Settings(BaseSettings):
         # time, so it would print on every collection.
         if "pytest" not in sys.modules:
             print(
-                f"WARNING: SECRET_KEY is not safe to use ({problem}); booting anyway "
+                f"WARNING: SECRET_KEY is not safe to use ({weakness}); booting anyway "
                 "because ALLOW_INSECURE_SECRET_KEY=true. Never set that outside local "
                 "development.",
                 file=sys.stderr,

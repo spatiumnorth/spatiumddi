@@ -29,8 +29,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.core.security as security
-from app.config import Settings, secret_key_problem, settings
+from app.config import Settings, settings, signing_key_weakness
 from app.core import crypto, rotate_secret_key
 from app.core.security import create_access_token, decode_access_token, hash_password
 from app.models.ai import AIProvider
@@ -56,15 +55,15 @@ _PASSWORD = "Sup3r-secret!"
     ],
 )
 def test_weak_keys_refuse_to_boot(key: str) -> None:
-    assert secret_key_problem(key) is not None
+    assert signing_key_weakness(key) is not None
     with pytest.raises(ValidationError, match="SECRET_KEY is not safe"):
         Settings(secret_key=key, allow_insecure_secret_key=False)
 
 
 def test_a_generated_key_boots() -> None:
-    assert secret_key_problem(_GOOD_KEY) is None
+    assert signing_key_weakness(_GOOD_KEY) is None
     # Helm's randAlphaNum 64 can spell "change" by chance; no separator, no refusal.
-    assert secret_key_problem("aB3" + "Change" + "x9Q" * 18) is None
+    assert signing_key_weakness("aB3" + "Change" + "x9Q" * 18) is None
     assert Settings(secret_key=_GOOD_KEY, allow_insecure_secret_key=False).secret_key == _GOOD_KEY
 
 
@@ -123,7 +122,7 @@ def test_a_malformed_credential_key_is_refused_at_boot() -> None:
 @pytest.fixture()
 def production_token_rule(monkeypatch: pytest.MonkeyPatch) -> None:
     """Undo the test suite's opt-out, so tokens are judged as in production."""
-    monkeypatch.setattr(security, "ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION", False)
+    monkeypatch.setattr("app.core.security.ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION", False)
 
 
 async def _local_user(db: AsyncSession) -> User:
