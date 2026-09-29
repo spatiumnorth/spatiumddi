@@ -12,13 +12,17 @@ stream simply stops.
 These tests drive the real ``fetch_to`` and ``_fetch_image`` against a
 local HTTP server that can promise a length and close early, honour or
 ignore ``Range``, and answer an error status. Stdlib only, no network
-beyond 127.0.0.1.
+beyond 127.0.0.1. The TLS tests also need the ``openssl`` CLI, to make a
+throwaway self-signed certificate.
 """
 
 from __future__ import annotations
 
 import http.server
 import importlib.util
+import shutil
+import ssl
+import subprocess
 import threading
 import urllib.error
 from importlib.machinery import SourceFileLoader
@@ -58,11 +62,16 @@ class _Server:
     ("cut", n) = 200 promising the whole body, n bytes sent, then closed;
     ("range",) = 206 from the requested offset when a Range is asked for,
     else like "full"; ("status", code) = that error status.
+
+    With ``tls`` the server speaks HTTPS with that context; the first
+    ``drop_first`` connections are closed before their handshake. Every
+    accepted connection is counted, handshake or not.
     """
 
-    def __init__(self, plans):
+    def __init__(self, plans, tls: ssl.SSLContext | None = None, drop_first: int = 0):
         self.plans = list(plans)
         self.requests: list[dict[str, str]] = []
+        self.connections = 0
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -96,11 +105,24 @@ class _Server:
                 self.wfile.write(body)
 
         class Quiet(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                sock, addr = super().get_request()
+                server.connections += 1
+                if tls is None:
+                    return sock, addr
+                if server.connections <= drop_first:
+                    sock.close()  # gone before the handshake, as a replaced frontend pod
+                    raise OSError("dropped before the TLS handshake")
+                # A handshake the client refuses raises here; serve_forever
+                # drops the connection and carries on.
+                return tls.wrap_socket(sock, server_side=True), addr
+
             def handle_error(self, request, client_address):
                 pass  # a client hanging up mid-response is the point of these tests
 
         self.httpd = Quiet(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/raw.xz?t=token"
+        scheme = "https" if tls is not None else "http"
+        self.url = f"{scheme}://127.0.0.1:{self.httpd.server_address[1]}/raw.xz?t=token"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
@@ -113,14 +135,34 @@ class _Server:
 def serve():
     servers: list[_Server] = []
 
-    def start(*plans):
-        s = _Server(plans)
+    def start(*plans, **kwargs):
+        s = _Server(plans, **kwargs)
         servers.append(s)
         return s
 
     yield start
     for s in servers:
         s.close()
+
+
+@pytest.fixture(scope="module")
+def self_signed_tls(tmp_path_factory):
+    """A server context with a throwaway self-signed certificate: what an
+    external image URL looks like to a node that cannot verify it."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("the openssl CLI is needed to make a self-signed certificate")
+    d = tmp_path_factory.mktemp("tls")
+    cert, key = d / "cert.pem", d / "key.pem"
+    subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-subj", "/CN=127.0.0.1", "-keyout", str(key), "-out", str(cert)],
+        check=True,
+        capture_output=True,
+    )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    return ctx
 
 
 # ── the defect, pinned ──────────────────────────────────────────────
@@ -213,6 +255,78 @@ def test_a_local_write_error_is_raised_at_once(slot_cli, serve, tmp_path, monkey
     with pytest.raises(slot_cli._LocalWriteError, match="No space left"):
         slot_cli.fetch_to(s.url, dst)
     assert len(s.requests) == 1
+
+
+# ── a certificate failure is configuration, not a dropped transfer ──
+
+
+def test_a_certificate_the_node_cannot_verify_is_raised_at_once(
+    slot_cli, serve, tmp_path, self_signed_tls, capsys
+):
+    """A verified fetch (an external image URL) that meets a certificate it
+    cannot verify fails at once. Retrying cannot fix it: it only added 75 s
+    of backoff before an rc 6 that said the download was interrupted.
+    urlopen wraps the error in URLError, which is an OSError."""
+    s = serve(("full",), tls=self_signed_tls)
+    dst = tmp_path / "slot.raw.xz"
+    with pytest.raises(urllib.error.URLError) as err:
+        slot_cli.fetch_to(s.url, dst)
+    assert isinstance(err.value.reason, ssl.SSLCertVerificationError)
+    assert s.connections == 1
+    assert "retrying" not in capsys.readouterr().out
+
+
+def test_an_unwrapped_certificate_error_is_raised_at_once(slot_cli, tmp_path, monkeypatch):
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append(1)
+        raise ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+    monkeypatch.setattr(slot_cli, "_fetch_http_once", refuse)
+    with pytest.raises(ssl.SSLCertVerificationError):
+        slot_cli.fetch_to("https://127.0.0.1:9/raw.xz", tmp_path / "slot.raw.xz")
+    assert len(calls) == 1
+
+
+def test_the_self_served_fetch_still_skips_verification(slot_cli, serve, tmp_path, self_signed_tls):
+    """The node's own image URL is behind its self-signed web certificate.
+    It is fetched unverified and the bytes are checked against the sha256
+    instead (#386), so the certificate is never a reason to refuse it."""
+    s = serve(("full",), tls=self_signed_tls)
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst, insecure=True)
+    assert dst.read_bytes() == BODY
+
+
+def test_a_tls_handshake_cut_short_is_still_retried(slot_cli, serve, tmp_path, self_signed_tls):
+    """Only a certificate failure is raised at once. A connection that drops
+    during the handshake is transfer trouble, and is retried."""
+    s = serve(("full",), tls=self_signed_tls, drop_first=1)
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst, insecure=True)
+    assert dst.read_bytes() == BODY
+    assert s.connections == 2
+
+
+def test_a_refused_connection_is_still_retried(slot_cli, serve, tmp_path, monkeypatch):
+    """What the live drills saw on the attempt after the cut, while the
+    node's replacement frontend pod was not serving yet."""
+    s = serve(("full",))
+    real = slot_cli._fetch_http_once
+    calls = []
+
+    def refused_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(slot_cli, "_fetch_http_once", refused_once)
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert len(calls) == 2
 
 
 def test_the_progress_sidecar_names_the_retry(slot_cli, serve, tmp_path):

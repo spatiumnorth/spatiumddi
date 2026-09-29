@@ -416,8 +416,8 @@ def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = Fals
     An HTTP download must arrive WHOLE (#1216): a short, dropped or
     stalled transfer, or a 408/429/5xx answer, is retried up to
     ``_FETCH_ATTEMPTS`` times with backoff, and only a transfer that never
-    completes raises DownloadFailed. A 4xx answer and a local write error
-    are raised at once.
+    completes raises DownloadFailed. A 4xx answer, a certificate that
+    cannot be verified and a local write error are raised at once.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     if not src.startswith(("http://", "https://")):
@@ -454,6 +454,7 @@ def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = Fals
                 print(f"  download completed on attempt {attempt} of {_FETCH_ATTEMPTS}")
             return
         except urllib.error.HTTPError as exc:
+            # First: HTTPError subclasses URLError.
             if exc.code == 416 and dst.exists():
                 # Our Range asked past the end of what the server has: the
                 # partial file cannot be continued, so start it over.
@@ -465,8 +466,19 @@ def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = Fals
                 raise
             exc.close()
             last = exc
+        except ssl.SSLCertVerificationError:
+            # A certificate the node cannot verify is configuration (an
+            # unknown CA, an expired or mismatched certificate), not a
+            # dropped transfer, so a retry cannot fix it. Only a verified
+            # fetch meets this: the self-served one is unverified.
+            raise
+        except urllib.error.URLError as exc:
+            # urlopen wraps the certificate failure above in URLError.
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise
+            last = exc
         except (DownloadIncomplete, http.client.HTTPException, OSError) as exc:
-            # OSError covers URLError, a reset, a TLS error and the read
+            # OSError covers a reset, any other TLS error and the read
             # timeout; http.client.HTTPException covers IncompleteRead on a
             # chunked body and a malformed response.
             last = exc
