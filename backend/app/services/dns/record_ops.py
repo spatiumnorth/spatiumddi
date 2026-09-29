@@ -414,8 +414,12 @@ def record_op_payload(record: DNSRecord) -> dict[str, Any]:
     """The neutral RecordOp payload (``name``/``type``/``value``/``ttl``/
     ``priority``/``weight``/``port``) ``enqueue_record_op`` + the agentless
     drivers consume, built from a ``DNSRecord`` row. One place to add a field so
-    a new one can't be silently dropped from a provider push (#632)."""
+    a new one can't be silently dropped from a provider push (#632).
+
+    ``record_id`` names the row, so a delete's RRset drops exactly that row
+    and not an identical twin that stays live (#1230). Drivers ignore it."""
     return {
+        "record_id": str(record.id),
         "name": record.name,
         "type": record.record_type,
         "value": record.value,

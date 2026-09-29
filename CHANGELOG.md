@@ -223,6 +223,91 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **VoIP phone-profile options reach the phone, and are checked when
+  saved (#1294).** A phone profile rendered each option under its
+  catalogue name (`polycom-config-url`, `yealink-prov-server`,
+  `vendor-encapsulated-options`). The agent does not know those names and
+  dropped them with only a log line, so a Polycom profile saved and option
+  160 never reached a phone. The profile's option **code** now decides what
+  is delivered: its canonical name when SpatiumDDI has one (66, 150), else
+  `code:NN`, which the agent renders with its shipped definition. Values
+  get the #1228 checks: a code listed twice, a name that contradicts its
+  code (SpatiumDDI's own or the VoIP catalogue's), and a value Kea cannot
+  load are each a `422`. A stored row whose name contradicts its code keeps
+  the delivery it had before. Enabling a profile
+  checks every option and refuses the starter pack's `CHANGE-ME`
+  placeholders. Rendered by code, a placeholder in binary option 43 would
+  otherwise make Kea reject the group's whole config. A profile stored
+  before these checks is rendered without the options Kea cannot load,
+  each logged as `dhcp_phone_option_dropped_invalid`.
+  `vendor_class_match` is placed inside a Kea string literal, so a `'` or
+  a control character now gets a 422, and a stored profile containing one
+  is left out of the
+  render instead of breaking the config. It is measured in bytes, so a
+  non-ASCII vendor string can now match. Verified with `kea-dhcp4 -t`.
+
+- **Deleting one of two identical DNS records no longer takes the
+  record off the server (#1230).** Nothing stopped a record being stored
+  twice: `POST …/records` did no duplicate check, so an Ansible retry, a
+  flaky network or a double click made a second identical row. Every
+  record op carries the whole RRset the server should end up with
+  (#773), and a delete dropped the deleted record's *value* from it,
+  taking the twin's copy too. The server stopped answering for a
+  record the zone, and the UI, still listed. Two fixes:
+  - A delete now drops the deleted *row*, named in the op payload as
+    `record_id`, so an identical row that stays keeps the value on the
+    wire. This covers twins that already exist, with no data migration,
+    on every delete path that has the row (single, bulk, trash purge,
+    IPAM sync) and on agent and agentless drivers alike. The wire never
+    carries the same RR twice.
+  - Creating or editing a record into an identical one (same view,
+    owner name case-insensitively, type, value and priority / weight /
+    port; TTL is the RRset's) is a `409` naming the existing record.
+    Bulk create skips it as `identical record already exists`, which
+    also makes re-submitting a batch idempotent. The Copilot's
+    `create_dns_record` refuses it. A record in the trash does not
+    count.
+
+- **DHCP option names and values are checked when saved (#1228).**
+  Scope, pool, reservation, option-template, client-class and
+  device-policy options were stored as given. Only `domain-name` and
+  `domain-search` were checked. A value Kea cannot parse, such as
+  `routers: "10.0.0.1, bogus"`, an MTU of 70000, or text in raw option
+  43 where hex is required, made Kea reject the whole config for the
+  server group. The agent reverted and alerted (#882), but every later
+  change to the group was stuck behind it. A name the renderer does not
+  know was dropped by the agent with only a log line, so the option
+  was saved and never served. Each of those writes is now a `422` that
+  names the option. Names are checked against what the Kea renderer
+  emits for the scope's address family. A raw `code:NN` is accepted
+  only for the codes SpatiumDDI ships a definition for, since the
+  agent drops any other. `opt-NN` (the Windows importer's spelling) is
+  accepted. Raw `option_data` is refused. Values are typed: IPv4 or
+  IPv6 addresses, integer ranges, FQDNs, non-blank strings, and plain
+  even-length hex for binary codes. The rules were checked against
+  `kea-dhcp4 -t`. An option already stored is not re-checked unless
+  the write changes it, so existing scopes stay editable. Applying an
+  option template checks the merged result against the scope's family.
+  A pick from the custom-options catalogue is now stored under the code
+  it can be delivered as (`code:43`), instead of a catalogue name the
+  agent would drop. This applies in the option-template and client-class
+  editors too, which used to key such a pick by its name or `option-NN`.
+
+- **A slot upgrade survives its image download being cut short
+  (#1216).** The runner read the image until the connection stopped
+  sending and never compared the bytes with `Content-Length`. So a
+  download cut mid-transfer left a partial image, and the apply failed
+  as "checksum mismatch", which reads as a corrupt image. A rolling
+  cluster upgrade can cut it: the frontend pod that serves a node its
+  image is replaced mid-download (#1215). The runner now counts the
+  bytes. A short, dropped or stalled transfer, and an HTTP 408, 429 or
+  5xx answer, gets up to five attempts, with backoff of 5, 10, 20 and
+  40 s, and a retry resumes with `Range` where the server allows it. A
+  4xx answer, a certificate the node cannot verify and a full disk fail
+  at once. A download that never completes fails with its own message:
+  the image download was interrupted, nothing was written to the
+  inactive slot, and the upgrade can be retried.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
@@ -1314,6 +1399,66 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **A client can no longer choose the source IP the API records
+  and rate-limits (#1221).** Compose published the API on every
+  interface, and the API believed `X-Real-IP` from any caller. nginx
+  overwrites that header, but a client talking to `:8000` directly set
+  its own. That bypassed the per-IP login throttle and the ACME
+  `allowfrom` gate, and wrote any address it liked into audit rows,
+  reopening #626 by another path. Now uvicorn runs with
+  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
+  `X-Forwarded-Proto` only when the real TCP peer is in the new
+  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
+  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
+  longer read at all. Compose also publishes the API on `127.0.0.1`
+  only (`API_BIND`). Browsers and remote agents already go through
+  the frontend, and the looking-glass collector's host networking
+  uses localhost. **Upgrade note:** if you reach `:8000` from another
+  machine, set `API_BIND=0.0.0.0`, and preferably narrow
+  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
+  whose nodes have public addresses, add them to
+  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
+  browser, as the client.
+
+- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
+  `SECRET_KEY` signs every session token and, unless
+  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
+  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
+  both shipped a committed placeholder, and the boot check only warned (and
+  did not recognise the k8s one at all). On such an install any signed-in
+  user could mint a superadmin token, since user ids are visible in the
+  audit log, and a database dump decrypted every stored LDAP, integration
+  and AI provider secret. Now the api refuses to start on either
+  placeholder, on a key under 32 characters, or on one that reads like a
+  placeholder, and says how to generate a key and how to move an existing
+  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
+  instead; `docker-compose.dev.yml` sets it and nothing else should.
+  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
+  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
+  falling back to a different key. Helm and the appliance already generate
+  their own keys and are unaffected.
+  **Upgrade note:** an install that has been running on the placeholder
+  stops at boot. Follow "Rotating `SECRET_KEY`" in
+  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
+  with a one-off Job in `k8s/ops/`): set a new key, then run
+  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
+  starting the api. It re-encrypts every stored credential for the new key
+  (the same walk a cross-install restore uses), is idempotent, and records
+  an audit row; everyone signs in again. Deliberately not "generate a key
+  on first start": compose could only persist it in Postgres, next to the
+  credentials it protects, so a dump would decrypt them anyway. Because
+  anyone could have signed requests on a placeholder key, the doc also
+  says to review API tokens, users and the audit log afterwards.
+  Also: an access token that names no session (`jti`) is refused. Every
+  login has minted one since `2026.05.07-1`, so such a token can only be
+  forged, and it also escaped force-logout. The session a token names must
+  also belong to the token's user, or a forger could pair their own live
+  session with a superadmin's id. And force-logout now reaches
+  the nmap scan stream, which checked its own token without looking at
+  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
+  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
+  the placeholder.
 
 - **Appliance supervisors verify the control plane's TLS certificate
   (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on

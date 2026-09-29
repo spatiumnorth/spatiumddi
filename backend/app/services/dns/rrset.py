@@ -114,13 +114,21 @@ def rrset_target(op: str, record: dict[str, Any]) -> tuple[str, str] | None:
 
 def _member(value: str, ttl: int | None, src: Any) -> dict[str, Any]:
     """One RRset member. ``src`` is either a ``DNSRecord`` or an op payload
-    dict — both expose the structured fields under the same names."""
+    dict — both expose the structured fields under the same names.
+
+    A member built from a row also carries that row's ``id`` (an op payload
+    carries it as ``record_id``), so a delete can drop exactly the row it is
+    about and not an identical twin (#1230). It never reaches the wire:
+    ``_rrset_payload`` strips it."""
     getter = src.get if isinstance(src, dict) else lambda f: getattr(src, f, None)
     out: dict[str, Any] = {"value": value, "ttl": ttl}
     for field in _STRUCT_FIELDS:
         val = getter(field)
         if val is not None:
             out[field] = val
+    row_id = src.get("record_id") if isinstance(src, dict) else getattr(src, "id", None)
+    if row_id is not None:
+        out["id"] = str(row_id)
     return out
 
 
@@ -196,17 +204,35 @@ def _fold(
       spliced over any identical member rather than appended, so replaying an
       op cannot duplicate an RR, and an op whose row has not been flushed yet
       still lands.
-    * ``delete`` — the op's value is absent. Removing by value matters for the
-      callers that enqueue the retraction *before* the row leaves the database
-      (``bulk_delete_records`` gates its DB delete on the wire result, so at
-      stamp time every victim is still live), where the rows the query returns
-      include the very values being retracted.
+    * ``delete`` — the op's ROW is absent. When the payload names the row
+      (``record_id``), exactly that member is dropped, so an identical row
+      that stays live keeps the value on the wire (#1230): the database can
+      hold the same RR twice, and deleting one copy used to ship an RRset
+      without it, so the server stopped answering for a record the UI still
+      listed. Dropping the row rather than letting the query miss it matters
+      for the callers that enqueue the retraction *before* the row leaves the
+      database (``bulk_delete_records`` gates its DB delete on the wire
+      result, and the IPAM sync deletes after enqueueing), where the rows the
+      query returns include the very row being retracted. A payload without
+      ``record_id`` (a caller with no row at hand) falls back to removing the
+      value outright.
+
+    The result is de-duplicated: the database may hold twins, the wire must
+    not carry the same RR twice.
     """
     own = _member(record.get("value") or "", record.get("ttl"), record)
-    desired = [m for m in members if not _same_rr(m, own)]
-    if op != "delete":
-        desired.append(own)
-    return desired
+    row_id = own.get("id")
+    if op == "delete" and row_id is not None:
+        desired = [m for m in members if m.get("id") != row_id]
+    else:
+        desired = [m for m in members if not _same_rr(m, own)]
+        if op != "delete":
+            desired.append(own)
+    unique: list[dict[str, Any]] = []
+    for member in desired:
+        if not any(_same_rr(member, kept) for kept in unique):
+            unique.append(member)
+    return unique
 
 
 def _rrset_payload(members: list[dict[str, Any]], zone_ttl: int | None) -> dict[str, Any]:
@@ -222,7 +248,7 @@ def _rrset_payload(members: list[dict[str, Any]], zone_ttl: int | None) -> dict[
     ttls = [default_ttl if m.get("ttl") is None else m["ttl"] for m in members]
     return {
         "ttl": min(ttls) if ttls else default_ttl,
-        "members": [{k: v for k, v in m.items() if k != "ttl"} for m in members],
+        "members": [{k: v for k, v in m.items() if k not in ("ttl", "id")} for m in members],
     }
 
 
