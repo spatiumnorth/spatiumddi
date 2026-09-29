@@ -141,6 +141,25 @@ so a scope saved before this check stays editable. Applying an option
 template checks the merged result against the scope's address family.
 The value rules were measured against `kea-dhcp4 -t` (Kea 3.0.3).
 
+**VoIP phone profiles (#1294)** follow the same rules, with one difference.
+A phone option names its **code**, and the code decides what is delivered.
+The name beside it is only a label. A code SpatiumDDI has a canonical name
+for (66, 150) renders under that name. Any other code renders as `code:NN`.
+Profiles used to render the catalogue name (`polycom-config-url`), which the
+agent does not know and dropped, so option 160 never reached a phone. A
+canonical name that contradicts its code, or a code listed twice, is a
+`422`.
+
+Enabling a profile checks every option, not only the changed ones. It also
+refuses the starter pack's `CHANGE-ME` placeholders, which the pack seeds
+into every option of the profiles it creates disabled. A profile stored
+before these checks is rendered without any option Kea cannot load, with a
+`dhcp_phone_option_dropped_invalid` warning in the api log. Before, one such
+option would have rejected the group's whole config. `vendor_class_match` is
+placed inside a Kea string literal, so a `'` in it is refused, and a stored
+profile containing one is left out of the render. The match is measured in
+bytes, so a non-ASCII vendor string can match.
+
 #### Dynamic-lease DNS drift (`dns_track_dynamic_leases`)
 
 When SpatiumDDI pulls active leases from an agentless DHCP server (Windows DHCP,

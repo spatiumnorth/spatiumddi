@@ -396,3 +396,100 @@ def validate_options(
         if key in prev and prev[key] == value:
             continue
         _check_one(str(key), value, address_family)
+
+
+# ── Phone profiles (#1294) ──────────────────────────────────────────────────
+
+# The value the VoIP starter pack seeds every option with, for the operator to
+# replace. A profile is refused ``enabled`` while one is left.
+PHONE_PLACEHOLDER = "CHANGE-ME"
+
+
+def phone_option_key(code: int) -> str:
+    """The key a phone-profile option is rendered under (#1294).
+
+    A phone option names its CODE explicitly; the name beside it is a label.
+    So the code decides what is delivered: the canonical name when SpatiumDDI
+    has one for it (66 → ``tftp-server-name``), else ``code:NN``. Keying by the
+    catalogue name (``polycom-config-url``) is what the agent dropped, so
+    option 160 never reached a phone.
+    """
+    return CODE_TO_NAME.get(code) or f"code:{code}"
+
+
+def phone_options_map(rows: Any) -> dict[str, Any]:
+    """``[{code, name, value}, …]`` → the mapping a phone class renders.
+    Rows with no value, or no usable code, are skipped."""
+    out: dict[str, Any] = {}
+    for row in rows or ():
+        if not isinstance(row, dict) or not row.get("value"):
+            continue
+        raw = row.get("code")
+        try:
+            code = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            continue
+        if code:
+            out[phone_option_key(code)] = row["value"]
+    return out
+
+
+def validate_phone_options(rows: Any, *, previous: Any = None, going_live: bool = False) -> None:
+    """Raise ``ValueError`` naming the first phone option Kea could not load.
+
+    Checks what ``phone_options_map`` will render, against DHCPv4 (a phone
+    class is Dhcp4-only). Also refuses a code listed twice (one would silently
+    win) and a canonical name that contradicts its code. Options unchanged
+    from ``previous`` are skipped — the #597 stance — unless the profile is
+    going live, when every option is checked and a starter-pack placeholder
+    left in is refused.
+    """
+    seen: dict[int, str] = {}
+    for row in rows or ():
+        if not isinstance(row, dict) or not row.get("value"):
+            continue
+        code = int(row.get("code") or 0)
+        if code in seen:
+            raise ValueError(f"option {code} is listed twice")
+        seen[code] = str(row.get("value"))
+        name = row.get("name")
+        if name:
+            canonical = OPTION_NAME_ALIASES.get(str(name), str(name))
+            named_code = next((c for c, n in CODE_TO_NAME.items() if n == canonical), None)
+            if named_code is not None and named_code != code:
+                raise ValueError(
+                    f"option {code} is labelled '{name}', which is option {named_code}; "
+                    "the code is what is delivered, so fix one or the other"
+                )
+    mapping = phone_options_map(rows)
+    if going_live:
+        for code, value in seen.items():
+            if value.strip() == PHONE_PLACEHOLDER:
+                raise ValueError(
+                    f"option {code} still holds the starter pack's '{PHONE_PLACEHOLDER}' "
+                    "placeholder; set its real value before enabling the profile"
+                )
+    validate_options(
+        mapping,
+        address_family="ipv4",
+        previous=None if going_live or previous is None else phone_options_map(previous),
+    )
+
+
+def phone_options_loadable(rows: Any) -> tuple[dict[str, Any], list[str]]:
+    """What a phone class may render, and the keys dropped from it (#1294).
+
+    Only options Kea can load: a profile stored before its options were
+    checked may hold a value Kea rejects (the starter pack's CHANGE-ME in
+    binary option 43), and one bad option rejects the WHOLE config.
+    """
+    kept: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in phone_options_map(rows).items():
+        try:
+            _check_one(key, value, "ipv4")
+        except ValueError:
+            dropped.append(key)
+            continue
+        kept[key] = value
+    return kept, dropped

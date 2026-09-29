@@ -223,6 +223,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **VoIP phone-profile options reach the phone, and are checked when
+  saved (#1294).** A phone profile rendered each option under its
+  catalogue name (`polycom-config-url`, `yealink-prov-server`,
+  `vendor-encapsulated-options`). The agent does not know those names and
+  dropped them with only a log line, so a Polycom profile saved and option
+  160 never reached a phone. The profile's option **code** now decides what
+  is delivered: its canonical name when SpatiumDDI has one (66, 150), else
+  `code:NN`, which the agent renders with its shipped definition. Values
+  get the #1228 checks: a code listed twice, a name that contradicts its
+  code, and a value Kea cannot load are each a `422`. Enabling a profile
+  checks every option and refuses the starter pack's `CHANGE-ME`
+  placeholders. Rendered by code, a placeholder in binary option 43 would
+  otherwise make Kea reject the group's whole config. A profile stored
+  before these checks is rendered without the options Kea cannot load,
+  each logged as `dhcp_phone_option_dropped_invalid`.
+  `vendor_class_match` is placed inside a Kea string literal, so a `'`
+  now gets a 422, and a stored profile containing one is left out of the
+  render instead of breaking the config. It is measured in bytes, so a
+  non-ASCII vendor string can now match. Verified with `kea-dhcp4 -t`.
+
 - **Deleting one of two identical DNS records no longer takes the
   record off the server (#1230).** Nothing stopped a record being stored
   twice: `POST …/records` did no duplicate check, so an Ansible retry, a
