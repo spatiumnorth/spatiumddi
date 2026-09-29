@@ -189,6 +189,12 @@ export function NmapScanForm({
             onChange={(e) => setExtraArgs(e.target.value)}
             placeholder="e.g. --reason -Pn"
           />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Scan type, host discovery, ports, timing, service / OS detection,
+            and <span className="font-mono">--script</span> with named
+            non-intrusive scripts. File, target and spoofing options are
+            refused.
+          </p>
         </div>
       </div>
 

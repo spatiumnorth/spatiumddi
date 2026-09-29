@@ -394,7 +394,10 @@ class RunNmapScanArgs(BaseModel):
     extra_args: str | None = Field(
         default=None,
         description=(
-            "Optional extra nmap flags. Validated server-side — " "dangerous flags are rejected."
+            "Optional extra nmap flags, checked against an allowlist: scan "
+            "type, host discovery, ports, timing, service / OS detection, and "
+            "--script with named non-intrusive scripts (no categories). "
+            "Options that read or write files, add targets, or spoof are refused."
         ),
     )
 
@@ -2043,6 +2046,7 @@ async def _apply_create_dns_record(
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
+    from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
 
@@ -2068,6 +2072,21 @@ async def _apply_create_dns_record(
         if name in ("@", "")
         else f"{name}.{zone.name}".rstrip(".") + ("." if zone.name.endswith(".") else "")
     )
+
+    # #1230 — never store the same RR twice; see app.services.dns.record_identity.
+    existing = await find_identical_record(
+        db,
+        zone.id,
+        view_id=None,
+        name=name,
+        record_type=rtype,
+        value=args.value,
+        priority=args.priority,
+        weight=args.weight if rtype == "SRV" else None,
+        port=args.port if rtype == "SRV" else None,
+    )
+    if existing is not None:
+        raise ValueError(describe_identical(existing))
 
     row = DNSRecord(
         zone_id=zone.id,

@@ -223,6 +223,68 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting one of two identical DNS records no longer takes the
+  record off the server (#1230).** Nothing stopped a record being stored
+  twice: `POST …/records` did no duplicate check, so an Ansible retry, a
+  flaky network or a double click made a second identical row. Every
+  record op carries the whole RRset the server should end up with
+  (#773), and a delete dropped the deleted record's *value* from it,
+  taking the twin's copy too. The server stopped answering for a
+  record the zone, and the UI, still listed. Two fixes:
+  - A delete now drops the deleted *row*, named in the op payload as
+    `record_id`, so an identical row that stays keeps the value on the
+    wire. This covers twins that already exist, with no data migration,
+    on every delete path that has the row (single, bulk, trash purge,
+    IPAM sync) and on agent and agentless drivers alike. The wire never
+    carries the same RR twice.
+  - Creating or editing a record into an identical one (same view,
+    owner name case-insensitively, type, value and priority / weight /
+    port; TTL is the RRset's) is a `409` naming the existing record.
+    Bulk create skips it as `identical record already exists`, which
+    also makes re-submitting a batch idempotent. The Copilot's
+    `create_dns_record` refuses it. A record in the trash does not
+    count.
+
+- **DHCP option names and values are checked when saved (#1228).**
+  Scope, pool, reservation, option-template, client-class and
+  device-policy options were stored as given. Only `domain-name` and
+  `domain-search` were checked. A value Kea cannot parse, such as
+  `routers: "10.0.0.1, bogus"`, an MTU of 70000, or text in raw option
+  43 where hex is required, made Kea reject the whole config for the
+  server group. The agent reverted and alerted (#882), but every later
+  change to the group was stuck behind it. A name the renderer does not
+  know was dropped by the agent with only a log line, so the option
+  was saved and never served. Each of those writes is now a `422` that
+  names the option. Names are checked against what the Kea renderer
+  emits for the scope's address family. A raw `code:NN` is accepted
+  only for the codes SpatiumDDI ships a definition for, since the
+  agent drops any other. `opt-NN` (the Windows importer's spelling) is
+  accepted. Raw `option_data` is refused. Values are typed: IPv4 or
+  IPv6 addresses, integer ranges, FQDNs, non-blank strings, and plain
+  even-length hex for binary codes. The rules were checked against
+  `kea-dhcp4 -t`. An option already stored is not re-checked unless
+  the write changes it, so existing scopes stay editable. Applying an
+  option template checks the merged result against the scope's family.
+  A pick from the custom-options catalogue is now stored under the code
+  it can be delivered as (`code:43`), instead of a catalogue name the
+  agent would drop. This applies in the option-template and client-class
+  editors too, which used to key such a pick by its name or `option-NN`.
+
+- **A slot upgrade survives its image download being cut short
+  (#1216).** The runner read the image until the connection stopped
+  sending and never compared the bytes with `Content-Length`. So a
+  download cut mid-transfer left a partial image, and the apply failed
+  as "checksum mismatch", which reads as a corrupt image. A rolling
+  cluster upgrade can cut it: the frontend pod that serves a node its
+  image is replaced mid-download (#1215). The runner now counts the
+  bytes. A short, dropped or stalled transfer, and an HTTP 408, 429 or
+  5xx answer, gets up to five attempts, with backoff of 5, 10, 20 and
+  40 s, and a retry resumes with `Range` where the server allows it. A
+  4xx answer, a certificate the node cannot verify and a full disk fail
+  at once. A download that never completes fails with its own message:
+  the image download was interrupted, nothing was written to the
+  inactive slot, and the upgrade can be retried.
+
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
   BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
@@ -1335,6 +1397,113 @@ the formatter handles the rest.
   whose nodes have public addresses, add them to
   `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
   browser, as the client.
+
+- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
+  `SECRET_KEY` signs every session token and, unless
+  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
+  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
+  both shipped a committed placeholder, and the boot check only warned (and
+  did not recognise the k8s one at all). On such an install any signed-in
+  user could mint a superadmin token, since user ids are visible in the
+  audit log, and a database dump decrypted every stored LDAP, integration
+  and AI provider secret. Now the api refuses to start on either
+  placeholder, on a key under 32 characters, or on one that reads like a
+  placeholder, and says how to generate a key and how to move an existing
+  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
+  instead; `docker-compose.dev.yml` sets it and nothing else should.
+  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
+  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
+  falling back to a different key. Helm and the appliance already generate
+  their own keys and are unaffected.
+  **Upgrade note:** an install that has been running on the placeholder
+  stops at boot. Follow "Rotating `SECRET_KEY`" in
+  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
+  with a one-off Job in `k8s/ops/`): set a new key, then run
+  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
+  starting the api. It re-encrypts every stored credential for the new key
+  (the same walk a cross-install restore uses), is idempotent, and records
+  an audit row; everyone signs in again. Deliberately not "generate a key
+  on first start": compose could only persist it in Postgres, next to the
+  credentials it protects, so a dump would decrypt them anyway. Because
+  anyone could have signed requests on a placeholder key, the doc also
+  says to review API tokens, users and the audit log afterwards.
+  Also: an access token that names no session (`jti`) is refused. Every
+  login has minted one since `2026.05.07-1`, so such a token can only be
+  forged, and it also escaped force-logout. The session a token names must
+  also belong to the token's user, or a forger could pair their own live
+  session with a superadmin's id. And force-logout now reaches
+  the nmap scan stream, which checked its own token without looking at
+  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
+  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
+  the placeholder.
+
+- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
+  read files through a scan (#1223).** The scan endpoint is gated on
+  `manage_nmap_scans`, which the builtin Network Editor role holds, and
+  `extra_args` was checked only for shell metacharacters and for `/` in
+  `--script` values. So a delegated user could pass `-iL <file>`: nmap
+  reads it as a target list and prints every line it cannot resolve
+  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
+  back, which was verified in the api container as the api user. Also
+  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
+  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
+  target or `-iR` (past target validation and the #722 do-not-probe
+  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
+  intrusive script. Now every token must be an allowed option with a
+  value of the right shape: scan type, host discovery, port selection,
+  timing, service / OS detection, `--reason` / `--open`, and `--script`
+  with script **names** that nmap's own `script.db` puts in none of the
+  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
+  `fuzzer` categories. Category names, wildcards and expressions are
+  refused, because no category is clean: nmap's `safe` category holds 33
+  scripts that are also `external` or `intrusive` (`whois-ip` queries
+  third-party WHOIS servers, against non-negotiable #17), and `default`
+  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
+  in favour of the presets that already offer them. The copilot's scan
+  proposal goes through the same check, and so does a scan already queued
+  with old arguments, since the worker re-validates before it runs.
+
+- **A release publishes nothing until CI, Trivy and main have all said yes
+  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
+  pushed `:latest` alongside each version tag before the ISO, the
+  OpenAPI export or the GitHub release had finished. So #1218's BIND
+  image shipped with 7 HIGH CVEs that nothing on the release path looked
+  for; a release that failed part-way had already moved every compose
+  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
+  covers tags, anyone with write access could release any commit. Now a
+  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
+  to pass on the tagged commit. Each image is built once, pushed by
+  digest with no tag, and both architectures are pulled from that digest
+  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
+  ever scanned amd64); only when every image passes is that same digest
+  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
+  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
+  a final job after the GitHub release exists, all images or none: it
+  records where each `:latest` pointed, retries each move, and puts back
+  the ones already moved if one still fails. Release runs are no longer
+  serialised, because GitHub cancels a queued run when another queues
+  behind it and `meta` can now wait an hour; "is this the newest
+  release" is re-checked right before GitHub's latest release and
+  `:latest` are set instead. The workflow also stops assuming CalVer
+  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
+  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
+  `:latest`, and the previous release, the CHANGELOG section and whether
+  a tag becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering, ranking only tags on `main` that have
+  a published release (`.github/scripts/release-tags.sh`), so a stray tag
+  cannot freeze `:latest`. The shell it replaces got all three wrong
+  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
+  one, and the CHANGELOG lookup was a prefix match that returns
+  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
+  one no longer takes over `:latest` or the stable download URLs, or
+  uploads the un-versioned copies behind them. Release candidates no
+  longer take slots in the asset pruner's keep window (eight candidates
+  would have pushed eight final releases' ISOs out early); a candidate
+  keeps its ISO until a final release supersedes it. The image list is
+  one file, `.github/images.json`, read by both workflows and the
+  image-upgrade linter. And `docs-publish.yml` no longer runs on release
+  tags: a tag on an older commit rolled the docs site back behind
+  `main`, and a tag off `main` published unreviewed docs.
 
 - **Pinned images brought current; the CloudNativePG operator and
   Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with

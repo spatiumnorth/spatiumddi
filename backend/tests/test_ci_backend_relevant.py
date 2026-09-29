@@ -58,6 +58,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
+    "test_release_version_script.py": "scripts/release_version.py",
+    "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
     "test_trivy_pr_lanes.py": (
         ".github/workflows/build-dns-images.yml",

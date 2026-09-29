@@ -1080,7 +1080,14 @@ _dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] |
 
 
 async def _enqueue_dns_op(
-    db: AsyncSession, zone: DNSZone, op: str, name: str, rtype: str, value: str, ttl: int | None
+    db: AsyncSession,
+    zone: DNSZone,
+    op: str,
+    name: str,
+    rtype: str,
+    value: str,
+    ttl: int | None,
+    record_id: uuid.UUID | None = None,
 ) -> Any:
     """Wrapper to enqueue a record op against the zone's primary server.
     Imported lazily to avoid circular import.
@@ -1093,7 +1100,12 @@ async def _enqueue_dns_op(
     from app.services.dns.serial import bump_zone_serial
 
     target_serial = bump_zone_serial(zone)
-    record = {"name": name, "type": rtype, "value": value, "ttl": ttl}
+    record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
+    if record_id is not None:
+        # #1230 — names the row being retracted, so a delete drops exactly it
+        # from the RRset and an identical row that stays (an operator's manual
+        # copy of an IPAM record, say) keeps the value on the wire.
+        record["record_id"] = str(record_id)
 
     collector = _dns_op_collector.get()
     if collector is not None:
@@ -1301,6 +1313,7 @@ async def _sync_dns_record(
                     record.record_type,
                     record.value,
                     record.ttl,
+                    record_id=record.id,
                 )
             await db.delete(record)
         ip.dns_record_id = None
@@ -1407,6 +1420,7 @@ async def _sync_dns_record(
                     record.record_type,
                     record.value,
                     record.ttl,
+                    record_id=record.id,
                 )
             await db.delete(record)
         ip.dns_record_id = None
@@ -1433,6 +1447,7 @@ async def _sync_dns_record(
                     rec.record_type,
                     rec.value,
                     rec.ttl,
+                    record_id=rec.id,
                 )
             await db.delete(rec)
             existing_by_zone.pop(rec.zone_id, None)
@@ -1494,6 +1509,7 @@ async def _sync_dns_record(
                     existing.record_type,
                     existing.value,
                     existing.ttl,
+                    record_id=existing.id,
                 )
                 await db.delete(existing)
                 new_rec = DNSRecord(
@@ -1542,6 +1558,7 @@ async def _sync_dns_record(
                         forward_rtype,
                         old_value,
                         existing.ttl,
+                        record_id=existing.id,
                     )
                 existing.name = ip.hostname
                 existing.fqdn = target_fqdn
@@ -1601,7 +1618,9 @@ async def _sync_dns_record(
         for rec in stale_ptrs:
             old_zone = await db.get(DNSZone, rec.zone_id)
             if old_zone is not None:
-                await _enqueue_dns_op(db, old_zone, "delete", rec.name, "PTR", rec.value, rec.ttl)
+                await _enqueue_dns_op(
+                    db, old_zone, "delete", rec.name, "PTR", rec.value, rec.ttl, record_id=rec.id
+                )
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
@@ -1653,7 +1672,14 @@ async def _sync_dns_record(
                 old_zone = await db.get(DNSZone, record.zone_id)
                 if old_zone is not None:
                     await _enqueue_dns_op(
-                        db, old_zone, "delete", record.name, "PTR", record.value, record.ttl
+                        db,
+                        old_zone,
+                        "delete",
+                        record.name,
+                        "PTR",
+                        record.value,
+                        record.ttl,
+                        record_id=record.id,
                     )
                 await db.delete(record)
                 new_ptr = DNSRecord(
@@ -6504,6 +6530,7 @@ async def _apply_dns_sync(
                 {
                     "op": "delete",
                     "record": {
+                        "record_id": str(r.id),
                         "name": r.name,
                         "type": r.record_type,
                         "value": r.value,
@@ -7769,7 +7796,16 @@ async def delete_alias(
         )
     zone = await db.get(DNSZone, rec.zone_id)
     if zone is not None:
-        await _enqueue_dns_op(db, zone, "delete", rec.name, rec.record_type, rec.value, rec.ttl)
+        await _enqueue_dns_op(
+            db,
+            zone,
+            "delete",
+            rec.name,
+            rec.record_type,
+            rec.value,
+            rec.ttl,
+            record_id=rec.id,
+        )
     db.add(
         _audit(
             current_user,

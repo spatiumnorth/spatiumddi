@@ -25,6 +25,14 @@
 #            the tag, and the notes are ALWAYS kept — provenance is tiny
 #            and the binary can be rebuilt from the tag if ever needed.
 #
+# Pre-releases (SemVer release candidates, 1.0.0-rc.N — #1182, #1226) do
+# NOT take keep-window slots: cutting eight candidates before a release
+# would otherwise push eight final releases out of the window early, and
+# operators pinned to those lose their install media. A pre-release keeps
+# its heavy assets until a final release is published after it, and loses
+# them then — a candidate the release has superseded is not something to
+# install.
+#
 # Also drops the stray mkosi-ImageVersion-named slot sha (e.g.
 # spatiumddi-appliance-slot-0.1.0.sha256) from every release — a
 # historical artefact of the pre-#392 release workflow (now fixed at
@@ -73,11 +81,11 @@ echo "  keep newest ${KEEP_VERSIONED} releases' versioned heavy assets; dry_run=
 # Limit 1000 covers all foreseeable history. Capture into a var with an
 # explicit rc check so a gh auth/network/rate-limit failure FAILS LOUD
 # instead of looking like "no releases" (which would silently skip pruning).
-# TSV: "<tag>\t<isLatest>".
+# TSV: "<tag>\t<isLatest>\t<isPrerelease>".
 if ! releases_tsv=$(
     gh release list --repo "$REPO" --limit 1000 --exclude-drafts \
-        --json tagName,isLatest,createdAt \
-        -q 'sort_by(.createdAt) | reverse | .[] | [.tagName, (.isLatest|tostring)] | @tsv'
+        --json tagName,isLatest,isPrerelease,createdAt \
+        -q 'sort_by(.createdAt) | reverse | .[] | [.tagName, (.isLatest|tostring), (.isPrerelease|tostring)] | @tsv'
 ); then
     echo "ERROR: 'gh release list' failed (auth / network / rate-limit?)" >&2
     exit 1
@@ -108,6 +116,9 @@ del() {
 }
 
 idx=0
+# Set once the newest-first walk has passed a final release: every
+# pre-release after that point has been superseded by it.
+seen_final="false"
 # #1026 — every architecture the release pipeline publishes appliance
 # assets for. Keep in lock-step with the ``arch`` matrix in release.yml:
 # an architecture built there and missing here is one whose heavy assets
@@ -127,8 +138,7 @@ _in_list() {
 }
 
 for line in "${RELEASES[@]}"; do
-    tag="${line%%$'\t'*}"
-    is_latest="${line##*$'\t'}"
+    IFS=$'\t' read -r tag is_latest is_prerelease <<<"$line"
 
     # Nightly pre-releases are NOT this sweep's problem: nightly.yml's own
     # prune-releases job deletes the whole release (assets, tag and all)
@@ -177,7 +187,13 @@ for line in "${RELEASES[@]}"; do
     VER_HEAVY+=("spatiumddi-appliance-${tag}.iso")
 
     beyond_window="false"
-    [ "$idx" -ge "$KEEP_VERSIONED" ] && beyond_window="true"
+    if [ "$is_prerelease" = "true" ]; then
+        # Not counted against the window; superseded once a final release
+        # was published after it.
+        beyond_window="$seen_final"
+    elif [ "$idx" -ge "$KEEP_VERSIONED" ]; then
+        beyond_window="true"
+    fi
 
     mapfile -t ASSETS < <(
         gh release view "$tag" --repo "$REPO" --json assets \
@@ -186,6 +202,12 @@ for line in "${RELEASES[@]}"; do
 
     if [ "$is_latest" = "true" ]; then
         echo "  [${idx}] ${tag} — LATEST: keeping full asset set"
+    elif [ "$is_prerelease" = "true" ]; then
+        if [ "$beyond_window" = "true" ]; then
+            echo "  [--] ${tag} — pre-release superseded by a final release: dropping generic + versioned heavy assets"
+        else
+            echo "  [--] ${tag} — pre-release newer than every final release: dropping generic dupes only"
+        fi
     elif [ "$beyond_window" = "true" ]; then
         echo "  [${idx}] ${tag} — beyond keep window: dropping generic + versioned heavy assets"
     else
@@ -223,7 +245,10 @@ for line in "${RELEASES[@]}"; do
         fi
     done
 
-    idx=$((idx + 1))
+    if [ "$is_prerelease" != "true" ]; then
+        idx=$((idx + 1))
+        seen_final="true"
+    fi
 done
 
 kept_releases="${#RELEASES[@]}"

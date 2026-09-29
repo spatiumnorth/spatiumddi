@@ -66,6 +66,12 @@ scripts/lint_workflow_shell.py
 # been restructured must RAISE, not find zero images and report success.
 scripts/lint_image_upgrades.py
 
+# test_release_version_script.py (#1226) loads the release workflow's tag
+# helper and pins the decisions it makes for release.yml: which tags may be
+# published, the previous release across the CalVer → SemVer switch, and
+# whether a tag becomes :latest.
+scripts/release_version.py
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says

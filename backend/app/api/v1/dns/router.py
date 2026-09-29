@@ -100,6 +100,7 @@ from app.services.dns.named_conf_validation import (
     validate_address_match_list,
     validate_view_name,
 )
+from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     enqueue_dnssec_op,
@@ -6490,6 +6491,10 @@ async def list_records(
     )
 
 
+def _identical_record_conflict(existing: DNSRecord) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, describe_identical(existing))
+
+
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/records",
     response_model=RecordResponse,
@@ -6513,6 +6518,21 @@ async def create_record(
     )
     _validate_address_record_value(body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+    # #1230 — a client retry (Ansible, a flaky network, a double click) must
+    # not store the same RR twice.
+    existing = await find_identical_record(
+        db,
+        zone_id,
+        view_id=body.view_id,
+        name=body.name,
+        record_type=body.record_type,
+        value=body.value,
+        priority=body.priority,
+        weight=body.weight,
+        port=body.port,
+    )
+    if existing is not None:
+        raise _identical_record_conflict(existing)
 
     record = DNSRecord(
         zone_id=zone_id,
@@ -6588,6 +6608,24 @@ async def update_record(
         _validate_address_record_value(record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
+    # #1230 — an edit must not turn this row into a twin of another. Only
+    # checked when a field that makes up the record's identity changed, so a
+    # TTL edit on a twin that predates the rule still goes through.
+    if changes.keys() & {"name", "value", "priority", "weight", "port", "view_id"}:
+        existing = await find_identical_record(
+            db,
+            record.zone_id,
+            view_id=record.view_id,
+            name=record.name,
+            record_type=record.record_type,
+            value=record.value,
+            priority=record.priority,
+            weight=record.weight,
+            port=record.port,
+            exclude_id=record.id,
+        )
+        if existing is not None:
+            raise _identical_record_conflict(existing)
     target_serial = bump_zone_serial(zone) if zone is not None else None
     if zone is not None:
         await enqueue_record_op(
@@ -6824,15 +6862,9 @@ async def bulk_delete_records(
     ops = [
         {
             "op": "delete",
-            "record": {
-                "name": r.name,
-                "type": r.record_type,
-                "value": r.value,
-                "ttl": r.ttl,
-                "priority": r.priority,
-                "weight": r.weight,
-                "port": r.port,
-            },
+            # record_op_payload carries the row id, so deleting one of two
+            # identical rows keeps the value on the wire (#1230).
+            "record": record_op_payload(r),
             "target_serial": target_serial,
         }
         for r in targets
@@ -6947,10 +6979,12 @@ class BulkCreateRecordsRequest(BaseModel):
     seeding, perf #454). This bumps the serial once, enqueues all record ops in
     one batch, writes one audit row, and commits once.
 
-    Exact ``(name, record_type, value)`` duplicates *within the submitted
-    batch* are de-duplicated and reported in ``skipped``; pre-existing records
-    in the zone are NOT checked (the caller owns idempotency — the perf seeder,
-    for example, skips re-seeding a zone it already populated).
+    A record identical to another in the batch, or to a live record already
+    in the zone, is skipped and reported in ``skipped`` (#1230): a stored twin
+    means deleting either copy retracts the record from the server while the
+    other still lists it. Identical means the same view, owner name (compared
+    case-insensitively), type, value and structured fields. Re-submitting a
+    batch is therefore idempotent.
     """
 
     records: list[RecordCreate]
@@ -6992,21 +7026,60 @@ async def bulk_create_records(
     for rtype in {r.record_type for r in body.records}:
         await _check_driver_gated_record_type(rtype, group_id, db)
 
-    # De-dupe exact (name, type, value) collisions within the batch so a sloppy
-    # payload doesn't insert pointless duplicate rows.
-    seen: set[tuple[str, str, str]] = set()
+    # Normalise first: MX defaults its priority to 10, so an MX with and one
+    # without an explicit 10 are the same record and must compare equal.
+    for r in body.records:
+        r.priority, r.weight, r.port = _normalize_record_struct_fields(
+            r.record_type, r.priority, r.weight, r.port
+        )
+
+    def _identity(
+        view_id: uuid.UUID | None,
+        name: str,
+        rtype: str,
+        value: str,
+        priority: int | None,
+        weight: int | None,
+        port: int | None,
+    ) -> tuple[Any, ...]:
+        return (view_id, name.lower(), rtype.upper(), value.strip(), priority, weight, port)
+
+    # #1230 — the zone's live records at the submitted names, so a record the
+    # zone already holds is skipped rather than stored a second time.
+    names = sorted({r.name.lower() for r in body.records})
+    existing_keys: set[tuple[Any, ...]] = set()
+    for start in range(0, len(names), 5000):
+        rows = (
+            await db.execute(
+                select(
+                    DNSRecord.view_id,
+                    DNSRecord.name,
+                    DNSRecord.record_type,
+                    DNSRecord.value,
+                    DNSRecord.priority,
+                    DNSRecord.weight,
+                    DNSRecord.port,
+                ).where(
+                    DNSRecord.zone_id == zone_id,
+                    func.lower(DNSRecord.name).in_(names[start : start + 5000]),
+                )
+            )
+        ).all()
+        existing_keys.update(_identity(*row) for row in rows)
+
+    seen: set[tuple[Any, ...]] = set()
     skipped: list[dict[str, str]] = []
     accepted: list[RecordCreate] = []
     for r in body.records:
-        key = (r.name, r.record_type, r.value)
-        if key in seen:
+        key = _identity(r.view_id, r.name, r.record_type, r.value, r.priority, r.weight, r.port)
+        reason = (
+            "identical record already exists"
+            if key in existing_keys
+            else "duplicate within batch" if key in seen else None
+        )
+        if reason is not None:
             skipped.append(
-                {
-                    "name": r.name,
-                    "record_type": r.record_type,
-                    "value": r.value,
-                    "reason": "duplicate within batch",
-                }
+                {"name": r.name, "record_type": r.record_type, "value": r.value, "reason": reason}
             )
             continue
         seen.add(key)
@@ -7017,9 +7090,6 @@ async def bulk_create_records(
 
     records: list[DNSRecord] = []
     for r in accepted:
-        r.priority, r.weight, r.port = _normalize_record_struct_fields(
-            r.record_type, r.priority, r.weight, r.port
-        )
         _validate_address_record_value(r.record_type, r.value)
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         records.append(

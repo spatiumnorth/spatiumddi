@@ -413,7 +413,7 @@ Three of the four events have distinct jobs:
 |---|---|---|
 | **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**, path-filtered to their own `agent/<name>/**`), `agent-e2e.yml` (path-filtered to `agent/**` + `charts/spatiumddi/**` — it installs the control plane from the `:latest` release images, so a `backend/` or `frontend/` change cannot reach the cluster it tests; #1021), plus two GitHub-managed CodeQL runs that are not workflow files: **CodeQL** (default setup: actions, JS/TS, Python) and **CodeQL - Code Quality** (JS/TS, Python — the source of the bot review threads that must be resolved before merge). | Where correctness is gated. Nothing merges without it. |
 | **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
-| **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO. |
+| **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO — after three gates (#1226): the tag is on `main` and `ci.yml` passed on it; each image is built once, pushed by digest, and both architectures pass Trivy + `trivy-gate.sh` before that digest is tagged; and `:latest` moves last, once the GitHub release exists. |
 | **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
 
 Two rules follow, and both were violations once:

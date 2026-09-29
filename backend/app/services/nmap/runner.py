@@ -11,9 +11,15 @@ Security model:
 * Argv is built via ``shlex``-aware tokenisation; we never invoke a
   shell — the subprocess is spawned with ``create_subprocess_exec``.
 * Operator-supplied ``extra_args`` is split with ``shlex.split`` and
-  every token is validated against an allowlist regex. Tokens
-  carrying shell metacharacters (`;|&$\\`<>()`) or path traversal in
-  ``--script`` values are rejected.
+  every token must be an option on an ALLOWLIST (#1223): timing, port
+  selection, scan type, host discovery, service / OS detection, and
+  ``--script`` with named scripts nmap itself classifies as
+  non-intrusive. Anything else is refused, including every option that
+  reads or writes a file (``-iL``, ``-o*``, ``--datadir``, ``--resume``,
+  ``--script-args``), adds targets (a bare address, ``-iR``), or spoofs
+  (``-S``, ``-D``, ``-e``). The gate is ``manage_nmap_scans``, which the
+  builtin Network Editor role holds, so this is a delegated user's
+  input, not a superadmin's.
 * The API container runs as a non-root user, so privileged scan
   modes (raw SYN ``-sS``, OS detection ``-O`` without privilege) just
   fall back to TCP-connect / refuse — that's fine; we surface the
@@ -82,7 +88,6 @@ PRESETS: dict[str, list[str]] = {
 _BASE_ARGS = ["nmap", "-oN", "-", "--stats-every", "2s"]
 
 _PORT_SPEC_RE = re.compile(r"^[0-9,\-UTSI:]+$")
-_SHELL_METACHARS = set(";|&$`<>()")
 
 # CIDR-target safety limits. /16 IPv4 is 65k hosts which is at the
 # upper end of "I know what I'm doing" — anything larger than this
@@ -189,7 +194,197 @@ def _validate_port_spec(spec: str | None) -> str | None:
     return spec
 
 
+# ── extra_args allowlist (#1223) ─────────────────────────────────────
+#
+# A blocklist cannot work here: nmap has well over a hundred options and
+# the dangerous ones are ordinary-looking (``-iL /etc/passwd`` reads a
+# file and echoes the unresolvable "targets" back into the scan output the
+# caller streams; ``-oN <path>`` writes one as the api user). So every
+# token must be an option listed below, and every value must match its
+# option's shape. Anything else, including a bare positional token (which
+# nmap would scan as an extra target, past target validation and the #722
+# do-not-probe policy), is refused.
+
+_DURATION_RE: Final = re.compile(r"^\d+(?:\.\d+)?(?:ms|s|m|h)?$")
+_INT_RE: Final = re.compile(r"^\d{1,6}$")
+_NUMBER_RE: Final = re.compile(r"^(?:\d{1,6}(?:\.\d+)?|\.\d+)$")
+_TIMING_VALUES: Final = frozenset(
+    {"0", "1", "2", "3", "4", "5", "paranoid", "sneaky", "polite", "normal", "aggressive", "insane"}
+)
+
+# Options that take no value.
+_EXTRA_FLAGS: Final = frozenset(
+    {
+        # scan technique (raw-socket ones degrade to connect() unprivileged)
+        "-sS",
+        "-sT",
+        "-sA",
+        "-sW",
+        "-sM",
+        "-sU",
+        "-sN",
+        "-sF",
+        "-sX",
+        "-sY",
+        "-sZ",
+        "-sO",
+        "-sn",
+        "-sL",
+        # host discovery
+        "-Pn",
+        "-PE",
+        "-PP",
+        "-PM",
+        "-PR",
+        "-n",
+        "-R",
+        "--system-dns",
+        "--disable-arp-ping",
+        "--traceroute",
+        # port selection
+        "-F",
+        "-r",
+        "--allports",
+        # service / OS detection
+        "-sV",
+        "-O",
+        "--version-light",
+        "--version-all",
+        "--version-trace",
+        "--osscan-limit",
+        "--osscan-guess",
+        # timing
+        "--defeat-rst-ratelimit",
+        "--defeat-icmp-ratelimit",
+        # output detail (stdout only; the output FILE options are refused)
+        "--reason",
+        "--open",
+        "--packet-trace",
+        "--script-trace",
+        # address family
+        "-6",
+    }
+)
+
+
+def _is_port_spec(value: str) -> bool:
+    return bool(_PORT_SPEC_RE.match(value))
+
+
+# Options that take exactly one value, and what the value must look like.
+_EXTRA_VALUE_OPTIONS: Final[dict[str, Any]] = {
+    "-p": _is_port_spec,
+    "--exclude-ports": _is_port_spec,
+    "--top-ports": _INT_RE.match,
+    "--port-ratio": _NUMBER_RE.match,
+    "-T": _TIMING_VALUES.__contains__,
+    "--max-retries": _INT_RE.match,
+    "--host-timeout": _DURATION_RE.match,
+    "--scan-delay": _DURATION_RE.match,
+    "--max-scan-delay": _DURATION_RE.match,
+    "--min-rate": _NUMBER_RE.match,
+    "--max-rate": _NUMBER_RE.match,
+    "--min-parallelism": _INT_RE.match,
+    "--max-parallelism": _INT_RE.match,
+    "--min-hostgroup": _INT_RE.match,
+    "--max-hostgroup": _INT_RE.match,
+    "--min-rtt-timeout": _DURATION_RE.match,
+    "--max-rtt-timeout": _DURATION_RE.match,
+    "--initial-rtt-timeout": _DURATION_RE.match,
+    "--script-timeout": _DURATION_RE.match,
+    "--version-intensity": re.compile(r"^[0-9]$").match,
+    "--max-os-tries": _INT_RE.match,
+    # Validated separately: see _validate_script_value.
+    "--script": None,
+}
+
+# Short options nmap accepts with the value attached (``-p22``, ``-T4``,
+# ``-PS22,80``, ``-vv``).
+_ATTACHED_SHORT: Final = (
+    (re.compile(r"^-p(.+)$"), _is_port_spec),
+    (re.compile(r"^-T(.+)$"), _TIMING_VALUES.__contains__),
+    (re.compile(r"^-P[SAUY]([0-9,\-]*)$"), lambda v: v == "" or _is_port_spec(v)),
+    (re.compile(r"^-(v+|d+)$"), lambda v: True),
+)
+
+# nmap's own script database, written by ``nmap --script-updatedb`` and
+# shipped with the package.
+_NMAP_SCRIPT_DB = "/usr/share/nmap/scripts/script.db"
+
+# A script in any of these categories is refused. ``external`` is here for
+# non-negotiable #17 as much as for safety: those scripts send data about
+# the target to third parties (WHOIS, ASN lookups, DNS blocklists, ...).
+# No category NAME is accepted in ``--script``, because none is clean:
+# nmap's own ``safe`` category holds 33 scripts that are also ``external``
+# or ``intrusive``, and ``default`` holds two open-proxy probes.
+_FORBIDDEN_SCRIPT_CATEGORIES: Final = frozenset(
+    {"intrusive", "exploit", "dos", "brute", "external", "malware", "fuzzer"}
+)
+_SCRIPT_NAME_RE: Final = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_SCRIPT_ENTRY_RE: Final = re.compile(r'filename = "([^"]+)\.nse", categories = \{([^}]*)\}')
+
+
+def _load_script_categories(path: str) -> dict[str, frozenset[str]] | None:
+    """Script name → categories, from nmap's script.db; None if unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return {
+        name: frozenset(re.findall(r'"([^"]+)"', cats))
+        for name, cats in _SCRIPT_ENTRY_RE.findall(text)
+    }
+
+
+def _validate_script_value(value: str) -> None:
+    """``--script`` takes a comma list of script NAMES, each one nmap
+    classifies in no forbidden category.
+
+    Categories, wildcards (``http-*``), boolean expressions (``not
+    intrusive``) and paths are refused: each can expand to scripts this
+    check never saw. Unknown names are refused too, since nmap would
+    otherwise try the value as a file or directory.
+    """
+    names = value.split(",")
+    for name in names:
+        if not _SCRIPT_NAME_RE.match(name):
+            raise NmapArgError(
+                f"--script accepts a comma-separated list of script names only (got {value!r})"
+            )
+    catalogue = _load_script_categories(_NMAP_SCRIPT_DB)
+    if catalogue is None:
+        raise NmapArgError("--script is unavailable: nmap's script database could not be read")
+    for name in names:
+        bare = name.removesuffix(".nse")
+        categories = catalogue.get(bare)
+        if categories is None:
+            raise NmapArgError(
+                f"--script: unknown script {name!r} (script names only; "
+                "category names such as default or safe are not accepted)"
+            )
+        forbidden = categories & _FORBIDDEN_SCRIPT_CATEGORIES
+        if forbidden:
+            raise NmapArgError(
+                f"--script: {name!r} is in the {', '.join(sorted(forbidden))} "
+                "category and is not allowed from extra_args"
+            )
+
+
+def _check_option_value(option: str, value: str) -> None:
+    if option == "--script":
+        _validate_script_value(value)
+        return
+    if not _EXTRA_VALUE_OPTIONS[option](value):
+        raise NmapArgError(f"extra_args: invalid value for {option}: {value!r}")
+
+
 def _validate_extra_args(extra: str | None) -> list[str]:
+    """Validate operator-supplied nmap options against the allowlist.
+
+    Returns the tokens unchanged; raises :class:`NmapArgError` naming the
+    first one that is not allowed.
+    """
     if extra is None:
         return []
     extra = extra.strip()
@@ -199,21 +394,50 @@ def _validate_extra_args(extra: str | None) -> list[str]:
         tokens = shlex.split(extra)
     except ValueError as exc:
         raise NmapArgError(f"extra_args could not be parsed: {exc}") from exc
-    for tok in tokens:
-        if any(c in _SHELL_METACHARS for c in tok):
-            raise NmapArgError(f"extra_args token contains shell metacharacter: {tok!r}")
-        # Reject obvious path traversal in --script values. Bare numeric
-        # / wordlist names are allowed, just not paths.
-        if tok.startswith("--script") and ("=" in tok or False):
-            value = tok.split("=", 1)[1]
-            if ".." in value or "/" in value:
-                raise NmapArgError(f"--script value may not contain '/' or '..': {value!r}")
-    # Also catch the two-arg form: "--script foo/bar"
-    for i, tok in enumerate(tokens):
-        if tok == "--script" and i + 1 < len(tokens):
-            value = tokens[i + 1]
-            if ".." in value or "/" in value:
-                raise NmapArgError(f"--script value may not contain '/' or '..': {value!r}")
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _EXTRA_FLAGS:
+            i += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            option, value = tok.split("=", 1)
+            if option in _EXTRA_VALUE_OPTIONS:
+                _check_option_value(option, value)
+                i += 1
+                continue
+        elif tok in _EXTRA_VALUE_OPTIONS:
+            if i + 1 >= len(tokens):
+                raise NmapArgError(f"extra_args: {tok} needs a value")
+            _check_option_value(tok, tokens[i + 1])
+            i += 2
+            continue
+        else:
+            matched = False
+            for pattern, check in _ATTACHED_SHORT:
+                m = pattern.match(tok)
+                if m:
+                    if not check(m.group(1)):
+                        raise NmapArgError(f"extra_args: invalid value in {tok!r}")
+                    matched = True
+                    break
+            if matched:
+                i += 1
+                continue
+        if tok in ("-sC", "-A") or tok.startswith("--script-args"):
+            hint = (
+                "use the default_scripts or aggressive preset"
+                if tok in ("-sC", "-A")
+                else "script arguments are not accepted"
+            )
+            raise NmapArgError(f"extra_args: {tok!r} is not allowed here; {hint}")
+        raise NmapArgError(
+            f"extra_args: {tok!r} is not an allowed nmap option. Allowed: scan type, "
+            "host discovery, port selection, timing, service / OS detection, "
+            "--reason / --open, and --script with named non-intrusive scripts. "
+            "Options that read or write files, add targets, or spoof are refused."
+        )
     return tokens
 
 
