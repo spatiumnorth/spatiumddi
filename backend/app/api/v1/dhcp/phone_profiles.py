@@ -123,12 +123,15 @@ class PhoneProfileScopeAttach(BaseModel):
     scope_ids: list[uuid.UUID]
 
 
-def _check_options(rows: list[dict], *, previous: Any = None, going_live: bool) -> None:
+def _check_options(
+    rows: list[dict], *, previous: Any = None, going_live: bool, enabled: bool = False
+) -> None:
     """422 naming the first option Kea could not load (#1294). A profile being
     enabled gets the full check, placeholders included; any other edit checks
-    only the options it changes, so a stored profile stays editable."""
+    only the options it changes, so a stored profile stays editable. A changed
+    option on an enabled profile may not be a placeholder either."""
     try:
-        validate_phone_options(rows, previous=previous, going_live=going_live)
+        validate_phone_options(rows, previous=previous, going_live=going_live, enabled=enabled)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -314,7 +317,12 @@ async def update_profile(
     going_live = bool(payload.get("enabled")) and not prof.enabled
     if "option_set" in payload:
         payload["option_set"] = _option_set_payload(body.option_set or [])
-        _check_options(payload["option_set"], previous=prof.option_set or [], going_live=going_live)
+        _check_options(
+            payload["option_set"],
+            previous=prof.option_set or [],
+            going_live=going_live,
+            enabled=bool(payload.get("enabled", prof.enabled)),
+        )
     elif going_live:
         _check_options(prof.option_set or [], going_live=True)
     if "tags" in payload:

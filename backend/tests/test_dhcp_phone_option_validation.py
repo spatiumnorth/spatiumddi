@@ -76,6 +76,40 @@ def test_an_unchanged_stored_option_does_not_block_an_edit() -> None:
         validate_phone_options(broken, previous=broken, going_live=True)
 
 
+def test_a_catalogue_label_that_contradicts_its_code_is_refused() -> None:
+    # The editor's "Add option" row defaults to code 66; a label typed over it
+    # without changing the code would otherwise deliver the URL as option 66.
+    with pytest.raises(ValueError, match="which is option 160"):
+        validate_phone_options([{"code": 66, "name": "polycom-config-url", "value": URL}])
+    with pytest.raises(ValueError, match="which is option 43"):
+        validate_phone_options([{"code": 160, "name": "code:43", "value": "0104"}])
+
+
+def test_a_stored_contradiction_keeps_its_pre_1294_delivery() -> None:
+    # Before #1294 a label the agent knew decided, and any other was dropped.
+    stored = [
+        {"code": 66, "name": "tftp-server-address", "value": "10.0.0.9"},
+        {"code": 66, "name": "polycom-config-url", "value": URL},
+    ]
+    assert phone_options_map(stored) == {"tftp-server-address": "10.0.0.9"}
+    # And the profile stays editable while those rows are left alone.
+    validate_phone_options(
+        stored + [{"code": 161, "name": "yealink-prov-server", "value": URL}],
+        previous=stored,
+    )
+    # Going live re-checks every row, so the contradiction has to be fixed.
+    with pytest.raises(ValueError, match="which is option 150"):
+        validate_phone_options(stored, previous=stored, going_live=True)
+
+
+def test_an_enabled_profile_cannot_gain_a_placeholder() -> None:
+    rows = [{"code": 160, "name": "polycom-config-url", "value": "CHANGE-ME"}]
+    with pytest.raises(ValueError, match="placeholder"):
+        validate_phone_options(rows, previous=[], enabled=True)
+    # One already stored is left alone.
+    validate_phone_options(rows, previous=rows, enabled=True)
+
+
 def test_the_render_drops_what_kea_cannot_load() -> None:
     kept, dropped = phone_options_loadable(
         [
@@ -116,12 +150,21 @@ async def test_a_stored_profile_renders_by_code_and_skips_a_bad_match(
         vendor_class_match="it's",
         option_set=[{"code": 66, "value": "tftp.example"}],
     )
-    db_session.add_all([good, bad])
+    newline = DHCPPhoneProfile(
+        group_id=grp.id,
+        name="Newline",
+        description="",
+        enabled=True,
+        vendor_class_match="Poly\ncom",
+        option_set=[{"code": 66, "value": "tftp.example"}],
+    )
+    db_session.add_all([good, bad, newline])
     await db_session.flush()
     db_session.add_all(
         [
             DHCPPhoneProfileScope(profile_id=good.id, scope_id=scope.id),
             DHCPPhoneProfileScope(profile_id=bad.id, scope_id=scope.id),
+            DHCPPhoneProfileScope(profile_id=newline.id, scope_id=scope.id),
         ]
     )
     await db_session.flush()

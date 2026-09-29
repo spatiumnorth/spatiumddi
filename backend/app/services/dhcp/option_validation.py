@@ -39,6 +39,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Callable, Mapping
+from functools import lru_cache
 from typing import Any
 
 from app.core.dns_names import contains_control_chars, validate_fqdn
@@ -49,6 +50,7 @@ from app.drivers.dhcp.kea import (
     _KEA_VENDOR_OPTION_DEFS,
 )
 from app.services.dhcp.option_codes import get_by_code
+from app.services.dhcp.voip_options import load_catalog as load_voip_catalog
 
 # Canonical code → SpatiumDDI name, for list-form entries that carry a code.
 CODE_TO_NAME: dict[int, str] = {
@@ -417,60 +419,128 @@ def phone_option_key(code: int) -> str:
     return CODE_TO_NAME.get(code) or f"code:{code}"
 
 
+def _row_code(row: Mapping[str, Any]) -> int:
+    """The row's option code, or 0 when it has none usable."""
+    raw = row.get("code")
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _label_code(name: Any) -> int | None:
+    """The option code a row's label names, or ``None`` when it names none.
+
+    Covers the renderer's own vocabulary (canonical names, their aliases,
+    ``code:NN``) and the VoIP catalogue's names (``polycom-config-url`` → 160).
+    """
+    if not name:
+        return None
+    code = option_key_code(str(name))
+    if code is not None:
+        return code
+    return _voip_name_codes().get(str(name))
+
+
+@lru_cache(maxsize=1)
+def _voip_name_codes() -> dict[str, int]:
+    return {o.name: o.code for v in load_voip_catalog() for o in v.options}
+
+
+def _phone_row_key(row: Mapping[str, Any]) -> str | None:
+    """The key one phone row renders under, or ``None`` when it renders nothing.
+
+    The code decides. The one exception is a row stored before #1294 whose
+    label contradicts its code: the write path refuses those now, but before
+    it the LABEL decided when the agent knew it (``tftp-server-address`` or
+    ``code:NN``) and the row was dropped when it did not (a catalogue name).
+    Such a row keeps that behaviour, so an upgrade neither moves a working
+    option to another code nor starts delivering one that never went out.
+    """
+    if not row.get("value"):
+        return None
+    code = _row_code(row)
+    if not code:
+        return None
+    name = row.get("name")
+    named = _label_code(name)
+    if named is None or named == code:
+        return phone_option_key(code)
+    if option_key_code(str(name)) is None:
+        return None  # a catalogue name the agent never knew: never delivered
+    canon = OPTION_NAME_ALIASES.get(str(name), str(name))
+    return canon if canon in _V4_CHECKS else f"code:{named}"
+
+
 def phone_options_map(rows: Any) -> dict[str, Any]:
     """``[{code, name, value}, …]`` → the mapping a phone class renders.
     Rows with no value, or no usable code, are skipped."""
     out: dict[str, Any] = {}
     for row in rows or ():
-        if not isinstance(row, dict) or not row.get("value"):
+        if not isinstance(row, dict):
             continue
-        raw = row.get("code")
-        try:
-            code = int(raw) if raw is not None else 0
-        except (TypeError, ValueError):
-            continue
-        if code:
-            out[phone_option_key(code)] = row["value"]
+        key = _phone_row_key(row)
+        if key is not None:
+            out[key] = row["value"]
     return out
 
 
-def validate_phone_options(rows: Any, *, previous: Any = None, going_live: bool = False) -> None:
+def _row_identity(row: Any) -> tuple[int, str, str] | None:
+    if not isinstance(row, dict):
+        return None
+    return (_row_code(row), str(row.get("name") or ""), str(row.get("value") or ""))
+
+
+def validate_phone_options(
+    rows: Any,
+    *,
+    previous: Any = None,
+    going_live: bool = False,
+    enabled: bool = False,
+) -> None:
     """Raise ``ValueError`` naming the first phone option Kea could not load.
 
     Checks what ``phone_options_map`` will render, against DHCPv4 (a phone
     class is Dhcp4-only). Also refuses a code listed twice (one would silently
-    win) and a canonical name that contradicts its code. Options unchanged
-    from ``previous`` are skipped — the #597 stance — unless the profile is
-    going live, when every option is checked and a starter-pack placeholder
-    left in is refused.
+    win) and a label naming a different option than its code. Options
+    unchanged from ``previous`` are skipped — the #597 stance, so a stored
+    profile stays editable — unless the profile is going live, when every
+    option is checked and a starter-pack placeholder left in is refused. A
+    changed option on a profile that is (or stays) ``enabled`` is refused the
+    placeholder too.
     """
-    seen: dict[int, str] = {}
+    stored = (
+        set()
+        if going_live or previous is None
+        else {i for i in map(_row_identity, previous or ()) if i is not None}
+    )
+    seen: dict[int, bool] = {}  # code → that row is unchanged from ``previous``
     for row in rows or ():
         if not isinstance(row, dict) or not row.get("value"):
             continue
-        code = int(row.get("code") or 0)
-        if code in seen:
+        code = _row_code(row)
+        if not code:
+            raise ValueError(f"option code {row.get('code')!r} is not a DHCP option code")
+        unchanged = _row_identity(row) in stored
+        if code in seen and not (unchanged and seen[code]):
             raise ValueError(f"option {code} is listed twice")
-        seen[code] = str(row.get("value"))
+        seen[code] = unchanged
+        if unchanged:
+            continue
         name = row.get("name")
-        if name:
-            canonical = OPTION_NAME_ALIASES.get(str(name), str(name))
-            named_code = next((c for c, n in CODE_TO_NAME.items() if n == canonical), None)
-            if named_code is not None and named_code != code:
-                raise ValueError(
-                    f"option {code} is labelled '{name}', which is option {named_code}; "
-                    "the code is what is delivered, so fix one or the other"
-                )
-    mapping = phone_options_map(rows)
-    if going_live:
-        for code, value in seen.items():
-            if value.strip() == PHONE_PLACEHOLDER:
-                raise ValueError(
-                    f"option {code} still holds the starter pack's '{PHONE_PLACEHOLDER}' "
-                    "placeholder; set its real value before enabling the profile"
-                )
+        named = _label_code(name)
+        if named is not None and named != code:
+            raise ValueError(
+                f"option {code} is labelled '{name}', which is option {named}; "
+                "the code is what is delivered, so fix one or the other"
+            )
+        if (going_live or enabled) and str(row["value"]).strip() == PHONE_PLACEHOLDER:
+            raise ValueError(
+                f"option {code} still holds the starter pack's '{PHONE_PLACEHOLDER}' "
+                "placeholder; set its real value before enabling the profile"
+            )
     validate_options(
-        mapping,
+        phone_options_map(rows),
         address_family="ipv4",
         previous=None if going_live or previous is None else phone_options_map(previous),
     )

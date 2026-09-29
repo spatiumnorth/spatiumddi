@@ -147,17 +147,21 @@ The name beside it is only a label. A code SpatiumDDI has a canonical name
 for (66, 150) renders under that name. Any other code renders as `code:NN`.
 Profiles used to render the catalogue name (`polycom-config-url`), which the
 agent does not know and dropped, so option 160 never reached a phone. A
-canonical name that contradicts its code, or a code listed twice, is a
-`422`.
+name that contradicts its code, or a code listed twice, is a `422`. That
+covers both SpatiumDDI's own names and the VoIP catalogue's, so
+`polycom-config-url` left on the editor's default code 66 is refused. A row
+stored before this check whose name contradicts its code keeps the delivery
+it had: under the name when the agent knew it, and not at all otherwise.
 
 Enabling a profile checks every option, not only the changed ones. It also
 refuses the starter pack's `CHANGE-ME` placeholders, which the pack seeds
-into every option of the profiles it creates disabled. A profile stored
+into every option of the profiles it creates disabled. A changed option on
+an enabled profile may not be a placeholder either. A profile stored
 before these checks is rendered without any option Kea cannot load, with a
 `dhcp_phone_option_dropped_invalid` warning in the api log. Before, one such
 option would have rejected the group's whole config. `vendor_class_match` is
-placed inside a Kea string literal, so a `'` in it is refused, and a stored
-profile containing one is left out of the render. The match is measured in
+placed inside a Kea string literal, so a `'` or a control character in it
+is refused, and a stored profile containing one is left out of the render. The match is measured in
 bytes, so a non-ASCII vendor string can match.
 
 #### Dynamic-lease DNS drift (`dns_track_dynamic_leases`)

@@ -232,14 +232,17 @@ the formatter handles the rest.
   is delivered: its canonical name when SpatiumDDI has one (66, 150), else
   `code:NN`, which the agent renders with its shipped definition. Values
   get the #1228 checks: a code listed twice, a name that contradicts its
-  code, and a value Kea cannot load are each a `422`. Enabling a profile
+  code (SpatiumDDI's own or the VoIP catalogue's), and a value Kea cannot
+  load are each a `422`. A stored row whose name contradicts its code keeps
+  the delivery it had before. Enabling a profile
   checks every option and refuses the starter pack's `CHANGE-ME`
   placeholders. Rendered by code, a placeholder in binary option 43 would
   otherwise make Kea reject the group's whole config. A profile stored
   before these checks is rendered without the options Kea cannot load,
   each logged as `dhcp_phone_option_dropped_invalid`.
-  `vendor_class_match` is placed inside a Kea string literal, so a `'`
-  now gets a 422, and a stored profile containing one is left out of the
+  `vendor_class_match` is placed inside a Kea string literal, so a `'` or
+  a control character now gets a 422, and a stored profile containing one
+  is left out of the
   render instead of breaking the config. It is measured in bytes, so a
   non-ASCII vendor string can now match. Verified with `kea-dhcp4 -t`.
 

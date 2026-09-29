@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.dns_names import contains_control_chars
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
@@ -582,9 +583,10 @@ async def _assemble_phone_classes(
             continue
         match_expr = ""
         if prof.vendor_class_match:
-            if "'" in prof.vendor_class_match:
-                # #1294 — it ends Kea's string literal and the whole config is
-                # rejected. Refused on write now; a profile stored before that
+            if "'" in prof.vendor_class_match or contains_control_chars(prof.vendor_class_match):
+                # #1294 — a ``'`` ends Kea's string literal, and Kea's lexer
+                # refuses a newline inside one; either rejects the whole
+                # config. Refused on write now; a profile stored before that
                 # is left out of the render rather than breaking every scope.
                 log.warning(
                     "dhcp_phone_profile_skipped_bad_match",
