@@ -37,12 +37,16 @@ _VERSIONS = _REPO_ROOT / "backend" / "app" / "core" / "versions.py"
 # A CalVer release tag always carries its ``-N``: the bare date is what
 # versions.py accepts from a reporting build, not what a tag may be.
 _CALVER_TAG = re.compile(r"^\d{4}\.\d{2}\.\d{2}-\d+$")
-# SemVer, with no leading zeros (SemVer §2) and no build metadata (``+`` is
-# not legal in an image tag). The leading-zero rule is what keeps a CalVer
-# date that lost its ``-N`` (``2026.09.04``) from reading as SemVer.
-_SEMVER_TAG = re.compile(
-    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
+# SemVer, with no leading zeros (SemVer §2 for the version, §9 for numeric
+# pre-release identifiers) and no build metadata (``+`` is not legal in an
+# image tag). The leading-zero rule keeps a CalVer date that lost its ``-N``
+# (``2026.09.04``) from reading as SemVer, and keeps ``1.0.0-rc.01`` from
+# being a second spelling of ``1.0.0-rc.1``: both parse to the same release,
+# and the chart-version rewrite in release.yml would publish both as the
+# same chart version.
+_NUM = r"(?:0|[1-9]\d*)"
+_PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+_SEMVER_TAG = re.compile(rf"^({_NUM})\.{_NUM}\.{_NUM}(?:-{_PRE_ID}(?:\.{_PRE_ID})*)?$")
 # A SemVer major this large is a CalVer date typed without its zeros
 # (``2026.9.4``), never a real release, and published it would outrank
 # every release after it.

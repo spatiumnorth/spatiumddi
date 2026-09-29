@@ -26,14 +26,10 @@ for as long as it has existed:
 
 Neither failure announces itself: the build is green, the image is published,
 and the only symptom is a Trivy report weeks later blaming packages nobody
-touched. So this asserts both, over the SAME image list the nightly matrix
-builds from — a new image is covered the moment it is added there, rather
-than when somebody remembers to add it here.
-
-It also asserts that release.yml publishes exactly that list (#1226). The
-release workflow carries its own copy because it builds, scans and pushes
-from it; an image missing from that copy would keep building every night
-and silently stop being released.
+touched. So this asserts both, over the SAME image list the nightly and
+release matrices build from (``.github/images.json``) — a new image is
+covered the moment it is added there, rather than when somebody remembers to
+add it here.
 
 stdlib-only, no network, no docker. Exit 1 on any finding.
 """
@@ -46,15 +42,8 @@ import re
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-NIGHTLY = REPO_ROOT / ".github" / "workflows" / "nightly.yml"
-RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
-
-# The images list is a heredoc of JSON inside a step of each workflow (the
-# nightly's gate, the release's meta). Parsed rather than duplicated, so this
-# linter cannot fall behind the matrix.
-_IMAGES_BLOCK = re.compile(
-    r"cat > /tmp/images\.json <<'IMAGES_EOF'\n(.*?)\n\s*IMAGES_EOF", re.DOTALL
-)
+# The one list of shipped images, read by nightly.yml and release.yml too.
+IMAGES = REPO_ROOT / ".github" / "images.json"
 
 # A package-manager upgrade of everything already installed. `apt-get upgrade`
 # and `apt-get dist-upgrade` both qualify; `apt-get install` deliberately does
@@ -128,36 +117,18 @@ def _shipped_body(body: str, target: str) -> str:
     return "\n".join("\n".join(stages[i][2]) for i in chain)
 
 
-def _images(workflow: pathlib.Path) -> list[dict[str, str]]:
-    match = _IMAGES_BLOCK.search(workflow.read_text())
-    if not match:
+def _images() -> list[dict[str, str]]:
+    try:
+        images = json.loads(IMAGES.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{IMAGES}: cannot read the image list ({exc})") from exc
+    # An empty list would make every check below vacuous and print success.
+    if not isinstance(images, list) or not images:
         raise SystemExit(
-            f"{workflow}: could not find the images.json heredoc — if the step was "
-            "restructured, update this linter rather than letting it silently check nothing"
+            f"{IMAGES}: expected a non-empty JSON list of images — a linter that checks "
+            "nothing must not report success"
         )
-    # The heredoc body is indented inside the YAML block scalar.
-    body = "\n".join(line.strip() for line in match.group(1).splitlines())
-    return json.loads(body)
-
-
-def _list_drift(nightly: list[dict[str, str]], release: list[dict[str, str]]) -> list[str]:
-    """How the release's image list differs from the nightly's, entry by entry."""
-    by_name = {image["image"]: image for image in nightly}
-    released = {image["image"]: image for image in release}
-    findings = [
-        f"{name}: built by the nightly but not published by release.yml"
-        for name in sorted(by_name.keys() - released.keys())
-    ]
-    findings += [
-        f"{name}: published by release.yml but not built by the nightly"
-        for name in sorted(released.keys() - by_name.keys())
-    ]
-    findings += [
-        f"{name}: release.yml builds {released[name]} but the nightly builds {by_name[name]}"
-        for name in sorted(by_name.keys() & released.keys())
-        if released[name] != by_name[name]
-    ]
-    return findings
+    return images
 
 
 def _strip_trailing_comment(line: str) -> str:
@@ -201,13 +172,13 @@ def _strip_comments(text: str) -> str:
 
 
 def main() -> int:
-    findings: list[str] = _list_drift(_images(NIGHTLY), _images(RELEASE))
+    findings: list[str] = []
 
-    for image in _images(NIGHTLY):
+    for image in _images():
         rel = image["file"].lstrip("./")
         path = REPO_ROOT / rel
         if not path.is_file():
-            findings.append(f"{rel}: listed in the nightly matrix but not on disk")
+            findings.append(f"{rel}: listed in .github/images.json but not on disk")
             continue
 
         try:

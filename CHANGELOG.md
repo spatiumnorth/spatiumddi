@@ -1324,23 +1324,38 @@ the formatter handles the rest.
   install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
   covers tags, anyone with write access could release any commit. Now a
   `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
-  to pass on the tagged commit; every image is built and scanned with
-  Trivy + `trivy-gate.sh` (the nightly's gate) before anything, including
-  the chart, is pushed; and `:latest` moves in a final job, after the
-  GitHub release exists, by copying the release's manifest rather than
-  rebuilding it. The release workflow also stops assuming CalVer (#1182
-  step 3): it accepts SemVer tags and publishes a SemVer pre-release
-  (`1.0.0-rc.1`) as a GitHub pre-release that never becomes `:latest`,
-  and the previous release, the CHANGELOG section and whether a tag
-  becomes latest are decided in `scripts/release_version.py` on the
-  product's own version ordering. The shell it replaces got all three
-  wrong across the switch: `sort -V` ranks every `2026.*` tag above every
-  `1.*` one, and the CHANGELOG lookup was a prefix match that returns
+  to pass on the tagged commit. Each image is built once, pushed by
+  digest with no tag, and both architectures are pulled from that digest
+  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
+  ever scanned amd64); only when every image passes is that same digest
+  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
+  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
+  a final job after the GitHub release exists, all images or none: it
+  records where each `:latest` pointed, retries each move, and puts back
+  the ones already moved if one still fails. Release runs are no longer
+  serialised, because GitHub cancels a queued run when another queues
+  behind it and `meta` can now wait an hour; "is this the newest
+  release" is re-checked right before GitHub's latest release and
+  `:latest` are set instead. The workflow also stops assuming CalVer
+  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
+  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
+  `:latest`, and the previous release, the CHANGELOG section and whether
+  a tag becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering, ranking only tags on `main` that have
+  a published release (`.github/scripts/release-tags.sh`), so a stray tag
+  cannot freeze `:latest`. The shell it replaces got all three wrong
+  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
+  one, and the CHANGELOG lookup was a prefix match that returns
   `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
-  one no longer takes over `:latest` or the stable download URLs.
-  `scripts/lint_image_upgrades.py` now also fails when the release's
-  image list and the nightly's differ, so an image cannot keep building
-  every night and silently stop being released.
+  one no longer takes over `:latest` or the stable download URLs, or
+  uploads the un-versioned copies behind them. Release candidates no
+  longer take slots in the asset pruner's keep window (eight candidates
+  would have pushed eight final releases' ISOs out early); a candidate
+  keeps its ISO until a final release supersedes it. The image list is
+  one file, `.github/images.json`, read by both workflows and the
+  image-upgrade linter. And `docs-publish.yml` no longer runs on release
+  tags: a tag on an older commit rolled the docs site back behind
+  `main`, and a tag off `main` published unreviewed docs.
 
 - **Pinned images brought current; the CloudNativePG operator and
   Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with

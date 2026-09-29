@@ -13,13 +13,10 @@ or a way the linter could have looked like it passed while checking nothing:
     comments merely describe an upgrade it does not perform;
   * an ``ARG`` never referenced in the RUN text does not change that text, so
     it changes no cache key and busts nothing;
-  * and if the nightly's images heredoc is ever restructured, the linter must
+  * and if the image list (``.github/images.json``, shared by the nightly and
+    the release since #1226) is ever emptied or unreadable, the linter must
     say so rather than find zero images and report success — the failure mode
     this whole class of guard keeps producing.
-
-#1226 added the release workflow's own copy of the list, which it builds,
-scans and pushes from; an image that drops off it keeps building every night
-and silently stops being released, so the two must match entry for entry.
 """
 
 from __future__ import annotations
@@ -39,17 +36,7 @@ pytestmark = pytest.mark.skipif(
     reason="image-upgrade linter not present in this checkout",
 )
 
-_NIGHTLY_TEMPLATE = """\
-jobs:
-  gate:
-    steps:
-      - run: |
-          cat > /tmp/images.json <<'IMAGES_EOF'
-          [
-            {"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}
-          ]
-          IMAGES_EOF
-"""
+_IMAGES = '[{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}]'
 
 _GOOD_DOCKERFILE = """\
 FROM alpine:3.24 AS runtime
@@ -74,18 +61,14 @@ def _run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     dockerfile: str | None,
-    nightly: str = _NIGHTLY_TEMPLATE,
-    release: str | None = None,
+    images: str = _IMAGES,
 ) -> int:
-    workflows = tmp_path / ".github" / "workflows"
-    workflows.mkdir(parents=True)
-    (workflows / "nightly.yml").write_text(nightly)
-    (workflows / "release.yml").write_text(nightly if release is None else release)
+    (tmp_path / ".github").mkdir(parents=True)
+    (tmp_path / ".github" / "images.json").write_text(images)
     if dockerfile is not None:
         (tmp_path / "Dockerfile").write_text(dockerfile)
     monkeypatch.setattr(lint, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(lint, "NIGHTLY", workflows / "nightly.yml")
-    monkeypatch.setattr(lint, "RELEASE", workflows / "release.yml")
+    monkeypatch.setattr(lint, "IMAGES", tmp_path / ".github" / "images.json")
     return lint.main()
 
 
@@ -232,70 +215,21 @@ def test_an_image_missing_from_disk_is_reported(
     assert _run(lint, monkeypatch, tmp_path, None) == 1
 
 
-def test_a_restructured_heredoc_raises_rather_than_passing(
-    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize("images", ["[]", "{}", "not json"])
+def test_an_empty_or_unreadable_image_list_raises_rather_than_passing(
+    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, images: str
 ) -> None:
     """Finding zero images must not read as success. A guard that evaluates
     nothing looks exactly like one that passed — which is the failure this
     repo keeps rediscovering (#1030 most recently)."""
     with pytest.raises(SystemExit):
-        _run(
-            lint,
-            monkeypatch,
-            tmp_path,
-            _GOOD_DOCKERFILE,
-            nightly="jobs:\n  gate:\n    steps:\n      - run: echo no heredoc here\n",
-        )
-
-
-_SECOND_IMAGE = (
-    '{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"},\n'
-    '            {"image": "other", "context": ".", "file": "./Dockerfile", "target": "runtime"}'
-)
-_ONE_IMAGE = '{"image": "an-image", "context": ".", "file": "./Dockerfile", "target": "runtime"}'
-
-
-@pytest.mark.parametrize(
-    ("nightly", "release"),
-    [
-        # An image the nightly builds and the release no longer publishes.
-        (_NIGHTLY_TEMPLATE.replace(_ONE_IMAGE, _SECOND_IMAGE), _NIGHTLY_TEMPLATE),
-        # The other direction: published by a release, never built nightly,
-        # so a regression in it surfaces only when a release is cut.
-        (_NIGHTLY_TEMPLATE, _NIGHTLY_TEMPLATE.replace(_ONE_IMAGE, _SECOND_IMAGE)),
-        # Same name, different build: the #732 shape, a release that drops
-        # the api's ``target: runtime`` and ships the dev stage.
-        (_NIGHTLY_TEMPLATE, _NIGHTLY_TEMPLATE.replace('"target": "runtime"', '"target": ""')),
-    ],
-    ids=["missing-from-release", "missing-from-nightly", "different-target"],
-)
-def test_the_release_list_must_match_the_nightly_list(
-    lint: types.ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-    nightly: str,
-    release: str,
-) -> None:
-    (tmp_path / "Dockerfile").write_text(_GOOD_DOCKERFILE)
-    assert _run(lint, monkeypatch, tmp_path, None, nightly=nightly, release=release) == 1
-
-
-def test_a_release_without_the_heredoc_raises(
-    lint: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    with pytest.raises(SystemExit):
-        _run(
-            lint,
-            monkeypatch,
-            tmp_path,
-            _GOOD_DOCKERFILE,
-            release="jobs:\n  meta:\n    steps:\n      - run: echo no heredoc here\n",
-        )
+        _run(lint, monkeypatch, tmp_path, _GOOD_DOCKERFILE, images=images)
 
 
 def test_the_real_tree_passes(lint: types.ModuleType) -> None:
-    """The linter against the repo it ships in — every image the nightly
-    builds. Skipped in the dev container, which copies only backend/."""
-    if not (_REPO_ROOT / ".github" / "workflows" / "nightly.yml").is_file():
+    """The linter against the repo it ships in — every image the nightly and
+    the release build. Skipped in the dev container, which copies only
+    backend/."""
+    if not (_REPO_ROOT / ".github" / "images.json").is_file():
         pytest.skip("full checkout not present in this image")
     assert lint.main() == 0

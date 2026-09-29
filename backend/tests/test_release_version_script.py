@@ -67,6 +67,8 @@ def _tag(rv: types.ModuleType, name: str):
         ("1.2.10", False),
         ("1.0.0-rc.1", True),
         ("1.0.0-beta.2", True),
+        ("1.0.0-rc.0", True),
+        ("1.0.0-0a.1", True),  # alphanumeric may start with a digit
     ],
 )
 def test_release_tags_are_accepted(rv: types.ModuleType, name: str, prerelease: bool) -> None:
@@ -79,6 +81,9 @@ def test_release_tags_are_accepted(rv: types.ModuleType, name: str, prerelease: 
         "2026.09.04",  # a CalVer tag always carries its -N
         "2026.9.4",  # nor is it SemVer: that major would outrank every release
         "1.01.0",  # SemVer forbids leading zeros
+        "1.0.0-rc.01",  # ...in numeric pre-release identifiers too: a second rc.1
+        "1.0.0-",
+        "1.0.0-rc..1",
         "2026.13.40-1",  # not a date
         "0.1.0",  # the packaging placeholder; SemVer releases start at 1.0.0
         "0.0.0-nightly-20260928",
