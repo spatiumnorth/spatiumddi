@@ -12,10 +12,11 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
-from app.api.v1.dhcp.scopes import validate_domain_options
+from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPClientClass, DHCPServerGroup
+from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
     tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_client_class"))]
@@ -73,7 +74,10 @@ async def create_class(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A client class with that name exists")
-    validate_domain_options(body.options or {})  # #597 — domain-name/domain-search FQDNs
+    # A client class always renders into Dhcp4 (and into Dhcp6 when the
+    # group has v6 scopes); "any" checks it as the Dhcp4 it must load in.
+    body.options = normalize_options(body.options)
+    validate_dhcp_options(body.options, address_family="any")
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
@@ -101,8 +105,9 @@ async def update_class(
         raise HTTPException(status_code=404, detail="Client class not found")
     changes = body.model_dump(exclude_none=True)
     if "options" in changes:
-        # Validate only changed domain options (#597) vs the stored value.
-        validate_domain_options(changes["options"], previous=cc.options or {})
+        # Validate only changed options (#597, #1228) vs the stored value.
+        changes["options"] = normalize_options(changes["options"])
+        validate_dhcp_options(changes["options"], address_family="any", previous=cc.options or {})
     for k, v in changes.items():
         setattr(cc, k, v)
     write_audit(

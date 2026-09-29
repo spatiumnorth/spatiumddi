@@ -245,6 +245,31 @@ the formatter handles the rest.
     `create_dns_record` refuses it. A record in the trash does not
     count.
 
+- **DHCP option names and values are checked when saved (#1228).**
+  Scope, pool, reservation, option-template, client-class and
+  device-policy options were stored as given. Only `domain-name` and
+  `domain-search` were checked. A value Kea cannot parse, such as
+  `routers: "10.0.0.1, bogus"`, an MTU of 70000, or text in raw option
+  43 where hex is required, made Kea reject the whole config for the
+  server group. The agent reverted and alerted (#882), but every later
+  change to the group was stuck behind it. A name the renderer does not
+  know was dropped by the agent with only a log line, so the option
+  was saved and never served. Each of those writes is now a `422` that
+  names the option. Names are checked against what the Kea renderer
+  emits for the scope's address family. A raw `code:NN` is accepted
+  only for the codes SpatiumDDI ships a definition for, since the
+  agent drops any other. `opt-NN` (the Windows importer's spelling) is
+  accepted. Raw `option_data` is refused. Values are typed: IPv4 or
+  IPv6 addresses, integer ranges, FQDNs, non-blank strings, and plain
+  even-length hex for binary codes. The rules were checked against
+  `kea-dhcp4 -t`. An option already stored is not re-checked unless
+  the write changes it, so existing scopes stay editable. Applying an
+  option template checks the merged result against the scope's family.
+  A pick from the custom-options catalogue is now stored under the code
+  it can be delivered as (`code:43`), instead of a catalogue name the
+  agent would drop. This applies in the option-template and client-class
+  editors too, which used to key such a pick by its name or `option-NN`.
+
 - **A slot upgrade survives its image download being cut short
   (#1216).** The runner read the image until the connection stopped
   sending and never compared the bytes with `Content-Length`. So a
