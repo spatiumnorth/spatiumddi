@@ -308,19 +308,22 @@ def test_logfile_receives_json_and_a_reconfigure_closes_the_old_handle(tmp_path,
     saved_handlers, saved_level = list(root.handlers), root.level
     monkeypatch.setattr(log_module.settings, "log_format", "json")
     try:
-        first = tmp_path / "worker-1.log"
-        capp._configure_structured_logging(loglevel=logging.INFO, logfile=str(first))
-        handle = capp._LOGFILE_STREAM
-        logging.getLogger("celery.app.trace").info("to the file")
-        assert json.loads(first.read_text().splitlines()[-1])["event"] == "to the file"
+        logfile = tmp_path / "worker.log"
+        capp._configure_structured_logging(loglevel=logging.INFO, logfile=str(logfile))
+        ours = [h for h in root.handlers if getattr(h, log_module._HANDLER_FLAG, False)]
+        assert len(ours) == 1 and isinstance(ours[0], logging.FileHandler)
+        logging.getLogger("celery.app.trace").info("stdlib to the file")
+        structlog.get_logger("fresh-logger").info("structlog_to_the_file")
+        events = [json.loads(line)["event"] for line in logfile.read_text().splitlines()]
+        assert events == ["stdlib to the file", "structlog_to_the_file"]
 
         capp._configure_structured_logging(loglevel=logging.INFO, logfile=None)
-        assert handle is not None and handle.closed
-        assert capp._LOGFILE_STREAM is None
+        assert ours[0].stream is None or ours[0].stream.closed
     finally:
-        if capp._LOGFILE_STREAM is not None:
-            capp._LOGFILE_STREAM.close()
-            capp._LOGFILE_STREAM = None
+        for handler in list(root.handlers):
+            if getattr(handler, log_module._HANDLER_FLAG, False):
+                root.removeHandler(handler)
+                handler.close()
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
         structlog.configure(**saved_config)

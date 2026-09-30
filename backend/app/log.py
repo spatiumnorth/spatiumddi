@@ -41,6 +41,7 @@ def configure_logging(
     *,
     stream: TextIO | None = None,
     level: int | str | None = None,
+    logfile: str | None = None,
 ) -> None:
     """Configure structlog for JSON output per the observability spec.
 
@@ -53,6 +54,9 @@ def configure_logging(
 
     ``stream`` sends both to one file object; the default is the process's
     stdout for structlog lines and stderr for stdlib records, as before.
+    ``logfile`` (Celery's ``--logfile``) sends both to that file instead,
+    through a ``FileHandler`` — so the logging module owns the handle and
+    closes it when this handler is replaced or at shutdown.
     ``level`` (Celery's ``--loglevel``) applies only when it is MORE verbose
     than ``LOG_LEVEL``, so neither a command-line default nor the setting
     can hide what the other asked to see.
@@ -75,15 +79,22 @@ def configure_logging(
         exc_processors = []
         renderer = structlog.dev.ConsoleRenderer()
 
+    handler: logging.StreamHandler[TextIO]
+    if logfile:
+        handler = logging.FileHandler(logfile, encoding="utf-8")
+        struct_file: TextIO | None = handler.stream
+    else:
+        handler = logging.StreamHandler(stream)
+        struct_file = stream
+
     structlog.configure(
         processors=shared_processors + exc_processors + [renderer],
         wrapper_class=structlog.make_filtering_bound_logger(level_no),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=stream),
+        logger_factory=structlog.PrintLoggerFactory(file=struct_file),
         cache_logger_on_first_use=True,
     )
 
-    handler = logging.StreamHandler(stream)
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=[*shared_processors, structlog.stdlib.add_logger_name],
@@ -100,5 +111,6 @@ def configure_logging(
     for existing in list(root.handlers):
         if getattr(existing, _HANDLER_FLAG, False):
             root.removeHandler(existing)
+            existing.close()
     root.addHandler(handler)
     root.setLevel(level_no)
