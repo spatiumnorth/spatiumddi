@@ -343,7 +343,7 @@ The `looking-glass` service uses `network_mode: host` so BGP (TCP/179) originate
 
 1. Control plane already running somewhere reachable (e.g. `https://spatium.example.com`).
 2. The pre-shared agent bootstrap key from the control plane. These are the `DNS_AGENT_KEY` / `DHCP_AGENT_KEY` env values the control plane was started with; reveal them from the UI at **Settings → Security → Agent bootstrap keys** (`POST /api/v1/admin/agent-keys/reveal`, superadmin + password-confirm). The agent must present this same key — the control plane rejects bootstrap attempts with an unknown key. The agent exchanges the pre-shared key for a rotating JWT on first contact and caches it locally, so it only needs the bootstrap key once.
-3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
+3. The agent verifies the control plane's TLS certificate. With a certificate from a public CA there is nothing to do. With a private CA or a self-signed certificate, put that CA next to the compose file as `spatium-ca.crt`, uncomment the `./spatium-ca.crt:/etc/ssl/spatium-ca.crt:ro` volume line, and set `TLS_CA_PATH=/etc/ssl/spatium-ca.crt` in `.env`. `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` turns verification off instead: lab use only, since anyone on the network path can then read the agent key and serve the agent its configuration. The agent logs a warning on every start while it is off, and `TLS_CA_PATH` wins if both are set. (Until #1220 these files defaulted the skip to `1`; see the upgrade note in the CHANGELOG.)
 
 ### DHCP-only VM
 

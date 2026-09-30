@@ -1239,6 +1239,8 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 
 When two DHCP server containers serve the same pool, they must not hand the same IP to different MACs. SpatiumDDI solves this by treating a **`DHCPServerGroup` with two Kea members as an implicit HA pair** — HA tuning lives on the group, per-peer URL lives on each server, and Kea's `libdhcp_ha.so` hook is rendered on every member's config. There is no separate "failover channel" row any more (that was removed in 2026.04.22-1 when scopes moved to the group).
 
+> **HA covers DHCPv4 only (#1238).** The agent renders `libdhcp_ha.so` into the `Dhcp4` config alone; `Dhcp6` loads `libdhcp_lease_cmds.so` and nothing else, and the HA state the UI shows is read from the DHCPv4 daemon. A DHCPv6 scope on a group with two or more Kea members is served by **each member on its own**: pools are not split, leases are not shared, and two members can hand the same address to different clients. The UI marks an enabled stateful scope like that `v6: no HA` (a `stateless` or `slaac` scope hands out no address, so it is not flagged) and says so in the scope form, and every HA pill reads `HA v4: <state>`. Until DHCPv6 HA lands ([#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258)), serve DHCPv6 from a group with one Kea member.
+
 ### Data model
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
@@ -1281,7 +1283,7 @@ The `libdhcp_lease_cmds.so` hook is a hard prerequisite for HA and is loaded unc
 
 A fourth thread in the agent (`HAStatusPoller`, `agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `status-get` against the local Kea control socket every ~15 s with small jitter and POSTs the result to `POST /api/v1/dhcp/agents/ha-status`. Kea 2.6 folded HA state into the generic `status-get` response under `arguments.high-availability[0].ha-servers.local.state`; the extractor also accepts pre-2.6 `ha-status-get` shapes for forward-compat. The control plane stores the state on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. The poller self-disables when the most recent bundle carried no `failover` block, so standalone servers don't spam Kea with commands that return an error.
 
-Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer. The group detail view shows the same pill inline per-server so you can see HA state without drilling into each server page; use the Refresh button there after changing HA mode to repaint without waiting for the 30 s React Query poll.
+Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA v4: <state>` pill; the `v4` is there because this is the DHCPv4 daemon's state and says nothing about DHCPv6. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer. The group detail view shows the same pill inline per-server so you can see HA state without drilling into each server page; use the Refresh button there after changing HA mode to repaint without waiting for the 30 s React Query poll.
 
 ### Peer IP drift self-healing
 
@@ -1527,19 +1529,22 @@ rule here has been surfaced to an operator, not just silently logged.
 
 ### Kea HA (on a server group)
 
-- **At most 2 Kea members in a group.** `libdhcp_ha.so` only supports
-  pairs; adding a third Kea member makes the config ambiguous.
-  Validation is a deferred follow-up (see `CLAUDE.md`), not enforced
-  at the CRUD layer today.
+- **HA covers DHCPv4 only.** A DHCPv6 scope on a group with two or
+  more Kea members is served by every member independently, with no
+  lease coordination; the UI flags an enabled stateful one `v6: no HA`. DHCPv6 HA is
+  [#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258).
+- **Two HA partners.** `libdhcp_ha.so` pairs two servers; a third or
+  later Kea member renders as a `backup` peer (#332), which receives
+  lease updates but takes no part in the heartbeat.
 - **Group mode enum.** `mode` must be `standalone`, `hot-standby`, or
   `load-balancing`. Enforced at `backend/app/api/v1/dhcp/server_groups.py`.
 - **HA rendering requires both peers' URLs.** If either Kea member in
   a 2-member group has an empty `ha_peer_url`, the config bundle
   drops the `failover` block and neither peer loads the HA hook —
   silent fall-through to "not-yet-configured" state.
-- **Mixed driver groups are OK.** A group can contain Windows DHCP
-  servers alongside Kea; only Kea members participate in the HA
-  rendering path.
+- **Mixed driver groups are refused (#1110).** Creating or moving a
+  server into a group that already has the other driver is a `422`:
+  Kea HA cannot coordinate with Windows failover. See §14.
 
 ### Client classes
 

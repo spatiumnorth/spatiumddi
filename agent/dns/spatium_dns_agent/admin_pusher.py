@@ -85,11 +85,7 @@ def redact_secrets(content: str) -> str:
 
 
 def _cp_client(cfg: AgentConfig) -> httpx.Client:
-    verify: bool | str = True
-    if cfg.insecure_skip_tls_verify:
-        verify = False
-    elif cfg.tls_ca_path:
-        verify = cfg.tls_ca_path
+    verify = cfg.httpx_verify()
     return httpx.Client(base_url=cfg.control_plane_url, verify=verify, timeout=15.0)
 
 

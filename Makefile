@@ -283,7 +283,12 @@ test-durations:
 # ``dockerfile:context:name``.
 #
 # IMAGE=<name> scans one image; omit to scan all eight.
-TRIVY_CACHE ?= $(CURDIR)/.trivy-cache
+#
+# The loop lives in scripts/trivy-scan.sh, which tells a finding apart from a
+# scan that never ran (#1272) — see its header. The DB cache defaults to a
+# path OUTSIDE the checkout: Docker Desktop can refuse to mount a checkout on
+# an external volume, and that refusal used to be reported as a finding.
+TRIVY_CACHE ?= $(HOME)/.cache/spatiumddi-trivy
 TRIVY_IMAGES ?= \
 	agent/dhcp/images/kea/Dockerfile:.:kea \
 	agent/dns/images/bind9/Dockerfile:.:bind9 \
@@ -295,34 +300,7 @@ TRIVY_IMAGES ?= \
 	frontend/Dockerfile:frontend:frontend
 
 trivy:
-	@mkdir -p $(TRIVY_CACHE)
-	@fail=0; \
-	for spec in $(TRIVY_IMAGES); do \
-	  df=$${spec%%:*}; name=$${spec##*:}; ctx=$${spec#*:}; ctx=$${ctx%:*}; \
-	  if [ -n "$(IMAGE)" ] && [ "$(IMAGE)" != "$$name" ]; then continue; fi; \
-	  printf "→ %-14s building… " "$$name"; \
-	  if ! docker build -q -f "$$df" -t "spatiumddi-trivy-$$name:scan" "$$ctx" >/dev/null 2>&1; then \
-	    printf "BUILD FAILED\n"; fail=1; continue; \
-	  fi; \
-	  printf "scanning… "; \
-	  if docker run --rm \
-	      -v /var/run/docker.sock:/var/run/docker.sock \
-	      -v "$(TRIVY_CACHE)":/root/.cache/ \
-	      aquasec/trivy:latest image \
-	      --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --scanners vuln -q \
-	      "spatiumddi-trivy-$$name:scan" >/tmp/trivy-$$name.txt 2>&1; then \
-	    printf "clean\n"; \
-	  else \
-	    printf "FINDINGS\n"; \
-	    grep -E "CVE-|Total:" /tmp/trivy-$$name.txt | head -8 | sed 's/^/     /'; \
-	    fail=1; \
-	  fi; \
-	done; \
-	if [ $$fail -ne 0 ]; then \
-	  echo ""; echo "✗ Trivy found HIGH/CRITICAL vulnerabilities — fix before pushing."; \
-	  exit 1; \
-	fi; \
-	echo ""; echo "✓ Trivy clean (HIGH/CRITICAL, ignore-unfixed) — safe to push."
+	@IMAGE="$(IMAGE)" TRIVY_CACHE="$(TRIVY_CACHE)" bash scripts/trivy-scan.sh $(TRIVY_IMAGES)
 
 # ── OpenAPI contract export (#903) ──────────────────────────────────────────
 #

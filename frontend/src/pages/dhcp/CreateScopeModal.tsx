@@ -17,6 +17,7 @@ import {
 } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
+import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
@@ -230,6 +231,16 @@ export function CreateScopeModal({
     setRaManaged(m === "stateful");
     setRaOther(m !== "slaac");
   }
+
+  // #1238 — HA is DHCPv4 only. Say so while the scope is being set up,
+  // not only as a tag after it has been created on a multi-Kea group.
+  const selectedGroup = dhcpGroups.find((g) => g.id === groupId);
+  const v6NoHa =
+    isV6 &&
+    v6ScopeLacksHa(
+      { address_family: "ipv6", v6_address_mode: v6Mode },
+      selectedGroup,
+    );
 
   const { data: failover } = useGroupFailover(groupId || undefined);
   const windowsMembers = failover?.members ?? [];
@@ -772,6 +783,11 @@ export function CreateScopeModal({
                 </option>
               </select>
             </Field>
+            {v6NoHa && selectedGroup && (
+              <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-300">
+                {v6ScopeNoHaNote(selectedGroup.kea_member_count)}
+              </div>
+            )}
             <div className="rounded border bg-muted/20 p-2 text-[11px] text-muted-foreground">
               Set these Router Advertisement flags on your{" "}
               <strong>router</strong> (radvd / gateway) — SpatiumDDI&apos;s Kea
