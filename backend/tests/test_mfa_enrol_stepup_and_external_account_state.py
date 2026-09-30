@@ -260,9 +260,9 @@ async def test_a_disabled_external_account_is_refused_before_anything_changes(
 
 
 def test_the_login_page_gets_a_distinct_error_code():
-    from app.api.v1.auth.router import _login_error_redirect
+    import app.api.v1.auth.router as auth_router
 
-    location = _login_error_redirect("account_disabled").headers["location"]
+    location = auth_router._login_error_redirect("account_disabled").headers["location"]
     assert location.endswith("error=account_disabled")
 
 
@@ -392,12 +392,12 @@ async def test_an_unreadable_budget_raises_instead_of_reading_as_unblocked(
 
 def _throttle_down(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     import app.api.v1.auth.router as auth_router
-    from app.core.auth_throttle import StepupThrottleUnavailable
+    import app.core.auth_throttle as throttle
 
     failures: list[object] = []
 
     async def _blocked(_user_id: object) -> bool:
-        raise StepupThrottleUnavailable
+        raise throttle.StepupThrottleUnavailable
 
     async def _record(user_id: object) -> None:
         failures.append(user_id)
