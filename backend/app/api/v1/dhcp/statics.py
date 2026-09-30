@@ -21,7 +21,11 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.option_validation import normalize_options
-from app.services.dhcp.static_ipam import detach_ipam_for_static, upsert_ipam_for_static
+from app.services.dhcp.static_ipam import (
+    detach_ipam_for_static,
+    publish_handover_ddns,
+    upsert_ipam_for_static,
+)
 from app.services.dhcp.windows_writethrough import push_static_change
 from app.services.tags import apply_tag_filter
 
@@ -324,7 +328,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
-    await detach_ipam_for_static(db, st)
+    handovers = await detach_ipam_for_static(db, st)
     write_audit(
         db,
         user=user,
@@ -334,4 +338,8 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_display=f"{st.mac_address}->{st.ip_address}",
     )
     await db.delete(st)
+    # #1274 — a row handed to a live lease gets its DDNS back, but only once
+    # the reservation is gone: DDNS lets a reservation's hostname win.
+    await db.flush()
+    await publish_handover_ddns(db, handovers)
     await db.commit()

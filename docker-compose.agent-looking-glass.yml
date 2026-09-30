@@ -49,10 +49,15 @@ services:
       SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
 
       # ── TLS ───────────────────────────────────────────────────────
-      # Flip to 0 once your control plane has a trusted cert. Default
-      # is 1 for lab / self-signed testing.
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-1}"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+      # The control plane's certificate is verified (#1220). A cert from a
+      # public CA needs nothing here. For a private CA or a self-signed
+      # cert, mount that CA (the commented volume below) and set
+      # TLS_CA_PATH=/etc/ssl/spatium-ca.crt in .env.
+      # SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 turns verification off: lab use
+      # only, since anyone on the network path can then read the agent key.
+      # TLS_CA_PATH wins if both are set.
+      TLS_CA_PATH: "${TLS_CA_PATH:-}"
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-0}"
 
       # ── Tuning (optional, defaults shown) ─────────────────────────
       # LOG_LEVEL: INFO
@@ -61,8 +66,8 @@ services:
       # RIB_POLL_INTERVAL: "30"
     volumes:
       - lg_agent_state:/var/lib/spatium-lg-agent
-      # Optional: mount a CA bundle to verify the control plane.
-      # - /etc/ssl/certs:/etc/ssl/certs:ro
+      # Private-CA / self-signed control plane: the CA TLS_CA_PATH names.
+      # - ./spatium-ca.crt:/etc/ssl/spatium-ca.crt:ro
 
 volumes:
   lg_agent_state:

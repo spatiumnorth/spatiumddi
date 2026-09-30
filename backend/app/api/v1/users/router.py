@@ -269,6 +269,19 @@ async def update_user(
             detail="Cannot remove your own superadmin status",
         )
 
+    # #1242 — an external account has no local password, so the flag would
+    # lock it out of everything until an admin cleared it again. Clearing it
+    # stays allowed, which is how a row set before this check gets tidied
+    # up. Refused before any field is touched, so a 400 changes nothing.
+    if body.force_password_change and user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{user.username}' signs in through {user.auth_source}; its password is "
+                "managed by the identity provider, so it cannot be required to change it here."
+            ),
+        )
+
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
@@ -297,6 +310,18 @@ async def reset_password(
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.auth_source != "local":
+        # #1242 — a local password on an external account is never used to
+        # sign in (login goes to the provider), and the reset also sets
+        # ``force_password_change``, which would lock the account out.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{user.username}' signs in through {user.auth_source}; reset the password "
+                "in the identity provider. To end its sessions here, disable the account or "
+                "revoke them from Sessions."
+            ),
+        )
 
     # Admin reset bypasses history (an admin reset is by definition out
     # of band — the user's prior choices are not in scope) but still

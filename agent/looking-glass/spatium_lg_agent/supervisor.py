@@ -31,6 +31,11 @@ log = structlog.get_logger(__name__)
 
 
 def run(cfg: AgentConfig) -> int:
+    # Every start, so it cannot scroll out of view (#1220).
+    tls_warning = cfg.tls_warning()
+    if tls_warning:
+        log.warning("control_plane_tls", detail=tls_warning)
+
     _agent_id, token = ensure_token(cfg)
     token_ref = [token]
 
