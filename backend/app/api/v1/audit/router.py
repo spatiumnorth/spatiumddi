@@ -7,6 +7,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB
+from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
@@ -128,7 +129,7 @@ async def export_change_report_pdf(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": content_disposition(fname)},
     )
 
 

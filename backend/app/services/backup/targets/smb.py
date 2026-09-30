@@ -49,6 +49,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
@@ -58,8 +59,8 @@ _ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 def _unc(config: dict[str, Any], filename: str | None = None) -> str:
     """Compose the ``\\\\server\\share\\path[\\filename]`` UNC path
-    smbclient expects. ``os.path.basename`` defends against
-    operator-supplied filenames containing path separators.
+    smbclient expects. ``safe_filename`` refuses operator-supplied
+    filenames containing path separators.
     """
     server = config["server"]
     share = config["share"].strip("/\\")
@@ -68,7 +69,7 @@ def _unc(config: dict[str, Any], filename: str | None = None) -> str:
     if sub:
         parts.append(sub.replace("/", "\\"))
     if filename is not None:
-        parts.append(os.path.basename(filename))
+        parts.append(safe_filename(filename))
     return "\\".join(parts)
 
 
@@ -241,7 +242,7 @@ class SmbDestination(BackupDestination):
                     return fh.read()
             except FileNotFoundError as exc:
                 raise BackupDestinationError(
-                    f"archive {os.path.basename(filename)!r} not found at {target}"
+                    f"archive {safe_filename(filename)!r} not found at {target}"
                 ) from exc
             except Exception as exc:  # noqa: BLE001
                 raise BackupDestinationError(f"SMB read failed: {exc}") from exc

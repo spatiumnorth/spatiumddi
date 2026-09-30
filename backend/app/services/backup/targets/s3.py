@@ -81,6 +81,7 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     RetentionLockedError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
@@ -124,11 +125,11 @@ def _client(config: dict[str, Any]):
 
 def _key(config: dict[str, Any], filename: str) -> str:
     """Compose the object key from the optional prefix + filename.
-    ``os.path.basename`` defends against operator-typed paths in
-    ``filename`` that try to escape the prefix.
+    ``safe_filename`` refuses operator-typed paths in ``filename``
+    that would escape the prefix.
     """
     prefix = (config.get("prefix") or "").strip("/")
-    safe = os.path.basename(filename)
+    safe = safe_filename(filename)
     if prefix:
         return f"{prefix}/{safe}"
     return safe

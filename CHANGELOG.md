@@ -1409,6 +1409,30 @@ the formatter handles the rest.
 
 ### Security
 
+- **A backup archive named `..` can no longer delete the folder above
+  the archives (#1243).** The shared `safe_filename()` was
+  `os.path.basename`, and `basename("..")` is `..`. On a WebDAV target
+  `urljoin` turned that into the parent collection's URL, so
+  `DELETE /backup/targets/{id}/archives/%2E%2E` sent a recursive WebDAV
+  `DELETE` one level above the archives. Superadmin-only, but it
+  deletes data. `safe_filename()` now refuses an empty name, `.`, `..`,
+  anything with a `/` or `\`, and control characters, instead of
+  stripping (stripping also turned `a/b.zip` into `b.zip`, an archive
+  the caller never named). The seven drivers that carried their own
+  inline `basename` (S3, SCP, Azure Blob, SMB, FTP, GCS, WebDAV) now
+  all call it. The WebDAV URL percent-encodes the name as well, so a
+  name that arrives as `%2E%2E` is sent as a literal and never becomes
+  a dot-segment on a server that decodes before normalising.
+  The download, delete and restore-from-archive routes answer **422**
+  for such a name without reaching the destination, and also for any
+  name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
+  are the only names the listing ever shows, so any other name was
+  never offered by this API. Eleven download routes that built
+  `Content-Disposition` by hand now use `content_disposition()`, and an
+  uploaded upgrade image's filename, the one download name an uploader
+  controls, is stored as its last path component with control
+  characters removed, instead of verbatim.
+
 - **A client can no longer choose the source IP the API records
   and rate-limits (#1221).** Compose published the API on every
   interface, and the API believed `X-Real-IP` from any caller. nginx

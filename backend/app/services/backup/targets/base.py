@@ -20,7 +20,6 @@ of every driver into the router.
 
 from __future__ import annotations
 
-import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -37,14 +36,31 @@ ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 
 def safe_filename(filename: str) -> str:
-    """Strip path separators from an operator-supplied filename.
+    """Return *filename* if it is one plain path component, else refuse it.
 
     This is the defence that stops a crafted archive name escaping the
     configured directory / prefix / collection, so it lives in one place
     rather than being re-inlined per driver — hardening it in one copy
-    while three others stayed as they were is the failure worth avoiding.
+    while others stayed as they were is the failure worth avoiding.
+
+    It REFUSES rather than strips (#1243). The old ``os.path.basename``
+    stripped separators and let ``..`` through unchanged, because
+    ``basename("..") == ".."`` — and ``..`` is not a name inside the
+    collection, it is the collection's parent. On WebDAV ``urljoin`` turns
+    it into the parent collection's URL, so deleting an archive called
+    ``..`` sent a recursive ``DELETE`` one level up. Stripping is also the
+    wrong shape in itself: ``a/b.zip`` quietly became ``b.zip``, an
+    archive the caller never named.
     """
-    return os.path.basename(filename)
+    if (
+        not filename
+        or filename in (".", "..")
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename)
+    ):
+        raise InvalidArchiveNameError(f"invalid archive name {filename!r}")
+    return filename
 
 
 class BackupDestinationError(Exception):
@@ -57,6 +73,17 @@ class DestinationConfigError(BackupDestinationError):
     """The ``config`` blob is malformed for this destination kind
     (missing a required field, type mismatch, etc.). 422-shaped on
     the API side."""
+
+
+class InvalidArchiveNameError(BackupDestinationError):
+    """The archive name is not a single plain path component (#1243).
+
+    Raised by :func:`safe_filename` before anything reaches the
+    destination. A subclass so every existing ``except
+    BackupDestinationError`` still catches it; the API layer catches it
+    first and answers 422, since the name is the caller's mistake, not
+    the destination failing.
+    """
 
 
 class RetentionLockedError(BackupDestinationError):

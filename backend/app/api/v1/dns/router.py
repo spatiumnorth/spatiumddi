@@ -35,6 +35,7 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
+from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     contains_control_chars,
@@ -4240,7 +4241,7 @@ async def export_all_zones(
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 
@@ -7560,7 +7561,7 @@ async def export_zone(
     return Response(
         content=text,
         media_type="text/dns",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 

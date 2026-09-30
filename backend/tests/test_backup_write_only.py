@@ -37,7 +37,11 @@ from app.services.backup.targets import (
     UnsupportedOperationError,
     get_destination,
 )
-from app.services.backup.targets.base import BackupDestinationError, DestinationConfigError
+from app.services.backup.targets.base import (
+    BackupDestinationError,
+    DestinationConfigError,
+    InvalidArchiveNameError,
+)
 from app.services.backup.targets.https_put import (
     HttpsPutDestination,
     _parse_extra_headers,
@@ -366,9 +370,11 @@ def test_target_url_appends_when_there_is_no_placeholder_or_query():
     )
 
 
-def test_target_url_strips_a_directory_traversal_from_the_filename():
+def test_target_url_refuses_a_directory_traversal_in_the_filename():
+    # Refused rather than stripped since #1243.
     cfg = {"url": "https://nexus.example/repository/backups"}
-    assert _target_url(cfg, "../../evil.zip").endswith("/evil.zip")
+    with pytest.raises(InvalidArchiveNameError):
+        _target_url(cfg, "../../evil.zip")
 
 
 def test_extra_headers_parse_and_refuse_malformed_lines():

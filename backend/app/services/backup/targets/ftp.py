@@ -52,6 +52,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
@@ -228,7 +229,7 @@ class FtpDestination(BackupDestination):
         filename: str,
         archive_bytes: bytes,
     ) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
         tmp = remote + ".tmp"
 
@@ -314,7 +315,7 @@ class FtpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> bytes:
@@ -331,7 +332,7 @@ class FtpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> None:

@@ -50,6 +50,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
@@ -128,7 +129,7 @@ class AzureBlobDestination(BackupDestination):
 
     def _blob_name(self, config: dict[str, Any], filename: str) -> str:
         prefix = (config.get("prefix") or "").strip("/")
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         return f"{prefix}/{safe}" if prefix else safe
 
     def _strip_prefix(self, config: dict[str, Any], blob_name: str) -> str:
