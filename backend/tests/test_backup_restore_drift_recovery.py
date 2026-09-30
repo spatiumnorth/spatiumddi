@@ -29,6 +29,7 @@ from app.models import Base
 from app.services.backup import migrations
 from app.services.backup.migrations import (
     SchemaVerdict,
+    _error_excerpt,
     _failing_revision,
     _missing_objects,
     _verify_schema_at_head,
@@ -69,7 +70,10 @@ def _older_head() -> tuple[str, str]:
     head = script.get_current_head()
     assert head is not None
     down = script.get_revision(head).down_revision
-    assert isinstance(down, str), "head is a merge revision; pick another ancestor"
+    # A merge head has a tuple of parents; any one of them is an ancestor.
+    if isinstance(down, tuple):
+        down = down[0]
+    assert isinstance(down, str)
     return down, head
 
 
@@ -117,6 +121,8 @@ async def test_missing_objects_refuse_the_stamp(failed_upgrade: dict[str, Any]) 
     assert "'c3c3'" in outcome.error, "the refusal should name the revision that failed"
     assert "'b2b2'" in outcome.error, "the refusal should say where alembic_version stopped"
     assert head in outcome.error
+    # One transaction per revision (#1204): b2b2 committed before c3c3 failed.
+    assert outcome.migrations_applied == ["b2b2"]
 
 
 async def test_a_check_that_cannot_run_refuses_the_stamp(
@@ -146,7 +152,11 @@ async def test_a_verified_schema_is_stamped(failed_upgrade: dict[str, Any]) -> N
 
     assert failed_upgrade["stamped"] == 1
     assert outcome.state == "auto_recovered"
-    assert outcome.migrations_applied == []
+    # b2b2 committed before c3c3 stopped on "already exists" (#1204), so
+    # the outcome must not claim nothing ran.
+    assert outcome.migrations_applied == ["b2b2"]
+    assert outcome.error is not None
+    assert "No migrations actually ran" not in outcome.error
 
 
 async def test_other_failures_never_reach_the_recovery(
@@ -252,3 +262,25 @@ async def test_a_long_ladder_still_reaches_the_recovery(
     assert outcome.error is not None
     assert "widget_audit" in outcome.error, "the drift branch was never reached"
     assert "DuplicateTableError" in outcome.error, "the exception was truncated away"
+
+
+def test_error_excerpt_leads_with_the_exception_not_the_sql() -> None:
+    """SQLAlchemy puts the whole statement after the exception line; a wide
+    CREATE TABLE must not push the exception out of what is shown."""
+    sql = "CREATE TABLE widget (" + ", ".join(f"col_{i} INTEGER" for i in range(200)) + ")"
+    output = (
+        "INFO  [alembic.runtime.migration] Running upgrade b2b2 -> c3c3, second\n"
+        "Traceback (most recent call last):\n"
+        '  File "x.py", line 1, in <module>\n'
+        "    op.create_table(...)\n"
+        "sqlalchemy.exc.ProgrammingError: (asyncpg.exceptions.DuplicateTableError) "
+        'relation "widget" already exists\n'
+        f"[SQL: {sql}]\n"
+        "(Background on this error at: https://sqlalche.me/e/20/f405)\n"
+    )
+    excerpt = _error_excerpt(output)
+
+    assert excerpt.startswith("sqlalchemy.exc.ProgrammingError")
+    assert "DuplicateTableError" in excerpt
+    assert len(excerpt) <= 1500
+    assert _error_excerpt("no traceback here") == "no traceback here"

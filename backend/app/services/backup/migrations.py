@@ -305,11 +305,16 @@ async def maybe_upgrade_after_restore(
 
     if proc.returncode != 0:
         output = stderr.decode(errors="replace") or stdout.decode(errors="replace")
-        # The TAIL: alembic logs one INFO line per revision before the
-        # traceback, so on a long ladder the first 1500 characters hold
-        # only those, and the exception — the part worth reading, and
-        # the part the drift match below looks for — was cut off.
-        msg = output[-1500:]
+        # Not the head: alembic logs one INFO line per revision before
+        # the traceback, so on a long ladder the first 1500 characters
+        # held only those and cut off the exception (#1233). Not merely
+        # the tail either: SQLAlchemy appends the whole ``[SQL: …]``
+        # statement after the exception line, and a wide CREATE TABLE
+        # pushes that line out of it.
+        msg = _error_excerpt(output)
+        # With one transaction per revision (#1204), every revision
+        # announced before the failing one has committed.
+        applied = _announced_revisions(output)[:-1]
         logger.error(
             "backup_restore_alembic_upgrade_failed",
             source_head=source_head,
@@ -357,7 +362,7 @@ async def maybe_upgrade_after_restore(
                     state="failed",
                     source_head=source_head,
                     local_head=local_head,
-                    migrations_applied=[],
+                    migrations_applied=applied,
                     error=_unverified_drift_error(
                         msg=msg,
                         failed_at=failed_at,
@@ -377,21 +382,27 @@ async def maybe_upgrade_after_restore(
                     state="auto_recovered",
                     source_head=source_head,
                     local_head=local_head,
-                    migrations_applied=[],
+                    migrations_applied=applied,
                     error=(
                         "alembic_version was stale: the upgrade stopped on an "
                         "object that already exists"
                         + (f" (revision {failed_at!r})" if failed_at else "")
                         + f", and every table and column {local_head!r} declares "
                         "is present in the restored schema, so head was stamped "
-                        "to align. No migrations actually ran."
+                        "to align. "
+                        + (
+                            f"{len(applied)} revision(s) before it had already "
+                            f"committed: {', '.join(applied)}."
+                            if applied
+                            else "No migrations actually ran."
+                        )
                     ),
                 )
             return MigrationOutcome(
                 state="failed",
                 source_head=source_head,
                 local_head=local_head,
-                migrations_applied=[],
+                migrations_applied=applied,
                 error=(
                     f"alembic upgrade failed and stamp-head recovery also "
                     f"failed. Upgrade error: {msg}; stamp error: {stamp_err}"
@@ -402,7 +413,7 @@ async def maybe_upgrade_after_restore(
             state="failed",
             source_head=source_head,
             local_head=local_head,
-            migrations_applied=[],
+            migrations_applied=applied,
             error=f"alembic upgrade failed (exit {proc.returncode}): {msg}",
         )
 
@@ -425,6 +436,11 @@ async def maybe_upgrade_after_restore(
 _RUNNING_UPGRADE_RE = re.compile(r"Running upgrade .*?-> ([0-9A-Za-z_]+)")
 
 
+def _announced_revisions(output: str) -> list[str]:
+    """Every revision ``alembic upgrade`` announced, in order."""
+    return _RUNNING_UPGRADE_RE.findall(output)
+
+
 def _failing_revision(output: str) -> str | None:
     """Return the revision ``alembic upgrade`` was running when it failed.
 
@@ -432,8 +448,28 @@ def _failing_revision(output: str) -> str | None:
     DDL runs, and the upgrade stops at the first that raises. None when
     the output carries no announcement (it failed before the first one).
     """
-    found = _RUNNING_UPGRADE_RE.findall(output)
+    found = _announced_revisions(output)
     return found[-1] if found else None
+
+
+_ERROR_EXCERPT_CHARS = 1500
+
+
+def _error_excerpt(output: str, limit: int = _ERROR_EXCERPT_CHARS) -> str:
+    """The part of a failed alembic run worth showing an operator.
+
+    Starts at the exception line of the LAST traceback (the first
+    unindented line after its header), so the exception type and message
+    lead even when SQLAlchemy follows them with a long ``[SQL: …]``
+    statement. Falls back to the tail when there is no traceback.
+    """
+    marker = "Traceback (most recent call last):"
+    idx = output.rfind(marker)
+    if idx != -1:
+        for m in re.finditer(r"^\S.*$", output[idx + len(marker) :], re.M):
+            start = idx + len(marker) + m.start()
+            return output[start : start + limit]
+    return output[-limit:]
 
 
 @dataclass
@@ -536,15 +572,19 @@ def _unverified_drift_error(
             f"({verdict.error}), so head was NOT stamped."
         )
     else:
-        shown: list[str] = []
-        if verdict.missing_tables:
-            names = ", ".join(verdict.missing_tables[:10])
-            more = len(verdict.missing_tables) - 10
-            shown.append(f"tables {names}" + (f" and {more} more" if more > 0 else ""))
-        if verdict.missing_columns:
-            names = ", ".join(verdict.missing_columns[:10])
-            more = len(verdict.missing_columns) - 10
-            shown.append(f"columns {names}" + (f" and {more} more" if more > 0 else ""))
+
+        def sample(kind: str, names: list[str], cap: int = 10) -> str:
+            more = len(names) - cap
+            return f"{kind} {', '.join(names[:cap])}" + (f" and {more} more" if more > 0 else "")
+
+        shown = [
+            sample(kind, names)
+            for kind, names in (
+                ("tables", verdict.missing_tables),
+                ("columns", verdict.missing_columns),
+            )
+            if names
+        ]
         why = (
             f"the restored schema is NOT at {local_head!r}: it lacks "
             + "; ".join(shown)

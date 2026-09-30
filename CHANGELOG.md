@@ -266,10 +266,12 @@ the formatter handles the rest.
   database migrated cleanly to head, the models omit a column the
   initial schema still has, and index and constraint names differ in
   dozens of places, so a full schema comparison would refuse the case
-  the recovery exists for. The restore's upgrade error now shows the
-  end of alembic's output rather than the start. On a long upgrade the
-  first 1,500 characters held only per-revision INFO lines, which cut
-  off the exception and hid the "already exists" match.
+  the recovery exists for. The restore's upgrade error now starts at
+  the exception line rather than at the start of alembic's output. On
+  a long upgrade the first 1,500 characters held only per-revision
+  INFO lines, which cut off the exception and hid the "already
+  exists" match. `migrations_applied` now lists the revisions that
+  committed before the failing one, instead of always being empty.
 
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's

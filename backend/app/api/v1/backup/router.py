@@ -467,13 +467,18 @@ async def restore_backup(
             f"applied)."
         )
     elif migration is not None and migration.state == "auto_recovered":
+        n = len(migration.migrations_applied)
         note += (
             f" Schema-version drift detected ({migration.source_head!r} → "
             f"{migration.local_head!r}) and auto-recovered via "
             f"`alembic stamp head`: the upgrade stopped on an object that "
             f"already exists, and every table and column the local head "
-            f"declares was found in the restored schema, so no migrations "
-            f"actually needed to run."
+            f"declares was found in the restored schema"
+            + (
+                f" ({n} migration{'s' if n != 1 else ''} committed before the stop)."
+                if n
+                else ", so no migrations actually needed to run."
+            )
         )
     elif migration is not None and migration.state == "incompatible_newer":
         note += (
