@@ -889,6 +889,7 @@ appliance-stamp-dev:
 	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
 	  echo "BUILD_TIME=\"$$(date -u +%Y-%m-%dT%H:%M:%SZ)\""; \
 	  echo "APPLIANCE_ARCH=\"$(notdir $(APPLIANCE_ARCH))\""; \
+	  echo "APPLIANCE_PROFILE=\"$(APPLIANCE_PROFILE)\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"
 
