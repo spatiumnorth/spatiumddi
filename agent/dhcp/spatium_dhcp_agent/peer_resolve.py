@@ -40,11 +40,14 @@ CHECK_INTERVAL = 30.0
 class PeerResolveWatcher:
     """Re-resolves HA peer hostnames and triggers reload on IP change.
 
-    ``apply_fn`` is the agent's ``SyncLoop._apply_bundle`` — called as
-    ``apply_fn(bundle, reload_kea=True)``. We deliberately reuse the
-    same render+reload pipeline so the new render goes through the
-    full audit path (``save_rendered_kea`` etc.) rather than mutating
-    the live config in-place.
+    ``apply_fn`` is called as ``apply_fn(bundle, reload_kea=True)``. The
+    supervisor wires it to ``SyncLoop.reapply_current_bundle`` (#1247),
+    which re-renders the bundle the sync loop has LIVE — the ``bundle``
+    argument only says which one this watcher saw — under the sync loop's
+    apply lock and through its revert path. It used to be
+    ``SyncLoop._apply_bundle`` itself, so a render Kea refused was only
+    logged here and left on disk for the next container start to boot
+    into, and this thread could race the sync loop's own apply.
     """
 
     def __init__(
@@ -151,10 +154,18 @@ class PeerResolveWatcher:
             log.warning("ha_peer_reresolve_no_apply_fn", changes=len(changed))
             return
         try:
-            self._apply_fn(bundle, reload_kea=True)
-            log.info("ha_peer_reresolve_reloaded", changes=len(changed))
-        except Exception:  # noqa: BLE001 — don't let one failed reload kill the watcher
+            result = self._apply_fn(bundle, reload_kea=True)
+        except Exception:
+            # Never let one failed reload kill the watcher thread.
             log.exception("ha_peer_reresolve_reload_failed")
+            return
+        # ``reapply_current_bundle`` answers False when Kea refused the
+        # re-render (it has reverted and reported it) and None when there was
+        # nothing to re-apply; a legacy apply_fn returns None on success.
+        if result is False:
+            log.warning("ha_peer_reresolve_rejected_reverted", changes=len(changed))
+        else:
+            log.info("ha_peer_reresolve_reloaded", changes=len(changed), applied=result)
 
     @staticmethod
     def _peer_hosts(bundle: dict[str, Any]) -> list[str]:

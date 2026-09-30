@@ -223,6 +223,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP HA peer-IP re-render goes through the revert path and can no
+  longer race the sync loop (#1247).** When an HA peer's hostname resolved
+  to a new address, the agent's watcher re-rendered Kea by calling
+  `_apply_bundle` directly, from its own thread. So #882's protection never
+  applied to it. A re-render Kea refused was only logged: no revert, no
+  quarantine, no apply verdict on the heartbeat, and the refused document
+  stayed at `kea_config_path` for the next container start to boot into.
+  Nothing serialised the watcher against the sync loop either, so it could
+  put an older bundle back over a newer one while the agent reported the
+  newer etag. The watcher now calls `SyncLoop.reapply_current_bundle`, which
+  re-applies the bundle that is live, read under one apply lock that every
+  apply now takes, through `_apply_with_revert`. A quarantined bundle is not
+  re-rendered, and the #1140 IPv6-address recheck uses the same path.
+
 - **Audit rows carry the request id, and the worker and beat log JSON
   like the api (#1245, #1246).** `audit_log.request_id` existed, was part of
   the tamper-evidence hash, and was never set, although the docs say it

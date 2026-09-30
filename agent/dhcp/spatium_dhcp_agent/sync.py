@@ -137,6 +137,13 @@ class SyncLoop:
         self.ha_poller = ha_poller
         self.peer_watcher = peer_watcher
         self._stop = threading.Event()
+        # #1247 — every apply goes through this. The sync loop is not the
+        # only thread that applies: the HA peer-IP watcher re-renders from
+        # its own thread, and without a lock the two could interleave —
+        # writing Kea's files, reloading, reverting — and leave an OLDER
+        # bundle live while ``_current_etag`` reports the newer one.
+        # Re-entrant because a failed apply reverts from inside the lock.
+        self._apply_lock = threading.RLock()
         self._current_etag: str | None = None
         self._consecutive_failures = 0
         self._offline = False
@@ -319,26 +326,27 @@ class SyncLoop:
         reads on its next start. Leaving it would turn a rejected apply into
         a crash loop the next time the container restarts.
         """
-        try:
-            self._apply_bundle(bundle, reload_kea=True)
-        except ConfigApplyError as e:
-            self._handle_apply_failure(etag, e.phase, e.cause)
-            return False
-        except Exception as e:
-            self._handle_apply_failure(etag, None, e)
-            return False
+        with self._apply_lock:
+            try:
+                self._apply_bundle(bundle, reload_kea=True)
+            except ConfigApplyError as e:
+                self._handle_apply_failure(etag, e.phase, e.cause)
+                return False
+            except Exception as e:
+                self._handle_apply_failure(etag, None, e)
+                return False
 
-        self._quarantine.clear()
-        if self._reload_confirmed:
-            commit_config(self.cfg.state_dir, etag)
-        else:
-            # Written, not confirmed — every control socket was unreachable,
-            # so nothing has validated this document. Keep the previous
-            # last-known-good rather than promoting a bundle Kea may refuse
-            # the moment it comes back.
-            log.info("config_not_committed_unconfirmed", etag=etag)
-        self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
-        return True
+            self._quarantine.clear()
+            if self._reload_confirmed:
+                commit_config(self.cfg.state_dir, etag)
+            else:
+                # Written, not confirmed — every control socket was unreachable,
+                # so nothing has validated this document. Keep the previous
+                # last-known-good rather than promoting a bundle Kea may refuse
+                # the moment it comes back.
+                log.info("config_not_committed_unconfirmed", etag=etag)
+            self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
+            return True
 
     def _handle_apply_failure(
         self, etag: str, phase: str | None, cause: BaseException
@@ -762,6 +770,39 @@ class SyncLoop:
             if op_id:
                 self.heartbeat.pending_acks.append({"op_id": op_id, "result": "ok"})
 
+    def reapply_current_bundle(self, reason: str) -> bool | None:
+        """Re-render and reload the bundle that is live now (#1247).
+
+        For re-renders that host state forces rather than the control plane
+        — the HA peer-IP watcher. Two things it deliberately does that
+        calling ``_apply_bundle`` directly did not:
+
+        * it goes through ``_apply_with_revert``, so a render Kea refuses is
+          reverted to last-known-good, quarantined and REPORTED, instead of
+          being logged and left at ``kea_config_path`` for the next
+          container start to boot into;
+        * it re-applies the bundle the sync loop has live, read under the
+          apply lock, not a snapshot the caller took earlier — so it can
+          never put an older bundle back over a newer one.
+
+        Returns True / False as ``_apply_with_revert`` does, or None when
+        there is nothing to re-apply: no bundle yet, or the live etag is
+        quarantined (re-rendering a refused config would just be refused
+        again).
+        """
+        with self._apply_lock:
+            etag = self._current_etag
+            if etag is None or self._quarantine.blocks(etag):
+                log.info("reapply_skipped", reason=reason, etag=etag)
+                return None
+            bundle, cached_etag = load_config(self.cfg.state_dir)
+            if bundle is None or cached_etag != etag:
+                log.info("reapply_skipped_cache_mismatch", reason=reason, etag=etag)
+                return None
+            log.info("reapply_current_bundle", reason=reason, etag=etag)
+            # Re-entrant: ``_apply_with_revert`` takes the same lock.
+            return self._apply_with_revert(bundle, etag)
+
     def _recheck_v6_unicast(self) -> None:
         """Re-render the current bundle when the host's global IPv6
         addresses no longer match the ones in kea-dhcp6's unicast list (#1140).
@@ -781,15 +822,12 @@ class SyncLoop:
         current = tuple(global_ipv6_addresses())
         if current == applied:
             return
-        bundle, cached_etag = load_config(self.cfg.state_dir)
-        if bundle is None or cached_etag != etag:
-            return
         log.info(
             "dhcp6_unicast_addresses_changed",
             before=[f"{i}/{a}" for i, a in applied],
             after=[f"{i}/{a}" for i, a in current],
         )
-        self._apply_with_revert(bundle, etag)
+        self.reapply_current_bundle("dhcp6_unicast_addresses_changed")
 
     def run(self) -> None:
         while not self._stop.is_set():
