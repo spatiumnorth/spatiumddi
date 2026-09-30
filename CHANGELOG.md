@@ -223,6 +223,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`make trivy` no longer reports a scan that never ran as a finding
+  (#1272).** Any non-zero exit from the scanner container was printed as
+  FINDINGS, so a Docker error (a refused mount, a pull failure, the daemon
+  down) or a Trivy error (a DB download failure, which Trivy also reports
+  as exit 1) ended in "Trivy found HIGH/CRITICAL vulnerabilities" with no
+  finding listed, for images that scanned clean. The loop moved to
+  `scripts/trivy-scan.sh`, which reports FINDINGS only when Trivy exits 1
+  and its report lists one. Everything else is SCAN FAILED or BUILD FAILED,
+  with the end of the log on screen, and exits 2 rather than 1, so the two
+  can be told apart. An `IMAGE=` that matches no image now fails instead of
+  printing "Trivy clean". The vulnerability-DB cache defaults to
+  `~/.cache/spatiumddi-trivy` rather than a directory in the checkout:
+  Docker Desktop can refuse to mount a checkout on an external volume,
+  which is how this was found. Set `TRIVY_CACHE` to keep the old location.
+
 - **A DHCP HA peer-IP re-render can no longer leave a refused config on
   disk, race the sync loop, or be skipped while the agent is degraded
   (#1247).** When an HA peer's hostname resolved to a new address, the
