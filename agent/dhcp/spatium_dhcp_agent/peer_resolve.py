@@ -52,7 +52,7 @@ class PeerResolveWatcher:
 
     def __init__(
         self,
-        apply_fn: Callable[..., None] | None = None,
+        apply_fn: Callable[..., bool | None] | None = None,
         *,
         check_interval: float = CHECK_INTERVAL,
     ):
@@ -76,7 +76,7 @@ class PeerResolveWatcher:
         # peer-IP-drift self-healing this class exists to provide never ran.
         self._resolved: dict[str, str] = {}
 
-    def set_apply_fn(self, apply_fn: Callable[..., None]) -> None:
+    def set_apply_fn(self, apply_fn: Callable[..., bool | None]) -> None:
         """Arm the watcher with the SyncLoop's bundle-apply callback.
 
         Called by the supervisor after the SyncLoop is constructed so
@@ -159,13 +159,17 @@ class PeerResolveWatcher:
             # Never let one failed reload kill the watcher thread.
             log.exception("ha_peer_reresolve_reload_failed")
             return
-        # ``reapply_current_bundle`` answers False when Kea refused the
-        # re-render (it has reverted and reported it) and None when there was
-        # nothing to re-apply; a legacy apply_fn returns None on success.
+        # ``reapply_current_bundle`` answers True when the re-render is live,
+        # False when Kea refused it (it has reverted and reported it) and None
+        # when it re-applied nothing — no bundle yet, the live etag is
+        # quarantined, or a newer bundle is mid-apply. None is not a reload,
+        # so it must not be logged as one.
         if result is False:
             log.warning("ha_peer_reresolve_rejected_reverted", changes=len(changed))
+        elif result is None:
+            log.info("ha_peer_reresolve_not_applied", changes=len(changed))
         else:
-            log.info("ha_peer_reresolve_reloaded", changes=len(changed), applied=result)
+            log.info("ha_peer_reresolve_reloaded", changes=len(changed))
 
     @staticmethod
     def _peer_hosts(bundle: dict[str, Any]) -> list[str]:

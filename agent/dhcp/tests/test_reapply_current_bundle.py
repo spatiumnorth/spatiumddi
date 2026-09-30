@@ -25,7 +25,7 @@ import pytest
 from spatium_dhcp_agent import sync as sync_mod
 from spatium_dhcp_agent.cache import ensure_layout, save_config
 from spatium_dhcp_agent.config import AgentConfig
-from spatium_dhcp_agent.config_apply import STATUS_OK, ApplyStatus
+from spatium_dhcp_agent.config_apply import STATUS_REVERTED, ApplyStatus
 from spatium_dhcp_agent.kea_ctrl import KeaCtrlError
 from spatium_dhcp_agent.peer_resolve import PeerResolveWatcher
 from spatium_dhcp_agent.sync import SyncLoop
@@ -73,19 +73,105 @@ def _live_config(cfg: AgentConfig) -> str:
     return json.dumps(json.loads(cfg.kea_config_path.read_text()))
 
 
-def test_a_refused_re_render_is_reverted_and_reported_not_just_logged(
-    loop: SyncLoop, monkeypatch: pytest.MonkeyPatch
+def test_a_refused_re_render_restores_the_documents_and_reports_it(
+    loop: SyncLoop, agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
 ):
     _poll_apply(loop, "A", "192.0.2.0/24")
+    before = agent_cfg.kea_config_path.read_text()
 
     def refuse(sock, doc):  # type: ignore[no-untyped-def]
         raise KeaCtrlError("peer URL refused")
 
     monkeypatch.setattr(sync_mod, "config_test", refuse)
     assert loop.reapply_current_bundle("ha_peer_ip_changed") is False
-    # Before #1247 the status stayed OK and nothing was quarantined.
-    assert loop.apply_status.status != STATUS_OK
-    assert loop._quarantine.etag == "A"
+    # Reported — before #1247 the status stayed OK and it was only logged.
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert "ha_peer_ip_changed" in (loop.apply_status.error or "")
+    # The refused render is not what the next container start boots into.
+    assert agent_cfg.kea_config_path.read_text() == before
+    # And a known-good control-plane bundle is not poisoned: the control
+    # plane changed nothing, so there is nothing to quarantine.
+    assert loop._quarantine.etag is None
+
+
+def test_after_a_revert_a_host_change_re_renders_last_known_good(
+    loop: SyncLoop, agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+):
+    """The regression the first cut had: re-rendering ``_current_etag``
+    skipped a quarantined B, so a peer that moved while the agent ran on
+    last-known-good A was never followed."""
+    _poll_apply(loop, "A", "192.0.2.0/24")
+
+    def refuse_b(sock, doc):  # type: ignore[no-untyped-def]
+        if "198.51.100.0/24" in json.dumps(doc):
+            raise KeaCtrlError("bad scope")
+        return {"result": 0}
+
+    monkeypatch.setattr(sync_mod, "config_test", refuse_b)
+    bundle_b = _bundle("B", "198.51.100.0/24")
+    save_config(loop.cfg.state_dir, bundle_b, "B")
+    assert loop._apply_with_revert(bundle_b, "B") is False
+    loop._current_etag = "B"
+    assert loop._quarantine.etag == "B"
+
+    rendered: list[str] = []
+    real_apply = loop._apply_bundle
+
+    def spy(bundle: dict[str, Any], **kw: Any) -> None:
+        rendered.append(bundle["etag"])
+        real_apply(bundle, **kw)
+
+    monkeypatch.setattr(loop, "_apply_bundle", spy)
+    assert loop.reapply_current_bundle("ha_peer_ip_changed") is True
+    assert rendered == ["A"]
+    # Still reverted: the control plane's bundle B has not converged.
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert "192.0.2.0/24" in _live_config(agent_cfg)
+
+
+def test_only_a_daemon_that_accepted_the_render_is_reloaded_back(
+    loop: SyncLoop, agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+):
+    """The daemons reload independently. When dhcp4 took the re-render and
+    dhcp6 refused it, dhcp4 must be put back on the restored document, and
+    dhcp6 — still on its old one — must not be reloaded, since a Kea reload
+    restarts the HA hook's state machine."""
+    _poll_apply(loop, "A", "192.0.2.0/24")
+    reloads: list[str] = []
+
+    def v6_refuses(sock, doc):  # type: ignore[no-untyped-def]
+        if "Dhcp6" in doc:
+            raise KeaCtrlError("v6 refused")
+        return {"result": 0}
+
+    monkeypatch.setattr(sync_mod, "config_test", v6_refuses)
+    monkeypatch.setattr(
+        sync_mod, "config_reload", lambda sock: reloads.append(str(sock))
+    )
+    assert loop.reapply_current_bundle("ha_peer_ip_changed") is False
+    v4, v6 = str(agent_cfg.kea_control_socket), str(agent_cfg.kea_control_socket_v6)
+    # Once for the re-render, once to put dhcp4 back; never dhcp6.
+    assert reloads == [v4, v4]
+    assert v6 not in reloads
+
+
+def test_the_v6_recheck_does_not_retry_the_same_refusal_every_loop(
+    loop: SyncLoop, monkeypatch: pytest.MonkeyPatch
+):
+    _poll_apply(loop, "A", "192.0.2.0/24")
+    loop._v6_unicast_applied = (("eth0", "2001:db8::1"),)
+    addresses = [("eth0", "2001:db8::2")]
+    monkeypatch.setattr(sync_mod, "global_ipv6_addresses", lambda: list(addresses))
+    calls: list[str] = []
+    monkeypatch.setattr(
+        loop, "reapply_current_bundle", lambda reason: calls.append(reason) or False
+    )
+    loop._recheck_v6_unicast()
+    loop._recheck_v6_unicast()
+    assert len(calls) == 1  # the same refusal is not asked again
+    addresses[:] = [("eth0", "2001:db8::3")]
+    loop._recheck_v6_unicast()
+    assert len(calls) == 2  # a new address set is a new question
 
 
 def test_the_live_bundle_is_re_applied_never_the_callers_older_snapshot(
@@ -110,17 +196,6 @@ def test_the_live_bundle_is_re_applied_never_the_callers_older_snapshot(
     assert loop.apply_status.etag == "B"
 
 
-def test_a_quarantined_bundle_is_not_re_rendered(
-    loop: SyncLoop, monkeypatch: pytest.MonkeyPatch
-):
-    _poll_apply(loop, "A", "192.0.2.0/24")
-    loop._quarantine.record("A", "refused earlier")
-    calls: list[int] = []
-    monkeypatch.setattr(loop, "_apply_bundle", lambda *a, **kw: calls.append(1))
-    assert loop.reapply_current_bundle("ha_peer_ip_changed") is None
-    assert calls == []
-
-
 def test_nothing_to_re_apply_before_the_first_bundle(loop: SyncLoop):
     assert loop.reapply_current_bundle("ha_peer_ip_changed") is None
 
@@ -131,13 +206,15 @@ def test_the_watcher_and_the_sync_loop_never_apply_at_once(
     _poll_apply(loop, "A", "192.0.2.0/24")
     inside = 0
     peak = 0
+    entered = 0
     guard = threading.Lock()
     real_apply = loop._apply_bundle
 
     def slow_apply(*args: Any, **kwargs: Any) -> None:
-        nonlocal inside, peak
+        nonlocal inside, peak, entered
         with guard:
             inside += 1
+            entered += 1
             peak = max(peak, inside)
         time.sleep(0.05)
         try:
@@ -147,8 +224,10 @@ def test_the_watcher_and_the_sync_loop_never_apply_at_once(
                 inside -= 1
 
     monkeypatch.setattr(loop, "_apply_bundle", slow_apply)
+    # Both re-applies render the live bundle, so all three reach
+    # ``_apply_bundle`` (``entered == 3``) and ``peak == 1`` is only true with
+    # the lock.
     bundle_b = _bundle("B", "198.51.100.0/24")
-    save_config(loop.cfg.state_dir, bundle_b, "B")
     threads = [
         threading.Thread(target=loop._apply_with_revert, args=(bundle_b, "B")),
         threading.Thread(
@@ -162,4 +241,5 @@ def test_the_watcher_and_the_sync_loop_never_apply_at_once(
         t.start()
     for t in threads:
         t.join()
+    assert entered == 3
     assert peak == 1

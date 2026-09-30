@@ -223,19 +223,26 @@ the formatter handles the rest.
 
 ### Fixed
 
-- **A DHCP HA peer-IP re-render goes through the revert path and can no
-  longer race the sync loop (#1247).** When an HA peer's hostname resolved
-  to a new address, the agent's watcher re-rendered Kea by calling
-  `_apply_bundle` directly, from its own thread. So #882's protection never
-  applied to it. A re-render Kea refused was only logged: no revert, no
-  quarantine, no apply verdict on the heartbeat, and the refused document
-  stayed at `kea_config_path` for the next container start to boot into.
-  Nothing serialised the watcher against the sync loop either, so it could
-  put an older bundle back over a newer one while the agent reported the
-  newer etag. The watcher now calls `SyncLoop.reapply_current_bundle`, which
-  re-applies the bundle that is live, read under one apply lock that every
-  apply now takes, through `_apply_with_revert`. A quarantined bundle is not
-  re-rendered, and the #1140 IPv6-address recheck uses the same path.
+- **A DHCP HA peer-IP re-render can no longer leave a refused config on
+  disk, race the sync loop, or be skipped while the agent is degraded
+  (#1247).** When an HA peer's hostname resolved to a new address, the
+  agent's watcher re-rendered Kea by calling `_apply_bundle` directly, from
+  its own thread. A render Kea refused was only logged, with no apply
+  verdict on the heartbeat, and the refused document stayed at
+  `kea_config_path` for the next container start to boot into. Nothing
+  serialised it against the sync loop either, so it could put an older
+  bundle back over a newer one while the agent reported the newer etag.
+  The watcher now calls `SyncLoop.reapply_current_bundle`, under the one
+  apply lock every apply takes. It re-renders the bundle Kea is actually
+  running, which the loop now tracks, so a peer that moves while the agent
+  runs on last-known-good is still followed. A re-render forced by host
+  state is not the control-plane bundle's fault, so a refusal does not
+  quarantine it. Instead the Kea documents are put back, and a daemon that
+  had accepted the render (the two reload independently) is reloaded from
+  them; a daemon that refused it is left alone, since a Kea reload restarts
+  the HA hook's state machine. The refusal is reported as a reverted apply
+  naming the reason. The #1140 IPv6-address recheck uses the same path and
+  no longer retries an identical refusal every loop.
 
 - **Audit rows carry the request id, and the worker and beat log JSON
   like the api (#1245, #1246).** `audit_log.request_id` existed, was part of

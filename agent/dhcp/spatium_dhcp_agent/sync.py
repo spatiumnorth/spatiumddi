@@ -144,6 +144,12 @@ class SyncLoop:
         # bundle live while ``_current_etag`` reports the newer one.
         # Re-entrant because a failed apply reverts from inside the lock.
         self._apply_lock = threading.RLock()
+        # #1247 — the bundle Kea is actually RUNNING, which is not always
+        # ``_current_etag``: after a revert (or a boot from previous) the loop
+        # parks on the refused etag while Kea runs last-known-good. A
+        # host-state re-render must re-render THIS, or it is dropped exactly
+        # when the agent is already degraded.
+        self._live: tuple[dict[str, Any], str] | None = None
         self._current_etag: str | None = None
         self._consecutive_failures = 0
         self._offline = False
@@ -170,6 +176,13 @@ class SyncLoop:
         # no longer holds makes kea-dhcp6 refuse its whole config the next
         # time it loads it.
         self._v6_unicast_applied: tuple[tuple[str, str], ...] | None = None
+        # #1247 — each daemon's result from the last reload, so a refused
+        # host-state re-render reloads back only a daemon that ACCEPTED the
+        # new render (a Kea reload restarts the HA hook's state machine), and
+        # the (live etag, addresses) the #1140 recheck saw refused, so it
+        # does not retry the same refusal every loop.
+        self._last_reload_results: dict[str, str] = {}
+        self._v6_refused: tuple[str, tuple[tuple[str, str], ...]] | None = None
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -213,6 +226,7 @@ class SyncLoop:
                     reload_kea=True,
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
+                self._live = (bundle, etag or "")
                 if not booting_from_previous and self._reload_confirmed:
                     # #882 — ``current`` demonstrably loads, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
@@ -297,6 +311,7 @@ class SyncLoop:
             )
             log.exception("bootstrap_last_known_good_apply_failed")
             return
+        self._live = (prev_bundle, prev_etag or "")
         self._current_etag = prev_etag
         self._set_status(
             ApplyStatus(
@@ -337,6 +352,7 @@ class SyncLoop:
                 return False
 
             self._quarantine.clear()
+            self._live = (bundle, etag)
             if self._reload_confirmed:
                 commit_config(self.cfg.state_dir, etag)
             else:
@@ -381,6 +397,7 @@ class SyncLoop:
             log.exception("sync_revert_failed", failed_etag=etag)
             return
 
+        self._live = (prev_bundle, prev_etag or "")
         self._set_status(
             ApplyStatus(
                 status=STATUS_REVERTED,
@@ -598,6 +615,7 @@ class SyncLoop:
             )
             # At least one daemon ran config-test against this document and
             # accepted it, which is what makes it a legitimate revert target.
+            self._last_reload_results = {"dhcp4": r4, "dhcp6": r6}
             self._reload_confirmed = RELOAD_OK in (r4, r6)
             if r4 == RELOAD_OK and r6 == RELOAD_OK:
                 self.heartbeat.daemon_status = {"status": "ok"}
@@ -771,37 +789,98 @@ class SyncLoop:
                 self.heartbeat.pending_acks.append({"op_id": op_id, "result": "ok"})
 
     def reapply_current_bundle(self, reason: str) -> bool | None:
-        """Re-render and reload the bundle that is live now (#1247).
+        """Re-render the bundle Kea is running now, for a HOST change (#1247).
 
-        For re-renders that host state forces rather than the control plane
-        — the HA peer-IP watcher. Two things it deliberately does that
-        calling ``_apply_bundle`` directly did not:
+        For re-renders that host state forces rather than the control plane:
+        an HA peer's hostname resolving to a new address, a host IPv6 address
+        coming or going (#1140). What it deliberately does:
 
-        * it goes through ``_apply_with_revert``, so a render Kea refuses is
-          reverted to last-known-good, quarantined and REPORTED, instead of
-          being logged and left at ``kea_config_path`` for the next
-          container start to boot into;
-        * it re-applies the bundle the sync loop has live, read under the
-          apply lock, not a snapshot the caller took earlier — so it can
-          never put an older bundle back over a newer one.
+        * **It re-renders what is LIVE** (``_live``), read under the apply
+          lock — never a caller's earlier snapshot, so it cannot put an older
+          bundle back over a newer one; and not ``_current_etag`` either,
+          which after a revert names a refused bundle while Kea runs
+          last-known-good. So a peer that moves while the agent is already
+          degraded is still followed.
+        * **A refusal is not the bundle's fault.** The control plane changed
+          nothing, so the etag is not quarantined (that would poison a
+          known-good bundle) and there is nothing to "revert to" — the
+          previous bundle re-rendered against the same host state is the
+          same document. Instead the Kea documents written for the attempt
+          are put back, and both daemons reloaded from them, so disk and
+          daemon agree and the next container start does not boot into the
+          refused render. The failure is reported as a reverted apply naming
+          the reason.
 
-        Returns True / False as ``_apply_with_revert`` does, or None when
-        there is nothing to re-apply: no bundle yet, or the live etag is
-        quarantined (re-rendering a refused config would just be refused
-        again).
+        Returns True when the re-render is live, False when Kea refused it,
+        None when nothing is live yet (Kea is still on its baked config).
         """
         with self._apply_lock:
-            etag = self._current_etag
-            if etag is None or self._quarantine.blocks(etag):
-                log.info("reapply_skipped", reason=reason, etag=etag)
+            if self._live is None:
+                log.info("reapply_skipped_nothing_live", reason=reason)
                 return None
-            bundle, cached_etag = load_config(self.cfg.state_dir)
-            if bundle is None or cached_etag != etag:
-                log.info("reapply_skipped_cache_mismatch", reason=reason, etag=etag)
-                return None
-            log.info("reapply_current_bundle", reason=reason, etag=etag)
-            # Re-entrant: ``_apply_with_revert`` takes the same lock.
-            return self._apply_with_revert(bundle, etag)
+            bundle, etag = self._live
+            snapshot = self._snapshot_kea_documents()
+            self._last_reload_results = {}
+            log.info("reapply_live_bundle", reason=reason, etag=etag)
+            try:
+                self._apply_bundle(bundle, reload_kea=True)
+            except Exception as e:  # noqa: BLE001 — any failure restores the documents
+                phase = e.phase if isinstance(e, ConfigApplyError) else None
+                cause = e.cause if isinstance(e, ConfigApplyError) else e
+                self._restore_kea_documents(snapshot)
+                self._set_status(
+                    ApplyStatus(
+                        status=STATUS_REVERTED,
+                        etag=etag,
+                        failed_etag=etag,
+                        phase=phase,
+                        error=truncate_error(
+                            f"re-render after {reason} refused: {cause}"
+                        ),
+                    )
+                )
+                log.error(
+                    "reapply_refused_restored",
+                    reason=reason,
+                    etag=etag,
+                    error=str(cause),
+                )
+                return False
+            # Only claim OK when the live bundle IS the one the control plane
+            # sent: after a revert, the status must keep saying so.
+            if etag == self._current_etag:
+                self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
+            return True
+
+    def _snapshot_kea_documents(self) -> dict[str, Any]:
+        """The Kea documents on disk now, so a refused re-render can put them
+        back (#1247). ``None`` for a file that does not exist yet."""
+        files: dict[Path, str | None] = {}
+        for path in (self.cfg.kea_config_path, self.cfg.kea_config_path_v6):
+            files[path] = path.read_text() if path.exists() else None
+        return {"files": files, "v6_unicast": self._v6_unicast_applied}
+
+    def _restore_kea_documents(self, snapshot: dict[str, Any]) -> None:
+        """Put the snapshotted documents back, and reload from them only a
+        daemon that ACCEPTED the refused render. The two daemons reload
+        independently, so one can have taken it while the other refused;
+        the refuser never left its old document and is not touched, since a
+        Kea reload restarts the HA hook's state machine. ``_reload_socket``
+        runs config-test first and never raises."""
+        self._v6_unicast_applied = snapshot["v6_unicast"]
+        sockets = {
+            self.cfg.kea_config_path: (self.cfg.kea_control_socket, "dhcp4"),
+            self.cfg.kea_config_path_v6: (self.cfg.kea_control_socket_v6, "dhcp6"),
+        }
+        for path, text in snapshot["files"].items():
+            if text is None:
+                path.unlink(missing_ok=True)
+                continue
+            doc = json.loads(text)
+            self._atomic_write_json(path, doc)
+            socket_path, daemon = sockets[path]
+            if self._last_reload_results.get(daemon) == RELOAD_OK:
+                self._reload_socket(socket_path, doc, daemon, 0.0)
 
     def _recheck_v6_unicast(self) -> None:
         """Re-render the current bundle when the host's global IPv6
@@ -816,18 +895,25 @@ class SyncLoop:
         ``/proc/net/if_inet6`` is cheap.
         """
         applied = self._v6_unicast_applied
-        etag = self._current_etag
-        if applied is None or etag is None or self._quarantine.blocks(etag):
+        if applied is None or self._live is None:
             return
         current = tuple(global_ipv6_addresses())
         if current == applied:
+            return
+        key = (self._live[1], current)
+        if self._v6_refused == key:
+            # Kea already refused the render for exactly this live bundle and
+            # these addresses; retrying every loop would only reload the
+            # daemons for the same answer. A new bundle or another address
+            # change is a new question.
             return
         log.info(
             "dhcp6_unicast_addresses_changed",
             before=[f"{i}/{a}" for i, a in applied],
             after=[f"{i}/{a}" for i, a in current],
         )
-        self.reapply_current_bundle("dhcp6_unicast_addresses_changed")
+        result = self.reapply_current_bundle("dhcp6_unicast_addresses_changed")
+        self._v6_refused = key if result is False else None
 
     def run(self) -> None:
         while not self._stop.is_set():
