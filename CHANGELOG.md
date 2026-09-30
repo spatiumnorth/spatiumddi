@@ -1485,7 +1485,10 @@ the formatter handles the rest.
   a per-account budget of 5 per 15 minutes, then `429`: each of those runs
   for a caller who already holds a session, so unthrottled each was a
   password oracle for exactly the hijacked session the step-up exists to
-  stop.
+  stop. That budget fails closed: while Redis is unreachable the three
+  step-ups answer `503` with `Retry-After: 60`, because the account
+  lockout counts sign-in answers only and nothing else would bound the
+  guessing. Sign-in is unaffected.
 
 - **External accounts honour their state (#1242).** A **disabled** LDAP,
   OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row

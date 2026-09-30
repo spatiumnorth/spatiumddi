@@ -42,6 +42,7 @@ from app.core.auth.user_sync import (
     sync_external_user,
 )
 from app.core.auth_throttle import (
+    StepupThrottleUnavailable,
     login_rate_limited,
     mfa_challenge_consume,
     record_stepup_password_failure,
@@ -1103,8 +1104,22 @@ async def _refuse_if_stepup_blocked(user: User) -> None:
     """429 once the account has spent its wrong-answer budget on MFA
     step-ups (#1241). These run for a caller who already holds a session —
     the hijacked session they exist to stop — so unthrottled, each is an
-    oracle for the password (or, on disable / regenerate, the TOTP code)."""
-    if await stepup_password_blocked(user.id):
+    oracle for the password (or, on disable / regenerate, the TOTP code).
+
+    503 while the budget cannot be read: the throttle fails closed, so a
+    Redis outage pauses MFA changes rather than lifting the limit."""
+    try:
+        blocked = await stepup_password_blocked(user.id)
+    except StepupThrottleUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Two-factor settings can't be changed right now because the "
+                "attempt limiter is unavailable. Try again in a minute."
+            ),
+            headers={"Retry-After": "60"},
+        ) from None
+    if blocked:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many incorrect attempts. Try again in 15 minutes.",

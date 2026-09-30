@@ -364,3 +364,90 @@ async def test_wrong_step_up_answers_are_counted_and_then_refused(
     r = await client.post(url, headers=headers, json={"password": "pw-123456"})
     assert r.status_code == 429, r.text
     assert failures == [user.id]  # the right password was never even checked
+
+
+# ── #1241 gate walk: the step-up throttle fails CLOSED ────────────────
+#
+# The ddi-pg walk stopped Redis for 76 s: eight wrong step-up answers in a
+# row each got 403 and none got 429. The account lockout counts sign-in
+# answers only, so nothing else bounds a hijacked session's guessing.
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_budget_raises_instead_of_reading_as_unblocked(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import app.core.auth_throttle as throttle
+
+    def _down(*_a: object, **_k: object) -> object:
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(throttle, "make_async_redis", _down)
+    with pytest.raises(throttle.StepupThrottleUnavailable):
+        await throttle.stepup_password_blocked(uuid.uuid4())
+    # Counting stays best-effort: the answer was already refused, and the
+    # next attempt's check fails closed on its own.
+    await throttle.record_stepup_password_failure(uuid.uuid4())
+
+
+def _throttle_down(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    import app.api.v1.auth.router as auth_router
+    from app.core.auth_throttle import StepupThrottleUnavailable
+
+    failures: list[object] = []
+
+    async def _blocked(_user_id: object) -> bool:
+        raise StepupThrottleUnavailable
+
+    async def _record(user_id: object) -> None:
+        failures.append(user_id)
+
+    monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
+    monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
+    return failures
+
+
+@pytest.mark.asyncio
+async def test_enrolment_is_refused_while_the_budget_cannot_be_read(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    failures = _throttle_down(monkeypatch)
+    user, _, headers = await _session_user(
+        db_session, auth_source="local", signed_in_ago=timedelta(0), password="pw-123456"
+    )
+    for password in ("nope", "pw-123456"):
+        r = await client.post(
+            "/api/v1/auth/mfa/enroll/begin", headers=headers, json={"password": password}
+        )
+        # 503, not 429: nothing was guessed, the limiter is simply down.
+        assert r.status_code == 503, r.text
+        assert r.headers.get("retry-after") == "60"
+    # Refused BEFORE the credential: no answer was checked, so none counted,
+    # and no candidate secret was minted.
+    assert failures == []
+    await db_session.refresh(user)
+    assert user.totp_secret_encrypted is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/mfa/disable", "/mfa/recovery-codes/regenerate"])
+async def test_disable_and_regenerate_are_refused_while_the_budget_cannot_be_read(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, path: str
+):
+    from app.services.mfa import encrypt_secret, generate_secret
+
+    failures = _throttle_down(monkeypatch)
+    user, _, headers = await _session_user(
+        db_session, auth_source="local", signed_in_ago=timedelta(0), password="pw-123456"
+    )
+    user.totp_enabled = True
+    user.totp_secret_encrypted = encrypt_secret(generate_secret())
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/auth{path}", headers=headers, json={"password": "nope", "code": "000000"}
+    )
+    assert r.status_code == 503, r.text
+    assert failures == []
+    await db_session.refresh(user)
+    assert user.totp_enabled is True

@@ -79,7 +79,11 @@ session alone doesn't prove and an SSO account has no local password.
   budget of 5 per 15 minutes, after which the step-up answers `429` without
   checking the credential: these run for a caller who already holds a
   session, so unthrottled each would be a password oracle. The budget lives
-  in Redis and fails open, like the login throttle.
+  in Redis and, unlike the login throttle, fails **closed**: while Redis is
+  unreachable the three step-ups answer `503` with `Retry-After: 60`. The
+  account lockout counts wrong sign-in answers, not step-up answers, so
+  nothing else would bound the guessing; an outage pauses MFA changes and
+  leaves sign-in alone.
 - **Login flow**: when MFA is enabled, the `POST /auth/login` response
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
