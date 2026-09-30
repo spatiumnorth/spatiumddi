@@ -1495,6 +1495,19 @@ the formatter handles the rest.
   **Upgrade note:** an already-paired appliance takes its pin at its first
   contact after the upgrade, then checks it against the CA's list; a
   mismatch is logged as `supervisor.tls.pin_not_vouched`.
+  **Also fixed, because pinning depends on it:** after a control-plane
+  reboot, the frontend kept serving the first-boot certificate. A k3s start
+  puts it back into the TLS Secret (#1215), the frontend pod that starts
+  then loads it, and when the api wrote the active certificate back, the
+  frontend did not roll. The rollout annotation was a checksum of the
+  certificate's content, and restoring the same content left it unchanged.
+  Found on a two-appliance test: after one reboot the control plane served
+  a certificate its own signed list did not name, and the remote appliance
+  refused it on every heartbeat until the frontend was restarted by hand.
+  The annotation now also covers the Secret's `resourceVersion`, which
+  every real write moves, so the write-back rolls the frontend. Browsers
+  stop being shown the first-boot certificate after a reboot as well. The
+  revert itself remains #1215.
 
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
