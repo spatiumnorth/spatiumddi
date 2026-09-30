@@ -97,6 +97,9 @@ def build_document(version: str | None) -> dict:
     honest object to export.
     """
     os.environ["APP_TITLE"] = CANONICAL_TITLE
+    # The export never signs or decrypts anything, and release.yml runs it
+    # with no SECRET_KEY at all, which the app otherwise refuses (#1222).
+    os.environ.setdefault("ALLOW_INSECURE_SECRET_KEY", "true")
     if version:
         os.environ["VERSION"] = version
     else:

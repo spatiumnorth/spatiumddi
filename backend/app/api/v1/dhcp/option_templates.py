@@ -19,7 +19,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
-from app.api.v1.dhcp.scopes import validate_domain_options
+from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
@@ -27,6 +27,7 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServerGroup,
 )
+from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
     tags=["dhcp"],
@@ -34,25 +35,6 @@ router = APIRouter(
 )
 
 _VALID_FAMILIES = {"ipv4", "ipv6"}
-
-
-def _normalize_options(raw: Any) -> dict[str, Any]:
-    """Accept either ``{name: value}`` or ``[{code, name, value}, ...]``."""
-    if raw is None:
-        return {}
-    if isinstance(raw, dict):
-        return {str(k): v for k, v in raw.items()}
-    if isinstance(raw, list):
-        out: dict[str, Any] = {}
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            if not name:
-                continue
-            out[str(name)] = entry.get("value")
-        return out
-    return {}
 
 
 class OptionTemplateCreate(BaseModel):
@@ -146,8 +128,8 @@ async def create_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
-    options = _normalize_options(body.options)
-    validate_domain_options(options)  # #597 — domain-name/domain-search are FQDNs
+    options = normalize_options(body.options)
+    await validate_dhcp_options(db, options, group_id=group_id, address_family=body.address_family)
     tpl = DHCPOptionTemplate(
         group_id=group_id,
         name=body.name,
@@ -201,11 +183,23 @@ async def update_template(
         )
         if clash.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="A template with that name exists")
-    if "options" in payload:
-        payload["options"] = _normalize_options(payload["options"])
-        # Validate only changed domain options (#597) so a round-tripped
-        # grandfathered value doesn't block an unrelated edit.
-        validate_domain_options(payload["options"], previous=tpl.options or {})
+    family = payload.get("address_family", tpl.address_family)
+    if "options" in payload or family != tpl.address_family:
+        # The stored map is normalised too: a template saved before #1228
+        # may carry an alias (``domain-name-servers``) the check rejects.
+        options = normalize_options(payload["options"] if "options" in payload else tpl.options)
+        # Validate only changed options (#597, #1228) so a round-tripped
+        # grandfathered value doesn't block an unrelated edit — unless the
+        # family changed, which makes every option new to the template.
+        await validate_dhcp_options(
+            db,
+            options,
+            group_id=tpl.group_id,
+            address_family=family,
+            previous=(tpl.options or {}) if family == tpl.address_family else None,
+        )
+        if "options" in payload:
+            payload["options"] = options
     for k, v in payload.items():
         setattr(tpl, k, v)
     write_audit(
@@ -283,12 +277,24 @@ async def apply_template_to_scope(
             detail="Template and scope belong to different groups",
         )
     current = dict(scope.options or {})
-    tpl_options = dict(tpl.options or {})
+    # Normalised so a template stored before #1228 under an alias the agent
+    # renders (``domain-name-servers``, ``interface-mtu``) is not refused as
+    # an unknown option, and so it overwrites the canonical key it aliases.
+    tpl_options = normalize_options(tpl.options)
     overwritten = sorted(k for k in tpl_options if k in current and current[k] != tpl_options[k])
     if body.mode == "replace":
         new_options: dict[str, Any] = dict(tpl_options)
     else:
         new_options = {**current, **tpl_options}
+    # The template was checked against its own family, which need not be the
+    # scope's (#1228), and may predate the check entirely.
+    await validate_dhcp_options(
+        db,
+        new_options,
+        group_id=scope.group_id,
+        address_family=scope.address_family or "ipv4",
+        previous=current,
+    )
     scope.options = new_options
     # Applying a template mutates the scope's rendered options, so wake
     # the scope's group long-poll. ``group_id`` is a direct column on

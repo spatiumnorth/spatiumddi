@@ -14,8 +14,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from app.api.v1.dhcp.agents import _auth_agent
 from app.core.security import create_access_token, hash_password
@@ -23,7 +24,7 @@ from app.main import app
 from app.models.alerts import AlertRule
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dhcp import DHCPMACBlock, DHCPServer, DHCPServerGroup
+from app.models.dhcp import DHCPLease, DHCPMACBlock, DHCPServer, DHCPServerGroup
 from app.models.feature_module import FeatureModule
 from app.models.ipam import IPAddress, IPBlock, IpMacHistory, IPSpace, MACAllowlist, Subnet
 from app.services import feature_modules
@@ -431,6 +432,193 @@ async def test_lease_event_no_sighting_when_module_off(
         )
     ).scalar_one_or_none()
     assert sighting is None  # zero-overhead when the feature is off
+
+
+# ── #1172: a batch that grants and releases the same address ─────────────
+
+
+def _event(ip: str, mac: str, state: str) -> dict:
+    """One v4 event in the shape the agent sends (Kea's expire is both ends)."""
+    end = datetime.now(UTC) + (timedelta(hours=1) if state == "active" else timedelta(0))
+    return {
+        "ip_address": ip,
+        "mac_address": mac,
+        "hostname": f"h-{ip.rsplit('.', 1)[-1]}",
+        "state": state,
+        "starts_at": datetime.now(UTC).isoformat(),
+        "ends_at": end.isoformat(),
+        "expires_at": end.isoformat(),
+    }
+
+
+async def _post_batch(client: AsyncClient, server: DHCPServer, body: dict):  # noqa: ANN202
+    app.dependency_overrides[_auth_agent] = lambda: (server, {})
+    try:
+        return await client.post("/api/v1/dhcp/agents/lease-events", json=body)
+    finally:
+        app.dependency_overrides.pop(_auth_agent, None)
+
+
+def _ip_str(value: object) -> str:
+    return str(value).split("/", 1)[0]
+
+
+async def _stored(db: AsyncSession, server: DHCPServer, subnet: Subnet) -> tuple[dict, dict, dict]:
+    """(lease state by ip, IPAM status by ip, sighting MACs by ip) as committed."""
+    leases = (
+        (await db.execute(select(DHCPLease).where(DHCPLease.server_id == server.id)))
+        .scalars()
+        .all()
+    )
+    rows = (
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet.id)))
+        .scalars()
+        .all()
+    )
+    seen = (
+        await db.execute(
+            select(IPAddress.address, IpMacHistory.mac_address)
+            .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
+            .where(IPAddress.subnet_id == subnet.id)
+        )
+    ).all()
+    sightings: dict[str, list[str]] = {}
+    for addr, mac in seen:
+        sightings.setdefault(_ip_str(addr), []).append(str(mac))
+    return (
+        {_ip_str(le.ip_address): le.state for le in leases},
+        {_ip_str(r.address): r.status for r in rows},
+        sightings,
+    )
+
+
+def _failed_sightings(logs: list[dict]) -> list[dict]:
+    return [e for e in logs if e.get("event") == "dhcp_agent_lease_mac_observation_failed"]
+
+
+async def test_a_batch_that_releases_an_address_it_granted_commits_whole(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """[grant X, release X, grant Y] with the watch on: the release deletes the
+    row X's sighting was queued for. That sighting used to fail its FK inside
+    the batch's transaction, and the batch was lost behind a 200 (#1172)."""
+    server, subnet = await _seed_dhcp(db_session)
+    await _enable_watch(db_session)
+    await db_session.commit()
+    x, y = "10.41.1.60", "10.41.1.61"
+    body = {
+        "batch_id": uuid.uuid4().hex,
+        "leases": [
+            _event(x, "aa:bb:cc:de:ad:60", "active"),
+            _event(x, "aa:bb:cc:de:ad:60", "released"),
+            _event(y, "aa:bb:cc:de:ad:61", "active"),
+        ],
+    }
+    with capture_logs() as logs:
+        resp = await _post_batch(client, server, body)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["duplicate"] is False
+
+    leases, rows, sightings = await _stored(db_session, server, subnet)
+    assert leases == {x: "released", y: "active"}
+    assert x not in rows  # the release tore X's mirror down
+    assert rows[y] == "dhcp"
+    assert sightings == {y: ["aa:bb:cc:de:ad:61"]}
+    # X's row was gone before its sighting ran: skipped, not a failure.
+    assert _failed_sightings(logs) == []
+
+    # The dedupe receipt committed with the rows, so a replay is a duplicate.
+    again = await _post_batch(client, server, body)
+    assert again.status_code == 200, again.text
+    assert again.json()["duplicate"] is True
+
+
+async def test_a_new_device_ahead_of_a_release_keeps_its_first_seen_audit(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """[grant Y (never seen), grant X, release X]: Y's sighting and its
+    device.first_seen audit row are written; X, released in the same batch,
+    records nothing."""
+    server, subnet = await _seed_dhcp(db_session)
+    await _enable_watch(db_session)
+    await db_session.commit()
+    x, y = "10.41.1.62", "10.41.1.63"
+    resp = await _post_batch(
+        client,
+        server,
+        {
+            "batch_id": uuid.uuid4().hex,
+            "leases": [
+                _event(y, "aa:bb:cc:de:ad:63", "active"),
+                _event(x, "aa:bb:cc:de:ad:62", "active"),
+                _event(x, "aa:bb:cc:de:ad:62", "released"),
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    leases, rows, sightings = await _stored(db_session, server, subnet)
+    assert leases == {x: "released", y: "active"}
+    assert x not in rows
+    assert sightings == {y: ["aa:bb:cc:de:ad:63"]}
+    audits = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "first_seen",
+                    AuditLog.resource_type == "ip_mac_observation",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a.resource_display for a in audits] == [f"{y} (aa:bb:cc:de:ad:63)"]
+
+
+async def test_a_sighting_that_fails_rolls_back_only_itself(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any sighting error, not only the FK one: it is logged and skipped, and
+    the rest of the batch commits (#1172)."""
+    from app.services.ipam import discovery
+
+    real = discovery.record_mac_observation
+
+    async def failing_for_one_mac(
+        db: AsyncSession, ip_id: uuid.UUID, mac: str | None, *, source: str = "sweep"
+    ):  # noqa: ANN202
+        if mac == "aa:bb:cc:de:ad:64":
+            # A database error: without a savepoint around the sighting it
+            # leaves the whole transaction aborted.
+            await db.execute(text("SELECT 1 / 0"))
+        return await real(db, ip_id, mac, source=source)
+
+    monkeypatch.setattr(discovery, "record_mac_observation", failing_for_one_mac)
+    server, subnet = await _seed_dhcp(db_session)
+    await _enable_watch(db_session)
+    await db_session.commit()
+    a, b = "10.41.1.64", "10.41.1.65"
+    with capture_logs() as logs:
+        resp = await _post_batch(
+            client,
+            server,
+            {
+                "batch_id": uuid.uuid4().hex,
+                "leases": [
+                    _event(a, "aa:bb:cc:de:ad:64", "active"),
+                    _event(b, "aa:bb:cc:de:ad:65", "active"),
+                ],
+            },
+        )
+    assert resp.status_code == 200, resp.text
+
+    leases, rows, sightings = await _stored(db_session, server, subnet)
+    assert leases == {a: "active", b: "active"}
+    assert rows == {a: "dhcp", b: "dhcp"}
+    assert sightings == {b: ["aa:bb:cc:de:ad:65"]}
+    failed = _failed_sightings(logs)
+    assert [e["ip"] for e in failed] == [a]
 
 
 # ── HTTP: review queue + block ───────────────────────────────────────────

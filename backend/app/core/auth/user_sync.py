@@ -37,11 +37,17 @@ class ExternalAuthResult:
 
 
 class ExternalSyncRejected(Exception):
-    """Raised when we refuse to provision or update a user."""
+    """Raised when we refuse to provision or update a user.
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    ``user`` is the existing account the refusal is about, when there is
+    one, so the caller's ``denied`` audit row is linked to it — filtering
+    the audit log by a disabled account shows the attempts to use it.
+    """
+
+    def __init__(self, reason: str, detail: str = "", *, user: User | None = None) -> None:
         self.reason = reason
         self.detail = detail
+        self.user = user
         super().__init__(detail or reason)
 
 
@@ -71,7 +77,8 @@ async def sync_external_user(
 
     ``provider.type`` is used as the value for ``User.auth_source`` ("ldap",
     "oidc", or "saml"). Raises ``ExternalSyncRejected`` if the login should
-    be refused (no mapping match, same-username local user, auto-create off).
+    be refused (no mapping match, same-username local user, auto-create off,
+    or a disabled account).
     """
     key = (result.external_id or "").strip()
     if not key:
@@ -105,6 +112,17 @@ async def sync_external_user(
             )
         if collision is not None:
             user = collision
+
+    # 3b) A disabled account is refused HERE, before anything is minted
+    # (#1242). Every later request already 403s on ``is_active``, so no data
+    # was ever reachable — but the login itself completed: a session row, a
+    # token pair and a ``login`` / ``success`` audit row for a login that was
+    # never allowed. Raising routes it through each caller's existing
+    # ``denied`` audit instead. Checked before the refresh below so a
+    # disabled account's profile and group membership are not rewritten by
+    # an attempt to use it either.
+    if user is not None and not user.is_active:
+        raise ExternalSyncRejected("account_disabled", "User account is disabled", user=user)
 
     # 4) Create or refresh.
     if user is None:

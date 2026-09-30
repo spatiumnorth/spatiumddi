@@ -79,6 +79,24 @@ def canonical_json(row: AuditLog) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+#: ``AuditLog.request_id`` is ``String(64)``.
+_REQUEST_ID_MAX = 64
+
+
+def _current_request_id() -> str | None:
+    """The ``request_id`` bound in structlog's context, if any.
+
+    ``RequestContextMiddleware`` binds it for every API request, and the
+    Celery ``task_prerun`` hook binds the task id (#1246), so a row written
+    by either carries the id its log lines carry. Capped to the column: an
+    over-long value would fail the INSERT, and with it the audited change.
+    """
+    value = structlog.contextvars.get_contextvars().get("request_id")
+    if value is None:
+        return None
+    return str(value)[:_REQUEST_ID_MAX] or None
+
+
 def hash_row(prev_hash: str | None, canonical: str) -> str:
     h = hashlib.sha256()
     if prev_hash is not None:
@@ -111,11 +129,19 @@ def compute_audit_hashes(session: Session) -> None:
     # values through to the INSERT, overriding the defaults with the same
     # values we just hashed over.
     now = datetime.now(UTC)
+    request_id = _current_request_id()
     for row in new_rows:
         if row.id is None:
             row.id = uuid.uuid4()
         if row.timestamp is None:
             row.timestamp = now
+        # #1245 — the column existed, was in the hash, and no writer ever
+        # set it, although the docs say it links an audit row to its
+        # request's log lines. Filled here, the one path every AuditLog
+        # insert takes, and BEFORE hashing, so the stored value is the
+        # hashed one. An explicit value on the row wins.
+        if row.request_id is None and request_id is not None:
+            row.request_id = request_id
         # Also materialise any Python-side *scalar* column defaults that
         # are still unset. Columns like ``auth_source`` (default "local")
         # and ``result`` (default "success") are None at before_flush time

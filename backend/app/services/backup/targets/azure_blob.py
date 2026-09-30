@@ -38,23 +38,22 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
-
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 
 class AzureBlobDestination(BackupDestination):
@@ -128,7 +127,7 @@ class AzureBlobDestination(BackupDestination):
 
     def _blob_name(self, config: dict[str, Any], filename: str) -> str:
         prefix = (config.get("prefix") or "").strip("/")
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         return f"{prefix}/{safe}" if prefix else safe
 
     def _strip_prefix(self, config: dict[str, Any], blob_name: str) -> str:
@@ -178,7 +177,7 @@ class AzureBlobDestination(BackupDestination):
             try:
                 for blob in client.list_blobs(name_starts_with=list_prefix):
                     name = self._strip_prefix(config, blob.name)
-                    if not _ARCHIVE_NAME_RE.match(name):
+                    if not ARCHIVE_NAME_RE.match(name):
                         continue
                     last_modified = blob.last_modified
                     if last_modified is None:

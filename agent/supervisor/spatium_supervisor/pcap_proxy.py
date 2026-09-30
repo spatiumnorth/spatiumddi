@@ -44,6 +44,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from . import cp_tls
 from .cert_auth import build_auth_headers, load_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url
@@ -163,13 +164,21 @@ def _cleanup(cid: str) -> None:
 
 def pcap_loop_forever(cfg: SupervisorConfig, identity: Identity) -> None:
     """Run the pcap long-poll loop until the process exits (daemon thread)."""
-    with httpx.Client(timeout=_POLL_TIMEOUT_S + 5.0) as client:
-        while True:
-            try:
+    # #1219 — a fresh client per poll, verified against the control
+    # plane's pinned certificate, so a re-pin by the heartbeat loop is
+    # picked up here too. The pin is only ever taken by registration.
+    while True:
+        try:
+            with cp_tls.client(
+                cfg.state_dir,
+                _effective_control_plane_url(cfg),
+                first_contact=False,
+                timeout=_POLL_TIMEOUT_S + 5.0,
+            ) as client:
                 _pcap_once(cfg, identity, client)
-            except Exception as exc:  # noqa: BLE001 — never let the thread die
-                log.warning("supervisor.pcap.loop_crashed", error=str(exc))
-                time.sleep(_BACKOFF_S)
+        except Exception as exc:  # noqa: BLE001 — never let the thread die
+            log.warning("supervisor.pcap.loop_crashed", error=str(exc))
+            time.sleep(_BACKOFF_S)
 
 
 def _pcap_once(cfg: SupervisorConfig, identity: Identity, client: httpx.Client) -> None:

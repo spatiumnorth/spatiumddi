@@ -62,6 +62,28 @@ session alone doesn't prove and an SSO account has no local password.
   Authenticator / Authy / 1Password / Bitwarden, enters a 6-digit code
   to confirm enrolment, and the next page shows 10 single-use backup
   codes (persisted hashed). Backup codes are only shown once.
+  **Starting an enrolment needs a step-up (#1241)**, because it decides
+  whose authenticator the account trusts from then on: a local user
+  re-enters their password; an external-auth user must have signed in with
+  their identity provider within the last 10 minutes
+  (`MFA_ENROL_SIGN_IN_WINDOW`), and is told to sign out and back in
+  otherwise. The sign-in time is the session's `created_at`, which a token
+  refresh carries forward rather than restamps, so a stolen session cannot
+  refresh its way into looking recent; a request with no session (an API
+  token) fails closed. `GET /auth/mfa/status` reports which one applies
+  (`enrol_requires`), whether the current sign-in is still recent
+  (`enrol_sign_in_recent`) and the window itself
+  (`enrol_sign_in_window_minutes`). A refused attempt answers `403` and is
+  audited as `mfa.enrol_begin` / `denied`. Wrong answers to any MFA step-up
+  (begin, disable, regenerate recovery codes) count toward a per-account
+  budget of 5 per 15 minutes, after which the step-up answers `429` without
+  checking the credential: these run for a caller who already holds a
+  session, so unthrottled each would be a password oracle. The budget lives
+  in Redis and, unlike the login throttle, fails **closed**: while Redis is
+  unreachable the three step-ups answer `503` with `Retry-After: 60`. The
+  account lockout counts wrong sign-in answers, not step-up answers, so
+  nothing else would bound the guessing; an outage pauses MFA changes and
+  leaves sign-in alone.
 - **Login flow**: when MFA is enabled, the `POST /auth/login` response
   carries a short-lived **pre-token** instead of the full access token.
   The UI prompts for either a 6-digit TOTP code or a backup code and
@@ -80,9 +102,9 @@ session alone doesn't prove and an SSO account has no local password.
   user proves their password**; a **password-less external-auth user
   proves a current TOTP code** (so they must enrol MFA first, hence the
   open enrolment above). TOTP is deliberately **not** accepted in lieu of
-  a local user's password — that would downgrade the password step-up,
-  since MFA enrolment needs only a session and a hijacked session could
-  otherwise self-enrol and reveal. Disable / regenerate-recovery-codes
+  a local user's password — that would make the reveal step-up only as
+  strong as the enrolment gate, rather than the password it exists to
+  demand. Disable / regenerate-recovery-codes
   follow the same shape (password for local, TOTP-only for SSO).
 
 ## External identity providers
@@ -529,8 +551,17 @@ rather than swallowing the failure. Permission-related rejections
 - **Invalid credentials.** Local password verification failure returns
   `401`. Enforced at `backend/app/api/v1/auth/router.py`.
 - **Account disabled.** Login is refused with `403` when
-  `user.is_active` is false — regardless of auth source.
-  `backend/app/api/v1/auth/router.py`.
+  `user.is_active` is false — regardless of auth source. For an external
+  account the check is in `sync_external_user`, before any session, token
+  or profile update, and the attempt is audited as `denied` with reason
+  `account_disabled` (#1242); the OIDC / SAML redirect flows land on the
+  login page with `?error=account_disabled`.
+  `backend/app/api/v1/auth/router.py`, `backend/app/core/auth/user_sync.py`.
+- **Must change password applies to local accounts only (#1242).** An
+  external account has no password here to change, so an admin cannot set
+  `force_password_change` on one (`400`), nor reset its password (`400` —
+  reset it in the identity provider). A row that already carries the flag
+  is not held to it: enforcement reads `User.password_change_required`.
 - **Empty external ID from IdP.** External login (LDAP / OIDC / SAML /
   RADIUS / TACACS+) with no stable external identifier in the IdP
   response is rejected — we won't create a `User` row we can't

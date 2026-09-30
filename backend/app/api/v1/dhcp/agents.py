@@ -19,6 +19,7 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 
 from app.api.deps import DB
@@ -63,7 +64,7 @@ from app.services.dhcp.agent_token import (
 )
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
-from app.services.dhcp.lease_cleanup import peer_holds_active_lease
+from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
 
@@ -1339,10 +1340,16 @@ async def agent_lease_events(
             # take the shared mirror + DDNS away while the other peer still
             # reports the lease active; the second one (or the expiry sweep,
             # if the other peer never reports) does.
+            #
+            # #1318 — nor while another client's lease on this server
+            # holds the address. The agent re-reads its whole lease file on
+            # every start, so an old client's grant and release of an address
+            # arrive again after the address has gone to a new client, and
+            # the release must not take the new client's mirror with it.
             if (
                 ipam_row is not None
                 and ipam_row.auto_from_lease
-                and await peer_holds_active_lease(db, lease, now=now)
+                and await address_still_held(db, lease, now=now)
             ):
                 continue
             if ipam_row is not None and ipam_row.auto_from_lease:
@@ -1371,13 +1378,26 @@ async def agent_lease_events(
     if to_observe:
         from app.api.v1.dhcp._audit import write_audit
         from app.services.ipam.discovery import record_mac_observation
+        from app.services.ipam.new_device import MacObservationResult
 
         await db.flush()
+        first_seen: list[tuple[IPAddress, MacObservationResult]] = []
         for ipam_row, mac in to_observe:
-            if ipam_row.id is None:
+            # A later released / expired / declined event in this same batch
+            # deleted the row (the branch above), so there is no address left
+            # to record the sighting against: its INSERT would only fail the
+            # ip_mac_history foreign key (#1172).
+            if ipam_row.id is None or sa_inspect(ipam_row).deleted:
                 continue
+            # One savepoint per sighting, so a sighting that fails rolls back
+            # only itself (#1172). Without it the first failure aborted the
+            # transaction and the batch was lost whole -- its leases, mirrors,
+            # DDNS changes and dedupe receipt: the COMMIT ran as a rollback
+            # behind a 200 the agent never resends, or, with DNS changes
+            # pending, failed as a 500 the agent resends into the same failure.
             try:
-                result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
+                async with db.begin_nested():
+                    result = await record_mac_observation(db, ipam_row.id, mac, source="dhcp_lease")
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "dhcp_agent_lease_mac_observation_failed",
@@ -1387,20 +1407,27 @@ async def agent_lease_events(
                 )
                 continue
             if result is not None and result.is_first_seen_new:
-                write_audit(
-                    db,
-                    user=None,
-                    action="first_seen",
-                    resource_type="ip_mac_observation",
-                    resource_id=f"{ipam_row.id}:{result.mac_address}",
-                    resource_display=f"{ipam_row.address} ({result.mac_address})",
-                    new_value={
-                        "mac_address": result.mac_address,
-                        "ip_address": str(ipam_row.address),
-                        "source": "dhcp_lease",
-                        "is_randomized": result.is_randomized,
-                    },
-                )
+                first_seen.append((ipam_row, result))
+        # Staged only after the last savepoint. Each savepoint flushes what is
+        # pending when it begins, and the audit forwarder and event publisher
+        # dispatch what a flush wrote on after_commit, which a savepoint's
+        # release fires too: a device.first_seen written inside the loop would
+        # go out before the batch itself committed.
+        for ipam_row, result in first_seen:
+            write_audit(
+                db,
+                user=None,
+                action="first_seen",
+                resource_type="ip_mac_observation",
+                resource_id=f"{ipam_row.id}:{result.mac_address}",
+                resource_display=f"{ipam_row.address} ({result.mac_address})",
+                new_value={
+                    "mac_address": result.mac_address,
+                    "ip_address": str(ipam_row.address),
+                    "source": "dhcp_lease",
+                    "is_randomized": result.is_randomized,
+                },
+            )
 
     await db.commit()
     return {"upserted": upserted}

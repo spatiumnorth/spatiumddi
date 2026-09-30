@@ -3143,6 +3143,54 @@ installer wizard offers two methods at the **Bootstrap method** prompt:
 > even though the cluster is healthy on the survivors. Configure the VIP
 > on the control plane under **Appliance → Network & Host**.
 
+### How the appliance trusts the control plane's certificate (#1219)
+
+The supervisor verifies the control plane's TLS certificate on every
+connection, including a control plane with a self-signed certificate, without
+the operator installing a CA anywhere:
+
+1. **First contact pins the certificate.** When the supervisor first reaches
+   an `https://` control-plane URL (registration), it records the certificate
+   the server presented and from then on trusts exactly that certificate. The
+   check is in the TLS handshake, so nothing (no session token, no agent key)
+   is sent to a server that does not hold the pinned key. The hostname does
+   not have to match, so an IP works. The supervisor logs the fingerprint as
+   `supervisor.tls.pinned_on_first_contact`; it should match the one shown
+   under **Appliance → TLS** on the control plane. If it does not, something
+   intercepted the connection.
+2. **Rotation goes through the appliance CA.** The Web UI certificate changes
+   in normal operation: a self-signed one is re-minted when a member joins or
+   the VIP changes, an operator uploads one, ACME renews one. When the
+   supervisor meets a new certificate it fetches
+   `GET /api/v1/appliance/supervisor/tls-pins`, the list of certificates the
+   control plane serves signed by the appliance CA (whose certificate the
+   supervisor received on approval), and re-pins only if the new certificate
+   is on it. Otherwise it keeps the old pin and logs
+   `supervisor.tls.certificate_not_vouched`.
+3. **Once approved, the first-contact pin is checked.** When the CA arrives,
+   the supervisor checks that the certificate it pinned at first contact is on
+   the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
+
+An `http://` control-plane URL (acceptable for labs, per the installer) is
+probed once with a bare `GET /` to learn the `https://` it redirects to; that
+certificate is pinned, and every real request goes straight to the `https://`
+target. So the pairing code and the session token never cross the network in
+cleartext, even when the URL was typed as `http://`.
+Re-pairing with `spatium-pair` forgets the pinned certificate and the CA, so
+an appliance moved to a rebuilt or different control plane pins the new one
+on its next contact.
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` still turns verification off, with a
+warning; the appliance chart no longer sets it (before #1219 it did,
+unconditionally, and nothing was pinned in its place).
+
+**Limit, stated plainly.** Trust on first use is as good as the first
+contact. An attacker on the path at pairing time who also substitutes the CA
+certificate the supervisor receives at approval is not caught automatically;
+comparing the logged fingerprint with **Appliance → TLS** is the check. The
+DNS, DHCP and looking-glass role pods on an appliance still skip verification
+toward the control plane; they need the pinned certificate passed through to
+them, which is tracked separately.
+
 ### Pairing code (recommended) — issue #169
 
 The control-plane operator generates a short-lived 8-digit code on

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import DB, CurrentUser
+from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
@@ -118,7 +119,7 @@ async def get_bundle(db: DB, user: CurrentUser):
         iter([blob]),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition(filename),
             "Content-Length": str(len(blob)),
         },
     )

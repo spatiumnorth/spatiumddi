@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Download, Loader2, Trash2 } from "lucide-react";
 import {
@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { humanTime } from "@/pages/network/_shared";
 
 type RightTab = "live" | "history" | "result";
@@ -88,6 +89,14 @@ export function PacketCapturePage() {
     setTab("live");
   };
 
+  // #1311 — the route is not module-gated, only the API is, so a bookmark
+  // or the Fleet drilldown can land here with tools.pcap off. Everything
+  // below calls the gated API, so say the feature is off instead of
+  // rendering a form whose Run answers "Feature 'tools.pcap' is disabled".
+  // Wait for the module list first: ``enabled`` is optimistically true
+  // while it loads, and the history query would fire and 404.
+  const featureModules = useFeatureModules();
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b bg-card px-6 py-4">
@@ -103,63 +112,86 @@ export function PacketCapturePage() {
         </p>
       </div>
 
-      <div className="flex-1 overflow-auto p-6">
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          <div className="rounded-lg border bg-card p-4">
-            <h2 className="mb-3 text-sm font-medium">New capture</h2>
-            <CaptureForm
-              onStarted={onStarted}
-              initialVantage={initialVantage}
-            />
+      {!featureModules.ready ? (
+        <div className="flex flex-1 items-center justify-center p-6 text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin" />
+        </div>
+      ) : !featureModules.enabled("tools.pcap") ? (
+        <div className="p-6">
+          <div className="max-w-2xl rounded-lg border border-dashed p-6">
+            <p className="text-sm font-medium">Packet capture is turned off</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              It ships disabled because captures carry raw traffic. A superadmin
+              can enable it under{" "}
+              <Link
+                to="/admin/features"
+                className="text-primary underline underline-offset-2"
+              >
+                Features &amp; Integrations
+              </Link>{" "}
+              → Tools → Packet capture.
+            </p>
           </div>
-
-          <div className="flex flex-col rounded-lg border bg-card">
-            <div className="flex items-center gap-1 border-b px-2">
-              <TabButton
-                active={tab === "live"}
-                onClick={() => setTab("live")}
-                live={!!activeId}
-              >
-                Live
-              </TabButton>
-              <TabButton
-                active={tab === "history"}
-                onClick={() => setTab("history")}
-              >
-                History
-              </TabButton>
-              <TabButton
-                active={tab === "result"}
-                onClick={() => setTab("result")}
-                disabled={!displayId}
-              >
-                Last result
-              </TabButton>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-auto p-6">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <div className="rounded-lg border bg-card p-4">
+              <h2 className="mb-3 text-sm font-medium">New capture</h2>
+              <CaptureForm
+                onStarted={onStarted}
+                initialVantage={initialVantage}
+              />
             </div>
-            <div className="p-4">
-              {tab === "live" && (
-                <LiveTab
-                  captureId={activeId}
-                  onComplete={(id) => {
-                    setDisplayId(id);
-                    setActiveId(null);
-                    setTab("result");
-                  }}
-                />
-              )}
-              {tab === "history" && (
-                <HistoryTab
-                  onSelect={(c) => {
-                    setDisplayId(c.id);
-                    setTab("result");
-                  }}
-                />
-              )}
-              {tab === "result" && <ResultTab captureId={displayId} />}
+
+            <div className="flex flex-col rounded-lg border bg-card">
+              <div className="flex items-center gap-1 border-b px-2">
+                <TabButton
+                  active={tab === "live"}
+                  onClick={() => setTab("live")}
+                  live={!!activeId}
+                >
+                  Live
+                </TabButton>
+                <TabButton
+                  active={tab === "history"}
+                  onClick={() => setTab("history")}
+                >
+                  History
+                </TabButton>
+                <TabButton
+                  active={tab === "result"}
+                  onClick={() => setTab("result")}
+                  disabled={!displayId}
+                >
+                  Last result
+                </TabButton>
+              </div>
+              <div className="p-4">
+                {tab === "live" && (
+                  <LiveTab
+                    captureId={activeId}
+                    onComplete={(id) => {
+                      setDisplayId(id);
+                      setActiveId(null);
+                      setTab("result");
+                    }}
+                  />
+                )}
+                {tab === "history" && (
+                  <HistoryTab
+                    onSelect={(c) => {
+                      setDisplayId(c.id);
+                      setTab("result");
+                    }}
+                  />
+                )}
+                {tab === "result" && <ResultTab captureId={displayId} />}
+              </div>
             </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -42,7 +42,12 @@ services:
     networks:
       - spatiumddi
     ports:
-      - "${API_PORT:-8000}:8000"
+      # Localhost only by default (#1221): the api believes X-Real-IP from
+      # private-range peers, so a LAN client reaching it directly could set
+      # its own IP. Browsers and remote agents go through the frontend;
+      # host-network services here (looking-glass) use 127.0.0.1. See
+      # API_BIND in .env.example before widening it.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi
@@ -244,7 +249,6 @@ services:
       SERVER_NAME: dns-bind9
       AGENT_GROUP: default
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
@@ -278,7 +282,6 @@ services:
       SERVER_NAME: dns-powerdns
       AGENT_GROUP: default-powerdns
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
@@ -310,7 +313,6 @@ services:
       SERVER_NAME: dns-technitium
       AGENT_GROUP: default-technitium
       AGENT_ROLES: authoritative
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
       - dns_technitium_state:/var/lib/spatium-dns-agent
       - dns_technitium_config:/etc/dns
@@ -385,8 +387,6 @@ services:
       AGENT_ROLES: primary
 
       # ── TLS ───────────────────────────────────────────────────────
-      # Skip TLS verify for self-signed control planes. Lab-only.
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
       # Path to a CA bundle (in-container) for private CA verification.
       # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
 
@@ -448,9 +448,6 @@ services:
       AGENT_GROUP: default
       AGENT_ROLES: secondary
 
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
-
       # Tuning (see dhcp-kea above for the full list).
       # LOG_LEVEL: INFO
       # HEARTBEAT_INTERVAL: "30"
@@ -495,10 +492,6 @@ services:
       # ── Registration ──────────────────────────────────────────────
       # Collector name (LookingGlassCollector row); unique per collector.
       SERVER_NAME: ${LG_HOSTNAME:-looking-glass}
-
-      # ── TLS ───────────────────────────────────────────────────────
-      # Loopback to the same-host API — TLS verify off is fine.
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
 
       # ── Tuning (optional, defaults shown) ─────────────────────────
       # LOG_LEVEL: INFO

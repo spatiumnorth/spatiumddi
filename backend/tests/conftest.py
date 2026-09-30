@@ -82,6 +82,11 @@ _TEST_DATABASE_URL = _per_worker_url(_BASE_TEST_DATABASE_URL, _WORKER)
 # set; in xdist mode it swaps to the worker-suffixed name.
 os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
 
+# Tests boot on whatever SECRET_KEY the environment has, the .env.example
+# placeholder included, which the app otherwise refuses (#1222). setdefault,
+# so an explicit ALLOW_INSECURE_SECRET_KEY=false still wins.
+os.environ.setdefault("ALLOW_INSECURE_SECRET_KEY", "true")
+
 import asyncpg  # noqa: E402  — must follow the DATABASE_URL override above
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
@@ -94,8 +99,13 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
 )
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+import app.core.security as _security  # noqa: E402
 from app.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
+
+# Test fixtures mint access tokens with no session row; production refuses
+# those (#1222). test_secret_key_hardening.py turns this back off to prove it.
+_security.ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION = True
 from app.models.base import Base  # noqa: E402
 
 # NullPool: open a fresh asyncpg connection on every checkout and drop it on

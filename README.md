@@ -1457,7 +1457,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
 
 Contributions are welcome.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR
+- Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. Every commit needs a DCO sign-off (`git commit -s`), explained there
 - Good first tasks are tagged on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
 - Design discussion happens in [GitHub Discussions](https://github.com/spatiumnorth/spatiumddi/discussions)
 
