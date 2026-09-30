@@ -132,6 +132,7 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
+from app.services.dns.tsig import group_key_names
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -238,7 +239,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
-VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
+VALID_NOTIFY = {"yes", "no", "explicit", "master-only", "primary-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # Upstream forwarding transport (issue #50). No "https" member: BIND has no
 # client-side HTTP transport, so DoH-upstream isn't expressible on the BIND9
@@ -3165,7 +3166,7 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerO
 
 
 async def _validated_option_changes(
-    group_id: uuid.UUID, changes: dict[str, Any], opts: DNSServerOptions, db: DB
+    group_id: uuid.UUID, changes: dict[str, Any], opts: Any, db: DB
 ) -> dict[str, Any]:
     """Validate the options about to reach named.conf (#1244).
 
@@ -3174,7 +3175,8 @@ async def _validated_option_changes(
     stored before this gate existed into a 422 on an unrelated edit — the
     operator changing the RRL window would be told their query-log path is
     wrong, with no way to save until they fixed a field they never touched.
-    A new row has no previous values, so everything on it is checked.
+    A new row has no previous values, so everything on it is checked —
+    ``opts`` may be ``None`` for that case (zone create, #1316).
 
     Raises 422 naming the field and the offending element, the same shape
     as the view and ACL validators.
@@ -3225,17 +3227,7 @@ async def _validated_zone_named_conf_fields(
     }
     if not fields:
         return {}
-    acl_names, known_keys = await _group_symbol_names(group_id, db)
-    try:
-        return {
-            k: validate_server_option(k, v, known_acls=acl_names, known_keys=known_keys)
-            for k, v in fields.items()
-        }
-    except ViewValidationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
-        ) from exc
+    return await _validated_option_changes(group_id, fields, zone, db)
 
 
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
@@ -3421,18 +3413,9 @@ async def _group_symbol_names(
     if exclude_acl_id is not None:
         acl_stmt = acl_stmt.where(DNSAcl.id != exclude_acl_id)
     acl_names = frozenset((await db.execute(acl_stmt)).scalars().all())
-
-    key_names = set(
-        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    # The group's legacy auto-generated loopback key is a real ``key {}`` in
-    # the rendered config too, so it is citable like any other.
-    group = await db.get(DNSServerGroup, group_id)
-    if group is not None and group.tsig_key_name:
-        key_names.add(group.tsig_key_name)
-    return acl_names, frozenset(key_names)
+    # Operator keys plus the group's legacy loopback key, which is a real
+    # ``key {}`` in the rendered config too and so citable like any other.
+    return acl_names, await group_key_names(db, group_id)
 
 
 async def _assert_acl_graph_is_acyclic(group_id: uuid.UUID, db: DB) -> None:

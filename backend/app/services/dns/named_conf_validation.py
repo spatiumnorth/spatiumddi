@@ -628,4 +628,9 @@ def key_reference(element: str) -> str | None:
     """
     body = (element or "").strip().lstrip("!").strip()
     match = _KEY_TOKEN_RE.search(body)
-    return match.group(1) if match else None
+    # BIND takes ``key "name"`` as well as ``key name``; a row stored before
+    # the validators existed may carry the quoted form, and returning the
+    # quotes would compare unequal to every defined key and wave it through.
+    if match is None:
+        return None
+    return match.group(1).strip('"') or None

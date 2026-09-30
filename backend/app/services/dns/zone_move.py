@@ -60,7 +60,7 @@ from app.services.dns.record_ops import (
     count_queued_zone_ops,
     sweep_zone_ops,
 )
-from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 
 logger = structlog.get_logger(__name__)
 
@@ -400,8 +400,8 @@ async def assemble_move_plan(
     _scan_key_references(
         plan,
         zone,
-        await _group_key_names(db, zone.group_id),
-        await _group_key_names(db, target_group.id),
+        await group_key_names(db, zone.group_id),
+        await group_key_names(db, target_group.id),
     )
 
     plan.pools_repointed = await _count(db, DNSPool, DNSPool.zone_id == zone.id)
@@ -473,22 +473,8 @@ def _scan_acl_references(
             plan.acl_names_lost.append(name)
 
 
-async def _group_key_names(db: AsyncSession, group_id: uuid.UUID) -> set[str]:
-    """Every ``key {}`` name a group's rendered config defines: its
-    operator TSIG keys plus the legacy auto-generated group key."""
-    names = set(
-        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    group = await db.get(DNSServerGroup, group_id)
-    if group is not None and group.tsig_key_name:
-        names.add(group.tsig_key_name)
-    return names
-
-
 def _scan_key_references(
-    plan: ZoneMovePlan, zone: DNSZone, source_keys: set[str], target_keys: set[str]
+    plan: ZoneMovePlan, zone: DNSZone, source_keys: frozenset[str], target_keys: frozenset[str]
 ) -> None:
     cited = {
         name

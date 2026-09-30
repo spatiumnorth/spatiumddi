@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSAcl, DNSServerGroup, DNSTSIGKey, DNSZone
+from app.services.dns.named_conf_validation import key_reference
 
 
 async def _superadmin(db: AsyncSession) -> dict[str, str]:
@@ -114,3 +115,45 @@ async def test_update_checks_a_changed_value_but_not_a_stored_one(
     r = await client.put(url, json={"allow_transfer": ["10.0.0.300"]}, headers=headers)
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["field"] == "allow_transfer"
+
+
+@pytest.mark.asyncio
+async def test_notify_value_accepted_on_create_is_accepted_on_update(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Create validates against the named.conf grammar, update against the
+    request model's set — the two must agree, or a zone created with a
+    value becomes uneditable by any client that sends it back."""
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/dns/groups/{group.id}/zones",
+        json={"name": "example.com", "notify_enabled": "primary-only"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    zone_id = r.json()["id"]
+
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/zones/{zone_id}",
+        json={"notify_enabled": "primary-only", "ttl": 600},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    ("element", "expected"),
+    [
+        ("key xfer", "xfer"),
+        ("!key xfer", "xfer"),
+        ('key "xfer"', "xfer"),
+        ("192.0.2.1 port 5353 key notif", "notif"),
+        ("192.0.2.1", None),
+        ("office", None),
+    ],
+)
+def test_key_reference(element: str, expected: str | None) -> None:
+    assert key_reference(element) == expected
