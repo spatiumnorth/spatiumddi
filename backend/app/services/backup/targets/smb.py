@@ -37,13 +37,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -53,8 +53,6 @@ from app.services.backup.targets.base import (
 )
 
 logger = structlog.get_logger(__name__)
-
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 
 def _unc(config: dict[str, Any], filename: str | None = None) -> str:
@@ -211,7 +209,7 @@ class SmbDestination(BackupDestination):
             rows: list[ArchiveListing] = []
             try:
                 for entry in scandir(root):
-                    if not entry.is_file() or not _ARCHIVE_NAME_RE.match(entry.name):
+                    if not entry.is_file() or not ARCHIVE_NAME_RE.match(entry.name):
                         continue
                     stat = entry.stat()
                     rows.append(

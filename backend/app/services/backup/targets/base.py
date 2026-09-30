@@ -32,7 +32,13 @@ from typing import Any
 #: Shared rather than copied per driver: a change to the naming scheme that
 #: missed one file would make that destination's retention sweep and
 #: ``latest/download`` silently blind, with no error anywhere.
-ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
+#:
+#: The middle excludes path separators and control characters (#1243) so
+#: the listing can never offer a name :func:`safe_filename` then refuses —
+#: an object-store key under a nested "directory"
+#: (``spatiumddi-backup-x/y.zip``) would otherwise be listed, picked as
+#: ``latest``, counted by retention, and fail every download / delete.
+ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-)[^/\\\x00-\x1f\x7f]*\.zip$")
 
 
 def safe_filename(filename: str) -> str:

@@ -1427,7 +1427,11 @@ the formatter handles the rest.
   for such a name without reaching the destination, and also for any
   name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
   are the only names the listing ever shows, so any other name was
-  never offered by this API. Eleven download routes that built
+  never offered by this API; the shared name pattern also stops
+  matching a name with a separator in it, so an object-store key under
+  a nested prefix is no longer listed as an archive nothing can then
+  download or delete, and the seven drivers that carried their own copy
+  of it now use the shared one. Thirteen download routes that built
   `Content-Disposition` by hand now use `content_disposition()`, and an
   uploaded upgrade image's filename, the one download name an uploader
   controls, is stored as its last path component with control

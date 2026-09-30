@@ -41,7 +41,6 @@ Implementation notes:
 from __future__ import annotations
 
 import os
-import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -51,6 +50,7 @@ import httpx
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -61,7 +61,6 @@ from app.services.backup.targets.base import (
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 # Generous timeout — WebDAV against a residential Nextcloud over a
 # slow link can stall for tens of seconds on a multi-MB upload.
@@ -229,7 +228,7 @@ class WebDAVDestination(BackupDestination):
             # still encoded would be encoded twice on the way back and
             # name an object that does not exist.
             name = unquote(os.path.basename(href.rstrip("/")))
-            if not _ARCHIVE_NAME_RE.match(name):
+            if not ARCHIVE_NAME_RE.match(name):
                 continue
             propstat = response.find(f"{_DAV_NS}propstat/{_DAV_NS}prop")
             if propstat is None:

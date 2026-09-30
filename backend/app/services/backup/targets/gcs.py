@@ -35,13 +35,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -51,8 +51,6 @@ from app.services.backup.targets.base import (
 )
 
 logger = structlog.get_logger(__name__)
-
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 
 def _client(config: dict[str, Any]):
@@ -188,7 +186,7 @@ class GcsDestination(BackupDestination):
                 blobs = client.list_blobs(config["bucket"], prefix=list_prefix)
                 for blob in blobs:
                     name = _strip_prefix(config, blob.name)
-                    if not _ARCHIVE_NAME_RE.match(name):
+                    if not ARCHIVE_NAME_RE.match(name):
                         continue
                     if blob.time_created is None:
                         continue

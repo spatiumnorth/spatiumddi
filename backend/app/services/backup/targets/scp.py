@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import re
 import stat as stat_mod
 from datetime import UTC, datetime
 from typing import Any
@@ -53,6 +52,7 @@ from typing import Any
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -63,7 +63,6 @@ from app.services.backup.targets.base import (
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 
@@ -312,7 +311,7 @@ class ScpDestination(BackupDestination):
             for attr in entries:
                 if attr.st_mode is None or stat_mod.S_ISDIR(attr.st_mode):
                     continue
-                if not _ARCHIVE_NAME_RE.match(attr.filename):
+                if not ARCHIVE_NAME_RE.match(attr.filename):
                     continue
                 if not attr.st_mtime or not attr.st_size:
                     continue

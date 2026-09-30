@@ -269,3 +269,28 @@ def test_stored_upgrade_image_name_is_one_printable_component(raw, expected):
     image_id = uuid.uuid4()
     got = _stored_upload_name(raw, image_id)
     assert got == (expected if expected is not None else f"{image_id}.raw.xz")
+
+
+# ── the listing never offers a name the routes refuse ─────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["spatiumddi-backup-x/y.zip", "pre-restore-a\\b.zip", "spatiumddi-backup-a\rb.zip"],
+)
+def test_archive_name_pattern_excludes_what_safe_filename_refuses(name: str):
+    # A nested object-store key used to match the listing pattern, so it
+    # was listed, picked as ``latest`` and counted by retention, and then
+    # every download / delete of it was refused.
+    from app.services.backup.targets.base import ARCHIVE_NAME_RE
+
+    assert not ARCHIVE_NAME_RE.match(name)
+    with pytest.raises(InvalidArchiveNameError):
+        safe_filename(name)
+
+
+def test_archive_name_pattern_still_matches_a_generated_name():
+    from app.services.backup.targets.base import ARCHIVE_NAME_RE
+
+    assert ARCHIVE_NAME_RE.match(_GOOD)
+    assert ARCHIVE_NAME_RE.match("pre-restore-20260929-120000.zip")

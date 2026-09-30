@@ -68,13 +68,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -87,7 +87,6 @@ from app.services.backup.targets.base import (
 logger = structlog.get_logger(__name__)
 
 # Same archive-name pattern as the local-volume driver.
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 # boto3 ClientError import is lazy — keeps the import-graph cost off
 # the hot path and avoids forcing every install to ship boto3 once
@@ -343,7 +342,7 @@ class S3Destination(BackupDestination):
                     for obj in page.get("Contents") or []:
                         key = obj["Key"]
                         filename = _strip_prefix(config, key)
-                        if not _ARCHIVE_NAME_RE.match(filename):
+                        if not ARCHIVE_NAME_RE.match(filename):
                             continue
                         last_modified = obj.get("LastModified")
                         if last_modified is None:

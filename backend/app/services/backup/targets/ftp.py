@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import re
 import ssl
 from datetime import UTC, datetime
 from typing import Any
@@ -47,6 +46,7 @@ from typing import Any
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
@@ -57,7 +57,6 @@ from app.services.backup.targets.base import (
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 _MODES = {"ftp", "ftps_explicit", "ftps_implicit"}
 
@@ -266,7 +265,7 @@ class FtpDestination(BackupDestination):
                     for name, facts in entries:
                         if facts.get("type") not in {"file", "OS.unix=symlink"}:
                             continue
-                        if not _ARCHIVE_NAME_RE.match(name):
+                        if not ARCHIVE_NAME_RE.match(name):
                             continue
                         size = int(facts.get("size", 0) or 0)
                         modify = facts.get("modify")  # YYYYMMDDhhmmss UTC
@@ -289,7 +288,7 @@ class FtpDestination(BackupDestination):
                     client.retrlines(f"LIST {remote_path}", raw_lines.append)
                     for line in raw_lines:
                         name = line.rsplit(" ", 1)[-1]
-                        if not _ARCHIVE_NAME_RE.match(name):
+                        if not ARCHIVE_NAME_RE.match(name):
                             continue
                         try:
                             size_resp = client.sendcmd(f"SIZE {remote_path}/{name}").split(" ", 1)
