@@ -16,7 +16,7 @@ the protocol specification.
 | `AGENT_DRIVER` | `bind9` (only supported backend) |
 | `AGENT_GROUP` | Optional DNS server group to join |
 | `AGENT_ROLES` | Comma-separated: `authoritative,recursive,forwarder` |
-| `TLS_CA_PATH` | Optional custom CA bundle |
-| `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` | Dev only |
+| `TLS_CA_PATH` | CA bundle to verify the control plane against (private CA or self-signed). Wins over the skip flag |
+| `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` | Turns verification off. Lab only: the agent key is readable on the network path. Logged as a warning on every start |
 
 State directory: `/var/lib/spatium-dns-agent` (must be a volume).

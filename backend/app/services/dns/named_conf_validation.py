@@ -46,6 +46,7 @@ __all__ = [
     "AclCycleError",
     "ViewValidationError",
     "is_name_reference",
+    "key_reference",
     "order_acls_for_render",
     "validate_acl_name",
     "validate_address_match_list",
@@ -587,6 +588,10 @@ def validate_server_option(
 ) -> Any:
     """Validate one ``DNSServerOptions`` field; return the cleaned value.
 
+    Also used for a zone's ``allow_query`` / ``allow_transfer`` /
+    ``also_notify`` / ``notify_enabled`` (#1316): the zone statement
+    carries the same clauses, under the same names, with the same grammar.
+
     Fields without a named.conf grammar here are returned unchanged — the
     booleans and integers are already typed by the request model.
     """
@@ -608,3 +613,24 @@ def validate_server_option(
     if field in PATH_OPTION_PREFIXES:
         return _validate_path(str(value), field=field)
     return value
+
+
+_KEY_TOKEN_RE = re.compile(r"(?:^|\s)key\s+(\S+)")
+
+
+def key_reference(element: str) -> str | None:
+    """The TSIG key name an address-match or ``also-notify`` element cites.
+
+    ``key <name>`` in an address-match-list and ``<ip> [port <n>] key
+    <name>`` in ``also-notify`` both name a ``key {}`` the rendered config
+    must define — the zone move (#935, #1316) needs to know which ones a
+    zone depends on, exactly as it does for ACL names.
+    """
+    body = (element or "").strip().lstrip("!").strip()
+    match = _KEY_TOKEN_RE.search(body)
+    # BIND takes ``key "name"`` as well as ``key name``; a row stored before
+    # the validators existed may carry the quoted form, and returning the
+    # quotes would compare unequal to every defined key and wave it through.
+    if match is None:
+        return None
+    return match.group(1).strip('"') or None

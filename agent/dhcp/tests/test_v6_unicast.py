@@ -131,16 +131,21 @@ def test_an_address_change_re_renders_the_current_bundle(
     loop = SyncLoop(agent_cfg, token_ref=[""], heartbeat=_FakeHeartbeat())
     applied: list[str] = []
 
-    def _apply(bundle: dict[str, Any], etag: str) -> bool:
+    # #1247 — the recheck re-renders the LIVE bundle through
+    # ``reapply_current_bundle``; record what it re-renders.
+    def _reapply(reason: str) -> bool:
+        assert loop._live is not None
+        bundle, etag = loop._live
         applied.append(etag)
         loop._apply_bundle(bundle, reload_kea=False)
         return True
 
-    monkeypatch.setattr(loop, "_apply_with_revert", _apply)
+    monkeypatch.setattr(loop, "reapply_current_bundle", _reapply)
     bundle = _v6_bundle()
     save_config(agent_cfg.state_dir, bundle, "sha256:v6")
     loop._current_etag = "sha256:v6"
     loop._apply_bundle(bundle, reload_kea=False)
+    loop._live = (bundle, "sha256:v6")
 
     loop._recheck_v6_unicast()
     assert applied == [], "unchanged addresses: no re-render"
@@ -163,12 +168,14 @@ def test_without_v6_scopes_address_changes_are_ignored(
     monkeypatch.setattr(sync_mod, "global_ipv6_addresses", lambda: list(addrs))
     loop = SyncLoop(agent_cfg, token_ref=[""], heartbeat=_FakeHeartbeat())
     monkeypatch.setattr(
-        loop, "_apply_with_revert", lambda *_a: pytest.fail("must not re-render")
+        loop, "reapply_current_bundle", lambda *_a: pytest.fail("must not re-render")
     )
     bundle: dict[str, Any] = {"server": {"interfaces": ["*"]}, "scopes": []}
     save_config(agent_cfg.state_dir, bundle, "sha256:v4only")
     loop._current_etag = "sha256:v4only"
     loop._apply_bundle(bundle, reload_kea=False)
+    # Live, so the ONLY reason nothing re-renders is the absence of v6 scopes.
+    loop._live = (bundle, "sha256:v4only")
 
     addrs[:] = []
     loop._recheck_v6_unicast()

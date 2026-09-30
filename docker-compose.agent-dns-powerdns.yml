@@ -58,16 +58,23 @@ services:
       # AGENT_DRIVER is baked into the image (powerdns); no override.
 
       # ── TLS ───────────────────────────────────────────────────────
-      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-1}"
-      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+      # The control plane's certificate is verified (#1220). A cert from a
+      # public CA needs nothing here. For a private CA or a self-signed
+      # cert, mount that CA (the commented volume below) and set
+      # TLS_CA_PATH=/etc/ssl/spatium-ca.crt in .env.
+      # SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 turns verification off: lab use
+      # only, since anyone on the network path can then read the agent key.
+      # TLS_CA_PATH wins if both are set.
+      TLS_CA_PATH: "${TLS_CA_PATH:-}"
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-0}"
     volumes:
+      # Private-CA / self-signed control plane: the CA TLS_CA_PATH names.
+      # - ./spatium-ca.crt:/etc/ssl/spatium-ca.crt:ro
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       # LMDB-backed zone storage. Keep this volume — losing it means
       # losing every zone the agent has applied. Backups should
       # snapshot this volume; the LMDB file is consistent on disk.
       - dns_powerdns_lmdb:/var/lib/powerdns
-      # Optional: mount a CA bundle to verify the control plane.
-      # - /etc/ssl/certs:/etc/ssl/certs:ro
     ports:
       # DNS — UDP and TCP. The host-port defaults (1053) are lab-friendly
       # to avoid colliding with systemd-resolved on 53 *and* avahi-mDNS

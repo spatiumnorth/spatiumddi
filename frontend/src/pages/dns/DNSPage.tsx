@@ -3170,7 +3170,8 @@ function MoveZoneModal({
     !!preview &&
     (preview.name_collision ||
       preview.dnssec_unsupported_drivers.length > 0 ||
-      preview.acl_names_lost.length > 0);
+      preview.acl_names_lost.length > 0 ||
+      preview.key_names_lost.length > 0);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3214,8 +3215,8 @@ function MoveZoneModal({
                 would land in. Rename or delete it first.
               </div>
             )}
-            {/* Two blockers no acknowledgement can waive — neither leaves a
-                state the operator could inspect and fix afterwards. */}
+            {/* Blockers no acknowledgement can waive — none leaves a state
+                the operator could inspect and fix afterwards. */}
             {preview.dnssec_unsupported_drivers.length > 0 && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 This zone is DNSSEC-signed and{" "}
@@ -3235,6 +3236,17 @@ function MoveZoneModal({
                 <code>named.conf</code>, which BIND rejects whole &mdash; the
                 entire target group would stop converging, not just this zone.
                 Create ACLs with those names there first.
+              </div>
+            )}
+            {preview.key_names_lost.length > 0 && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                This zone names TSIG key(s){" "}
+                <code>{preview.key_names_lost.join(", ")}</code> that{" "}
+                <strong>{preview.target_group_name}</strong> does not define.
+                Moving it would leave an undefined symbol in that group&rsquo;s{" "}
+                <code>named.conf</code>, which BIND rejects whole &mdash; the
+                entire target group would stop converging, not just this zone.
+                Create keys with those names there first.
               </div>
             )}
 

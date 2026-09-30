@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, KeyRound, ShieldCheck, Smartphone, Loader2 } from "lucide-react";
-import { authApi, type MfaEnrolBeginResponse } from "@/lib/api";
+import { authApi, formatApiError, type MfaEnrolBeginResponse } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { Modal } from "@/components/ui/modal";
 
@@ -68,11 +68,23 @@ function MfaPanel() {
   );
   const [showDisable, setShowDisable] = useState(false);
   const [showRegen, setShowRegen] = useState(false);
+  const [askPassword, setAskPassword] = useState(false);
 
   const enrollBegin = useMutation({
-    mutationFn: () => authApi.mfaEnrollBegin(),
-    onSuccess: (data) => setEnrolling(data),
+    mutationFn: (password?: string) => authApi.mfaEnrollBegin(password),
+    onSuccess: (data) => {
+      setAskPassword(false);
+      setEnrolling(data);
+    },
   });
+  // #1241 — starting an enrolment needs a step-up: a local account's
+  // password, or an SSO account's recent sign-in.
+  const needsPassword = status?.enrol_requires === "password";
+  const signInTooOld =
+    status?.enrol_requires === "recent_sign_in" && !status.enrol_sign_in_recent;
+  // With no status there is no way to know which step-up applies, so the
+  // button stays disabled rather than guessing "none" and sending a local
+  // user's begin without a password.
 
   return (
     <div className="rounded-lg border bg-card">
@@ -115,14 +127,30 @@ function MfaPanel() {
                 again will replace it.
               </p>
             )}
+            {signInTooOld && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                Setting up two-factor authentication needs a recent sign-in.
+                Sign out, sign in again through your identity provider, and
+                start within {status?.enrol_sign_in_window_minutes} minutes.
+              </p>
+            )}
             <button
               type="button"
-              onClick={() => enrollBegin.mutate()}
-              disabled={enrollBegin.isPending}
+              onClick={() =>
+                needsPassword
+                  ? setAskPassword(true)
+                  : enrollBegin.mutate(undefined)
+              }
+              disabled={!status || enrollBegin.isPending || signInTooOld}
               className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {enrollBegin.isPending ? "Generating…" : "Set up authenticator"}
             </button>
+            {!askPassword && enrollBegin.isError && (
+              <p className="text-xs text-destructive">
+                {formatApiError(enrollBegin.error, "Could not start set-up")}
+              </p>
+            )}
           </div>
         ) : (
           <div className="space-y-2 text-xs">
@@ -155,6 +183,21 @@ function MfaPanel() {
         )}
       </div>
 
+      {askPassword && (
+        <EnrolPasswordModal
+          pending={enrollBegin.isPending}
+          error={
+            enrollBegin.isError
+              ? formatApiError(enrollBegin.error, "Could not start set-up")
+              : ""
+          }
+          onClose={() => {
+            setAskPassword(false);
+            enrollBegin.reset();
+          }}
+          onSubmit={(password) => enrollBegin.mutate(password)}
+        />
+      )}
       {enrolling && (
         <EnrollModal
           data={enrolling}
@@ -511,5 +554,61 @@ function RegenerateRecoveryModal({
       error={error}
       successContent={successContent}
     />
+  );
+}
+
+/** #1241 — a local account confirms its password before an authenticator
+ *  is attached to it, so a hijacked session cannot enrol its own. */
+function EnrolPasswordModal({
+  pending,
+  error,
+  onClose,
+  onSubmit,
+}: {
+  pending: boolean;
+  error: string;
+  onClose: () => void;
+  onSubmit: (password: string) => void;
+}) {
+  const [password, setPassword] = useState("");
+  return (
+    <Modal title="Confirm your password" onClose={onClose}>
+      <form
+        className="space-y-3 text-sm"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (password) onSubmit(password);
+        }}
+      >
+        <p className="text-xs text-muted-foreground">
+          Enter your current password to set up two-factor authentication.
+        </p>
+        <input
+          type="password"
+          autoComplete="current-password"
+          autoFocus
+          className={inputCls}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={!password || pending}
+            className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {pending ? "Checking…" : "Continue"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }

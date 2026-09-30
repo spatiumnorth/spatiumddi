@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Modal } from "@/components/ui/modal";
+import { v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
 export { Modal };
 
@@ -197,5 +198,18 @@ export function StatusDot({
       className={`inline-block h-2 w-2 rounded-full flex-shrink-0 ${cls} ${className}`}
       title={status}
     />
+  );
+}
+
+/** #1238 — marks a DHCPv6 scope on a group with two or more Kea members,
+ * which HA does not coordinate. Callers decide with `v6ScopeLacksHa`. */
+export function V6NoHaTag({ keaMemberCount }: { keaMemberCount: number }) {
+  return (
+    <span
+      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+      title={v6ScopeNoHaNote(keaMemberCount)}
+    >
+      v6: no HA
+    </span>
   );
 }

@@ -223,6 +223,125 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A BIND9 apply is reported OK only once named is actually serving it
+  (#1224, #1239).** Validation ran `named-checkconf`, which never reads zone
+  files, and returned success outright if the checker was missing; and
+  `rndc reload <zone>` only *queues* the load and exits 0 even for a file
+  named cannot parse (verified against BIND 9.20). So a zone with a bad
+  record kept serving its old copy, or SERVFAILed if it was new, while the
+  apply reported `ok` and committed the bundle as last-known-good, which
+  left #882's revert nothing to revert to. Three more holes in the same
+  path: a `reconfig` named refused at run time (a DoT cert it could not
+  read, which `named-checkconf` passes) fell back to SIGHUP, which named
+  refuses the same way, and the SIGHUP was never checked; `os.kill` failing
+  was only logged; and a named that died on its first start read back as
+  started, because a zombie still reads `named` in `/proc/<pid>/comm`. Now
+  validate runs `named-checkzone` on every zone file the render added or
+  changed (flags matching named's own `check-integrity no`, and not
+  resolving out-of-zone names over the network) and fails closed without
+  either checker; after the swap each changed zone's serial is read back
+  with `rndc zonestatus` until it matches the file; a runtime-refused
+  `reconfig`, an undeliverable SIGHUP, named exiting after SIGHUP and named
+  dying on first start all fail the reload phase, so #882 reverts and
+  alerts. Every one of those was reproduced against a real named 9.20
+  before and after the change, and SIGHUP is kept only for a control
+  channel that cannot be reached at all.
+
+- **DHCP HA says it covers DHCPv4 only, and a DHCPv6 scope it does not
+  cover is flagged (#1238).** The agent renders Kea's HA hook into the
+  DHCPv4 config alone and reads HA state from the DHCPv4 daemon, but
+  nothing said so. The HA pill on the DHCP page, the server modal and the
+  dashboard read as the health of the whole pair, so an operator with
+  DHCPv6 scopes on an HA group had every reason to think they were
+  protected. They are not: each member serves a v6 scope on its own, and
+  two members can hand the same address to different clients. The pill
+  now reads `HA v4: <state>` with a tooltip saying what HA covers, the
+  dashboard row reads "HA Pairs · DHCPv4", and an enabled stateful DHCPv6
+  scope on a group with two or more Kea members carries a `v6: no HA` tag
+  in the group's scope list and on the IPAM subnet's DHCP tab, with the
+  same warning in the scope form while it is being set up (a `stateless`
+  or `slaac` scope allocates no address, so it is not flagged). The group's Mode hint,
+  the API's `ha_state` field description, the `list_dhcp_servers`
+  Copilot tool, `DHCP.md` and `DHCP_DRIVERS.md` say the same. Two stale
+  claims in DHCP.md's HA constraints are corrected on the way: a third
+  Kea member is a backup peer (#332), not an error, and mixed Kea +
+  Windows groups are refused (#1110). DHCPv6 HA itself is #1258.
+
+- **`make trivy` no longer reports a scan that never ran as a finding
+  (#1272).** Any non-zero exit from the scanner container was printed as
+  FINDINGS, so a Docker error (a refused mount, a pull failure, the daemon
+  down) or a Trivy error (a DB download failure, which Trivy also reports
+  as exit 1) ended in "Trivy found HIGH/CRITICAL vulnerabilities" with no
+  finding listed, for images that scanned clean. The loop moved to
+  `scripts/trivy-scan.sh`, which reports FINDINGS only when Trivy exits 1
+  and its report lists one. Everything else is SCAN FAILED or BUILD FAILED,
+  with the end of the log on screen, and exits 2 rather than 1, so the two
+  can be told apart. An `IMAGE=` that matches no image now fails instead of
+  printing "Trivy clean". The vulnerability-DB cache defaults to
+  `~/.cache/spatiumddi-trivy` rather than a directory in the checkout:
+  Docker Desktop can refuse to mount a checkout on an external volume,
+  which is how this was found. Set `TRIVY_CACHE` to keep the old location.
+
+- **A DHCP HA peer-IP re-render can no longer leave a refused config on
+  disk, race the sync loop, or be skipped while the agent is degraded
+  (#1247).** When an HA peer's hostname resolved to a new address, the
+  agent's watcher re-rendered Kea by calling `_apply_bundle` directly, from
+  its own thread. A render Kea refused was only logged, with no apply
+  verdict on the heartbeat, and the refused document stayed at
+  `kea_config_path` for the next container start to boot into. Nothing
+  serialised it against the sync loop either, so it could put an older
+  bundle back over a newer one while the agent reported the newer etag.
+  The watcher now calls `SyncLoop.reapply_current_bundle`, under the one
+  apply lock every apply takes. It re-renders the bundle Kea is actually
+  running, which the loop now tracks, so a peer that moves while the agent
+  runs on last-known-good is still followed. A re-render forced by host
+  state is not the control-plane bundle's fault, so a refusal does not
+  quarantine it. Instead the Kea documents are put back, and a daemon that
+  had accepted the render (the two reload independently) is reloaded from
+  them; a daemon that refused it is left alone, since a Kea reload restarts
+  the HA hook's state machine. The refusal is reported as a reverted apply
+  naming the reason. The #1140 IPv6-address recheck uses the same path and
+  no longer retries an identical refusal every loop.
+
+- **Audit rows carry the request id, and the worker and beat log JSON
+  like the api (#1245, #1246).** `audit_log.request_id` existed, was part of
+  the tamper-evidence hash, and was never set, although the docs say it
+  links an audit row to its request's log lines. It is now filled from the
+  logging context before the hash is computed, so the chain still verifies.
+  Separately, the Celery worker and beat never configured logging: their
+  output was Celery's plain text plus structlog's console renderer, with no
+  `service` and no `request_id`, against non-negotiable #7. They now share
+  the api's pipeline, Celery's own `Task … received` / `succeeded` lines
+  included, tagged `service=worker` / `service=beat`, and each task binds its
+  task id as `request_id`. The two fixes meet there: an audit row a scheduled
+  task writes now carries the task id, so a change can be traced from the
+  audit log to the worker line that made it. Every line the api logs outside a
+  request now carries `service` too.
+  **`request_id` is now always generated by the api**, never taken from the
+  caller: it is stored inside the audit hash, and a caller-chosen value would
+  let a caller make its audit rows claim another request's id. A caller's
+  own `X-Request-ID` (1–64 characters of `A-Z a-z 0-9 . _ : -`) is logged as
+  `client_request_id` and still echoed back in the response header, so a
+  report quoting it finds the log lines and, through them, the audit row.
+  The 500 handler no longer adopts the raw header either. The worker honours
+  `--loglevel` (when more verbose than `LOG_LEVEL`) and `--logfile`, and a
+  task run eagerly inside a request restores the request's id when it ends.
+  Celery's one-time startup banner is still plain text.
+
+- **A zone's access lists are checked before they reach `named.conf`
+  (#1316).** The zone half of #1244. A zone's `allow_query`,
+  `allow_transfer`, `also_notify` and `notify_enabled` were stored as sent
+  and rendered into its `zone { … }` statement; the agent renders
+  `allow-transfer` there on every BIND9 server. One bad element made BIND
+  refuse the file, which stops every zone in the group converging, not just
+  this one. Zone create and update now run the same checks as the server
+  options and answer 422 naming the field and element; on update only a
+  changed value is checked, so a zone stored before this fix stays
+  editable. A zone move also refuses a zone whose lists cite a TSIG key the
+  target group doesn't define, the same whole-group failure the move
+  already refused for ACL names (#935). A zone's `forwarders` are left
+  alone: a Technitium forward zone may carry a hostname or DoH URL there.
+
 - **The DNS server options editor refuses values BIND cannot load
   (#1244).** `PUT /dns/groups/{id}/options` stored `allow-query` and the
   other address lists, `also-notify`, the forwarders, the single-word
@@ -1444,6 +1563,67 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **Setting up two-factor authentication needs a step-up (#1241).**
+  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
+  that decides whose authenticator the account trusts. A hijacked session
+  could enrol the attacker's: for an SSO superadmin that authenticator then
+  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
+  SNMP communities, provider secrets); for a local user it locks the real
+  owner out, since disabling MFA needs a code only the attacker has. A
+  local user now re-enters their password to start enrolling; an SSO user
+  must have signed in with their identity provider in the last 10 minutes,
+  and is told to sign out and back in otherwise. A token refresh now keeps
+  the session's original sign-in time rather than restamping it, so a
+  stolen session cannot refresh its way into looking recent; the session
+  viewer's "created" column now means when that person signed in. Refused
+  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
+  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
+  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
+  for a caller who already holds a session, so unthrottled each was a
+  password oracle for exactly the hijacked session the step-up exists to
+  stop. That budget fails closed: while Redis is unreachable the three
+  step-ups answer `503` with `Retry-After: 60`, because the account
+  lockout counts sign-in answers only and nothing else would bound the
+  guessing. Sign-in is unaffected.
+
+- **External accounts honour their state (#1242).** A **disabled** LDAP,
+  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
+  and a `login` / `success` audit row, before every later request was
+  refused. The check now runs before anything is issued or updated, answers
+  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
+  as `denied`. And **"must change password"** on an external account, which
+  has no password here to change, locked it out until an admin cleared the
+  flag: setting it, or resetting the password, on an external account is
+  now refused, and an account that already carries the flag is no longer
+  held to it.
+
+- **Remote agents verify the control plane's certificate by default
+  (#1220).** All five `docker-compose.agent-*.yml` files defaulted
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
+  the docs ran agents that trusted any certificate, and anyone on the
+  network path could read the platform-wide agent key (then enrol rogue
+  agents and pull TSIG keys) or serve the agent its DNS / DHCP
+  configuration. Worse, the skip was checked before `TLS_CA_PATH` in the
+  DNS, DHCP and looking-glass agents, so mounting the control plane's CA
+  as `DOCKER.md` said verified nothing either, silently. Now the files
+  default to `0` and pass `TLS_CA_PATH` through from `.env` (with a
+  commented CA volume to uncomment); `TLS_CA_PATH` wins over the skip;
+  and an agent logs `control_plane_tls` on every start while
+  verification is off, or while a skip is being ignored. The DNS agent's
+  seven hand-copied verify decisions are now one `httpx_verify()`, with a
+  test that fails if a copy reappears. `DNS_AGENT.md` named a
+  `CA_BUNDLE_PATH` variable no code reads; it is `TLS_CA_PATH`. The
+  in-stack `docker-compose.yml` agents talk plain `http://api:8000`, so
+  the flag was a no-op there and is removed. The looking-glass agent got
+  its first tests and now runs in CI's agent matrix.
+  **Upgrade note:** a remote agent relying on the old default against a
+  private-CA or self-signed control plane stops connecting after the
+  upgrade. Mount that CA and set `TLS_CA_PATH` (`docs/deployment/DOCKER.md`,
+  distributed agent prerequisites), or set
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` explicitly in `.env` to keep the old
+  behaviour in a lab. Appliance role pods and the supervisor are not
+  changed here; they are #1219.
 
 - **A backup archive named `..` can no longer delete the folder above
   the archives (#1243).** The shared `safe_filename()` was
