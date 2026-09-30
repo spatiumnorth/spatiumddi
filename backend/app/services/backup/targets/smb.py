@@ -37,29 +37,28 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
-
 
 def _unc(config: dict[str, Any], filename: str | None = None) -> str:
     """Compose the ``\\\\server\\share\\path[\\filename]`` UNC path
-    smbclient expects. ``os.path.basename`` defends against
-    operator-supplied filenames containing path separators.
+    smbclient expects. ``safe_filename`` refuses operator-supplied
+    filenames containing path separators.
     """
     server = config["server"]
     share = config["share"].strip("/\\")
@@ -68,7 +67,7 @@ def _unc(config: dict[str, Any], filename: str | None = None) -> str:
     if sub:
         parts.append(sub.replace("/", "\\"))
     if filename is not None:
-        parts.append(os.path.basename(filename))
+        parts.append(safe_filename(filename))
     return "\\".join(parts)
 
 
@@ -210,7 +209,7 @@ class SmbDestination(BackupDestination):
             rows: list[ArchiveListing] = []
             try:
                 for entry in scandir(root):
-                    if not entry.is_file() or not _ARCHIVE_NAME_RE.match(entry.name):
+                    if not entry.is_file() or not ARCHIVE_NAME_RE.match(entry.name):
                         continue
                     stat = entry.stat()
                     rows.append(
@@ -241,7 +240,7 @@ class SmbDestination(BackupDestination):
                     return fh.read()
             except FileNotFoundError as exc:
                 raise BackupDestinationError(
-                    f"archive {os.path.basename(filename)!r} not found at {target}"
+                    f"archive {safe_filename(filename)!r} not found at {target}"
                 ) from exc
             except Exception as exc:  # noqa: BLE001
                 raise BackupDestinationError(f"SMB read failed: {exc}") from exc

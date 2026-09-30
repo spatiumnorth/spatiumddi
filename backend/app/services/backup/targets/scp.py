@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import re
 import stat as stat_mod
 from datetime import UTC, datetime
 from typing import Any
@@ -53,16 +52,17 @@ from typing import Any
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 
@@ -260,7 +260,7 @@ class ScpDestination(BackupDestination):
         filename: str,
         archive_bytes: bytes,
     ) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
         tmp = remote + ".tmp"
 
@@ -311,7 +311,7 @@ class ScpDestination(BackupDestination):
             for attr in entries:
                 if attr.st_mode is None or stat_mod.S_ISDIR(attr.st_mode):
                     continue
-                if not _ARCHIVE_NAME_RE.match(attr.filename):
+                if not ARCHIVE_NAME_RE.match(attr.filename):
                     continue
                 if not attr.st_mtime or not attr.st_size:
                     continue
@@ -328,7 +328,7 @@ class ScpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> bytes:
@@ -350,7 +350,7 @@ class ScpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> None:

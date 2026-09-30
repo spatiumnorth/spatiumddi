@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -36,6 +37,8 @@ import shutil
 import ssl
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,51 +302,244 @@ def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None
         pass
 
 
+# #1216 — a download that ends early must be seen, and survived.
+#
+# ``http.client`` returns a SHORT body without complaint when the peer
+# closes the connection before Content-Length bytes arrived (its own
+# comment: "Ideally, we would raise IncompleteRead if the content-length
+# wasn't satisfied, but it might break compatibility"). That is exactly
+# what a node sees when the frontend pod serving its download is replaced
+# mid-transfer, e.g. in the rollout #1215 triggers during a rolling
+# upgrade: the kubelet kills nginx when its grace period ends and the
+# image on disk simply stops. The sha256 check then refused the partial
+# file, correctly, but the apply failed as "checksum mismatch", which
+# sends the operator looking for a corrupt image. So the bytes are
+# counted against Content-Length, and a transfer that ends early, drops
+# or stalls is retried with backoff before the apply gives up.
+_FETCH_ATTEMPTS = 5
+_FETCH_BACKOFF_SECONDS = (5, 10, 20, 40)  # before attempts 2, 3, 4, 5
+# Per blocking read, not per download: a transfer that stops moving for
+# this long is a stall, and a stall is retried like a drop (the wrapper's
+# 45 min cap is the backstop, not the detector).
+_FETCH_READ_TIMEOUT_SECONDS = 120
+# Server-side trouble worth another attempt. A 4xx is an answer (a bad
+# token, a deleted image) and is never retried.
+_RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class DownloadIncomplete(Exception):
+    """The server closed the transfer before ``expected`` bytes arrived."""
+
+    def __init__(self, received: int, expected: int) -> None:
+        super().__init__(f"received {received} of {expected} bytes")
+        self.received = received
+        self.expected = expected
+
+
+class DownloadFailed(Exception):
+    """Every attempt to fetch the image failed; ``cmd_apply`` returns 6."""
+
+
+class _LocalWriteError(RuntimeError):
+    """Writing the staged file failed (a full disk, say). A retry cannot
+    help, so this is never treated as a transfer problem."""
+
+
+class _UnusableRange(Exception):
+    """The server answered a resume with a 206 that does not continue the
+    partial file. The partial file is discarded, so the next attempt asks
+    for the whole image."""
+
+    def __init__(self, have: int, content_range: str | None) -> None:
+        super().__init__(
+            f"the server answered a resume from byte {have} with "
+            f"Content-Range {content_range or '(none)'}; starting over"
+        )
+
+
+_CONTENT_RANGE_RE = re.compile(r"\s*bytes\s+(\d+)-\d+/(\d+)\s*$", re.IGNORECASE)
+
+
+def _content_range(value: str | None) -> tuple[int, int] | None:
+    """``(first byte, whole file's length)`` of a ``Content-Range: bytes
+    a-b/n`` header, else None."""
+    m = _CONTENT_RANGE_RE.match(value or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _fetch_http_once(
+    src: str, dst: Path, *, ctx: ssl.SSLContext | None, report: bool, attempt: int
+) -> None:
+    """One HTTP attempt into ``dst``.
+
+    A partial ``dst`` left by an earlier attempt of THIS fetch is resumed
+    with ``Range``: kept and appended to when the server answers 206 from
+    exactly that offset, rewritten from the start when it answers 200 (the
+    multi-node path proxies the mirror with a plain GET, so it always
+    does). Any other 206 discards it and raises _UnusableRange. Raises
+    DownloadIncomplete on a short body, counted against the whole file.
+    """
+    have = dst.stat().st_size if dst.exists() else 0
+    req = urllib.request.Request(src)
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    with urllib.request.urlopen(req, context=ctx, timeout=_FETCH_READ_TIMEOUT_SECONDS) as r:
+        status = getattr(r, "status", 200)
+        try:
+            length = int(r.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if status == 206:
+            # Kept only when it continues the partial file: it starts at the
+            # byte asked for, and names the whole file's length to count the
+            # bytes against. Written from byte 0, any other range passes for
+            # the whole image and the checksum fails it as a mismatch (rc 3),
+            # the misreport #1216 removes. So it is discarded instead, and the
+            # next attempt asks for the whole image (no Range).
+            content_range = r.headers.get("Content-Range")
+            span = _content_range(content_range)
+            if span is None or span[0] != have:
+                dst.unlink(missing_ok=True)
+                raise _UnusableRange(have, content_range)
+            mode, done, total = ("ab" if have else "wb"), have, span[1]
+        else:
+            mode, done, total = "wb", 0, length
+        try:
+            f = open(dst, mode)
+        except OSError as exc:
+            raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
+        try:
+            last_pct = -5
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                try:
+                    f.write(chunk)
+                except OSError as exc:
+                    raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
+                done += len(chunk)
+                if report and total > 0:
+                    pct = int(done * 100 / total)
+                    if pct - last_pct >= 2 or pct >= 100:
+                        last_pct = pct
+                        detail = f"{done // (1024 * 1024)} / {total // (1024 * 1024)} MB"
+                        if attempt > 1:
+                            detail += f" (attempt {attempt} of {_FETCH_ATTEMPTS})"
+                        _write_progress("downloading", pct, detail)
+        finally:
+            # Closing flushes the last buffered bytes, so it can meet a full
+            # disk too. Only the file's own calls are wrapped: an error from
+            # r.read() is transfer trouble, and is retried.
+            try:
+                f.close()
+            except OSError as exc:
+                raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
+        if total and done < total:
+            raise DownloadIncomplete(done, total)
+
+
 def fetch_to(src: str, dst: Path, *, insecure: bool = False, report: bool = False) -> None:
-    """Stream-copy from URL or local file path into dst.
+    """Copy from URL or local file path into dst.
 
     ``insecure`` (#386 Part A) skips TLS cert-verification — used ONLY
     for the appliance's own self-served upgrade-image URL behind its
     self-signed web cert, and only when the caller will verify the bytes
     against an expected sha256. ``report`` (#386 Part C) emits download
     percentage into the progress sidecar from the Content-Length header.
+
+    An HTTP download must arrive WHOLE (#1216): a short, dropped or
+    stalled transfer, or a 408/429/5xx answer, is retried up to
+    ``_FETCH_ATTEMPTS`` times with backoff, and only a transfer that never
+    completes raises DownloadFailed. A 4xx answer, a certificate that
+    cannot be verified and a local write error are raised at once.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.startswith(("http://", "https://")):
-        ctx: ssl.SSLContext | None = None
-        if insecure and src.startswith("https://"):
-            print("  (TLS cert verification disabled for this self-served fetch)")
-            ctx = ssl._create_unverified_context()
-        print(f"  fetching {src}")
-        with urllib.request.urlopen(src, context=ctx) as r, open(dst, "wb") as f:
-            total = 0
-            try:
-                total = int(r.headers.get("Content-Length") or 0)
-            except (TypeError, ValueError):
-                total = 0
-            done = 0
-            last_pct = -5
-            while True:
-                chunk = r.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if report and total > 0:
-                    pct = int(done * 100 / total)
-                    if pct - last_pct >= 2 or pct >= 100:
-                        last_pct = pct
-                        _write_progress(
-                            "downloading",
-                            pct,
-                            f"{done // (1024 * 1024)} / {total // (1024 * 1024)} MB",
-                        )
-    else:
+    if not src.startswith(("http://", "https://")):
         srcpath = Path(src)
         if not srcpath.exists():
             raise FileNotFoundError(f"image source not found: {src}")
         print(f"  copying {srcpath}")
         shutil.copy2(srcpath, dst)
+        return
+    ctx: ssl.SSLContext | None = None
+    if insecure and src.startswith("https://"):
+        print("  (TLS cert verification disabled for this self-served fetch)")
+        ctx = ssl._create_unverified_context()
+    print(f"  fetching {src}")
+    # Resume only within this fetch: a partial file from an earlier run may
+    # belong to a different image.
+    dst.unlink(missing_ok=True)
+    last: Exception | None = None
+    for attempt in range(1, _FETCH_ATTEMPTS + 1):
+        if attempt > 1:
+            delay = _FETCH_BACKOFF_SECONDS[min(attempt - 2, len(_FETCH_BACKOFF_SECONDS) - 1)]
+            print(f"  download attempt {attempt - 1} of {_FETCH_ATTEMPTS} failed ({last}); "
+                  f"retrying in {delay}s")
+            if report:
+                _write_progress(
+                    "downloading", None,
+                    f"download interrupted ({last}); retrying in {delay}s "
+                    f"(attempt {attempt} of {_FETCH_ATTEMPTS})",
+                )
+            time.sleep(delay)
+        try:
+            _fetch_http_once(src, dst, ctx=ctx, report=report, attempt=attempt)
+            if attempt > 1:
+                print(f"  download completed on attempt {attempt} of {_FETCH_ATTEMPTS}")
+            return
+        except urllib.error.HTTPError as exc:
+            # First: HTTPError subclasses URLError.
+            if exc.code == 416 and dst.exists():
+                # Our Range asked past the end of what the server has: the
+                # partial file cannot be continued, so start it over.
+                exc.close()
+                dst.unlink(missing_ok=True)
+                last = exc
+                continue
+            if exc.code not in _RETRYABLE_HTTP_STATUS:
+                raise
+            exc.close()
+            last = exc
+        except ssl.SSLCertVerificationError:
+            # A certificate the node cannot verify is configuration (an
+            # unknown CA, an expired or mismatched certificate), not a
+            # dropped transfer, so a retry cannot fix it. Only a verified
+            # fetch meets this: the self-served one is unverified.
+            raise
+        except urllib.error.URLError as exc:
+            # urlopen wraps the certificate failure above in URLError.
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise
+            last = exc
+        except (DownloadIncomplete, _UnusableRange, http.client.HTTPException, OSError) as exc:
+            # OSError covers a reset, any other TLS error and the read
+            # timeout; http.client.HTTPException covers IncompleteRead on a
+            # chunked body and a malformed response.
+            last = exc
+    received = dst.stat().st_size if dst.exists() else 0
+    raise DownloadFailed(
+        f"download interrupted after {_FETCH_ATTEMPTS} attempts ({last}); "
+        f"{received} bytes on disk"
+    )
+
+
+def _fetch_image(src: str, staged: Path, *, insecure: bool) -> int:
+    """Fetch the image into ``staged``: 0 on success, 6 when the transfer
+    never completed (#1216).
+
+    rc 6 is its own code so the wrapper can say what happened: the
+    download was cut and retries did not recover it, and nothing was
+    written. Reported as "checksum mismatch" (rc 3) it read as a corrupt
+    image. The partial file is removed; the message carries its size.
+    """
+    try:
+        fetch_to(src, staged, insecure=insecure, report=True)
+    except DownloadFailed as exc:
+        print(f"ERROR: {exc}. Nothing was written to the inactive slot.", file=sys.stderr)
+        staged.unlink(missing_ok=True)
+        return 6
+    return 0
 
 
 def sha256_file(path: Path) -> str:
@@ -401,7 +597,9 @@ def cmd_apply(args) -> int:
 
     # Fetch.
     _write_progress("downloading", 0, f"fetching {args.image}")
-    fetch_to(args.image, staged, insecure=insecure, report=True)
+    rc = _fetch_image(args.image, staged, insecure=insecure)
+    if rc:
+        return rc
 
     # Verify SHA256 against an expected literal (#386 — passed by the
     # control plane for self-served images, no second fetch) or a sidecar

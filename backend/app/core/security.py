@@ -49,6 +49,19 @@ def verify_password(plain: str, hashed: str) -> bool:
 # ── JWT ────────────────────────────────────────────────────────────────────────
 
 
+# Every access token has carried a ``jti`` naming its ``UserSession`` since
+# #72 (2026.05.07-1): both places that mint one pass it. So a token without
+# one was not minted by this server. It can only be forged, and a forged
+# token would also escape force-logout, which works by revoking the session
+# the jti names. Such tokens are refused (#1222).
+#
+# The test suite sets this to True: its fixtures mint tokens with no session
+# row, and making every one of them create a session proves nothing a
+# dedicated test does not. It is a module attribute, not a setting, so no
+# environment variable or config file can turn it on.
+ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION = False
+
+
 def create_access_token(
     subject: str,
     extra: dict[str, Any] | None = None,
@@ -57,10 +70,9 @@ def create_access_token(
 ) -> str:
     """Mint an access JWT. ``jti`` ties the token to a ``UserSession``
     row so a superadmin can force-logout an in-flight token by
-    flipping ``UserSession.revoked`` (issue #72). Tokens issued before
-    that landing carry no ``jti``; the auth dep treats those as still
-    valid (legacy compatibility) so existing sessions don't all 401
-    the moment the rolling deploy crosses two API instances."""
+    flipping ``UserSession.revoked`` (issue #72). Every real login passes
+    one; a token minted without it is refused by
+    :func:`decode_access_token` outside the test suite (#1222)."""
     expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "access"}
     if jti is not None:
@@ -82,7 +94,42 @@ def decode_access_token(token: str) -> dict[str, Any]:
     payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
     if payload.get("type") != "access":
         raise JWTError("Not an access token")
+    if payload.get("jti") is None and not ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION:
+        raise JWTError("Access token names no session")
     return payload
+
+
+async def live_access_session(db: Any, payload: dict[str, Any]) -> Any:
+    """The live ``UserSession`` a decoded access token names, or raise.
+
+    The one session gate for every path that accepts an access token (the
+    auth dependency, the nmap stream, the maintenance-mode bypass), so they
+    cannot disagree. Raises :class:`JWTError` when the session is missing,
+    revoked or expired (force-logout, #72), or belongs to a different user
+    than the token's ``sub``. That last check is what makes a jti worth
+    requiring (#1222): without it, anyone able to sign a token could put
+    their OWN live session's jti next to a superadmin's user id.
+
+    Returns None only for a token with no ``jti``, which
+    :func:`decode_access_token` has already refused outside the test suite.
+    """
+    from app.models.auth import UserSession  # noqa: PLC0415 — keep security import-light
+
+    jti = payload.get("jti")
+    if jti is None:
+        return None
+    # A jti that is not a UUID cannot name a session. Looked up as-is, the
+    # database rejects the bind and the caller sees a 500, not a 401.
+    try:
+        session_id = uuid.UUID(str(jti))
+    except ValueError as exc:
+        raise JWTError("Session revoked or expired") from exc
+    session = await db.get(UserSession, session_id)
+    if session is None or session.revoked or session.expires_at <= datetime.now(UTC):
+        raise JWTError("Session revoked or expired")
+    if str(session.user_id) != str(payload.get("sub")):
+        raise JWTError("Session belongs to another user")
+    return session
 
 
 # ── MFA challenge tokens (issue #69) ──────────────────────────────────────────

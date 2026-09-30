@@ -126,12 +126,31 @@ def deploy_active_cert(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
     return True
 
 
+def rollout_checksum(crt_b64: str, key_b64: str, resource_version: str) -> str:
+    """The pod-template annotation value that makes the frontend roll.
+
+    The Secret's content AND its ``resourceVersion``. Content alone was the
+    #1219 strand: a k3s start on the seed puts the first-boot certificate back
+    into the Secret (#1215), the frontend pod that starts then serves it, and
+    the api's write-back of the active certificate restores exactly the
+    content the annotation already names, so the Deployment saw no change,
+    never rolled, and nginx served the first-boot certificate until the pod
+    happened to restart. A supervisor pinned to the real certificate refuses
+    that one, so every remote appliance lost the control plane after each
+    reboot. Every real write to the Secret moves its ``resourceVersion``; a
+    PATCH that changes nothing does not, so re-applying an unchanged
+    certificate still rolls nothing.
+    """
+    src = (crt_b64 + key_b64 + ":" + resource_version).encode("utf-8")
+    return hashlib.sha256(src).hexdigest()
+
+
 def reload_frontend_nginx() -> bool:
     """Trigger a frontend Deployment rollout so pods re-read the Secret.
 
     Bumps the ``spatiumddi.io/tls-secret-checksum`` annotation on the
-    Deployment's pod template to the sha256 of the freshly-PATCHed
-    Secret data. The Deployment controller treats the annotation
+    Deployment's pod template to ``rollout_checksum`` of the freshly-PATCHed
+    Secret (its data and its ``resourceVersion``). The Deployment controller treats the annotation
     change as a template change + rolls the pod. Single-replica
     appliance frontend uses the Recreate strategy (chart template
     handles this when hostNetwork=true) so the old pod terminates
@@ -176,8 +195,11 @@ def reload_frontend_nginx() -> bool:
         logger.warning("appliance_nginx_reload_secret_bad_json", error=str(exc))
         return False
     data = secret.get("data") or {}
-    checksum_src = ((data.get(_TLS_CRT_KEY) or "") + (data.get(_TLS_KEY_KEY) or "")).encode("utf-8")
-    checksum = hashlib.sha256(checksum_src).hexdigest()
+    checksum = rollout_checksum(
+        data.get(_TLS_CRT_KEY) or "",
+        data.get(_TLS_KEY_KEY) or "",
+        (secret.get("metadata") or {}).get("resourceVersion") or "",
+    )
     ok, err = k8s.patch_deployment_annotation(deployment_name, _ROLLOUT_ANNOTATION, checksum)
     if not ok:
         logger.warning(

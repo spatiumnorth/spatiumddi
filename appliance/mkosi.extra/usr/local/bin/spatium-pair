@@ -155,6 +155,16 @@ if [ "$RESET_IDENTITY" -eq 1 ]; then
         find "$PERSIST_DIR" -mindepth 1 -delete \
             && echo "spatium-pair: wiped $PERSIST_DIR"
     fi
+else
+    # #1219 — forget the control plane's pinned TLS certificate and the
+    # appliance CA that vouches for its rotations. Re-pairing is the
+    # operator saying, locally and as root, "trust the control plane at
+    # this URL"; if that is a rebuilt or different control plane, the old
+    # pin fails every handshake and the old CA refuses the new one's
+    # signed list, so the supervisor could never reach it to be told it is
+    # revoked and re-register. The next contact pins the new certificate.
+    rm -f /var/persist/spatium-supervisor/tls/control-plane.pem \
+          /var/persist/spatium-supervisor/tls/ca-chain.pem
 fi
 
 # Issue #183 Phase 7 — bounce the supervisor pod via kubectl so it

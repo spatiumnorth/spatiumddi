@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
+from app.core.content_disposition import content_disposition
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
@@ -191,7 +192,7 @@ async def create_and_download_backup(
         _iter(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition(filename),
             "Content-Length": str(len(archive_bytes)),
         },
     )

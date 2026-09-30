@@ -140,6 +140,7 @@ from app.services.appliance.storage_health import (
     worst_severity,
 )
 from app.services.appliance.syslog import syslog_bundle
+from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
 
 logger = structlog.get_logger(__name__)
@@ -353,6 +354,18 @@ class SupervisorRegisterRequest(BaseModel):
         if len(cleaned) != 8:
             raise ValueError("Pairing code must be 8 decimal digits.")
         return cleaned
+
+
+class SupervisorTlsPinsResponse(BaseModel):
+    """The certificates the control plane serves, signed by the appliance CA
+    (#1219). ``payload`` is base64 of canonical JSON
+    ``{"version": 1, "certs_sha256": [...], "issued_at": "..."}``;
+    ``signature`` is the CA's signature over exactly those bytes."""
+
+    payload: str
+    signature: str
+    algorithm: str
+    ca_cert_sha256: str
 
 
 class SupervisorRegisterResponse(BaseModel):
@@ -671,6 +684,36 @@ async def self_register_bootstrap(
 
 
 # ── Endpoint ───────────────────────────────────────────────────────
+
+
+@router.get(
+    "/supervisor/tls-pins",
+    response_model=SupervisorTlsPinsResponse,
+    summary="The served TLS certificates, signed by the appliance CA (unauthenticated)",
+)
+async def supervisor_tls_pins(db: DB) -> SupervisorTlsPinsResponse:
+    """How a supervisor tells a certificate rotation from an interception (#1219).
+
+    Supervisors pin the control plane's TLS certificate on first contact. When
+    the certificate changes (a self-signed one is re-minted on member join or
+    VIP change; an operator uploads or ACME renews one), a supervisor fetches
+    this over a connection to the NEW certificate and re-pins only if the CA
+    it received at approval vouches for it.
+
+    Unauthenticated, and deliberately not behind the registration gate: an
+    approved supervisor must be able to re-pin after an operator turns new
+    registrations off. Nothing here is secret, and a forger needs the CA key.
+    503 until a CA exists, since until then no supervisor holds one to verify
+    with.
+    """
+    pin_set = await signed_pin_set(db)
+    if pin_set is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "No appliance CA yet: nothing has been approved, so there is no "
+            "authority to sign the certificate list.",
+        )
+    return SupervisorTlsPinsResponse(**pin_set)
 
 
 @router.post(

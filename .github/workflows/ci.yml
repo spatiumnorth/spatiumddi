@@ -636,7 +636,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        agent: [dhcp, dns, supervisor]
+        # looking-glass joined with #1220, its first tests: the agent had
+        # none, so its TLS handling had never run under CI.
+        agent: [dhcp, dns, supervisor, looking-glass]
     defaults:
       run:
         working-directory: agent/${{ matrix.agent }}

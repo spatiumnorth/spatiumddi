@@ -4893,6 +4893,10 @@ export interface ZoneMovePreview {
    *  Non-empty means the commit refuses: an undefined symbol makes BIND
    *  reject the whole file, stopping the entire target group. */
   acl_names_lost: string[];
+  /** TSIG keys the zone cites as ``key <name>`` that the target group
+   *  doesn't define (#1316). Non-empty means the commit refuses, for the
+   *  same reason as ``acl_names_lost``. */
+  key_names_lost: string[];
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
