@@ -19,18 +19,34 @@ export function haPillTitle(
 }
 
 /**
- * True when a DHCPv6 scope sits on a group with two or more Kea members.
+ * True when an enabled, stateful DHCPv6 scope sits on a group with two or
+ * more Kea members.
  *
  * Deliberately not "the group's HA hook is rendered": that also needs every
  * member's peer URL, but a v6 scope is served uncoordinated by every Kea
  * member either way. A group whose membership is unknown (not loaded yet)
  * reads as false, so the flag never appears on a guess.
+ *
+ * Only a scope that ALLOCATES addresses is at risk: a `stateless` scope
+ * serves options only and a `slaac` one renders nothing, so two members
+ * answering it independently hand out identical option sets and no
+ * address. A disabled scope is not in the bundle at all. Flagging either
+ * would warn about a duplicate-address hazard that cannot happen.
  */
 export function v6ScopeLacksHa(
-  scope: { address_family?: "ipv4" | "ipv6" },
+  scope: {
+    address_family?: "ipv4" | "ipv6";
+    v6_address_mode?: "stateful" | "stateless" | "slaac";
+    enabled?: boolean;
+  },
   group: { kea_member_count?: number } | null | undefined,
 ): boolean {
-  return scope.address_family === "ipv6" && (group?.kea_member_count ?? 0) >= 2;
+  return (
+    scope.address_family === "ipv6" &&
+    (scope.v6_address_mode ?? "stateful") === "stateful" &&
+    scope.enabled !== false &&
+    (group?.kea_member_count ?? 0) >= 2
+  );
 }
 
 export function v6ScopeNoHaNote(keaMemberCount: number): string {

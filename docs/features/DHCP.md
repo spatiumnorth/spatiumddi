@@ -1239,7 +1239,7 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 
 When two DHCP server containers serve the same pool, they must not hand the same IP to different MACs. SpatiumDDI solves this by treating a **`DHCPServerGroup` with two Kea members as an implicit HA pair** — HA tuning lives on the group, per-peer URL lives on each server, and Kea's `libdhcp_ha.so` hook is rendered on every member's config. There is no separate "failover channel" row any more (that was removed in 2026.04.22-1 when scopes moved to the group).
 
-> **HA covers DHCPv4 only (#1238).** The agent renders `libdhcp_ha.so` into the `Dhcp4` config alone; `Dhcp6` loads `libdhcp_lease_cmds.so` and nothing else, and the HA state the UI shows is read from the DHCPv4 daemon. A DHCPv6 scope on a group with two or more Kea members is served by **each member on its own**: pools are not split, leases are not shared, and two members can hand the same address to different clients. The UI marks such a scope `v6: no HA`, and every HA pill reads `HA v4: <state>`. Until DHCPv6 HA lands ([#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258)), serve DHCPv6 from a group with one Kea member.
+> **HA covers DHCPv4 only (#1238).** The agent renders `libdhcp_ha.so` into the `Dhcp4` config alone; `Dhcp6` loads `libdhcp_lease_cmds.so` and nothing else, and the HA state the UI shows is read from the DHCPv4 daemon. A DHCPv6 scope on a group with two or more Kea members is served by **each member on its own**: pools are not split, leases are not shared, and two members can hand the same address to different clients. The UI marks an enabled stateful scope like that `v6: no HA` (a `stateless` or `slaac` scope hands out no address, so it is not flagged) and says so in the scope form, and every HA pill reads `HA v4: <state>`. Until DHCPv6 HA lands ([#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258)), serve DHCPv6 from a group with one Kea member.
 
 ### Data model
 
@@ -1531,7 +1531,7 @@ rule here has been surfaced to an operator, not just silently logged.
 
 - **HA covers DHCPv4 only.** A DHCPv6 scope on a group with two or
   more Kea members is served by every member independently, with no
-  lease coordination; the UI flags it `v6: no HA`. DHCPv6 HA is
+  lease coordination; the UI flags an enabled stateful one `v6: no HA`. DHCPv6 HA is
   [#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258).
 - **Two HA partners.** `libdhcp_ha.so` pairs two servers; a third or
   later Kea member renders as a `backup` peer (#332), which receives

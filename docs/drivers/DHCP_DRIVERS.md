@@ -198,7 +198,7 @@ override alone (nothing when it is on). Full measurements:
 
 ### HA coordination
 
-Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.21-2), SpatiumDDI treats a `DHCPServerGroup` with exactly two Kea members as an implicit HA pair — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
+Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.21-2), SpatiumDDI treats a `DHCPServerGroup` with two or more Kea members as an implicit HA pair (a third or later member renders as a `backup` peer, #332) — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
 
 **DHCPv4 only (#1238).** `render_kea` appends the HA hook to `Dhcp4["hooks-libraries"]` alone — the `Dhcp6` block loads only `libdhcp_lease_cmds.so` — and `HAStatusPoller` sends `status-get` to the DHCPv4 control socket alone. So the `failover` block coordinates DHCPv4 and nothing else: a DHCPv6 scope on the same group is served by each member independently, and `DHCPServer.ha_state` is the DHCPv4 daemon's state. The UI labels it `HA v4` and flags a v6 scope on a multi-Kea group. DHCPv6 HA is [#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258).
 

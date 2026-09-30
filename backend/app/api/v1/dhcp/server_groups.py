@@ -27,6 +27,7 @@ from app.api.v1.dhcp._failover_schemas import (
     FailoverScopesChange,
     GroupFailoverResponse,
 )
+from app.api.v1.dhcp.servers import HA_STATE_DESCRIPTION
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServerGroup
@@ -132,11 +133,7 @@ class ServerSummary(BaseModel):
     driver: str
     host: str
     status: str
-    ha_state: str | None = Field(
-        description=(
-            "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: DHCPv6 scopes on the group are served by each member independently (#1238)."
-        ),
-    )
+    ha_state: str | None = Field(description=HA_STATE_DESCRIPTION)
     ha_peer_url: str
     agent_approved: bool
 

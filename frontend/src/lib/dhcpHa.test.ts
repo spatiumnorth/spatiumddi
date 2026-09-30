@@ -26,6 +26,35 @@ describe("v6ScopeLacksHa (#1238)", () => {
     expect(v6ScopeLacksHa({}, pair)).toBe(false);
   });
 
+  it("leaves a scope that allocates no addresses alone", () => {
+    // stateless = options only, slaac = nothing rendered: no address for
+    // two members to hand out twice.
+    expect(
+      v6ScopeLacksHa(
+        { address_family: "ipv6", v6_address_mode: "stateless" },
+        pair,
+      ),
+    ).toBe(false);
+    expect(
+      v6ScopeLacksHa(
+        { address_family: "ipv6", v6_address_mode: "slaac" },
+        pair,
+      ),
+    ).toBe(false);
+    expect(
+      v6ScopeLacksHa(
+        { address_family: "ipv6", v6_address_mode: "stateful" },
+        pair,
+      ),
+    ).toBe(true);
+  });
+
+  it("leaves a disabled scope alone: it is not in the bundle", () => {
+    expect(
+      v6ScopeLacksHa({ address_family: "ipv6", enabled: false }, pair),
+    ).toBe(false);
+  });
+
   it("leaves a single-Kea group alone: one server needs no coordination", () => {
     expect(
       v6ScopeLacksHa({ address_family: "ipv6" }, { kea_member_count: 1 }),

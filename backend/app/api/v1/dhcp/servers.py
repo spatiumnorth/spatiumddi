@@ -171,6 +171,14 @@ class ServerUpdate(BaseModel):
         return v
 
 
+# #1238 — shared by ``ServerResponse`` and the group roll-up's
+# ``ServerSummary`` so the two descriptions of one column cannot drift.
+HA_STATE_DESCRIPTION = (
+    "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: "
+    "DHCPv6 scopes on the group are served by each member independently (#1238)."
+)
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -206,12 +214,7 @@ class ServerResponse(BaseModel):
     ha_peer_url: str = ""
     # Kea HA state — latest value reported by the agent's periodic
     # ``status-get`` poll. Null for standalone servers (group size < 2).
-    ha_state: str | None = Field(
-        default=None,
-        description=(
-            "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: DHCPv6 scopes on the group are served by each member independently (#1238)."
-        ),
-    )
+    ha_state: str | None = Field(default=None, description=HA_STATE_DESCRIPTION)
     ha_last_heartbeat_at: datetime | None = None
     # Per-server maintenance mode (issue #182).
     maintenance_mode: bool = False

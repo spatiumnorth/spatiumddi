@@ -232,9 +232,11 @@ the formatter handles the rest.
   protected. They are not: each member serves a v6 scope on its own, and
   two members can hand the same address to different clients. The pill
   now reads `HA v4: <state>` with a tooltip saying what HA covers, the
-  dashboard row reads "HA Pairs · DHCPv4", and a DHCPv6 scope on a group
-  with two or more Kea members carries a `v6: no HA` tag in the group's
-  scope list and on the IPAM subnet's DHCP tab. The group's Mode hint,
+  dashboard row reads "HA Pairs · DHCPv4", and an enabled stateful DHCPv6
+  scope on a group with two or more Kea members carries a `v6: no HA` tag
+  in the group's scope list and on the IPAM subnet's DHCP tab, with the
+  same warning in the scope form while it is being set up (a `stateless`
+  or `slaac` scope allocates no address, so it is not flagged). The group's Mode hint,
   the API's `ha_state` field description, the `list_dhcp_servers`
   Copilot tool, `DHCP.md` and `DHCP_DRIVERS.md` say the same. Two stale
   claims in DHCP.md's HA constraints are corrected on the way: a third
