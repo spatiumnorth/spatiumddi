@@ -223,6 +223,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Fleet drilldown's Packet capture button no longer leads to a
+  form that can't run (#1311).** `tools.pcap` ships disabled, and only its
+  API was gated. The button opened the Packet Capture page anyway, and a
+  capture failed only on Run, with `Feature 'tools.pcap' is disabled` and
+  no hint where to turn it on. The button is now disabled while the module
+  is off, with a link to Features & Integrations. The page itself, reached
+  from a bookmark, says the feature is off and where to enable it, instead
+  of rendering a form whose requests all 404.
+
 - **VoIP phone-profile options reach the phone, and are checked when
   saved (#1294).** A phone profile rendered each option under its
   catalogue name (`polycom-config-url`, `yealink-prov-server`,
