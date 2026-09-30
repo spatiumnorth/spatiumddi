@@ -32,6 +32,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { SpoolChip } from "@/components/SpoolChip";
+import { haPillTitle } from "@/lib/dhcpHa";
 import {
   dhcpApi,
   logsApi,
@@ -103,8 +104,11 @@ export function ServerDetailModal({
             {server.host}:{server.port}
           </span>
           {server.ha_state && (
-            <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">
-              HA: {server.ha_state}
+            <span
+              className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600"
+              title={haPillTitle(server.ha_last_heartbeat_at)}
+            >
+              HA v4: {server.ha_state}
             </span>
           )}
           {server.maintenance_mode && (
@@ -293,7 +297,7 @@ function OverviewTab({ server }: { server: DHCPServer }) {
           }
         />
         <InfoCard
-          label="HA state"
+          label="HA state (DHCPv4)"
           value={server.ha_state ?? "—"}
           accent={
             server.ha_state === "partner-down" ||

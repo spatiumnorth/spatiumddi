@@ -223,6 +223,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DHCP HA says it covers DHCPv4 only, and a DHCPv6 scope it does not
+  cover is flagged (#1238).** The agent renders Kea's HA hook into the
+  DHCPv4 config alone and reads HA state from the DHCPv4 daemon, but
+  nothing said so. The HA pill on the DHCP page, the server modal and the
+  dashboard read as the health of the whole pair, so an operator with
+  DHCPv6 scopes on an HA group had every reason to think they were
+  protected. They are not: each member serves a v6 scope on its own, and
+  two members can hand the same address to different clients. The pill
+  now reads `HA v4: <state>` with a tooltip saying what HA covers, the
+  dashboard row reads "HA Pairs · DHCPv4", and a DHCPv6 scope on a group
+  with two or more Kea members carries a `v6: no HA` tag in the group's
+  scope list and on the IPAM subnet's DHCP tab. The group's Mode hint,
+  the API's `ha_state` field description, the `list_dhcp_servers`
+  Copilot tool, `DHCP.md` and `DHCP_DRIVERS.md` say the same. Two stale
+  claims in DHCP.md's HA constraints are corrected on the way: a third
+  Kea member is a backup peer (#332), not an error, and mixed Kea +
+  Windows groups are refused (#1110). DHCPv6 HA itself is #1258.
+
 - **`make trivy` no longer reports a scan that never ran as a finding
   (#1272).** Any non-zero exit from the scanner container was printed as
   FINDINGS, so a Docker error (a refused mount, a pull failure, the daemon

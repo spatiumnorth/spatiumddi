@@ -132,7 +132,11 @@ class ServerSummary(BaseModel):
     driver: str
     host: str
     status: str
-    ha_state: str | None
+    ha_state: str | None = Field(
+        description=(
+            "Kea HA state reported by the DHCPv4 daemon. HA covers DHCPv4 only: DHCPv6 scopes on the group are served by each member independently (#1238)."
+        ),
+    )
     ha_peer_url: str
     agent_approved: bool
 
