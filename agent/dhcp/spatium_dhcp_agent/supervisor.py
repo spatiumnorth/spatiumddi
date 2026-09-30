@@ -100,9 +100,13 @@ def run(cfg: AgentConfig) -> int:
     syncer = SyncLoop(
         cfg, token_ref, heartbeat, ha_poller=ha_poller, peer_watcher=peer_watcher
     )
+    # #1247 — through the sync loop's lock and revert path, re-applying the
+    # bundle that is live NOW rather than the watcher's snapshot: a peer-IP
+    # re-render Kea refuses must be reverted and reported like any other,
+    # and must never put an older bundle back over a newer one.
     peer_watcher.set_apply_fn(
-        lambda bundle, reload_kea=True: syncer._apply_bundle(
-            bundle, reload_kea=reload_kea
+        lambda _bundle, reload_kea=True: syncer.reapply_current_bundle(
+            "ha_peer_ip_changed"
         )
     )
     leases = LeaseWatcher(cfg, token_ref, heartbeat, spool=spools.get("lease_events"))

@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.dns_names import contains_control_chars
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
@@ -53,6 +54,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
+from app.services.dhcp.option_validation import phone_options_loadable
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf, resolve_dnssl
 from app.services.e911 import effective_subnet_erls
 from app.services.e911.dhcp_options import kea_option_data
@@ -581,24 +583,36 @@ async def _assemble_phone_classes(
             continue
         match_expr = ""
         if prof.vendor_class_match:
-            n = len(prof.vendor_class_match)
+            if "'" in prof.vendor_class_match or contains_control_chars(prof.vendor_class_match):
+                # #1294 — a ``'`` ends Kea's string literal, and Kea's lexer
+                # refuses a newline inside one; either rejects the whole
+                # config. Refused on write now; a profile stored before that
+                # is left out of the render rather than breaking every scope.
+                log.warning(
+                    "dhcp_phone_profile_skipped_bad_match",
+                    profile=prof.name,
+                    profile_id=str(prof.id),
+                )
+                continue
+            # Bytes, not characters: ``option[60].hex`` is the raw option, so
+            # a non-ASCII prefix measured in characters never matched.
+            n = len(prof.vendor_class_match.encode("utf-8"))
             match_expr = f"substring(option[60].hex,0,{n})=='{prof.vendor_class_match}'"
-        # Convert option_set list-of-dicts into Kea-flavoured option-data
-        # keyed by option-name. The renderer in ``drivers/dhcp/kea.py``
-        # walks the dict and falls back to ``code: <int>`` form when the
-        # entry has no recognised name. Trailing options with empty
-        # values get dropped so the class doesn't render an empty line.
-        options: dict[str, str] = {}
-        for opt in prof.option_set or []:
-            name = opt.get("name") if isinstance(opt, dict) else None
-            value = opt.get("value") if isinstance(opt, dict) else None
-            code = opt.get("code") if isinstance(opt, dict) else None
-            if not value:
-                continue
-            key = name or (f"code:{code}" if code else None)
-            if not key:
-                continue
-            options[str(key)] = str(value)
+        # #1294 — keyed by CODE (``phone_option_key``): the catalogue names a
+        # profile carries (``polycom-config-url``) are unknown to the agent,
+        # which dropped them, so option 160 never reached a phone. And only
+        # what Kea can load: a profile stored before its options were checked
+        # may hold a value Kea would reject (the starter pack's CHANGE-ME in
+        # binary option 43), and one bad option rejects the WHOLE config.
+        # Dropped here with a warning rather than rendered.
+        options, dropped = phone_options_loadable(prof.option_set)
+        for key in dropped:
+            log.warning(
+                "dhcp_phone_option_dropped_invalid",
+                profile=prof.name,
+                profile_id=str(prof.id),
+                option=key,
+            )
 
         out.append(
             PhoneClassDef(

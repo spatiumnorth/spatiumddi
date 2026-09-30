@@ -29,7 +29,7 @@ import errno
 import pytest
 
 from app.services.backup.targets import DESTINATIONS, get_destination
-from app.services.backup.targets.base import DestinationConfigError
+from app.services.backup.targets.base import DestinationConfigError, InvalidArchiveNameError
 from app.services.backup.targets.libnfs_client import (
     NfsError,
     _NfsDirent,
@@ -138,12 +138,14 @@ def test_remote_path_without_a_subdirectory():
     assert _remote_path(cfg) == "/"
 
 
-def test_remote_path_strips_separators_from_the_filename():
+def test_remote_path_refuses_a_filename_that_is_not_one_component():
     # The same defence every other driver applies: an operator-supplied
-    # filename must not escape the configured directory.
+    # filename must not escape the configured directory. Refused rather
+    # than stripped since #1243 — stripping let ``..`` through unchanged.
     cfg = {"server": "h", "export": "/e", "path": "archives"}
-    assert _remote_path(cfg, "../../etc/passwd") == "/archives/passwd"
-    assert _remote_path(cfg, "/abs/path/x.zip") == "/archives/x.zip"
+    for bad in ("../../etc/passwd", "/abs/path/x.zip", ".."):
+        with pytest.raises(InvalidArchiveNameError):
+            _remote_path(cfg, bad)
 
 
 def test_part_suffix_is_invisible_to_the_archive_regex():

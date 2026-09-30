@@ -397,3 +397,53 @@ async def test_existing_active_row_still_wins_over_the_secret(
     assert row.name == "operator-cert"
     # Path A re-deploys the DB's cert over whatever the Secret held.
     assert spy.calls == [(existing_pem, existing_key)]
+
+
+# ── #1219: the write-back after a #1215 revert must roll the frontend ──────
+
+
+def test_rollout_checksum_moves_with_the_secrets_resource_version() -> None:
+    """Content alone cannot tell "restored after a revert" from "unchanged"."""
+    same = deployment.rollout_checksum("Y3J0", "a2V5", "100")
+    assert deployment.rollout_checksum("Y3J0", "a2V5", "100") == same
+    assert deployment.rollout_checksum("Y3J0", "a2V5", "102") != same
+    assert deployment.rollout_checksum("b3RoZXI=", "a2V5", "100") != same
+
+
+def test_restoring_the_same_cert_after_a_revert_rolls_the_frontend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live on the #1219 rig: after a control-plane reboot k3s re-applied the
+    first-boot certificate (#1215), the frontend started serving it, and the
+    api's write-back restored the SAME content the annotation already named —
+    so nothing rolled, nginx kept the first-boot certificate, and the pinned
+    remote supervisor refused the control plane until someone restarted it."""
+    import json
+
+    monkeypatch.setattr(deployment.settings, "appliance_mode", True)
+    secret = {"data": {"tls.crt": "QUNUSVZF", "tls.key": "S0VZ"}, "metadata": {}}
+    annotations: list[str] = []
+
+    class _Cfg:
+        namespace = "spatium"
+
+    monkeypatch.setattr(deployment.k8s, "get_config", lambda: _Cfg())
+    monkeypatch.setattr(
+        deployment.k8s, "_request", lambda method, path: (200, json.dumps(secret).encode())
+    )
+    monkeypatch.setattr(
+        deployment.k8s,
+        "patch_deployment_annotation",
+        lambda name, key, value: (annotations.append(value) or (True, None)),
+    )
+
+    secret["metadata"]["resourceVersion"] = "100"  # deployed before the reboot
+    assert deployment.reload_frontend_nginx()
+    secret["metadata"]["resourceVersion"] = "102"  # k3s reverted, api wrote it back
+    assert deployment.reload_frontend_nginx()
+    assert annotations[0] != annotations[1], "the write-back must change the pod template"
+
+    # An unchanged Secret (a PATCH that changed nothing keeps its version)
+    # still rolls nothing.
+    assert deployment.reload_frontend_nginx()
+    assert annotations[1] == annotations[2]

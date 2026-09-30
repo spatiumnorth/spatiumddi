@@ -41,26 +41,26 @@ Implementation notes:
 from __future__ import annotations
 
 import os
-import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, unquote, urljoin
 
 import httpx
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 # Generous timeout — WebDAV against a residential Nextcloud over a
 # slow link can stall for tens of seconds on a multi-MB upload.
@@ -87,13 +87,6 @@ _DAV_NS = "{DAV:}"
 
 def _ensure_trailing_slash(url: str) -> str:
     return url if url.endswith("/") else url + "/"
-
-
-def _safe_filename(filename: str) -> str:
-    """Strip path separators from operator-supplied filenames so a
-    crafted filename can't escape the configured collection.
-    """
-    return os.path.basename(filename)
 
 
 class WebDAVDestination(BackupDestination):
@@ -159,7 +152,17 @@ class WebDAVDestination(BackupDestination):
         )
 
     def _archive_url(self, config: dict[str, Any], filename: str) -> str:
-        return urljoin(_ensure_trailing_slash(config["url"]), _safe_filename(filename))
+        # Percent-encoded, not just checked (#1243): ``safe_filename``
+        # refuses a literal ``..``, but a name that ARRIVES encoded
+        # (``%2E%2E``) is one plain component to us and a dot-segment to
+        # a server that normalises after decoding (RFC 3986 §2.3 makes
+        # ``%2E`` equivalent to ``.``). Quoting sends it as ``%252E%252E``,
+        # which decodes to the literal name and nothing else. The names we
+        # write are ``[A-Za-z0-9._-]``, which ``quote`` leaves alone.
+        return urljoin(
+            _ensure_trailing_slash(config["url"]),
+            quote(safe_filename(filename), safe=""),
+        )
 
     async def write(
         self,
@@ -221,8 +224,11 @@ class WebDAVDestination(BackupDestination):
             # Skip the collection itself — its href ends with the
             # collection path.
             href = href_el.text
-            name = os.path.basename(href.rstrip("/"))
-            if not _ARCHIVE_NAME_RE.match(name):
+            # Decoded, because ``_archive_url`` encodes: a name returned
+            # still encoded would be encoded twice on the way back and
+            # name an object that does not exist.
+            name = unquote(os.path.basename(href.rstrip("/")))
+            if not ARCHIVE_NAME_RE.match(name):
                 continue
             propstat = response.find(f"{_DAV_NS}propstat/{_DAV_NS}prop")
             if propstat is None:
@@ -264,7 +270,7 @@ class WebDAVDestination(BackupDestination):
                 raise BackupDestinationError(f"WebDAV GET failed: {exc}") from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
-                f"archive {_safe_filename(filename)!r} not found at {target}"
+                f"archive {safe_filename(filename)!r} not found at {target}"
             )
         if resp.status_code != 200:
             raise BackupDestinationError(

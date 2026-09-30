@@ -581,7 +581,7 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    # Notify — yes | no | explicit | master-only
+    # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
     also_notify: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     allow_notify: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)

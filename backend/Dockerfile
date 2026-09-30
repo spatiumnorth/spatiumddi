@@ -161,14 +161,15 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
 
-# --proxy-headers + --forwarded-allow-ips=* makes uvicorn honor
-# X-Forwarded-For / X-Forwarded-Proto when populating request.client
-# and request.url.scheme. Required so the audit log captures the real
-# end-user IP rather than the frontend nginx container's IP. The
-# wildcard is safe here because the api container is only reachable
-# from inside the compose / k8s network — the frontend nginx is the
-# only entity talking to it, and nginx is under our control.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --no-proxy-headers: uvicorn must NOT rewrite request.client /
+# request.url.scheme from forwarding headers itself. It used to, with
+# --forwarded-allow-ips=* (#626), which let any caller that reached the
+# api directly choose its own address (#1221). The app's
+# TrustedProxyMiddleware (app/core/request_meta.py) needs the real TCP
+# peer, and applies X-Real-IP / X-Forwarded-Proto only when that peer is
+# in TRUSTED_PROXY_CIDRS, so audit rows still record the end user's IP
+# behind nginx rather than the nginx container's.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
 
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────

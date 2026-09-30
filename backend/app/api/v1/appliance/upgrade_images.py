@@ -79,6 +79,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
+from app.core.content_disposition import content_disposition
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
@@ -124,6 +125,24 @@ def _github_asset_filename(asset_url: str) -> str:
     """Last path segment of a release-asset URL, minus any query string."""
     tail = urlparse(asset_url).path.rsplit("/", 1)[-1]
     return tail if tail.endswith(".raw.xz") else _GITHUB_IMAGE_FILENAME
+
+
+def _stored_upload_name(raw: str | None, image_id: uuid.UUID) -> str:
+    """The filename to record for an uploaded image (#1243).
+
+    ``file.filename`` is whatever the uploading client put in its
+    multipart part, and it is stored, shown in the Fleet UI and audit
+    rows, and sent back in ``Content-Disposition`` on every download. So
+    it is reduced to its last path component (a browser on Windows may
+    send ``C:\\...\\slot.raw.xz``), control characters are dropped, and
+    it is cut to the column's 255 — with the generated name as the
+    fallback when nothing is left, rather than an empty string.
+    """
+    name = (raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    if name in ("", ".", ".."):
+        return f"{image_id}.raw.xz"
+    return name[:255]
 
 
 def _require_superadmin(user: CurrentUser) -> None:
@@ -306,7 +325,7 @@ async def _stream_download_from_mirror(
     # path segment ("raw.xz") or save the raw UUID.
     resp_filename = filename or f"{image_id}.raw.xz"
     resp_headers: dict[str, str] = {
-        "Content-Disposition": f'attachment; filename="{resp_filename}"',
+        "Content-Disposition": content_disposition(resp_filename),
     }
     if "content-length" in upstream.headers:
         resp_headers["Content-Length"] = upstream.headers["content-length"]
@@ -700,7 +719,7 @@ async def upload_upgrade_image(
 
     row = ApplianceUpgradeImage(
         id=image_id,
-        filename=file.filename or f"{image_id}.raw.xz",
+        filename=_stored_upload_name(file.filename, image_id),
         size_bytes=bytes_written,
         sha256=expected_sha,
         appliance_version=appliance_version.strip(),

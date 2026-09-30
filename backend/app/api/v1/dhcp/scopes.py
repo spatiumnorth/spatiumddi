@@ -22,13 +22,17 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import validate_fqdn
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.option_validation import (
+    normalize_options,
+    option_key_code,
+    validate_options,
+)
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -56,92 +60,22 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
 
-_CODE_TO_NAME: dict[int, str] = {
-    2: "time-offset",
-    3: "routers",
-    6: "dns-servers",
-    15: "domain-name",
-    26: "mtu",
-    28: "broadcast-address",
-    42: "ntp-servers",
-    66: "tftp-server-name",
-    67: "bootfile-name",
-    119: "domain-search",
-    150: "tftp-server-address",
-}
-
-
-# Legacy / alternate option names that collapse onto a canonical name.
-# The frontend historically sent option 6 as the IANA name
-# ``domain-name-servers`` while the canonical stored vocabulary (and the
-# Kea driver's option-name map) is ``dns-servers`` (#583). Normalise on
-# write so new rows store canonically, and recognise the alias on read so
-# already-persisted rows still resolve to code 6 in ``_scope_to_response``
-# rather than falling through to code 0 / the custom-options bucket.
-_OPTION_NAME_ALIASES: dict[str, str] = {"domain-name-servers": "dns-servers"}
-
-
-def validate_domain_options(
-    opts: dict[str, Any], *, previous: dict[str, Any] | None = None
+def validate_dhcp_options(
+    opts: dict[str, Any],
+    *,
+    address_family: str = "ipv4",
+    previous: dict[str, Any] | None = None,
 ) -> None:
-    """Validate the FQDN-valued DHCP options (issue #597); raise 422 on a bad one.
+    """422 naming the first option the Kea renderer cannot emit (#1228).
 
-    ``domain-name`` (option 15) is a single FQDN; ``domain-search``
-    (option 119) is a list of FQDNs. Both render straight into the Kea
-    config, so a malformed value would break it or ship a bad search suffix.
-    Empty / whitespace-only entries are rejected too (a blank search suffix
-    is meaningless). A value identical to ``previous`` is skipped, so an
-    update that merely round-trips a grandfathered value doesn't block the
-    edit (validate-on-*change*, matching the issue's report-don't-break stance).
+    Covers names and values; the FQDN checks #597 added live in the same
+    validator now. Keys unchanged from ``previous`` are skipped, so an edit
+    that round-trips a grandfathered option is not blocked by it.
     """
-    prev = previous or {}
     try:
-        dn = opts.get("domain-name")
-        if isinstance(dn, str) and dn != prev.get("domain-name"):
-            if not dn.strip():
-                raise ValueError("domain-name option must not be blank")
-            validate_fqdn(dn, field="domain-name option")
-        ds = opts.get("domain-search")
-        if isinstance(ds, list) and ds != prev.get("domain-search"):
-            for d in ds:
-                if not str(d).strip():
-                    raise ValueError("domain-search option contains a blank entry")
-                validate_fqdn(str(d), field="domain-search option")
+        validate_options(opts, address_family=address_family, previous=previous)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-def _normalize_options(raw: Any) -> dict[str, Any]:
-    """Normalize option shape (name aliases, list→dict). Does NOT validate —
-    callers run ``validate_domain_options`` so the create/update paths can
-    apply different only-on-change gating."""
-    if raw is None:
-        return {}
-    if isinstance(raw, dict):
-        return {_OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in raw.items()}
-    if isinstance(raw, list):
-        out: dict[str, Any] = {}
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            code = entry.get("code")
-            # #856 — the conditional binds looser than ``or``, so the previous
-            # ``entry.get("name") or _CODE_TO_NAME.get(int(code)) if code else None``
-            # evaluated as ``(name or lookup) if code else None``: an entry
-            # identified by NAME with no ``code`` was silently discarded rather
-            # than used as-is. Resolve the two independently.
-            name = entry.get("name")
-            if not name and code:
-                try:
-                    name = _CODE_TO_NAME.get(int(code)) or f"option-{code}"
-                except (TypeError, ValueError):
-                    name = None
-            if not name:
-                continue
-            name = _OPTION_NAME_ALIASES.get(name, name)
-            out[name] = entry.get("value")
-        return out
-    return {}
 
 
 def _normalize_sync_mode(v: str | None) -> str:
@@ -472,14 +406,6 @@ class ScopeUpdate(BaseModel):
         return _validate_relay_addresses(v)
 
 
-_NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
-# Existing rows may still be stored under the legacy alias (#583); map it
-# to code 6 on readback so the DNS Servers field populates on edit.
-for _alias, _canon in _OPTION_NAME_ALIASES.items():
-    if _canon in _NAME_TO_CODE:
-        _NAME_TO_CODE[_alias] = _NAME_TO_CODE[_canon]
-
-
 class ScopeResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -535,7 +461,11 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
     opts: list[dict[str, Any]] = []
     if isinstance(raw, dict):
         for name, val in raw.items():
-            opts.append({"code": _NAME_TO_CODE.get(name, 0), "name": name, "value": val})
+            # Legacy aliases (#583) resolve to their code so the field
+            # populates on edit, and a raw ``code:43`` / ``opt-43`` reads back
+            # under its own number rather than "0" (#1228).
+            code = option_key_code(name) or 0
+            opts.append({"code": code, "name": name, "value": val})
     elif isinstance(raw, list):
         opts = list(raw)
     return ScopeResponse(
@@ -726,8 +656,8 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
-    _create_options = _normalize_options(body.options)
-    validate_domain_options(_create_options)  # always validate on create (#597)
+    _create_options = normalize_options(body.options)
+    validate_dhcp_options(_create_options, address_family=address_family)
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -872,12 +802,16 @@ async def update_scope(
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
     if "options" in changes:
-        normalized = _normalize_options(changes["options"])
-        # Validate only domain options that CHANGED from the stored value
-        # (issue #597 review) — the scope form round-trips the full options
-        # dict, so re-validating an unchanged grandfathered value would block
-        # an unrelated edit.
-        validate_domain_options(normalized, previous=scope.options or {})
+        normalized = normalize_options(changes["options"])
+        # Validate only options that CHANGED from the stored value (#597
+        # review, #1228) — the scope form round-trips the full options dict,
+        # so re-validating an unchanged grandfathered value would block an
+        # unrelated edit.
+        validate_dhcp_options(
+            normalized,
+            address_family=scope.address_family or "ipv4",
+            previous=scope.options or {},
+        )
         changes["options"] = normalized
     # ``clear_pxe_profile=True`` is the explicit detach signal — Pydantic
     # collapses missing + null on ``pxe_profile_id`` so we need a

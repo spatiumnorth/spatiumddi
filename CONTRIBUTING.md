@@ -14,6 +14,9 @@ Thank you for your interest in contributing! SpatiumDDI is an open project and w
 git clone https://github.com/spatiumnorth/spatiumddi.git
 cd spatiumddi
 cp .env.example .env
+# The api refuses to boot on the placeholder SECRET_KEY (#1222):
+# (-i.bak, not -i: BSD sed on macOS takes the next argument as the suffix.)
+sed -i.bak "s|^SECRET_KEY=.*|SECRET_KEY=$(openssl rand -hex 32)|" .env && rm .env.bak
 docker compose up -d
 ```
 

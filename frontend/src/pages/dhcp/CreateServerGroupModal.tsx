@@ -146,7 +146,7 @@ export function CreateServerGroupModal({
         </Field>
         <Field
           label="Mode"
-          hint="How servers in this group coordinate. HA modes render the Kea libdhcp_ha.so hook when the group has 2 Kea members."
+          hint="How servers in this group coordinate. HA modes render the Kea libdhcp_ha.so hook when the group has 2 Kea members. HA covers DHCPv4 only: each member serves DHCPv6 scopes on its own."
         >
           <select
             className={inputCls}

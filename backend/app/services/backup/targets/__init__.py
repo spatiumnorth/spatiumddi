@@ -17,10 +17,12 @@ from app.services.backup.targets.base import (
     BackupDestination,
     BackupDestinationError,
     DestinationConfigError,
+    InvalidArchiveNameError,
     RetentionLockedError,
     UnsupportedOperationError,
     get_destination,
     list_destination_kinds,
+    safe_filename,
 )
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.gcs import GcsDestination
@@ -60,6 +62,7 @@ __all__ = [
     "BackupDestinationError",
     "UnsupportedOperationError",
     "DestinationConfigError",
+    "InvalidArchiveNameError",
     "RetentionLockedError",
     "AzureBlobDestination",
     "FtpDestination",
@@ -80,4 +83,5 @@ __all__ = [
     "list_destination_kinds",
     "merge_config_for_update",
     "redact_config_secrets",
+    "safe_filename",
 ]

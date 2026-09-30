@@ -45,7 +45,7 @@ from app.api.pagination import MAX_PAGE
 from app.api.v1.probe_guard import enforce_probe_target
 from app.core.permissions import require_permission, user_has_permission
 from app.core.responses import EventStreamResponse
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, live_access_session
 from app.db import get_db
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -553,6 +553,13 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: 
         user_id: str = payload["sub"]
     except (JWTError, KeyError) as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+
+    # Force-logout (#72) must reach the stream too, as it does every other
+    # route through get_current_user: a revoked session's token is refused.
+    try:
+        await live_access_session(db, payload)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Session revoked or expired") from exc
 
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if user is None:

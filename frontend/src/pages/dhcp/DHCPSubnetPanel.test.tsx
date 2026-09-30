@@ -17,6 +17,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { MyPermissions } from "@/lib/api";
 
 const myPermissions = vi.fn<() => Promise<MyPermissions>>();
+// #1238 — the scope's family and its group's Kea member count, per test.
+const fixture = { family: "ipv4", keaMembers: 2 };
+const listGroups = vi.fn(() =>
+  Promise.resolve([
+    { id: "grp-1", name: "pair", kea_member_count: fixture.keaMembers },
+  ]),
+);
 
 vi.mock("@/lib/api", () => ({
   authApi: { myPermissions: () => myPermissions() },
@@ -27,11 +34,14 @@ vi.mock("@/lib/api", () => ({
           id: "scope-1",
           name: "staff",
           subnet_id: "sub-1",
+          group_id: "grp-1",
+          address_family: fixture.family,
           lease_time: 86400,
           enabled: true,
           ddns_enabled: false,
         },
       ]),
+    listGroups: () => listGroups(),
     listPools: () =>
       Promise.resolve([
         {
@@ -86,6 +96,38 @@ function button(name: string | RegExp): HTMLButtonElement {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  fixture.family = "ipv4";
+  fixture.keaMembers = 2;
+});
+
+describe("DHCPSubnetPanel HA coverage (#1238)", () => {
+  it("flags a DHCPv6 scope on a two-Kea group, which HA does not cover", async () => {
+    fixture.family = "ipv6";
+    await openPanel(grants(["read", "*"]));
+    const tag = await screen.findByText("v6: no HA");
+    expect(tag.getAttribute("title")).toContain("HA covers DHCPv4 only");
+  });
+
+  // The negative cases wait for the group list to land, or they would pass
+  // before the tag had any chance to render.
+  async function groupsLoaded() {
+    await waitFor(() => expect(listGroups).toHaveBeenCalled());
+    await act(async () => {});
+  }
+
+  it("leaves a DHCPv4 scope on the same group alone", async () => {
+    await openPanel(grants(["read", "*"]));
+    await groupsLoaded();
+    expect(screen.queryByText("v6: no HA")).toBeNull();
+  });
+
+  it("leaves a DHCPv6 scope on a single-Kea group alone", async () => {
+    fixture.family = "ipv6";
+    fixture.keaMembers = 1;
+    await openPanel(grants(["read", "*"]));
+    await groupsLoaded();
+    expect(screen.queryByText("v6: no HA")).toBeNull();
+  });
 });
 
 describe("DHCPSubnetPanel write controls (#1155)", () => {

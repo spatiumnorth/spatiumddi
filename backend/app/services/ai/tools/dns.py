@@ -397,10 +397,11 @@ async def preview_dns_zone_move(
         "source_drivers": plan.source_drivers,
         "target_drivers": plan.target_drivers,
         "name_collision": plan.name_collision,
-        # Hard refusals: neither is waivable by acknowledgement, because
-        # neither leaves a state the operator could inspect and fix after.
+        # Hard refusals: none is waivable by acknowledgement, because none
+        # leaves a state the operator could inspect and fix after.
         "dnssec_unsupported_drivers": plan.dnssec_unsupported_drivers,
         "acl_names_lost": plan.acl_names_lost,
+        "key_names_lost": plan.key_names_lost,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }

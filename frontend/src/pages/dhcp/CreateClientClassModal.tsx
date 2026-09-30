@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPClientClass, type DHCPOption } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
+import { optionsFromMap, optionsToMap } from "./dhcpOptionKeys";
 
 export function CreateClientClassModal({
   klass,
@@ -18,23 +19,13 @@ export function CreateClientClassModal({
   const [name, setName] = useState(klass?.name ?? "");
   const [description, setDescription] = useState(klass?.description ?? "");
   const [matchExpr, setMatchExpr] = useState(klass?.match_expression ?? "");
-  const initialOptions: DHCPOption[] = klass?.options
-    ? Object.entries(klass.options).map(([name, value]) => ({
-        code: 0,
-        name,
-        value: value as string | string[],
-      }))
-    : [];
+  const initialOptions: DHCPOption[] = optionsFromMap(klass?.options);
   const [options, setOptions] = useState<DHCPOption[]>(initialOptions);
   const [error, setError] = useState("");
 
   const mut = useMutation({
     mutationFn: () => {
-      const optionsDict: Record<string, unknown> = {};
-      for (const opt of options) {
-        const key = opt.name || `option-${opt.code}`;
-        optionsDict[key] = opt.value;
-      }
+      const optionsDict = optionsToMap(options);
       const data: Partial<DHCPClientClass> = {
         name,
         description,
