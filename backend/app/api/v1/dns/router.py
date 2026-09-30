@@ -3196,6 +3196,48 @@ async def _validated_option_changes(
     return cleaned
 
 
+#: Zone fields written into the zone's own ``zone { … }`` statement (#1316).
+#: ``forwarders`` is deliberately absent: a Technitium forward zone may carry
+#: a hostname or DoH URL there, which the BIND ``ip[@port]`` grammar refuses.
+_ZONE_NAMED_CONF_FIELDS = ("allow_query", "allow_transfer", "also_notify", "notify_enabled")
+
+
+async def _validated_zone_named_conf_fields(
+    group_id: uuid.UUID, changes: dict[str, Any], zone: DNSZone | None, db: DB
+) -> dict[str, Any]:
+    """Validate a zone's named.conf clauses before they are stored (#1316).
+
+    The zone half of #1244: the agent renders a zone's ``allow-transfer``
+    (and the control-plane template all four) verbatim into the zone
+    statement, so one bad element makes BIND refuse the file and the WHOLE
+    group stops converging, not just this zone.
+
+    On update (``zone`` given) only a changed value is checked, for the
+    same reason as the options form: a value stored before this gate must
+    not block an unrelated edit. Raises 422 naming the field and element.
+    """
+    fields = {
+        k: v
+        for k, v in changes.items()
+        if k in _ZONE_NAMED_CONF_FIELDS
+        and v is not None
+        and (zone is None or v != getattr(zone, k, None))
+    }
+    if not fields:
+        return {}
+    acl_names, known_keys = await _group_symbol_names(group_id, db)
+    try:
+        return {
+            k: validate_server_option(k, v, known_acls=acl_names, known_keys=known_keys)
+            for k, v in fields.items()
+        }
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -4189,7 +4231,9 @@ async def create_zone(
     if body.dnssec_enabled:
         await _check_driver_gated_operation("dnssec_sign", group_id, db)
 
-    zone = DNSZone(group_id=group_id, **body.model_dump())
+    payload = body.model_dump()
+    payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
+    zone = DNSZone(group_id=group_id, **payload)
     db.add(zone)
 
     # Write-through: push the create to any windows_dns-with-creds server
@@ -4791,6 +4835,7 @@ async def update_zone(
     # nor empty the masters on an existing secondary.
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
         zone.group_id,
@@ -5828,6 +5873,7 @@ class ZoneMovePreviewResponse(BaseModel):
     dnssec_unsupported_drivers: list[str]
     acl_names_remapped: list[str]
     acl_names_lost: list[str]
+    key_names_lost: list[str]
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -5863,6 +5909,7 @@ class ZoneMovePreviewResponse(BaseModel):
             dnssec_unsupported_drivers=plan.dnssec_unsupported_drivers,
             acl_names_remapped=plan.acl_names_remapped,
             acl_names_lost=plan.acl_names_lost,
+            key_names_lost=plan.key_names_lost,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )

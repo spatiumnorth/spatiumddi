@@ -223,6 +223,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's access lists are checked before they reach `named.conf`
+  (#1316).** The zone half of #1244. A zone's `allow_query`,
+  `allow_transfer`, `also_notify` and `notify_enabled` were stored as sent
+  and rendered into its `zone { … }` statement; the agent renders
+  `allow-transfer` there on every BIND9 server. One bad element made BIND
+  refuse the file, which stops every zone in the group converging, not just
+  this one. Zone create and update now run the same checks as the server
+  options and answer 422 naming the field and element; on update only a
+  changed value is checked, so a zone stored before this fix stays
+  editable. A zone move also refuses a zone whose lists cite a TSIG key the
+  target group doesn't define, the same whole-group failure the move
+  already refused for ACL names (#935). A zone's `forwarders` are left
+  alone: a Technitium forward zone may carry a hostname or DoH URL there.
+
 - **The DNS server options editor refuses values BIND cannot load
   (#1244).** `PUT /dns/groups/{id}/options` stored `allow-query` and the
   other address lists, `also-notify`, the forwarders, the single-word

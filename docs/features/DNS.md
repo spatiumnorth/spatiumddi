@@ -249,6 +249,9 @@ the operator could not inspect and fix afterwards:
   per-group, so the name becomes an undefined symbol — and BIND rejects the
   file *whole*, which stops the entire target group converging rather than
   just this zone;
+* a **TSIG key** cited as `key <name>` in those same lists that the target
+  group does not define (422, #1316). Keys are per-group too, so it is the same
+  undefined symbol and the same whole-group failure;
 * a **forwarders-less forward zone onto a Technitium group** (422), the same
   #743 guard every create and update runs.
 
@@ -1429,6 +1432,13 @@ unrelated edit.
   `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
   absolute, with no `.` or `..` segment, using only letters, digits, `.`,
   `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
+
+A zone's own `allow_query`, `allow_transfer`, `also_notify` and
+`notify_enabled` go through the same checks on zone create and update (#1316),
+with the same only-changed-values rule on update. They render into the zone's
+`zone { … }` statement, so a bad value there stops the whole group converging
+just as a bad server option does. A zone's `forwarders` are not checked this
+way: a Technitium forward zone may carry a hostname or DoH URL there.
 
 ## 16. Multi-group / split-horizon publishing at the IPAM layer (issue #25)
 
