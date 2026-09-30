@@ -37,6 +37,17 @@ global:
   # ``RuntimeDefault`` | ``Unconfined`` | ``""`` (omit the block entirely).
   seccompProfile: RuntimeDefault
 
+# #1281 — how a role agent given the EXTERNAL control-plane URL (an off-cluster
+# appliance) checks the control plane's certificate. By default it trusts
+# exactly the certificate its supervisor pinned (supervisor.hostMounts.stateDir
+# + /tls, mounted read-only). The supervisor sets insecureSkipVerify only when
+# it was itself started with SPATIUM_INSECURE_SKIP_TLS_VERIFY=1: a supervisor
+# that does not verify pins nothing, so the agents would otherwise wait
+# forever for a pin that never comes. They then skip too, and say so on every
+# start. Never set by default.
+controlPlaneTls:
+  insecureSkipVerify: false
+
 # #983 — PriorityClasses. Unlike the umbrella chart these default to ON and
 # the per-workload names below default to NON-empty, because this chart
 # renders the classes it names. Turning ``create`` off without also clearing

@@ -42,7 +42,7 @@ from pathlib import Path
 
 import structlog
 
-from . import appliance_state, k8s_api
+from . import appliance_state, cp_tls, k8s_api
 
 
 @dataclass(frozen=True)
@@ -272,6 +272,12 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "create": False,
             "external": True,
         },
+        # #1281 — the role agents on the external URL verify against this
+        # supervisor's pin, unless this supervisor was started with the skip:
+        # then it pins nothing, and the agents would wait for ever.
+        "controlPlaneTls": {
+            "insecureSkipVerify": cp_tls.skip_verify(),
+        },
         "agentLanding": {
             "enabled": False,
         },
@@ -407,13 +413,16 @@ def role_release_fingerprint(env_file: Path) -> str:
     The agents' control-plane URL is in it too (#1281): it changes when the
     node is promoted into the control plane, with nothing in the role env
     moving, and without it the agents would keep verifying the external URL
-    against a pin their supervisor no longer maintains.
+    against a pin their supervisor no longer maintains. So is whether this
+    supervisor skips verification, which decides between the pin and the
+    skip in the agents' pods.
     """
     env_vars = _parse_env_file(env_file)
     tag = role_image_tag(env_vars)
     return (
         f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
         f"control_plane_url={role_control_plane_url(env_vars)}\n"
+        f"skip_tls_verify={cp_tls.skip_verify()}\n"
     )
 
 

@@ -83,23 +83,34 @@ atomically (a new inode), which a single-file bind mount would never see.
 ``type: Directory`` rather than DirectoryOrCreate, so kubelet never creates
 it root-owned ahead of the supervisor; the pod waits until it exists. The
 agent reads the file on every client build and fails closed while it is
-absent. Paths match ``cp_tls.PIN_FILENAME`` + the supervisor's STATE_DIR
+absent. The one exception is ``controlPlaneTls.insecureSkipVerify``, which the
+supervisor sets only when it was itself started with the skip (see
+values.yaml): a supervisor that does not verify pins nothing. Paths match ``cp_tls.PIN_FILENAME`` + the supervisor's STATE_DIR
 (pinned by agent/supervisor/tests/test_role_pod_pinned_tls.py).
 */}}
 {{- define "spatiumddi-appliance.cpPin.env" -}}
+{{- if (.Values.controlPlaneTls).insecureSkipVerify }}
+- name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+  value: "1"
+{{- else }}
 - name: TLS_PINNED_CERTS_PATH
   value: /var/lib/spatium-cp-tls/control-plane.pem
+{{- end }}
 {{- end -}}
 
 {{- define "spatiumddi-appliance.cpPin.mount" -}}
+{{- if not (.Values.controlPlaneTls).insecureSkipVerify }}
 - name: cp-tls-pin
   mountPath: /var/lib/spatium-cp-tls
   readOnly: true
+{{- end }}
 {{- end -}}
 
 {{- define "spatiumddi-appliance.cpPin.volume" -}}
+{{- if not (.Values.controlPlaneTls).insecureSkipVerify }}
 - name: cp-tls-pin
   hostPath:
     path: {{ printf "%s/tls" .Values.supervisor.hostMounts.stateDir }}
     type: Directory
+{{- end }}
 {{- end -}}

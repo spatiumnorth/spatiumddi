@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ssl
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +14,17 @@ log = structlog.get_logger(__name__)
 
 # Whether the last pinned-trust read failed, so a missing pin is logged
 # once when it goes missing and once when it arrives, not on every request.
+# Every client-building thread passes through here, hence the lock.
+_pin_lock = threading.Lock()
 _pin_state = {"unavailable": False}
+
+
+def _pin_changed(unavailable: bool) -> bool:
+    """Record whether the pin is unavailable; True when that is a change."""
+    with _pin_lock:
+        changed = _pin_state["unavailable"] != unavailable
+        _pin_state["unavailable"] = unavailable
+        return changed
 
 
 def pinned_context(path: str) -> ssl.SSLContext:
@@ -44,8 +55,7 @@ def pinned_context(path: str) -> ssl.SSLContext:
             raise ValueError("no certificate in the file")
         ctx.load_verify_locations(cadata=pem)
     except (OSError, ValueError, ssl.SSLError) as exc:
-        if not _pin_state["unavailable"]:
-            _pin_state["unavailable"] = True
+        if _pin_changed(True):
             log.warning(
                 "control_plane_pin_unavailable",
                 path=path,
@@ -57,8 +67,7 @@ def pinned_context(path: str) -> ssl.SSLContext:
                 ),
             )
         return ctx
-    if _pin_state["unavailable"]:
-        _pin_state["unavailable"] = False
+    if _pin_changed(False):
         log.info("control_plane_pin_loaded", path=path)
     return ctx
 
@@ -127,8 +136,15 @@ class AgentConfig:
         the control plane's CA meant it to be used, and the skip used to win
         silently, so following the documented CA setup while the compose
         default still said ``1`` verified nothing.
+
+        The pin is consulted only for an ``https://`` URL: over ``http://``
+        there is no certificate, and building the context there would log
+        ``control_plane_pin_unavailable`` (a supervisor pins nothing for a
+        plain-http control plane) while every request in fact succeeds.
         """
-        if self.tls_pinned_certs_path:
+        if self.tls_pinned_certs_path and self.control_plane_url.lower().startswith(
+            "https://"
+        ):
             return pinned_context(self.tls_pinned_certs_path)
         if self.tls_ca_path:
             return self.tls_ca_path

@@ -3200,7 +3200,11 @@ certificates in that file, with no hostname check, the same way the
 supervisor does, and reads it on every connection, so a certificate the
 supervisor re-pins reaches the agents without a restart. Until the supervisor
 has pinned, every request fails and the agent logs
-`control_plane_pin_unavailable`; it does not fall back to skipping. On a
+`control_plane_pin_unavailable`; it does not fall back to skipping. The one
+exception is a supervisor started by hand with
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins nothing, so it renders its
+agents with the skip too (`controlPlaneTls.insecureSkipVerify`), and they warn
+about it on every start. On a
 control-plane member, including an appliance promoted into the control plane,
 the agents are not given the external URL at all: they use the in-cluster api
 Service, as the member's supervisor does. The pin cannot serve there, because

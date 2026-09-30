@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import inspect
 import socket
 import ssl
 import threading
@@ -33,7 +32,6 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-import spatium_dhcp_agent.config as config_module
 from spatium_dhcp_agent.config import AgentConfig, pinned_context
 
 
@@ -210,8 +208,31 @@ def test_the_pin_wins_over_the_ca_and_the_skip(
         assert warning is None
 
 
-def test_the_env_var_is_read() -> None:
-    """``from_env`` is covered through the chart's variable name, since the
-    chart and the agent are separate files that must agree on it."""
-    assert "tls_pinned_certs_path" in {f.name for f in dataclasses.fields(AgentConfig)}
-    assert 'os.environ.get("TLS_PINNED_CERTS_PATH")' in inspect.getsource(config_module)
+def test_the_env_var_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``from_env`` reads the variable the chart sets: the chart and the agent
+    are separate files that must agree on its name."""
+    monkeypatch.setenv("SPATIUM_API_URL", "https://cp")
+    monkeypatch.setenv("SPATIUM_AGENT_KEY", "k")
+    monkeypatch.setenv(
+        "TLS_PINNED_CERTS_PATH", "/var/lib/spatium-cp-tls/control-plane.pem"
+    )
+    cfg = AgentConfig.from_env()
+    assert cfg.tls_pinned_certs_path == "/var/lib/spatium-cp-tls/control-plane.pem"
+    monkeypatch.setenv("TLS_PINNED_CERTS_PATH", "")
+    assert AgentConfig.from_env().tls_pinned_certs_path is None
+
+
+def test_a_plain_http_url_does_not_consult_the_pin(
+    base_cfg: AgentConfig, tmp_path: Path
+) -> None:
+    """Over http there is no certificate; building the pinned context there
+    would log that every request fails while every request succeeds."""
+    cfg = dataclasses.replace(
+        base_cfg,
+        control_plane_url="http://10.0.0.1",
+        tls_pinned_certs_path=str(tmp_path / "absent.pem"),
+        tls_ca_path=None,
+        insecure_skip_tls_verify=False,
+    )
+    assert not isinstance(cfg.httpx_verify(), ssl.SSLContext)
+    assert cfg.tls_warning() is None

@@ -148,10 +148,9 @@ def test_the_agent_reads_the_pin_the_supervisor_writes() -> None:
     mount = _define("spatiumddi-appliance.cpPin.mount")
     volume = _define("spatiumddi-appliance.cpPin.volume")
 
-    pinned = re.search(r"value: (\S+)", env)
+    pinned = re.search(r"name: TLS_PINNED_CERTS_PATH\s+value: (\S+)", env)
     mount_path = re.search(r"mountPath: (\S+)", mount)
     assert pinned and mount_path
-    assert "name: TLS_PINNED_CERTS_PATH" in env
     # The file the agent reads is the pin, inside the mounted directory.
     assert pinned.group(1) == f"{mount_path.group(1)}/{cp_tls.PIN_FILENAME}"
     assert "readOnly: true" in mount
@@ -180,3 +179,60 @@ def test_no_role_pod_skips_verification(template: str, block: str) -> None:
             r'\{\{- include "spatiumddi-appliance\.cpPin\.' + piece + r'"'
         )
         assert re.search(pattern, text), (template, piece)
+
+
+# ── a supervisor that does not verify ────────────────────────────────────────
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_the_supervisor_skip_reaches_the_agents(
+    member, monkeypatch: pytest.MonkeyPatch, skip: bool
+) -> None:
+    """A supervisor started with the skip pins nothing, so its agents would
+    wait for ever on the pin. They take the skip instead; by default they
+    never do."""
+    member(False)
+    monkeypatch.setenv("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "1" if skip else "0")
+    values = service_lifecycle._build_values(
+        ["dns-bind9"], {"CONTROL_PLANE_URL": EXTERNAL, **KEYS}
+    )
+    assert values["controlPlaneTls"] == {"insecureSkipVerify": skip}
+
+
+def test_the_skip_moves_the_apply_key(
+    member, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    chart = tmp_path / "spatiumddi-appliance.tgz"
+    chart.write_bytes(b"chart")
+    monkeypatch.setattr(service_lifecycle, "_BAKED_CHART_TARBALL", chart)
+    monkeypatch.setattr(service_lifecycle, "_chart_digest_cache", None)
+    env = tmp_path / "role-compose.env"
+    env.write_text(f"CONTROL_PLANE_URL={EXTERNAL}\n", encoding="utf-8")
+    member(False)
+
+    monkeypatch.setenv("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "0")
+    verifying = heartbeat._role_apply_key(env.read_text(), env)
+    monkeypatch.setenv("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "1")
+    assert heartbeat._role_apply_key(env.read_text(), env) != verifying
+
+
+def test_the_helpers_choose_one_or_the_other() -> None:
+    """With the skip: the skip env and no pin mount or volume. Without it:
+    the pin, and never the skip."""
+    env = _define("spatiumddi-appliance.cpPin.env")
+    skip_branch, pin_branch = env.split("{{- else }}")
+    assert "SPATIUM_INSECURE_SKIP_TLS_VERIFY" in skip_branch
+    assert "TLS_PINNED_CERTS_PATH" not in skip_branch
+    assert "TLS_PINNED_CERTS_PATH" in pin_branch
+    assert "SPATIUM_INSECURE_SKIP_TLS_VERIFY" not in pin_branch
+    assert "(.Values.controlPlaneTls).insecureSkipVerify" in skip_branch
+    for piece in ("mount", "volume"):
+        assert (
+            _define(f"spatiumddi-appliance.cpPin.{piece}")
+            .lstrip()
+            .startswith("{{- if not (.Values.controlPlaneTls).insecureSkipVerify }}")
+        ), piece
+    values = (CHART / "values.yaml").read_text(encoding="utf-8")
+    assert re.search(
+        r"^controlPlaneTls:\n  insecureSkipVerify: false$", values, re.MULTILINE
+    )

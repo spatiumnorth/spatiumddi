@@ -216,6 +216,11 @@ render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
+# #1281 — the other branch of the off-cluster TLS choice: a supervisor started
+# with the skip pins nothing, so its agents skip too and mount no pin.
+render appliance-offcluster-skip "$APPLIANCE" \
+    --set dnsBind9.enabled=true --set dnsBind9.controlPlaneUrl=https://cp.example \
+    --set controlPlaneTls.insecureSkipVerify=true
 
 # #992 — the two release shapes this chart is ACTUALLY installed as, on every
 # appliance. Rendering the chart once (as everything above does) can never see

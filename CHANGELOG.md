@@ -1877,7 +1877,12 @@ the formatter handles the rest.
   connection, so a certificate the supervisor re-pins reaches the agents
   without a restart. Until the supervisor has pinned, every request fails
   and the agent logs `control_plane_pin_unavailable`; it never falls back to
-  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip.
+  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
+  and is used only for an `https://` URL. The one exception is a supervisor
+  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
+  nothing, so its agents take the skip too (chart value
+  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
+  about it on every start.
   An appliance promoted into the control plane no longer gives its agents
   the external URL at all: they use the in-cluster api Service, as its
   supervisor does. That closes the #409 known limitation and is also

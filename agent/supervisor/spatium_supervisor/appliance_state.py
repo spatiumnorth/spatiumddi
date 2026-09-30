@@ -3873,10 +3873,6 @@ def read_node_ip() -> str | None:
     return None
 
 
-# ── Issue #285 Phase 1 — fleet-firewall prerequisites ────────────────
-
-
-
 def is_control_plane_member() -> bool:
     """True when this node is part of the control-plane k3s cluster: installed
     as a control-plane seed, or an appliance promoted into it whose join the
@@ -3890,6 +3886,10 @@ def is_control_plane_member() -> bool:
         return True
     join_state, _ = read_cluster_join_state()
     return join_state == "ready"
+
+
+# ── Issue #285 Phase 1 — fleet-firewall prerequisites ────────────────
+
 
 def read_node_ips() -> list[str] | None:
     """Every k3s-registered InternalIP for this node (#285 Phase 1).
