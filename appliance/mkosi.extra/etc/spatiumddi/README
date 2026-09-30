@@ -11,7 +11,7 @@ Files dropped here on first boot or by cloud-init user-data:
                    entrypoint at startup via the hostPath bind
                    mount at /etc/spatiumddi-host/.env.
 
-  release          Optional. Set SPATIUMDDI_VERSION=<calver-tag> to
+  release          Optional. Set SPATIUMDDI_VERSION=<release-tag> to
                    pin a specific release at first boot. cloud-init
                    can write this via:
                      write_files:

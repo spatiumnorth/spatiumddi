@@ -10,7 +10,12 @@ from datetime import date
 
 import pytest
 
-from app.core.versions import includes_release, nightly_build_date, parse_release
+from app.core.versions import (
+    includes_release,
+    nightly_build_date,
+    parse_release,
+    upgrade_direction,
+)
 
 
 @pytest.mark.parametrize(
@@ -113,3 +118,32 @@ def test_a_nightly_cannot_be_placed_against_a_semver_release() -> None:
 def test_the_release_must_be_a_release() -> None:
     with pytest.raises(ValueError):
         includes_release("2026.06.12-2", "dev")
+
+
+# The per-box Fleet upgrade and its Fleet form both use this (#1182): a
+# backward move is allowed (it is also the manual rollback path) but warned.
+@pytest.mark.parametrize(
+    ("installed", "target", "expected"),
+    [
+        ("2026.09.04-1", "2026.11.03-1", "forward"),
+        ("2026.11.03-1", "1.0.0", "forward"),
+        ("1.0.0-rc.2", "1.0.0", "forward"),
+        ("1.0.9", "1.0.10", "forward"),
+        ("1.0.0", "1.0.0", "same"),
+        ("2026.11.03-1", "2026.11.03-1", "same"),
+        ("1.0.0", "2026.11.03-1", "backward"),
+        ("1.0.10", "1.0.9", "backward"),
+        ("2026.11.03-1", "2026.09.04-1", "backward"),
+        ("0.0.0-nightly-20261110+abc1234", "2026.11.03-1", "backward"),
+        ("0.0.0-nightly-20261001+abc1234", "2026.11.03-1", "forward"),
+        ("0.0.0-nightly-20261103+abc1234", "2026.11.03-1", "unknown"),
+        ("0.0.0-nightly-20261110+abc1234", "1.0.0", "unknown"),
+        ("dev", "1.0.0", "unknown"),
+        (None, "1.0.0", "unknown"),
+        ("2026.11.03-1", "dev", "unknown"),
+        ("2026.11.03-1", "", "unknown"),
+        ("2026.11.03-1", None, "unknown"),
+    ],
+)
+def test_upgrade_direction(installed: str | None, target: str | None, expected: str) -> None:
+    assert upgrade_direction(installed, target) == expected

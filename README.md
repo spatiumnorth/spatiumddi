@@ -1214,9 +1214,19 @@ Idempotent — re-running the seed swallows 409s and PATCHes existing rows so fo
 
 ### Upgrading
 
-SpatiumDDI uses CalVer (`YYYY.MM.DD-N`) and ships every component
-(api, worker, beat, frontend, dns-bind9, dhcp-kea) at the same tag.
-The image tag is controlled by `SPATIUMDDI_VERSION` in your `.env`.
+SpatiumDDI ships every component (api, worker, beat, frontend,
+dns-bind9, dhcp-kea) at the same tag. Releases up to the bridge are
+CalVer (`YYYY.MM.DD-N`); from 1.0.0 they are SemVer
+(`MAJOR.MINOR.PATCH`), and every SemVer release is newer than every
+CalVer one. The image tag is controlled by `SPATIUMDDI_VERSION` in
+your `.env`.
+
+> **Reaching 1.0.0 from a CalVer release.** Upgrade to the bridge — the
+> last CalVer release — first. The code that decides whether a version is
+> newer runs in the version you upgrade *from*, and only the bridge and
+> later know that `1.0.0` comes after `2026.x`: an older install is never
+> offered 1.0.0, and its upgrade preflight refuses it. The 1.0.0 release
+> notes name the bridge.
 
 **Track latest** (default — your `.env` ships with `SPATIUMDDI_VERSION=latest`):
 

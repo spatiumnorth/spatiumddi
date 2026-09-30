@@ -1,7 +1,10 @@
 # Changelog
 
 All notable changes to SpatiumDDI are documented in this file.
-Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses [CalVer](https://calver.org/) (`YYYY.MM.DD-N`).
+Format follows [Keep a Changelog](https://keepachangelog.com/). Releases up to the
+bridge are [CalVer](https://calver.org/) (`YYYY.MM.DD-N`); from 1.0.0 they are
+[SemVer](https://semver.org/) (`MAJOR.MINOR.PATCH`, candidates `1.0.0-rc.N`),
+and every SemVer release is newer than every CalVer one (#1182).
 
 This file is hard-wrapped at ~70 chars for terminal reading. The
 release workflow runs each section through `scripts/format_release_
@@ -195,6 +198,28 @@ the formatter handles the rest.
   the comparison half of #1182, which the last CalVer release has to
   carry. The release workflow and docs changes follow separately.
 
+- **The rest of the switch to SemVer at 1.0.0 (#1182).** The last
+  CalVer release, the bridge, now carries everything that has to run
+  in the version being upgraded *from*:
+  - The DNS, DHCP and looking-glass agents report the release their
+    image was built from. Each reported a date string frozen in its
+    package since it was written (`2026.04.14.1` for the DNS agent),
+    whatever release it shipped in; an unstamped build reports `dev`.
+    The supervisor got the same fix in #1183.
+  - A per-box OS upgrade from Fleet records which way it moves the
+    node (`forward`, `same`, `backward` or `unknown`) in its audit row
+    and log, and the Fleet form warns before a rollback. It still
+    refuses nothing: it is also the manual rollback path. The rolling
+    upgrade already refuses a backward target.
+  - The Helm chart version moved from a `sed` in the release workflow
+    to `scripts/release_version.py chart-version`, tested: a CalVer
+    tag drops its leading zeros, a SemVer tag is published unchanged.
+  - The installer's clock check reads the ISO's `BUILD_TIME` instead of
+    parsing a date out of the version, which stops being a date at
+    1.0.0. Local builds now stamp `BUILD_TIME` too.
+  - The docs describe both schemes, and that an install must reach the
+    bridge before it can be offered 1.0.0.
+
 - **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
   2026-09-24 and the backend's requirement had no upper bound, so CI
   picked it up at once. The test suite passes on it, but its new
@@ -241,6 +266,12 @@ the formatter handles the rest.
   Helm 3 and a bare-metal install that does not exist; the feature docs'
   dated status banners; a missing CHANGELOG link in the docs index and
   README; and three stale code comments.
+
+- **The manual `helm upgrade` command on the Releases tab never
+  worked (#1182).** It passed no `--version`, and every published chart
+  is a SemVer pre-release (the CalVer `-N`), which Helm's unversioned
+  lookup skips, so Helm answered *Could not locate a version matching
+  provided version string*. The command now names the chart version.
 
 - **A raw option code in the spelling the group's servers drop is
   refused, not saved and never served (#1296).** Kea and FortiGate read

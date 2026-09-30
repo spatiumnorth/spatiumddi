@@ -20,7 +20,7 @@ name: Agent E2E (kind)
 # cadences, so they need different tags:
 #
 # * ``ghcr.io/spatiumnorth/spatiumddi-{api,frontend}`` — built only by
-#   ``release.yml`` on CalVer tag push. ``:latest`` exists; ``:main``
+#   ``release.yml`` on a release tag push. ``:latest`` exists; ``:main``
 #   does not. So control-plane workloads pin ``:latest``.
 # * ``ghcr.io/spatiumnorth/{dns-bind9,dns-powerdns,dhcp-kea}`` — built
 #   by ``build-dns-images.yml`` / ``build-dhcp-images.yml`` on every
@@ -160,7 +160,7 @@ jobs:
           # Default to ``pr-test`` so the chart pulls the just-built
           # local images side-loaded into kind in the previous step.
           # On workflow_dispatch the operator can override to ``main``
-          # / ``latest`` / a CalVer tag for a registry-image smoke test.
+          # / ``latest`` / a release tag for a registry-image smoke test.
           AGENT_TAG="${{ github.event.inputs.agent_tag || 'pr-test' }}"
           echo "Installing chart with control-plane tag=${CONTROL_TAG}, agent tag=${AGENT_TAG}"
           # The agent PSK has to be pre-shared with the control plane

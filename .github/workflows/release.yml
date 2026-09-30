@@ -200,8 +200,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           outputs: type=image,name=${{ env.REF }},push-by-digest=true,name-canonical=true,push=true
-          # APP_VERSION: the version the supervisor reports (#1183). An
-          # image that declares no such ARG ignores it.
+          # APP_VERSION: the version the supervisor (#1183) and the agents
+          # (#1182) report. An image that declares no such ARG ignores it.
           build-args: |
             VITE_APP_VERSION=${{ needs.meta.outputs.version }}
             APP_VERSION=${{ needs.meta.outputs.version }}
@@ -365,12 +365,12 @@ jobs:
         name: Package + push chart
         run: |
           VERSION="${{ needs.meta.outputs.version }}"
-          # Helm enforces strict SemVer 2, which forbids leading zeroes
-          # in MAJOR.MINOR.PATCH. Our CalVer tag (2026.04.20-1) carries
-          # `04` and sometimes `-01`, so strip them: 2026.04.20-1 ->
-          # 2026.4.20-1. The original tag is kept as appVersion so the
-          # human-readable release identity survives on the artifact.
-          CHART_VERSION=$(echo "$VERSION" | sed -E 's/\.0([0-9])/.\1/g; s/-0([0-9]+)$/-\1/')
+          # Helm enforces strict SemVer 2, which forbids leading zeroes in
+          # MAJOR.MINOR.PATCH, so a CalVer tag drops them (2026.04.20-1 ->
+          # 2026.4.20-1); a SemVer tag is published unchanged (#1182). The
+          # original tag is kept as appVersion so the human-readable
+          # release identity survives on the artifact.
+          CHART_VERSION=$(python3 scripts/release_version.py chart-version "$VERSION")
           echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
           echo "→ packaging spatiumddi version=${CHART_VERSION} appVersion=${VERSION}"
           mkdir -p dist
@@ -385,7 +385,7 @@ jobs:
   # ── Build appliance ISO ─────────────────────────────────────────────────────
   # The build itself lives in build-appliance.yml (reusable, #823), so the
   # nightly exercises the exact same assembly daily instead of it only ever
-  # running when a release is cut. The CalVer tag serves as both the
+  # running when a release is cut. The release tag serves as both the
   # appliance-release stamp and the baked-image tag, and stable_copies
   # stays on (default) so the un-versioned spatiumddi-appliance-amd64.*
   # names exist for the /releases/latest/download/ stable URLs.
@@ -421,7 +421,7 @@ jobs:
   #
   # The native app lives in its own repo, so the schema is the contract
   # BETWEEN two repos rather than a file a client reads off this working tree.
-  # Attaching it per CalVer tag lets that client codegen against an exact
+  # Attaching it per release tag lets that client codegen against an exact
   # server version instead of against whatever ``main`` happens to be.
   #
   # Runs inside the api image this release just published, not a fresh venv:

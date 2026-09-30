@@ -73,6 +73,7 @@ from app.core.agent_wake import (
 )
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
+from app.core.versions import upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -5331,6 +5332,13 @@ async def schedule_appliance_upgrade(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     resolved_url = row.desired_slot_image_url or target.url
+    # #1182 — which way this moves the node. Never refused: this is also the
+    # manual rollback path, and the label is operator-typed. But a backward
+    # move boots older code against a database the newer release may already
+    # have migrated (#1227), so it is recorded and logged as a warning, and
+    # the Fleet form warns before it is sent. The rolling orchestrator does
+    # refuse a backward target (the preflight's version_path check).
+    direction = upgrade_direction(row.installed_appliance_version, body.desired_appliance_version)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5345,15 +5353,20 @@ async def schedule_appliance_upgrade(
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
                 "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "installed_appliance_version": row.installed_appliance_version,
+                "direction": direction,
             },
         )
     )
     await db.commit()
-    logger.info(
+    log = logger.warning if direction in ("backward", "same") else logger.info
+    log(
         "appliance_upgrade_scheduled",
         appliance_id=str(row.id),
         hostname=row.hostname,
+        installed_version=row.installed_appliance_version,
         desired_version=body.desired_appliance_version,
+        direction=direction,
         user=current_user.username,
     )
     # #358 Phase 1 — wake the supervisor heartbeat long-poll so the upgrade

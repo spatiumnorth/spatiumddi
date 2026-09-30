@@ -1732,13 +1732,13 @@ Hybrid BIOS + UEFI boot via grub (`Bootable=yes`, `Bootloader=grub`,
 ### Future build pipeline (Phases 2–5)
 
 ```
-trigger: tag push (CalVer)
+trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
   ↓
 1. Reuse the existing image-build workflows
-   - ghcr.io/spatiumnorth/spatiumddi-api:<calver>
-   - ghcr.io/spatiumnorth/spatiumddi-frontend:<calver>
-   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<calver>
-   - ghcr.io/spatiumnorth/dhcp-kea:<calver>
+   - ghcr.io/spatiumnorth/spatiumddi-api:<release tag>
+   - ghcr.io/spatiumnorth/spatiumddi-frontend:<release tag>
+   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<release tag>
+   - ghcr.io/spatiumnorth/dhcp-kea:<release tag>
   ↓
 2. Build appliance images via the builder container
    - Phase 1: amd64 qcow2 (all-in-one)
@@ -2497,7 +2497,7 @@ OS. The `/appliance` Releases card lists recent GitHub releases;
 operator clicks Apply, the api pod writes a trigger file the
 host-side `spatiumddi-release-update.path` unit watches, the
 runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
-new CalVer tag. helm-controller picks up the change and runs
+new release tag. helm-controller picks up the change and runs
 `helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
 — which pulls images from the local containerd image store (already
 loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
@@ -2668,7 +2668,7 @@ drives upgrades for all of them from a single screen.
   pending operator-set desired version.
 * Clicking **Upgrade** on an appliance row opens a release picker
   (same `applianceReleasesApi.list` source as the per-box UI).
-  The picked CalVer tag is written to that agent's
+  The picked release tag is written to that agent's
   `desired_appliance_version` + `desired_slot_image_url` columns.
 * The agent's next ConfigBundle long-poll picks it up via the new
   `fleet_upgrade` block on the bundle. The agent's
@@ -2698,6 +2698,7 @@ picker plus a pre-filled copy-paste command:
   # Kubernetes:
   helm upgrade spatiumddi-dns-bind9 \
     oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+    --version 2026.5.12-2 \
     --set image.tag=2026.05.12-2 \
     --reuse-values
   ```
@@ -2879,8 +2880,12 @@ so a first-time operator never gets stuck looking for the upload.
 **Flow (operator-facing):**
 
 1. Operator opens `/appliance` → **Rolling Upgrade**.
-2. Types the **Target version (CalVer)**. Tab refuses any tag that
-   doesn't match `YYYY.MM.DD-N` (preflight's `version_path` check).
+2. Types the **Target version**: a release tag, CalVer (`YYYY.MM.DD-N`)
+   up to the bridge or SemVer (`1.0.0`) from 1.0.0 on. Preflight's
+   `version_path` check fails a tag that is not a release, and a target
+   that is not newer than the running release (SemVer → CalVer is
+   backward). A build that is not a release (`dev`, a nightly) is
+   unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict`, `replication_lag`, `disk_headroom`,
@@ -2989,7 +2994,7 @@ you — the `etcd_snapshot_freshness` row warns when the newest snapshot
 the seed has reported is older than the cron interval, or when there is
 none — but it can only report; taking one is still a manual step, and
 nothing can tell preflight whether a given target crosses a Kubernetes
-minor (the target is a CalVer tag; the k3s it bakes is not known until
+minor (the target is a release tag; the k3s it bakes is not known until
 the image boots). Read the release notes.
 
 Same-minor bumps are unaffected — revert the slot and you are done.
@@ -3016,7 +3021,7 @@ Same-minor bumps are unaffected — revert the slot and you are done.
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):
      a. Fleet → Upgrade images → Upload .raw.xz + paste the SHA-256 +
-        type the CalVer tag → Upload. Bytes stream through the api
+        type the release tag → Upload. Bytes stream through the api
         to the mirror PVC. (Connected installs can skip steps 1-2 and
         use the "Pick from GitHub Releases" tab here instead.)
      b. Rolling Upgrade → type 2026.06.01-1 → leave source as

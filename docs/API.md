@@ -83,7 +83,7 @@ feature area.
 
 `/api/openapi.json` always describes the **running** build, which is the
 right answer for a browser and the wrong one for a client generated ahead
-of time. Since #903 the same document is attached to every CalVer release
+of time. Since #903 the same document is attached to every release
 as `openapi.json`, so an out-of-repo client — the native app in
 [`spatiumnorth/spatiumddi-mobile`](https://github.com/spatiumnorth/spatiumddi-mobile)
 — can codegen against an exact server version rather than against whatever

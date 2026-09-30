@@ -4,7 +4,7 @@
 The native app lives in its own repo (``spatiumnorth/spatiumddi-mobile``), so
 the schema is no longer a file a client can read off the working tree — it is
 the contract between two repos, and it has to be versioned and fetchable.
-``.github/workflows/release.yml`` runs this on every CalVer tag and attaches
+``.github/workflows/release.yml`` runs this on every release tag and attaches
 the result to the release; the same command reproduces that artifact locally
 (``make openapi``) and in the mobile repo's CI.
 
@@ -127,7 +127,7 @@ def main() -> int:
         "--version",
         default=os.environ.get("VERSION"),
         help=(
-            "Value for info.version — the CalVer tag in CI (GITHUB_REF_NAME). "
+            "Value for info.version — the release tag in CI (GITHUB_REF_NAME). "
             "Defaults to $VERSION, and to the app's own default ('dev') when "
             "neither is set."
         ),

@@ -15,6 +15,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { helmChartVersion } from "@/lib/versions";
 
 // Number of most-recent releases rendered as full cards. Anything older
 // collapses behind a "Show N older releases" disclosure so the tab
@@ -326,10 +327,15 @@ function ManualApplyModal({
     `SPATIUMDDI_VERSION=${tag} docker compose pull && \\`,
     `SPATIUMDDI_VERSION=${tag} docker compose up -d`,
   ].join("\n");
+  // --version is required, not optional (#1182): every CalVer chart is a
+  // SemVer pre-release, and Helm's unversioned resolution skips those, so
+  // without it Helm finds no chart at all.
+  const chartVersion = helmChartVersion(tag);
   const k8sCmd = [
     "# On a workstation with kubectl + helm pointed at the cluster:",
     "helm upgrade spatiumddi \\",
     "  oci://ghcr.io/spatiumnorth/charts/spatiumddi \\",
+    ...(chartVersion ? [`  --version ${chartVersion} \\`] : []),
     `  --set image.tag=${tag} \\`,
     "  --reuse-values",
   ].join("\n");

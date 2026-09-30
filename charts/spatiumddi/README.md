@@ -7,10 +7,12 @@ StatefulSets.
 
 - **Chart type:** application
 - **Registry:** `oci://ghcr.io/spatiumnorth/charts/spatiumddi`
-- **Versioning:** Each SpatiumDDI release tag (CalVer `YYYY.MM.DD-N`)
-  publishes a chart version with leading zeroes stripped so it's a
-  valid SemVer 2 identifier — e.g. tag `2026.04.20-1` →
-  chart version `2026.4.20-1`.
+- **Versioning:** Each SpatiumDDI release tag publishes a chart version.
+  A CalVer tag (`YYYY.MM.DD-N`, up to the bridge release) has its
+  leading zeroes stripped so it's a valid SemVer 2 identifier — e.g. tag
+  `2026.04.20-1` → chart version `2026.4.20-1`. A SemVer tag (from
+  1.0.0) is the chart version unchanged. Every CalVer chart is a SemVer
+  pre-release, so Helm finds it only with an explicit `--version`.
 
 ## TL;DR
 

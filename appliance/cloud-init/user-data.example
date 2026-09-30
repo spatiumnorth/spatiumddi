@@ -28,7 +28,7 @@ users:
 
 # ── Optional: pin a SpatiumDDI release tag ────────────────────────────────────
 # Without this, the appliance pulls :latest on first boot. For
-# production use, pin to a known-good CalVer tag.
+# production use, pin to a known-good release tag.
 #
 # write_files:
 #   - path: /etc/spatiumddi/release
