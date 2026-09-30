@@ -36,9 +36,12 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from typing import Any
 
 __all__ = [
+    "ADDRESS_MATCH_LIST_OPTIONS",
     "BUILTIN_ACLS",
+    "PATH_OPTION_PREFIXES",
     "RESERVED_VIEW_NAMES",
     "AclCycleError",
     "ViewValidationError",
@@ -46,6 +49,7 @@ __all__ = [
     "order_acls_for_render",
     "validate_acl_name",
     "validate_address_match_list",
+    "validate_server_option",
     "validate_view_name",
 ]
 
@@ -403,3 +407,204 @@ def order_acls_for_render(acls: list[dict]) -> list[dict]:
     for name in sorted(by_name):
         visit(name, [])
     return ordered
+
+
+# ── server-group options (issue #1244) ───────────────────────────────────
+#
+# ``DNSServerOptions`` holds the same kind of free text as a view, and the
+# renderers interpolate it the same way — verbatim, into ``options { … }``
+# (and, for the query-log path, into a ``file "…"`` clause). Until #1244
+# ``PUT /dns/groups/{id}/options`` stored it unchecked, so the options
+# editor accepted values that could never render: one bad element and
+# ``named-checkconf`` refused the bundle, which since #882 the agent reverts
+# and alerts on, but which the form had already reported as saved.
+#
+# The gate is at the API only. A test that wants a group's config to fail
+# (#882's end-to-end lever) can still write the row through the ORM or hand
+# the agent a bundle directly; what it can no longer do is get an operator
+# form to accept the value.
+
+#: Options that are BIND address-match-lists: addresses, prefixes, the
+#: built-ins, ``key <name>`` and ACL names, each optionally negated.
+ADDRESS_MATCH_LIST_OPTIONS = (
+    "allow_query",
+    "allow_query_cache",
+    "allow_recursion",
+    "allow_transfer",
+    "allow_notify",
+    "blackhole",
+    "rrl_exempt_clients",
+)
+
+#: Single-token options rendered bare (``forward only;``,
+#: ``notify explicit;``), so anything outside the grammar is a syntax error.
+_OPTION_CHOICES: dict[str, frozenset[str]] = {
+    "forward_policy": frozenset({"first", "only"}),
+    "dnssec_validation": frozenset({"auto", "yes", "no"}),
+    "notify_enabled": frozenset({"yes", "no", "explicit", "master-only", "primary-only"}),
+    "query_log_channel": frozenset({"file", "syslog", "stderr"}),
+}
+
+#: ``severity`` in a logging channel. ``debug`` may carry a level.
+_SEVERITIES = frozenset({"critical", "error", "warning", "notice", "info", "dynamic", "debug"})
+_DEBUG_LEVEL_RE = re.compile(r"^debug\s+\d{1,3}$")
+
+#: Where each path option may point. The query log has to land in the
+#: directory the agent's entrypoint chowns to the unprivileged user (and
+#: that its shipper tails); a keytab is read-only host material.
+PATH_OPTION_PREFIXES: dict[str, tuple[str, ...]] = {
+    "query_log_file": ("/var/log/named/",),
+    "gss_tsig_keytab_path": ("/etc/", "/var/lib/"),
+}
+
+# Deliberately narrow: the value sits inside ``"…"`` in named.conf, so a
+# quote, a semicolon, a brace, whitespace or a control character would
+# either close the string or end the statement.
+_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+
+
+def _validate_path(value: str, *, field: str) -> str:
+    candidate = (value or "").strip()
+    prefixes = PATH_OPTION_PREFIXES[field]
+    if not _PATH_RE.match(candidate):
+        raise ViewValidationError(
+            f"'{value}' is not a usable path: it must be absolute and contain "
+            f"only letters, digits, '.', '_', '-' and '/' — it is written "
+            f'into named.conf inside "…".',
+            field=field,
+            value=value,
+        )
+    if any(part in (".", "..") for part in candidate.split("/")):
+        raise ViewValidationError(
+            f"'{value}' contains a '.' or '..' segment; give the path directly.",
+            field=field,
+            value=value,
+        )
+    if not candidate.startswith(prefixes) or candidate.endswith("/"):
+        raise ViewValidationError(
+            f"'{value}' must be a file under {' or '.join(prefixes)}.",
+            field=field,
+            value=value,
+        )
+    return candidate
+
+
+def _validate_choice(value: str, *, field: str) -> str:
+    candidate = (value or "").strip().lower()
+    if field == "query_log_severity":
+        if candidate in _SEVERITIES or _DEBUG_LEVEL_RE.match(candidate):
+            return candidate
+        allowed = ", ".join(sorted(_SEVERITIES)) + ", debug <level>"
+    else:
+        if candidate in _OPTION_CHOICES[field]:
+            return candidate
+        allowed = ", ".join(sorted(_OPTION_CHOICES[field]))
+    raise ViewValidationError(
+        f"'{value}' is not a valid value (one of: {allowed}).",
+        field=field,
+        value=value,
+    )
+
+
+def _validate_port(port: str, *, field: str, element: str) -> None:
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ViewValidationError(
+            f"'{port}' is not a port number (1-65535).", field=field, value=element
+        )
+
+
+def _validate_ip(ip: str, *, field: str, element: str) -> None:
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError as exc:
+        raise ViewValidationError(
+            f"'{ip}' is not an IP address.", field=field, value=element
+        ) from exc
+
+
+def _validate_forwarders(elements: list[str], *, field: str) -> list[str]:
+    """``ip`` or ``ip@port`` — the wire shape both renderers split on ``@``."""
+    cleaned: list[str] = []
+    for element in elements:
+        raw = (element or "").strip()
+        ip, sep, port = raw.partition("@")
+        _validate_ip(ip.strip(), field=field, element=element)
+        if sep:
+            _validate_port(port.strip(), field=field, element=element)
+        cleaned.append(raw)
+    return cleaned
+
+
+def _validate_also_notify(
+    elements: list[str], *, field: str, known_keys: frozenset[str]
+) -> list[str]:
+    """``<ip> [port <n>] [key <name>]`` per entry.
+
+    NOT an address-match-list: ``also-notify`` names servers to send NOTIFY
+    to, so a prefix, a negation or an ACL name is a syntax error there.
+    """
+    cleaned: list[str] = []
+    for element in elements:
+        raw = (element or "").strip()
+        tokens = raw.split()
+        if not tokens:
+            raise ViewValidationError(
+                "Empty entry — remove it or replace it with an IP address.",
+                field=field,
+                value=element,
+            )
+        _validate_ip(tokens[0], field=field, element=element)
+        rest = tokens[1:]
+        if rest[:1] == ["port"] and len(rest) >= 2:
+            _validate_port(rest[1], field=field, element=element)
+            rest = rest[2:]
+        if rest[:1] == ["key"] and len(rest) == 2:
+            if rest[1] not in known_keys:
+                known = ", ".join(sorted(known_keys)) if known_keys else "none defined"
+                raise ViewValidationError(
+                    f"'{rest[1]}' is not a TSIG key defined in this server group "
+                    f"(available: {known}).",
+                    field=field,
+                    value=element,
+                )
+            rest = []
+        if rest:
+            raise ViewValidationError(
+                f"'{raw}' is not '<ip> [port <n>] [key <name>]'.",
+                field=field,
+                value=element,
+            )
+        cleaned.append(" ".join(tokens))
+    return cleaned
+
+
+def validate_server_option(
+    field: str,
+    value: Any,
+    *,
+    known_acls: frozenset[str] = frozenset(),
+    known_keys: frozenset[str] = frozenset(),
+) -> Any:
+    """Validate one ``DNSServerOptions`` field; return the cleaned value.
+
+    Fields without a named.conf grammar here are returned unchanged — the
+    booleans and integers are already typed by the request model.
+    """
+    if value is None:
+        return None
+    if field in ADDRESS_MATCH_LIST_OPTIONS:
+        return validate_address_match_list(
+            list(value),
+            field=field,
+            known_acls=known_acls,
+            known_keys=known_keys,
+        )
+    if field == "forwarders":
+        return _validate_forwarders(list(value), field=field)
+    if field == "also_notify":
+        return _validate_also_notify(list(value), field=field, known_keys=known_keys)
+    if field in _OPTION_CHOICES or field == "query_log_severity":
+        return _validate_choice(str(value), field=field)
+    if field in PATH_OPTION_PREFIXES:
+        return _validate_path(str(value), field=field)
+    return value

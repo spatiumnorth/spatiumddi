@@ -99,6 +99,7 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_server_option,
     validate_view_name,
 )
 from app.services.dns.record_identity import describe_identical, find_identical_record
@@ -3163,6 +3164,38 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerO
     return opts  # type: ignore[return-value]
 
 
+async def _validated_option_changes(
+    group_id: uuid.UUID, changes: dict[str, Any], opts: DNSServerOptions, db: DB
+) -> dict[str, Any]:
+    """Validate the options about to reach named.conf (#1244).
+
+    Only a field whose value CHANGES is checked. The options form sends
+    every field on every save, so checking them all would turn a value
+    stored before this gate existed into a 422 on an unrelated edit — the
+    operator changing the RRL window would be told their query-log path is
+    wrong, with no way to save until they fixed a field they never touched.
+    A new row has no previous values, so everything on it is checked.
+
+    Raises 422 naming the field and the offending element, the same shape
+    as the view and ACL validators.
+    """
+    acl_names, known_keys = await _group_symbol_names(group_id, db)
+    cleaned: dict[str, Any] = {}
+    try:
+        for field, value in changes.items():
+            if value is None or value == getattr(opts, field, None):
+                continue
+            cleaned[field] = validate_server_option(
+                field, value, known_acls=acl_names, known_keys=known_keys
+            )
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+    return cleaned
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -3194,6 +3227,7 @@ async def update_options(
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
+    changes.update(await _validated_option_changes(group_id, changes, opts, db))
     for k, v in changes.items():
         setattr(opts, k, v)
 

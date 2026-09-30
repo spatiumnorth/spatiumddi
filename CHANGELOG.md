@@ -223,6 +223,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS server options editor refuses values BIND cannot load
+  (#1244).** `PUT /dns/groups/{id}/options` stored `allow-query` and the
+  other address lists, `also-notify`, the forwarders, the single-word
+  options (`forward`, `dnssec-validation`, `notify`, the query-log channel
+  and severity) and the query-log and GSS-TSIG keytab paths without any
+  check, and the renderers write them into `named.conf` as they are. One
+  bad element and `named-checkconf` refused the whole group's config:
+  since #882 the agent reverts and raises an alert, but the form had
+  already reported the save as successful. Each field is now checked
+  against BIND's grammar for it, and a bad value is a 422 naming the field
+  and the element, the same shape as the view and ACL checks (#876, #899).
+  A key or ACL name must be defined in the group. `also_notify` takes
+  `<ip> [port <n>] [key <name>]`, not an address list. The query-log file
+  must sit under `/var/log/named/`, where the agent can write it and its
+  shipper reads it, and a keytab under `/etc/` or `/var/lib/`.
+  Only a changed value is checked, because the form sends every field on
+  every save: a value stored before this fix doesn't block an unrelated
+  edit, but can't be saved again once changed.
+
 - **The Fleet drilldown's Packet capture button no longer leads to a
   form that can't run (#1311).** `tools.pcap` ships disabled, and only its
   API was gated. The button opened the Packet Capture page anyway, and a

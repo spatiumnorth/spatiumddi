@@ -1399,10 +1399,36 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
 
 ### Server options
 
-- **`forward_policy` enum.** `first` or `only`. Validator in
-  `backend/app/api/v1/dns/router.py`.
-- **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator in
-  `backend/app/api/v1/dns/router.py`.
+Everything below is written into `named.conf` as is, so an invalid value
+would make BIND refuse the whole group's config. Each is a `422` naming
+the field and the offending element, from `validate_server_option` in
+`backend/app/services/dns/named_conf_validation.py` (#1244). Only a value
+that **changes** is checked: the options form sends every field on every
+save, and a value stored before this check existed must not block an
+unrelated edit.
+
+- **Address-match-lists.** `allow_query`, `allow_query_cache`,
+  `allow_recursion`, `allow_transfer`, `allow_notify`, `blackhole` and
+  `rrl_exempt_clients` take addresses, CIDR prefixes, the built-ins
+  (`any` / `none` / `localhost` / `localnets`), `key <name>` and ACL names,
+  each optionally negated with `!`. A key or ACL name must be defined in the
+  group. Same gate as a view's `match_clients` (#876).
+- **`also_notify`.** `<ip> [port <n>] [key <name>]` per entry. Not an
+  address-match-list: it names servers to NOTIFY, so a prefix, a negation or
+  an ACL name is refused.
+- **`forwarders`.** `<ip>` or `<ip>@<port>`.
+- **`forward_policy` enum.** `first` or `only`.
+- **`dnssec_validation` enum.** `auto`, `yes`, or `no`.
+- **`notify_enabled` enum.** `yes`, `no`, `explicit`, `master-only` or
+  `primary-only`.
+- **`query_log_channel` enum.** `file`, `syslog` or `stderr`.
+- **`query_log_severity`.** `critical`, `error`, `warning`, `notice`,
+  `info`, `dynamic`, `debug` or `debug <level>`.
+- **Paths.** `query_log_file` must be a file under `/var/log/named/` (the
+  directory the agent makes writable and its query-log shipper tails), and
+  `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
+  absolute, with no `.` or `..` segment, using only letters, digits, `.`,
+  `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
 
 ## 16. Multi-group / split-horizon publishing at the IPAM layer (issue #25)
 
