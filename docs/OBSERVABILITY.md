@@ -137,12 +137,17 @@ All services use `structlog` configured to emit **newline-delimited JSON** (NDJS
 | `level` | `debug`, `info`, `warning`, `error`, `critical` |
 | `service` | `api`, `worker`, `beat`, `agent`, `dhcp`, `dns` |
 | `instance` | Hostname or pod name |
-| `request_id` | In the api, the caller's `X-Request-ID` when it is 1–64 characters of `A-Z a-z 0-9 . _ : -`, otherwise a generated UUID; returned as `X-Request-ID` on every response. In the worker, the Celery task id, bound for the length of the task. Absent on lines logged outside a request or task |
+| `request_id` | In the api, a UUID generated for every request, never the caller's (it is stored in the tamper-evident `audit_log.request_id`, so a caller must not choose it). In the worker, the Celery task id, bound for the length of the task. Absent on lines logged outside a request or task |
+| `client_request_id` | The caller's own `X-Request-ID`, when it sent one of 1–64 characters of `A-Z a-z 0-9 . _ : -`. The response echoes it back as `X-Request-ID`; without one, the response carries `request_id` |
 
 The worker and beat log through the same pipeline as the api (#1246),
 including Celery's own stdlib lines (`Task … received` / `succeeded`), so
-one filter on `service` / `request_id` covers all three. The one exception
-is Celery's startup banner, printed once before logging is configured.
+one filter on `service` / `request_id` covers all three. The effective
+level is the more verbose of `--loglevel` and `LOG_LEVEL`, and `--logfile`
+receives the JSON lines. A worker running an embedded scheduler (`-B`) logs
+as `service=worker`; its scheduler lines carry `logger=celery.beat`. The one
+plain-text exception is Celery's startup banner, printed once before logging
+is configured.
 
 ### Sensitive Data Rules (enforced by linting)
 - **Never log**: passwords, tokens, API keys, full credentials

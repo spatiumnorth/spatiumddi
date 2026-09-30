@@ -76,8 +76,7 @@ async def test_an_audit_row_carries_the_request_id_and_the_chain_verifies(
     client: AsyncClient, db_session: AsyncSession
 ):
     headers = await _admin_headers(db_session)
-    rid = await _audited_create(client, {**headers, "X-Request-ID": "client-corr-42"})
-    assert rid == "client-corr-42"
+    rid = await _audited_create(client, headers)
 
     row = await _row_for(db_session, rid)
     assert row is not None and row.action == "create"
@@ -85,6 +84,28 @@ async def test_an_audit_row_carries_the_request_id_and_the_chain_verifies(
     # verification as a content edit.
     result = await verify_chain(db_session)
     assert result.ok, result.breaks
+
+
+@pytest.mark.asyncio
+async def test_a_client_id_is_echoed_but_never_stored_in_the_audit_row(
+    client: AsyncClient, db_session: AsyncSession
+):
+    # The audit column is inside the tamper-evidence hash: a caller-chosen
+    # id there would let a caller make its rows claim another request's id.
+    headers = await _admin_headers(db_session)
+    echoed = await _audited_create(client, {**headers, "X-Request-ID": "victim-request-7"})
+    assert echoed == "victim-request-7"  # the caller still gets its own id back
+    assert await _row_for(db_session, "victim-request-7") is None
+    newest = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.action == "create").order_by(AuditLog.seq.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert newest is not None and uuid.UUID(newest.request_id)
 
 
 @pytest.mark.asyncio
@@ -99,7 +120,7 @@ async def test_a_generated_id_is_recorded_when_the_client_sends_none(
 
 @pytest.mark.parametrize(
     "value",
-    ["x" * 65, "has space", "semi;colon", "", "ünïcode"],
+    ["x" * 65, "has space", "semi;colon", "", "ünïcode", "abc\n"],
 )
 def test_an_unusable_client_id_is_replaced_not_truncated(value: str):
     # It would fail the 64-character column, or be unfit for a log field;
@@ -144,47 +165,90 @@ async def test_the_bound_id_is_used_outside_a_request_and_an_explicit_one_wins(
 # ── #1246: the worker and beat ────────────────────────────────────────
 
 
-def test_the_command_line_names_the_service():
-    assert _celery_service(["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]) == "beat"
-    assert _celery_service(["celery", "-A", "app.celery_app", "worker", "-Q", "dns"]) == "worker"
+@pytest.mark.parametrize(
+    ("argv", "service"),
+    [
+        (["celery", "-A", "app.celery_app", "beat", "--loglevel=info"], "beat"),
+        (["celery", "--app=app.celery_app", "beat"], "beat"),
+        (["celery", "-A", "app.celery_app", "-b", "redis://x", "beat"], "beat"),
+        (["celery", "-A", "app.celery_app", "worker", "-Q", "dns"], "worker"),
+        # A queue NAMED beat is still a worker; so is an embedded scheduler.
+        (["celery", "-A", "app.celery_app", "worker", "-Q", "beat"], "worker"),
+        (["celery", "-A", "app.celery_app", "worker", "-B"], "worker"),
+    ],
+)
+def test_the_subcommand_names_the_service(argv: list[str], service: str):
+    assert _celery_service(argv) == service
 
 
-def test_a_task_binds_its_id_and_unbinds_it_after():
-    class _Task:
-        name = "app.tasks.example"
+class _Task:
+    name = "app.tasks.example"
 
+
+def test_a_task_binds_its_id_and_clears_it_after():
     _bind_task_request_id(task_id="t-1", task=_Task())
-    try:
-        ctx = structlog.contextvars.get_contextvars()
-        assert ctx["request_id"] == "t-1"
-        assert ctx["task"] == "app.tasks.example"
-    finally:
-        _unbind_task_request_id()
+    ctx = structlog.contextvars.get_contextvars()
+    assert ctx["request_id"] == "t-1"
+    assert ctx["task"] == "app.tasks.example"
+    _unbind_task_request_id(task_id="t-1")
     assert "request_id" not in structlog.contextvars.get_contextvars()
+    assert "task" not in structlog.contextvars.get_contextvars()
 
 
-def test_celery_is_told_not_to_install_its_own_logging():
-    # Any receiver on setup_logging stops Celery hijacking the root logger
-    # and redirecting stdout, which would wrap each JSON line in a text one.
+def test_an_eager_task_restores_its_callers_id():
+    # .apply() / task_always_eager run the task inside an API request or
+    # another task; clearing would leave the caller with no request_id.
+    tokens = structlog.contextvars.bind_contextvars(request_id="outer-request")
+    try:
+        _bind_task_request_id(task_id="t-2", task=_Task())
+        assert structlog.contextvars.get_contextvars()["request_id"] == "t-2"
+        _unbind_task_request_id(task_id="t-2")
+        assert structlog.contextvars.get_contextvars()["request_id"] == "outer-request"
+        assert "task" not in structlog.contextvars.get_contextvars()
+    finally:
+        structlog.contextvars.reset_contextvars(**tokens)
+
+
+def test_our_receiver_is_what_stops_celery_installing_its_own_logging():
+    # A receiver on setup_logging stops Celery hijacking the root logger and
+    # redirecting stdout, which would wrap each JSON line in a text one. It
+    # must be OURS: another library's receiver would keep a bare
+    # "any receivers" check green with ours removed.
+    import weakref
+
     from celery.signals import setup_logging
 
-    assert setup_logging.receivers
+    from app.celery_app import _configure_structured_logging
+
+    connected = [
+        ref() if isinstance(ref, weakref.ReferenceType) else ref
+        for _key, ref in setup_logging.receivers
+    ]
+    assert _configure_structured_logging in connected
 
 
 @pytest.fixture
 def worker_logging(monkeypatch: pytest.MonkeyPatch):
-    """configure_logging as the worker, writing into a buffer; restored after."""
+    """configure_logging as the worker, writing into a buffer.
+
+    Restores what it replaced — the structlog config, the root handlers and
+    the root level — rather than resetting to defaults, so a later test sees
+    the configuration it would have seen had this one never run.
+    """
     from app import log as log_module
 
+    saved_config = structlog.get_config()
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
     monkeypatch.setattr(log_module.settings, "log_format", "json")
+    monkeypatch.setattr(log_module.settings, "log_level", "INFO")
     buffer = io.StringIO()
     configure_logging(service="worker", stream=buffer)
     yield buffer
-    root = logging.getLogger()
-    for handler in list(root.handlers):
-        if getattr(handler, log_module._HANDLER_FLAG, False):
-            root.removeHandler(handler)
-    structlog.reset_defaults()
+    root.handlers[:] = saved_handlers
+    root.setLevel(saved_level)
+    structlog.configure(**saved_config)
 
 
 def _lines(buffer: io.StringIO) -> list[dict]:
@@ -221,3 +285,15 @@ def test_configuring_twice_does_not_duplicate_lines(worker_logging: io.StringIO)
 def test_an_explicit_service_on_a_line_is_kept(worker_logging: io.StringIO):
     structlog.get_logger().info("startup", service="api")
     assert _lines(worker_logging)[0]["service"] == "api"
+
+
+def test_a_more_verbose_loglevel_wins_and_a_quieter_one_does_not(worker_logging: io.StringIO):
+    # Celery no longer applies --loglevel itself once we own setup_logging,
+    # so configure_logging takes it: --loglevel=debug must still show debug,
+    # and a quieter command-line default must not hide LOG_LEVEL's info.
+    configure_logging(service="worker", stream=worker_logging, level="DEBUG")
+    logging.getLogger("x").debug("debug-visible")
+    configure_logging(service="worker", stream=worker_logging, level=logging.WARNING)
+    logging.getLogger("x").info("info-still-visible")
+    events = [line["event"] for line in _lines(worker_logging)]
+    assert events == ["debug-visible", "info-still-visible"]

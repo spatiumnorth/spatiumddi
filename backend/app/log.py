@@ -30,7 +30,18 @@ def _service_adder(service: str) -> structlog.types.Processor:
     return _add
 
 
-def configure_logging(service: str = "api", *, stream: TextIO | None = None) -> None:
+def _level_number(value: int | str, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    return int(getattr(logging, str(value).upper(), default))
+
+
+def configure_logging(
+    service: str = "api",
+    *,
+    stream: TextIO | None = None,
+    level: int | str | None = None,
+) -> None:
     """Configure structlog for JSON output per the observability spec.
 
     One pipeline for both kinds of line. structlog loggers render through
@@ -42,8 +53,13 @@ def configure_logging(service: str = "api", *, stream: TextIO | None = None) -> 
 
     ``stream`` sends both to one file object; the default is the process's
     stdout for structlog lines and stderr for stdlib records, as before.
+    ``level`` (Celery's ``--loglevel``) applies only when it is MORE verbose
+    than ``LOG_LEVEL``, so neither a command-line default nor the setting
+    can hide what the other asked to see.
     """
-    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    level_no = _level_number(settings.log_level, logging.INFO)
+    if level is not None:
+        level_no = min(level_no, _level_number(level, level_no))
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
@@ -61,7 +77,7 @@ def configure_logging(service: str = "api", *, stream: TextIO | None = None) -> 
 
     structlog.configure(
         processors=shared_processors + exc_processors + [renderer],
-        wrapper_class=structlog.make_filtering_bound_logger(level),
+        wrapper_class=structlog.make_filtering_bound_logger(level_no),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(file=stream),
         cache_logger_on_first_use=True,
@@ -85,4 +101,4 @@ def configure_logging(service: str = "api", *, stream: TextIO | None = None) -> 
         if getattr(existing, _HANDLER_FLAG, False):
             root.removeHandler(existing)
     root.addHandler(handler)
-    root.setLevel(level)
+    root.setLevel(level_no)

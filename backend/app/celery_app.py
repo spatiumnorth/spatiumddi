@@ -1,9 +1,20 @@
+import contextvars
 import importlib
 import sys
+from collections.abc import Mapping
+from typing import Any
 
 import structlog
 from celery import Celery
 from celery.schedules import crontab, schedule
+from celery.signals import (
+    beat_init,
+    setup_logging,
+    task_failure,
+    task_postrun,
+    task_prerun,
+    worker_init,
+)
 
 from app.config import settings
 
@@ -753,8 +764,8 @@ if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
 # uncaught task exception lands in the ``internal_error`` table so
 # operators can review crashes without tailing ``docker compose logs
 # worker``. ``task_revoked`` and ``task_unknown`` are deliberately
-# *not* hooked — those are operational signals, not bugs.
-from celery.signals import task_failure  # noqa: E402
+# *not* hooked — those are operational signals, not bugs. The handler,
+# ``_capture_task_failure``, is below the init-signal handlers.
 
 # Schema-at-head signal registration (issue #565). ``app.tasks.
 # schema_check`` connects ``worker_ready`` / ``beat_init`` /
@@ -765,8 +776,6 @@ from celery.signals import task_failure  # noqa: E402
 # Use import_module (not a bound ``import … as _x``) so static analysis
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
-
-from celery.signals import beat_init, worker_init  # noqa: E402
 
 
 @worker_init.connect
@@ -841,23 +850,62 @@ def _capture_task_failure(
 # ``configure_logging`` used to run only in the api's lifespan, so worker
 # and beat output was Celery's plain text plus structlog's dev console
 # renderer, with no ``service`` and no ``request_id`` — non-negotiable #7.
-from celery.signals import setup_logging, task_postrun, task_prerun  # noqa: E402
+
+#: ``celery`` global options that take a value, so the token after them is
+#: not the subcommand. Every other ``-x`` / ``--x`` / ``--x=v`` is a flag.
+_CELERY_VALUE_OPTIONS = frozenset(
+    {"-A", "--app", "-b", "--broker", "--result-backend", "--loader", "--config", "--workdir"}
+)
 
 
 def _celery_service(argv: list[str] | None = None) -> str:
     """``beat`` or ``worker``, from the ``celery -A app.celery_app <cmd>``
     command line. ``setup_logging`` fires in both before either's own init
-    signal, and does not say which one it is."""
-    return "beat" if "beat" in (argv if argv is not None else sys.argv)[1:] else "worker"
+    signal, and does not say which one it is.
+
+    Decided by the SUBCOMMAND, not by any token equal to ``beat``: a queue
+    named ``beat`` (``worker -Q beat``) is still a worker. A worker running
+    an embedded scheduler (``worker -B``) is one process and logs as
+    ``worker``; its scheduler lines are told apart by ``logger=celery.beat``.
+    """
+    tokens = (argv if argv is not None else sys.argv)[1:]
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        if token in _CELERY_VALUE_OPTIONS:
+            skip = True
+            continue
+        if token.startswith("-"):
+            continue
+        return "beat" if token == "beat" else "worker"
+    return "worker"
 
 
 @setup_logging.connect
-def _configure_structured_logging(**_: object) -> None:
+def _configure_structured_logging(
+    loglevel: int | str | None = None, logfile: str | None = None, **_: object
+) -> None:
     """Connecting ANY receiver to ``setup_logging`` stops Celery installing
     its own root handler and redirecting stdout into it — which is what
     would otherwise wrap every structlog JSON line in a second, plain-text
-    Celery record."""
-    importlib.import_module("app.log").configure_logging(service=_celery_service())
+    Celery record.
+
+    That also means Celery no longer applies ``--loglevel`` / ``--logfile``
+    itself, so both are passed through: the level is the more verbose of
+    ``--loglevel`` and ``LOG_LEVEL`` (so ``--loglevel=debug`` still turns
+    debugging on), and ``--logfile`` receives the JSON lines.
+    """
+    stream = open(logfile, "a", buffering=1, encoding="utf-8") if logfile else None  # noqa: SIM115
+    importlib.import_module("app.log").configure_logging(
+        service=_celery_service(), stream=stream, level=loglevel
+    )
+
+
+#: The context tokens each running task's ``request_id`` / ``task`` binding
+#: replaced, keyed by task id, so postrun can restore rather than clear.
+_TASK_CONTEXT_TOKENS: dict[str, Mapping[str, contextvars.Token[Any]]] = {}
 
 
 @task_prerun.connect
@@ -868,11 +916,23 @@ def _bind_task_request_id(
     and every audit row it writes (#1245), carries it, so a scheduled
     change can be traced from the audit log to the worker's output. The
     ``task_failure`` hook above already files diagnostics under it."""
-    structlog.contextvars.bind_contextvars(request_id=task_id, task=getattr(task, "name", None))
+    tokens = structlog.contextvars.bind_contextvars(
+        request_id=task_id, task=getattr(task, "name", None)
+    )
+    if task_id is not None:
+        _TASK_CONTEXT_TOKENS[task_id] = tokens
 
 
 @task_postrun.connect
-def _unbind_task_request_id(**_: object) -> None:
-    # A prefork child runs many tasks; without this the next task's
-    # pre-bind lines would inherit the previous task's id.
-    structlog.contextvars.unbind_contextvars("request_id", "task")
+def _unbind_task_request_id(task_id: str | None = None, **_: object) -> None:
+    """Put back what the task's binding replaced.
+
+    Restored, not cleared: a task applied eagerly (``.apply()``, or
+    ``task_always_eager``) runs inside an API request or another task, and
+    clearing would leave the rest of that caller logging — and writing audit
+    rows — with no ``request_id``. In a prefork child with nothing bound
+    before, restoring IS clearing, so the next task still starts clean.
+    """
+    tokens = _TASK_CONTEXT_TOKENS.pop(task_id, None) if task_id is not None else None
+    if tokens:
+        structlog.contextvars.reset_contextvars(**tokens)
