@@ -122,16 +122,24 @@ does not know was silently dropped by the agent.
 | `code:NN` | a raw DHCPv4 code, for the codes SpatiumDDI ships an `option-def` for: 43, 123, 132, 150, 160, 161, 176 and 242. Binary codes (43, 123) take plain even-length hex, with no `0x` and no `:` separators. Kea rejects both forms. Not accepted on a Windows group |
 | `opt-NN` | the Windows spelling, and the importer's for an option it does not canonicalise. Only the Windows driver reads it, so only the code range is checked. Accepted only on a group whose servers are all Windows |
 
-Which raw spelling a group accepts depends on its servers, because each
-driver silently drops the other's: Kea and FortiGate read `code:NN` and
-skip `opt-NN`; Windows reads `opt-NN` and skips `code:NN`. So `opt-NN` is
-refused on a group with no Windows server (including a group with no
-servers yet) and `code:NN` on a Windows group, each naming the spelling to
-use instead. A group that mixes Windows with Kea or FortiGate (refused for
-new servers since #1110) takes neither, because one side would drop it:
-use a named option or split the group. An option stored before this check
-(an imported `opt-NN` on a Kea group, say) stays editable as long as it is
-left unchanged.
+Which raw spelling a scope accepts depends on its group's servers,
+because each driver silently drops the other's: Kea and FortiGate read
+`code:NN` and skip `opt-NN`; Windows reads `opt-NN` and skips `code:NN`.
+So on scope options, and on option templates (which are applied to
+scopes), `opt-NN` is refused on a group with no Windows server (including
+a group with no servers yet) and `code:NN` on a Windows group, each naming
+the spelling to use instead. A group that mixes Windows with Kea or
+FortiGate takes neither, because one side would drop it: use a named
+option or split the group. (Adding a server that would mix Kea and Windows
+has been refused since #1110; a FortiGate + Windows group can still be
+assembled.)
+
+Pool and reservation overrides, client classes and device policies are
+rendered by Kea and FortiGate only, never by Windows, so they always take
+`code:NN`, whatever else is in the group.
+
+An option stored before this check (an imported `opt-NN` on a Kea group,
+say) stays editable as long as it is left unchanged.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6

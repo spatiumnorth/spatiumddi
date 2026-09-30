@@ -364,7 +364,8 @@ async def create_device_policy(
         raise HTTPException(status_code=409, detail="A device policy with that name exists")
     # Device policies are DHCPv4 only by construction (options 55 / 60).
     body.options = normalize_options(body.options)
-    await validate_dhcp_options(db, body.options, group_id=group_id, address_family="ipv4")
+    # A device policy compiles to a Kea client class: the Kea raw-code rule (#1296).
+    await validate_dhcp_options(db, body.options, group_id=None, address_family="ipv4")
     override = _validate_override(body.match_override)
 
     payload = body.model_dump()
@@ -434,7 +435,7 @@ async def update_device_policy(
         await validate_dhcp_options(
             db,
             changes["options"],
-            group_id=row.group_id,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family="ipv4",
             previous=row.options or {},
         )

@@ -341,6 +341,14 @@ def test_a_mixed_group_takes_neither_raw_spelling(key: str) -> None:
         validate_options({key: "0104"}, raw_codes=RAW_CODES_NONE)
 
 
+@pytest.mark.parametrize("key", ["code:43", "opt-43"])
+def test_a_v6_raw_code_is_refused_as_v4_only_not_as_the_other_spelling(key: str) -> None:
+    """Naming the other spelling on a v6 scope would send the operator to a
+    key that is refused too."""
+    with pytest.raises(ValueError, match="DHCPv4 only"):
+        validate_options({key: "0104"}, address_family="ipv6")
+
+
 def test_named_options_are_accepted_whatever_the_group() -> None:
     for raw_codes in (RAW_CODES_KEA, RAW_CODES_WINDOWS, RAW_CODES_NONE):
         validate_options({"routers": ["10.0.0.1"]}, raw_codes=raw_codes)
@@ -383,7 +391,7 @@ async def _group_with(db: AsyncSession, *drivers: str) -> DHCPServerGroup:
     ],
     ids=["kea-opt", "kea-code", "empty-opt", "fortigate-opt", "win-opt", "win-code", "mixed"],
 )
-async def test_a_client_class_takes_the_groups_raw_spelling(
+async def test_an_option_template_takes_the_groups_raw_spelling(
     client: AsyncClient,
     db_session: AsyncSession,
     drivers: tuple[str, ...],
@@ -391,18 +399,41 @@ async def test_a_client_class_takes_the_groups_raw_spelling(
     status: int,
     fragment: str | None,
 ) -> None:
+    """Templates are applied to scopes, whose options a Windows server renders."""
     h = await _headers(db_session)
     grp = await _group_with(db_session, *drivers)
     await db_session.commit()
     value = "0104" if key.startswith("code:") else "http://wpad.example/wpad.dat"
     resp = await client.post(
-        f"/api/v1/dhcp/server-groups/{grp.id}/client-classes",
+        f"/api/v1/dhcp/server-groups/{grp.id}/option-templates",
         headers=h,
-        json={"name": "c", "options": {key: value}},
+        json={"name": "t", "options": {key: value}},
     )
     assert resp.status_code == status, resp.text
     if fragment:
         assert fragment in str(resp.json()["detail"])
+
+
+@pytest.mark.parametrize(
+    "drivers", [("windows_dhcp",), ("kea", "windows_dhcp")], ids=["win", "mixed"]
+)
+async def test_kea_only_constructs_take_the_kea_spelling_on_any_group(
+    client: AsyncClient, db_session: AsyncSession, drivers: tuple[str, ...]
+) -> None:
+    """Client classes are rendered by Kea / FortiGate alone, never Windows, so
+    a Windows member does not change what they accept: code:NN is served by
+    the Kea side of a mixed group, and opt-NN would be served by nothing."""
+    h = await _headers(db_session)
+    grp = await _group_with(db_session, *drivers)
+    await db_session.commit()
+    url = f"/api/v1/dhcp/server-groups/{grp.id}/client-classes"
+    ok = await client.post(url, headers=h, json={"name": "c", "options": {"code:150": "10.0.0.9"}})
+    assert ok.status_code == 201, ok.text
+    bad = await client.post(
+        url, headers=h, json={"name": "d", "options": {"opt-252": "http://wpad.example/wpad.dat"}}
+    )
+    assert bad.status_code == 422, bad.text
+    assert "use code:252" in str(bad.json()["detail"])
 
 
 async def test_a_kea_scope_refuses_opt_nn_on_every_write_path(

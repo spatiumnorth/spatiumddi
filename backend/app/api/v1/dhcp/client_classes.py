@@ -77,7 +77,8 @@ async def create_class(
     # A client class always renders into Dhcp4 (and into Dhcp6 when the
     # group has v6 scopes); "any" checks it as the Dhcp4 it must load in.
     body.options = normalize_options(body.options)
-    await validate_dhcp_options(db, body.options, group_id=group_id, address_family="any")
+    # A client class is rendered by Kea / FortiGate only: the Kea raw-code rule (#1296).
+    await validate_dhcp_options(db, body.options, group_id=None, address_family="any")
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
@@ -110,7 +111,7 @@ async def update_class(
         await validate_dhcp_options(
             db,
             changes["options"],
-            group_id=cc.group_id,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family="any",
             previous=cc.options or {},
         )

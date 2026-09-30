@@ -33,6 +33,7 @@ from app.services.dhcp.option_validation import (
     RAW_CODES_KEA,
     RAW_CODES_NONE,
     RAW_CODES_WINDOWS,
+    changes_raw_code,
     normalize_options,
     option_key_code,
     validate_options,
@@ -95,10 +96,20 @@ async def validate_dhcp_options(
 
     Covers names and values; the FQDN checks #597 added live in the same
     validator now. Keys unchanged from ``previous`` are skipped, so an edit
-    that round-trips a grandfathered option is not blocked by it. The raw
-    option-code spelling is checked against ``group_id``'s drivers (#1296).
+    that round-trips a grandfathered option is not blocked by it.
+
+    The raw option-code spelling is checked against ``group_id``'s drivers
+    (#1296). Pass ``group_id`` only for options a Windows server renders:
+    scope options, and option templates (applied to scopes). Pool and
+    reservation overrides, client classes and device policies are rendered by
+    Kea / FortiGate alone, so those callers pass ``None`` and get the Kea
+    rule even on a group with Windows members.
     """
-    raw_codes = await group_raw_codes(db, group_id)
+    # The drivers only matter to a changed raw-code key; skip the query for
+    # the common all-named-options write.
+    raw_codes = (
+        await group_raw_codes(db, group_id) if changes_raw_code(opts, previous) else RAW_CODES_KEA
+    )
     try:
         validate_options(
             opts, address_family=address_family, previous=previous, raw_codes=raw_codes

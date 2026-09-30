@@ -248,7 +248,7 @@ async def create_static(
         await validate_dhcp_options(
             db,
             body.options_override,
-            group_id=scope.group_id,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
         )
     await _conflict_check(db, scope, body.ip_address, body.mac_address)
@@ -297,7 +297,7 @@ async def update_static(
         await validate_dhcp_options(
             db,
             changes["options_override"],
-            group_id=scope.group_id,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
             previous=st.options_override or {},
         )

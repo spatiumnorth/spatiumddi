@@ -229,12 +229,14 @@ the formatter handles the rest.
   skips `code:NN`. The option check from #1228 accepted both spellings on
   every group, so an `opt-NN` on a Kea group, or a `code:NN` on a Windows
   one, was saved and silently dropped by the server: the failure #1228 set
-  out to stop. Scopes, pools, reservations, option templates, client
-  classes and device policies now check the raw spelling against the
-  group's servers and name the one to use. A group with no servers yet
-  follows the Kea rule, and a group mixing Windows with another driver
-  takes neither spelling. Named options are unaffected, and a stored raw
-  option (an imported `opt-NN`, say) stays editable while it is unchanged.
+  out to stop. Scope options and option templates now check the raw
+  spelling against the group's servers and name the one to use. A group
+  with no servers yet follows the Kea rule, and a group mixing Windows
+  with another driver takes neither spelling. Pool and reservation
+  overrides, client classes and device policies, which only Kea and
+  FortiGate render, always take `code:NN`. Named options are unaffected,
+  and a stored raw option (an imported `opt-NN`, say) stays editable while
+  it is unchanged.
 
 - **A BIND9 apply is reported OK only once named is actually serving it
   (#1224, #1239).** Validation ran `named-checkconf`, which never reads zone

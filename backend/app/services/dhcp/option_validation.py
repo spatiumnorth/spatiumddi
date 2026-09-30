@@ -35,8 +35,9 @@ each driver silently drops the other's: Kea and FortiGate read ``code:NN``
 and skip ``opt-NN``, Windows reads ``opt-NN`` and skips ``code:NN``. So the
 caller passes ``raw_codes``: ``"code"`` for a group with no Windows member
 (Kea, FortiGate, or no servers yet), ``"opt"`` for an all-Windows group, and
-``"none"`` for a group mixing the two (refused for new servers since #1110),
-where neither spelling reaches every member.
+``"none"`` for a group mixing Windows with another driver, where neither
+spelling reaches every member. (#1110 refuses only the Kea + Windows mix for
+new servers; FortiGate + Windows can still be assembled.)
 
 Everything else — including ``option_data``, the raw Kea passthrough that
 internal producers (#972) merge in at bundle time — is refused.
@@ -359,9 +360,11 @@ def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_C
     raw = _RAW_CODE.fullmatch(key)
     if raw:
         code = int(raw.group(1))
-        _refuse_raw_spelling(key, raw.group(1), raw_codes)
+        # Before the spelling check: naming the other spelling on a v6 scope
+        # would send the operator to a key that is refused too.
         if address_family == "ipv6":
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
+        _refuse_raw_spelling(key, raw.group(1), raw_codes)
         if code not in _KEA_VENDOR_OPTION_DEFS:
             supported = ", ".join(f"code:{c}" for c in sorted(_KEA_VENDOR_OPTION_DEFS))
             raise ValueError(
@@ -378,6 +381,9 @@ def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_C
 
     win = _WINDOWS_CODE.fullmatch(key)
     if win:
+        if address_family == "ipv6" and raw_codes != RAW_CODES_WINDOWS:
+            # The ``code:NN`` the spelling check would suggest is v4-only.
+            raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
         _refuse_raw_spelling(key, win.group(1), raw_codes)
         if not 1 <= int(win.group(1)) <= 254:
             raise ValueError(f"option '{key}': option codes run 1..254")
@@ -426,14 +432,29 @@ def validate_options(
     that round-trips a grandfathered option — stored before this check existed,
     or brought in by an importer — is not blocked by it (the #597 stance).
     """
+    for key, value in _changed_options(options, previous):
+        _check_one(key, value, address_family, raw_codes)
+
+
+def _changed_options(
+    options: Mapping[str, Any], previous: Mapping[str, Any] | None
+) -> list[tuple[str, Any]]:
+    """The ``(key, value)`` pairs of ``options`` not unchanged from ``previous``."""
     # Compare against the stored map under canonical names, so a row stored
     # under a legacy alias (``domain-name-servers``, #583) that the write
     # normalised still counts as unchanged.
     prev = {OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in (previous or {}).items()}
-    for key, value in options.items():
-        if key in prev and prev[key] == value:
-            continue
-        _check_one(str(key), value, address_family, raw_codes)
+    return [
+        (str(key), value)
+        for key, value in options.items()
+        if not (str(key) in prev and prev[str(key)] == value)
+    ]
+
+
+def changes_raw_code(options: Mapping[str, Any], previous: Mapping[str, Any] | None = None) -> bool:
+    """Whether ``options`` sets a raw-code key (``code:NN`` / ``opt-NN``) that
+    ``validate_options`` would check — the only case ``raw_codes`` matters."""
+    return any(_is_code_key(key) for key, _ in _changed_options(options, previous))
 
 
 # ── Phone profiles (#1294) ──────────────────────────────────────────────────

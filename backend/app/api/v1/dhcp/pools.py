@@ -220,7 +220,7 @@ async def create_pool(
         await validate_dhcp_options(
             db,
             body.options_override,
-            group_id=scope.group_id,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
         )
 
@@ -312,7 +312,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         await validate_dhcp_options(
             db,
             changes["options_override"],
-            group_id=scope.group_id if scope else None,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=(scope.address_family if scope else None) or "ipv4",
             previous=pool.options_override or {},
         )
