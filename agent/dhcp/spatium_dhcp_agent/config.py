@@ -58,17 +58,36 @@ class AgentConfig:
         return Path(str(self.kea_lease_file).replace("leases4", "leases6"))
 
     def httpx_verify(self) -> bool | str:
-        """Resolve the ``verify=`` argument for ``httpx.Client`` calls.
+        """Resolve the ``verify=`` argument for every control-plane client.
 
-        Issue #266 — was previously duplicated across 9 modules. Single
-        source of truth: ``insecure_skip_tls_verify`` (dev-only override)
-        wins over a custom CA bundle; the default is full verification.
+        ``TLS_CA_PATH`` wins over ``SPATIUM_INSECURE_SKIP_TLS_VERIFY`` (#1220):
+        an operator who mounted the control plane's CA meant it to be used,
+        and the skip used to win silently, so following the documented CA
+        setup while the compose default still said ``1`` verified nothing.
         """
-        if self.insecure_skip_tls_verify:
-            return False
         if self.tls_ca_path:
             return self.tls_ca_path
-        return True
+        return not self.insecure_skip_tls_verify
+
+    def tls_warning(self) -> str | None:
+        """What to warn about at every start, or None. Only for ``https``:
+        against a plain-``http`` URL (the in-stack ``http://api:8000``)
+        there is no certificate to verify either way."""
+        if not self.control_plane_url.lower().startswith("https://"):
+            return None
+        if self.tls_ca_path and self.insecure_skip_tls_verify:
+            return (
+                "SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 is ignored because TLS_CA_PATH is "
+                "set: the control plane is verified against that CA"
+            )
+        if self.insecure_skip_tls_verify:
+            return (
+                "TLS verification of the control plane is OFF "
+                "(SPATIUM_INSECURE_SKIP_TLS_VERIFY=1): anyone on the network path "
+                "can read the agent key and serve this agent its configuration. "
+                "Mount the control plane's CA and set TLS_CA_PATH instead"
+            )
+        return None
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
