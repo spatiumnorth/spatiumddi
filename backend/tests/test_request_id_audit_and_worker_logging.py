@@ -297,3 +297,30 @@ def test_a_more_verbose_loglevel_wins_and_a_quieter_one_does_not(worker_logging:
     logging.getLogger("x").info("info-still-visible")
     events = [line["event"] for line in _lines(worker_logging)]
     assert events == ["debug-visible", "info-still-visible"]
+
+
+def test_logfile_receives_json_and_a_reconfigure_closes_the_old_handle(tmp_path, monkeypatch):
+    from app import celery_app as capp
+    from app import log as log_module
+
+    saved_config = structlog.get_config()
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    monkeypatch.setattr(log_module.settings, "log_format", "json")
+    try:
+        first = tmp_path / "worker-1.log"
+        capp._configure_structured_logging(loglevel=logging.INFO, logfile=str(first))
+        handle = capp._LOGFILE_STREAM
+        logging.getLogger("celery.app.trace").info("to the file")
+        assert json.loads(first.read_text().splitlines()[-1])["event"] == "to the file"
+
+        capp._configure_structured_logging(loglevel=logging.INFO, logfile=None)
+        assert handle is not None and handle.closed
+        assert capp._LOGFILE_STREAM is None
+    finally:
+        if capp._LOGFILE_STREAM is not None:
+            capp._LOGFILE_STREAM.close()
+            capp._LOGFILE_STREAM = None
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+        structlog.configure(**saved_config)

@@ -2,7 +2,7 @@ import contextvars
 import importlib
 import sys
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TextIO
 
 import structlog
 from celery import Celery
@@ -883,6 +883,11 @@ def _celery_service(argv: list[str] | None = None) -> str:
     return "worker"
 
 
+#: The ``--logfile`` handle, when one was given. Module-level because it must
+#: outlive the signal handler that opens it.
+_LOGFILE_STREAM: TextIO | None = None
+
+
 @setup_logging.connect
 def _configure_structured_logging(
     loglevel: int | str | None = None, logfile: str | None = None, **_: object
@@ -897,9 +902,17 @@ def _configure_structured_logging(
     ``--loglevel`` and ``LOG_LEVEL`` (so ``--loglevel=debug`` still turns
     debugging on), and ``--logfile`` receives the JSON lines.
     """
-    stream = open(logfile, "a", buffering=1, encoding="utf-8") if logfile else None  # noqa: SIM115
+    global _LOGFILE_STREAM
+    # Held open for the life of the process — every later line is written to
+    # it — and closed if logging is ever configured again, so a second
+    # setup never leaks the first handle.
+    if _LOGFILE_STREAM is not None:
+        _LOGFILE_STREAM.close()
+        _LOGFILE_STREAM = None
+    if logfile:
+        _LOGFILE_STREAM = open(logfile, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
     importlib.import_module("app.log").configure_logging(
-        service=_celery_service(), stream=stream, level=loglevel
+        service=_celery_service(), stream=_LOGFILE_STREAM, level=loglevel
     )
 
 
