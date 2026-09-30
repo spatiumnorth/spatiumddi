@@ -1195,7 +1195,7 @@ cp .env.example .env
 #   POSTGRES_PASSWORD=<set this>
 #   SECRET_KEY=$(openssl rand -hex 32)
 #   DNS_AGENT_KEY=$(openssl rand -hex 32)   # needed if running the DNS container
-docker compose build
+docker compose pull
 docker compose run --rm migrate
 docker compose up -d
 ```
@@ -1376,8 +1376,8 @@ EOF
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
-- Kubernetes 1.31+ with Helm 3, **or**
-- Ubuntu 22.04 / Debian 12 / Alpine 3.20+ for bare metal
+- Kubernetes 1.36 with Helm 4 (what the charts are tested against; k3s 1.36 on the appliance), **or**
+- The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
 ---
 
@@ -1399,6 +1399,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | Document | Description |
 |---|---|
 | [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
+| [Changelog](CHANGELOG.md) | What changed in each release, including upgrade notes |
 | [Architecture](docs/ARCHITECTURE.md) | System topology, control plane / data plane split, agent contract, HA design |
 | [Data Model](docs/DATA_MODEL.md) | Database models grouped by domain, key relationships, shared conventions |
 | [REST API](docs/API.md) | API conventions — pagination, filtering, error format, auth, versioning |
@@ -1421,7 +1422,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
 | [Docker Compose](docs/deployment/DOCKER.md) | Compose setup, ports, first-time setup, TLS, HA, password reset |
 | [Kubernetes](docs/deployment/KUBERNETES.md) | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA |
-| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance |
+| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, OS appliance (the Compose Patroni overlay is unsupported in 1.0) |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
 | [Third-Party Components](docs/THIRD_PARTY.md) | Every bundled engine, library and OS package — license, artifact it ships in, and why it's there |

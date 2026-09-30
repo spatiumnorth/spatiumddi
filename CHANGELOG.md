@@ -223,6 +223,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Compose upgrade steps upgrade, and the deployment docs stop
+  describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
+  upgrade procedure ran `docker compose build`, which rebuilds nothing:
+  `docker-compose.yml` pins pre-built images and has no `build:`
+  sections, so following it re-ran the images already on the host. It
+  and the install steps in DOCKER.md, README and BAREMETAL.md now run
+  `docker compose pull`. The Compose Patroni overlay
+  (`k8s/ha/postgres-docker-compose.yaml`) was presented as a working HA
+  path in four docs, but Patroni never starts under it, and on an
+  existing install it comes up as a new project on empty volumes. It is
+  now documented as non-functional and unsupported in 1.0, with the
+  reasons in the file's own header; making Compose HA real stays #137.
+  Also corrected: the Compose Redis runs without AOF, not with it;
+  CloudNativePG replication is asynchronous, so a failover can lose the
+  last few commits; the README requirements named Kubernetes 1.31 /
+  Helm 3 and a bare-metal install that does not exist; the feature docs'
+  dated status banners; a missing CHANGELOG link in the docs index and
+  README; and three stale code comments.
+
 - **A raw option code in the spelling the group's servers drop is
   refused, not saved and never served (#1296).** Kea and FortiGate read
   raw options as `code:NN` and skip `opt-NN`; Windows reads `opt-NN` and

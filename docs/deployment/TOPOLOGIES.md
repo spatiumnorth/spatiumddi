@@ -170,8 +170,12 @@ DNS / DHCP agents per Topology 2 / 3 above, pointing at the LB URL.
 - `k8s/ha/postgres-cluster.yaml` — CloudNativePG manifest (K8s analogue of
   Patroni). Three-node primary + 2 replicas with auto-failover.
 - `k8s/ha/redis-sentinel.yaml` — Redis Sentinel manifest.
-- `k8s/ha/postgres-docker-compose.yaml` — Patroni reference for Docker Compose
-  (use this if you're not on K8s yet but want a real HA database).
+- `k8s/ha/postgres-docker-compose.yaml` — a Patroni overlay for Docker
+  Compose that **does not work and is unsupported in 1.0**: Patroni never
+  starts, and on an existing install it comes up on empty volumes (see its
+  header, and [#137](https://github.com/spatiumnorth/spatiumddi/issues/137)
+  for making Compose HA real). For a real HA database off Kubernetes, use
+  the appliance ([Topology 7](#topology-7--appliance-multi-node-control-plane-ha-272)).
 - `charts/spatiumddi` — umbrella Helm chart that selects the HA shapes
   via `postgresql.kind=cnpg` / `redis.kind=sentinel`.
 
@@ -340,7 +344,8 @@ recommended HA path for operators who installed from the ISO.
 
 **Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
-node, the UI stays up on the same address. Bring the node back, or
+node, the UI stays up on the same address. CNPG replicates
+asynchronously, so a failover can lose the last few commits (RPO > 0). Bring the node back, or
 replace it — operator-driven dead-node replacement is the Phase 9
 follow-up tracked on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 

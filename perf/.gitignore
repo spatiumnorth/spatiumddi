@@ -1,5 +1,4 @@
 # Live run state + artifacts are regenerated per run — never committed.
-# (Rendered reports under perf/reports/<run_id>/ ARE committed for reproducibility.)
 run/
 *.pyc
 __pycache__/

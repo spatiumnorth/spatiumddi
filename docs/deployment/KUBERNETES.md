@@ -310,8 +310,15 @@ references for non-Helm installs.
 ### PostgreSQL — CloudNativePG
 
 Set `postgresql.kind: cnpg` to render a CloudNativePG `Cluster` CR (a
-primary + sync/async replicas with automatic failover) instead of the
-single-node StatefulSet:
+primary + streaming replicas with automatic failover) instead of the
+single-node StatefulSet.
+
+Replication is **asynchronous**: the `Cluster` sets no
+`postgresql.synchronous`, so a commit returns before a replica has it, and a
+failover can lose the last few commits (RPO > 0). That trades a small window
+of possible loss for write latency that does not depend on a replica. If you
+need zero data loss on failover, configure synchronous replication on the
+`Cluster` yourself and accept the latency.
 
 ```yaml
 postgresql:

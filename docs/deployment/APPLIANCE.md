@@ -453,7 +453,8 @@ the reference topologies are in
 - **PostgreSQL HA = CloudNativePG.** The operator-managed `Cluster` CR
   is the permanent appliance default (`postgresql.kind=cnpg`); instances
   scale with the committed member count (1 → 3/5/7, primary + streaming
-  replicas + automatic failover). The CNPG **operator** pod itself is
+  replicas + automatic failover). Replication is asynchronous, so a
+  failover can lose the last few commits (RPO > 0). The CNPG **operator** pod itself is
   pinned to a small Burstable footprint (`cnpg.resources`: 50m/128Mi
   requests, 500m/512Mi limits) so it isn't the first thing kubelet OOM-
   kills when the all-in-one control node gets tight — an unbounded

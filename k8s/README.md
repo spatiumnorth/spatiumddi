@@ -134,15 +134,15 @@ The operator creates two Services automatically:
 - `postgres-primary` → always points to the current primary (read/write)
 - `postgres-replica` → load-balances across read replicas
 
-### PostgreSQL HA — Patroni (Docker Compose)
+### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
-For Docker Compose HA deployments, use the Patroni-based setup:
-
-```bash
-docker compose -f docker-compose.yml -f k8s/ha/postgres-docker-compose.yaml up -d
-```
-
-Set `DATABASE_URL` to point at HAProxy port 5000 instead of the single `postgres` container.
+`ha/postgres-docker-compose.yaml` does **not** work. Patroni never starts,
+the overlay renames the compose project onto empty volumes, its network does
+not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing
+`.env` at HAProxy changes nothing. Don't run it against an existing install.
+The file's header lists the details, and
+[#137](https://github.com/spatiumnorth/spatiumddi/issues/137) tracks making
+Compose HA real. Use CloudNativePG (above) or the OS appliance for HA.
 
 ### Redis HA — Sentinel (K8s)
 

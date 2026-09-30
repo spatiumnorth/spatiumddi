@@ -284,6 +284,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
       <span class="idx-card-title">Third-Party Components</span>
       <span class="idx-card-desc">Every bundled engine, library and OS package, with its licence and the artifact it ships in</span>
     </a>
+    <a class="idx-card" href="{{ site.links.github }}/blob/main/CHANGELOG.md">
+      <span class="idx-card-title">Changelog</span>
+      <span class="idx-card-desc">What changed in each release, including upgrade notes</span>
+    </a>
     <a class="idx-card" href="{{ site.links.github }}">
       <span class="idx-card-title">Source, Releases &amp; Issues</span>
       <span class="idx-card-desc">The project on GitHub</span>

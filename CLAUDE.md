@@ -57,11 +57,11 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
 | `docs/deployment/KUBERNETES.md` | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA (see also `k8s/README.md` + `charts/spatiumddi/README.md`) |
-| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance (no Ansible playbooks; that path is planned, not implemented) |
+| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, OS appliance; the Compose Patroni overlay is documented as non-functional in 1.0 (#1236, real Compose HA is #137). No Ansible playbooks; that path is planned, not implemented |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
-| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
+| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, and a Patroni Compose overlay that does not work (#1236) |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
 | `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Technitium (agent-managed + agentless `technitium_api`) + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
