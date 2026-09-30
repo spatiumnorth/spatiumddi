@@ -195,6 +195,14 @@ APPLIANCE_ALL_ON=(
     --set observability.nodeExporter.enabled=true
     --set dns.useMetalLBVIP=true
     --set cnpg.enabled=true
+    # #1281 — the off-cluster shape: an external control-plane URL renders
+    # the pinned-certificate env, mount and hostPath volume in every role
+    # pod. appliance-full-stack below keeps the in-cluster (no URL) branch.
+    --set dnsBind9.controlPlaneUrl=https://cp.example
+    --set dnsPowerdns.controlPlaneUrl=https://cp.example
+    --set dnsTechnitium.controlPlaneUrl=https://cp.example
+    --set dhcpKea.controlPlaneUrl=https://cp.example
+    --set lookingGlass.controlPlaneUrl=https://cp.example
 )
 lint "$APPLIANCE"
 lint "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"

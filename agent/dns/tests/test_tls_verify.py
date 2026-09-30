@@ -68,7 +68,10 @@ def test_every_client_uses_the_one_resolution() -> None:
         path.name
         for path in PACKAGE.rglob("*.py")
         if path.name != "config.py"
-        and re.search(r"\.(insecure_skip_tls_verify|tls_ca_path)\b", path.read_text())
+        and re.search(
+            r"\.(insecure_skip_tls_verify|tls_ca_path|tls_pinned_certs_path)\b",
+            path.read_text(),
+        )
     ]
     assert offenders == []
 

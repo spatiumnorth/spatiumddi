@@ -113,18 +113,17 @@ dnsBind9:
       memory: 64Mi
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
-  # controlPlaneUrl is the EXTERNAL operator-facing URL (self-signed
-  # cert). #409 — the co-located DaemonSet agent now PREFERS this when
-  # the supervisor sets it (an Application appliance is its own single-
-  # node k3s with no in-cluster control Service, so the in-cluster name
-  # does not resolve), skipping TLS verify on that self-signed path.
-  # Empty on a control-plane/full-stack appliance → falls through to
-  # inClusterApiUrl (the #292 in-cluster verified-HTTP path).
-  # KNOWN LIMITATION: a promoted Application member keeps its baked
-  # external URL here (service_lifecycle._build_values is not yet member-
-  # aware), so its role pods stay on the external + TLS-skip path rather
-  # than the in-cluster path the heartbeat switches to — uncommon
-  # topology, tracked as a #409 follow-up.
+  # controlPlaneUrl is the EXTERNAL operator-facing URL. #409 — the
+  # co-located DaemonSet agent PREFERS this when the supervisor sets it (an
+  # Application appliance is its own single-node k3s with no in-cluster
+  # control Service, so the in-cluster name does not resolve). #1281 — on
+  # that path the agent verifies the control plane against the certificate
+  # the supervisor pinned (supervisor.hostMounts.stateDir + /tls, mounted
+  # read-only), where it used to skip verification.
+  # Empty on a control-plane member → falls through to inClusterApiUrl (the
+  # #292 in-cluster HTTP path). That includes an Application appliance
+  # promoted into the control plane: service_lifecycle.role_control_plane_url
+  # leaves this empty there, as the heartbeat switches to in-cluster too.
   controlPlaneUrl: ""
   # #292 — in-cluster API Service URL the co-located DaemonSet agent
   # registers against (plain HTTP — no TLS to verify intra-cluster, so

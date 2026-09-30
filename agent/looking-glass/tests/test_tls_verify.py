@@ -20,6 +20,7 @@ def _cfg(monkeypatch: pytest.MonkeyPatch, url: str, ca: str | None, skip: bool) 
     else:
         monkeypatch.setenv("TLS_CA_PATH", ca)
     monkeypatch.setenv("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "1" if skip else "0")
+    monkeypatch.delenv("TLS_PINNED_CERTS_PATH", raising=False)
     return AgentConfig.from_env()
 
 

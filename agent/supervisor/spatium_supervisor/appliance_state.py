@@ -3876,6 +3876,21 @@ def read_node_ip() -> str | None:
 # ── Issue #285 Phase 1 — fleet-firewall prerequisites ────────────────
 
 
+
+def is_control_plane_member() -> bool:
+    """True when this node is part of the control-plane k3s cluster: installed
+    as a control-plane seed, or an appliance promoted into it whose join the
+    host runner has reported ready.
+
+    The one definition, shared by the heartbeat (which switches to the
+    in-cluster api Service on a member) and the role chart values (whose agents
+    must switch with it, #1281), so the two cannot disagree about a node.
+    """
+    if detect_appliance_variant() == "control-plane":
+        return True
+    join_state, _ = read_cluster_join_state()
+    return join_state == "ready"
+
 def read_node_ips() -> list[str] | None:
     """Every k3s-registered InternalIP for this node (#285 Phase 1).
 

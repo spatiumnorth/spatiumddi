@@ -1842,10 +1842,8 @@ the formatter handles the rest.
   and session token no longer cross the wire in cleartext before the
   redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
   the CA, so an appliance moved to a rebuilt control plane pins the new one
-  rather than refusing it forever. Still open: the
-  DNS, DHCP and looking-glass role pods on an appliance skip verification
-  toward the control plane, which needs the pinned certificate passed
-  through to them (tracked separately).
+  rather than refusing it forever. The DNS, DHCP and looking-glass role
+  pods were left skipping verification here; #1281 below closes that.
   **Upgrade note:** an already-paired appliance takes its pin at its first
   contact after the upgrade, then checks it against the CA's list; a
   mismatch is logged as `supervisor.tls.pin_not_vouched`.
@@ -1862,6 +1860,33 @@ the formatter handles the rest.
   every real write moves, so the write-back rolls the frontend. Browsers
   stop being shown the first-boot certificate after a reboot as well. The
   revert itself remains #1215.
+
+- **Appliance role pods verify the control plane's TLS certificate
+  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
+  pods reach the control plane at its external URL, and the chart gave
+  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
+  the platform-wide agent key out and the DNS / DHCP configuration back,
+  so anyone on the path could read the key and serve a node its zones and
+  scopes. They now use the certificate their supervisor pinned (#1219): the
+  chart mounts the supervisor's `tls/` directory read-only (public material
+  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
+  trusts exactly the certificates in that file, with a pinned leaf as its
+  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
+  could not do this: it checks the hostname and needs a real CA, so a
+  CA-issued leaf or an IP URL fails there. The file is read on every
+  connection, so a certificate the supervisor re-pins reaches the agents
+  without a restart. Until the supervisor has pinned, every request fails
+  and the agent logs `control_plane_pin_unavailable`; it never falls back to
+  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip.
+  An appliance promoted into the control plane no longer gives its agents
+  the external URL at all: they use the in-cluster api Service, as its
+  supervisor does. That closes the #409 known limitation and is also
+  required here, because a member's supervisor heartbeats in-cluster and
+  never re-pins, while a member joining re-mints the Web UI certificate.
+  The role apply key now includes the agents' URL, so a promotion re-applies
+  the role chart. Not covered: an `http://` control-plane URL, which the
+  role agents still use as typed (the supervisor upgrades its own traffic
+  to the `https://` target).
 
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on
