@@ -35,6 +35,7 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
+from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     contains_control_chars,
@@ -98,6 +99,7 @@ from app.services.dns.named_conf_validation import (
     validate_acl_entries,
     validate_acl_name,
     validate_address_match_list,
+    validate_server_option,
     validate_view_name,
 )
 from app.services.dns.record_identity import describe_identical, find_identical_record
@@ -130,6 +132,7 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
+from app.services.dns.tsig import group_key_names
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -236,7 +239,7 @@ _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
-VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
+VALID_NOTIFY = {"yes", "no", "explicit", "master-only", "primary-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # Upstream forwarding transport (issue #50). No "https" member: BIND has no
 # client-side HTTP transport, so DoH-upstream isn't expressible on the BIND9
@@ -3162,6 +3165,71 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerO
     return opts  # type: ignore[return-value]
 
 
+async def _validated_option_changes(
+    group_id: uuid.UUID, changes: dict[str, Any], opts: Any, db: DB
+) -> dict[str, Any]:
+    """Validate the options about to reach named.conf (#1244).
+
+    Only a field whose value CHANGES is checked. The options form sends
+    every field on every save, so checking them all would turn a value
+    stored before this gate existed into a 422 on an unrelated edit — the
+    operator changing the RRL window would be told their query-log path is
+    wrong, with no way to save until they fixed a field they never touched.
+    A new row has no previous values, so everything on it is checked —
+    ``opts`` may be ``None`` for that case (zone create, #1316).
+
+    Raises 422 naming the field and the offending element, the same shape
+    as the view and ACL validators.
+    """
+    acl_names, known_keys = await _group_symbol_names(group_id, db)
+    cleaned: dict[str, Any] = {}
+    try:
+        for field, value in changes.items():
+            if value is None or value == getattr(opts, field, None):
+                continue
+            cleaned[field] = validate_server_option(
+                field, value, known_acls=acl_names, known_keys=known_keys
+            )
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+    return cleaned
+
+
+#: Zone fields written into the zone's own ``zone { … }`` statement (#1316).
+#: ``forwarders`` is deliberately absent: a Technitium forward zone may carry
+#: a hostname or DoH URL there, which the BIND ``ip[@port]`` grammar refuses.
+_ZONE_NAMED_CONF_FIELDS = ("allow_query", "allow_transfer", "also_notify", "notify_enabled")
+
+
+async def _validated_zone_named_conf_fields(
+    group_id: uuid.UUID, changes: dict[str, Any], zone: DNSZone | None, db: DB
+) -> dict[str, Any]:
+    """Validate a zone's named.conf clauses before they are stored (#1316).
+
+    The zone half of #1244: the agent renders a zone's ``allow-transfer``
+    (and the control-plane template all four) verbatim into the zone
+    statement, so one bad element makes BIND refuse the file and the WHOLE
+    group stops converging, not just this zone.
+
+    On update (``zone`` given) only a changed value is checked, for the
+    same reason as the options form: a value stored before this gate must
+    not block an unrelated edit. Raises 422 naming the field and element.
+    """
+    fields = {
+        k: v
+        for k, v in changes.items()
+        if k in _ZONE_NAMED_CONF_FIELDS
+        and v is not None
+        and (zone is None or v != getattr(zone, k, None))
+    }
+    if not fields:
+        return {}
+    return await _validated_option_changes(group_id, fields, zone, db)
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -3193,6 +3261,7 @@ async def update_options(
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
+    changes.update(await _validated_option_changes(group_id, changes, opts, db))
     for k, v in changes.items():
         setattr(opts, k, v)
 
@@ -3344,18 +3413,9 @@ async def _group_symbol_names(
     if exclude_acl_id is not None:
         acl_stmt = acl_stmt.where(DNSAcl.id != exclude_acl_id)
     acl_names = frozenset((await db.execute(acl_stmt)).scalars().all())
-
-    key_names = set(
-        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    # The group's legacy auto-generated loopback key is a real ``key {}`` in
-    # the rendered config too, so it is citable like any other.
-    group = await db.get(DNSServerGroup, group_id)
-    if group is not None and group.tsig_key_name:
-        key_names.add(group.tsig_key_name)
-    return acl_names, frozenset(key_names)
+    # Operator keys plus the group's legacy loopback key, which is a real
+    # ``key {}`` in the rendered config too and so citable like any other.
+    return acl_names, await group_key_names(db, group_id)
 
 
 async def _assert_acl_graph_is_acyclic(group_id: uuid.UUID, db: DB) -> None:
@@ -4154,7 +4214,9 @@ async def create_zone(
     if body.dnssec_enabled:
         await _check_driver_gated_operation("dnssec_sign", group_id, db)
 
-    zone = DNSZone(group_id=group_id, **body.model_dump())
+    payload = body.model_dump()
+    payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
+    zone = DNSZone(group_id=group_id, **payload)
     db.add(zone)
 
     # Write-through: push the create to any windows_dns-with-creds server
@@ -4240,7 +4302,7 @@ async def export_all_zones(
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 
@@ -4756,6 +4818,7 @@ async def update_zone(
     # nor empty the masters on an existing secondary.
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
         zone.group_id,
@@ -5793,6 +5856,7 @@ class ZoneMovePreviewResponse(BaseModel):
     dnssec_unsupported_drivers: list[str]
     acl_names_remapped: list[str]
     acl_names_lost: list[str]
+    key_names_lost: list[str]
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -5828,6 +5892,7 @@ class ZoneMovePreviewResponse(BaseModel):
             dnssec_unsupported_drivers=plan.dnssec_unsupported_drivers,
             acl_names_remapped=plan.acl_names_remapped,
             acl_names_lost=plan.acl_names_lost,
+            key_names_lost=plan.key_names_lost,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -7560,7 +7625,7 @@ async def export_zone(
     return Response(
         content=text,
         media_type="text/dns",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 

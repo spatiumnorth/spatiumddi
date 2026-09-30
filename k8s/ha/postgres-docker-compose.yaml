@@ -1,15 +1,31 @@
-# PostgreSQL HA for Docker Compose using Patroni
-# This is a SEPARATE compose file for HA Postgres.
-# It replaces the single `postgres` service in docker-compose.yml.
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ NOT FUNCTIONAL. DO NOT USE. Compose HA is unsupported in 1.0 (#1236).      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+# `docker compose -f docker-compose.yml -f <this file> config` shows why:
+#   1. pg1-pg3 have no `command:`, so they run postgres:16-alpine's own CMD and
+#      Patroni never starts: three independent standalone Postgres servers.
+#   2. The top-level `name: spatiumddi-ha` overrides the project name, so an
+#      existing install comes up as a NEW project on EMPTY volumes.
+#   3. `networks.spatiumddi` is `external: true, name: spatiumddi`, but the base
+#      stack creates `spatiumddi_spatiumddi`, so `up` fails with network-not-found.
+#   4. docker-compose.yml hardcodes DATABASE_URL / REDIS_URL / CELERY_* under
+#      `environment:`, which beats `env_file: .env`, so pointing .env at HAProxy
+#      changes nothing, and the base `postgres` service still runs.
+#   5. It bind-mounts ./haproxy.cfg, which is not in the repo.
+# It is kept only as a starting point for #137, which tracks making Compose HA
+# real. For a supported HA control plane, use the OS appliance (Topology 7) or
+# Kubernetes with CloudNativePG (charts/spatiumddi, k8s/ha/postgres-cluster.yaml).
 #
-# Usage:
-#   docker compose -f docker-compose.yml -f k8s/ha/postgres-docker-compose.yaml up -d
+# Intended design (NOT what this file does today, see above): PostgreSQL HA
+# for Docker Compose using Patroni, as a SEPARATE compose file replacing the
+# single `postgres` service in docker-compose.yml. Do not layer it onto a
+# running stack.
 #
-# Architecture:
+# Intended architecture:
 #   - 3 PostgreSQL nodes managed by Patroni (1 leader + 2 replicas)
 #   - etcd cluster for distributed consensus (3 nodes)
 #   - HAProxy for transparent primary discovery (port 5000 = read/write, 5001 = read-only)
-#   - Application connects to HAProxy:5000 — no code changes needed
+#   - Application connects to HAProxy:5000 (needs the DATABASE_URL fix in item 4)
 
 name: spatiumddi-ha
 

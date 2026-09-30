@@ -17,18 +17,23 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.option_validation import (
+    RAW_CODES_KEA,
+    RAW_CODES_NONE,
+    RAW_CODES_WINDOWS,
+    changes_raw_code,
     normalize_options,
     option_key_code,
     validate_options,
@@ -60,20 +65,55 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
 
-def validate_dhcp_options(
+async def group_raw_codes(db: AsyncSession, group_id: Any) -> str:
+    """The raw option-code spelling ``group_id``'s servers read (#1296).
+
+    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate read
+    ``code:NN`` and drop ``opt-NN``. A group with no servers yet follows Kea:
+    a Windows scope cannot exist without a Windows server to write it to.
+    """
+    if group_id is None:
+        return RAW_CODES_KEA
+    drivers = set(
+        (await db.execute(select(DHCPServer.driver).where(DHCPServer.server_group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    if "windows_dhcp" not in drivers:
+        return RAW_CODES_KEA
+    return RAW_CODES_WINDOWS if drivers == {"windows_dhcp"} else RAW_CODES_NONE
+
+
+async def validate_dhcp_options(
+    db: AsyncSession,
     opts: dict[str, Any],
     *,
+    group_id: Any,
     address_family: str = "ipv4",
     previous: dict[str, Any] | None = None,
 ) -> None:
-    """422 naming the first option the Kea renderer cannot emit (#1228).
+    """422 naming the first option the group's servers cannot serve (#1228).
 
     Covers names and values; the FQDN checks #597 added live in the same
     validator now. Keys unchanged from ``previous`` are skipped, so an edit
     that round-trips a grandfathered option is not blocked by it.
+
+    The raw option-code spelling is checked against ``group_id``'s drivers
+    (#1296). Pass ``group_id`` only for options a Windows server renders:
+    scope options, and option templates (applied to scopes). Pool and
+    reservation overrides, client classes and device policies are rendered by
+    Kea / FortiGate alone, so those callers pass ``None`` and get the Kea
+    rule even on a group with Windows members.
     """
+    # The drivers only matter to a changed raw-code key; skip the query for
+    # the common all-named-options write.
+    raw_codes = (
+        await group_raw_codes(db, group_id) if changes_raw_code(opts, previous) else RAW_CODES_KEA
+    )
     try:
-        validate_options(opts, address_family=address_family, previous=previous)
+        validate_options(
+            opts, address_family=address_family, previous=previous, raw_codes=raw_codes
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -657,7 +697,9 @@ async def create_scope(
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
     _create_options = normalize_options(body.options)
-    validate_dhcp_options(_create_options, address_family=address_family)
+    await validate_dhcp_options(
+        db, _create_options, group_id=group_id, address_family=address_family
+    )
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -807,8 +849,10 @@ async def update_scope(
         # review, #1228) — the scope form round-trips the full options dict,
         # so re-validating an unchanged grandfathered value would block an
         # unrelated edit.
-        validate_dhcp_options(
+        await validate_dhcp_options(
+            db,
             normalized,
+            group_id=scope.group_id,
             address_family=scope.address_family or "ipv4",
             previous=scope.options or {},
         )

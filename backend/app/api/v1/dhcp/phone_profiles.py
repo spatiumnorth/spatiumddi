@@ -21,12 +21,13 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.dns_names import contains_control_chars
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
     DHCPPhoneProfile,
@@ -34,6 +35,7 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServerGroup,
 )
+from app.services.dhcp.option_validation import validate_phone_options
 from app.services.dhcp.voip_options import load_catalog as load_voip_catalog
 
 router = APIRouter(
@@ -48,11 +50,11 @@ router = APIRouter(
 class PhoneOptionInput(BaseModel):
     """One DHCP option delivered when a phone profile match fires.
 
-    ``code`` is the DHCP option-code (e.g. 66 for tftp-server-name).
-    ``name`` is the Kea option-data name; when omitted the renderer
-    falls back to the option-code library lookup. ``value`` is the
-    Kea-format string ("10.0.0.1", "tftp.example.com", "0x012345…"
-    for binhex options).
+    ``code`` is the DHCP option-code (e.g. 66 for tftp-server-name) and
+    decides what is delivered (#1294). ``name`` is a label; a canonical
+    SpatiumDDI name that contradicts the code is refused. ``value`` is the
+    Kea-format string: an address, a hostname or URL, or plain hex digits
+    with no ``0x`` for a binary option such as 43.
     """
 
     code: int = Field(..., ge=1, le=254)
@@ -66,6 +68,15 @@ class PhoneOptionResponse(BaseModel):
     value: str
 
 
+def _check_vendor_match(v: str | None) -> str | None:
+    """The match renders inside a Kea string literal (``=='<match>'``); a
+    ``'`` ends the literal early and Kea rejects the WHOLE config (measured,
+    kea-dhcp4 3.0.3). Control characters have no business in option 60."""
+    if v is not None and ("'" in v or contains_control_chars(v)):
+        raise ValueError("vendor_class_match may not contain ' or control characters")
+    return v
+
+
 class PhoneProfileCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str = ""
@@ -74,6 +85,8 @@ class PhoneProfileCreate(BaseModel):
     vendor_class_match: str | None = Field(default=None, max_length=255)
     option_set: list[PhoneOptionInput] = []
     tags: dict[str, Any] = {}
+
+    _vendor_match = field_validator("vendor_class_match")(_check_vendor_match)
     # Optional: attach to scopes immediately on create. Each id must
     # belong to the same DHCPServerGroup as the profile.
     scope_ids: list[uuid.UUID] = []
@@ -87,6 +100,8 @@ class PhoneProfileUpdate(BaseModel):
     vendor_class_match: str | None = Field(None, max_length=255)
     option_set: list[PhoneOptionInput] | None = None
     tags: dict[str, Any] | None = None
+
+    _vendor_match = field_validator("vendor_class_match")(_check_vendor_match)
 
 
 class PhoneProfileResponse(BaseModel):
@@ -106,6 +121,19 @@ class PhoneProfileResponse(BaseModel):
 
 class PhoneProfileScopeAttach(BaseModel):
     scope_ids: list[uuid.UUID]
+
+
+def _check_options(
+    rows: list[dict], *, previous: Any = None, going_live: bool, enabled: bool = False
+) -> None:
+    """422 naming the first option Kea could not load (#1294). A profile being
+    enabled gets the full check, placeholders included; any other edit checks
+    only the options it changes, so a stored profile stays editable. A changed
+    option on an enabled profile may not be a placeholder either."""
+    try:
+        validate_phone_options(rows, previous=previous, going_live=going_live, enabled=enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _option_set_payload(rows: list[PhoneOptionInput]) -> list[dict]:
@@ -215,6 +243,7 @@ async def create_profile(
         raise HTTPException(status_code=409, detail="A phone profile with that name exists")
 
     await _validate_scope_ids(db, group_id, body.scope_ids)
+    _check_options(_option_set_payload(body.option_set), going_live=body.enabled)
 
     prof = DHCPPhoneProfile(
         group_id=group_id,
@@ -285,8 +314,17 @@ async def update_profile(
         if clash.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="A phone profile with that name exists")
 
+    going_live = bool(payload.get("enabled")) and not prof.enabled
     if "option_set" in payload:
         payload["option_set"] = _option_set_payload(body.option_set or [])
+        _check_options(
+            payload["option_set"],
+            previous=prof.option_set or [],
+            going_live=going_live,
+            enabled=bool(payload.get("enabled", prof.enabled)),
+        )
+    elif going_live:
+        _check_options(prof.option_set or [], going_live=True)
     if "tags" in payload:
         payload["tags"] = dict(payload["tags"] or {})
 

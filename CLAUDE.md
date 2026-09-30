@@ -57,11 +57,11 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
 | `docs/deployment/KUBERNETES.md` | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA (see also `k8s/README.md` + `charts/spatiumddi/README.md`) |
-| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance (no Ansible playbooks; that path is planned, not implemented) |
+| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, OS appliance; the Compose Patroni overlay is documented as non-functional in 1.0 (#1236, real Compose HA is #137). No Ansible playbooks; that path is planned, not implemented |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
-| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
+| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, and a Patroni Compose overlay that does not work (#1236) |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
 | `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Technitium (agent-managed + agentless `technitium_api`) + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
@@ -2769,7 +2769,7 @@ SpatiumDDI uses **CalVer**: `YYYY.MM.DD-N` where N is the release number for tha
 - Git tags and Docker image tags follow this scheme exactly
 - Release is triggered by pushing a tag (see `.github/workflows/release.yml`). It publishes nothing until three gates pass ([#1226](https://github.com/spatiumnorth/spatiumddi/issues/1226)): the tag is a release tag on `main` and `ci.yml` passed on that commit (it waits up to an hour for a running CI); every image is built once, pushed by digest, and both architectures pass Trivy + `trivy-gate.sh` before that digest is tagged; and `:latest` moves last, all images or none, only after the GitHub release exists. The tag decisions (validity, previous release, whether it becomes latest) live in `scripts/release_version.py`, on top of `backend/app/core/versions.py`'s ordering, and rank only tags on `main` with a published release (`.github/scripts/release-tags.sh`). The shipped image list is `.github/images.json`, shared by `release.yml`, `nightly.yml` and `scripts/lint_image_upgrades.py`
 
-**Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer until that lands. After it, every SemVer version must compare newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so never compare versions as strings; use the shared helper that #1182 introduces.
+**Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer up to and including the **bridge** (the last CalVer release); from 1.0.0 they are `MAJOR.MINOR.PATCH`, with candidates tagged `1.0.0-rc.N` and published as GitHub pre-releases. Every SemVer release is newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so **never compare versions as strings**: use `backend/app/core/versions.py` (`parse_release`, `includes_release`, `upgrade_direction`), its frontend mirror `frontend/src/lib/versions.ts` (keep the two in step; `versions.test.ts` runs the same cases), and, for tag decisions in CI, `scripts/release_version.py`. A build that is not a release (`dev`, `latest`, a nightly's `0.0.0-nightly-YYYYMMDD+sha`, a `0.x` placeholder) is an *unknown* version, never an old one. The bridge must ship before `1.0.0` is tagged: every "is this newer?" decision runs in the version being upgraded *from*, so only the bridge and later can see that 1.0.0 is newer. Every CalVer Helm chart is a SemVer pre-release, so a helm command for one needs an explicit `--version`.
 
 ---
 

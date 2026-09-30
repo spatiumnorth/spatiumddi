@@ -531,8 +531,8 @@ nightly, so the seven tags cover seven *changed* days rather than seven
 calendar days.
 
 Each nightly also publishes a **pre-release tagged `nightly-YYYY.MM.DD`**
-(CalVer date, prefixed so it can never match `release.yml`'s bare-CalVer
-tag trigger), carrying that build's appliance ISO + slot-upgrade image and
+(the build date, prefixed so it can never match `release.yml`'s
+release-tag triggers), carrying that build's appliance ISO + slot-upgrade image and
 a `built-from:` line recording the exact commit. Pre-releases older than
 **7 days** are deleted automatically, git tag included, so the Releases
 page shows at most a week of dated nightlies alongside the real releases

@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 import structlog
 
+from . import cp_tls
 from . import nettools
 from .cert_auth import build_auth_headers, load_cert
 from .config import SupervisorConfig
@@ -68,15 +69,23 @@ def nettool_loop_forever(cfg: SupervisorConfig, identity: Identity) -> None:
     iteration so a post-revoke re-pair (new appliance_id on disk) is
     picked up without restarting the supervisor.
     """
-    with httpx.Client(timeout=_POLL_TIMEOUT_S + 5.0) as client:
-        while True:
-            try:
+    # #1219 — a fresh client per poll, verified against the control
+    # plane's pinned certificate, so a re-pin by the heartbeat loop is
+    # picked up here too. The pin is only ever taken by registration.
+    while True:
+        try:
+            with cp_tls.client(
+                cfg.state_dir,
+                _effective_control_plane_url(cfg),
+                first_contact=False,
+                timeout=_POLL_TIMEOUT_S + 5.0,
+            ) as client:
                 _nettool_once(cfg, identity, client)
-            except Exception as exc:  # noqa: BLE001
-                # Last-ditch swallow — any uncaught error must not kill
-                # the thread. Log loud + back off.
-                log.warning("supervisor.nettool.loop_crashed", error=str(exc))
-                time.sleep(_BACKOFF_S)
+        except Exception as exc:  # noqa: BLE001
+            # Last-ditch swallow — any uncaught error must not kill
+            # the thread. Log loud + back off.
+            log.warning("supervisor.nettool.loop_crashed", error=str(exc))
+            time.sleep(_BACKOFF_S)
 
 
 def _nettool_once(

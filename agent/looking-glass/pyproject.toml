@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spatium-lg-agent"
-version = "2026.07.04.1"
+# Package metadata only. The version the agent reports is stamped into the
+# image at build time (its package __init__.py).
+version = "0.0.0"
 description = "SpatiumDDI sidecar agent for the receive-only BGP Looking Glass collector (GoBGP)"
 readme = "README.md"
 requires-python = ">=3.12"

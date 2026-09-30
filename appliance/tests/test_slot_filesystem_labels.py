@@ -568,7 +568,7 @@ def _existing(tmp_path: Path, topology: dict, releases: dict[str, str | None]):
         topology,
         _EXISTING,
         '_existing_install_version "/dev/vda"',
-        extra=_extract("_appliance_version_from") + "\n",
+        extra=_extract("_release_field") + "\n" + _extract("_appliance_version_from") + "\n",
     )
 
 

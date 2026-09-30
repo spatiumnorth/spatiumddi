@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFil
 from fastapi.responses import Response
 
 from app.api.deps import DB, CurrentUser
+from app.core.content_disposition import content_disposition
 from app.core.permissions import user_has_permission
 from app.core.responses import PdfResponse
 from app.services.ipam.address_set_gate import (
@@ -273,7 +274,7 @@ async def export_pdf_endpoint(
     return Response(
         content=data,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 
@@ -308,5 +309,5 @@ async def export_endpoint(
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )

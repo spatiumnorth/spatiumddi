@@ -175,3 +175,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD test -S /run/kea/kea4-ctrl-socket || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-dhcp-entrypoint"]
+
+# #1182 — the version the agent reports: the release tag from release.yml,
+# the nightly stamp from nightly.yml. A build that passes nothing reports
+# "dev". Last, so a new version only rebuilds this layer.
+ARG APP_VERSION=dev
+ENV SPATIUM_AGENT_VERSION=${APP_VERSION}

@@ -353,7 +353,8 @@ beat stays a singleton (§2). For the datastores you bring HA Postgres
 ([`../charts/spatiumddi/`](https://github.com/spatiumnorth/spatiumddi/tree/main/charts/spatiumddi)) ships an in-chart
 Redis Sentinel option; reference HA add-ons live under
 [`../k8s/ha/`](https://github.com/spatiumnorth/spatiumddi/tree/main/k8s/ha) (`postgres-cluster.yaml` for CloudNativePG,
-`redis-sentinel.yaml`, and a Patroni Compose). When Redis is HA the app
+`redis-sentinel.yaml`, and a Patroni Compose overlay that does not work and is
+unsupported in 1.0, #1236). When Redis is HA the app
 connects via a `sentinel://` URL and the wake bus follows failover
 through the Sentinel-aware Redis client.
 

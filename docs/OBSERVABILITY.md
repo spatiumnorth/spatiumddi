@@ -137,7 +137,17 @@ All services use `structlog` configured to emit **newline-delimited JSON** (NDJS
 | `level` | `debug`, `info`, `warning`, `error`, `critical` |
 | `service` | `api`, `worker`, `beat`, `agent`, `dhcp`, `dns` |
 | `instance` | Hostname or pod name |
-| `request_id` | UUID, passed through as `X-Request-ID` header |
+| `request_id` | In the api, a UUID generated for every request, never the caller's (it is stored in the tamper-evident `audit_log.request_id`, so a caller must not choose it). In the worker, the Celery task id, bound for the length of the task. Absent on lines logged outside a request or task |
+| `client_request_id` | The caller's own `X-Request-ID`, when it sent one of 1–64 characters of `A-Z a-z 0-9 . _ : -`. The response echoes it back as `X-Request-ID`; without one, the response carries `request_id` |
+
+The worker and beat log through the same pipeline as the api (#1246),
+including Celery's own stdlib lines (`Task … received` / `succeeded`), so
+one filter on `service` / `request_id` covers all three. The effective
+level is the more verbose of `--loglevel` and `LOG_LEVEL`, and `--logfile`
+receives the JSON lines. A worker running an embedded scheduler (`-B`) logs
+as `service=worker`; its scheduler lines carry `logger=celery.beat`. The one
+plain-text exception is Celery's startup banner, printed once before logging
+is configured.
 
 ### Sensitive Data Rules (enforced by linting)
 - **Never log**: passwords, tokens, API keys, full credentials
@@ -381,7 +391,8 @@ AuditLog
   old_value: JSONB          -- full previous state (null for create)
   new_value: JSONB          -- full new state (null for delete)
   changed_fields: str[]     -- list of field names that changed (for updates)
-  request_id: str           -- correlates to application log
+  request_id: str           -- the request_id of the log lines that made the change:
+                            --   the API request, or the Celery task id (#1245)
   result: enum(success, denied, error)
   error_detail: str (nullable)
 ```

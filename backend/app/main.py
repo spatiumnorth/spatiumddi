@@ -1,4 +1,5 @@
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -810,23 +811,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("shutdown", service="api")
 
 
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _client_request_id(value: str | None) -> str | None:
+    """A caller's ``X-Request-ID``, when it is safe to log and echo.
+
+    Only a short id of plain characters is kept — it goes into every log
+    line and back out as a response header — and anything else is dropped
+    rather than truncated, since a truncated id would no longer match the
+    caller's. ``fullmatch``, not ``match``: ``$`` also matches before a
+    trailing newline.
+    """
+    if value and _REQUEST_ID_RE.fullmatch(value):
+        return value
+    return None
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Attach a request_id to structlog context for every request."""
+    """Attach a request_id to structlog context for every request.
+
+    ``request_id`` is ALWAYS generated here. It is what the log lines, the
+    Diagnostics row and ``audit_log.request_id`` carry (#1245), and the audit
+    column sits inside the tamper-evidence hash: an id the caller chose would
+    let a caller make its audit rows claim another request's id. A caller's
+    own ``X-Request-ID`` is kept as ``client_request_id`` on the log lines,
+    which is how a report quoting it finds the ``request_id``, and it is what
+    the response echoes back, so a caller still gets its own id (#1201).
+    """
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        client_request_id = _client_request_id(request.headers.get("X-Request-ID"))
         # For the unhandled-exception handler (#1201): it runs in Starlette's
         # ServerErrorMiddleware, outside this one, so neither the header set
         # below nor this frame's locals reach its response. ``request.state``
         # lives on the ASGI scope, which that handler's Request shares.
         request.state.request_id = request_id
+        request.state.client_request_id = client_request_id
         structlog.contextvars.clear_contextvars()
-        structlog.contextvars.bind_contextvars(
-            request_id=request_id,
-            service="api",
-        )
+        structlog.contextvars.bind_contextvars(request_id=request_id, service="api")
+        if client_request_id:
+            structlog.contextvars.bind_contextvars(client_request_id=client_request_id)
         response: Response = await call_next(request)  # type: ignore[arg-type]
-        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Request-ID"] = client_request_id or request_id
         return response
 
 
@@ -1229,8 +1257,14 @@ def create_app() -> FastAPI:
         # sent (#1201): this used to read the request header alone, so a
         # client that sent none got a 500 with no X-Request-ID and a log line
         # and Diagnostics row carrying ``request_id: null``.
-        request_id = getattr(request.state, "request_id", None) or request.headers.get(
-            "X-Request-ID"
+        #
+        # When the exception came from a middleware OUTSIDE that one, nothing
+        # is on ``request.state``: generate the id here rather than adopting
+        # the raw header, which is unvalidated — a long one would fail the
+        # Diagnostics row's 64-character column and lose the record.
+        request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+        echo_id = getattr(request.state, "client_request_id", None) or _client_request_id(
+            request.headers.get("X-Request-ID")
         )
         try:
             sanitised_headers = {
@@ -1270,7 +1304,7 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal Server Error"},
-            headers={"X-Request-ID": request_id} if request_id else None,
+            headers={"X-Request-ID": echo_id or request_id},
         )
 
     # The 422 the document declares is not the only 422 the API returns.

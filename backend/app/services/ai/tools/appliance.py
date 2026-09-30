@@ -999,7 +999,7 @@ class FindUpgradeImagesArgs(BaseModel):
         "short SHA-256 / upload time / notes. ``architecture`` is null for "
         "an image nobody labelled — that means UNKNOWN, never amd64 "
         "(#1026). Use to answer 'which upgrade images do we "
-        "have staged?' or 'is 2026.06.01-1 already uploaded?'. Read-only "
+        "have staged?' or 'is 1.0.0 already uploaded?'. Read-only "
         "— upload / import / delete happen in Fleet → Upgrade images."
     ),
     args_model=FindUpgradeImagesArgs,

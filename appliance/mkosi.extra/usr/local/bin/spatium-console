@@ -1832,7 +1832,7 @@ def appliance_version_string(env: dict[str, str]) -> str:
 
     /etc/spatiumddi/appliance-release is the build-time stamp written
     by mkosi.postinst. SPATIUMDDI_VERSION in .env is the container
-    image tag (CalVer or "latest"). Collapse to one value when they
+    image tag (a release tag or "latest"). Collapse to one value when they
     match (the normal case — every release pins them together); only
     spell out both when they diverge, which signals an in-flight
     Phase 4c release-apply that updated the docker image tag without

@@ -1195,7 +1195,7 @@ cp .env.example .env
 #   POSTGRES_PASSWORD=<set this>
 #   SECRET_KEY=$(openssl rand -hex 32)
 #   DNS_AGENT_KEY=$(openssl rand -hex 32)   # needed if running the DNS container
-docker compose build
+docker compose pull
 docker compose run --rm migrate
 docker compose up -d
 ```
@@ -1214,9 +1214,19 @@ Idempotent — re-running the seed swallows 409s and PATCHes existing rows so fo
 
 ### Upgrading
 
-SpatiumDDI uses CalVer (`YYYY.MM.DD-N`) and ships every component
-(api, worker, beat, frontend, dns-bind9, dhcp-kea) at the same tag.
-The image tag is controlled by `SPATIUMDDI_VERSION` in your `.env`.
+SpatiumDDI ships every component (api, worker, beat, frontend,
+dns-bind9, dhcp-kea) at the same tag. Releases up to the bridge are
+CalVer (`YYYY.MM.DD-N`); from 1.0.0 they are SemVer
+(`MAJOR.MINOR.PATCH`), and every SemVer release is newer than every
+CalVer one. The image tag is controlled by `SPATIUMDDI_VERSION` in
+your `.env`.
+
+> **Reaching 1.0.0 from a CalVer release.** Upgrade to the bridge — the
+> last CalVer release — first. The code that decides whether a version is
+> newer runs in the version you upgrade *from*, and only the bridge and
+> later know that `1.0.0` comes after `2026.x`: an older install is never
+> offered 1.0.0, and its upgrade preflight refuses it. The 1.0.0 release
+> notes name the bridge.
 
 **Track latest** (default — your `.env` ships with `SPATIUMDDI_VERSION=latest`):
 
@@ -1376,8 +1386,8 @@ EOF
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
-- Kubernetes 1.31+ with Helm 3, **or**
-- Ubuntu 22.04 / Debian 12 / Alpine 3.20+ for bare metal
+- Kubernetes with Helm: CI tests the charts on Kubernetes 1.36 with Helm 4 (k3s 1.36 on the appliance); the umbrella chart declares `kubeVersion: >=1.31`, **or**
+- The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
 ---
 
@@ -1399,6 +1409,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | Document | Description |
 |---|---|
 | [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
+| [Changelog](CHANGELOG.md) | What changed in each release, including upgrade notes |
 | [Architecture](docs/ARCHITECTURE.md) | System topology, control plane / data plane split, agent contract, HA design |
 | [Data Model](docs/DATA_MODEL.md) | Database models grouped by domain, key relationships, shared conventions |
 | [REST API](docs/API.md) | API conventions — pagination, filtering, error format, auth, versioning |
@@ -1421,7 +1432,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
 | [Docker Compose](docs/deployment/DOCKER.md) | Compose setup, ports, first-time setup, TLS, HA, password reset |
 | [Kubernetes](docs/deployment/KUBERNETES.md) | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA |
-| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance |
+| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, OS appliance (the Compose Patroni overlay is unsupported in 1.0) |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
 | [Third-Party Components](docs/THIRD_PARTY.md) | Every bundled engine, library and OS package — license, artifact it ships in, and why it's there |
@@ -1447,7 +1458,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
 
 Contributions are welcome.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR
+- Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. Every commit needs a DCO sign-off (`git commit -s`), explained there
 - Good first tasks are tagged on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)
 - Design discussion happens in [GitHub Discussions](https://github.com/spatiumnorth/spatiumddi/discussions)
 

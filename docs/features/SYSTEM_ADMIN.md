@@ -1041,9 +1041,13 @@ Other notable areas on the model (each a small cluster of columns): integration 
 
 ### Current Version Display
 
-The current application version is displayed in the UI header bar and on the System Admin → About page. The version string follows **CalVer** format: `YYYY.MM.DD-N` where N is the release number for that date (starting at 1).
+The current application version is displayed in the UI header bar and on the System Admin → About page. Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
 
-Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day)
+Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day), `1.0.0-rc.1`, `1.0.0`, `1.0.1`
+
+Every SemVer release is newer than every CalVer one, and versions are never compared as strings (`"1.0.0" > "2026.09.04-1"` and `"1.0.10" > "1.0.9"` are both false as strings): the update check, the upgrade preflight and the Fleet gates all go through `app/core/versions.py`, mirrored for the UI in `frontend/src/lib/versions.ts`. A build that is not a release (`dev`, `latest`, a nightly's `0.0.0-nightly-YYYYMMDD+sha`, a `0.x` placeholder) is an *unknown* version, never an old one.
+
+**Upgrade to the bridge before 1.0.0.** Everything that decides whether a version is newer runs in the version being upgraded *from*, so an install older than the bridge is never offered 1.0.0 and its preflight refuses it. The 1.0.0 release notes name the bridge release.
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
@@ -1052,7 +1056,7 @@ The version is injected at build time and exposed via:
 ### GitHub Release Check
 
 When `github_release_check_enabled` is true, SpatiumDDI periodically polls the GitHub Releases API for the latest release tag. If a newer version is available:
-- A banner appears in the admin UI: "SpatiumDDI 2026.05.01-1 is available — view changelog"
+- A banner appears in the admin UI: "SpatiumDDI 1.0.1 is available — view changelog"
 - A notification is sent to configured notification channels if `notify_on_new_release` is enabled
 - Superadmins can dismiss the banner or snooze for N days
 

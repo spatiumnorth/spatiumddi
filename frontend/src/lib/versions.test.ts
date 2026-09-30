@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   compareReleases,
+  helmChartVersion,
   includesRelease,
   nightlyBuildDay,
   parseRelease,
   releaseVerdict,
+  upgradeDirection,
 } from "@/lib/versions";
 
 // The same cases as backend/tests/test_versions.py: the two implementations
@@ -140,5 +142,59 @@ describe("releaseVerdict", () => {
     expect(releaseVerdict([null, FROZEN], "2026.06.12-2")).toBeNull();
     expect(releaseVerdict([undefined, "dev"], "2026.06.12-2")).toBeNull();
     expect(releaseVerdict([], "2026.06.12-2")).toBeNull();
+  });
+});
+
+describe("upgradeDirection", () => {
+  it.each([
+    ["2026.09.04-1", "2026.11.03-1", "forward"],
+    ["2026.11.03-1", "1.0.0", "forward"],
+    ["1.0.0-rc.2", "1.0.0", "forward"],
+    ["1.0.9", "1.0.10", "forward"],
+    ["1.0.0", "1.0.0", "same"],
+    ["2026.11.03-1", "2026.11.03-1", "same"],
+    ["1.0.0", "2026.11.03-1", "backward"],
+    ["1.0.10", "1.0.9", "backward"],
+    ["2026.11.03-1", "2026.09.04-1", "backward"],
+    ["0.0.0-nightly-20261110+abc1234", "2026.11.03-1", "backward"],
+    ["0.0.0-nightly-20261001+abc1234", "2026.11.03-1", "forward"],
+    ["0.0.0-nightly-20261103+abc1234", "2026.11.03-1", "unknown"],
+    ["0.0.0-nightly-20261110+abc1234", "1.0.0", "unknown"],
+    ["dev", "1.0.0", "unknown"],
+    [null, "1.0.0", "unknown"],
+    ["2026.11.03-1", "dev", "unknown"],
+    ["2026.11.03-1", "", "unknown"],
+    ["2026.11.03-1", null, "unknown"],
+  ] as const)("%s -> %s is %s", (installed, target, expected) => {
+    expect(upgradeDirection(installed, target)).toBe(expected);
+  });
+});
+
+describe("helmChartVersion", () => {
+  // The same cases as chart_version() in scripts/release_version.py.
+  it.each([
+    ["2026.04.20-1", "2026.4.20-1"],
+    ["2026.09.04-1", "2026.9.4-1"],
+    ["2026.10.10-12", "2026.10.10-12"],
+    ["1.0.0", "1.0.0"],
+    ["1.0.0-rc.1", "1.0.0-rc.1"],
+    ["1.10.0", "1.10.0"],
+  ])("%s is published as chart %s", (tag, chart) => {
+    expect(helmChartVersion(tag)).toBe(chart);
+  });
+
+  it("is null for anything that is not a release", () => {
+    expect(helmChartVersion("dev")).toBeNull();
+    expect(helmChartVersion("latest")).toBeNull();
+    expect(helmChartVersion("0.0.0-nightly-20261110+abc")).toBeNull();
+  });
+
+  it("is null for a release string no tag could carry, so no chart exists", () => {
+    // parseRelease accepts all of these; release.yml refuses them as tags.
+    expect(helmChartVersion("2026.09.04")).toBeNull();
+    expect(helmChartVersion("1.0.0+abc")).toBeNull();
+    expect(helmChartVersion("01.0.0")).toBeNull();
+    expect(helmChartVersion("1.0.0-rc.01")).toBeNull();
+    expect(helmChartVersion("2026.9.4")).toBeNull();
   });
 });

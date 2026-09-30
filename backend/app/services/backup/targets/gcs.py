@@ -35,23 +35,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
-
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 
 def _client(config: dict[str, Any]):
@@ -78,11 +77,11 @@ def _client(config: dict[str, Any]):
 
 def _object_name(config: dict[str, Any], filename: str) -> str:
     """Compose the object name from the optional prefix +
-    filename. ``os.path.basename`` defends against operator-
-    supplied paths trying to escape the prefix.
+    filename. ``safe_filename`` refuses operator-supplied paths
+    that would escape the prefix.
     """
     prefix = (config.get("prefix") or "").strip("/")
-    safe = os.path.basename(filename)
+    safe = safe_filename(filename)
     return f"{prefix}/{safe}" if prefix else safe
 
 
@@ -187,7 +186,7 @@ class GcsDestination(BackupDestination):
                 blobs = client.list_blobs(config["bucket"], prefix=list_prefix)
                 for blob in blobs:
                     name = _strip_prefix(config, blob.name)
-                    if not _ARCHIVE_NAME_RE.match(name):
+                    if not ARCHIVE_NAME_RE.match(name):
                         continue
                     if blob.time_created is None:
                         continue

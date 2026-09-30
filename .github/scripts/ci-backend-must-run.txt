@@ -72,6 +72,13 @@ scripts/lint_image_upgrades.py
 # whether a tag becomes :latest.
 scripts/release_version.py
 
+# test_trivy_scan_script.py (#1272) runs the `make trivy` loop against a
+# stubbed docker and pins that a scan which never ran reads as SCAN FAILED,
+# never as FINDINGS — and reads the Makefile to pin that the target still
+# calls it, with the DB cache outside the checkout.
+scripts/trivy-scan.sh
+Makefile
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says
