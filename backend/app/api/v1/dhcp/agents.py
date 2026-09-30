@@ -64,10 +64,7 @@ from app.services.dhcp.agent_token import (
 )
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
-from app.services.dhcp.lease_cleanup import (
-    another_client_holds_address,
-    peer_holds_active_lease,
-)
+from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
 
@@ -1352,10 +1349,7 @@ async def agent_lease_events(
             if (
                 ipam_row is not None
                 and ipam_row.auto_from_lease
-                and (
-                    await peer_holds_active_lease(db, lease, now=now)
-                    or await another_client_holds_address(db, lease, now=now)
-                )
+                and await address_still_held(db, lease, now=now)
             ):
                 continue
             if ipam_row is not None and ipam_row.auto_from_lease:

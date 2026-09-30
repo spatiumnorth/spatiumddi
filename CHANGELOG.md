@@ -349,7 +349,10 @@ the formatter handles the rest.
   back as a new row without its MAC history. With New-device watch on,
   #1172 hid this by losing the replayed batch whole. A release now
   leaves the row in place while another lease on the address is active
-  and unexpired.
+  and unexpired. The expiry sweep and the lease purge (the Windows
+  poll's absence-delete and the delete-lease endpoint) ask the same
+  question, so an old client's lease left `active` past its expiry no
+  longer takes the new client's IPAM row and DNS records with it either.
 
 - **With New-device watch on, a DHCP lease batch that grants and releases
   the same address is no longer lost (#1172).** With the watch on, the

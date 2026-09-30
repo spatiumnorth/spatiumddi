@@ -498,3 +498,79 @@ async def test_a_release_with_no_other_holder_still_removes_the_mirror(
 
     assert await _mirror_of(db_session, subnet_id) is None
     assert ddns.revoked == [IP]
+
+
+# ── #1318 on the other teardown paths: another client on the SAME server ──
+#
+# The lease-event release spares the mirror while another client on the
+# same server holds the address. The expiry sweep and ``purge_lease`` (the
+# pull's absence-delete and the delete-lease endpoint) tear the same mirror
+# down, so they ask the same question.
+
+SAME_SERVER_NEW_MAC = "aa:bb:cc:dd:ee:53"
+
+
+@pytest.mark.asyncio
+async def test_expiry_sweep_spares_the_mirror_of_the_client_holding_the_address_now(
+    db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    """The old client's row was left ``active`` past its expiry (Kea reused
+    the address for a new client with no release line for the old one)."""
+    import app.tasks.dhcp_lease_cleanup as cleanup
+
+    a, _b, scope, _subnet, mirror = await _pair(db_session)
+    old = _lease(a, scope, expires_at=datetime.now(UTC) - timedelta(hours=1))
+    new = _lease(a, scope, mac_address=SAME_SERVER_NEW_MAC)
+    db_session.add_all([old, new])
+    await db_session.commit()
+    mirror_id = mirror.id
+
+    cleaned, _deleted = await cleanup._sweep()
+
+    assert cleaned == 0
+    assert await _mirror_exists(db_session, mirror_id)
+    assert ddns.revoked == [], "the new client's DNS must stay"
+
+
+@pytest.mark.asyncio
+async def test_expiry_sweep_still_removes_the_mirror_when_both_clients_expired(
+    db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    import app.tasks.dhcp_lease_cleanup as cleanup
+
+    a, _b, scope, _subnet, mirror = await _pair(db_session)
+    past = datetime.now(UTC) - timedelta(hours=1)
+    db_session.add_all(
+        [
+            _lease(a, scope, expires_at=past),
+            _lease(a, scope, mac_address=SAME_SERVER_NEW_MAC, expires_at=past),
+        ]
+    )
+    await db_session.commit()
+    mirror_id = mirror.id
+
+    cleaned, _deleted = await cleanup._sweep()
+    assert cleaned == 1
+    assert not await _mirror_exists(db_session, mirror_id)
+
+
+@pytest.mark.asyncio
+async def test_purging_the_old_clients_lease_keeps_the_new_clients_mirror(
+    db_session: AsyncSession, ddns: _DDNSSpy
+) -> None:
+    a, _b, scope, _subnet, mirror = await _pair(db_session)
+    old = _lease(a, scope, state="released", expires_at=datetime.now(UTC) - timedelta(hours=1))
+    new = _lease(a, scope, mac_address=SAME_SERVER_NEW_MAC)
+    db_session.add_all([old, new])
+    await db_session.flush()
+
+    assert await purge_lease(db_session, old) is False
+    await db_session.flush()
+    assert await _mirror_exists(db_session, mirror.id)
+    assert ddns.revoked == []
+
+    # With the new client's lease purged too, nothing holds the address.
+    assert await purge_lease(db_session, new) is True
+    await db_session.flush()
+    assert not await _mirror_exists(db_session, mirror.id)
+    assert ddns.revoked == [IP]
