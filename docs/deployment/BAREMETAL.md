@@ -92,7 +92,7 @@ Build a local ISO with `make appliance-dev-iso`.
 - **[`DOCKER.md`](DOCKER.md)** — the canonical container guide; use it for any
   bare-metal-host-with-Docker deployment.
 - **[`APPLIANCE.md`](APPLIANCE.md)** — the supported bare-metal-OS install.
-- **[`TOPOLOGIES.md`](TOPOLOGIES.md)** — six reference production topologies,
+- **[`TOPOLOGIES.md`](TOPOLOGIES.md)** — seven reference production topologies,
   including the hand-rolled HA control plane (Topology 4).
 - **[`KUBERNETES.md`](KUBERNETES.md)** — the umbrella Helm chart walkthrough for
   Kubernetes / Helm deployments, backed by [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md)

@@ -214,8 +214,12 @@ docker compose run --rm migrate
 docker compose up -d
 ```
 
-`docker compose pull` fetches the images for the profiles your `.env` enables
-(`COMPOSE_PROFILES`), so the DNS and DHCP containers are upgraded with the rest.
+`docker compose pull` and `docker compose up -d` act only on the profiles that
+are active. If you enable the DNS / DHCP / Looking Glass containers through
+`COMPOSE_PROFILES` in `.env`, they are upgraded with the rest. If you start
+them with `--profile` on the command line instead, pass the same `--profile`
+flags to both `pull` and `up -d`, or those containers keep running the old
+images against the newly migrated control plane.
 To upgrade to a specific release rather than the newest, set
 `SPATIUMDDI_VERSION` in `.env` first; see the README's *Upgrading* section.
 
@@ -317,7 +321,7 @@ gunzip -c postgres-only-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -
 
 ### Redis backup
 
-The Compose Redis runs **without AOF persistence** (`redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru`): at most Redis's default periodic RDB snapshots land in the `redis_data` volume, so a Redis restart can lose queued Celery tasks and cached state. That is by design: there's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping, throttle counters — so a Redis backup is not needed, and everything in it is rebuilt or re-queued by the next beat tick. (The Helm chart does run Redis with `--appendonly yes`.)
+The Compose Redis runs **without AOF persistence** (`redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru`): at most Redis's default periodic RDB snapshots land in the `redis_data` volume, so a Redis restart can lose queued Celery tasks and cached state. That is by design: there's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping, throttle counters — so a Redis backup is not needed. Cached state is rebuilt and periodic tasks fire again on the next beat tick; a one-off task that was queued but not yet run when Redis restarted (a manual backup run, an ACME order, a scan) is lost and has to be started again. (The Helm chart does run Redis with `--appendonly yes`.)
 
 ---
 

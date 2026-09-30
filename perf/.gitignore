@@ -1,4 +1,6 @@
 # Live run state + artifacts are regenerated per run — never committed.
+# (Reports copied to perf/reports/<run_id>/ by `--publish` are meant to be
+# committed — see perf/reports/README.md — so that path is NOT ignored.)
 run/
 *.pyc
 __pycache__/

@@ -1376,7 +1376,7 @@ EOF
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
-- Kubernetes 1.36 with Helm 4 (what the charts are tested against; k3s 1.36 on the appliance), **or**
+- Kubernetes with Helm: CI tests the charts on Kubernetes 1.36 with Helm 4 (k3s 1.36 on the appliance); the umbrella chart declares `kubeVersion: >=1.31`, **or**
 - The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
 ---

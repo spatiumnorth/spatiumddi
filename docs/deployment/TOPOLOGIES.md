@@ -445,8 +445,8 @@ stateless. A few shape notes:
   isn't shared with anything; switch to S3 / SCP / Azure / GCS /
   SMB / FTP / WebDAV for distributed installs.
 - **Restore** runs via `pg_restore` against the live Postgres. In
-  Topology 4+ point this at the **primary** (Patroni HAProxy port
-  5000, not the read-only port 5001). The api containers' SQLAlchemy
+  Topology 4+ point this at the **primary** (for a hand-rolled Patroni
+  cluster behind HAProxy, the read/write port, not the read-only one). The api containers' SQLAlchemy
   pool gets disposed during restore, so transient 503s during the
   restore window are expected — see the `pool_pre_ping=True` +
   transient-DB handler in `app/db.py`.

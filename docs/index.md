@@ -214,7 +214,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     </a>
     <a class="idx-card" href="deployment/BAREMETAL.html">
       <span class="idx-card-title">Bare Metal</span>
-      <span class="idx-card-desc">Compose on a host, Patroni HA Postgres overlay, the appliance path</span>
+      <span class="idx-card-desc">Compose on a host and the appliance path (the Compose Patroni overlay is unsupported in 1.0)</span>
     </a>
     <a class="idx-card" href="deployment/WINDOWS.html">
       <span class="idx-card-title">Windows Server</span>

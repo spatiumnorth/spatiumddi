@@ -384,7 +384,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/haproxy", "track": "^3\\.[0-9]+-alpine$" },
-      "note": "Stay on an LTS branch: this proxies every Patroni connection and nothing else in the repo watches it. 3.4 IS the current LTS -- `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve to the same digest, verified 2026-09-08. The previous pin (2.9) was a short-lived NON-LTS branch whose last release was March 2025, so it had gone 18 months with no security fixes at all."
+      "note": "Stay on an LTS branch: nothing else in the repo watches this image. It sits in the Compose Patroni overlay, which does not work and is unsupported in 1.0 (#1236), but the pin is kept current so #137 does not start from an unmaintained HAProxy. 3.4 IS the current LTS -- `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve to the same digest, verified 2026-09-08. The previous pin (2.9) was a short-lived NON-LTS branch whose last release was March 2025, so it had gone 18 months with no security fixes at all."
     },
 
     "etcd-patroni": {
