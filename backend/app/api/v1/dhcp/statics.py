@@ -245,7 +245,12 @@ async def create_static(
         raise HTTPException(status_code=404, detail="Scope not found")
     if body.options_override:
         body.options_override = normalize_options(body.options_override)
-        validate_dhcp_options(body.options_override, address_family=scope.address_family or "ipv4")
+        await validate_dhcp_options(
+            db,
+            body.options_override,
+            group_id=scope.group_id,
+            address_family=scope.address_family or "ipv4",
+        )
     await _conflict_check(db, scope, body.ip_address, body.mac_address)
     st = DHCPStaticAssignment(
         scope_id=scope_id,
@@ -289,8 +294,10 @@ async def update_static(
     changes = body.model_dump(exclude_none=True)
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
-        validate_dhcp_options(
+        await validate_dhcp_options(
+            db,
             changes["options_override"],
+            group_id=scope.group_id,
             address_family=scope.address_family or "ipv4",
             previous=st.options_override or {},
         )

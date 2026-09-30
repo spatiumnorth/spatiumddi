@@ -16,9 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
-from app.models.dhcp import DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.option_validation import (
+    RAW_CODES_KEA,
+    RAW_CODES_NONE,
+    RAW_CODES_WINDOWS,
     normalize_options,
     renderer_vocabularies,
     validate_options,
@@ -48,7 +51,6 @@ def test_the_checked_names_are_exactly_the_renderers() -> None:
         {"code:43": "0104c0a80001"},
         {"code:150": "10.0.0.9"},
         {"code:160": "https://prov.example/{mac}"},
-        {"opt-252": "http://wpad.example/wpad.dat"},
         {"routers": [], "ntp-servers": None, "dns-servers": ""},  # unset, skipped
     ],
 )
@@ -79,7 +81,6 @@ def test_renderable_options_pass(options: dict) -> None:
         ({"code:150": "tftp.example"}, "not an IPv4 address"),
         ({"code:44": "10.0.0.1"}, "option 44 (netbios-name-servers)"),
         ({"code:999": "x"}, "cannot deliver"),
-        ({"opt-300": "x"}, "1..254"),
         ({"netbios-name-servers": ["10.0.0.1"]}, "unknown DHCP option"),
         ({"option-44": "10.0.0.1"}, "unknown DHCP option"),
         ({"option_data": [{"name": "routers", "data": "x"}]}, "raw Kea option-data"),
@@ -305,3 +306,145 @@ async def test_applying_a_template_checks_the_result_against_the_scope(
     )
     assert resp.status_code == 422, resp.text
     assert "'dns-servers'" in resp.json()["detail"]
+
+
+# ── #1296: the raw-code spelling follows the group's servers ─────────────────
+#
+# Kea and FortiGate read ``code:NN`` and drop ``opt-NN``; Windows reads
+# ``opt-NN`` and drops ``code:NN``. Each drop is silent: the option is saved
+# and never served.
+
+
+def test_opt_nn_is_the_windows_spelling_only() -> None:
+    validate_options({"opt-252": "http://wpad.example/wpad.dat"}, raw_codes=RAW_CODES_WINDOWS)
+    with pytest.raises(ValueError) as exc:
+        validate_options({"opt-252": "http://wpad.example/wpad.dat"})
+    assert "'opt-252'" in str(exc.value)
+    assert "use code:252" in str(exc.value)
+
+
+def test_code_nn_is_refused_on_windows_pointing_at_opt_nn() -> None:
+    with pytest.raises(ValueError) as exc:
+        validate_options({"code:43": "0104"}, raw_codes=RAW_CODES_WINDOWS)
+    assert "'code:43'" in str(exc.value)
+    assert "use opt-43" in str(exc.value)
+
+
+def test_a_windows_code_is_still_range_checked() -> None:
+    with pytest.raises(ValueError, match="1..254"):
+        validate_options({"opt-300": "x"}, raw_codes=RAW_CODES_WINDOWS)
+
+
+@pytest.mark.parametrize("key", ["code:43", "opt-43"])
+def test_a_mixed_group_takes_neither_raw_spelling(key: str) -> None:
+    with pytest.raises(ValueError, match="mixes Windows and non-Windows"):
+        validate_options({key: "0104"}, raw_codes=RAW_CODES_NONE)
+
+
+def test_named_options_are_accepted_whatever_the_group() -> None:
+    for raw_codes in (RAW_CODES_KEA, RAW_CODES_WINDOWS, RAW_CODES_NONE):
+        validate_options({"routers": ["10.0.0.1"]}, raw_codes=raw_codes)
+
+
+def test_an_imported_opt_nn_stays_editable_on_a_kea_group() -> None:
+    """The #597 / #1228 rule: an unchanged stored key is not re-checked."""
+    stored = {"opt-252": "http://wpad.example/wpad.dat"}
+    validate_options({**stored, "routers": ["10.0.0.1"]}, previous=stored)
+
+
+async def _group_with(db: AsyncSession, *drivers: str) -> DHCPServerGroup:
+    grp = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(grp)
+    await db.flush()
+    for i, driver in enumerate(drivers):
+        db.add(
+            DHCPServer(
+                name=f"s{i}-{uuid.uuid4().hex[:6]}",
+                driver=driver,
+                host=f"192.0.2.{10 + i}",
+                port=67,
+                server_group_id=grp.id,
+            )
+        )
+    await db.flush()
+    return grp
+
+
+@pytest.mark.parametrize(
+    ("drivers", "key", "status", "fragment"),
+    [
+        (("kea",), "opt-252", 422, "use code:252"),
+        (("kea",), "code:43", 201, None),
+        ((), "opt-252", 422, "use code:252"),  # no servers yet: the Kea rule
+        (("fortigate",), "opt-252", 422, "use code:252"),
+        (("windows_dhcp",), "opt-252", 201, None),
+        (("windows_dhcp", "windows_dhcp"), "code:43", 422, "use opt-43"),
+        (("kea", "windows_dhcp"), "opt-252", 422, "mixes Windows"),
+    ],
+    ids=["kea-opt", "kea-code", "empty-opt", "fortigate-opt", "win-opt", "win-code", "mixed"],
+)
+async def test_a_client_class_takes_the_groups_raw_spelling(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    drivers: tuple[str, ...],
+    key: str,
+    status: int,
+    fragment: str | None,
+) -> None:
+    h = await _headers(db_session)
+    grp = await _group_with(db_session, *drivers)
+    await db_session.commit()
+    value = "0104" if key.startswith("code:") else "http://wpad.example/wpad.dat"
+    resp = await client.post(
+        f"/api/v1/dhcp/server-groups/{grp.id}/client-classes",
+        headers=h,
+        json={"name": "c", "options": {key: value}},
+    )
+    assert resp.status_code == status, resp.text
+    if fragment:
+        assert fragment in str(resp.json()["detail"])
+
+
+async def test_a_kea_scope_refuses_opt_nn_on_every_write_path(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The issue's case: saved on a Kea group, dropped by the agent."""
+    h = await _headers(db_session)
+    subnet, _ = await _subnet_and_group(db_session)
+    grp = await _group_with(db_session, "kea")
+    scope = DHCPScope(subnet_id=subnet.id, group_id=grp.id, name="s", options={})
+    db_session.add(scope)
+    await db_session.commit()
+    opt = {"opt-252": "http://wpad.example/wpad.dat"}
+
+    cases = [
+        ("put", f"/api/v1/dhcp/scopes/{scope.id}", {"options": opt}),
+        (
+            "post",
+            f"/api/v1/dhcp/scopes/{scope.id}/pools",
+            {"start_ip": "192.0.2.100", "end_ip": "192.0.2.150", "options_override": opt},
+        ),
+        (
+            "post",
+            f"/api/v1/dhcp/scopes/{scope.id}/statics",
+            {
+                "ip_address": "192.0.2.20",
+                "mac_address": "aa:bb:cc:dd:ee:01",
+                "options_override": opt,
+            },
+        ),
+        (
+            "post",
+            f"/api/v1/dhcp/server-groups/{grp.id}/option-templates",
+            {"name": "t", "options": opt},
+        ),
+        (
+            "post",
+            f"/api/v1/dhcp/server-groups/{grp.id}/device-policies",
+            {"name": "p", "device_classes": ["HP Print Server"], "options": opt},
+        ),
+    ]
+    for method, url, body in cases:
+        resp = await getattr(client, method)(url, headers=h, json=body)
+        assert resp.status_code == 422, (url, resp.text)
+        assert "use code:252" in str(resp.json()["detail"]), (url, resp.text)

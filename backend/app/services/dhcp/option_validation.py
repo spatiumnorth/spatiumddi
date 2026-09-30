@@ -30,6 +30,14 @@ Accepted keys:
   canonicalise. Only the Windows driver reads it, and the Windows cmdlet
   checks the value, so only the code range is checked here.
 
+Which raw spelling a group accepts depends on its servers (#1296), because
+each driver silently drops the other's: Kea and FortiGate read ``code:NN``
+and skip ``opt-NN``, Windows reads ``opt-NN`` and skips ``code:NN``. So the
+caller passes ``raw_codes``: ``"code"`` for a group with no Windows member
+(Kea, FortiGate, or no servers yet), ``"opt"`` for an all-Windows group, and
+``"none"`` for a group mixing the two (refused for new servers since #1110),
+where neither spelling reaches every member.
+
 Everything else — including ``option_data``, the raw Kea passthrough that
 internal producers (#972) merge in at bundle time — is refused.
 """
@@ -317,7 +325,30 @@ def _supported(address_family: str) -> str:
     return ", ".join(names)
 
 
-def _check_one(key: str, value: Any, address_family: str) -> None:
+RAW_CODES_KEA = "code"
+RAW_CODES_WINDOWS = "opt"
+RAW_CODES_NONE = "none"
+
+
+def _refuse_raw_spelling(key: str, code: str, raw_codes: str) -> None:
+    """Refuse a raw-code key the group's servers would drop (#1296)."""
+    if raw_codes == RAW_CODES_NONE:
+        raise ValueError(
+            f"option '{key}': this group mixes Windows and non-Windows DHCP servers, and "
+            "each drops the other's raw option spelling (Windows reads opt-NN, Kea and "
+            "FortiGate read code:NN), so no raw code reaches every server; use a named "
+            "option, or move the servers into single-driver groups"
+        )
+    if key.startswith("opt-") and raw_codes != RAW_CODES_WINDOWS:
+        raise ValueError(
+            f"option '{key}': opt-NN is the Windows DHCP spelling, and this group's "
+            f"servers drop it; use code:{code}"
+        )
+    if key.startswith("code:") and raw_codes == RAW_CODES_WINDOWS:
+        raise ValueError(f"option '{key}': Windows DHCP servers drop code:NN; use opt-{code}")
+
+
+def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_CODES_KEA) -> None:
     """Raise ``ValueError`` naming ``key`` when it cannot be rendered."""
     if key == "option_data":
         raise ValueError(
@@ -328,6 +359,7 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
     raw = _RAW_CODE.fullmatch(key)
     if raw:
         code = int(raw.group(1))
+        _refuse_raw_spelling(key, raw.group(1), raw_codes)
         if address_family == "ipv6":
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
         if code not in _KEA_VENDOR_OPTION_DEFS:
@@ -346,6 +378,7 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
 
     win = _WINDOWS_CODE.fullmatch(key)
     if win:
+        _refuse_raw_spelling(key, win.group(1), raw_codes)
         if not 1 <= int(win.group(1)) <= 254:
             raise ValueError(f"option '{key}': option codes run 1..254")
         return
@@ -380,11 +413,14 @@ def validate_options(
     *,
     address_family: str = "ipv4",
     previous: Mapping[str, Any] | None = None,
+    raw_codes: str = RAW_CODES_KEA,
 ) -> None:
     """Raise ``ValueError`` naming the first option that cannot be rendered.
 
     ``address_family`` is ``ipv4``, ``ipv6``, or ``any`` for a client class,
     which always renders into Dhcp4 and so is checked against Dhcp4 first.
+    ``raw_codes`` is the raw-code spelling the group's servers read; see the
+    module docstring.
 
     A key whose value is unchanged from ``previous`` is skipped, so an edit
     that round-trips a grandfathered option — stored before this check existed,
@@ -397,7 +433,7 @@ def validate_options(
     for key, value in options.items():
         if key in prev and prev[key] == value:
             continue
-        _check_one(str(key), value, address_family)
+        _check_one(str(key), value, address_family, raw_codes)
 
 
 # ── Phone profiles (#1294) ──────────────────────────────────────────────────

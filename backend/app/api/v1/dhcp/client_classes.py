@@ -77,7 +77,7 @@ async def create_class(
     # A client class always renders into Dhcp4 (and into Dhcp6 when the
     # group has v6 scopes); "any" checks it as the Dhcp4 it must load in.
     body.options = normalize_options(body.options)
-    validate_dhcp_options(body.options, address_family="any")
+    await validate_dhcp_options(db, body.options, group_id=group_id, address_family="any")
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
@@ -107,7 +107,13 @@ async def update_class(
     if "options" in changes:
         # Validate only changed options (#597, #1228) vs the stored value.
         changes["options"] = normalize_options(changes["options"])
-        validate_dhcp_options(changes["options"], address_family="any", previous=cc.options or {})
+        await validate_dhcp_options(
+            db,
+            changes["options"],
+            group_id=cc.group_id,
+            address_family="any",
+            previous=cc.options or {},
+        )
     for k, v in changes.items():
         setattr(cc, k, v)
     write_audit(
