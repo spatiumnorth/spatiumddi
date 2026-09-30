@@ -223,6 +223,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Audit rows carry the request id, and the worker and beat log JSON
+  like the api (#1245, #1246).** `audit_log.request_id` existed, was part of
+  the tamper-evidence hash, and was never set, although the docs say it
+  links an audit row to its request's log lines. It is now filled from the
+  logging context before the hash is computed, so the chain still verifies.
+  Separately, the Celery worker and beat never configured logging: their
+  output was Celery's plain text plus structlog's console renderer, with no
+  `service` and no `request_id`, against non-negotiable #7. They now share
+  the api's pipeline, Celery's own `Task … received` / `succeeded` lines
+  included, tagged `service=worker` / `service=beat`, and each task binds its
+  task id as `request_id`. The two fixes meet there: an audit row a scheduled
+  task writes now carries the task id, so a change can be traced from the
+  audit log to the worker line that made it. Every line the api logs outside a
+  request now carries `service` too. A caller's `X-Request-ID` is adopted
+  only when it is 1–64 plain characters (`A-Z a-z 0-9 . _ : -`): it now lands
+  in a 64-character column inside the hash, so anything else is replaced
+  with a generated id rather than truncated. Celery's one-time startup banner
+  is still plain text.
+
 - **A zone's access lists are checked before they reach `named.conf`
   (#1316).** The zone half of #1244. A zone's `allow_query`,
   `allow_transfer`, `also_notify` and `notify_enabled` were stored as sent

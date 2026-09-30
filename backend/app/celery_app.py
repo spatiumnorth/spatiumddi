@@ -1,5 +1,7 @@
 import importlib
+import sys
 
+import structlog
 from celery import Celery
 from celery.schedules import crontab, schedule
 
@@ -832,3 +834,45 @@ def _capture_task_failure(
         request_id=task_id,
         context=context,
     )
+
+
+# ── Structured logging in the worker and beat (issue #1246) ─────────────
+#
+# ``configure_logging`` used to run only in the api's lifespan, so worker
+# and beat output was Celery's plain text plus structlog's dev console
+# renderer, with no ``service`` and no ``request_id`` — non-negotiable #7.
+from celery.signals import setup_logging, task_postrun, task_prerun  # noqa: E402
+
+
+def _celery_service(argv: list[str] | None = None) -> str:
+    """``beat`` or ``worker``, from the ``celery -A app.celery_app <cmd>``
+    command line. ``setup_logging`` fires in both before either's own init
+    signal, and does not say which one it is."""
+    return "beat" if "beat" in (argv if argv is not None else sys.argv)[1:] else "worker"
+
+
+@setup_logging.connect
+def _configure_structured_logging(**_: object) -> None:
+    """Connecting ANY receiver to ``setup_logging`` stops Celery installing
+    its own root handler and redirecting stdout into it — which is what
+    would otherwise wrap every structlog JSON line in a second, plain-text
+    Celery record."""
+    importlib.import_module("app.log").configure_logging(service=_celery_service())
+
+
+@task_prerun.connect
+def _bind_task_request_id(
+    task_id: str | None = None, task: object | None = None, **_: object
+) -> None:
+    """The task id is the worker's ``request_id``: every line the task logs,
+    and every audit row it writes (#1245), carries it, so a scheduled
+    change can be traced from the audit log to the worker's output. The
+    ``task_failure`` hook above already files diagnostics under it."""
+    structlog.contextvars.bind_contextvars(request_id=task_id, task=getattr(task, "name", None))
+
+
+@task_postrun.connect
+def _unbind_task_request_id(**_: object) -> None:
+    # A prefork child runs many tasks; without this the next task's
+    # pre-bind lines would inherit the previous task's id.
+    structlog.contextvars.unbind_contextvars("request_id", "task")

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -801,11 +802,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("shutdown", service="api")
 
 
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _client_request_id(value: str | None) -> str | None:
+    """A caller's ``X-Request-ID``, when it is safe to adopt.
+
+    Adopting it lets a caller correlate its own logs with ours, but the id
+    now lands in ``audit_log.request_id`` (#1245), a 64-character column
+    inside the tamper-evidence hash, as well as in every log line. So only
+    a short id of plain characters is kept; anything else is replaced by a
+    generated one rather than truncated, since a truncated id would no
+    longer match the caller's.
+    """
+    if value and _REQUEST_ID_RE.match(value):
+        return value
+    return None
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Attach a request_id to structlog context for every request."""
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = _client_request_id(request.headers.get("X-Request-ID")) or str(uuid.uuid4())
         # For the unhandled-exception handler (#1201): it runs in Starlette's
         # ServerErrorMiddleware, outside this one, so neither the header set
         # below nor this frame's locals reach its response. ``request.state``
