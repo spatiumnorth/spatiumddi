@@ -37,9 +37,11 @@ that genuinely vanished from the server.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,8 +50,12 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
 
+logger = structlog.get_logger(__name__)
+
 __all__ = [
+    "LeaseHandover",
     "detach_ipam_for_static",
+    "publish_handover_ddns",
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
@@ -197,7 +203,7 @@ async def detach_ipam_for_static(
     st: DHCPStaticAssignment,
     *,
     to_status: str = "available",
-) -> None:
+) -> list[LeaseHandover]:
     """Release the IPAM row back to ``available`` when the static is removed.
 
     Also tears down the forward A (DNS sync with action=delete).
@@ -224,8 +230,15 @@ async def detach_ipam_for_static(
     DHCP config is gone" variant — the caller must be an explicitly destructive
     path that asked for it. A held row stays held whatever holds the address;
     the lease mirror leaves a reserved row alone as well.
+
+    Returns the rows handed to a live lease. Their DDNS records are the
+    caller's to publish with ``publish_handover_ddns``, and only once the
+    reservation itself is deleted: DDNS lets a reservation's hostname win, so
+    publishing while it still exists would put its name back on the row.
     """
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+    handovers: list[LeaseHandover] = []
 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in res.scalars().all():
@@ -240,8 +253,47 @@ async def detach_ipam_for_static(
             lease = await _live_lease_at(db, row) if to_status == "available" else None
             if lease is not None:
                 _mirror_lease_onto(row, lease)
+                if subnet_row is not None:
+                    handovers.append(LeaseHandover(subnet_row, row, lease))
             else:
                 row.status = to_status
+    return handovers
+
+
+@dataclass(frozen=True)
+class LeaseHandover:
+    """A row ``detach_ipam_for_static`` handed to the lease that holds it."""
+
+    subnet: Subnet
+    row: IPAddress
+    lease: DHCPLease
+
+
+async def publish_handover_ddns(db: AsyncSession, handovers: list[LeaseHandover]) -> None:
+    """Publish the lease's DDNS records for rows that just became its mirror.
+
+    The reservation's own A / PTR were torn down at the detach, and the
+    ingest runs ``apply_ddns_for_lease`` whenever it takes a row over, so
+    without this the mirror would sit in IPAM with no DNS until the client's
+    next renewal (the same wait #1274 removes for IPAM). A no-op when the
+    subnet's DDNS is off. Call it only after the reservation is deleted and
+    flushed; see ``detach_ipam_for_static``. Best-effort, like the ingest's
+    call: a DNS failure never undoes the IPAM hand-over, and the next lease
+    event or sweep reconciles it.
+    """
+    from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+    for h in handovers:
+        try:
+            await apply_ddns_for_lease(
+                db, subnet=h.subnet, ipam_row=h.row, client_hostname=h.lease.hostname
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            logger.warning(
+                "dhcp_static_delete_lease_ddns_failed",
+                address=str(h.row.address),
+                error=str(exc),
+            )
 
 
 async def _live_lease_at(

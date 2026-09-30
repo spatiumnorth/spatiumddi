@@ -347,7 +347,10 @@ the formatter handles the rest.
   and the next-free allocation could hand it to a second device. When
   the lease table holds an active lease on the address in that
   subnet, the delete now makes the row that lease's `dhcp` mirror,
-  linked to it, as if the lease had arrived after the delete.
+  linked to it, as if the lease had arrived after the delete. In a
+  DDNS-enabled subnet its A / PTR records are published under the
+  lease's hostname once the reservation is gone, as the lease ingest
+  does, instead of the address staying out of DNS until the renewal.
   `available` is kept when no active lease holds the address.
 
 - **The version-pin check now sees the Alpine-packaged daemons, and

@@ -28,6 +28,7 @@ from app.models.dhcp import (
     DHCPServerGroup,
     DHCPStaticAssignment,
 )
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dhcp.static_ipam import detach_ipam_for_static, upsert_ipam_for_static
 
@@ -284,3 +285,80 @@ async def test_the_mirror_takes_the_leases_name_and_keeps_a_later_sighting(
     assert row.status == "dhcp"
     assert row.hostname == "printer-7"
     assert (row.last_seen_at, row.last_seen_method) == (swept, "arp")
+
+
+@pytest.mark.asyncio
+async def test_the_leases_own_mac_and_name_win(db_session: AsyncSession) -> None:
+    """A lease whose name and MAC differ from the reservation's stamps its own,
+    as the ingest does when it takes a row over."""
+    grp, (srv,) = await _group(db_session)
+    subnet, scope = await _scope(db_session, grp)
+    st = await _reservation(db_session, scope, hostname="printer-7")
+    db_session.add(_lease(srv, scope, hostname="laptop-9", mac="aa:bb:cc:dd:ee:99"))
+    await db_session.flush()
+
+    await detach_ipam_for_static(db_session, st)
+    await db_session.flush()
+
+    row = await _row(db_session, subnet)
+    assert row.hostname == "laptop-9"
+    assert str(row.mac_address) == "aa:bb:cc:dd:ee:99"
+
+
+@pytest.mark.asyncio
+async def test_in_a_ddns_subnet_the_mirror_gets_its_dns_back(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The reservation's A record is torn down at the delete. The ingest
+    publishes DDNS whenever it takes a row over, so the hand-over does too,
+    under the LEASE's name: DDNS lets a reservation's hostname win, so a
+    publish before the reservation is gone would put its name back."""
+    token = await _superadmin_token(db_session)
+    dns_group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(dns_group)
+    await db_session.flush()
+    zone = DNSZone(
+        group_id=dns_group.id,
+        name="lan.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.lan.example.",
+        admin_email="admin.lan.example.",
+    )
+    db_session.add(zone)
+    await db_session.flush()
+
+    grp, (srv,) = await _group(db_session)
+    subnet, scope = await _scope(db_session, grp)
+    subnet.dns_zone_id = str(zone.id)
+    subnet.dns_inherit_settings = False
+    subnet.ddns_enabled = True
+    subnet.ddns_inherit_settings = False
+    subnet.ddns_hostname_policy = "client_or_generated"
+    await db_session.flush()
+    st = await _reservation(db_session, scope, hostname="printer-7")
+    db_session.add(_lease(srv, scope, hostname="laptop-9"))
+    await db_session.commit()
+
+    r = await client.delete(
+        f"/api/v1/dhcp/statics/{st.id}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert r.status_code == 204, r.text
+
+    row = await _row(db_session, subnet)
+    await db_session.refresh(row)
+    assert row.status == "dhcp"
+    assert row.hostname == "laptop-9"
+    assert row.dns_record_id is not None
+    names = (
+        (
+            await db_session.execute(
+                select(DNSRecord.name).where(
+                    DNSRecord.ip_address_id == row.id, DNSRecord.record_type == "A"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert names == ["laptop-9"]
