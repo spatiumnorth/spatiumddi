@@ -255,10 +255,10 @@ the formatter handles the rest.
   sent to the login page either, because the login check never ran.
   The new page renders inside the app, shows the requested path as
   plain text, and links back to the dashboard. It also suggests a few
-  pages from the sidebar's own list, skipping any whose feature is
-  turned off, and says that a disabled feature (Settings → Features)
-  is a common cause. Signed-out users now go to the login page. Also:
-  the legacy `/network/<id>` bookmark route matched any `/network/...`
+  pages from the sidebar's own list, closest to the mistyped path
+  first, and skips any whose feature is turned off (Settings →
+  Features). Signed-out users now go to the login page. Also: the
+  legacy `/network/<id>` bookmark route matched any `/network/...`
   typo and looked it up as a device. It now redirects a real device id
   to `/network/devices/<id>`, which its comment always said it did,
   and shows the 404 page for anything else.

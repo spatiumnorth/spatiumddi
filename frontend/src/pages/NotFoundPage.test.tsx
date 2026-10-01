@@ -87,4 +87,19 @@ describe("NotFoundPage", () => {
     // Still useful: falls back to the default destinations.
     expect(hrefs).toContain("/ipam");
   });
+
+  it("ranks the closest same-section page into the capped list", () => {
+    renderAt("/network/vlna");
+    const hrefs = screen
+      .getAllByRole("listitem")
+      .map((li) => li.querySelector("a")?.getAttribute("href"));
+    expect(hrefs[0]).toBe("/network/vlans");
+  });
+
+  it("shows bidi control characters escaped, not applied", () => {
+    renderAt("/ipam/%E2%80%AEtxt.exe");
+    expect(screen.getByTestId("not-found-path").textContent).toBe(
+      "/ipam/%E2%80%AEtxt.exe",
+    );
+  });
 });

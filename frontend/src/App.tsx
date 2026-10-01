@@ -1,4 +1,10 @@
-import { Routes, Route, Navigate, useParams } from "react-router-dom";
+import {
+  Routes,
+  Route,
+  Navigate,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useBrandDocumentTitle } from "@/hooks/usePublicSettings";
@@ -121,8 +127,11 @@ const UUID_RE =
  */
 function LegacyDeviceRoute() {
   const { id = "" } = useParams<{ id: string }>();
+  const { search, hash } = useLocation();
   if (!UUID_RE.test(id)) return <NotFoundPage />;
-  return <Navigate to={`/network/devices/${id}`} replace />;
+  // Keep the bookmark's query + fragment — the old route rendered the
+  // device page in place, so they used to reach it.
+  return <Navigate to={`/network/devices/${id}${search}${hash}`} replace />;
 }
 
 export default function App() {
@@ -283,10 +292,12 @@ export default function App() {
           element={<Navigate to="/dhcp" replace />}
         />
         <Route path="settings" element={<SettingsPage />} />
-        {/* #1360 — catch-all, deliberately the LAST child of the protected
-            layout: an unknown URL renders inside the app chrome, and a
-            signed-out user is sent to /login by ProtectedRoute like on any
-            other page. Without it <Routes> rendered null — a blank page. */}
+        {/* #1360 — catch-all, deliberately a child of the protected layout
+            (react-router ranks `*` below every other match, so its position
+            among the children does not matter): an unknown URL renders
+            inside the app chrome, and a signed-out user is sent to /login by
+            ProtectedRoute like on any other page. Without it <Routes>
+            rendered null — a blank page. */}
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>

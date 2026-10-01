@@ -29,7 +29,13 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 // Stand-ins for the chrome and the pages a redirect lands on: the test is
 // about which element the route table picks, not what those pages render.
 function Where() {
-  return <span data-testid="location">{useLocation().pathname}</span>;
+  const { pathname, search } = useLocation();
+  return (
+    <>
+      <span data-testid="location">{pathname}</span>
+      <span data-testid="search">{search}</span>
+    </>
+  );
 }
 vi.mock("@/components/layout/AppLayout", () => ({
   AppLayout: () => (
@@ -92,5 +98,12 @@ describe("catch-all route", () => {
     expect(screen.getByTestId("location").textContent).toBe(
       `/network/devices/${id}`,
     );
+  });
+
+  it("keeps the bookmark's query string on the legacy redirect", () => {
+    const id = "3f2b8c1e-9a4d-4e7b-8c21-5d6f7a8b9c0d";
+    renderAt(`/network/${id}?tab=interfaces`);
+    expect(screen.getByText("device detail")).toBeTruthy();
+    expect(screen.getByTestId("search").textContent).toBe("?tab=interfaces");
   });
 });
