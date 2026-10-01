@@ -71,9 +71,11 @@ GHOST = _m(18446744073709551557, "ddipg-member-3-7d1c4ad1", "192.168.122.86")  #
 
 
 def _run(tmp_path: Path, members: list[dict], request: str | None,
-         node_name: str = "ddipg-seed", age_s: float = 0.0, **store) -> tuple[dict, str, dict]:
+         node_name: str = "ddipg-seed", age_s: float = 0.0, curl: str | None = None,
+         **store) -> tuple[dict, str, dict]:
     """One run of the runner. `request` None writes no request (the unit started
-    again by hand); `age_s` backdates the request's mtime."""
+    again by hand); `age_s` backdates the request's mtime; `curl` replaces the
+    removal command with a fake curl that dumps these headers."""
     rs = tmp_path / "release-state"
     rs.mkdir(exist_ok=True)
     if request is not None:
@@ -99,6 +101,15 @@ def _run(tmp_path: Path, members: list[dict], request: str | None,
         "FAKE_TRIGGER": str(rs / "etcd-evict-pending"),
         "SPATIUM_NODE_NAME": node_name,
     }
+    if curl is not None:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        (fake_bin / "curl").write_text(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' \"$FAKE_CURL_HEADERS\"\n")
+        (fake_bin / "curl").chmod(0o755)
+        del env["SPATIUM_ETCD_REMOVE_CMD"]
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_CURL_HEADERS"] = curl
     subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True,
                    check=False)
     answer = (rs / "etcd-evict.state").read_text() if (rs / "etcd-evict.state").exists() else ""
@@ -332,3 +343,33 @@ def test_a_member_name_must_end_where_its_hex_does(tmp_path: Path) -> None:
                             _request(("ddipg-member-3", "192.168.122.86")))
     assert results["ddipg-member-3"] == ("absent", "")
     assert "removed" not in etcd
+
+
+def test_an_answer_without_grpc_status_is_not_a_removal(tmp_path: Path) -> None:
+    """#1326 review: remove_member read a missing grpc-status as success, so an
+    HTTP 415 (a server that did not take the call as gRPC) logged "removed".
+    The re-list kept the verdict right (`present`); the log and the reason now
+    say what happened."""
+    results, _, _ = _run(tmp_path, [SEED, M1, GHOST],
+                         _request(("ddipg-member-3", "192.168.122.86")),
+                         curl="HTTP/2 415 \r\ncontent-type: text/plain; charset=utf-8\r\n\r\n")
+    state, detail = results["ddipg-member-3"]
+    assert state == "present"
+    assert "remove failed: 18446744073709551557 ddipg-member-3-7d1c4ad1: no grpc-status in " \
+           "etcd's answer (HTTP 415)" in detail
+    log = (tmp_path / "log" / "etcd-evict.log").read_text()
+    assert "could not remove etcd member" in log
+    assert "removed etcd member" not in log
+
+
+def test_grpc_answers_are_read_from_headers_and_trailers() -> None:
+    mod = _module()
+    ok = "HTTP/2 200 \r\ncontent-type: application/grpc\r\n\r\ngrpc-status: 0\r\n"
+    assert mod.grpc_error(ok) == ""
+    gone = ("HTTP/2 200 \r\ncontent-type: application/grpc\r\ngrpc-status: 5\r\n"
+            "grpc-message: etcdserver: member not found\r\n\r\n")
+    assert mod.grpc_error(gone) == ""
+    refused = ("HTTP/2 200 \r\ncontent-type: application/grpc\r\ngrpc-status: 14\r\n"
+               "grpc-message: etcdserver:%20unhealthy%20cluster\r\n\r\n")
+    assert mod.grpc_error(refused) == "grpc-status 14: etcdserver: unhealthy cluster"
+    assert mod.grpc_error("HTTP/2 415 \r\n\r\n") == "no grpc-status in etcd's answer (HTTP 415)"

@@ -234,13 +234,24 @@ def remove_member(member_id: int) -> str:
                            timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"curl: {exc}"[:200]
-    headers = r.stdout.decode("utf-8", errors="replace")
     if r.returncode != 0:
         return f"curl exit {r.returncode}: {r.stderr.decode(errors='replace').strip()[:160]}"
+    return grpc_error(r.stdout.decode("utf-8", errors="replace"))
+
+
+def grpc_error(headers: str) -> str:
+    """'' when etcd's answer says the member is gone (grpc-status 0, or the
+    member was not found), else what went wrong. curl dumps the HTTP/2 trailers
+    with the headers, and every gRPC answer carries a grpc-status; an answer
+    without one (an HTTP 415 from a server that did not take the call as gRPC)
+    removed nothing, and the log must not say it did."""
     status = re.search(r"(?im)^grpc-status:\s*(\d+)", headers)
     message = re.search(r"(?im)^grpc-message:\s*(.*?)\s*$", headers)
     text = urllib.request.unquote(message.group(1)) if message else ""
-    if status is None or status.group(1) == "0" or "member not found" in text:
+    if status is None:
+        http = re.search(r"(?im)^HTTP/[\d.]+\s+(\d{3})", headers)
+        return f"no grpc-status in etcd's answer (HTTP {http.group(1) if http else '?'})"
+    if status.group(1) == "0" or "member not found" in text:
         return ""
     return f"grpc-status {status.group(1)}: {text}"[:200]
 
