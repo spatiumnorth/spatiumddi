@@ -359,6 +359,12 @@ A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS
 
 The archive is the unit operators move around — single-file, easy to ship over SCP / drop into S3 / download to a laptop.
 
+#### What an archive exposes
+
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. Most credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **The exception is each DNS server group's internal TSIG key** (`dns_server_group.tsig_key_secret`), which is stored in clear: the group's BIND9 servers grant zone transfers and dynamic updates to that key from any address, so anyone holding an archive can read and rewrite every zone the group serves for as long as that key is in use.
+
+So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
+
 #### Passphrase rules
 
 Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
@@ -397,10 +403,10 @@ squash.
 **NFS has no authentication, and the form says so.** AUTH_SYS is the only
 security flavour v1 supports: the client asserts a uid and the server believes
 it. A passing connection test therefore says nothing about who *else* on the
-network can read the export. Archives are encrypted with the target passphrase,
-so what an unrestricted export exposes is the metadata — archive names, sizes,
-and how often you back up — not the contents. Restrict the export to the control
-plane's address on the server side, and set the destination's `uid` / `gid` to an
+network can read the export, and an archive's database dump is not encrypted
+(see [What an archive exposes](#what-an-archive-exposes)), so an unrestricted
+export exposes the contents of every archive on it. Restrict the export to the
+control plane's address on the server side, and set the destination's `uid` / `gid` to an
 identity the export grants write access (with the usual `root_squash` default,
 presenting uid 0 gets mapped to `nobody` and every write fails; the driver
 detects that errno and names squash as the likely cause rather than reporting a
@@ -502,8 +508,13 @@ a single file at 4 GiB, so an estate whose archive outgrows that would fail
 mid-run, at the end of a long backup, on a destination that had worked for
 months. A disk with no filesystem UUID is refused too — there would be nothing
 stable to mount it by, since the kernel device name is reassigned on the next
-plug. Archives are already encrypted with the target passphrase, so LUKS on the
-disk is your choice, not a requirement.
+plug. An encrypted disk is refused for the same reason as any other filesystem:
+a LUKS container reports as `crypto_LUKS`, and the appliance carries no
+`cryptsetup` to unlock it. So the archives on a removable disk sit there in the
+clear, and an archive's database dump is not encrypted (see
+[What an archive exposes](#what-an-archive-exposes)) — treat the disk as a copy
+of the install: keep it physically secured, and if it has to leave the building,
+use a destination that encrypts at rest instead.
 
 On a multi-node cluster the **Kubernetes node** field on the destination is
 filled in for you from the fleet — the disk is plugged into one machine, and
@@ -598,8 +609,11 @@ Three things make this a least-privilege pull rather than a full API key:
   strong `ETag`. A poller that already has the newest archive gets a `304` and
   the destination is not read at all — without this, a nightly poller
   re-downloads a multi-GB archive every run.
-* **The archive is encrypted with the target passphrase**, which the puller
-  never needs and should not have. It fetches ciphertext.
+* **The puller never needs the target passphrase**, and should not have it:
+  without it most stored credentials in the archive stay encrypted. The rest of
+  the database dump is readable, the DNS group TSIG keys included (see
+  [What an archive exposes](#what-an-archive-exposes)), so protect the token and
+  wherever the puller writes the archive as you would the install itself.
 
 Two limits: a **destination must exist** — for a pull-only deployment make a
 `local_volume` target the staging destination, because a `GET` that triggers a
@@ -651,7 +665,9 @@ Same code path is hit whether the archive comes from an upload or a destination 
      Worth knowing for anyone revisiting this: classifying the unclassified tables — the fix originally sketched on #781 — would **not** have solved it, because `CASCADE` reaches them regardless of whether a section claims them. Classification only decides what an operator can *tick*.
 5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. An archive whose head is **not in this install's chain** — i.e. taken on a newer build — is **refused up front, before any data is replayed**, so a database this build cannot migrate is never written (#781); the operator is told to upgrade SpatiumDDI here first.
 
-   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code, which the api's strict schema-head readiness gate rejects. The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code, which the api's strict schema-head readiness gate rejects. The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `auto_recovered` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+
+   **Drift recovery.** An upgrade that stops on an object that *already exists* is the signature of a stale `alembic_version`: the archive was taken while that row lagged the schema, so the dump carries a schema already at head beneath a version that says otherwise. The restore then runs `alembic stamp head` and reports `auto_recovered` — but only after checking that every table and column this build's models declare is present in the restored database. The signature alone is not proof (#1233): any revision that meets one object it would create fails the same way, and since migrations commit one revision at a time (#1204), the revisions before it stay applied and those after it never ran. Stamping head on the signature would record that partially migrated schema as current, and it would fail later somewhere unrelated to the restore. When anything is missing, or the check cannot run, the restore reports `failed`, names the missing tables and columns, and leaves `alembic_version` at the last revision that committed, so a manual `alembic upgrade head` resumes from there. The check is deliberately one-directional and covers tables and columns only; a revision after the failing one that changes only data, indexes, constraints or types is not visible to it.
 6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column in the schema plus every JSONB-embedded Fernet string (`backup_target.config`'s `__enc__:` fields, and on `platform_settings` the SNMPv3 passphrases, syslog TLS CA bundles, APT GPG keys and private-mirror passwords); decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator does not have to copy the recovered `SECRET_KEY` into the destination's `.env` manually.
 
    Both lists in `app/services/backup/rewrap.py` are deliberately explicit rather than auto-discovered, so that adding an encrypted field is a review decision — and both are guarded, because "explicit" only works if drift is caught. It wasn't: the column list had silently drifted to 21 of 47 columns (#781). Everything a list misses stays encrypted under the *source* install's key, which surfaces only on first use of the affected credential. On the appliance this is the default case, not an edge case — `spatiumddi-firstboot` mints a fresh `SECRET_KEY` on every install, so every restore onto reimaged hardware is a cross-install restore.
