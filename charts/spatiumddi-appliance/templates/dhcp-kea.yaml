@@ -91,13 +91,12 @@ spec:
             # #292 / #409 — in-cluster API Service over HTTP by default;
             # prefer the supervisor-supplied external controlPlaneUrl when
             # set (Application appliance with its own k3s — no in-cluster
-            # control Service), skipping TLS verify on that self-signed
-            # path. See dns-bind9.yaml for the full rationale.
+            # control Service), verified against the supervisor's pinned
+            # certificate (#1281). See dns-bind9.yaml for the full rationale.
             - name: SPATIUM_API_URL
               value: {{ .Values.dhcpKea.controlPlaneUrl | default .Values.dhcpKea.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             {{- if .Values.dhcpKea.controlPlaneUrl }}
-            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
-              value: "1"
+            {{- include "spatiumddi-appliance.cpPin.env" . | nindent 12 }}
             {{- end }}
             - name: SPATIUM_AGENT_KEY
               value: {{ .Values.dhcpKea.agentKey | quote }}
@@ -149,12 +148,18 @@ spec:
               mountPath: /var/lib/spatium-dhcp-agent
             - name: leases
               mountPath: /var/lib/kea
+            {{- if .Values.dhcpKea.controlPlaneUrl }}
+            {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
+            {{- end }}
       # #292 — per-node hostPath (not shared PVC, not emptyDir). The
       # shared local-path PVC pinned its PV to one node → other DaemonSet
       # pods Pending; emptyDir would drop leases + the #5 cache on
       # restart. hostPath keeps each node's leases + cache durable on the
       # persistent /var partition. See dns-bind9.yaml for the full note.
       volumes:
+        {{- if .Values.dhcpKea.controlPlaneUrl }}
+        {{- include "spatiumddi-appliance.cpPin.volume" . | nindent 8 }}
+        {{- end }}
         - name: agent-state
           hostPath:
             path: /var/lib/spatiumddi/agents/dhcp-kea/state

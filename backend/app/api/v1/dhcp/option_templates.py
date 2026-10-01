@@ -129,7 +129,7 @@ async def create_template(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
     options = normalize_options(body.options)
-    validate_dhcp_options(options, address_family=body.address_family)
+    await validate_dhcp_options(db, options, group_id=group_id, address_family=body.address_family)
     tpl = DHCPOptionTemplate(
         group_id=group_id,
         name=body.name,
@@ -191,8 +191,10 @@ async def update_template(
         # Validate only changed options (#597, #1228) so a round-tripped
         # grandfathered value doesn't block an unrelated edit — unless the
         # family changed, which makes every option new to the template.
-        validate_dhcp_options(
+        await validate_dhcp_options(
+            db,
             options,
+            group_id=tpl.group_id,
             address_family=family,
             previous=(tpl.options or {}) if family == tpl.address_family else None,
         )
@@ -286,8 +288,12 @@ async def apply_template_to_scope(
         new_options = {**current, **tpl_options}
     # The template was checked against its own family, which need not be the
     # scope's (#1228), and may predate the check entirely.
-    validate_dhcp_options(
-        new_options, address_family=scope.address_family or "ipv4", previous=current
+    await validate_dhcp_options(
+        db,
+        new_options,
+        group_id=scope.group_id,
+        address_family=scope.address_family or "ipv4",
+        previous=current,
     )
     scope.options = new_options
     # Applying a template mutates the scope's rendered options, so wake

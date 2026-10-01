@@ -10,15 +10,33 @@ Two complements to the per-account lockout (#71):
   ``jti`` so a captured (challenge + TOTP) pair can't be replayed inside
   the 5-minute token TTL (#7).
 
+* ``stepup_password_blocked`` / ``record_stepup_password_failure`` — a
+  per-ACCOUNT budget on wrong answers to an in-session step-up (MFA
+  enrolment, disable, recovery-code regeneration; #1241). Those checks run
+  for a caller who already holds a session, which is exactly the hijacked
+  session they exist to stop — unthrottled, each one is a password oracle.
+  Keyed by account, not IP: the session is the attacker's, the address is
+  whatever they like.
+
 Plus one that is not an auth throttle at all:
 
 * ``e911_self_query_rate_limited`` — a per-source-IP budget on the
   unauthenticated HELD device self-query (#972).
 
-**The two auth throttles fail OPEN** when Redis is unreachable: the
+**The login throttles fail OPEN** when Redis is unreachable: the
 per-account lockout + the always-required second factor remain the hard
 backstops, so a Redis outage degrades them to no-ops rather than locking
 everyone out.
+
+**The step-up throttle fails CLOSED** (``StepupThrottleUnavailable``). The
+account lockout counts wrong SIGN-IN answers, not step-up answers, so for a
+hijacked session nothing else bounds the guessing: failing open would give
+it unlimited password guesses for as long as Redis is down, which on a
+Compose install (health-checked on ``/health/live``) is the whole outage.
+Refusing costs little — enrolling, disabling or regenerating MFA waits for
+Redis, while sign-in and everything else keeps working. Measured on the
+ddi-pg gate walk of #1241: with Redis stopped, eight wrong answers in a row
+each got 403 and none got 429.
 
 **The E911 one fails CLOSED**, and that inversion is the point rather than
 an oversight — see its docstring. It is not a complement to another
@@ -43,6 +61,12 @@ _LOGIN_RL_WINDOW_SECONDS = 60
 # Matches create_mfa_challenge_token's _MFA_TOKEN_TTL_MINUTES (5 min) —
 # once the challenge JWT expires the used-marker is moot.
 _MFA_USED_TTL_SECONDS = 5 * 60
+
+# 5 wrong step-up answers / 15 min / account (#1241). A person mistyping
+# gets several goes; a script guessing a password from a stolen session
+# gets five an hour-quarter.
+_STEPUP_FAIL_MAX = 5
+_STEPUP_FAIL_WINDOW_SECONDS = 15 * 60
 
 # 10 self-queries / 5 min / IP (#972 Phase 2). A phone asks for its own
 # location at boot and on a link change, not in a loop — so this is loose
@@ -125,3 +149,49 @@ async def mfa_challenge_consume(jti: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001 — never block MFA on a Redis blip
         logger.warning("mfa_replay_guard_redis_unavailable", error=str(exc))
         return True
+
+
+class StepupThrottleUnavailable(Exception):
+    """The step-up budget could not be read, so the step-up is refused rather
+    than run unthrottled. See the module docstring."""
+
+
+def _stepup_key(user_id: object) -> str:
+    return f"stepup_fail:{user_id}"
+
+
+async def stepup_password_blocked(user_id: object) -> bool:
+    """True once this account has used up its wrong-answer budget. Checked
+    BEFORE the credential, so a blocked caller learns nothing from a guess.
+
+    Fails CLOSED: raises ``StepupThrottleUnavailable`` when Redis cannot
+    answer, unlike the login throttle."""
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            count = await r.get(_stepup_key(user_id))
+            return count is not None and int(count) >= _STEPUP_FAIL_MAX
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — any Redis failure means "no budget to read"
+        logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
+        raise StepupThrottleUnavailable from exc
+
+
+async def record_stepup_password_failure(user_id: object) -> None:
+    """Count one wrong step-up answer. Only failures count, so a user who
+    gets it right is never slowed by their own successes.
+
+    Best-effort: a failure to count is logged, not raised. The answer has
+    already been refused, and the next attempt's ``stepup_password_blocked``
+    fails closed if Redis is still down."""
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            count = await r.incr(_stepup_key(user_id))
+            if count == 1:
+                await r.expire(_stepup_key(user_id), _STEPUP_FAIL_WINDOW_SECONDS)
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — throttle must never break the step-up
+        logger.warning("stepup_throttle_redis_unavailable", error=str(exc))

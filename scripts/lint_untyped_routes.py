@@ -79,6 +79,8 @@ def _load_routes() -> list[tuple[str, str]]:
     if backend.is_dir():
         sys.path.insert(0, str(backend))
     os.environ.setdefault("SECRET_KEY", "lint-only-not-a-real-secret")
+    # A lint-only key is exactly what the app refuses to boot on (#1222).
+    os.environ.setdefault("ALLOW_INSECURE_SECRET_KEY", "true")
     os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://lint@localhost/lint")
 
     from fastapi.routing import APIRoute  # noqa: PLC0415

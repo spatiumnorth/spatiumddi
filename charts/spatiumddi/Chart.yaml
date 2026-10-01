@@ -4,7 +4,7 @@ description: SpatiumDDI — all-in-one DDI (DNS, DHCP, IPAM) control plane + opt
 type: application
 # version + appVersion are placeholders for local `helm lint` / `helm template`
 # runs. The release workflow overrides both via `helm package --version
-# --app-version` using the CalVer release tag.
+# --app-version` using the release tag.
 version: 0.1.0
 appVersion: "0.0.0-dev"
 # #983 — 1.26 was a claim, not a tested floor: nobody has run this chart on

@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { safeExternalHref } from "@/lib/safeUrl";
 import { changeRequestsApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
@@ -250,7 +251,8 @@ export function Sidebar({
   const displayVersion = versionInfo?.version ?? __APP_VERSION__;
   const updateAvailable = versionInfo?.update_available ?? false;
   const latestVersion = versionInfo?.latest_version ?? null;
-  const latestReleaseUrl = versionInfo?.latest_release_url ?? null;
+  // From the GitHub API: linked only when http(s) (#1361).
+  const latestReleaseUrl = safeExternalHref(versionInfo?.latest_release_url);
 
   // Feature-module toggles — disabled modules drop their nav items
   // entirely (drive both the togglable feature surfaces and the

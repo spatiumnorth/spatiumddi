@@ -90,7 +90,7 @@ Located at [`app/drivers/dhcp/kea.py`](https://github.com/spatiumnorth/spatiumdd
 | Full scope/pool/reservation push | `ConfigBundle` → agent fetches via long-poll → agent renders + writes `/etc/kea/kea-dhcp4.conf` → `config-test` → `config-reload` over the Kea **unix control socket** | Incremental config — no daemon restart. |
 | Validate | `config-test` on the unix socket (with the full config doc as `arguments`) | Preflight — a config Kea rejects is never reloaded. |
 | Read leases | Agent tails the **memfile lease CSV** (`/var/lib/kea/kea-leases4.csv`) | Not the `lease_cmds` HTTP API. The hook is still loaded (HA depends on it), but leases reach the control plane by CSV tail → `POST /dhcp/agents/lease-events`. |
-| HA state | `status-get` on the unix socket, every ~15 s | Drives the live HA pill in the UI. |
+| HA state | `status-get` on the DHCPv4 unix socket, every ~15 s | Drives the live HA pill in the UI. DHCPv4 only — HA is not rendered into `Dhcp6`. |
 | Metrics | `statistic-get-all` on the unix socket, every ~60 s | Deltas of the `pkt4-*` counters. |
 
 **There is no HTTP Control Agent.** `kea-ctrl-agent` was removed in #637: Kea 3.0 deprecates it, and SpatiumDDI never spoke to it. Everything above rides the **unix control sockets** (`/run/kea/kea4-ctrl-socket`, `/run/kea/kea6-ctrl-socket`) via `agent/dhcp/spatium_dhcp_agent/kea_ctrl.py`. `:8000` is the HA hook's peer-to-peer listener and is now the only TCP port the image exposes.
@@ -198,7 +198,9 @@ override alone (nothing when it is on). Full measurements:
 
 ### HA coordination
 
-Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.21-2), SpatiumDDI treats a `DHCPServerGroup` with exactly two Kea members as an implicit HA pair — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
+Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.21-2), SpatiumDDI treats a `DHCPServerGroup` with two or more Kea members as an implicit HA pair (a third or later member renders as a `backup` peer, #332) — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
+
+**DHCPv4 only (#1238).** `render_kea` appends the HA hook to `Dhcp4["hooks-libraries"]` alone — the `Dhcp6` block loads only `libdhcp_lease_cmds.so` — and `HAStatusPoller` sends `status-get` to the DHCPv4 control socket alone. So the `failover` block coordinates DHCPv4 and nothing else: a DHCPv6 scope on the same group is served by each member independently, and `DHCPServer.ha_state` is the DHCPv4 daemon's state. The UI labels it `HA v4` and flags a v6 scope on a multi-Kea group. DHCPv6 HA is [#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258).
 
 - `_resolve_failover` in `backend/app/services/dhcp/config_bundle.py` walks the server's group. If the group has ≥ 2 Kea members and each has a non-empty `ha_peer_url`, it emits a `FailoverConfig` carrying the group's mode / heartbeat / max-response / max-ack / max-unacked tuning and both peers' URLs. Members are sorted by `id` so both peers render an identical `peers` array.
 - The agent's `render_kea.py:_ha_hook()` injects `libdhcp_ha.so` alongside the always-loaded `libdhcp_lease_cmds.so` (the HA hook depends on it).

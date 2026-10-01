@@ -141,13 +141,11 @@ async def _run_pg_dump(out_path: Path, *, snapshot_id: str | None = None) -> Non
         "--no-owner",
         "--no-privileges",
         "--quote-all-identifiers",
-        # ``--clean`` / ``--if-exists`` belong on the *restore*
-        # side now (``pg_restore --clean --if-exists``) — the
-        # custom-format archive carries the schema + data; the
-        # restore path adds the DROP/CREATE preamble at apply
-        # time. We omit them here so the dump is reusable for
-        # selective restore (which doesn't want the global
-        # cleanup).
+        # No ``--clean`` / ``--if-exists``: a full restore clears
+        # the whole schema itself before replaying (#1363 — the
+        # archive's own DROPs never reached tables a later
+        # migration added), and selective restore must not carry
+        # a global cleanup at all.
         f"--file={out_path}",
     ]
     if snapshot_id:

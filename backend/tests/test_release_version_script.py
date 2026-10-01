@@ -226,3 +226,41 @@ def test_notes_reads_the_file(
     path.write_text(_CHANGELOG)
     assert rv.main(["notes", "1.0.1", str(path)]) == 0
     assert capsys.readouterr().out.strip() == "- one"
+
+
+# ── chart-version: what Helm is told the chart is ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("name", "chart"),
+    [
+        # Helm rejects leading zeros, so a CalVer tag drops them.
+        ("2026.04.20-1", "2026.4.20-1"),
+        ("2026.09.04-1", "2026.9.4-1"),
+        ("2026.10.10-12", "2026.10.10-12"),
+        ("2026.11.03-01", "2026.11.3-1"),
+        # A SemVer tag is already a valid chart version.
+        ("1.0.0", "1.0.0"),
+        ("1.0.0-rc.1", "1.0.0-rc.1"),
+        ("1.10.0", "1.10.0"),
+        ("2.0.10", "2.0.10"),
+    ],
+)
+def test_chart_version(rv: types.ModuleType, name: str, chart: str) -> None:
+    assert rv.chart_version(_tag(rv, name)) == chart
+
+
+def test_every_calver_chart_is_a_prerelease_and_semver_charts_are_not(
+    rv: types.ModuleType,
+) -> None:
+    """Why the manual helm command must pass --version (#1182): Helm's
+    unversioned resolution skips pre-releases, and a CalVer chart always is
+    one. 1.0.0 is the first chart it would resolve on its own."""
+    assert "-" in rv.chart_version(_tag(rv, "2026.09.04-1"))
+    assert "-" not in rv.chart_version(_tag(rv, "1.0.0"))
+
+
+def test_chart_version_subcommand(rv: types.ModuleType, capsys: pytest.CaptureFixture[str]) -> None:
+    assert rv.main(["chart-version", "2026.04.20-1"]) == 0
+    assert capsys.readouterr().out.strip() == "2026.4.20-1"
+    assert rv.main(["chart-version", "nightly-2026.09.28"]) == 1

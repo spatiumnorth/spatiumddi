@@ -3,9 +3,13 @@
 
 Two shapes:
 
-* **Full restore** (no ``sections``) — hard overwrite. Replay the
-  archive over every table via ``pg_restore --clean`` (custom-format
-  archives) or ``psql`` (Phase 1 plain dumps).
+* **Full restore** (no ``sections``) — hard overwrite. Clear the schema,
+  then replay the archive's script (``pg_restore``'s output for a
+  custom-format archive, the dump itself for a Phase 1 plain one) through
+  ``psql``, both in one transaction. Clearing first is what makes an
+  archive older than this install restorable at all: ``pg_restore
+  --clean`` dropped only what the archive contained, so the tables later
+  migrations added survived and broke the replay (#1363).
 * **Selective restore** (``sections`` given) — TRUNCATE CASCADE + a
   data-only reload, over the **FK-cascade closure** of the selected
   sections' tables. The closure matters because CASCADE empties every
@@ -28,8 +32,9 @@ Safety rails:
   archive this build cannot migrate forward is refused with the
   database still intact. ``allow_newer_schema`` overrides it for the
   A/B-rollback case.
-* The data replay itself is atomic — ``--single-transaction`` on both
-  the psql and pg_restore paths. What is *not* atomic is the restore as
+* The data replay itself is atomic — clearing and replay run in one
+  ``psql --single-transaction``, and a ``pg_restore`` that fails part way
+  never lets psql reach end of input and commit. What is *not* atomic is the restore as
   a whole: the post-replay secret rewrap walks 65 columns/fields
   committing one at a time, so it can leave a half-migrated credential
   store. That is reported rather than hidden — see ``RewrapOutcome``'s
@@ -40,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -51,6 +57,7 @@ import structlog
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
+    _pg_subprocess_env,
     build_backup_archive,
     extract_archive_members,
 )
@@ -77,9 +84,9 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 SUPPORTED_FORMAT_VERSIONS = {1, 2}
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
-# Either binary can run a while on a hefty install; same envelope
-# as pg_dump so the matched-pair runs are bounded together.
-_PSQL_TIMEOUT_SECONDS = 30 * 60
+# A replay can run a while on a hefty install; same envelope as pg_dump so
+# the matched-pair runs are bounded together. Since #1363 a full restore runs
+# pg_restore feeding psql, and the whole replay shares this one deadline.
 _PG_RESTORE_TIMEOUT_SECONDS = 30 * 60
 
 
@@ -153,79 +160,340 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
         )
 
 
-async def _run_psql(sql_path: Path, db_url: str) -> None:
+# #1363 — a full restore must land on a schema holding exactly what the
+# archive carries. ``pg_restore --clean`` drops only the objects the ARCHIVE
+# contains, so every table a later migration added survived the replay with
+# its constraints. An archive older than ``dns_agent_bundle`` (every
+# 2026.09.04-1 archive) then failed outright: ``--clean`` could not drop
+# ``dns_server_pkey`` while ``dns_agent_bundle_server_id_fkey`` depended on
+# it, and the single transaction rolled back to a 400. A newer table with no
+# such key survived instead, and stopped the post-restore ``alembic upgrade``
+# on "already exists" — the drift branch #1233 had to tighten, entered by a
+# path that has nothing to do with a stale ``alembic_version``.
+#
+# So this runs first, in the SAME transaction as the replay: a failed replay
+# rolls the clearing back with it and the database is untouched. It drops
+# every table, view, sequence, standalone type and routine in ``public``
+# except an extension's members — ``CREATE EXTENSION IF NOT EXISTS`` in the
+# dump is then a no-op, and no extension needs re-creating (pg_trgm, #879, is
+# optional and may not be creatable by this role). Backups dump the whole
+# database with no exclusions, so nothing dropped here is lost: the archive
+# recreates everything that should exist. Names are captured as text up
+# front, because a CASCADE drop removes later rows' objects and a regclass of
+# a dropped oid renders as a bare number.
+_CLEAR_PUBLIC_SCHEMA_SQL = """\
+-- One NOTICE per cascaded constraint would otherwise bury the error, if any.
+SET client_min_messages = warning;
+DO $clear$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I', n.nspname, c.relname) AS obj,
+               CASE c.relkind
+                   WHEN 'v' THEN 'VIEW'
+                   WHEN 'm' THEN 'MATERIALIZED VIEW'
+                   WHEN 'f' THEN 'FOREIGN TABLE'
+                   WHEN 'S' THEN 'SEQUENCE'
+                   ELSE 'TABLE'
+               END AS kind
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind IN ('r', 'p', 'f', 'm', 'v', 'S')
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+          )
+        -- Tables first; whatever they take with them is skipped by IF EXISTS.
+        ORDER BY CASE c.relkind WHEN 'r' THEN 0 WHEN 'p' THEN 0 ELSE 1 END, c.relname
+    LOOP
+        EXECUTE format('DROP %s IF EXISTS %s CASCADE', r.kind, r.obj);
+    END LOOP;
+
+    FOR r IN
+        SELECT format('%I.%I', n.nspname, t.typname) AS obj
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public'
+          -- Not 'm': a multirange is internal to its range, which drops it.
+          -- Dropping one directly is an ERROR, not a no-op, in any order.
+          AND (
+              t.typtype IN ('e', 'd', 'r')
+              OR (t.typtype = 'c' AND EXISTS (
+                  SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'
+              ))
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+          )
+    LOOP
+        EXECUTE format('DROP TYPE IF EXISTS %s CASCADE', r.obj);
+    END LOOP;
+
+    FOR r IN
+        SELECT format('%I.%I(%s)', n.nspname, p.proname,
+                      pg_get_function_identity_arguments(p.oid)) AS obj
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+          )
+    LOOP
+        EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', r.obj);
+    END LOOP;
+END
+$clear$;
+"""
+
+_REPLAY_CHUNK_BYTES = 64 * 1024
+
+
+def _error_excerpt(stderr: str, limit: int = 1500) -> str:
+    """psql's stderr from its first ``ERROR`` line, which is the reason;
+    anything before it is notices and warnings."""
+    idx = stderr.find("ERROR:")
+    if idx != -1:
+        stderr = stderr[stderr.rfind("\n", 0, idx) + 1 :]
+    return stderr[:limit]
+
+
+async def _script_chunks(script: bytes | Path):
+    """Yield a plain dump in chunks: from memory when the caller already
+    holds it (the archive's bytes, which restore has just unzipped), else
+    from disk without blocking the loop."""
+    if isinstance(script, bytes):
+        view = memoryview(script)
+        for start in range(0, len(view), _REPLAY_CHUNK_BYTES):
+            yield bytes(view[start : start + _REPLAY_CHUNK_BYTES])
+        return
+    with script.open("rb") as fh:
+        while chunk := await asyncio.to_thread(fh.read, _REPLAY_CHUNK_BYTES):
+            yield chunk
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    """Kill ``proc`` if it is running, and reap it.
+
+    Its stdout is drained first: ``Process.wait()`` returns only once every
+    pipe has closed, and a killed producer's stdout still holds output
+    nobody will read, so without the drain the wait never returns.
+    """
+    if proc.returncode is None:
+        proc.kill()
+    if proc.stdout is not None:
+        await proc.stdout.read()
+    await proc.wait()
+
+
+async def _saw_token(stream: asyncio.StreamReader, token: bytes) -> bool:
+    """Drain ``stream`` to EOF; True when ``token`` appeared in it.
+
+    Keeps only a token-sized tail between reads, so a script that prints a
+    lot (one row per ``setval``) costs no memory.
+    """
+    seen, tail = False, b""
+    while chunk := await stream.read(_REPLAY_CHUNK_BYTES):
+        window = tail + chunk
+        seen = seen or token in window
+        tail = window[-len(token) :]
+    return seen
+
+
+async def _replay_clean(source, db_url: str, *, producer=None) -> None:
+    r"""Clear the schema and replay a SQL script, in ONE transaction (#1363).
+
+    ``source`` yields the script's bytes: a plain dump read from disk, or
+    ``pg_restore``'s script output for a custom-format archive (``producer``
+    is that process, so its failure can be told apart). Everything reaches
+    ``psql --single-transaction`` through stdin as one script, prefixed by
+    :data:`_CLEAR_PUBLIC_SCHEMA_SQL` — one ``-f -`` rather than several
+    ``-f`` files, because only psql 15+ wraps several in one transaction.
+
+    The script is streamed, not staged: an install's dump can be larger than
+    the api pod's scratch space. The cost of streaming is that psql reaching
+    end of input COMMITS, so a producer that dies half way through must
+    never let it get there. When the producer fails, psql is killed with its
+    stdin still open — the server then sees the connection drop mid
+    transaction and rolls everything back, the clearing included.
+
+    Success is psql ACKNOWLEDGING the end of the script, not just exiting 0:
+    a per-run token is ``\echo``-ed after the last statement, and only its
+    appearance on stdout proves psql read everything. Handing every byte to
+    the pipe proves nothing, since psql can leave early with exit 0 (a
+    ``\q``) while a small script still fits in the pipe.
+    """
     pg_env, _dbname = _pg_env_from_url(db_url)
-    # Kick every other connection first so the DROP / TRUNCATE in
-    # the dump's --clean preamble doesn't deadlock against the
-    # worker / beat / dns-bind9 / dhcp-kea / frontend SSE polls.
     await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
-    cmd = [
+    psql = await asyncio.create_subprocess_exec(
         "psql",
+        "--quiet",
+        "--no-psqlrc",
         "--set=ON_ERROR_STOP=1",
         "--single-transaction",
-        f"--file={sql_path}",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=full_env,
+        "--file=-",
+        env=_pg_subprocess_env(pg_env),
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdin, stdout, stderr = psql.stdin, psql.stdout, psql.stderr
+    assert stdin is not None and stdout is not None and stderr is not None
+    token = f"spatium-replay-complete-{secrets.token_hex(16)}".encode("ascii")
+    acknowledged = asyncio.ensure_future(_saw_token(stdout, token))
+    psql_stderr = asyncio.ensure_future(stderr.read())
+    producer_stderr = (
+        asyncio.ensure_future(producer.stderr.read())
+        if producer is not None and producer.stderr is not None
+        else None
+    )
+
+    async def kill_all() -> None:
+        # psql's stdout already has its reader (the acknowledgement task), so
+        # it is drained through that rather than by ``_stop``: two readers
+        # on one stream is an error.
+        if psql.returncode is None:
+            psql.kill()
+        # Waits for the reader to hit EOF without re-raising anything it
+        # failed with: cleanup must not replace the error being reported.
+        await asyncio.wait({acknowledged})
+        await psql.wait()
+        if producer is not None:
+            await _stop(producer)
+
+    def psql_gone() -> bool:
+        return psql.returncode is not None or stdin.is_closing()
+
+    async def copy() -> bool:
+        """Stream the script into psql; False when psql stopped reading.
+
+        Checked per chunk rather than left to the write: once psql exits,
+        asyncio's pipe transport DISCARDS further writes and ``drain()`` does
+        not raise, so a loop waiting for an exception would pump the rest of
+        the dump into nothing before reporting the error.
+        """
+        try:
+            stdin.write(_CLEAR_PUBLIC_SCHEMA_SQL.encode("utf-8"))
+            await stdin.drain()
+            async for chunk in source:
+                if psql_gone():
+                    return False
+                stdin.write(chunk)
+                await stdin.drain()
+            # On its own line: the script need not end with a newline.
+            stdin.write(b"\n\\echo " + token + b"\n")
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return not psql_gone()
+
+    # Set once psql has been given end of input: from then on it may be
+    # committing, so a timeout can no longer promise nothing was applied.
+    eof_sent = False
+    delivered = False
+    saw_end = False
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_PSQL_TIMEOUT_SECONDS)
+        # One deadline for the whole replay, not one per step.
+        async with asyncio.timeout(_PG_RESTORE_TIMEOUT_SECONDS):
+            delivered = await copy()
+            if not delivered:
+                # psql stopped reading, which only an error does. Stop the
+                # producer now: left running it blocks on a full pipe nobody
+                # drains. psql's own error is the one to report.
+                if producer is not None:
+                    await _stop(producer)
+            elif producer is not None:
+                await producer.wait()
+                if producer.returncode != 0:
+                    # psql has not seen end of input, so it has not committed;
+                    # the handler below kills it.
+                    err = (
+                        (await producer_stderr).decode(errors="replace")[:1500]
+                        if producer_stderr is not None
+                        else ""
+                    )
+                    raise BackupRestoreError(
+                        f"pg_restore failed (exit {producer.returncode}): {err}; "
+                        "nothing was applied"
+                    )
+            if delivered:
+                # End of input: psql COMMITs, or rolls back on an error in the
+                # final statements.
+                stdin.close()
+                eof_sent = True
+            await psql.wait()
+            saw_end = await acknowledged
     except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError(f"psql exceeded {_PSQL_TIMEOUT_SECONDS}s timeout") from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"psql failed (exit {proc.returncode}): {msg}")
+        await kill_all()
+        outcome = (
+            "the outcome is unknown — psql may have committed before it was stopped"
+            if eof_sent
+            else "nothing was applied"
+        )
+        raise BackupRestoreError(
+            f"restore replay exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout; {outcome}"
+        ) from exc
+    except BaseException:
+        await kill_all()
+        raise
+    if psql.returncode == 0 and not saw_end:
+        # psql left before the end of the script yet reported success (a
+        # ``\q`` in it, say). With --single-transaction that commits what it
+        # read, so this must not read as a completed restore.
+        raise BackupRestoreError(
+            "replay stopped before the end of the archive (psql exited 0 without "
+            "reading all of it); the database may hold a partial restore"
+        )
+    if psql.returncode != 0:
+        err = _error_excerpt((await psql_stderr).decode(errors="replace"))
+        raise BackupRestoreError(
+            f"replay failed (psql exit {psql.returncode}): {err}; nothing was applied"
+        )
+
+
+async def _run_psql(script: bytes | Path, db_url: str) -> None:
+    """Replay a plain-format (Phase 1) dump over a cleared schema (#1363)."""
+    await _replay_clean(_script_chunks(script), db_url)
 
 
 async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
-    """Replay a ``--format=custom`` archive via pg_restore (Phase
-    2+). ``--clean --if-exists`` ensures the destination's
-    matching objects get dropped before recreate; ``--no-owner``
-    + ``--no-acl`` strip role/grant clauses (matched to pg_dump's
-    flags); ``--single-transaction`` makes the whole replay
-    atomic. ``--exit-on-error`` so the first failure aborts
-    instead of the default behaviour of trying to keep going.
+    """Replay a ``--format=custom`` archive (Phase 2+) over a cleared schema.
+
+    ``pg_restore`` turns the archive into its SQL script (``--file=-``), and
+    :func:`_replay_clean` applies it after clearing the schema, in one
+    transaction (#1363). ``--clean`` is gone: everything it would drop is
+    already gone, and it never dropped what mattered — the tables the archive
+    does not contain. ``--no-owner`` + ``--no-acl`` strip role/grant clauses
+    (matched to pg_dump's flags).
     """
-    pg_env, dbname = _pg_env_from_url(db_url)
-    await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
-    cmd = [
+    producer = await asyncio.create_subprocess_exec(
         "pg_restore",
-        "--dbname",
-        dbname,
-        "--clean",
-        "--if-exists",
         "--no-owner",
         "--no-acl",
-        "--single-transaction",
-        "--exit-on-error",
+        "--file=-",
         str(dump_path),
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=full_env,
+        # Script mode never connects, so it gets no connection credentials.
+        env=_pg_subprocess_env({}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdout = producer.stdout
+    assert stdout is not None
+
+    async def script():
+        while chunk := await stdout.read(_REPLAY_CHUNK_BYTES):
+            yield chunk
+
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_PG_RESTORE_TIMEOUT_SECONDS
-        )
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError(
-            f"pg_restore exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout"
-        ) from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"pg_restore failed (exit {proc.returncode}): {msg}")
+        await _replay_clean(script(), db_url, producer=producer)
+    finally:
+        # _replay_clean reaps the producer on every path it owns; this covers
+        # a failure before it gets that far (terminating connections, starting
+        # psql), which would otherwise leave pg_restore blocked on a full pipe.
+        await _stop(producer)
 
 
 async def _truncate_tables(tables: list[str], db_url: str) -> None:
@@ -534,12 +802,13 @@ async def apply_backup_restore(
 
     # Phase 4: dispose of SQLAlchemy's connection pool. psql opens
     # its own connection, and leaving the async pool busy stalls
-    # the TRUNCATE / DROP statements emitted by pg_dump --clean —
-    # we'd deadlock against the worker / beat / agents reading at
-    # the same time. ``engine.dispose()`` closes every pooled
+    # the replay's DROP / TRUNCATE statements (the schema clearing
+    # of a full restore, the TRUNCATE of a selective one) — we'd
+    # deadlock against the worker / beat / agents reading at the
+    # same time. ``engine.dispose()`` closes every pooled
     # connection cleanly so the pool comes back empty after the
-    # restore. ``_terminate_other_db_connections`` (called from
-    # ``_run_psql`` below) then kicks anything still attached
+    # restore. ``_terminate_other_db_connections`` (called by each
+    # replay helper below) then kicks anything still attached
     # via the worker / beat / agent containers' own engines.
     from app.db import engine as global_engine  # noqa: PLC0415
 
@@ -629,9 +898,9 @@ async def apply_backup_restore(
             dump_path.write_bytes(db_bytes)
             await _run_pg_restore(dump_path, db_url)
         else:
-            sql_path = Path(tmpdir) / "database.sql"
-            sql_path.write_bytes(db_bytes)
-            await _run_psql(sql_path, db_url)
+            # Streamed from the bytes already in memory: staging them on
+            # disk only to read them back cost a full write of the dump.
+            await _run_psql(db_bytes, db_url)
 
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer

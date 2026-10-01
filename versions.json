@@ -384,7 +384,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/haproxy", "track": "^3\\.[0-9]+-alpine$" },
-      "note": "Stay on an LTS branch: this proxies every Patroni connection and nothing else in the repo watches it. 3.4 IS the current LTS -- `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve to the same digest, verified 2026-09-08. The previous pin (2.9) was a short-lived NON-LTS branch whose last release was March 2025, so it had gone 18 months with no security fixes at all."
+      "note": "Stay on an LTS branch: nothing else in the repo watches this image. It sits in the Compose Patroni overlay, which does not work and is unsupported in 1.0 (#1236), but the pin is kept current so #137 does not start from an unmaintained HAProxy. 3.4 IS the current LTS -- `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve to the same digest, verified 2026-09-08. The previous pin (2.9) was a short-lived NON-LTS branch whose last release was March 2025, so it had gone 18 months with no security fixes at all."
     },
 
     "etcd-patroni": {
@@ -410,7 +410,7 @@
         }
       ],
       "upstream": { "kind": "none" },
-      "note": "NOT a pin, and recorded here so it stops looking like one. The overlay BUILDS this image itself -- the sibling `build.dockerfile_inline` layers Patroni onto postgres:16-alpine via pip -- so `latest` names a purely local artifact that exists in no registry. Giving it a version number here would imply SpatiumDDI publishes one. The real unpinned thing in that block is `pip install patroni[etcd3]`, which resolves at build time, so two hosts built on different days get different Patroni versions; documented in docs/deployment/BAREMETAL.md rather than pinned, because the overlay is a reference template an operator is expected to adapt."
+      "note": "NOT a pin, and recorded here so it stops looking like one. The overlay BUILDS this image itself -- the sibling `build.dockerfile_inline` layers Patroni onto postgres:16-alpine via pip -- so `latest` names a purely local artifact that exists in no registry. Giving it a version number here would imply SpatiumDDI publishes one. The real unpinned thing in that block is `pip install patroni[etcd3]`, which resolves at build time, so two hosts built on different days get different Patroni versions; not pinned, because the overlay does not work and is unsupported in 1.0 (#1236; making Compose HA real is #137), so pinning a component of it would suggest otherwise."
     },
 
     "ruby-docs-preview": {

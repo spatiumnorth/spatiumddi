@@ -126,7 +126,8 @@ async def create_class(
         raise HTTPException(status_code=409, detail="A client class with that name exists")
     _check_test(body.match_expression, body.address_family)
     body.options = normalize_options(body.options)
-    validate_dhcp_options(body.options, address_family=body.address_family)
+    # A client class is rendered by Kea / FortiGate only: the Kea raw-code rule (#1296).
+    await validate_dhcp_options(db, body.options, group_id=None, address_family=body.address_family)
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
@@ -165,8 +166,10 @@ async def update_class(
         options = (
             normalize_options(changes["options"]) if "options" in changes else cc.options or {}
         )
-        validate_dhcp_options(
+        await validate_dhcp_options(
+            db,
             options,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=family,
             previous=None if family_changed else cc.options or {},
         )

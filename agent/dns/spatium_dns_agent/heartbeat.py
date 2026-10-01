@@ -19,6 +19,10 @@ from .spool import SpoolManager
 log = structlog.get_logger(__name__)
 
 
+# The control plane's ``ops_ack`` bound (``AgentHeartbeatRequest``).
+MAX_ACKS_PER_HEARTBEAT = 5000
+
+
 class HeartbeatClient:
     def __init__(
         self,
@@ -96,16 +100,23 @@ class HeartbeatClient:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
+        verify = self.cfg.httpx_verify()
         return httpx.Client(
             base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0
         )
 
     def send_once(self) -> None:
+        # #1232 — a snapshot, and only what it holds is removed on success.
+        # The sync thread appends acks while this request is in flight, and
+        # ``pending_acks.clear()`` after the response dropped any ack appended
+        # in that window: the op stayed ``in_flight`` on the control plane
+        # with no ack ever coming. The sync thread only ever appends, so the
+        # first ``len(acks)`` entries are exactly the ones sent.
+        # At most MAX_ACKS_PER_HEARTBEAT: the control plane refuses a longer
+        # list (422), and with nothing ever removed the agent would wedge on
+        # it for good. Two 5000-op pages can drain between heartbeats; the
+        # rest go on the next one.
+        acks = list(self.pending_acks[:MAX_ACKS_PER_HEARTBEAT])
         body: dict[str, Any] = {
             "agent_version": __version__,
             # #638 — the DNS DAEMON's version (e.g. "5.0.5" / "9.20.26"),
@@ -120,7 +131,7 @@ class HeartbeatClient:
             # sent as a literal ``{}``: declared on the server's request
             # model, accepted, and read by nothing.
             "config": self.config_apply.as_dict(),
-            "ops_ack": self.pending_acks,
+            "ops_ack": acks,
             "failed_ops_count": self.failed_ops_count,
         }
         if self.spool_manager is not None and not self._spool_field_unsupported:
@@ -151,7 +162,7 @@ class HeartbeatClient:
                     )
             if resp.status_code == 200:
                 data = resp.json()
-                self.pending_acks.clear()
+                del self.pending_acks[: len(acks)]
                 rotated = data.get("rotated_token")
                 if rotated:
                     self.token_ref[0] = rotated

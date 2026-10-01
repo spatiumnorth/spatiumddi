@@ -88,20 +88,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # #272 — skip TLS verification on the supervisor → control
-            # plane connection (register / poll / heartbeat). A fresh
-            # control plane serves a SELF-SIGNED cert; #234 hardened the
-            # supervisor's httpx client to verify by default, which
-            # broke appliance pairing (CERTIFICATE_VERIFY_FAILED on
-            # every register). The pairing code + the post-approval mTLS
-            # client cert are the real auth here; TLS is just transport
-            # over a LAN to an operator-typed IP. Trust-on-first-use is
-            # the right model for appliance bootstrap, so we opt this
-            # connection out of verification. (The kubeapi paths #234
-            # hardened are unaffected — this flag only gates the
-            # control-plane HTTP client.)
-            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
-              value: "1"
+            # No SPATIUM_INSECURE_SKIP_TLS_VERIFY (#1219). This used to set
+            # it unconditionally, calling the result trust-on-first-use; it
+            # was no verification at all, and the heartbeat response carries
+            # the agent keys and the slot image URL + sha256. The supervisor
+            # now pins the control plane's certificate on first contact
+            # itself (``cp_tls``), which is what makes a self-signed control
+            # plane work, and re-pins a rotated one only if the appliance CA
+            # vouches for it. Nor are the pairing code or the post-approval
+            # client cert any substitute: they authenticate the SUPERVISOR,
+            # not the server it is talking to.
           volumeMounts:
             - name: etc-spatiumddi-host
               mountPath: /etc/spatiumddi-host

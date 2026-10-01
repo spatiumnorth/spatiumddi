@@ -16,7 +16,7 @@ body:
     attributes:
       label: SpatiumDDI version
       description: "Git tag, image tag, or short commit SHA"
-      placeholder: "e.g. 2026.04.16-1 or ghcr.io/spatiumnorth/api:2026.04.16-2"
+      placeholder: "e.g. 2026.11.03-1, 1.0.0 or ghcr.io/spatiumnorth/spatiumddi-api:1.0.0"
     validations:
       required: true
 

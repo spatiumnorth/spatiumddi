@@ -44,6 +44,7 @@ import httpx
 import structlog
 
 from . import appliance_state, approval_state, firewall_peer_audit, watchdog
+from . import cp_tls
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -125,10 +126,7 @@ def _is_control_plane_member() -> bool:
         that was promoted into the control plane and whose host
         runner has reported the join completed.
     """
-    if appliance_state.detect_appliance_variant() == "control-plane":
-        return True
-    join_state, _ = appliance_state.read_cluster_join_state()
-    return join_state == "ready"
+    return appliance_state.is_control_plane_member()
 
 
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
@@ -776,6 +774,11 @@ def heartbeat_once(
         # revocation strikes. The control plane is unreachable, not
         # rejecting us; once it comes back the 200 path resumes.
         log.warning("supervisor.heartbeat.failed", error=str(exc))
+        # #1219 — the control plane presented a certificate other than the
+        # pinned one. Re-pin if its CA vouches for the new one (a rotation),
+        # refuse if not (an interception). The next heartbeat uses the result.
+        if cp_tls.is_verification_failure(exc):
+            cp_tls.try_repin(cfg.state_dir, _effective_control_plane_url(cfg))
         return False
     if resp.status_code == 403 or resp.status_code == 404:
         # 403 = approval revoked or cert no longer valid for any

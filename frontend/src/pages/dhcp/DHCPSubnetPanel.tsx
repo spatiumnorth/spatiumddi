@@ -18,7 +18,8 @@ import {
 } from "@/lib/approvalQueue";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
-import { DeleteConfirmModal } from "./_shared";
+import { DeleteConfirmModal, V6NoHaTag } from "./_shared";
+import { v6ScopeLacksHa } from "@/lib/dhcpHa";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
 
 // #1155 — the scope and pool writes, each on the check the server makes:
@@ -107,6 +108,12 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
     queryKey: ["dhcp-pools", scope.id],
     queryFn: () => dhcpApi.listPools(scope.id),
   });
+  // #1238 — HA is DHCPv4 only; flag a v6 scope on a multi-Kea group.
+  const { data: groups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+  });
+  const group = groups.find((g) => g.id === scope.group_id);
 
   const toggleEnabled = useMutation({
     mutationFn: (enabled: boolean) =>
@@ -142,9 +149,14 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
         <div className="flex items-center gap-3 min-w-0">
           <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
           <div className="min-w-0">
-            <p className="text-sm font-semibold truncate">
-              {scope.name || `Scope ${scope.id.slice(0, 8)}`}
-            </p>
+            <div className="flex min-w-0 items-center gap-2">
+              <p className="text-sm font-semibold truncate">
+                {scope.name || `Scope ${scope.id.slice(0, 8)}`}
+              </p>
+              {group && v6ScopeLacksHa(scope, group) && (
+                <V6NoHaTag keaMemberCount={group.kea_member_count} />
+              )}
+            </div>
             <p className="text-xs text-muted-foreground">
               Lease {scope.lease_time}s · {pools.length} pool
               {pools.length !== 1 ? "s" : ""}

@@ -53,7 +53,12 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.option_validation import options_for_family
+from app.services.dhcp.option_validation import (
+    options_for_family,
+    phone_options_loadable,
+    vendor_class_match_renderable,
+    vendor_class_match_test,
+)
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf, resolve_dnssl
 from app.services.e911 import effective_subnet_erls
 from app.services.e911.dhcp_options import kea_option_data
@@ -465,9 +470,10 @@ def _build_pxe_match_expression(
     """
     parts: list[str] = []
     if vendor_class_match:
-        n = len(vendor_class_match)
-        # Kea's `hex` for option 60 is the literal byte string.
-        parts.append(f"substring(option[60].hex,0,{n})=='{vendor_class_match}'")
+        # Bytes, not characters (#1357): Kea's `hex` for option 60 is the
+        # literal byte string. The caller has already dropped a match that
+        # cannot sit inside the literal.
+        parts.append(vendor_class_match_test(vendor_class_match))
     if arch_codes:
         arch_or = " or ".join(f"option[93].hex == 0x{code:04X}" for code in arch_codes)
         if len(arch_codes) > 1:
@@ -519,6 +525,20 @@ async def _assemble_pxe_classes(
             continue
         name = f"pxe-{str(prof.id)[:8]}-{str(m.id)[:8]}"
         if name in seen_names:
+            continue
+        if not vendor_class_match_renderable(m.vendor_class_match):
+            # #1357 — a ``'`` ends Kea's string literal and a control
+            # character is refused inside one; either rejects the WHOLE
+            # config. Refused on write now; a match stored before that is
+            # left out of the render rather than breaking every scope. The
+            # class is dropped, not rendered without its vendor test, which
+            # would widen it to every client of the matching arch.
+            log.warning(
+                "dhcp_pxe_match_skipped_bad_vendor_match",
+                profile=prof.name,
+                profile_id=str(prof.id),
+                match_id=str(m.id),
+            )
             continue
         seen_names.add(name)
         out.append(
@@ -574,24 +594,35 @@ async def _assemble_phone_classes(
             continue
         match_expr = ""
         if prof.vendor_class_match:
-            n = len(prof.vendor_class_match)
-            match_expr = f"substring(option[60].hex,0,{n})=='{prof.vendor_class_match}'"
-        # Convert option_set list-of-dicts into Kea-flavoured option-data
-        # keyed by option-name. The renderer in ``drivers/dhcp/kea.py``
-        # walks the dict and falls back to ``code: <int>`` form when the
-        # entry has no recognised name. Trailing options with empty
-        # values get dropped so the class doesn't render an empty line.
-        options: dict[str, str] = {}
-        for opt in prof.option_set or []:
-            name = opt.get("name") if isinstance(opt, dict) else None
-            value = opt.get("value") if isinstance(opt, dict) else None
-            code = opt.get("code") if isinstance(opt, dict) else None
-            if not value:
+            if not vendor_class_match_renderable(prof.vendor_class_match):
+                # #1294 — a ``'`` ends Kea's string literal, and Kea's lexer
+                # refuses a newline inside one; either rejects the whole
+                # config. Refused on write now; a profile stored before that
+                # is left out of the render rather than breaking every scope.
+                log.warning(
+                    "dhcp_phone_profile_skipped_bad_match",
+                    profile=prof.name,
+                    profile_id=str(prof.id),
+                )
                 continue
-            key = name or (f"code:{code}" if code else None)
-            if not key:
-                continue
-            options[str(key)] = str(value)
+            # Bytes, not characters: ``option[60].hex`` is the raw option, so
+            # a non-ASCII prefix measured in characters never matched.
+            match_expr = vendor_class_match_test(prof.vendor_class_match)
+        # #1294 — keyed by CODE (``phone_option_key``): the catalogue names a
+        # profile carries (``polycom-config-url``) are unknown to the agent,
+        # which dropped them, so option 160 never reached a phone. And only
+        # what Kea can load: a profile stored before its options were checked
+        # may hold a value Kea would reject (the starter pack's CHANGE-ME in
+        # binary option 43), and one bad option rejects the WHOLE config.
+        # Dropped here with a warning rather than rendered.
+        options, dropped = phone_options_loadable(prof.option_set)
+        for key in dropped:
+            log.warning(
+                "dhcp_phone_option_dropped_invalid",
+                profile=prof.name,
+                profile_id=str(prof.id),
+                option=key,
+            )
 
         out.append(
             PhoneClassDef(

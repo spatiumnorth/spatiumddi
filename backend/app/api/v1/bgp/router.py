@@ -109,6 +109,7 @@ class ASNNetwork(_UpstreamEnvelope):
     policy_locations: str | None = None
     irr_as_set: str | None = None
     looking_glass: str | None = None
+    website: str | None = None
 
 
 class ASNIxpPresence(_UpstreamEnvelope):

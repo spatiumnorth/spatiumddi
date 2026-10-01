@@ -3,7 +3,7 @@ name: Nightly
 # Nightly build of `main` (#805).
 #
 # WHY THIS EXISTS. Every published image and ISO comes from release.yml,
-# which fires only on a CalVer tag — so nothing builds the *release* image
+# which fires only on a release tag — so nothing builds the *release* image
 # except a release. That is how #732 survived: the api image shipped its
 # `dev` stage (pytest, as root) and nobody noticed until a release cut it.
 # It is also why a base-image CVE introduced by a Dockerfile change sits
@@ -23,9 +23,9 @@ name: Nightly
 #     reference them (see the prune job). Orphaned layers are GHCR's
 #     untagged-retention policy to collect, not this workflow's.
 #
-#   Pre-releases — ONE per nightly, tagged `nightly-YYYY.MM.DD` (CalVer
-#     date, prefixed so it can never match release.yml's bare-CalVer tag
-#     trigger and fire a release build). The previous design reused a
+#   Pre-releases — ONE per nightly, tagged `nightly-YYYY.MM.DD` (the build
+#     date, prefixed so it can never match release.yml's release-tag
+#     triggers and fire a release build). The previous design reused a
 #     single `nightly` pre-release with assets replaced in place — which
 #     made GitHub show the release's original creation date forever, so
 #     every nightly looked a week stale. Per-night releases carry the
@@ -236,14 +236,15 @@ jobs:
           echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
           # Per-night pre-release tag: CalVer date so nightlies sort and
           # read like the releases they sit next to, PREFIXED so it can
-          # never match release.yml's bare-CalVer tag trigger (a tag like
+          # never match release.yml's release-tag triggers (a tag like
           # 2026.08.08-nightly would fire a full release build).
           RELEASE_TAG="nightly-${NIGHT_DATE:0:4}.${NIGHT_DATE:4:2}.${NIGHT_DATE:6:2}"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "→ this is the build for the evening of ${NIGHT_DATE} (${DATE_TAG}, ${RELEASE_TAG}); now $(TZ=America/New_York date -d "@$NOW" '+%F %H:%M %Z')"
           # Informational version string baked into the frontend build and
-          # the appliance release stamp. Deliberately NOT CalVer-shaped, so
-          # it can never be mistaken for a release by a human or a sort.
+          # the appliance release stamp. Deliberately NOT a release version
+          # (app/core/versions.py reads it as a nightly), so it can never be
+          # mistaken for a release by a human, a sort or a version gate.
           echo "version=0.0.0-${DATE_TAG}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
           # The last nightly's commit is recorded in the newest dated
@@ -358,8 +359,8 @@ jobs:
           load: true
           push: false
           tags: scan-target:${{ matrix.image }}
-          # APP_VERSION: the version the supervisor reports (#1183). An
-          # image that declares no such ARG ignores it.
+          # APP_VERSION: the version the supervisor (#1183) and the agents
+          # (#1182) report. An image that declares no such ARG ignores it.
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
             APP_VERSION=${{ needs.gate.outputs.version }}
@@ -416,8 +417,8 @@ jobs:
           tags: |
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:nightly
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.date_tag }}
-          # APP_VERSION: the version the supervisor reports (#1183). An
-          # image that declares no such ARG ignores it.
+          # APP_VERSION: the version the supervisor (#1183) and the agents
+          # (#1182) report. An image that declares no such ARG ignores it.
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
             APP_VERSION=${{ needs.gate.outputs.version }}
@@ -511,8 +512,8 @@ jobs:
           ls -lh dist/
 
           # --target pins the tag to the exact commit this run built.
-          # `nightly-YYYY.MM.DD` cannot match release.yml's bare-CalVer
-          # trigger, so creating the tag fires nothing. Finalize fills in
+          # `nightly-YYYY.MM.DD` cannot match release.yml's release-tag
+          # triggers, so creating the tag fires nothing. Finalize fills in
           # the real notes once every job has succeeded.
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
@@ -548,7 +549,7 @@ jobs:
             echo "── $img"
             # A version is a prune candidate ONLY when every tag it carries
             # is a dated nightly tag. That is what protects `latest`, the
-            # CalVer release tags, and the `:nightly` pointer — the pointer
+            # release tags, and the `:nightly` pointer — the pointer
             # shares a version with the newest dated tag, which the sort
             # keeps anyway, but the all-tags-match rule means we would never
             # delete it even if it did not.
