@@ -845,7 +845,11 @@ the formatter handles the rest.
   eviction is removed too: a re-join that was already in flight when
   Replace landed. A node that is promoted again in that time is
   exempt, since its new member is wanted. A seed whose OS slot
-  predates the runner keeps the old behaviour.
+  predates the runner keeps the old behaviour. Promote is refused
+  while an eviction is still pending, for the node itself and for
+  any node under the same hostname, and the Fleet no longer offers
+  them for promotion: until the eviction settles, the seed removes
+  etcd members under that name.
 
 - **A join the seed's etcd refuses is rolled back with its reason,
   instead of sitting `joining` for good (#1285).** The join runner's

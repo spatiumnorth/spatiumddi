@@ -4264,6 +4264,40 @@ async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
     return sorted(set(out))
 
 
+async def _refuse_promote_while_evicting(db: DB, row: Appliance) -> None:
+    """409 when ``row``'s hostname has an eviction still pending (#1284): the
+    row itself between Replace and its ``left``, or another row under the
+    same hostname. The seed matches etcd members by hostname (case-blind
+    here, so a variant spelling can't slip past the guard)."""
+    if row.evict_requested or row.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance {row.hostname!r} is still being evicted (Fleet → Replace): the seed "
+            "removes etcd members under its hostname until the eviction settles. Promote it "
+            "once its row reads 'left' (or clear the cluster state if the eviction is stuck).",
+        )
+    if not row.hostname:
+        return
+    namesake = (
+        await db.execute(
+            select(Appliance.hostname)
+            .where(
+                Appliance.id != row.id,
+                Appliance.evict_requested.is_(True),
+                sa_func.lower(Appliance.hostname) == row.hostname.lower(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if namesake is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance {row.hostname!r} shares its hostname with an appliance that is still "
+            "being evicted (Fleet → Replace): the seed removes etcd members under that name "
+            "until the eviction settles. Promote it once that row reads 'left'.",
+        )
+
+
 async def _resolve_primary(db: DB, members: list[Appliance]) -> Appliance | None:
     """Return the etcd seed (``cluster_role='primary'``), designating
     one on the first promote.
@@ -4359,6 +4393,15 @@ async def promote_control_plane(
                 status.HTTP_409_CONFLICT,
                 f"Appliance {row.hostname!r} is already a control-plane member (or joining).",
             )
+        # #1284 — not while an eviction of this hostname is pending. Replace
+        # clears the row's roles at once, but until the seed confirms the
+        # eviction it removes every etcd member named `<hostname>-<8 hex>`
+        # on each heartbeat: a node promoted into that name meanwhile (this
+        # row, or a replacement box installed under the same hostname) would
+        # join, become a voter and lose its member on the seed's next tick.
+        # Once the row reads `left` a promote is safe: the seed ends its
+        # late-arrival watch on any name it is asked to join.
+        await _refuse_promote_while_evicting(db, row)
         # A control-plane-variant node is already a control plane — you
         # can't promote a control plane to a control plane. (The seed is
         # caught by the primary check above; this catches any other
