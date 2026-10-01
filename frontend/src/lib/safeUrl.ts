@@ -26,6 +26,6 @@ export function safeExternalHref(
   }
   // URL lowercases the scheme, so "HTTPS:" and "JAVASCRIPT:" land here
   // already folded.
-  const scheme = parsed.protocol.toLowerCase();
+  const scheme = parsed.protocol;
   return scheme === "http:" || scheme === "https:" ? parsed.href : null;
 }

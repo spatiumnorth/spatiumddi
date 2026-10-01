@@ -256,7 +256,7 @@ the formatter handles the rest.
   are also checked when they are fetched: a website is kept only if it
   is http(s), and a looking glass only if it is http(s), telnet or ssh,
   the schemes PeeringDB itself accepts. The GitHub release links on the
-  sidebar and the Releases tab get the same http(s) check.
+  sidebar and the Releases tab are also linked only when http(s).
 
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's

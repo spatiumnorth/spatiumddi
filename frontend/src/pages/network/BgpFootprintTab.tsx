@@ -458,7 +458,8 @@ function Field({
 }
 
 // PeeringDB values: only http(s) becomes a link. Anything else, including
-// a telnet: or ssh: looking glass, is shown as plain text (#1361).
+// a telnet: or ssh: looking glass, is shown as plain text (#1361). A link
+// shows its parsed href, so the text names the host it actually opens.
 function externalLink(value: string) {
   const href = safeExternalHref(value);
   if (!href) {
@@ -471,7 +472,7 @@ function externalLink(value: string) {
       rel="noreferrer noopener"
       className="inline-flex items-center gap-1 text-primary hover:underline"
     >
-      <span className="break-all">{value}</span>
+      <span className="break-all">{href}</span>
       <ExternalLink className="h-3 w-3 flex-shrink-0" />
     </a>
   );

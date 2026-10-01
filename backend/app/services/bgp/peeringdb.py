@@ -45,6 +45,11 @@ def _url_with_scheme(value: Any, allowed: frozenset[str]) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     value = value.strip()
+    # urlsplit silently drops tabs, newlines and leading C0 controls before
+    # it reads the scheme, so "ht\ttps://x" would pass while the string we
+    # hand on still carries them. Refuse any control character outright.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return None
     try:
         parts = urlsplit(value)
     except ValueError:
