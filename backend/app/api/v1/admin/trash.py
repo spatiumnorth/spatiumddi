@@ -319,9 +319,8 @@ async def restore_row(
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
 
-    restored, conflicts = await restore_batch(
-        db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts
-    )
+    result = await restore_batch(db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts)
+    restored, conflicts = result.restored, result.conflicts
     if conflicts and not skip_conflicts:
         raise HTTPException(
             status_code=409,
@@ -365,7 +364,9 @@ async def restore_row(
                 resource_type=resource_type_for(obj),
                 resource_id=str(obj.id),
                 resource_display=_row_label(obj),
-                new_value={"deletion_batch_id": str(batch_id)},
+                # A zone's records get no row of their own: they were restored
+                # by one UPDATE and are counted here (#1389).
+                new_value=result.audit_new_value(obj, batch_id),
                 result="success",
             )
         )
@@ -377,13 +378,13 @@ async def restore_row(
     logger.info(
         "trash.restore",
         batch_id=str(batch_id),
-        restored=len(restored),
+        restored=result.total,
         skipped=len(conflicts),
         user_id=str(current_user.id),
     )
     return RestoreResponse(
         batch_id=batch_id,
-        restored=len(restored),
+        restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
     )
 
