@@ -52,9 +52,12 @@ def _url_with_scheme(value: Any, allowed: frozenset[str]) -> str | None:
         return None
     try:
         parts = urlsplit(value)
+        # A non-empty netloc is not a host: "https://@", "https://:443" and
+        # "ssh://user@" all have one and no hostname.
+        host = parts.hostname
     except ValueError:
         return None
-    if parts.scheme.lower() not in allowed or not parts.netloc:
+    if parts.scheme.lower() not in allowed or not host:
         return None
     return value
 
