@@ -56,6 +56,7 @@ import structlog
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
+    _pg_subprocess_env,
     build_backup_archive,
     extract_archive_members,
 )
@@ -82,9 +83,9 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 SUPPORTED_FORMAT_VERSIONS = {1, 2}
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
-# Either binary can run a while on a hefty install; same envelope
-# as pg_dump so the matched-pair runs are bounded together. Since #1363 one
-# replay runs both (pg_restore feeding psql), under this one bound.
+# A replay can run a while on a hefty install; same envelope as pg_dump so
+# the matched-pair runs are bounded together. Since #1363 a full restore runs
+# pg_restore feeding psql, and the whole replay shares this one deadline.
 _PG_RESTORE_TIMEOUT_SECONDS = 30 * 60
 
 
@@ -214,8 +215,10 @@ BEGIN
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         WHERE n.nspname = 'public'
+          -- Not 'm': a multirange is internal to its range, which drops it.
+          -- Dropping one directly is an ERROR, not a no-op, in any order.
           AND (
-              t.typtype IN ('e', 'd', 'r', 'm')
+              t.typtype IN ('e', 'd', 'r')
               OR (t.typtype = 'c' AND EXISTS (
                   SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'
               ))
@@ -257,9 +260,16 @@ def _error_excerpt(stderr: str, limit: int = 1500) -> str:
     return stderr[:limit]
 
 
-async def _file_chunks(path: Path):
-    """Yield ``path`` in chunks without blocking the loop on a large dump."""
-    with path.open("rb") as fh:
+async def _script_chunks(script: bytes | Path):
+    """Yield a plain dump in chunks: from memory when the caller already
+    holds it (the archive's bytes, which restore has just unzipped), else
+    from disk without blocking the loop."""
+    if isinstance(script, bytes):
+        view = memoryview(script)
+        for start in range(0, len(view), _REPLAY_CHUNK_BYTES):
+            yield bytes(view[start : start + _REPLAY_CHUNK_BYTES])
+        return
+    with script.open("rb") as fh:
         while chunk := await asyncio.to_thread(fh.read, _REPLAY_CHUNK_BYTES):
             yield chunk
 
@@ -297,7 +307,6 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
     await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
     psql = await asyncio.create_subprocess_exec(
         "psql",
         "--quiet",
@@ -305,7 +314,7 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
         "--set=ON_ERROR_STOP=1",
         "--single-transaction",
         "--file=-",
-        env=full_env,
+        env=_pg_subprocess_env(pg_env),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -347,41 +356,61 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
             return False
         return not psql_gone()
 
+    # Set once psql has been given end of input: from then on it may be
+    # committing, so a timeout can no longer promise nothing was applied.
+    eof_sent = False
+    delivered = False
     try:
-        delivered = await asyncio.wait_for(copy(), timeout=_PG_RESTORE_TIMEOUT_SECONDS)
-        if not delivered:
-            # psql stopped reading, which only an error does. Stop the
-            # producer now: left running it blocks on a full pipe nobody
-            # drains. psql's own error is the one to report.
-            if producer is not None:
-                await _stop(producer)
-        elif producer is not None:
-            await asyncio.wait_for(producer.wait(), timeout=_PG_RESTORE_TIMEOUT_SECONDS)
-            if producer.returncode != 0:
-                # psql has not seen end of input, so it has not committed.
-                await kill_all()
-                err = (
-                    (await producer_stderr).decode(errors="replace")[:1500]
-                    if producer_stderr is not None
-                    else ""
-                )
-                raise BackupRestoreError(
-                    f"pg_restore failed (exit {producer.returncode}): {err}; " "nothing was applied"
-                )
-        if delivered:
-            # End of input: psql COMMITs, or rolls back on an error in the
-            # final statements.
-            stdin.close()
-        await asyncio.wait_for(psql.wait(), timeout=_PG_RESTORE_TIMEOUT_SECONDS)
+        # One deadline for the whole replay, not one per step.
+        async with asyncio.timeout(_PG_RESTORE_TIMEOUT_SECONDS):
+            delivered = await copy()
+            if not delivered:
+                # psql stopped reading, which only an error does. Stop the
+                # producer now: left running it blocks on a full pipe nobody
+                # drains. psql's own error is the one to report.
+                if producer is not None:
+                    await _stop(producer)
+            elif producer is not None:
+                await producer.wait()
+                if producer.returncode != 0:
+                    # psql has not seen end of input, so it has not committed;
+                    # the handler below kills it.
+                    err = (
+                        (await producer_stderr).decode(errors="replace")[:1500]
+                        if producer_stderr is not None
+                        else ""
+                    )
+                    raise BackupRestoreError(
+                        f"pg_restore failed (exit {producer.returncode}): {err}; "
+                        "nothing was applied"
+                    )
+            if delivered:
+                # End of input: psql COMMITs, or rolls back on an error in the
+                # final statements.
+                stdin.close()
+                eof_sent = True
+            await psql.wait()
     except TimeoutError as exc:
         await kill_all()
+        outcome = (
+            "the outcome is unknown — psql may have committed before it was stopped"
+            if eof_sent
+            else "nothing was applied"
+        )
         raise BackupRestoreError(
-            f"restore replay exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout; "
-            "nothing was applied"
+            f"restore replay exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout; {outcome}"
         ) from exc
     except BaseException:
         await kill_all()
         raise
+    if not delivered and psql.returncode == 0:
+        # psql left before end of input yet reported success (a ``\q`` in the
+        # script, say). With --single-transaction that commits what it read,
+        # so this must not read as a completed restore.
+        raise BackupRestoreError(
+            "replay stopped before the end of the archive (psql exited 0 without "
+            "reading all of it); the database may hold a partial restore"
+        )
     if psql.returncode != 0:
         err = _error_excerpt((await psql_stderr).decode(errors="replace"))
         raise BackupRestoreError(
@@ -389,9 +418,9 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
         )
 
 
-async def _run_psql(sql_path: Path, db_url: str) -> None:
+async def _run_psql(script: bytes | Path, db_url: str) -> None:
     """Replay a plain-format (Phase 1) dump over a cleared schema (#1363)."""
-    await _replay_clean(_file_chunks(sql_path), db_url)
+    await _replay_clean(_script_chunks(script), db_url)
 
 
 async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
@@ -404,14 +433,14 @@ async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
     does not contain. ``--no-owner`` + ``--no-acl`` strip role/grant clauses
     (matched to pg_dump's flags).
     """
-    pg_env, _dbname = _pg_env_from_url(db_url)
     producer = await asyncio.create_subprocess_exec(
         "pg_restore",
         "--no-owner",
         "--no-acl",
         "--file=-",
         str(dump_path),
-        env={**os.environ, **pg_env},
+        # Script mode never connects, so it gets no connection credentials.
+        env=_pg_subprocess_env({}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -422,7 +451,13 @@ async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
         while chunk := await stdout.read(_REPLAY_CHUNK_BYTES):
             yield chunk
 
-    await _replay_clean(script(), db_url, producer=producer)
+    try:
+        await _replay_clean(script(), db_url, producer=producer)
+    finally:
+        # _replay_clean reaps the producer on every path it owns; this covers
+        # a failure before it gets that far (terminating connections, starting
+        # psql), which would otherwise leave pg_restore blocked on a full pipe.
+        await _stop(producer)
 
 
 async def _truncate_tables(tables: list[str], db_url: str) -> None:
@@ -731,12 +766,13 @@ async def apply_backup_restore(
 
     # Phase 4: dispose of SQLAlchemy's connection pool. psql opens
     # its own connection, and leaving the async pool busy stalls
-    # the TRUNCATE / DROP statements emitted by pg_dump --clean —
-    # we'd deadlock against the worker / beat / agents reading at
-    # the same time. ``engine.dispose()`` closes every pooled
+    # the replay's DROP / TRUNCATE statements (the schema clearing
+    # of a full restore, the TRUNCATE of a selective one) — we'd
+    # deadlock against the worker / beat / agents reading at the
+    # same time. ``engine.dispose()`` closes every pooled
     # connection cleanly so the pool comes back empty after the
-    # restore. ``_terminate_other_db_connections`` (called from
-    # ``_run_psql`` below) then kicks anything still attached
+    # restore. ``_terminate_other_db_connections`` (called by each
+    # replay helper below) then kicks anything still attached
     # via the worker / beat / agent containers' own engines.
     from app.db import engine as global_engine  # noqa: PLC0415
 
@@ -826,9 +862,9 @@ async def apply_backup_restore(
             dump_path.write_bytes(db_bytes)
             await _run_pg_restore(dump_path, db_url)
         else:
-            sql_path = Path(tmpdir) / "database.sql"
-            sql_path.write_bytes(db_bytes)
-            await _run_psql(sql_path, db_url)
+            # Streamed from the bytes already in memory: staging them on
+            # disk only to read them back cost a full write of the dump.
+            await _run_psql(db_bytes, db_url)
 
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer

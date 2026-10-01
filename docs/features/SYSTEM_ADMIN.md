@@ -676,7 +676,9 @@ Same code path is hit whether the archive comes from an upload or a destination 
    |---|---|
    | Docker Compose | `docker compose exec api alembic upgrade head` |
    | Appliance (k3s) | `sudo k3s kubectl -n spatium exec deploy/spatium-control-spatiumddi-api -c api -- alembic upgrade head` |
-   | Helm | `kubectl -n <namespace> exec deploy/<release>-spatiumddi-api -c api -- alembic upgrade head` |
+   | Helm | `kubectl -n <namespace> exec deploy/<fullname>-api -c api -- alembic upgrade head` |
+
+   On Helm, `<fullname>` is `<release>-spatiumddi` (`ddi-spatiumddi` for the documented `helm install ddi …`), the release name alone when it already contains `spatiumddi`, or `fullnameOverride` when that is set. `kubectl -n <namespace> get deploy` lists it.
 
    `alembic current` in place of `upgrade head` shows the revision the database is at. The api stays out of service (`/health/ready` is not ready) until the schema reaches head.
 6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column in the schema plus every JSONB-embedded Fernet string (`backup_target.config`'s `__enc__:` fields, and on `platform_settings` the SNMPv3 passphrases, syslog TLS CA bundles, APT GPG keys and private-mirror passwords); decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator does not have to copy the recovered `SECRET_KEY` into the destination's `.env` manually.

@@ -56,6 +56,13 @@ CREATE TABLE dns_agent_bundle (
     server_id integer REFERENCES dns_server(id) ON DELETE CASCADE
 );
 CREATE TYPE added_later_kind AS ENUM ('a', 'b');
+-- A range brings a multirange that cannot be dropped on its own. The rename
+-- rewrites the range's pg_type row past its multirange's, so a catalog scan
+-- meets the multirange first, which is the order that used to fail.
+CREATE TYPE added_later_tmp AS RANGE (
+    subtype = float8, multirange_type_name = added_later_range_multirange
+);
+ALTER TYPE added_later_tmp RENAME TO added_later_range;
 CREATE VIEW added_later_view AS SELECT id FROM dns_server;
 CREATE FUNCTION added_later_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
 INSERT INTO dns_server VALUES (1, 'live', 'x'), (2, 'live-only', 'y');
@@ -136,6 +143,9 @@ async def _state(dbname: str) -> dict[str, object]:
             "function": await conn.fetchval(
                 "SELECT count(*) FROM pg_proc WHERE proname = 'added_later_fn'"
             ),
+            "range": await conn.fetchval(
+                "SELECT count(*) FROM pg_type WHERE typname LIKE 'added_later_range%'"
+            ),
         }
     finally:
         await conn.close()
@@ -164,6 +174,7 @@ _OLD_STATE = {
     "view": None,
     "enum": 0,
     "function": 0,
+    "range": 0,
 }
 
 
@@ -274,3 +285,10 @@ async def test_extension_members_survive(dbs) -> None:
         assert await conn.fetchval("SELECT similarity('abc', 'abd')") is not None
     finally:
         await conn.close()
+
+
+async def test_a_plain_archive_restores_from_memory(dbs) -> None:
+    """The restore hands the plain dump over as the bytes it unzipped."""
+    dest, _, plain = dbs
+    await restore._run_psql(plain.read_bytes(), _url_for(dest))
+    assert await _state(dest) == _OLD_STATE
