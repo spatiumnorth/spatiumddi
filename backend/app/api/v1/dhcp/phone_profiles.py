@@ -27,7 +27,6 @@ from sqlalchemy import delete, select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import contains_control_chars
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
     DHCPPhoneProfile,
@@ -35,7 +34,10 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServerGroup,
 )
-from app.services.dhcp.option_validation import validate_phone_options
+from app.services.dhcp.option_validation import (
+    check_vendor_class_match,
+    validate_phone_options,
+)
 from app.services.dhcp.voip_options import load_catalog as load_voip_catalog
 
 router = APIRouter(
@@ -68,15 +70,6 @@ class PhoneOptionResponse(BaseModel):
     value: str
 
 
-def _check_vendor_match(v: str | None) -> str | None:
-    """The match renders inside a Kea string literal (``=='<match>'``); a
-    ``'`` ends the literal early and Kea rejects the WHOLE config (measured,
-    kea-dhcp4 3.0.3). Control characters have no business in option 60."""
-    if v is not None and ("'" in v or contains_control_chars(v)):
-        raise ValueError("vendor_class_match may not contain ' or control characters")
-    return v
-
-
 class PhoneProfileCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str = ""
@@ -86,7 +79,7 @@ class PhoneProfileCreate(BaseModel):
     option_set: list[PhoneOptionInput] = []
     tags: dict[str, Any] = {}
 
-    _vendor_match = field_validator("vendor_class_match")(_check_vendor_match)
+    _vendor_match = field_validator("vendor_class_match")(check_vendor_class_match)
     # Optional: attach to scopes immediately on create. Each id must
     # belong to the same DHCPServerGroup as the profile.
     scope_ids: list[uuid.UUID] = []
@@ -101,7 +94,7 @@ class PhoneProfileUpdate(BaseModel):
     option_set: list[PhoneOptionInput] | None = None
     tags: dict[str, Any] | None = None
 
-    _vendor_match = field_validator("vendor_class_match")(_check_vendor_match)
+    _vendor_match = field_validator("vendor_class_match")(check_vendor_class_match)
 
 
 class PhoneProfileResponse(BaseModel):
