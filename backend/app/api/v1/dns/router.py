@@ -100,7 +100,9 @@ from app.services.dns.named_conf_validation import (
     validate_acl_name,
     validate_address_match_list,
     validate_server_option,
+    validate_update_acl_entry,
     validate_view_name,
+    validate_zone_forwarders,
 )
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
@@ -3199,8 +3201,9 @@ async def _validated_option_changes(
 
 
 #: Zone fields written into the zone's own ``zone { … }`` statement (#1316).
-#: ``forwarders`` is deliberately absent: a Technitium forward zone may carry
-#: a hostname or DoH URL there, which the BIND ``ip[@port]`` grammar refuses.
+#: ``forwarders`` is checked separately, and only on a BIND9 group (#1357): a
+#: Technitium forward zone may carry a hostname or DoH URL there, which the
+#: BIND ``ip[@port]`` grammar refuses.
 _ZONE_NAMED_CONF_FIELDS = ("allow_query", "allow_transfer", "also_notify", "notify_enabled")
 
 
@@ -3214,6 +3217,12 @@ async def _validated_zone_named_conf_fields(
     statement, so one bad element makes BIND refuse the file and the WHOLE
     group stops converging, not just this zone.
 
+    Zone ``forwarders`` join them on a BIND9 group (#1357), normalised to
+    the ``ip@port`` wire shape, but only for a forward zone: no other type
+    renders them, so a value there never reaches ``named.conf`` and stays
+    accepted as before. A zone becoming a forward zone has its stored
+    forwarders checked, since they start rendering then.
+
     On update (``zone`` given) only a changed value is checked, for the
     same reason as the options form: a value stored before this gate must
     not block an unrelated edit. Raises 422 naming the field and element.
@@ -3225,9 +3234,42 @@ async def _validated_zone_named_conf_fields(
         and v is not None
         and (zone is None or v != getattr(zone, k, None))
     }
-    if not fields:
-        return {}
-    return await _validated_option_changes(group_id, fields, zone, db)
+    cleaned = await _validated_option_changes(group_id, fields, zone, db) if fields else {}
+    zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
+    if zone_type != "forward":
+        return cleaned
+    stored = list(zone.forwarders or []) if zone is not None else None
+    becomes_forward = zone is not None and zone.zone_type != "forward"
+    forwarders = changes.get("forwarders")
+    if forwarders is None and becomes_forward:
+        forwarders = stored
+    if forwarders and (stored is None or becomes_forward or forwarders != stored):
+        checked = await _bind9_zone_forwarders(group_id, list(forwarders), db)
+        if checked is not None:
+            cleaned["forwarders"] = checked
+    return cleaned
+
+
+async def _bind9_zone_forwarders(
+    group_id: uuid.UUID, forwarders: list[str], db: DB
+) -> list[str] | None:
+    """Check a zone's forwarders against a BIND9 group's grammar (#1357).
+
+    The BIND9 agent renders them into the zone's ``forwarders { … };``.
+    Returns the canonical list, or ``None`` when the group runs no BIND9
+    server (a Technitium zone may carry a hostname or DoH URL). An empty
+    group reads as BIND9, the flagship driver, as every other driver gate
+    does. Raises 422 naming the offending element.
+    """
+    if not forwarders or "bind9" not in await _group_driver_names(db, group_id):
+        return None
+    try:
+        return validate_zone_forwarders(forwarders)
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
 
 
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
@@ -4921,12 +4963,18 @@ class UpdateAclEntryIn(BaseModel):
             raise ValueError(f"name_scope must be one of {sorted(_ACL_NAME_SCOPES)}")
         return v
 
-    @field_validator("record_types")
-    @classmethod
-    def _v_rtypes(cls, v: list[str] | None) -> list[str] | None:
-        if v is None:
-            return None
-        return [t.strip().upper() for t in v if t and t.strip()] or None
+    @model_validator(mode="after")
+    def _v_rendered_fields(self) -> UpdateAclEntryIn:
+        # #1357 — both reach the zone's ``update-policy`` rule verbatim, and
+        # a rule BIND refuses fails the whole group's config. Checked here so
+        # REST and the MCP apply path (which builds this model) share it.
+        try:
+            self.name_pattern, self.record_types = validate_update_acl_entry(
+                self.name_scope, self.name_pattern, self.record_types
+            )
+        except ViewValidationError as exc:
+            raise ValueError(f"{exc.field}: {exc}") from exc
+        return self
 
     @model_validator(mode="after")
     def _v_identity(self) -> UpdateAclEntryIn:
@@ -5964,6 +6012,11 @@ async def move_zone_commit(
     # Technitium group is accepted and then silently never created on the
     # daemon (#743). A move is just another way to arrive there.
     await _assert_forward_zone_serviceable(target_group.id, zone.zone_type, zone.forwarders, db)
+    # And the forwarder grammar (#1357): a Technitium zone's hostname or DoH
+    # URL is fine where it is, but a BIND9 group would drop it at render and
+    # the zone would quietly stop forwarding. Refused, not rewritten.
+    if zone.zone_type == "forward":
+        await _bind9_zone_forwarders(target_group.id, list(zone.forwarders or []), db)
     source_group_id = zone.group_id
     try:
         plan = await commit_zone_move(
