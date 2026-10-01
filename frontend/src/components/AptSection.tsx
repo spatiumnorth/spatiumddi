@@ -9,6 +9,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, Check, Plus, Trash2 } from "lucide-react";
 
 import {
+  formatApiError,
   settingsApi,
   type AptAuthUpdate,
   type AptGpgKeyUpdate,
@@ -197,8 +198,10 @@ export function AptSection({
       setSavedAt(Date.now());
       setTimeout(() => setSavedAt(null), 2500);
     },
-    onError: (err: unknown) =>
-      setSaveErr(err instanceof Error ? err.message : String(err)),
+    // formatApiError, not err.message: an AxiosError's message is only
+    // "Request failed with status code 422", which hides the validator's
+    // sentence naming the offending entry (#1384).
+    onError: (err: unknown) => setSaveErr(formatApiError(err)),
   });
 
   const validateMut = useMutation({

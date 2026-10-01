@@ -1021,13 +1021,18 @@ class SettingsUpdate(BaseModel):
             s = str(raw).strip()
             if not s:
                 continue
-            # These land inside apt.conf double-quoted strings (the host runner
-            # escapes quotes); reject control chars — C0 (< 0x20) AND ASCII DEL
-            # (0x7f) — plus over-long entries so a value can't smuggle a newline
-            # / extra directive past the render.
-            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in s) or len(s) > 200:
+            # These land inside apt.conf double-quoted strings, and apt.conf has
+            # no escape syntax there (#1384, verified against apt-config): a
+            # backslash is kept literally and a double quote ENDS the string,
+            # so an entry carrying one makes apt-config reject the whole policy
+            # file and the host keeps the old one. Reject quotes, control
+            # chars — C0 (< 0x20) AND ASCII DEL (0x7f) — and over-long entries
+            # so a value can't smuggle a newline / extra directive past the
+            # render.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F or c == '"' for c in s) or len(s) > 200:
                 raise ValueError(
-                    "unattended origin / package entries must be printable and ≤ 200 chars"
+                    "unattended origin / package entries must be printable, contain no "
+                    "double quote, and be ≤ 200 chars"
                 )
             out.append(s)
         return out

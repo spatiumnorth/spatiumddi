@@ -256,7 +256,16 @@ the formatter handles the rest.
   all and would break the daily run on the host, stopping every
   security update. All three now say regular expression, with examples,
   and the API refuses an entry that does not compile (422, naming it).
-  Entries saved before this are not re-checked.
+  Entries saved before this are not re-checked. Two rendering faults on
+  the same path are fixed with it: the host runner doubled every
+  backslash on the assumption that apt.conf unescapes them, which it
+  does not, so a regex like `linux-image-\d` reached unattended-upgrades
+  as a different expression and blocked nothing; and a double quote,
+  which apt.conf cannot express at all, was accepted and made the whole
+  policy file fail to parse. Values are now written verbatim and a
+  double quote is refused at save. The APT form also shows the server's
+  reason for a refused save instead of "Request failed with status code
+  422".
 
 - **Cluster health no longer counts a joining database replica as a
   ready instance (#1213).** The workload rollup on
