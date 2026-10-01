@@ -37,6 +37,7 @@ from app.models.appliance import (
 from app.models.auth import User
 from app.models.backup import BackupTarget
 from app.models.release_schema import ReleaseSchemaHead
+from app.services.appliance import slot as slot_service
 from app.services.appliance.slot import SlotStatus
 from app.services.upgrades import preflight
 from app.services.upgrades import schema_rollback as sr
@@ -267,11 +268,9 @@ async def test_record_this_release_skips_a_booted_slot_that_is_not_this_release(
     the newer release's api keeps running on the nightly's slot. It must not
     record the nightly at its own head, or the next rollback to the nightly
     reads as compatible."""
-    import app.services.appliance.slot as slot_module
-
     nightly = "0.0.0-nightly-20260930+f838ab8"
     monkeypatch.setattr(settings, "version", "2026.10.06-1")
-    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted(nightly))
+    monkeypatch.setattr(slot_service, "get_slot_status", lambda: _booted(nightly))
     await _set_db_revision(_head())
     await sr.record_this_release()
     async with AsyncSessionLocal() as s:
@@ -284,10 +283,8 @@ async def test_record_this_release_skips_a_booted_slot_that_is_not_this_release(
 async def test_record_this_release_records_the_booted_slot_when_it_is_this_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import app.services.appliance.slot as slot_module
-
     monkeypatch.setattr(settings, "version", "2026.10.06-1")
-    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted("2026.10.06-1"))
+    monkeypatch.setattr(slot_service, "get_slot_status", lambda: _booted("2026.10.06-1"))
     await _set_db_revision(_head())
     await sr.record_this_release()
     async with AsyncSessionLocal() as s:
@@ -303,11 +300,9 @@ async def test_record_this_release_records_a_nightly_slot_under_its_slot_name(
     while its slot carries ``0.0.0-nightly-YYYYMMDD+<sha>``. The slot name is
     what a rollback looks up, so it must be recorded, or a rollback to any
     nightly reads ``unknown`` and goes through unchecked."""
-    import app.services.appliance.slot as slot_module
-
     nightly = "0.0.0-nightly-20260930+f838ab8"
     monkeypatch.setattr(settings, "version", "nightly-20260930")
-    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted(nightly))
+    monkeypatch.setattr(slot_service, "get_slot_status", lambda: _booted(nightly))
     await _set_db_revision(_head())
     await sr.record_this_release()
     async with AsyncSessionLocal() as s:
