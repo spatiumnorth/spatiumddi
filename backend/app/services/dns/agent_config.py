@@ -51,14 +51,15 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.named_conf_validation import (
+    UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
     order_acls_for_render,
+    split_zone_forwarders,
     validate_acl_name,
     validate_address_match_list,
     validate_update_acl_entry,
-    validate_zone_forwarders,
 )
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -210,12 +211,20 @@ def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[s
     """
     kept: list[dict[str, Any]] = []
     for index, entry in enumerate(entries):
+        if entry.get("match_kind") != "tsig_key" or not entry.get("tsig_key_name"):
+            # Never reaches an ``update-policy`` rule (the agent skips it), so
+            # its fields cannot break the config — and dropping a ``deny``
+            # here would take every valid entry after it down for nothing.
+            kept.append(entry)
+            continue
+        # The agent renders the name only for a scope that carries one; a
+        # value left over on a ``zonesub`` entry is never written.
+        scope = entry.get("name_scope")
+        pattern = entry.get("name_pattern") if scope in UPDATE_POLICY_NAMED_SCOPES else None
         try:
             # Validity only: a renderable row ships as stored, so a bundle
             # that was fine before #1357 keeps its ETag.
-            validate_update_acl_entry(
-                entry.get("name_scope"), entry.get("name_pattern"), entry.get("record_types")
-            )
+            validate_update_acl_entry(scope, pattern, entry.get("record_types"))
         except ViewValidationError as exc:
             deny = entry.get("action") == "deny"
             logger.warning(
@@ -243,18 +252,15 @@ def _safe_zone_forwarders(zone: Any) -> list[str]:
     the whole group's config; a forward zone left with none is skipped by
     the agent, as it always has been.
     """
-    kept: list[str] = []
-    for element in list(getattr(zone, "forwarders", []) or []):
-        try:
-            kept.extend(validate_zone_forwarders([element]))
-        except ViewValidationError as exc:
-            logger.warning(
-                "dns_zone_forwarder_dropped_unrenderable",
-                zone=getattr(zone, "name", None),
-                zone_id=str(getattr(zone, "id", "")),
-                value=element,
-                error=str(exc),
-            )
+    kept, dropped = split_zone_forwarders(list(getattr(zone, "forwarders", []) or []))
+    for value, error in dropped:
+        logger.warning(
+            "dns_zone_forwarder_dropped_unrenderable",
+            zone=getattr(zone, "name", None),
+            zone_id=str(getattr(zone, "id", "")),
+            value=value,
+            error=error,
+        )
     return kept
 
 

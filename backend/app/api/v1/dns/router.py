@@ -3234,18 +3234,32 @@ async def _validated_zone_named_conf_fields(
     cleaned = await _validated_option_changes(group_id, fields, zone, db) if fields else {}
     forwarders = changes.get("forwarders")
     if forwarders and (zone is None or forwarders != list(zone.forwarders or [])):
-        # #1357 — the BIND9 agent renders these into the zone's
-        # ``forwarders { … };``. ``_group_driver_names`` reads an empty group
-        # as BIND9, the flagship driver, as every other driver gate does.
-        if "bind9" in await _group_driver_names(db, group_id):
-            try:
-                cleaned["forwarders"] = validate_zone_forwarders(list(forwarders))
-            except ViewValidationError as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail={"field": exc.field, "value": exc.value, "message": str(exc)},
-                ) from exc
+        checked = await _bind9_zone_forwarders(group_id, list(forwarders), db)
+        if checked is not None:
+            cleaned["forwarders"] = checked
     return cleaned
+
+
+async def _bind9_zone_forwarders(
+    group_id: uuid.UUID, forwarders: list[str], db: DB
+) -> list[str] | None:
+    """Check a zone's forwarders against a BIND9 group's grammar (#1357).
+
+    The BIND9 agent renders them into the zone's ``forwarders { … };``.
+    Returns the canonical list, or ``None`` when the group runs no BIND9
+    server (a Technitium zone may carry a hostname or DoH URL). An empty
+    group reads as BIND9, the flagship driver, as every other driver gate
+    does. Raises 422 naming the offending element.
+    """
+    if not forwarders or "bind9" not in await _group_driver_names(db, group_id):
+        return None
+    try:
+        return validate_zone_forwarders(forwarders)
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
 
 
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
@@ -5988,6 +6002,11 @@ async def move_zone_commit(
     # Technitium group is accepted and then silently never created on the
     # daemon (#743). A move is just another way to arrive there.
     await _assert_forward_zone_serviceable(target_group.id, zone.zone_type, zone.forwarders, db)
+    # And the forwarder grammar (#1357): a Technitium zone's hostname or DoH
+    # URL is fine where it is, but a BIND9 group would drop it at render and
+    # the zone would quietly stop forwarding. Refused, not rewritten.
+    if zone.zone_type == "forward":
+        await _bind9_zone_forwarders(target_group.id, list(zone.forwarders or []), db)
     source_group_id = zone.group_id
     try:
         plan = await commit_zone_move(

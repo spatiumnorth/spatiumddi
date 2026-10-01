@@ -19,7 +19,10 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPPXEArchMatch, DHCPPXEProfile, DHCPServerGroup
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.dhcp.option_validation import check_vendor_class_match
+from app.services.dhcp.option_validation import (
+    check_vendor_class_match,
+    vendor_class_match_test,
+)
 from tests.test_dhcp_phone_profiles import _make_group_server_scope
 
 
@@ -32,6 +35,16 @@ def test_the_shared_check_refuses_what_breaks_the_literal(value: str) -> None:
 @pytest.mark.parametrize("value", [None, "PXEClient", "HTTPClient:Arch:00016", "Polycôm"])
 def test_the_shared_check_accepts_real_vendor_classes(value: str | None) -> None:
     assert check_vendor_class_match(value) == value
+
+
+def test_ascii_keeps_the_quoted_form_and_non_ascii_renders_hex() -> None:
+    # ASCII is byte-identical to the pre-#1357 render, so no ETag moves.
+    assert vendor_class_match_test("PXEClient") == "substring(option[60].hex,0,9)=='PXEClient'"
+    # Above U+00FF a quoted literal is JSON-escaped to ``\u20ac``, which Kea's
+    # lexer refuses ("Unsupported unicode escape") — the whole config.
+    expr = vendor_class_match_test("V€")
+    assert expr == "substring(option[60].hex,0,4)==0x56E282AC"
+    assert "'" not in expr
 
 
 async def _headers(db: AsyncSession) -> dict[str, str]:
@@ -121,7 +134,9 @@ async def test_a_stored_bad_match_is_left_out_and_the_rest_renders(
     (pc,) = bundle.pxe_classes
     assert pc.boot_file_name == "ipxe.efi"
     # Bytes, not characters: "ö" is two bytes of option 60, so "Vendör" is 7.
-    assert "substring(option[60].hex,0,7)=='Vendör'" in pc.match_expression
+    # And a hex literal, not a quoted one: JSON-escaped to ``\u00f6``, Kea
+    # would read the quoted form as ONE byte and never match.
+    assert "substring(option[60].hex,0,7)==0x56656E64C3B672" in pc.match_expression
     assert "option[93].hex == 0x0007" in pc.match_expression
     # The rest of the bundle is intact.
     assert bundle.scopes

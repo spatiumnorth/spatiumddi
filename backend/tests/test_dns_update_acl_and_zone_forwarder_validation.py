@@ -17,6 +17,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns.router import VALID_RECORD_TYPES
@@ -364,3 +365,129 @@ async def test_a_technitium_bundle_keeps_hostname_forwarders(db_session: AsyncSe
     bundle = await build_config_bundle(db_session, server)
     (zone,) = [z for z in bundle["zones"] if z["name"] == "corp.example."]
     assert zone["forwarders"] == ["dns.google"]
+
+
+async def test_bundle_keeps_entries_the_agent_never_writes_into_update_policy(
+    db_session: AsyncSession,
+) -> None:
+    # A name left over on a zonesub entry is never rendered, so a deny
+    # carrying one must not take the grants below it down with it.
+    group, server = await _group(db_session)
+    key = await _key(db_session, group)
+    dyn = DNSZone(
+        group_id=group.id,
+        name="dyn.example.com.",
+        zone_type="primary",
+        kind="forward",
+        dynamic_update_enabled=True,
+    )
+    db_session.add(dyn)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DNSZoneUpdateAcl(
+                zone_id=dyn.id,
+                seq=0,
+                action="deny",
+                match_kind="tsig_key",
+                tsig_key_id=key.id,
+                name_scope="zonesub",
+                name_pattern="not a name; }",
+                record_types=["TXT"],
+            ),
+            DNSZoneUpdateAcl(
+                zone_id=dyn.id,
+                seq=1,
+                action="grant",
+                match_kind="tsig_key",
+                tsig_key_id=key.id,
+                name_scope="zonesub",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    bundle = await build_config_bundle(db_session, server)
+    (zone,) = [z for z in bundle["zones"] if z["name"] == "dyn.example.com."]
+    assert [e["action"] for e in zone["update_acl"]] == ["deny", "grant"]
+
+
+async def test_a_zone_move_into_a_bind9_group_refuses_unrenderable_forwarders(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    src, _ = await _group(db_session, driver="technitium")
+    dst, _ = await _group(db_session)
+    zone = DNSZone(
+        group_id=src.id,
+        name="corp.example.",
+        zone_type="forward",
+        kind="forward",
+        forwarders=["https://cloudflare-dns.com/dns-query"],
+    )
+    db_session.add(zone)
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/dns/groups/{src.id}/zones/{zone.id}/move/commit",
+        headers=headers,
+        json={
+            "target_group_id": str(dst.id),
+            "confirmation_zone_name": zone.name,
+            "acknowledgements": [],
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["field"] == "forwarders"
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+async def test_an_import_into_a_bind9_group_drops_unrenderable_forwarders(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.dns_import.canonical import ImportedZone, ImportPreview
+    from app.services.dns_import.commit import commit_import
+
+    group, _ = await _group(db_session)
+    user = User(
+        username=f"sa-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@t.io",
+        display_name="sa",
+        hashed_password=hash_password("password123"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    preview = ImportPreview(
+        source="bind9",
+        zones=[
+            ImportedZone(
+                name="corp.example.",
+                zone_type="forward",
+                kind="forward",
+                soa=None,
+                records=[],
+                forwarders=["10.0.0.5 port 853 tls upstream", "10.0.0.6 port 5353"],
+            )
+        ],
+        conflicts=[],
+        warnings=[],
+        total_records=0,
+        record_type_histogram={},
+    )
+    result = await commit_import(
+        db_session,
+        preview=preview,
+        target_group_id=group.id,
+        target_view_id=None,
+        conflict_actions={},
+        current_user=user,
+    )
+    assert result.zones[0].action_taken == "created", result.zones[0].error
+    assert any("10.0.0.5 port 853 tls upstream" in w for w in result.warnings)
+    zone = (
+        await db_session.execute(select(DNSZone).where(DNSZone.name == "corp.example."))
+    ).scalar_one()
+    assert zone.forwarders == ["10.0.0.6@5353"]

@@ -653,6 +653,17 @@ def vendor_class_match_test(value: str) -> str:
     Measured in bytes, not characters: ``option[60].hex`` is the raw
     option, so a non-ASCII prefix measured in characters never matched.
     The caller must have checked :func:`vendor_class_match_renderable`.
+
+    A non-ASCII prefix renders as a hex literal, not a quoted string. The
+    agent writes Kea's config with ``json.dumps``' default ASCII escaping,
+    and Kea's JSON lexer reads ``\\u00XX`` as ONE byte and refuses anything
+    above ``\\u00ff`` outright (measured, kea-dhcp4 3.0.3): ``'Vendör'``
+    would compare six bytes against a seven-byte prefix and never match,
+    and ``'V€'`` would reject the group's whole config. ASCII keeps the
+    quoted form so an existing bundle's ETag does not move.
     """
-    n = len(value.encode("utf-8"))
-    return f"substring(option[60].hex,0,{n})=='{value}'"
+    raw = value.encode("utf-8")
+    n = len(raw)
+    if value.isascii():
+        return f"substring(option[60].hex,0,{n})=='{value}'"
+    return f"substring(option[60].hex,0,{n})==0x{raw.hex().upper()}"

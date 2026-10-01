@@ -253,16 +253,20 @@ the formatter handles the rest.
   written verbatim into Kea's or BIND's config, so one malformed value
   made the server refuse the file and the whole server group stopped
   converging. A PXE profile's `vendor_class_match` now gets the check a
-  phone profile's has had since #1294 (no `'`, no control characters),
-  and its prefix is measured in bytes, so a non-ASCII vendor string can
-  match. An update-ACL entry's `name_pattern` must be a DNS name (a
+  phone profile's has had since #1294 (no `'`, no control characters).
+  On both, a non-ASCII prefix is now measured in bytes and compared as
+  hex, so it can match: quoted, Kea read it a byte short, and a
+  character above U+00FF made Kea refuse the config. An update-ACL
+  entry's `name_pattern` must be a DNS name (a
   leading `*.` for `wildcard`; `.` or `*` for `self`), and its
   `record_types` must be types BIND knows, including `DHCID`, `ANY`,
   `TYPE<n>` and a count such as `A(5)`; lower case is still accepted and
   upper-cased. A forward zone's forwarders on a BIND9 group must be `ip`
   or `ip@port` (`ip port <n>` is accepted and rewritten); Technitium
-  zones may still name a hostname or DoH URL. Each answers 422 naming
-  the offending element. Rows stored before this are left out of the
+  zones may still name a hostname or DoH URL, and moving such a zone
+  into a BIND9 group is refused. Each answers 422 naming the offending
+  element; a DNS import into a BIND9 group drops such a forwarder and
+  says so in the result. Rows stored before this are left out of the
   agent's config with a log line instead of shipped: a bad PXE match
   drops its class, a bad forwarder drops itself, and a bad update-ACL
   `grant` drops itself while a bad `deny` also drops the entries after

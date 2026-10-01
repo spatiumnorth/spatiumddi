@@ -38,7 +38,7 @@ import ipaddress
 import re
 from typing import Any
 
-from app.core.dns_names import validate_fqdn
+from app.core.dns_names import MAX_NAME_LEN, validate_fqdn
 
 __all__ = [
     "ADDRESS_MATCH_LIST_OPTIONS",
@@ -52,6 +52,7 @@ __all__ = [
     "UPDATE_POLICY_RR_TYPES",
     "key_reference",
     "order_acls_for_render",
+    "split_zone_forwarders",
     "validate_acl_name",
     "validate_address_match_list",
     "validate_server_option",
@@ -674,6 +675,26 @@ def validate_zone_forwarders(elements: list[str] | None, *, field: str = "forwar
     return ["@".join(part.strip() for part in c.split("@", 1)) for c in cleaned]
 
 
+def split_zone_forwarders(
+    elements: list[str] | None, *, field: str = "forwarders"
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Partition stored forwarders into renderable and not (#1357).
+
+    For values that were never checked on write — a row stored before
+    #1357, or an importer's output — where refusing the whole list is not
+    an option. Returns ``(kept, dropped)``: the renderable entries in
+    canonical ``ip[@port]`` form, and ``(value, reason)`` for each other.
+    """
+    kept: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    for element in elements or []:
+        try:
+            kept.extend(validate_zone_forwarders([element], field=field))
+        except ViewValidationError as exc:
+            dropped.append((element, str(exc)))
+    return kept, dropped
+
+
 # ── dynamic-update ACL entries (issue #1357) ─────────────────────────────
 #
 # A fine-grained ACL entry renders as one ``update-policy`` rule:
@@ -834,6 +855,15 @@ def _validate_update_policy_name(pattern: str, *, name_scope: str | None, field:
             field=field,
             value=pattern,
         ) from exc
+    # ``validate_fqdn`` capped the BODY at 253; the ``*.`` prefix still has to
+    # fit, or BIND refuses the name and the column (String(255)) overflows.
+    if len(prefix + normalised) > MAX_NAME_LEN:
+        raise ViewValidationError(
+            f"'{pattern}' is longer than {MAX_NAME_LEN} characters, the most a "
+            "DNS name can carry.",
+            field=field,
+            value=pattern,
+        )
     # Keep the operator's absolute-name dot: named.conf treats both spellings
     # as absolute, and the form's own placeholder carries one.
     return prefix + normalised + ("." if raw.endswith(".") else "")
