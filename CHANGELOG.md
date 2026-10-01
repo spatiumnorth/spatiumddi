@@ -1910,12 +1910,24 @@ the formatter handles the rest.
   - **Upgrade note.** The migration attributes existing accounts only
     where it can prove the provider: RADIUS / TACACS+ external ids name
     it, and an LDAP / OIDC / SAML account is attributed when its type has
-    exactly one provider. With two or more, an account is left unlinked
-    and is refused (`account_link_required`) until an administrator links
-    it from **Users → Edit → Sign-in provider**
-    (`POST /users/{id}/link-provider`, audited as
-    `user.provider_linked`). The Users page marks those accounts
+    exactly one provider **and** the account cannot have come from another
+    one: it was created after that provider, and after the last deletion of
+    any other provider of its type (read from the audit log). A disabled
+    provider counts: one enabled and one disabled provider of a type is two,
+    and links nothing. Anything else is left unlinked and is refused
+    (`account_link_required`) until an administrator links it from
+    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
+    audited as `user.provider_linked`). The Users page marks those accounts
     **unlinked**, and `list_users` reports their provider as null.
+  - **A deleted provider's accounts are not handed to its successor
+    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
+    their identifier intact, so "one provider of the type exists now" did
+    not mean "only one ever did". An earlier draft of this fix linked such
+    an account to the surviving provider, both at upgrade and at sign-in,
+    so the survivor's subject with the same `sub` or DN signed in as it.
+    The backfill now checks the audit log as above, and the sign-in path
+    never links an unlinked account itself: it always refuses with
+    `account_link_required`, and the refusal's audit row names the account.
   - **Behaviour change.** A user whose identifier at the provider changes,
     such as an LDAP DN after an OU move, was re-attached by username and
     is now refused until an administrator links the account again. The

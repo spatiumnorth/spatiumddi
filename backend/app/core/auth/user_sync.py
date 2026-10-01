@@ -93,9 +93,9 @@ async def _find_linked_user(
        account it could prove came from its provider, so one still NULL is
        one it could not: its provider may have been deleted before the
        upgrade, and adopting it here would hand it to whoever holds the same
-       identifier at the survivor (GHSA-4gx2). An account whose provider was
-       deleted after the upgrade has its ``external_id`` cleared, so it never
-       matches this step at all.
+       identifier at the survivor (found by QA on #1289). An account whose
+       provider was deleted after the upgrade has its ``external_id``
+       cleared, so it never matches this step at all.
 
     An account is never adopted by username alone, whatever its type.
     """

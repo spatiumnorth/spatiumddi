@@ -151,9 +151,11 @@ In order, a login through provider P as subject S with username U:
    (`POST /users/{id}/link-provider`) whose username is U and which has not
    signed in since the link;
 3. else, for an account from before `auth_provider_id` existed (NULL, same
-   type, external id S), adopts it **only while P is the only provider of
-   its type**, and otherwise refuses with `account_link_required` until an
-   administrator links it;
+   type, external id S), refuses with `account_link_required` until an
+   administrator links it. The login never links such an account itself:
+   one provider of the type existing *now* does not show that only one ever
+   did, and a deleted provider's accounts kept their identifiers in
+   released builds;
 4. else refuses with `username_collision` if any other account holds U;
 5. else provisions a new account under P (if `auto_create_users`).
 
@@ -169,8 +171,12 @@ new provider of the same type issuing the same `sub` / DN never adopts one
 would hand it to whoever holds the same username at the provider. The
 upgrade attributes existing accounts where it can prove the provider (a
 RADIUS / TACACS+ external id names it; an LDAP / OIDC / SAML account is
-attributed when its type has one provider), and leaves the rest for an
-administrator. They show an **unlinked** chip on the Users page, and
+attributed when its type has exactly one provider, the account was created
+after that provider, and no other provider that may have been of its type
+was deleted after the account was created, read from the `audit_log`
+`create` / `delete` rows), and leaves the rest for an administrator. A
+**disabled** provider still counts as a provider of its type: with one
+enabled and one disabled LDAP provider, the upgrade links no LDAP account. They show an **unlinked** chip on the Users page, and
 `list_users` reports their `auth_provider` as null.
 
 ### LDAP
@@ -618,9 +624,9 @@ rather than swallowing the failure. Permission-related rejections
   whose username already belongs to any account — local, or linked to
   another provider — is rejected (`username_collision`) rather than
   adopting it (#1235). `backend/app/core/auth/user_sync.py`.
-- **Account not linked.** An account from before provider linking,
-  whose type now has several providers, is rejected
-  (`account_link_required`) until an administrator links it.
+- **Account not linked.** An account from before provider linking that
+  the upgrade could not attribute is rejected (`account_link_required`)
+  until an administrator links it; the denied audit row names the account.
   `backend/app/core/auth/user_sync.py`.
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or

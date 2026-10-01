@@ -231,6 +231,7 @@ async def test_a_disabled_external_account_is_refused_before_anything_changes(
         display_name="Old",
         auth_source="oidc",
         external_id="sub-alice",
+        auth_provider_id=provider.id,
         is_active=False,
     )
     user.groups = []

@@ -185,16 +185,25 @@ async def test_a_changed_identifier_at_the_same_provider_is_not_adopted_by_usern
 # ── Accounts from before the provider column ─────────────────────────────────
 
 
-async def test_a_legacy_account_is_adopted_while_its_type_has_one_provider(
+async def test_a_legacy_account_is_refused_even_while_its_type_has_one_provider(
     db_session: AsyncSession,
 ) -> None:
+    """One provider of the type existing NOW does not mean only one ever did:
+    released builds kept a deleted provider's accounts with their external id
+    intact, so the survivor's subject with the same identifier would sign in
+    as them (found by QA on #1289). Whatever the backfill could not attribute waits for
+    an administrator's link."""
     group = await _group(db_session)
     provider = await _provider(db_session, group)
     legacy = await _legacy_user(db_session, auth_source="ldap", external_id="CN=jsmith,DC=a")
 
-    user = await sync_external_user(db_session, provider, _subject("CN=jsmith,DC=a"))
-    assert user.id == legacy.id
-    assert user.auth_provider_id == provider.id
+    with pytest.raises(ExternalSyncRejected) as exc:
+        await sync_external_user(db_session, provider, _subject("CN=jsmith,DC=a"))
+    assert exc.value.reason == "account_link_required"
+    # Carried so the login audit row names the account that was refused.
+    assert exc.value.user is not None and exc.value.user.id == legacy.id
+    await db_session.refresh(legacy)
+    assert legacy.auth_provider_id is None
 
 
 async def test_a_legacy_account_is_refused_when_several_providers_could_own_it(
@@ -413,3 +422,121 @@ async def test_the_backfill_attributes_only_what_it_can_prove(db_session: AsyncS
     # Names a provider that no longer exists: not handed to the sole TACACS+ one.
     assert orphan_tacacs.auth_provider_id is None
     assert local_user.auth_provider_id is None
+
+
+def _provider_audit(
+    action: str, provider_id: uuid.UUID, ptype: str | None, at: datetime
+) -> AuditLog:
+    return AuditLog(
+        timestamp=at,
+        action=action,
+        resource_type="auth_provider",
+        resource_id=str(provider_id),
+        resource_display="idp",
+        user_display_name="admin",
+        auth_source="local",
+        result="success",
+        new_value={"type": ptype} if ptype else {"accounts_unlinked": 1},
+    )
+
+
+async def _run_backfill(db: AsyncSession, *users: User) -> None:
+    by_prefix, sole_provider = _backfill_sql()
+    await db.execute(text(by_prefix))
+    await db.execute(text(sole_provider))
+    for user in users:
+        await db.refresh(user)
+
+
+def _external(db: AsyncSession, username: str, source: str, created_at: datetime) -> User:
+    user = User(
+        username=username,
+        email=f"{username}@example.com",
+        display_name=username,
+        hashed_password=None,
+        auth_source=source,
+        external_id=f"sub-{username}",
+        created_at=created_at,
+    )
+    db.add(user)
+    return user
+
+
+async def test_the_backfill_skips_an_account_older_than_the_sole_provider(
+    db_session: AsyncSession,
+) -> None:
+    """An account made before the surviving provider existed came from some
+    other one, whatever the audit log does or does not say about it."""
+    group = await _group(db_session)
+    sole = await _provider(db_session, group, "oidc")
+    older = _external(db_session, "older", "oidc", sole.created_at - timedelta(days=30))
+    newer = _external(db_session, "newer", "oidc", sole.created_at + timedelta(days=1))
+    await db_session.flush()
+
+    await _run_backfill(db_session, older, newer)
+    assert older.auth_provider_id is None
+    assert newer.auth_provider_id == sole.id
+
+
+async def test_the_backfill_skips_an_account_a_deleted_provider_may_have_made(
+    db_session: AsyncSession,
+) -> None:
+    """Found by QA on #1289: domain A is deleted, domain B is added, the upgrade runs.
+    Every account made before A's deletion may be A's, so none of those goes
+    to B; an account made after it can only be B's."""
+    group = await _group(db_session)
+    now = datetime.now(UTC)
+    survivor = await _provider(db_session, group, "oidc")
+    survivor.created_at = now - timedelta(days=60)
+    deleted_id = uuid.uuid4()
+    db_session.add_all(
+        [
+            _provider_audit("create", deleted_id, "oidc", now - timedelta(days=90)),
+            _provider_audit("delete", deleted_id, None, now - timedelta(days=10)),
+        ]
+    )
+    before = _external(db_session, "before", "oidc", now - timedelta(days=20))
+    after = _external(db_session, "after", "oidc", now - timedelta(days=5))
+    await db_session.flush()
+
+    await _run_backfill(db_session, before, after)
+    assert before.auth_provider_id is None
+    assert after.auth_provider_id == survivor.id
+
+
+async def test_the_backfill_ignores_a_deleted_provider_of_another_type(
+    db_session: AsyncSession,
+) -> None:
+    group = await _group(db_session)
+    now = datetime.now(UTC)
+    survivor = await _provider(db_session, group, "oidc")
+    survivor.created_at = now - timedelta(days=60)
+    deleted_id = uuid.uuid4()
+    db_session.add_all(
+        [
+            _provider_audit("create", deleted_id, "ldap", now - timedelta(days=90)),
+            _provider_audit("delete", deleted_id, None, now - timedelta(days=10)),
+        ]
+    )
+    user = _external(db_session, "u", "oidc", now - timedelta(days=20))
+    await db_session.flush()
+
+    await _run_backfill(db_session, user)
+    assert user.auth_provider_id == survivor.id
+
+
+async def test_the_backfill_treats_a_deletion_of_unknown_type_as_any_type(
+    db_session: AsyncSession,
+) -> None:
+    """No ``create`` row to read the type from: assume it could have been
+    this type, which only ever withholds a link."""
+    group = await _group(db_session)
+    now = datetime.now(UTC)
+    survivor = await _provider(db_session, group, "saml")
+    survivor.created_at = now - timedelta(days=60)
+    db_session.add(_provider_audit("delete", uuid.uuid4(), None, now - timedelta(days=10)))
+    user = _external(db_session, "u", "saml", now - timedelta(days=20))
+    await db_session.flush()
+
+    await _run_backfill(db_session, user)
+    assert user.auth_provider_id is None

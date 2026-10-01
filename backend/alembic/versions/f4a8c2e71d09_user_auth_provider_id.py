@@ -10,16 +10,30 @@ Backfill, best effort and never guessing:
 * RADIUS / TACACS+ accounts carry their provider in the external id
   (``<provider id>:<username>``), so they are attributed exactly.
 * An LDAP / OIDC / SAML account is attributed when exactly one provider of
-  its type exists. A RADIUS / TACACS+ account whose prefix names no
-  existing provider is left NULL rather than given to the survivor. With two or more there is no way to tell which one it
-  came from, so it stays NULL and the next login through either is refused
-  until an administrator links it (``POST /users/{id}/link-provider``).
+  its type exists AND the account cannot have come from any other: it was
+  created after that provider was, and after the last deletion of any other
+  provider of its type. Released builds left a deleted provider's accounts in
+  place (auth_source + external_id intact), so "one provider of the type
+  exists now" did not mean "only one ever did". An earlier draft of this
+  backfill handed an account of a provider deleted before the upgrade to the
+  survivor, and the survivor's subject with the same identifier signed in as
+  it (found by QA on #1289). The deletes are read from ``audit_log``; the delete row carries
+  no type, so it is joined to the provider's ``create`` row, which has
+  recorded ``new_value.type`` since auth providers shipped. A delete whose
+  type cannot be recovered counts as every type: it only ever withholds a
+  link, never grants one.
+* A RADIUS / TACACS+ account whose prefix names no existing provider is left
+  NULL rather than given to the survivor.
+
+Everything left NULL is refused at its next sign-in with
+``account_link_required`` until an administrator links it
+(``POST /users/{id}/link-provider``).
 
 A plain index rather than a unique one: an install that already holds two
 rows with one provider and one external id must still be able to upgrade.
 
 Revision ID: f4a8c2e71d09
-Revises: e6b2d94f1a37
+Revises: d8e1b5a26c47
 Create Date: 2026-09-29
 """
 
@@ -31,7 +45,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "f4a8c2e71d09"
-down_revision = "e6b2d94f1a37"
+down_revision = "d8e1b5a26c47"
 branch_labels = None
 depends_on = None
 
@@ -48,10 +62,11 @@ BACKFILL_BY_PREFIX = """
 """
 
 # Every other external type: only when exactly one provider of the type
-# exists, so the account cannot have come from another one. RADIUS /
-# TACACS+ are excluded: their external id names the provider, so one the
-# prefix pass did not attribute came from a provider that no longer exists,
-# and the sole survivor is exactly the guess this backfill refuses to make.
+# exists and the account cannot have come from another one (see the module
+# docstring). RADIUS / TACACS+ are excluded: their external id names the
+# provider, so one the prefix pass did not attribute came from a provider
+# that no longer exists, and the sole survivor is exactly the guess this
+# backfill refuses to make.
 BACKFILL_SOLE_PROVIDER = """
     UPDATE "user" u
        SET auth_provider_id = p.id
@@ -61,6 +76,27 @@ BACKFILL_SOLE_PROVIDER = """
        AND u.external_id IS NOT NULL
        AND p.type = u.auth_source
        AND (SELECT count(*) FROM auth_provider q WHERE q.type = u.auth_source) = 1
+       -- The account postdates the survivor, so it was not made before it.
+       AND u.created_at >= p.created_at
+       -- No other provider that may have been of this type was deleted after
+       -- the account was made, so that provider cannot have made it.
+       AND NOT EXISTS (
+           SELECT 1
+             FROM audit_log d
+            WHERE d.action = 'delete'
+              AND d.resource_type = 'auth_provider'
+              AND d.resource_id <> p.id::text
+              AND d.timestamp > u.created_at
+              AND COALESCE(
+                      (SELECT c.new_value ->> 'type'
+                         FROM audit_log c
+                        WHERE c.action = 'create'
+                          AND c.resource_type = 'auth_provider'
+                          AND c.resource_id = d.resource_id
+                        LIMIT 1),
+                      u.auth_source
+                  ) = u.auth_source
+       )
 """
 
 
