@@ -2672,12 +2672,17 @@ upgrade. Data-plane appliances are never checked, because their release
 does not touch the database. Pointing a node at the slot it already
 runs, which commits a trial boot, is not checked either.
 
-The revision each release was built with comes from two places. Every
-release records its own when it starts, once the schema is at its head,
-in the `release_schema_head` table. Releases older than that table are
-covered by `backend/app/data/release_schema_heads.json`, generated from
-the release tags by `scripts/release_schema_heads.py`. A release in
-neither, such as an older nightly, is reported as `unknown`, and the
+The revision each release was built with comes from two places.
+`backend/app/data/release_schema_heads.json` is generated from the
+release tags by `scripts/release_schema_heads.py`, and for a release it
+lists it is the answer. Every release also records its own when it
+starts, once the schema is at its head, in the `release_schema_head`
+table, which is what covers nightly and dev builds no tag names. An api
+records the booted slot's version only when that slot is its own
+release: after a rollback to a slot whose release cannot migrate, the
+newer release's api keeps running there, and recording the older
+version against its own head would let the next rollback to it through.
+A release in neither, such as an older nightly, is reported as `unknown`, and the
 switch goes ahead: refusing on "don't know" would block every rollback
 on an install that never recorded anything.
 

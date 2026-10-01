@@ -269,11 +269,13 @@ the formatter handles the rest.
     because refusing on "don't know" would block every rollback on an
     install that never recorded anything.
   - Each release records its schema head in a new `release_schema_head`
-    table when it starts, once the schema is at its head. Releases older
-    than the table come from `backend/app/data/release_schema_heads.json`,
+    table when it starts, once the schema is at its head, and records
+    the booted slot's version only when that slot is its own release.
+    Tagged releases come from `backend/app/data/release_schema_heads.json`,
     generated from the release tags by `scripts/release_schema_heads.py`
-    (55 releases, 2026.09.04-1 at `f3b8d21c74ae`). The table is backed up
-    with `alembic_version`.
+    (55 releases, 2026.09.04-1 at `f3b8d21c74ae`), which wins over a
+    recorded row for every release it lists. The table is backed up with
+    `alembic_version`.
   - A migrate step that meets a database a newer release migrated now
     says so, in the migrate Job and once in the `wait-for-migrate` init
     container, and names the way out: re-apply the newer release, or

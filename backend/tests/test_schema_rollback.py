@@ -169,7 +169,7 @@ def test_the_bundled_table_only_names_releases() -> None:
         assert not version.startswith(("nightly", "0.0.0")), version
 
 
-# ── the lookup: recorded first, then bundled ──────────────────────────
+# ── the lookup: bundled first, then recorded ──────────────────────────
 
 
 @pytest.mark.asyncio
@@ -184,10 +184,23 @@ async def test_the_reproduced_rollback_is_refused(db_session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
-async def test_a_recorded_head_wins_over_the_bundled_one(db_session: AsyncSession) -> None:
+async def test_the_bundled_table_wins_for_a_release_it_lists(db_session: AsyncSession) -> None:
+    """A wrong recorded row must not turn a refusal into a pass (#1300 QA walk):
+    the bundled table is generated from the tags, so for a release it lists it
+    is the truth."""
     db_session.add(ReleaseSchemaHead(version=OLD_RELEASE, alembic_head=_head()))
     await db_session.commit()
     check = await sr.check_release_can_run(db_session, OLD_RELEASE)
+    assert check.head_source == "bundled"
+    assert check.verdict == "incompatible"
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_head_answers_for_a_build_no_tag_names(db_session: AsyncSession) -> None:
+    nightly = "0.0.0-nightly-20261001+abcdef0"
+    db_session.add(ReleaseSchemaHead(version=nightly, alembic_head=_head()))
+    await db_session.commit()
+    check = await sr.check_release_can_run(db_session, nightly)
     assert check.head_source == "recorded"
     assert check.verdict == "compatible"
 
@@ -228,6 +241,82 @@ async def test_record_this_release_waits_for_head(monkeypatch: pytest.MonkeyPatc
     async with AsyncSessionLocal() as s:
         row = await s.get(ReleaseSchemaHead, "2026.10.06-1")
         assert row is not None and row.alembic_head == _head()
+
+
+def _booted(version: str | None) -> SlotStatus:
+    return SlotStatus(
+        appliance_mode=True,
+        current_slot="slot_a",
+        durable_default="slot_a",
+        is_trial_boot=False,
+        upgrade_state="ready",
+        upgrade_state_at=None,
+        log_tail="",
+        slot_a_version=version,
+        slot_b_version="2026.10.06-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_this_release_skips_a_booted_slot_that_is_not_this_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #1300 QA walk: after a rollback to a nightly that cannot migrate,
+    the newer release's api keeps running on the nightly's slot. It must not
+    record the nightly at its own head, or the next rollback to the nightly
+    reads as compatible."""
+    import app.services.appliance.slot as slot_module
+
+    nightly = "0.0.0-nightly-20260930+f838ab8"
+    monkeypatch.setattr(settings, "version", "2026.10.06-1")
+    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted(nightly))
+    await _set_db_revision(_head())
+    await sr.record_this_release()
+    async with AsyncSessionLocal() as s:
+        assert (await s.get(ReleaseSchemaHead, nightly)) is None
+        row = await s.get(ReleaseSchemaHead, "2026.10.06-1")
+        assert row is not None and row.alembic_head == _head()
+
+
+@pytest.mark.asyncio
+async def test_record_this_release_records_the_booted_slot_when_it_is_this_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.appliance.slot as slot_module
+
+    monkeypatch.setattr(settings, "version", "2026.10.06-1")
+    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted("2026.10.06-1"))
+    await _set_db_revision(_head())
+    await sr.record_this_release()
+    async with AsyncSessionLocal() as s:
+        row = await s.get(ReleaseSchemaHead, "2026.10.06-1")
+        assert row is not None and row.alembic_head == _head()
+
+
+@pytest.mark.asyncio
+async def test_record_this_release_records_a_nightly_slot_under_its_slot_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nightly's images are tagged ``nightly-YYYYMMDD`` (its settings.version)
+    while its slot carries ``0.0.0-nightly-YYYYMMDD+<sha>``. The slot name is
+    what a rollback looks up, so it must be recorded, or a rollback to any
+    nightly reads ``unknown`` and goes through unchecked."""
+    import app.services.appliance.slot as slot_module
+
+    nightly = "0.0.0-nightly-20260930+f838ab8"
+    monkeypatch.setattr(settings, "version", "nightly-20260930")
+    monkeypatch.setattr(slot_module, "get_slot_status", lambda: _booted(nightly))
+    await _set_db_revision(_head())
+    await sr.record_this_release()
+    async with AsyncSessionLocal() as s:
+        row = await s.get(ReleaseSchemaHead, nightly)
+        assert row is not None and row.alembic_head == _head()
+
+
+def test_a_nightly_slot_from_another_night_is_not_this_build() -> None:
+    assert not sr._slot_is_this_build("0.0.0-nightly-20260929+aaaaaaa", "nightly-20260930")
+    assert not sr._slot_is_this_build("0.0.0-nightly-20260930+aaaaaaa", "2026.10.06-1")
+    assert sr._slot_is_this_build(" 2026.10.06-1 ", "2026.10.06-1")
 
 
 # ── the migrate step says what happened ───────────────────────────────

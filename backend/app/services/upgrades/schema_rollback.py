@@ -13,13 +13,21 @@ serving behind the older UI, because the older pods never become ready.
 :func:`check_release_can_run` answers the question before the switch, from
 the one side that CAN answer it: the newer release, which holds the whole
 migration tree. What it needs is the head the target release was built with,
-from two sources, most specific first:
+from two sources:
 
+* ``app/data/release_schema_heads.json`` — generated from the release tags
+  (``scripts/release_schema_heads.py``). It is built from the tags
+  themselves, so for a release it lists it is the truth and wins;
 * ``release_schema_head`` — every release records itself at startup
   (:func:`record_running_release`), so the release an appliance upgraded
-  FROM is always there;
-* ``app/data/release_schema_heads.json`` — generated from the release tags,
-  for releases older than the table (``scripts/release_schema_heads.py``).
+  FROM is there even when it is a nightly or dev build no tag names.
+
+A recorded row is only as true as the process that wrote it. After a
+rollback to a release that cannot migrate, the newer release's api keeps
+running on the older slot, and it must not record the booted slot's version
+against its own head: that row would turn the next rollback to the older
+release into a pass (#1300 QA walk). So a process records the booted slot
+only when that slot is its own release.
 
 The verdict is one of three, and ``unknown`` is never read as either of the
 others: a nightly that predates the table, or a slot whose version was never
@@ -45,6 +53,7 @@ from sqlalchemy import func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.versions import nightly_build_date
 from app.models.release_schema import ReleaseSchemaHead
 
 logger = structlog.get_logger(__name__)
@@ -197,12 +206,15 @@ async def _database_revision(db: AsyncSession) -> str | None:
 
 
 async def _target_head(db: AsyncSession, version: str) -> tuple[str | None, HeadSource | None]:
-    recorded = await db.get(ReleaseSchemaHead, version)
-    if recorded is not None:
-        return recorded.alembic_head, "recorded"
+    # The bundled table is generated from the release tags, so for a release
+    # it lists it cannot be wrong; a recorded row can be (see the module
+    # docstring). Recorded rows answer only for builds no tag names.
     bundled = _bundled_heads().get(version)
     if bundled is not None:
         return bundled, "bundled"
+    recorded = await db.get(ReleaseSchemaHead, version)
+    if recorded is not None:
+        return recorded.alembic_head, "recorded"
     return None, None
 
 
@@ -273,12 +285,33 @@ async def record_running_release(db: AsyncSession, versions: Iterable[str | None
     return names
 
 
-async def record_this_release() -> None:
-    """Startup hook: record this build's head under every name it runs as.
+def _slot_is_this_build(booted: str, version: str | None) -> bool:
+    """Whether the booted slot's APPLIANCE_VERSION names the build this process is.
 
-    That is the image version and, on an appliance, the running slot's
-    APPLIANCE_VERSION, which is what a rollback looks the slot up by. The two
-    are equal on a release build and differ on dev builds.
+    A release build stamps both from its tag, so they are equal. A nightly
+    does not: its images are tagged ``nightly-YYYYMMDD`` (the chart's
+    ``image.tag``, hence ``settings.version``) while its slot carries
+    ``0.0.0-nightly-YYYYMMDD+<sha>``. Without this pairing a nightly would
+    never record its slot, and a rollback to it would always read ``unknown``.
+    """
+    booted = booted.strip()
+    version = (version or "").strip()
+    if booted == version:
+        return True
+    night = nightly_build_date(booted)
+    return night is not None and version == f"nightly-{night:%Y%m%d}"
+
+
+async def record_this_release() -> None:
+    """Startup hook: record this build's head under the names it runs as.
+
+    That is the image version and, on an appliance, the booted slot's
+    APPLIANCE_VERSION, which is what a rollback looks the slot up by — but
+    only when that slot is this build (:func:`_slot_is_this_build`). When it
+    is not, this process is the newer release's api still running after a
+    rollback to a slot whose own release cannot migrate. Recording the slot
+    then would claim that older release runs at this head, and the next
+    rollback to it would pass the check.
     """
     from app.config import settings  # noqa: PLC0415
     from app.core.schema_check import schema_at_head  # noqa: PLC0415
@@ -291,9 +324,19 @@ async def record_this_release() -> None:
         return
     names: list[str | None] = [settings.version]
     slots = get_slot_status()
-    if slots.current_slot == "slot_a":
-        names.append(slots.slot_a_version)
-    elif slots.current_slot == "slot_b":
-        names.append(slots.slot_b_version)
+    booted = (
+        slots.slot_a_version
+        if slots.current_slot == "slot_a"
+        else slots.slot_b_version if slots.current_slot == "slot_b" else None
+    )
+    if booted and not _slot_is_this_build(booted, settings.version):
+        logger.warning(
+            "release_schema_head_slot_not_recorded",
+            booted_slot_version=booted,
+            this_release=settings.version,
+            reason="the booted slot is not this release",
+        )
+    elif booted:
+        names.append(booted)
     async with AsyncSessionLocal() as db:
         await record_running_release(db, names)
