@@ -248,6 +248,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cluster health no longer counts a joining database replica as a
+  ready instance (#1213).** The workload rollup on
+  `GET /appliance/cluster/health` skipped only finished Job pods, so
+  while CNPG bootstrapped a replica its running `postgresql-N-join` pod
+  counted as a third ready database pod: the Cluster Overview read
+  3/3 healthy while CNPG reported two instances, "Creating a new
+  replica". Job pods no longer count toward a workload's ready or
+  total, and a workload with a Job still running reads `degraded`
+  rather than `healthy` until it finishes, with the count of running
+  Job pods on the row (`jobs_running`, shown as "+1 job") so a
+  degraded 2/2 says why. The rolling upgrade was
+  never affected: its safety check reads CNPG's own `readyInstances`.
+
 - **Unattended upgrades no longer install kernels on the appliance
   (#1249).** `mkosi.conf` said "No kernel upgrades" while the
   unattended-upgrades drop-in allowed security-pocket kernels, and

@@ -803,6 +803,9 @@ def get_cluster_health() -> dict[str, Any]:
     pods_running = 0
     pod_rows: list[dict[str, Any]] = []
     rollup: dict[str, dict[str, Any]] = {}
+    # Job pods still running per component (#1213): a CNPG
+    # ``postgresql-N-join`` pod means an instance is still being created.
+    jobs_running: dict[str, int] = {}
     for p in pods_raw:
         meta = p.get("metadata") or {}
         status = p.get("status") or {}
@@ -833,8 +836,14 @@ def get_cluster_health() -> dict[str, Any]:
         }
         pod_rows.append(row)
 
-        # Workload rollup — skip done Job pods (helm-install Completed etc.).
-        if terminal and owner == "Job":
+        # Workload rollup — Job pods are not serving instances, so none of
+        # them count toward a workload's ready / total (#1213). A running one
+        # used to: CNPG's join pod read as a third ready database pod while
+        # CNPG itself reported two instances, "Creating a new replica". A
+        # Job still running instead keeps its component off "healthy" below.
+        if owner == "Job":
+            if not terminal:
+                jobs_running[comp] = jobs_running.get(comp, 0) + 1
             continue
         agg = rollup.setdefault(
             comp,
@@ -850,13 +859,16 @@ def get_cluster_health() -> dict[str, Any]:
 
     workloads: list[dict[str, Any]] = []
     for comp, agg in rollup.items():
-        if agg["ready"] == agg["total"] and agg["total"] > 0:
+        # Carried on the row so a "degraded" at ready == total says why,
+        # rather than reading as 2/2 and degraded with no explanation.
+        n_jobs = jobs_running.get(comp, 0)
+        if agg["ready"] == agg["total"] and agg["total"] > 0 and not n_jobs:
             wstatus = "healthy"
         elif agg["ready"] > 0:
             wstatus = "degraded"
         else:
             wstatus = "down"
-        workloads.append({**agg, "status": wstatus})
+        workloads.append({**agg, "jobs_running": n_jobs, "status": wstatus})
     workloads.sort(
         key=lambda w: (
             (
