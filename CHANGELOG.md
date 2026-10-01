@@ -248,6 +248,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A PXE vendor match, a dynamic-update ACL entry and a BIND9 zone
+  forwarder are checked before they reach the config (#1357).** Each was
+  written verbatim into Kea's or BIND's config, so one malformed value
+  made the server refuse the file and the whole server group stopped
+  converging. A PXE profile's `vendor_class_match` now gets the check a
+  phone profile's has had since #1294 (no `'`, no control characters),
+  and its prefix is measured in bytes, so a non-ASCII vendor string can
+  match. An update-ACL entry's `name_pattern` must be a DNS name (a
+  leading `*.` for `wildcard`; `.` or `*` for `self`), and its
+  `record_types` must be types BIND knows, including `DHCID`, `ANY`,
+  `TYPE<n>` and a count such as `A(5)`; lower case is still accepted and
+  upper-cased. A forward zone's forwarders on a BIND9 group must be `ip`
+  or `ip@port` (`ip port <n>` is accepted and rewritten); Technitium
+  zones may still name a hostname or DoH URL. Each answers 422 naming
+  the offending element. Rows stored before this are left out of the
+  agent's config with a log line instead of shipped: a bad PXE match
+  drops its class, a bad forwarder drops itself, and a bad update-ACL
+  `grant` drops itself while a bad `deny` also drops the entries after
+  it, so the policy that remains never allows more than the one stored.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:

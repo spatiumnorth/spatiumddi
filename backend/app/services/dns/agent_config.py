@@ -57,6 +57,8 @@ from app.services.dns.named_conf_validation import (
     order_acls_for_render,
     validate_acl_name,
     validate_address_match_list,
+    validate_update_acl_entry,
+    validate_zone_forwarders,
 )
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -191,6 +193,71 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         return sorted(prepared, key=lambda a: a["name"])
 
 
+def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A zone's dynamic-update ACL with every unrenderable entry removed (#1357).
+
+    ``name_pattern`` and ``record_types`` reach the agent's ``update-policy``
+    rule verbatim, and were unvalidated before #1357 — so, as with the named
+    ACLs above, a row stored before that would make BIND refuse the whole
+    group's config on the next render. Such an entry is left out, loudly.
+
+    How it is left out depends on the action, because ``update-policy`` is
+    first-match. Dropping a bad ``grant`` only ever removes permission.
+    Dropping a bad ``deny`` would let the grants BELOW it match updates it
+    was refusing, so a bad ``deny`` drops every entry after it as well: what
+    remains is a prefix of the operator's policy, which can only grant less
+    than the whole of it did.
+    """
+    kept: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        try:
+            # Validity only: a renderable row ships as stored, so a bundle
+            # that was fine before #1357 keeps its ETag.
+            validate_update_acl_entry(
+                entry.get("name_scope"), entry.get("name_pattern"), entry.get("record_types")
+            )
+        except ViewValidationError as exc:
+            deny = entry.get("action") == "deny"
+            logger.warning(
+                "dns_update_acl_entry_dropped_unrenderable",
+                zone_id=str(zone_id),
+                action=entry.get("action"),
+                field=exc.field,
+                value=exc.value,
+                error=str(exc),
+                entries_after_dropped=(len(entries) - index - 1) if deny else 0,
+            )
+            if deny:
+                break
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _safe_zone_forwarders(zone: Any) -> list[str]:
+    """A BIND9 zone's forwarders with every unrenderable entry removed (#1357).
+
+    The BIND9 agent renders them into ``forwarders { … };`` and they were
+    unvalidated before #1357 (an import or an old row could carry a
+    hostname). A bad entry is dropped, loudly, rather than making BIND refuse
+    the whole group's config; a forward zone left with none is skipped by
+    the agent, as it always has been.
+    """
+    kept: list[str] = []
+    for element in list(getattr(zone, "forwarders", []) or []):
+        try:
+            kept.extend(validate_zone_forwarders([element]))
+        except ViewValidationError as exc:
+            logger.warning(
+                "dns_zone_forwarder_dropped_unrenderable",
+                zone=getattr(zone, "name", None),
+                zone_id=str(getattr(zone, "id", "")),
+                value=element,
+                error=str(exc),
+            )
+    return kept
+
+
 @dataclass(frozen=True)
 class RenderedBody:
     """The bundle minus its per-poll parts (#1111).
@@ -289,6 +356,10 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
                     "record_types": acl.record_types,
                 }
             )
+        update_acls_by_zone = {
+            zone_id: _safe_update_acl(zone_id, entries)
+            for zone_id, entries in update_acls_by_zone.items()
+        }
 
     # Every record of every zone in ONE query, as column rows rather than
     # ORM instances. This was one ``select(DNSRecord)`` per zone inside the
@@ -384,7 +455,11 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # authoritative serial the agent renders from.
             "serial": getattr(z, "last_serial", 0),
             # Forward-zone-only fields (ignored by the agent for other types).
-            "forwarders": list(getattr(z, "forwarders", []) or []),
+            "forwarders": (
+                _safe_zone_forwarders(z)
+                if server.driver == "bind9"
+                else list(getattr(z, "forwarders", []) or [])
+            ),
             "forward_only": bool(getattr(z, "forward_only", True)),
             # Secondary / stub primaries (issue #336). The agent renders these
             # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
