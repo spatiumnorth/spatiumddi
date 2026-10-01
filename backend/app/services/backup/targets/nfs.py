@@ -53,8 +53,9 @@ AUTH_SYS has no credential — the client asserts a uid and the server
 believes it. This is the one destination where "test connection passed"
 says nothing about who else can read the archives — and only an
 archive's ``secrets.enc`` is encrypted, not its database dump, so an
-unrestricted export exposes the archives' contents (#1352). Kerberos (``sec=krb5*``) is
-out of scope for v1 — the same call ``smb`` made for NTLM-only.
+unrestricted export exposes the archives' contents (#1352). Kerberos
+(``sec=krb5*``) is out of scope for v1 — the same call ``smb`` made for
+NTLM-only.
 """
 
 from __future__ import annotations

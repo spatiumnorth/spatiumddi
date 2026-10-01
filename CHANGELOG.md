@@ -257,9 +257,14 @@ the formatter handles the rest.
   least-privilege pull token "fetches ciphertext". The NFS destination
   form carried the same claim. Anyone who can read an archive can read
   the whole database, users, IPAM / DNS / DHCP data and the audit log
-  included; stored credentials stay encrypted under the source
-  install's key. The docs now say what an archive exposes, and the NFS
-  and removable-disk sections say to restrict or encrypt accordingly.
+  included. Most stored credentials stay encrypted under the source
+  install's key, but not each DNS server group's internal TSIG key,
+  which is stored in clear and is accepted for zone transfers and
+  dynamic updates from any address (encrypting it is #1364). The docs
+  now say what an archive exposes, the NFS section says to restrict
+  the export, and the removable-disk section no longer recommends
+  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
+  `cryptsetup` to unlock it.
 
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
