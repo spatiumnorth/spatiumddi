@@ -357,7 +357,9 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
         # on one stream is an error.
         if psql.returncode is None:
             psql.kill()
-        await acknowledged
+        # Waits for the reader to hit EOF without re-raising anything it
+        # failed with: cleanup must not replace the error being reported.
+        await asyncio.wait({acknowledged})
         await psql.wait()
         if producer is not None:
             await _stop(producer)
