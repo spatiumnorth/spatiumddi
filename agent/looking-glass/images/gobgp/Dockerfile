@@ -176,3 +176,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD /usr/local/bin/gobgp -u 127.0.0.1 -p 50051 -j neighbor >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-lg-entrypoint"]
+
+# #1182 — the version the agent reports: the release tag from release.yml,
+# the nightly stamp from nightly.yml. A build that passes nothing reports
+# "dev". Last, so a new version only rebuilds this layer.
+ARG APP_VERSION=dev
+ENV SPATIUM_AGENT_VERSION=${APP_VERSION}

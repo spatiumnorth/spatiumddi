@@ -101,8 +101,7 @@ spec:
             - name: CONTROL_PLANE_URL
               value: {{ .Values.lookingGlass.controlPlaneUrl | default .Values.lookingGlass.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             {{- if .Values.lookingGlass.controlPlaneUrl }}
-            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
-              value: "1"
+            {{- include "spatiumddi-appliance.cpPin.env" . | nindent 12 }}
             {{- end }}
             - name: LG_AGENT_KEY
               value: {{ .Values.lookingGlass.agentKey | quote }}
@@ -131,9 +130,15 @@ spec:
             # plane is unreachable.
             - name: agent-state
               mountPath: /var/lib/spatium-lg-agent
+            {{- if .Values.lookingGlass.controlPlaneUrl }}
+            {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
+            {{- end }}
       # Per-node hostPath, NOT a shared RWO PVC and NOT emptyDir — see
       # dns-bind9.yaml / dhcp-kea.yaml for the full rationale.
       volumes:
+        {{- if .Values.lookingGlass.controlPlaneUrl }}
+        {{- include "spatiumddi-appliance.cpPin.volume" . | nindent 8 }}
+        {{- end }}
         - name: agent-state
           hostPath:
             path: /var/lib/spatiumddi/agents/looking-glass/state

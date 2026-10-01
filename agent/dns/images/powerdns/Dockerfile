@@ -145,3 +145,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
   CMD dig @127.0.0.1 -p 53 id.server CH TXT +short +timeout=2 || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-dns-entrypoint"]
+
+# #1182 — the version the agent reports: the release tag from release.yml,
+# the nightly stamp from nightly.yml. A build that passes nothing reports
+# "dev". Last, so a new version only rebuilds this layer.
+ARG APP_VERSION=dev
+ENV SPATIUM_AGENT_VERSION=${APP_VERSION}

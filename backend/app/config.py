@@ -6,6 +6,12 @@ import sys
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.request_meta import (
+    DEFAULT_TRUSTED_PROXY_CIDRS,
+    TrustedNetworks,
+    parse_trusted_proxies,
+)
+
 # Sentinel default for ``secret_key``. Every deployment MUST override it
 # via the ``SECRET_KEY`` env var (or ``.env``): the model validator below
 # refuses to boot on it, or on any other weak key, unless
@@ -136,6 +142,16 @@ class Settings(BaseSettings):
     # set this to their real hostnames. Starlette's TrustedHostMiddleware
     # treats ``["*"]`` as "allow everything".
     trusted_hosts: str = "*"
+
+    # #1221 — the TCP peers whose ``X-Real-IP`` / ``X-Forwarded-Proto`` the
+    # api believes (comma-separated CIDRs or addresses; ``*`` = any peer).
+    # Default: private, loopback, CGNAT and ULA ranges, where the shipped
+    # proxies live (the compose frontend container, frontend pods, an
+    # appliance node reaching the api Service). A client whose own address
+    # is in this list and who can reach the api DIRECTLY could set its IP,
+    # so if you publish the api port beyond localhost, narrow this to your
+    # proxy's address. Validated at boot: a bad entry fails it.
+    trusted_proxy_cidrs: str = DEFAULT_TRUSTED_PROXY_CIDRS
 
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
@@ -423,6 +439,22 @@ class Settings(BaseSettings):
         if "*" in entries:
             return ["*"]
         return entries or ["*"]
+
+    @property
+    def trusted_proxy_networks(self) -> TrustedNetworks:
+        """``trusted_proxy_cidrs`` parsed for TrustedProxyMiddleware (#1221);
+        None means trust any peer (``*``)."""
+        return parse_trusted_proxies(self.trusted_proxy_cidrs)
+
+    @model_validator(mode="after")
+    def _check_trusted_proxy_cidrs(self) -> "Settings":
+        # Fail the boot on a typo rather than start trusting nobody (every
+        # user shares the proxy's rate-limit bucket) or everybody.
+        try:
+            parse_trusted_proxies(self.trusted_proxy_cidrs)
+        except ValueError as exc:
+            raise ValueError(f"TRUSTED_PROXY_CIDRS is invalid: {exc}") from exc
+        return self
 
     @model_validator(mode="after")
     def _check_secret_key(self) -> "Settings":

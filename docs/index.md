@@ -214,7 +214,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     </a>
     <a class="idx-card" href="deployment/BAREMETAL.html">
       <span class="idx-card-title">Bare Metal</span>
-      <span class="idx-card-desc">Compose on a host, Patroni HA Postgres overlay, the appliance path</span>
+      <span class="idx-card-desc">Compose on a host and the appliance path (the Compose Patroni overlay is unsupported in 1.0)</span>
     </a>
     <a class="idx-card" href="deployment/WINDOWS.html">
       <span class="idx-card-title">Windows Server</span>
@@ -283,6 +283,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     <a class="idx-card" href="THIRD_PARTY.html">
       <span class="idx-card-title">Third-Party Components</span>
       <span class="idx-card-desc">Every bundled engine, library and OS package, with its licence and the artifact it ships in</span>
+    </a>
+    <a class="idx-card" href="{{ site.links.github }}/blob/main/CHANGELOG.md">
+      <span class="idx-card-title">Changelog</span>
+      <span class="idx-card-desc">What changed in each release, including upgrade notes</span>
     </a>
     <a class="idx-card" href="{{ site.links.github }}">
       <span class="idx-card-title">Source, Releases &amp; Issues</span>

@@ -44,6 +44,7 @@ import time
 import httpx
 import structlog
 
+from . import cp_tls
 from . import appliance_state, k8s_api
 from .cert_auth import build_auth_headers, load_cert
 from .config import SupervisorConfig
@@ -80,16 +81,24 @@ def proxy_loop_forever(
     # httpx.Client is thread-safe but the supervisor's main heartbeat
     # client is in another thread; create our own to avoid lock
     # contention on concurrent polls.
-    with httpx.Client(timeout=_POLL_TIMEOUT_S + 5.0) as client:
-        while True:
-            try:
+    # #1219 — a fresh client per poll, verified against the control
+    # plane's pinned certificate, so a re-pin by the heartbeat loop is
+    # picked up here too. The pin is only ever taken by registration.
+    while True:
+        try:
+            with cp_tls.client(
+                cfg.state_dir,
+                cfg.control_plane_url,
+                first_contact=False,
+                timeout=_POLL_TIMEOUT_S + 5.0,
+            ) as client:
                 _proxy_once(cfg, identity, client)
-            except Exception as exc:  # noqa: BLE001
-                # Last-ditch swallow — any uncaught error in the
-                # proxy must not kill the supervisor thread. Log
-                # loud + back off.
-                log.warning("supervisor.k8s_proxy.loop_crashed", error=str(exc))
-                time.sleep(_BACKOFF_S)
+        except Exception as exc:  # noqa: BLE001
+            # Last-ditch swallow — any uncaught error in the
+            # proxy must not kill the supervisor thread. Log
+            # loud + back off.
+            log.warning("supervisor.k8s_proxy.loop_crashed", error=str(exc))
+            time.sleep(_BACKOFF_S)
 
 
 def _proxy_once(

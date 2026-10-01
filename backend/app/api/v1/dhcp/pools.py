@@ -217,7 +217,12 @@ async def create_pool(
         raise HTTPException(status_code=404, detail="Scope not found")
     if body.options_override:
         body.options_override = normalize_options(body.options_override)
-        validate_dhcp_options(body.options_override, address_family=scope.address_family or "ipv4")
+        await validate_dhcp_options(
+            db,
+            body.options_override,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
+            address_family=scope.address_family or "ipv4",
+        )
 
     if body.pool_type == "pd":
         # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
@@ -304,8 +309,10 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
     scope = await db.get(DHCPScope, pool.scope_id)
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
-        validate_dhcp_options(
+        await validate_dhcp_options(
+            db,
             changes["options_override"],
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=(scope.address_family if scope else None) or "ipv4",
             previous=pool.options_override or {},
         )

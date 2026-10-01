@@ -12,11 +12,13 @@ This helper unifies the re-confirmation:
 * **Local users** (have a password): only a correct password passes — TOTP is
   NOT accepted in lieu of it. Local users already hold the strongest factor,
   and accepting TOTP-instead-of-password would downgrade the reveal step-up
-  (MFA enrolment needs only a session, so a hijacked session could self-enrol
-  and reveal without the password). See the SECURITY note in reverify_operator.
+  (TOTP proves only what was enrolled, and before #1241 enrolment needed only
+  a session). See the SECURITY note in reverify_operator.
 * **External-auth users** (no local password): a correct TOTP code passes. MFA
   enrolment is now open to every auth source (#408), so an SSO superadmin can
-  enrol TOTP and then re-confirm with it. If they have NOT enrolled, the helper
+  enrol TOTP and then re-confirm with it. Enrolment itself is gated by
+  :func:`reverify_for_mfa_enrolment` (#1241): a password for local users, a
+  recent sign-in for external ones. If they have NOT enrolled, the helper
   returns ``MFA_REQUIRED`` so the caller can tell them to enrol rather than
   dead-ending on a password they don't have.
 
@@ -30,6 +32,7 @@ and audited, so a 30 s TOTP window is low-risk in the meantime.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -47,6 +50,7 @@ class ReauthOutcome(Enum):
     OK = "ok"
     BAD_CREDENTIAL = "bad_credential"  # wrong password / wrong or missing TOTP
     MFA_REQUIRED = "mfa_required"  # external-auth user with no MFA enrolled
+    SIGN_IN_TOO_OLD = "sign_in_too_old"  # external-auth user; sign in again (#1241)
 
 
 def _totp_ok(user: User, code: str | None) -> bool:
@@ -57,6 +61,11 @@ def _totp_ok(user: User, code: str | None) -> bool:
         return verify_totp(decrypt_secret(user.totp_secret_encrypted), code)
     except Exception:  # noqa: BLE001 — a decrypt/parse failure is just "no"
         return False
+
+
+def uses_local_password(user: User) -> bool:
+    """True for an account whose step-ups prove a local password."""
+    return bool(user.auth_source == "local" and user.hashed_password)
 
 
 def reverify_operator(
@@ -70,17 +79,16 @@ def reverify_operator(
     Never raises on a bad credential — returns an outcome so the caller keeps
     its own audit-on-denial + friction-sleep behaviour.
     """
-    has_local_password = bool(user.auth_source == "local" and user.hashed_password)
-    if has_local_password:
+    if uses_local_password(user):
         # SECURITY (review of #408): a local user must prove their PASSWORD —
         # TOTP is NOT accepted as a substitute here. Accepting TOTP-in-lieu-of-
-        # password would be a defense-in-depth downgrade: MFA enrolment only
-        # needs an authenticated session, so a hijacked session of a local
-        # superadmin who hasn't enrolled could self-enrol TOTP and then reveal
-        # secrets without ever proving the password the reveal step-up exists
-        # to demand. Local users already hold the strongest factor (password);
-        # only password-less SSO users fall back to TOTP below.
-        assert user.hashed_password is not None  # narrowed by has_local_password
+        # password would be a defense-in-depth downgrade: TOTP proves only
+        # what was enrolled, so the reveal step-up would be as strong as the
+        # enrolment gate rather than the password it exists to demand. Local
+        # users already hold the strongest factor (password); only
+        # password-less SSO users fall back to TOTP below — which is why
+        # enrolment itself now needs a step-up (#1241).
+        assert user.hashed_password is not None  # narrowed by uses_local_password
         if password and verify_password(password, user.hashed_password):
             return ReauthOutcome.OK
         return ReauthOutcome.BAD_CREDENTIAL
@@ -95,3 +103,47 @@ def reverify_operator(
     if _totp_ok(user, totp_code):
         return ReauthOutcome.OK
     return ReauthOutcome.BAD_CREDENTIAL
+
+
+#: How recent an external-auth user's sign-in must be to enrol MFA (#1241).
+MFA_ENROL_SIGN_IN_WINDOW = timedelta(minutes=10)
+
+
+def sign_in_is_recent(signed_in_at: datetime | None, *, now: datetime | None = None) -> bool:
+    if signed_in_at is None:
+        return False
+    return (now or datetime.now(UTC)) - signed_in_at <= MFA_ENROL_SIGN_IN_WINDOW
+
+
+def reverify_for_mfa_enrolment(
+    user: User,
+    *,
+    password: str | None,
+    signed_in_at: datetime | None,
+    now: datetime | None = None,
+) -> ReauthOutcome:
+    """Step-up for STARTING an MFA enrolment (#1241).
+
+    Enrolment used to need only a session, and it is the one step-up that
+    cannot fall back on TOTP — there is none yet. So a hijacked session
+    could enrol the attacker's authenticator and then: for an external-auth
+    superadmin, pass every TOTP reveal step-up above; for a local user, lock
+    the real owner out, since disabling MFA needs a code only the attacker
+    has.
+
+    * **Local users** prove their password, as every other step-up does.
+    * **External-auth users** have no password here, so they prove a RECENT
+      sign-in with their identity provider: the session must have been
+      created by a real login within :data:`MFA_ENROL_SIGN_IN_WINDOW`. A
+      refresh does not count — it carries the original sign-in time forward
+      — so a stolen session cannot make itself look fresh. No sign-in time
+      at all (an API token) fails closed.
+    """
+    if uses_local_password(user):
+        assert user.hashed_password is not None  # narrowed by uses_local_password
+        if password and verify_password(password, user.hashed_password):
+            return ReauthOutcome.OK
+        return ReauthOutcome.BAD_CREDENTIAL
+    if sign_in_is_recent(signed_in_at, now=now):
+        return ReauthOutcome.OK
+    return ReauthOutcome.SIGN_IN_TOO_OLD

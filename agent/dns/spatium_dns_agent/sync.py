@@ -226,11 +226,7 @@ class SyncLoop:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
+        verify = self.cfg.httpx_verify()
         # server holds for ~30s, give client a bit more
         return httpx.Client(
             base_url=self.cfg.control_plane_url, verify=verify, timeout=60.0

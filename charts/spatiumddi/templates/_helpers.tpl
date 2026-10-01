@@ -340,7 +340,7 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
      ${SPATIUMDDI_VERSION:-dev}`` wiring on the helm path.
      Precedence: operator-pinned ``image.tag`` wins (e.g. for a
      manual rollback) → chart-packaged ``.Chart.AppVersion`` (the
-     CalVer tag the release workflow stamps via
+     release tag the release workflow stamps via
      ``helm package --app-version``) → falls through to the
      api's own ``"dev"`` fallback in ``app/config.py``. Same
      resolution chain as the existing ``spatiumddi.image``

@@ -2398,6 +2398,12 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
+  /** What starting an enrolment asks for (#1241). */
+  enrol_requires: "password" | "recent_sign_in";
+  /** For `recent_sign_in`: false means sign out and back in first. */
+  enrol_sign_in_recent: boolean;
+  /** How recent that sign-in must be, in minutes. */
+  enrol_sign_in_window_minutes: number;
 }
 
 export interface MfaEnrolBeginResponse {
@@ -4893,6 +4899,10 @@ export interface ZoneMovePreview {
    *  Non-empty means the commit refuses: an undefined symbol makes BIND
    *  reject the whole file, stopping the entire target group. */
   acl_names_lost: string[];
+  /** TSIG keys the zone cites as ``key <name>`` that the target group
+   *  doesn't define (#1316). Non-empty means the commit refuses, for the
+   *  same reason as ``acl_names_lost``. */
+  key_names_lost: string[];
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -9634,9 +9644,9 @@ export const authApi = {
   // ── MFA (issue #69) ─────────────────────────────────────────────────
   mfaStatus: () =>
     api.get<MfaStatusResponse>("/auth/mfa/status").then((r) => r.data),
-  mfaEnrollBegin: () =>
+  mfaEnrollBegin: (password?: string) =>
     api
-      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin")
+      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
       .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),

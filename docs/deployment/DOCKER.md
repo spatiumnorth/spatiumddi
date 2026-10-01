@@ -19,7 +19,7 @@
 |---|---|---|---|
 | 8077 | Frontend (nginx) | HTTP | Host-published default; configurable via `HTTP_PORT` env var (container listens on 80) |
 | 443 | Frontend (nginx) | HTTPS | When TLS is configured (see §5) |
-| 8000 | API (uvicorn) | HTTP | Configurable via `API_PORT` env var; internal only in production |
+| 8000 | API (uvicorn) | HTTP | Published on `127.0.0.1` only by default (`API_BIND`, `API_PORT`); browsers and remote agents use the frontend |
 | 5432 | PostgreSQL | TCP | Internal only — never expose externally |
 | 6379 | Redis | TCP | Internal only — never expose externally |
 
@@ -41,8 +41,9 @@ cp .env.example .env
 # SECRET_KEY: openssl rand -hex 32  (the api refuses to boot without a real one)
 nano .env
 
-# Build images
-docker compose build
+# Fetch the release images (docker-compose.yml pins pre-built images from
+# ghcr.io; it has no build: sections, so `docker compose build` does nothing)
+docker compose pull
 
 # Run database migrations
 docker compose run --rm migrate
@@ -69,7 +70,9 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
 | `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
-| `API_PORT` | `8000` | Host port for the API (set to `127.0.0.1:8000:8000` to restrict to localhost) |
+| `API_PORT` | `8000` | Host port for the API |
+| `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
+| `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
@@ -175,12 +178,9 @@ See [`docs/features/ACME.md`](../features/ACME.md) for the full ACME provider sp
 
 ## 6. PostgreSQL High Availability (Docker Compose)
 
-For single-server deployments, the default single PostgreSQL container is sufficient. For HA:
+The Compose stack runs one PostgreSQL container, and **Compose HA is not supported in 1.0**. For a highly available database, run the OS appliance's multi-node control plane ([Topology 7](TOPOLOGIES.md#topology-7--appliance-multi-node-control-plane-ha-272)) or Kubernetes with CloudNativePG (see `k8s/README.md`).
 
-- **Patroni + etcd + HAProxy**: See `k8s/ha/postgres-docker-compose.yaml`
-- Connect your `.env` `DATABASE_URL` to HAProxy port 5000 (primary) instead of the `postgres` container
-
-For multi-server deployments, use Kubernetes with CloudNativePG (see `k8s/README.md`).
+The repo's `k8s/ha/postgres-docker-compose.yaml` is **not a working HA path**. Layered on this stack, Patroni never starts, the overlay renames the project onto empty volumes, its network does not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing `.env` at HAProxy changes nothing. The file's header lists the details. Making Compose HA real is tracked in [#137](https://github.com/spatiumnorth/spatiumddi/issues/137).
 
 ---
 
@@ -199,18 +199,29 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 > **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
 
 ```bash
-# Pull latest code
+# Refresh docker-compose.yml and .env.example for any new fields
 git pull
 
-# Rebuild images
-docker compose build
+# Fetch the new images. This is the step that upgrades: the compose file
+# pins pre-built images, so `docker compose build` rebuilds nothing, and
+# without a pull `up` keeps running the images already on the host.
+docker compose pull
 
 # Run new migrations (safe to run — Alembic is idempotent)
 docker compose run --rm migrate
 
-# Restart services with zero-downtime rolling update
-docker compose up -d --force-recreate api worker beat frontend
+# Recreate every service whose image changed
+docker compose up -d
 ```
+
+`docker compose pull` and `docker compose up -d` act only on the profiles that
+are active. If you enable the DNS / DHCP / Looking Glass containers through
+`COMPOSE_PROFILES` in `.env`, they are upgraded with the rest. If you start
+them with `--profile` on the command line instead, pass the same `--profile`
+flags to both `pull` and `up -d`, or those containers keep running the old
+images against the newly migrated control plane.
+To upgrade to a specific release rather than the newest, set
+`SPATIUMDDI_VERSION` in `.env` first; see the README's *Upgrading* section.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
 
@@ -310,7 +321,7 @@ gunzip -c postgres-only-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -
 
 ### Redis backup
 
-Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. There's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping — so a Redis backup is generally not needed. For point-in-time disaster recovery, copy the `redis_data` volume alongside the SpatiumDDI archive.
+The Compose Redis runs **without AOF persistence** (`redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru`): at most Redis's default periodic RDB snapshots land in the `redis_data` volume, so a Redis restart can lose queued Celery tasks and cached state. That is by design: there's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping, throttle counters — so a Redis backup is not needed. Cached state is rebuilt and periodic tasks fire again on the next beat tick; a one-off task that was queued but not yet run when Redis restarted (a manual backup run, an ACME order, a scan) is lost and has to be started again. (The Helm chart does run Redis with `--appendonly yes`.)
 
 ---
 
@@ -341,7 +352,7 @@ The `looking-glass` service uses `network_mode: host` so BGP (TCP/179) originate
 
 1. Control plane already running somewhere reachable (e.g. `https://spatium.example.com`).
 2. The pre-shared agent bootstrap key from the control plane. These are the `DNS_AGENT_KEY` / `DHCP_AGENT_KEY` env values the control plane was started with; reveal them from the UI at **Settings → Security → Agent bootstrap keys** (`POST /api/v1/admin/agent-keys/reveal`, superadmin + password-confirm). The agent must present this same key — the control plane rejects bootstrap attempts with an unknown key. The agent exchanges the pre-shared key for a rotating JWT on first contact and caches it locally, so it only needs the bootstrap key once.
-3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
+3. The agent verifies the control plane's TLS certificate. With a certificate from a public CA there is nothing to do. With a private CA or a self-signed certificate, put that CA next to the compose file as `spatium-ca.crt`, uncomment the `./spatium-ca.crt:/etc/ssl/spatium-ca.crt:ro` volume line, and set `TLS_CA_PATH=/etc/ssl/spatium-ca.crt` in `.env`. `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` turns verification off instead: lab use only, since anyone on the network path can then read the agent key and serve the agent its configuration. The agent logs a warning on every start while it is off, and `TLS_CA_PATH` wins if both are set. (Until #1220 these files defaulted the skip to `1`; see the upgrade note in the CHANGELOG.)
 
 ### DHCP-only VM
 

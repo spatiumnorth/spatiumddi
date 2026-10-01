@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
+from app.core.content_disposition import content_disposition
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import CsvResponse, IosConfigResponse
@@ -1051,7 +1052,7 @@ async def export_csv(
     return Response(
         content=render_csv(rows),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="e911-erls-{stamp}.csv"'},
+        headers={"Content-Disposition": content_disposition(f"e911-erls-{stamp}.csv")},
     )
 
 
@@ -1124,5 +1125,5 @@ async def export_ios_snippets(
     return Response(
         content=render_ios_snippets(rows, interface_names=port_names),
         media_type="text/plain",
-        headers={"Content-Disposition": (f'attachment; filename="e911-ios-lldp-med-{stamp}.txt"')},
+        headers={"Content-Disposition": content_disposition(f"e911-ios-lldp-med-{stamp}.txt")},
     )

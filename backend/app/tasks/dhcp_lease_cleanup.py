@@ -27,7 +27,7 @@ from app.models.ipam import IPAddress
 from app.services.dhcp.lease_cleanup import (
     _load_subnet_cache,
     _resolve_lease_subnet_id,
-    peer_holds_active_lease,
+    address_still_held,
 )
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.feature_modules import is_module_enabled
@@ -86,7 +86,12 @@ async def _sweep() -> tuple[int, int]:
             # The partner that renewed it has the newer expiry, and this
             # row is the stale one — typically because this server has
             # stopped being polled.
-            if await peer_holds_active_lease(db, lease, now=now_ts):
+            #
+            # #1318 — nor does another client's lease on this same server:
+            # a row left ``active`` past its expiry for an address that has
+            # since gone to a new client (Kea reused it without a release
+            # line for the old one) must not take the new client's mirror.
+            if await address_still_held(db, lease, now=now_ts):
                 continue
             # Remove the mirrored IPAM row if auto_from_lease — but only
             # within this lease's owning subnet. An address-only lookup

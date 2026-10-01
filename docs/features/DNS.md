@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status (snapshot):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS + Technitium DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones, catalog zones as producer *and* consumer, online DNSSEC, and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status:** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS + Technitium DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones, catalog zones as producer *and* consumer, online DNSSEC, and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -249,6 +249,9 @@ the operator could not inspect and fix afterwards:
   per-group, so the name becomes an undefined symbol — and BIND rejects the
   file *whole*, which stops the entire target group converging rather than
   just this zone;
+* a **TSIG key** cited as `key <name>` in those same lists that the target
+  group does not define (422, #1316). Keys are per-group too, so it is the same
+  undefined symbol and the same whole-group failure;
 * a **forwarders-less forward zone onto a Technitium group** (422), the same
   #743 guard every create and update runs.
 
@@ -1399,10 +1402,43 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
 
 ### Server options
 
-- **`forward_policy` enum.** `first` or `only`. Validator in
-  `backend/app/api/v1/dns/router.py`.
-- **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator in
-  `backend/app/api/v1/dns/router.py`.
+Everything below is written into `named.conf` as is, so an invalid value
+would make BIND refuse the whole group's config. Each is a `422` naming
+the field and the offending element, from `validate_server_option` in
+`backend/app/services/dns/named_conf_validation.py` (#1244). Only a value
+that **changes** is checked: the options form sends every field on every
+save, and a value stored before this check existed must not block an
+unrelated edit.
+
+- **Address-match-lists.** `allow_query`, `allow_query_cache`,
+  `allow_recursion`, `allow_transfer`, `allow_notify`, `blackhole` and
+  `rrl_exempt_clients` take addresses, CIDR prefixes, the built-ins
+  (`any` / `none` / `localhost` / `localnets`), `key <name>` and ACL names,
+  each optionally negated with `!`. A key or ACL name must be defined in the
+  group. Same gate as a view's `match_clients` (#876).
+- **`also_notify`.** `<ip> [port <n>] [key <name>]` per entry. Not an
+  address-match-list: it names servers to NOTIFY, so a prefix, a negation or
+  an ACL name is refused.
+- **`forwarders`.** `<ip>` or `<ip>@<port>`.
+- **`forward_policy` enum.** `first` or `only`.
+- **`dnssec_validation` enum.** `auto`, `yes`, or `no`.
+- **`notify_enabled` enum.** `yes`, `no`, `explicit`, `master-only` or
+  `primary-only`.
+- **`query_log_channel` enum.** `file`, `syslog` or `stderr`.
+- **`query_log_severity`.** `critical`, `error`, `warning`, `notice`,
+  `info`, `dynamic`, `debug` or `debug <level>`.
+- **Paths.** `query_log_file` must be a file under `/var/log/named/` (the
+  directory the agent makes writable and its query-log shipper tails), and
+  `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
+  absolute, with no `.` or `..` segment, using only letters, digits, `.`,
+  `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
+
+A zone's own `allow_query`, `allow_transfer`, `also_notify` and
+`notify_enabled` go through the same checks on zone create and update (#1316),
+with the same only-changed-values rule on update. They render into the zone's
+`zone { … }` statement, so a bad value there stops the whole group converging
+just as a bad server option does. A zone's `forwarders` are not checked this
+way: a Technitium forward zone may carry a hostname or DoH URL there.
 
 ## 16. Multi-group / split-horizon publishing at the IPAM layer (issue #25)
 

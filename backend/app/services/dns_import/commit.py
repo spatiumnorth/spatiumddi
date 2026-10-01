@@ -17,7 +17,7 @@ partial-success state cleanly.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,7 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import contains_control_chars
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServerGroup, DNSView, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
+from app.services.dns.named_conf_validation import split_zone_forwarders
 from app.services.dns.record_ops import enqueue_record_ops_bulk, record_op_payload
 
 from .canonical import (
@@ -589,10 +590,36 @@ async def commit_import(
     )
     conflicting = {c.zone_name for c in fresh_conflicts}
 
+    # #1357 — a BIND9 group renders a forward zone's forwarders as
+    # ``ip[ port n]``; an imported entry it cannot (a hostname, a DoH URL, a
+    # ``tls`` clause naming a definition that was not imported) would be
+    # dropped at render with only a log line. Drop it here instead and say
+    # so in the result. No servers yet reads as BIND9, as the API does.
+    drivers = set(
+        (
+            await db.execute(
+                select(DNSServer.driver).where(DNSServer.group_id == target_group_id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    bind9_target = not drivers or "bind9" in drivers
+    warnings = list(preview.warnings)
+
     now = datetime.now(UTC)
     results: list[CommitZoneResult] = []
 
     for parsed in preview.zones:
+        if bind9_target and parsed.forwarders:
+            kept, dropped = split_zone_forwarders(parsed.forwarders)
+            if dropped:
+                warnings.append(
+                    f"Zone {parsed.name!r}: dropped forwarder(s) "
+                    f"{', '.join(repr(v) for v, _ in dropped)} — a BIND9 group "
+                    "forwards to an IP address with an optional port only"
+                )
+            parsed = replace(parsed, forwarders=kept)
         target_name = _normalize_fqdn(parsed.name).lower()
         # Operator entry keyed by either the parsed name (preferred,
         # what the UI hands back) or the normalized form.
@@ -629,5 +656,5 @@ async def commit_import(
     return CommitResult(
         target_group_id=target_group_id,
         zones=results,
-        warnings=list(preview.warnings),
+        warnings=warnings,
     )

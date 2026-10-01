@@ -123,8 +123,10 @@ metallb:
     autoAssign: false
 
   # ── BGP (issue #566 decision D1 — light-up) ───────────────────────
-  # No behavior change while ``enabled: false``. Real peering needs an
-  # FRR backend — the seed supervisor flips BOTH this AND
+  # No behavior change while ``enabled: false``. This chart peers through
+  # the frr-k8s backend (#566 D1; MetalLB's native BGP mode could peer
+  # without FRR, but is not what this chart runs), so the seed supervisor
+  # flips BOTH this AND
   # ``frrk8s.enabled`` above together (apply_metallb_overrides) the
   # instant an operator configures a BGP peer via Fleet → Network &
   # Host, so the two flags never drift apart in practice.

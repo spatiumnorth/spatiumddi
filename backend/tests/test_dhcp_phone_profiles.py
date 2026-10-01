@@ -127,7 +127,10 @@ async def test_phone_profile_renders_when_attached_and_enabled(
     assert "Polycom" in pc.match_expression
     # The two options the operator set should land in the rendered class.
     assert pc.options.get("tftp-server-name") == "tftp.example.com"
-    assert pc.options.get("polycom-config-url") == "https://prov.example.com/{mac}"
+    # #1294 — keyed by code: the agent drops a catalogue name such as
+    # ``polycom-config-url``, so option 160 never reached a phone.
+    assert pc.options.get("code:160") == "https://prov.example.com/{mac}"
+    assert "polycom-config-url" not in pc.options
 
 
 async def test_disabled_phone_profile_emits_no_class(

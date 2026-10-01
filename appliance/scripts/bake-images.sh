@@ -10,7 +10,7 @@
 # We tag each image as ``ghcr.io/spatiumnorth/<name>:${SPATIUMDDI_VERSION}``
 # before save so the imported image matches the reference the chart's
 # values.yaml uses. SPATIUMDDI_VERSION resolves from the Makefile (CI
-# release sets it to the CalVer tag; local dev gets ``dev-<short-sha>-
+# release sets it to the release tag; local dev gets ``dev-<short-sha>-
 # <rand>``).
 #
 # Also writes /usr/lib/spatiumddi/spatiumddi-version so firstboot can
