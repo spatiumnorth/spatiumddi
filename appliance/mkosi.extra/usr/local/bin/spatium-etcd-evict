@@ -131,8 +131,9 @@ def peer_host(url: str) -> str:
 
 
 def _member_name_re(host: str) -> re.Pattern[str]:
-    """The name k3s gives a server's etcd member: `<node name>-<8 hex>`."""
-    return re.compile(r"^" + re.escape(host) + r"-[0-9a-f]{8}$")
+    """The name k3s gives a server's etcd member: `<node name>-<8 hex>`, and
+    nothing after it (`\\Z`: `$` also matches before a trailing newline)."""
+    return re.compile(r"^" + re.escape(host) + r"-[0-9a-f]{8}\Z")
 
 
 def node_members(members: list[dict], host: str, ips: list[str],

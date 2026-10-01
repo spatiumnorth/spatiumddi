@@ -318,3 +318,17 @@ def test_a_request_written_during_a_run_is_left_for_the_next(tmp_path: Path) -> 
     rs = tmp_path / "release-state"
     assert (rs / "etcd-evict-pending").read_text() == nxt
     assert "id a1b2c3" in (rs / "etcd-evict-pending.done").read_text()
+
+
+def test_a_member_name_must_end_where_its_hex_does(tmp_path: Path) -> None:
+    """#1326 review: the name pattern ended in `$`, which also matches before a
+    trailing newline, so `ddi-1-0123abcd\\n` read as ddi-1's member. Harmless
+    for the names etcd gives, but the match is meant to be the whole name."""
+    mod = _module()
+    assert mod._member_name_re("ddi-1").match("ddi-1-0123abcd")
+    assert not mod._member_name_re("ddi-1").match("ddi-1-0123abcd\n")
+    odd = _m(43, "ddipg-member-3-7d1c4ad1\n", "192.168.122.43")
+    results, _, etcd = _run(tmp_path, [SEED, M1, odd],
+                            _request(("ddipg-member-3", "192.168.122.86")))
+    assert results["ddipg-member-3"] == ("absent", "")
+    assert "removed" not in etcd
