@@ -620,3 +620,50 @@ def phone_options_loadable(rows: Any) -> tuple[dict[str, Any], list[str]]:
             continue
         kept[key] = value
     return kept, dropped
+
+
+# ── option-60 vendor-class match (#1294, #1357) ──────────────────────────────
+
+
+def vendor_class_match_renderable(value: str | None) -> bool:
+    """True when *value* can sit inside Kea's ``=='<match>'`` string literal.
+
+    A phone profile (#1294) and a PXE arch-match (#1357) both render their
+    ``vendor_class_match`` as ``substring(option[60].hex,0,N)=='<match>'``.
+    A ``'`` ends the literal early and Kea's lexer refuses a newline inside
+    one; either rejects the WHOLE config (measured, kea-dhcp4 3.0.3).
+    Control characters have no business in option 60 anyway.
+    """
+    return value is None or ("'" not in value and not contains_control_chars(value))
+
+
+def check_vendor_class_match(value: str | None) -> str | None:
+    """Pydantic validator body for ``vendor_class_match`` on write."""
+    if not vendor_class_match_renderable(value):
+        raise ValueError(
+            f"vendor_class_match {value!r} may not contain ' or control characters — "
+            "it is rendered inside a Kea string literal"
+        )
+    return value
+
+
+def vendor_class_match_test(value: str) -> str:
+    """The Kea ``test`` term matching an option-60 prefix.
+
+    Measured in bytes, not characters: ``option[60].hex`` is the raw
+    option, so a non-ASCII prefix measured in characters never matched.
+    The caller must have checked :func:`vendor_class_match_renderable`.
+
+    A non-ASCII prefix renders as a hex literal, not a quoted string. The
+    agent writes Kea's config with ``json.dumps``' default ASCII escaping,
+    and Kea's JSON lexer reads ``\\u00XX`` as ONE byte and refuses anything
+    above ``\\u00ff`` outright (measured, kea-dhcp4 3.0.3): ``'Vendör'``
+    would compare six bytes against a seven-byte prefix and never match,
+    and ``'V€'`` would reject the group's whole config. ASCII keeps the
+    quoted form so an existing bundle's ETag does not move.
+    """
+    raw = value.encode("utf-8")
+    n = len(raw)
+    if value.isascii():
+        return f"substring(option[60].hex,0,{n})=='{value}'"
+    return f"substring(option[60].hex,0,{n})==0x{raw.hex().upper()}"

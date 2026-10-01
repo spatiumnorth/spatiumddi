@@ -23,7 +23,6 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.dns_names import contains_control_chars
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
@@ -54,7 +53,11 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.option_validation import phone_options_loadable
+from app.services.dhcp.option_validation import (
+    phone_options_loadable,
+    vendor_class_match_renderable,
+    vendor_class_match_test,
+)
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf, resolve_dnssl
 from app.services.e911 import effective_subnet_erls
 from app.services.e911.dhcp_options import kea_option_data
@@ -474,9 +477,10 @@ def _build_pxe_match_expression(
     """
     parts: list[str] = []
     if vendor_class_match:
-        n = len(vendor_class_match)
-        # Kea's `hex` for option 60 is the literal byte string.
-        parts.append(f"substring(option[60].hex,0,{n})=='{vendor_class_match}'")
+        # Bytes, not characters (#1357): Kea's `hex` for option 60 is the
+        # literal byte string. The caller has already dropped a match that
+        # cannot sit inside the literal.
+        parts.append(vendor_class_match_test(vendor_class_match))
     if arch_codes:
         arch_or = " or ".join(f"option[93].hex == 0x{code:04X}" for code in arch_codes)
         if len(arch_codes) > 1:
@@ -528,6 +532,20 @@ async def _assemble_pxe_classes(
             continue
         name = f"pxe-{str(prof.id)[:8]}-{str(m.id)[:8]}"
         if name in seen_names:
+            continue
+        if not vendor_class_match_renderable(m.vendor_class_match):
+            # #1357 — a ``'`` ends Kea's string literal and a control
+            # character is refused inside one; either rejects the WHOLE
+            # config. Refused on write now; a match stored before that is
+            # left out of the render rather than breaking every scope. The
+            # class is dropped, not rendered without its vendor test, which
+            # would widen it to every client of the matching arch.
+            log.warning(
+                "dhcp_pxe_match_skipped_bad_vendor_match",
+                profile=prof.name,
+                profile_id=str(prof.id),
+                match_id=str(m.id),
+            )
             continue
         seen_names.add(name)
         out.append(
@@ -583,7 +601,7 @@ async def _assemble_phone_classes(
             continue
         match_expr = ""
         if prof.vendor_class_match:
-            if "'" in prof.vendor_class_match or contains_control_chars(prof.vendor_class_match):
+            if not vendor_class_match_renderable(prof.vendor_class_match):
                 # #1294 — a ``'`` ends Kea's string literal, and Kea's lexer
                 # refuses a newline inside one; either rejects the whole
                 # config. Refused on write now; a profile stored before that
@@ -596,8 +614,7 @@ async def _assemble_phone_classes(
                 continue
             # Bytes, not characters: ``option[60].hex`` is the raw option, so
             # a non-ASCII prefix measured in characters never matched.
-            n = len(prof.vendor_class_match.encode("utf-8"))
-            match_expr = f"substring(option[60].hex,0,{n})=='{prof.vendor_class_match}'"
+            match_expr = vendor_class_match_test(prof.vendor_class_match)
         # #1294 — keyed by CODE (``phone_option_key``): the catalogue names a
         # profile carries (``polycom-config-url``) are unknown to the agent,
         # which dropped them, so option 160 never reached a phone. And only

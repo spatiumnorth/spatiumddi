@@ -21,20 +21,27 @@ one exception: a **daily anonymous check of GitHub for a newer
 release** (an unauthenticated GET; GitHub sees your IP address and
 nothing about your install). Turn it off under **Settings →
 Application → Updates → Check for GitHub Releases**, or run fully
-air-gapped — every feature works with no internet access at all.
+air-gapped — every feature works with no internet access at all,
+except PowerDNS server groups for now (§3.5).
 Optional features that do reach third parties (Fingerbank device
 profiling, the Operator Copilot's LLM provider, Let's Encrypt,
 blocklist feeds, cloud DNS / integration mirrors, the whois and RBL
 tools) are off until you configure them,
 and the table below lists exactly what each one sends and to whom.
+Choosing **PowerDNS** for a server group adds connections that are
+not yet yours to configure: every PowerDNS server polls PowerDNS's
+security-advisory zone, and resolves the targets of ALIAS records,
+through Cloudflare's and Google's public resolvers, which are
+hardcoded today. That is a defect, not a design choice (§3.5,
+[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)).
 
 There is no telemetry endpoint to opt out of, because there is no
 telemetry endpoint. That is a design constraint, not a current state:
 [CLAUDE.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CLAUDE.md)
 non-negotiable #17 forbids adding one, and a CI test
 (`backend/tests/test_outbound_hosts_documented.py`) fails the build
-when a hostname appears in the backend that is not documented on this
-page.
+when a hostname appears in the backend or the agents that is not
+documented on this page.
 
 ---
 
@@ -78,8 +85,9 @@ product degrades — you simply do not get the "update available" pill.
 
 ## 3. Every outbound connection, in full
 
-This table is normative. A hostname that appears in `backend/app` and
-not here fails CI (see §8).
+This table is normative. A hostname that appears in `backend/app` or
+in an agent package under `agent/` — or a public IP address in an agent
+package — and not here fails CI (see §8).
 
 ### 3.1 Enabled by default
 
@@ -137,10 +145,44 @@ network the way Debian hosts do:
 None of this is SpatiumDDI-specific traffic and none of it carries
 your DDI data.
 
+### 3.5 DNS and DHCP servers SpatiumDDI runs
+
+The connections above are made by the control plane or the appliance
+host. The DNS and DHCP service containers otherwise reach the control
+plane and the addresses you configure on them (forwarders, failover
+peers, DDNS targets) — plus whatever answering your clients' queries
+needs, since they are DNS servers: a recursive BIND9 group with no
+forwarders resolves from the root servers, as any recursive resolver
+does. The upstreams SpatiumDDI picks for you, rather than you or your
+clients, are PowerDNS's. The agent renders `resolver=1.1.1.1,8.8.8.8`
+into every PowerDNS server's `pdns.conf`
+(`agent/dns/spatium_dns_agent/drivers/powerdns.py`). The setting #250
+added on the agent side to change it was never wired to the control
+plane, so **these addresses cannot be changed today**; making them
+configurable is tracked in
+[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353).
+PowerDNS sends two kinds of lookup through them:
+
+| Connection | Feature | Default | What is sent |
+|---|---|---|---|
+| `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53, then PowerDNS's `secpoll.powerdns.com` nameservers | PowerDNS security-status polling, a built-in PowerDNS feature SpatiumDDI does not turn off | **On for every PowerDNS server**, at startup and periodically after that, whether or not it serves any zone | A TXT query for `auth-<version>.security-status.secpoll.powerdns.com`, which tells the resolvers and PowerDNS's nameservers which PowerDNS version you run. Observed on the shipped 5.0.7 image. With no network route to the resolvers at all, that image does not start (`Unable to UDP connect to remote nameserver 1.1.1.1:53: Network unreachable`). |
+| `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53 | ALIAS records on a PowerDNS server group | Only on a PowerDNS group that serves an ALIAS record, when a client queries a name that has one | The **ALIAS target name** (A / AAAA queries for it), from the DNS server's own address, unencrypted. Cloudflare and Google see which names your ALIAS records point at, and when they were looked up. |
+
+To avoid both now, use BIND9 or Technitium rather than PowerDNS.
+Blocking the two addresses at a firewall stops the lookups and makes
+ALIAS answers fail. It is not a full workaround: a host with no route
+to them at all does not start PowerDNS (above), and whether PowerDNS
+starts when the packets are dropped rather than unroutable has not
+been verified.
+
 ## 4. Air-gapped operation
 
-Every feature works with all of the above blocked. That is not a
-claim about the happy path — it is non-negotiable #5 in the project's
+Every feature works with all of the above blocked, with one
+exception today: a PowerDNS server group, which needs a route to
+`1.1.1.1` / `8.8.8.8` to start (§3.5,
+[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)). Use
+BIND9 or Technitium on an air-gapped install. Apart from that, this is
+not a claim about the happy path — it is non-negotiable #5 in the project's
 own build rules: **DNS and DHCP service containers cache their
 last-known-good config locally and keep serving when the control plane
 is unreachable**, and by the same logic nothing in the control plane
@@ -217,35 +259,53 @@ A privacy statement rots the first time somebody adds a convenience
 fetch. Two guards keep this one honest:
 
 * **`backend/tests/test_outbound_hosts_documented.py`** walks
-  `backend/app` for hostname literals and asserts every one of them
-  appears on this page. A new outbound host fails CI until it is
-  documented here, with its default and its payload. Editing this file
-  runs that suite (it is a declared carve-out in
+  `backend/app` and the four shipped agent packages
+  (`agent/{dns,dhcp,looking-glass,supervisor}/spatium_*`) for hostname
+  literals, and the agent packages for public IP addresses in string
+  values, and asserts every one of them appears on this page. A new
+  outbound host fails CI until it is documented here, with its default
+  and its payload. Editing this file or an agent package runs that
+  suite (both are declared carve-outs in
   `.github/scripts/ci-backend-must-run.txt`).
 * **CLAUDE.md non-negotiable #17** — *No telemetry.* Never add an
   outbound connection that is not operator-configured and documented
   here; anything default-on needs an issue and a decision, not a PR.
 
-The guard covers Python source under `backend/app`. Two things it
-cannot see, and which therefore need a human: hostname literals in the
-appliance's **shell** scripts under
+The guard covers Python source under `backend/app` and the agent
+packages; the agents' `tests/` directories are not shipped and are not
+scanned. It looks for IP addresses in the agents only: in the backend
+they are almost all example addresses in tool descriptions, and the
+hardcoded PowerDNS resolvers in §3.5, which this page once missed,
+are IP addresses in agent code, which a hostname scan cannot see.
+Its hostname scan reads hosts out of `http://` and `https://` URLs, so
+a hostname written bare (a resolver name, a `tls://` endpoint) is not
+seen either. The things it cannot see, and which therefore need a
+human: hostname literals in the appliance's **shell** scripts under
 `appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
-§3.4.1's rows were written by hand and the next `curl` added to the
-installer will pass CI with nothing to catch it; hosts assembled at
-runtime from operator input (which is the point — those are *your*
-endpoints); and the feed catalogues in `backend/app/data/`, whose
-entries are all opt-in downloads covered by the blocklist row above.
+§3.4's rows were written by hand and the next `curl` added to the
+installer will pass CI with nothing to catch it; the same for the
+agent images' entrypoints and config files under `agent/*/images/`;
+connections a bundled daemon (BIND9, PowerDNS, dnsdist, Technitium,
+Kea, GoBGP) makes on its own built-in defaults, which appear in no
+SpatiumDDI source at all; hosts assembled at runtime from operator
+input (which is the point — those are *your* endpoints); public IP
+addresses in the backend; and the feed catalogues in
+`backend/app/data/`, whose entries are all opt-in downloads covered by
+the blocklist row above.
 
 If you find a connection this page does not describe, that is a bug —
 please [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Appendix — hostnames in the source that are not connections
 
-The guard in §8 matches text, so these appear in `backend/app` and are
-listed here to keep the check honest. **None of them is contacted.**
+The guard in §8 matches text, so these appear in `backend/app` or an
+agent package and are listed here to keep the check honest. **None of
+them is contacted.**
 
 **Documentation and homepage links** (shown in the UI or written in a
-comment, never fetched): `www.spatiumddi.com` (the ACME
+comment, never fetched): `github.com` (issue links in agent docstrings —
+the installer's SSH-key fetch in §3.4 is a separate use),
+`www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
