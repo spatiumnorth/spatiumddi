@@ -263,6 +263,33 @@ the formatter handles the rest.
   order Postgres returned the assignments in, so the winner and the
   ETag could change between two builds of an unchanged group.
 
+- **Deleting a large zone, and opening the Trash, no longer scale with
+  the zone (#1231).** The default zone delete loaded every record,
+  stamped each through the ORM and wrote one audit row per record, all
+  in one transaction and computing each audit hash under the global
+  audit lock, so it blocked every other audited change for its
+  duration. A zone's records are now stamped by one `UPDATE`, and the
+  zone's own audit row records how many it took with it
+  (`old_value.cascaded`). A record already in the trash keeps its own
+  deletion and comes back with that one, not with the zone. The Trash
+  page loaded every soft-deleted row of every type into Python on
+  each view, plus a count per batch per type; it now filters, counts
+  and pages in SQL, and counts batch sizes for the shown rows only.
+  The search stays a literal substring match.
+
+- **Cluster health no longer counts a joining database replica as a
+  ready instance (#1213).** The workload rollup on
+  `GET /appliance/cluster/health` skipped only finished Job pods, so
+  while CNPG bootstrapped a replica its running `postgresql-N-join` pod
+  counted as a third ready database pod: the Cluster Overview read
+  3/3 healthy while CNPG reported two instances, "Creating a new
+  replica". Job pods no longer count toward a workload's ready or
+  total, and a workload with a Job still running reads `degraded`
+  rather than `healthy` until it finishes, with the count of running
+  Job pods on the row (`jobs_running`, shown as "+1 job") so a
+  degraded 2/2 says why. The rolling upgrade was
+  never affected: its safety check reads CNPG's own `readyInstances`.
+
 - **PowerDNS servers no longer report their version to
   secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
   `secpoll.powerdns.com` at startup and periodically, naming the

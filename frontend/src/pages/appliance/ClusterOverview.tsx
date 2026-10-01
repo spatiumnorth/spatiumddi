@@ -1092,6 +1092,14 @@ export function WorkloadHealth({
                     {w.restarts}
                   </span>
                 )}
+                {w.jobs_running > 0 && (
+                  <span
+                    className="text-amber-600 dark:text-amber-400"
+                    title={`${w.jobs_running} job${w.jobs_running === 1 ? "" : "s"} still running (e.g. a database replica joining) — not counted in ready / total`}
+                  >
+                    +{w.jobs_running} job{w.jobs_running === 1 ? "" : "s"}
+                  </span>
+                )}
                 <span className="tabular-nums text-foreground">
                   {w.ready}/{w.total}
                 </span>

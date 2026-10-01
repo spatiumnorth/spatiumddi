@@ -157,6 +157,7 @@ from app.services.dns_io import (
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
+    add_to_batch,
     apply_soft_delete,
     collect_soft_delete_batch,
 )
@@ -6091,8 +6092,9 @@ async def delete_zone(
 ) -> Any:
     """Delete a DNS zone.
 
-    Default behavior is soft-delete: the zone + every record in it gets
-    stamped with the same ``deletion_batch_id``. Records cascade alongside
+    Default behavior is soft-delete: the zone + every live record in it gets
+    stamped with the same ``deletion_batch_id`` (a record already in the
+    trash keeps its own batch). Records cascade alongside
     the zone, so a single restore brings them all back atomically. The
     Windows write-through (``apply_zone_change(..., "delete")``) is
     deliberately skipped on the soft-delete path — the zone hasn't actually
@@ -6827,7 +6829,7 @@ async def delete_record(
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
-        apply_soft_delete(batch, current_user.id)
+        await apply_soft_delete(db, batch, current_user.id)
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -6838,7 +6840,7 @@ async def delete_record(
                     resource_type=row.resource_type,
                     resource_id=str(row.obj.id),
                     resource_display=row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    old_value=batch.audit_old_value(row),
                     result="success",
                 )
             )
@@ -7059,12 +7061,12 @@ async def bulk_delete_records(
         return BulkDeleteRecordsResponse(deleted=len(dispatched), skipped=skipped)
 
     # One batch id across the whole selection. ``collect_soft_delete_batch``
-    # mints a fresh id per root, so collect each record's cascade set and
-    # re-home the rows under a single batch before stamping.
+    # mints a fresh id per root, so append each record's cascade set to a
+    # single batch instead.
     batch = SoftDeleteBatch(batch_id=uuid.uuid4())
     for rec in dispatched:
-        batch.rows.extend((await collect_soft_delete_batch(db, rec)).rows)
-    apply_soft_delete(batch, current_user.id)
+        await add_to_batch(db, batch, rec)
+    await apply_soft_delete(db, batch, current_user.id)
     for row in batch.rows:
         db.add(
             AuditLog(
@@ -7075,7 +7077,7 @@ async def bulk_delete_records(
                 resource_type=row.resource_type,
                 resource_id=str(row.obj.id),
                 resource_display=row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
+                old_value=batch.audit_old_value(row),
                 result="success",
             )
         )
