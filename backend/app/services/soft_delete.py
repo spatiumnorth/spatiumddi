@@ -153,7 +153,7 @@ def _row_display(obj: Any) -> str:
     if isinstance(obj, DNSZone):
         return obj.name
     if isinstance(obj, DNSRecord):
-        return f"{obj.fqdn} {obj.record_type}"
+        return _record_label(obj.fqdn, obj.record_type)
     if isinstance(obj, DHCPScope):
         return obj.name or str(obj.id)
     if isinstance(obj, DHCPPool):
@@ -374,41 +374,52 @@ class RestoreResult:
         return value
 
 
-async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.UUID, str]:
-    """The batch's records that a live record already duplicates, in one query.
+def _record_label(fqdn: str, record_type: str) -> str:
+    return f"{fqdn} {record_type}"
 
-    The set-based form of ``default_conflict_check``'s record rule (#1389):
-    a per-record ``SELECT`` made restoring a 250k-record zone 250k queries.
-    Identity is the zone, name, type and value, plus the view and the
-    structured fields: under split-horizon the same record in two views is two
-    records, and an MX or SRV with the same target at another priority, weight
-    or port is another record, not a clash. That matches the identity bulk
-    record create dedupes on (#1230). Returns ``{record id: label}``.
+
+def _live_duplicate_exists() -> Any:
+    """``EXISTS`` a live record with the same identity as the ``DNSRecord`` row.
+
+    The set-based form of the record conflict rule (#1389): a per-record
+    ``SELECT`` made restoring a 250k-record zone 250k queries. Identity is the
+    zone, name, type and value, plus the view and the structured fields: under
+    split-horizon the same record in two views is two records, and an MX or SRV
+    with the same target at another priority, weight or port is another record,
+    not a clash. That matches the identity bulk record create dedupes on
+    (#1230).
     """
     live = aliased(DNSRecord)
+    return (
+        select(live.id)
+        .where(
+            live.deleted_at.is_(None),
+            live.zone_id == DNSRecord.zone_id,
+            live.name == DNSRecord.name,
+            live.record_type == DNSRecord.record_type,
+            live.value == DNSRecord.value,
+            live.view_id.is_not_distinct_from(DNSRecord.view_id),
+            live.priority.is_not_distinct_from(DNSRecord.priority),
+            live.weight.is_not_distinct_from(DNSRecord.weight),
+            live.port.is_not_distinct_from(DNSRecord.port),
+            live.id != DNSRecord.id,
+        )
+        .exists()
+    )
+
+
+async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.UUID, str]:
+    """The batch's records a live record already duplicates, in one query.
+
+    Returns ``{record id: label}``.
+    """
     stmt: Any = (
         select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type)
-        .where(
-            DNSRecord.deletion_batch_id == batch_id,
-            select(live.id)
-            .where(
-                live.deleted_at.is_(None),
-                live.zone_id == DNSRecord.zone_id,
-                live.name == DNSRecord.name,
-                live.record_type == DNSRecord.record_type,
-                live.value == DNSRecord.value,
-                live.view_id.is_not_distinct_from(DNSRecord.view_id),
-                live.priority.is_not_distinct_from(DNSRecord.priority),
-                live.weight.is_not_distinct_from(DNSRecord.weight),
-                live.port.is_not_distinct_from(DNSRecord.port),
-                live.id != DNSRecord.id,
-            )
-            .exists(),
-        )
+        .where(DNSRecord.deletion_batch_id == batch_id, _live_duplicate_exists())
         .execution_options(include_deleted=True)
     )
     return {
-        row_id: f"{fqdn} {record_type}"
+        row_id: _record_label(fqdn, record_type)
         for row_id, fqdn, record_type in (await db.execute(stmt)).tuples()
     }
 
@@ -495,15 +506,21 @@ async def restore_batch(
 
     for zone_id in zone_ids:
         where = [DNSRecord.zone_id == zone_id, DNSRecord.deletion_batch_id == batch_id]
-        if record_conflicts:
-            where.append(DNSRecord.id.not_in(list(record_conflicts)))
         # "evaluate" walks only the identity map, so a record already loaded
         # in this session does not keep reading as trashed after the UPDATE.
+        sync = "evaluate"
+        if record_conflicts:
+            # Only with skip_conflicts. The duplicates are excluded by the same
+            # predicate that found them, not by a list of ids, which on a large
+            # zone would exceed the driver's bind-parameter limit. Python cannot
+            # evaluate a correlated EXISTS, hence "fetch".
+            where.append(~_live_duplicate_exists())
+            sync = "fetch"
         updated = await db.execute(
             update(DNSRecord)
             .where(*where)
             .values(deleted_at=None, deleted_by_user_id=None, deletion_batch_id=None)
-            .execution_options(synchronize_session="evaluate")
+            .execution_options(synchronize_session=sync)
         )
         # Same guard as the delete side: a driver that cannot report a count
         # answers -1, which must not be added to the total.

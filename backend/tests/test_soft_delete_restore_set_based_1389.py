@@ -22,6 +22,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServerGroup, DNSView, DNSZone
+from app.services.soft_delete import restore_batch
 
 
 async def _admin(db: AsyncSession) -> dict[str, str]:
@@ -278,3 +279,44 @@ async def test_a_record_trashed_before_the_zone_stays_in_the_trash(
     rows = {r.id: r for r in await _records(db_session, zone_id)}
     assert rows[second_id].deleted_at is None
     assert rows[first_id].deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_skip_conflicts_leaves_only_the_duplicate_in_a_zone_batch(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The route refuses ``skip_conflicts`` on a zone batch, but the service
+    supports it: the duplicate stays in the trash and the rest come back."""
+    headers = await _admin(db_session)
+    group_id, zone_id = await _zone_with_records(db_session, 3)
+    await db_session.commit()
+    await _trash_zone(client, headers, group_id, zone_id)
+
+    records = await _records(db_session, zone_id)
+    dup = next(r for r in records if r.name == "h1")
+    dup_id, batch_id = dup.id, dup.deletion_batch_id
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name=dup.name,
+            fqdn=dup.fqdn,
+            record_type=dup.record_type,
+            value=dup.value,
+        )
+    )
+    await db_session.commit()
+
+    async def _no_clash(_obj: object) -> None:
+        return None
+
+    result = await restore_batch(
+        db_session, batch_id, conflict_check=_no_clash, skip_conflicts=True
+    )
+    await db_session.commit()
+    assert [c["id"] for c in result.conflicts] == [str(dup_id)]
+    assert result.bulk == {zone_id: {"dns_record": 2}}
+
+    db_session.expire_all()
+    rows = {r.id: r for r in await _records(db_session, zone_id)}
+    trashed = [rid for rid, r in rows.items() if r.deleted_at is not None]
+    assert trashed == [dup_id]
