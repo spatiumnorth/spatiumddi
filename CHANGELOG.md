@@ -291,6 +291,29 @@ the formatter handles the rest.
   LUKS: the appliance refuses a `crypto_LUKS` disk, having no
   `cryptsetup` to unlock it.
 
+- **A backup taken on an older release restores again (#1363).** A
+  full restore replayed the archive with `pg_restore --clean`, which
+  drops only the objects the archive contains. Every table a later
+  migration had added survived the replay, with its constraints. An
+  archive older than `dns_agent_bundle` (every 2026.09.04-1 archive)
+  therefore failed with a 400: `--clean` could not drop
+  `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on
+  it. A surviving table with no such dependency let the replay through
+  and stopped the post-restore upgrade on "already exists" instead. A
+  full restore now clears the schema and replays the archive in one
+  transaction: every table, view, sequence, standalone type and routine
+  in `public` is dropped (extension members are kept), then the
+  archive's SQL is applied by `psql --single-transaction`. For a
+  custom-format archive that SQL is streamed from `pg_restore`, not
+  staged on disk. If `pg_restore` fails part way, psql is killed before
+  it reaches end of input, so it never commits. Any failure leaves the
+  database as it was. Backups dump the whole database, so clearing loses
+  nothing the archive does not recreate. An error now leads with
+  PostgreSQL's `ERROR` line instead of notices. Also documented: the
+  command for the manual `alembic upgrade head` a `failed` restore asks
+  for, on Compose, the appliance and Helm (`SYSTEM_ADMIN.md` §2.9).
+  Found by amoona6's gate walk of #1349.
+
 - **A restore no longer stamps a half-migrated schema as current
   (#1233).** When `alembic upgrade head` failed after a restore with
   "already exists", from any revision, the restore ran `alembic stamp
