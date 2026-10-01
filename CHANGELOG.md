@@ -516,6 +516,22 @@ the formatter handles the rest.
   report (`GET /diagnostics/name-conformance`) now lists them, and
   deleting or renaming one lets the server apply again.
 
+- **A CNAME can no longer be saved beside other data at its name
+  (#1381).** `www A` then `www CNAME` were both saved. A name that holds
+  a CNAME holds nothing else (RFC 1034 §3.6.2, RFC 2181 §10.1), so
+  PowerDNS refused the agent's zone patch ("Conflicts with
+  pre-existing RRset") and BIND's zone check refuses "CNAME and other
+  data", which quarantines the server's whole config bundle (#1378).
+  Create, update, bulk create and the Copilot now refuse a CNAME at a
+  name that holds any record, a second CNAME, and any record at a name
+  that holds a CNAME, with a 409 naming the record in the way; a CNAME
+  at the zone apex, which always holds the SOA and NS, is a 422. Views
+  count: a record with no view meets every view, so a split-horizon
+  CNAME in one view beside an address in another stays legal. Bulk
+  create skips a clashing record and says why, as it does for a
+  duplicate. Records IPAM generates count as data at their name, so a
+  CNAME is refused where one exists.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:

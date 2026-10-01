@@ -1978,6 +1978,12 @@ async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> PreviewResult:
     from app.models.dns import DNSRecord, DNSZone  # local import — avoid cycle
+    from app.services.dns.cname_conflict import (
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2016,6 +2022,12 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
+    # #1381 — nor a CNAME beside other data; apply refuses it too.
+    if rtype == "CNAME" and is_apex(name):
+        return PreviewResult(ok=False, detail=APEX_CNAME_DETAIL)
+    clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
+    if clash is not None:
+        return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
 
     # Surface a heads-up if a row with the same (zone, name, type, value)
     # already exists; preview doesn't reject — operator may want a parallel
@@ -2054,6 +2066,12 @@ async def _apply_create_dns_record(
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
+    from app.services.dns.cname_conflict import (
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
     from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
@@ -2100,6 +2118,12 @@ async def _apply_create_dns_record(
     )
     if existing is not None:
         raise ValueError(describe_identical(existing))
+    # #1381 — a CNAME stands alone at its name, as on the REST path.
+    if rtype == "CNAME" and is_apex(name):
+        raise ValueError(APEX_CNAME_DETAIL)
+    clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
+    if clash is not None:
+        raise ValueError(describe_cname_conflict(rtype, fqdn, clash))
 
     row = DNSRecord(
         zone_id=zone.id,
