@@ -275,7 +275,9 @@ async def test_a_failed_op_raises_the_alert_for_24_hours(db_session: AsyncSessio
     assert len(matches) == 1
     subject, _display, message, _sev = matches[0]
     assert subject == f"dns_server:{server.id}"
-    assert "REFUSED" in message and zone.name in message
+    assert "REFUSED" in message and zone.name.rstrip(".") in message
+    # The zone is an FQDN; the sentence must not end "example.." (#1298 review).
+    assert ".." not in message
 
     later = now + timedelta(hours=25)
     assert await alerts._matching_dns_record_op_failed_subjects(db_session, None, later) == []  # type: ignore[arg-type]

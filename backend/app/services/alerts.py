@@ -3560,16 +3560,19 @@ async def _matching_dns_record_op_failed_subjects(
         server_name = ops[0][1]
         latest = ops[0][0]
         record = latest.record or {}
-        zones = sorted({op.zone_name for op, _ in ops})
+        # Zone names are stored as FQDNs; drop the root dot so the sentence
+        # does not end "example.com.." (#1298 review).
+        zones = sorted({op.zone_name.rstrip(".") for op, _ in ops})
         zone_list = ", ".join(zones[:5]) + (f" and {len(zones) - 5} more" if len(zones) > 5 else "")
         message = (
             f"DNS server '{server_name}' could not apply {len(ops)} record change(s) in the "
             f"last 24 h after every retry, in zone(s) {zone_list}. The records are in "
-            "SpatiumDDI but not on this server, which answers with the old data until a "
-            "full config render or an agent restart. Most recent: "
+            "SpatiumDDI but not on this server, which keeps answering with the old data. "
+            "A full config render or an agent restart sends them again, but a change the "
+            "server itself refused fails again until the record is corrected. Most recent: "
             f"{latest.op} {record.get('name', '?')} {record.get('type', '?')} in "
-            f"{latest.zone_name} — {latest.last_error or 'no error text'}. See the server's "
-            "Sync tab for every failed op."
+            f"{latest.zone_name.rstrip('.')}: {latest.last_error or 'no error text'}. See "
+            "the server's Sync tab for every failed op."
         )
         matches.append((f"dns_server:{server_id}", f"{server_name} (DNS)", message, None))
     return matches
@@ -5070,7 +5073,9 @@ async def seed_dns_record_op_failed_alert_rule() -> None:
                     "Fires when a DNS agent could not apply a record change after "
                     "every retry (about 45 minutes of backed-off attempts). The record "
                     "is saved in SpatiumDDI but the server keeps answering with the "
-                    "old data until a full config render or an agent restart. "
+                    "old data. A full config render or an agent restart sends it "
+                    "again; a change the server itself refused needs the record "
+                    "corrected first. "
                     "Auto-resolves 24 h after the last failure."
                 ),
                 rule_type=RULE_TYPE_DNS_RECORD_OP_FAILED,
