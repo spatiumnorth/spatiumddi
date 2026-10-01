@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
@@ -93,9 +93,53 @@ class SoftDeleteRow:
 
 
 @dataclass
+class BulkChild:
+    """Children stamped by one set-based UPDATE instead of being loaded (#1231).
+
+    A zone's records. Loading each one, stamping it through the ORM and
+    writing one audit row per record made the default zone delete a single
+    transaction proportional to the zone, holding the global audit lock for
+    every hash: on a 250k-record zone, minutes. The records are stamped with
+    one statement instead, and counted on the parent's own audit row.
+    """
+
+    parent: Any
+    model: type
+    fk_column: str
+    resource_type: str
+    count: int
+
+
+@dataclass
 class SoftDeleteBatch:
     batch_id: uuid.UUID
     rows: list[SoftDeleteRow] = field(default_factory=list)
+    bulk: list[BulkChild] = field(default_factory=list)
+
+    def counts(self) -> dict[str, int]:
+        """Rows per resource type, set-based children included."""
+        out: dict[str, int] = {}
+        for row in self.rows:
+            out[row.resource_type] = out.get(row.resource_type, 0) + 1
+        for child in self.bulk:
+            out[child.resource_type] = out.get(child.resource_type, 0) + child.count
+        return out
+
+    def audit_old_value(self, row: SoftDeleteRow) -> dict[str, Any]:
+        """The ``old_value`` for ``row``'s soft-delete audit entry.
+
+        A parent whose children were stamped set-based carries their count,
+        since they get no audit row of their own (#1231).
+        """
+        value: dict[str, Any] = {"deletion_batch_id": str(self.batch_id)}
+        cascaded = {
+            child.resource_type: child.count
+            for child in self.bulk
+            if child.parent is row.obj and child.count
+        }
+        if cascaded:
+            value["cascaded"] = cascaded
+        return value
 
 
 def _row_display(obj: Any) -> str:
@@ -187,25 +231,38 @@ async def _collect_descendants(db: AsyncSession, root: Any) -> list[Any]:
             select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == root.id)
         )
         out.extend(static_res.scalars().all())
-    elif isinstance(root, DNSZone):
-        rec_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == root.id))
-        for record in rec_res.scalars().all():
-            out.append(record)
+    # A DNSZone's records are not loaded here: they are stamped set-based by
+    # ``apply_soft_delete`` (see ``BulkChild`` and ``_attach_bulk``).
     return out
+
+
+async def _attach_bulk(db: AsyncSession, batch: SoftDeleteBatch, objs: list[Any]) -> None:
+    """Register the set-based children of every zone among ``objs`` (#1231)."""
+    for obj in objs:
+        if isinstance(obj, DNSZone):
+            count = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(DNSRecord)
+                    .where(DNSRecord.zone_id == obj.id, DNSRecord.deleted_at.is_(None))
+                )
+            ).scalar_one()
+            batch.bulk.append(
+                BulkChild(
+                    parent=obj,
+                    model=DNSRecord,
+                    fk_column="zone_id",
+                    resource_type="dns_record",
+                    count=int(count or 0),
+                )
+            )
 
 
 async def collect_soft_delete_batch(db: AsyncSession, root: Any) -> SoftDeleteBatch:
     """Build a fresh batch covering ``root`` + every cascade descendant."""
 
     batch = SoftDeleteBatch(batch_id=uuid.uuid4())
-    descendants = await _collect_descendants(db, root)
-    for obj in descendants:
-        batch.rows.append(
-            SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
-        )
-    batch.rows.append(
-        SoftDeleteRow(obj=root, resource_type=_resource_type(root), display=_row_display(root))
-    )
+    await add_to_batch(db, batch, root)
     return batch
 
 
@@ -217,23 +274,41 @@ async def add_to_batch(db: AsyncSession, batch: SoftDeleteBatch, root: Any) -> N
     shows one deletion and one restore brings both back, records included.
     """
 
-    for obj in await _collect_descendants(db, root):
+    objs = [*await _collect_descendants(db, root), root]
+    for obj in objs:
         batch.rows.append(
             SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
         )
-    batch.rows.append(
-        SoftDeleteRow(obj=root, resource_type=_resource_type(root), display=_row_display(root))
-    )
+    await _attach_bulk(db, batch, objs)
 
 
-def apply_soft_delete(batch: SoftDeleteBatch, user_id: uuid.UUID | None) -> datetime:
-    """Stamp every row in the batch. Caller is responsible for the audit log + commit."""
+async def apply_soft_delete(
+    db: AsyncSession, batch: SoftDeleteBatch, user_id: uuid.UUID | None
+) -> datetime:
+    """Stamp every row in the batch. Caller is responsible for the audit log + commit.
+
+    Set-based children are stamped with one UPDATE per parent. Only rows
+    still live are touched, so a record trashed earlier keeps its own batch
+    and comes back with that one, not this.
+    """
 
     now = datetime.now(UTC)
     for row in batch.rows:
         row.obj.deleted_at = now
         row.obj.deleted_by_user_id = user_id
         row.obj.deletion_batch_id = batch.batch_id
+    for child in batch.bulk:
+        fk = getattr(child.model, child.fk_column)
+        await db.execute(
+            update(child.model)
+            .where(fk == child.parent.id, child.model.deleted_at.is_(None))
+            .values(
+                deleted_at=now,
+                deleted_by_user_id=user_id,
+                deletion_batch_id=batch.batch_id,
+            )
+            .execution_options(synchronize_session=False)
+        )
     return now
 
 

@@ -6827,7 +6827,7 @@ async def delete_record(
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
-        apply_soft_delete(batch, current_user.id)
+        await apply_soft_delete(db, batch, current_user.id)
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -6838,7 +6838,7 @@ async def delete_record(
                     resource_type=row.resource_type,
                     resource_id=str(row.obj.id),
                     resource_display=row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    old_value=batch.audit_old_value(row),
                     result="success",
                 )
             )
@@ -7063,8 +7063,10 @@ async def bulk_delete_records(
     # re-home the rows under a single batch before stamping.
     batch = SoftDeleteBatch(batch_id=uuid.uuid4())
     for rec in dispatched:
-        batch.rows.extend((await collect_soft_delete_batch(db, rec)).rows)
-    apply_soft_delete(batch, current_user.id)
+        one = await collect_soft_delete_batch(db, rec)
+        batch.rows.extend(one.rows)
+        batch.bulk.extend(one.bulk)
+    await apply_soft_delete(db, batch, current_user.id)
     for row in batch.rows:
         db.add(
             AuditLog(
@@ -7075,7 +7077,7 @@ async def bulk_delete_records(
                 resource_type=row.resource_type,
                 resource_id=str(row.obj.id),
                 resource_display=row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
+                old_value=batch.audit_old_value(row),
                 result="success",
             )
         )

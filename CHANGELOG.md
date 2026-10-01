@@ -248,6 +248,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a large zone, and opening the Trash, no longer scale with
+  the zone (#1231).** The default zone delete loaded every record,
+  stamped each through the ORM and wrote one audit row per record, all
+  in one transaction and computing each audit hash under the global
+  audit lock, so it blocked every other audited change for its
+  duration. A zone's records are now stamped by one `UPDATE`, and the
+  zone's own audit row records how many it took with it
+  (`old_value.cascaded`). A record already in the trash keeps its own
+  deletion and comes back with that one, not with the zone. The Trash
+  page loaded every soft-deleted row of every type into Python on
+  each view, plus a count per batch per type; it now filters, counts
+  and pages in SQL, and counts batch sizes for the shown rows only.
+  The search stays a literal substring match.
+
 - **Unattended upgrades no longer install kernels on the appliance
   (#1249).** `mkosi.conf` said "No kernel upgrades" while the
   unattended-upgrades drop-in allowed security-pocket kernels, and
