@@ -104,6 +104,7 @@ from app.services.dns.named_conf_validation import (
     validate_view_name,
     validate_zone_forwarders,
 )
+from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -7849,6 +7850,25 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                 f"record with a CNAME (off-apex) / explicit A+AAAA pair."
             ),
         )
+    if record_type.upper() == "ALIAS":
+        # PowerDNS expands an ALIAS through the group's own plain-DNS
+        # forwarders and nothing else (#1353); without them the record would
+        # be stored and answer nothing.
+        opts = (
+            await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+        ).scalar_one_or_none()
+        if not alias_resolver(
+            getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "ALIAS records are resolved through the group's forwarders, and this "
+                    "group has none over plain DNS (port 53). Set forwarders under the "
+                    "group's server options first; SpatiumDDI no longer falls back to "
+                    "public resolvers."
+                ),
+            )
 
 
 async def _require_record(

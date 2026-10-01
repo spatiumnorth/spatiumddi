@@ -56,6 +56,25 @@ _PDNS_API_BASE = "http://127.0.0.1:8081/api/v1/servers/localhost"
 _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
 
+# ``resolver=`` takes ``ip``, ``ip:port`` or ``[v6]:port``, comma-separated.
+_ALIAS_RESOLVER_RE = re.compile(r"^[0-9A-Fa-f.:\[\],]*$")
+
+
+def _safe_alias_resolver(value: Any) -> str:
+    """The ALIAS resolver list to write into pdns.conf, or "" for ALIAS off.
+
+    The control plane builds the list from validated forwarders (#1353), but
+    it lands in pdns.conf, where a newline would start a new directive, so it
+    is checked again here. Anything that is not an address list turns ALIAS
+    off rather than reaching the file.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    if not _ALIAS_RESOLVER_RE.match(value.strip()):
+        log.warning("powerdns_alias_resolver_refused", value=value[:200])
+        return ""
+    return value.strip()
+
 
 def _quote_txt(value: str) -> str:
     """RFC 1035 TXT quoting — chunk into ≤255-byte strings."""
@@ -328,14 +347,13 @@ class PowerDNSDriver(DriverBase):
         if query_log_enabled and log_level < 6:
             log_level = 6
 
-        # Issue #250 — operator-overridable ALIAS resolver. Defaults
-        # to 1.1.1.1 + 8.8.8.8 for labs (matches pre-#250 behaviour),
-        # but air-gapped or split-horizon deployments can set
-        # ``options.alias_resolver`` to a private resolver list (or
-        # to an empty string to suppress the ALIAS feature entirely).
-        alias_resolver = opts.get("alias_resolver")
-        if alias_resolver is None:
-            alias_resolver = "1.1.1.1,8.8.8.8"
+        # The ALIAS resolver is the group's own plain-DNS forwarders,
+        # computed by the control plane (#1353); "" turns ALIAS expansion
+        # off. There is no built-in fallback: the old ``1.1.1.1,8.8.8.8``
+        # default sent every ALIAS target to Cloudflare and Google, an
+        # outbound connection nobody configured. The value is written into
+        # pdns.conf, so anything but an address list is refused here too.
+        alias_resolver = _safe_alias_resolver(opts.get("alias_resolver"))
         conf_path = new_dir / "pdns.conf"
         # 0600, not write_text: this file embeds ``api-key=`` in cleartext,
         # and that key grants zone CRUD + DNSSEC over the pdns REST API
@@ -1205,7 +1223,7 @@ class PowerDNSDriver(DriverBase):
         api_key: str,
         log_level: int,
         query_log_enabled: bool = False,
-        alias_resolver: str = "1.1.1.1,8.8.8.8",
+        alias_resolver: str = "",
     ) -> str:
         # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
         # Agent and control plane render the same shape; the agent
@@ -1248,7 +1266,7 @@ class PowerDNSDriver(DriverBase):
                 # PowerDNS polls a TXT record under secpoll.powerdns.com at
                 # startup and periodically to learn whether its version has
                 # a security advisory. That query leaves through ``resolver=``
-                # (the hardcoded public resolvers below) or the system
+                # (once hardcoded public resolvers, see below) or the system
                 # resolver, naming the version; it is an outbound connection
                 # nobody configured (non-negotiable #17). An empty suffix
                 # turns it off (#1353). PowerDNS fixes arrive with
@@ -1258,11 +1276,8 @@ class PowerDNSDriver(DriverBase):
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
-                # the configured resolver. #250 made the list overridable
-                # via ``options.alias_resolver`` (empty string disables
-                # ALIAS entirely), but the control plane never sends that
-                # option, so every server gets the 1.1.1.1 / 8.8.8.8
-                # default today — wiring it up is tracked in #1353.
+                # the configured resolver: the group's forwarders, or none
+                # and ALIAS off (#1353).
                 *(
                     ["expand-alias=yes", f"resolver={alias_resolver}"]
                     if alias_resolver.strip()

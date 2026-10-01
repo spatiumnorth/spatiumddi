@@ -21,19 +21,12 @@ one exception: a **daily anonymous check of GitHub for a newer
 release** (an unauthenticated GET; GitHub sees your IP address and
 nothing about your install). Turn it off under **Settings →
 Application → Updates → Check for GitHub Releases**, or run fully
-air-gapped — every feature works with no internet access at all,
-except PowerDNS server groups for now (§3.5).
+air-gapped — every feature works with no internet access at all.
 Optional features that do reach third parties (Fingerbank device
 profiling, the Operator Copilot's LLM provider, Let's Encrypt,
 blocklist feeds, cloud DNS / integration mirrors, the whois and RBL
 tools) are off until you configure them,
 and the table below lists exactly what each one sends and to whom.
-Choosing **PowerDNS** for a server group adds a connection that is
-not yet yours to configure: ALIAS records resolve their targets
-through Cloudflare's and Google's public resolvers, which are
-hardcoded today. That is a defect, not a design choice (§3.5,
-[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)).
-
 There is no telemetry endpoint to opt out of, because there is no
 telemetry endpoint. That is a design constraint, not a current state:
 [CLAUDE.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CLAUDE.md)
@@ -52,7 +45,7 @@ documented on this page.
 | Crash / error reporting | None. Errors go to your structured logs and the in-app diagnostics table. No Sentry, no Bugsnag, no third-party error sink. |
 | Accounts / registration / licensing | None. SpatiumDDI has no account system of its own, no activation, no entitlement check, and no trial timer. Apache 2.0, run it. |
 | Your DDI data | Never leaves your PostgreSQL unless you configure something that sends it (an integration to your own controller, a backup target you own, an alert webhook you point somewhere). |
-| Web UI tracking | The frontend loads no external script, font, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. |
+| Web UI tracking | The frontend loads no external script, font, image, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. (Until #1353 the MFA enrolment screen fetched its QR code from `api.qrserver.com`, sending the TOTP secret with it; see §8.) |
 | Docs site tracking | `www.spatiumddi.com` is a static Jekyll site with no analytics tag, no tracker pixel, and no third-party font or CDN include. |
 
 ## 2. The one connection that is on by default
@@ -152,26 +145,19 @@ plane and the addresses you configure on them (forwarders, failover
 peers, DDNS targets) — plus whatever answering your clients' queries
 needs, since they are DNS servers: a recursive BIND9 group with no
 forwarders resolves from the root servers, as any recursive resolver
-does. The upstreams SpatiumDDI picks for you, rather than you or your
-clients, are PowerDNS's. The agent renders `resolver=1.1.1.1,8.8.8.8`
-into every PowerDNS server's `pdns.conf`
-(`agent/dns/spatium_dns_agent/drivers/powerdns.py`). The setting #250
-added on the agent side to change it was never wired to the control
-plane, so **these addresses cannot be changed today**; making them
-configurable is tracked in
-[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353).
-PowerDNS sends one kind of lookup through them:
+does. SpatiumDDI picks no upstream for them.
 
-| Connection | Feature | Default | What is sent |
-|---|---|---|---|
-| `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53 | ALIAS records on a PowerDNS server group | Only on a PowerDNS group that serves an ALIAS record, when a client queries a name that has one | The **ALIAS target name** (A / AAAA queries for it), from the DNS server's own address, unencrypted. Cloudflare and Google see which names your ALIAS records point at, and when they were looked up. |
-
-Even with no ALIAS record, the `resolver=` line is there, and PowerDNS
-connects to it when it starts: on a host with **no network route** to
-those addresses the shipped 5.0.7 image does not start
-(`Unable to UDP connect to remote nameserver 1.1.1.1:53: Network
-unreachable`). Whether it starts when a firewall drops the packets,
-rather than having no route, has not been verified.
+**PowerDNS ALIAS records** resolve their targets at query time through
+the group's own forwarders, over plain DNS (port 53): the list you set
+under the group's server options, which a PowerDNS group otherwise does
+not use. With no forwarders, or with forwarders over TLS, HTTPS or QUIC
+(which PowerDNS's `resolver=` cannot speak, and which SpatiumDDI will not
+downgrade to plaintext), ALIAS expansion is off and the API refuses a new
+ALIAS record. Builds before #1353 rendered `resolver=1.1.1.1,8.8.8.8`
+into every PowerDNS server instead, sending ALIAS targets to Cloudflare
+and Google; an upgrade replaces it. A PowerDNS group that already serves
+ALIAS records and has no forwarders stops expanding them (A and AAAA
+queries for those names get no answer) until you set forwarders.
 
 PowerDNS's own **security-status polling** (a TXT query for
 `auth-<version>.security-status.secpoll.powerdns.com`, which names the
@@ -185,18 +171,11 @@ feature, also on by default, querying
 container's system resolver; its entrypoint now writes an empty
 `setSecurityPollSuffix("")`, which turns it off from the next restart.
 
-To avoid the ALIAS lookups now, use BIND9 or Technitium rather than
-PowerDNS, or block the two addresses at your firewall, which makes
-ALIAS answers fail.
-
 ## 4. Air-gapped operation
 
-Every feature works with all of the above blocked, with one
-exception today: a PowerDNS server group, which needs a route to
-`1.1.1.1` / `8.8.8.8` to start (§3.5,
-[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)). Use
-BIND9 or Technitium on an air-gapped install. Apart from that, this is
-not a claim about the happy path — it is non-negotiable #5 in the project's
+Every feature works with all of the above blocked. Builds before #1353
+were the exception: a PowerDNS server group needed a route to `1.1.1.1` /
+`8.8.8.8` to start (§3.5). This is not a claim about the happy path — it is non-negotiable #5 in the project's
 own build rules: **DNS and DHCP service containers cache their
 last-known-good config locally and keep serving when the control plane
 is unreachable**, and by the same logic nothing in the control plane
@@ -270,7 +249,7 @@ SpatiumDDI is built to be delegated without handing over everything:
 ## 8. Keeping this page true
 
 A privacy statement rots the first time somebody adds a convenience
-fetch. Two guards keep this one honest:
+fetch. Three guards keep this one honest:
 
 * **`backend/tests/test_outbound_hosts_documented.py`** walks
   `backend/app` and the four shipped agent packages
@@ -281,6 +260,20 @@ fetch. Two guards keep this one honest:
   and its payload. Editing this file or an agent package runs that
   suite (both are declared carve-outs in
   `.github/scripts/ci-backend-must-run.txt`).
+* **`frontend/src/lib/outbound-hosts.test.ts`** does the same for the
+  Web UI: every hostname in a string literal, template or JSX text under
+  `frontend/src`, and in `frontend/index.html`, must appear on this page.
+  It matches every host rather than only `src=` / `fetch(` uses, because
+  a URL built into a variable and handed to an `<img>` later is
+  indistinguishable from a link by syntax. That is exactly how the MFA
+  enrolment screen sent each user's TOTP secret, inside the `otpauth://`
+  URI, to `api.qrserver.com` to draw its QR code, from the release that
+  added MFA (2026.05.05-1) until #400's Content-Security-Policy began
+  blocking the request in 2026.06.13-1. The code is now drawn in the
+  browser. If your account enrolled MFA on a release in that range,
+  disable and re-enrol it to get a secret nobody else has seen. The test
+  runs in the Frontend Lint job, which runs on every pull request,
+  including one that only edits this page.
 * **CLAUDE.md non-negotiable #17** — *No telemetry.* Never add an
   outbound connection that is not operator-configured and documented
   here; anything default-on needs an issue and a decision, not a PR.
@@ -343,6 +336,21 @@ Nexus or internal receiver), `my-resource.openai.azure.com`,
 `pdns.internal`, `tdns.internal`,
 `api.meraki.cn` (named in a docstring as the regional shard a
 China-based operator would enter).
+
+**In the Web UI** (`frontend/src`, checked by the second guard in §8),
+none of them loaded by the browser: links in help text
+(`en.wikipedia.org`, the timezone list; `docs.docker.com`;
+`app.netbird.io` and `unifi.ui.com`, where to find an API key); example
+values in placeholders (`automation.example.com`, `boot.example`,
+`cloud.example.org`, `collector.example.com`, `example.com`,
+`idp.example.com`, `k8s.example.com`, `login.example.com`,
+`netbird.example.com`, `netbox.internal`, `proxy.internal`, and the
+URL shapes of a public calendar feed and of chat webhooks:
+`calendar.google.com`, `hooks.slack.com`, `discord.com`); and two form
+presets the control plane contacts only once you save a provider with
+them, as your own endpoint: `login.microsoftonline.com` (the Entra ID
+OIDC discovery URL) and `host.docker.internal` (a local Ollama for the
+Copilot).
 
 **In-cluster addresses**, which never leave the node:
 `spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the

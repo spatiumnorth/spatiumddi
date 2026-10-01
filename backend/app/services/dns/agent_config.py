@@ -67,6 +67,7 @@ from app.services.dns.pool_geo import (
     records_for_view,
     view_renders_zone,
 )
+from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
@@ -659,6 +660,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         "forward_transport": (getattr(opts, "forward_transport", "do53") if opts else "do53"),
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
+        # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
+        # forwarders, or "" for ALIAS off. Never a built-in public resolver.
+        "alias_resolver": alias_resolver(
+            getattr(opts, "forwarders", []) if opts else [],
+            getattr(opts, "forward_transport", "do53") if opts else "do53",
+        ),
     }
     # Built from the unified descriptor list so operator split-horizon
     # views (issue #24), synthesized geo views + the geo catch-all
