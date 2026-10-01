@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -288,8 +289,22 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+async def _saw_token(stream: asyncio.StreamReader, token: bytes) -> bool:
+    """Drain ``stream`` to EOF; True when ``token`` appeared in it.
+
+    Keeps only a token-sized tail between reads, so a script that prints a
+    lot (one row per ``setval``) costs no memory.
+    """
+    seen, tail = False, b""
+    while chunk := await stream.read(_REPLAY_CHUNK_BYTES):
+        window = tail + chunk
+        seen = seen or token in window
+        tail = window[-len(token) :]
+    return seen
+
+
 async def _replay_clean(source, db_url: str, *, producer=None) -> None:
-    """Clear the schema and replay a SQL script, in ONE transaction (#1363).
+    r"""Clear the schema and replay a SQL script, in ONE transaction (#1363).
 
     ``source`` yields the script's bytes: a plain dump read from disk, or
     ``pg_restore``'s script output for a custom-format archive (``producer``
@@ -304,6 +319,12 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     never let it get there. When the producer fails, psql is killed with its
     stdin still open — the server then sees the connection drop mid
     transaction and rolls everything back, the clearing included.
+
+    Success is psql ACKNOWLEDGING the end of the script, not just exiting 0:
+    a per-run token is ``\echo``-ed after the last statement, and only its
+    appearance on stdout proves psql read everything. Handing every byte to
+    the pipe proves nothing, since psql can leave early with exit 0 (a
+    ``\q``) while a small script still fits in the pipe.
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
     await _terminate_other_db_connections(pg_env)
@@ -316,11 +337,13 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
         "--file=-",
         env=_pg_subprocess_env(pg_env),
         stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdin, stderr = psql.stdin, psql.stderr
-    assert stdin is not None and stderr is not None
+    stdin, stdout, stderr = psql.stdin, psql.stdout, psql.stderr
+    assert stdin is not None and stdout is not None and stderr is not None
+    token = f"spatium-replay-complete-{secrets.token_hex(16)}".encode("ascii")
+    acknowledged = asyncio.ensure_future(_saw_token(stdout, token))
     psql_stderr = asyncio.ensure_future(stderr.read())
     producer_stderr = (
         asyncio.ensure_future(producer.stderr.read())
@@ -329,9 +352,15 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     )
 
     async def kill_all() -> None:
-        for proc in (psql, producer):
-            if proc is not None:
-                await _stop(proc)
+        # psql's stdout already has its reader (the acknowledgement task), so
+        # it is drained through that rather than by ``_stop``: two readers
+        # on one stream is an error.
+        if psql.returncode is None:
+            psql.kill()
+        await acknowledged
+        await psql.wait()
+        if producer is not None:
+            await _stop(producer)
 
     def psql_gone() -> bool:
         return psql.returncode is not None or stdin.is_closing()
@@ -352,6 +381,9 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
                     return False
                 stdin.write(chunk)
                 await stdin.drain()
+            # On its own line: the script need not end with a newline.
+            stdin.write(b"\n\\echo " + token + b"\n")
+            await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             return False
         return not psql_gone()
@@ -360,6 +392,7 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     # committing, so a timeout can no longer promise nothing was applied.
     eof_sent = False
     delivered = False
+    saw_end = False
     try:
         # One deadline for the whole replay, not one per step.
         async with asyncio.timeout(_PG_RESTORE_TIMEOUT_SECONDS):
@@ -390,6 +423,7 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
                 stdin.close()
                 eof_sent = True
             await psql.wait()
+            saw_end = await acknowledged
     except TimeoutError as exc:
         await kill_all()
         outcome = (
@@ -403,10 +437,10 @@ async def _replay_clean(source, db_url: str, *, producer=None) -> None:
     except BaseException:
         await kill_all()
         raise
-    if not delivered and psql.returncode == 0:
-        # psql left before end of input yet reported success (a ``\q`` in the
-        # script, say). With --single-transaction that commits what it read,
-        # so this must not read as a completed restore.
+    if psql.returncode == 0 and not saw_end:
+        # psql left before the end of the script yet reported success (a
+        # ``\q`` in it, say). With --single-transaction that commits what it
+        # read, so this must not read as a completed restore.
         raise BackupRestoreError(
             "replay stopped before the end of the archive (psql exited 0 without "
             "reading all of it); the database may hold a partial restore"

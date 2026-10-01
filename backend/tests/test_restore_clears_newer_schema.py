@@ -292,3 +292,26 @@ async def test_a_plain_archive_restores_from_memory(dbs) -> None:
     dest, _, plain = dbs
     await restore._run_psql(plain.read_bytes(), _url_for(dest))
     assert await _state(dest) == _OLD_STATE
+
+
+async def test_an_early_successful_exit_is_not_a_complete_restore(dbs) -> None:
+    """A script small enough to fit in the pipe, which makes psql leave with
+    exit 0 before its end: every byte was handed over, but psql never read
+    the rest. Only psql's own acknowledgement of the end proves it did."""
+    dest, _, _ = dbs
+
+    async def script():
+        yield b"SELECT 1;\n\\q\nSELECT 2;\n"
+
+    with pytest.raises(restore.BackupRestoreError, match="partial restore"):
+        await restore._replay_clean(script(), _url_for(dest))
+
+
+async def test_the_acknowledgement_is_found_across_reads() -> None:
+    """The token may straddle two reads of psql's output."""
+    token = b"spatium-replay-complete-" + b"ab" * 16
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"x" * (65536 - 10) + token[:10])
+    reader.feed_data(token[10:] + b"\n")
+    reader.feed_eof()
+    assert await restore._saw_token(reader, token)

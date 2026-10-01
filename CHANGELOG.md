@@ -306,8 +306,12 @@ the formatter handles the rest.
   archive's SQL is applied by `psql --single-transaction`. For a
   custom-format archive that SQL is streamed from `pg_restore`, not
   staged on disk. If `pg_restore` fails part way, psql is killed before
-  it reaches end of input, so it never commits. Any failure leaves the
-  database as it was. Backups dump the whole database, so clearing loses
+  it reaches end of input, so it never commits. A replay counts as
+  complete only when psql acknowledges the end of the script (a per-run
+  `\echo` token), so a psql that left early with exit 0 is a partial
+  restore, not a success. Any failure before end of input rolls back and
+  leaves the database as it was; a timeout after it, while psql may be
+  committing, is reported as an unknown outcome instead. Backups dump the whole database, so clearing loses
   nothing the archive does not recreate. An error now leads with
   PostgreSQL's `ERROR` line instead of notices. Also documented: the
   command for the manual `alembic upgrade head` a `failed` restore asks
