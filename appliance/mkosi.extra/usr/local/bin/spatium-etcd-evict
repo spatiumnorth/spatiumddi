@@ -57,6 +57,7 @@ anything that is not application/grpc. So:
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -123,9 +124,19 @@ def read_request(text: str) -> tuple[str, list[tuple[str, list[str]]]] | None:
 
 # ---- which members belong to a node -----------------------------------------------
 
+def canonical_addr(text: str) -> str:
+    """An address in one spelling, so `fd00:0::1` and `fd00::1` (or upper-case
+    hex) compare equal. Anything that is not an IP stays as written, lower-cased."""
+    text = text.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text.lower()
+
+
 def peer_host(url: str) -> str:
     try:
-        return (urlsplit(url).hostname or "").lower()
+        return canonical_addr(urlsplit(url).hostname or "")
     except ValueError:
         return ""
 
@@ -144,7 +155,7 @@ def node_members(members: list[dict], host: str, ips: list[str],
     this node's own."""
     name_re = _member_name_re(host)
     own_res = [_member_name_re(o) for o in own_names]
-    addrs = {a.lower() for a in ips}
+    addrs = {canonical_addr(a) for a in ips}
     out = []
     for m in members:
         name = str(m.get("name") or "")

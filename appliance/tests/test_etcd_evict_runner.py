@@ -373,3 +373,17 @@ def test_grpc_answers_are_read_from_headers_and_trailers() -> None:
                "grpc-message: etcdserver:%20unhealthy%20cluster\r\n\r\n")
     assert mod.grpc_error(refused) == "grpc-status 14: etcdserver: unhealthy cluster"
     assert mod.grpc_error("HTTP/2 415 \r\n\r\n") == "no grpc-status in etcd's answer (HTTP 415)"
+
+
+def test_ipv6_addresses_match_however_they_are_written(tmp_path: Path) -> None:
+    """#1326 review: addresses were compared as strings, so `fd00:0::86` missed
+    `fd00::86` and an unnamed learner on it read `absent`. Low risk (both sides
+    come Go-canonical), but the comparison is meant to be exact."""
+    learner = {"ID": 779, "name": "", "peerURLs": ["https://[FD00:0:0::86]:2380"]}
+    results, _, etcd = _run(tmp_path, [SEED, learner], _request(("ddipg-member-3", "fd00::86")))
+    assert results["ddipg-member-3"] == ("removed", "779 (unnamed)")
+    assert etcd["removed"] == [779]
+    mod = _module()
+    assert mod.canonical_addr("fd00:0::0086") == "fd00::86"
+    assert mod.canonical_addr("192.168.122.86") == "192.168.122.86"
+    assert mod.canonical_addr("Node-3.LAN") == "node-3.lan"
