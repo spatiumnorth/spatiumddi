@@ -349,12 +349,19 @@ classify_join_failure() {
     # the attempt ~15 min later ("failed to wait for API server to become
     # ready: context deadline exceeded") would read as a transport error. It is
     # not one: the seed answered, and its etcd said no.
-    local refused=""
-    case "$log" in
-        *"Waiting for other members to finish joining etcd cluster: etcdserver: unhealthy cluster"*)
-            refused=unhealthy ;;
-        *"Waiting for other members to finish joining etcd cluster: etcdserver: too many learner members"*)
-            refused=learners ;;
+    # The refusal decides only when the attempt ended on it: k3s gave up
+    # waiting for its API server, and the last "Waiting for other members"
+    # line it logged is that refusal. A refusal earlier in an attempt that then
+    # died of something else (a connection-refused fatal, say) is not the cause,
+    # and the unhealthy-cluster refusal is permanent upstream (no auto-retry).
+    local refused="" last_wait=""
+    case "$subject" in
+        *"failed to wait for API server to become ready"*)
+            last_wait="$(printf '%s\n' "$log" | grep -F 'Waiting for other members to finish joining etcd cluster:' | tail -n 1)"
+            case "$last_wait" in
+                *"etcdserver: unhealthy cluster"*) refused=unhealthy ;;
+                *"etcdserver: too many learner members"*) refused=learners ;;
+            esac ;;
     esac
     # Two stages, on purpose: first decide WHAT happened, then name it — so
     # every reason string is written exactly once below, and the backend's

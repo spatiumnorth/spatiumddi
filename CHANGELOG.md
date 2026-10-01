@@ -870,9 +870,12 @@ the formatter handles the rest.
   seed cannot reach, the node stays standalone: the reason says to
   remove that member first, and the join is not retried on its own,
   since every retry would wipe the node again and be refused again.
-  A learner backlog is still retried. The journal scan behind this
-  decision is also anchored in UTC, so an appliance set to another
-  time zone no longer scans the wrong window.
+  A learner backlog is still retried. A refusal names the failure
+  only when the attempt ended on it: one refused add early in an
+  attempt that then failed for another reason no longer stops the
+  automatic retry. The journal scan behind this decision is also
+  anchored in UTC, so an appliance set to another time zone no
+  longer scans the wrong window.
 
 - **After a DHCP agent restart, an address that has changed hands no
   longer drops out of IPAM while its new client holds it (#1318).**
