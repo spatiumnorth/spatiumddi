@@ -201,7 +201,8 @@ async def test_trash_listing_label_matches_row_display(
     space = IPSpace(name=f"lbl-{uuid.uuid4().hex[:6]}", description="")
     db_session.add(space)
     await db_session.flush()
-    named = IPBlock(space_id=space.id, network="10.77.0.0/16", name="campus")
+    # A trailing NBSP: Python's strip() removes it, so the SQL label must too.
+    named = IPBlock(space_id=space.id, network="10.77.0.0/16", name="campus\u00a0")
     db_session.add(named)
     await db_session.flush()
     unnamed = Subnet(space_id=space.id, block_id=named.id, network="10.77.1.0/24", name="")

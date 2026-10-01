@@ -96,7 +96,10 @@ async def _resolve_usernames(db: Any, user_ids: set[uuid.UUID]) -> dict[uuid.UUI
     return {row.id: row.username for row in res.all()}
 
 
-_WHITESPACE = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f"
+# Exactly the characters Python's ``str.strip()`` removes, Unicode included
+# (NBSP, U+3000, ...), so the SQL label below matches ``_row_display`` for
+# any name. Derived rather than spelled out so the two cannot drift.
+_WHITESPACE = "".join(c for c in map(chr, range(0x110000)) if c.isspace())
 
 
 def _label_expr(model: type) -> Any:
