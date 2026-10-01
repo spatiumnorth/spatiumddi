@@ -105,6 +105,12 @@ def test_render_pdns_conf_lmdb_defaults() -> None:
     assert "webserver-allow-from=127.0.0.1,::1" in out
 
 
+def test_render_pdns_conf_turns_off_security_polling() -> None:
+    # The agent's renderer does the same (#1353); an absent line would leave
+    # PowerDNS's default secpoll ON, phoning secpoll.powerdns.com.
+    assert "security-poll-suffix=" in render_pdns_conf(api_key="k").splitlines()
+
+
 def test_render_pdns_conf_rejects_unsupported_backend() -> None:
     with pytest.raises(ValueError, match="Phase 1 only supports backend='lmdb'"):
         render_pdns_conf(api_key="x", backend="gpgsql")

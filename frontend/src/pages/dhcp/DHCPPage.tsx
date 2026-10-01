@@ -77,7 +77,8 @@ import {
   servingByScopeId,
   useGroupFailover,
 } from "./windowsFailover";
-import { DeleteConfirmModal, StatusDot } from "./_shared";
+import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
+import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -1049,15 +1050,9 @@ function GroupServersList({
                       {s.ha_state && (
                         <span
                           className="inline-flex items-center rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                          title={
-                            s.ha_last_heartbeat_at
-                              ? `Last HA heartbeat ${new Date(
-                                  s.ha_last_heartbeat_at,
-                                ).toLocaleString()}`
-                              : "No HA heartbeat received yet"
-                          }
+                          title={haPillTitle(s.ha_last_heartbeat_at)}
                         >
-                          HA: {s.ha_state}
+                          HA v4: {s.ha_state}
                         </span>
                       )}
                       {s.maintenance_mode && (
@@ -1276,6 +1271,13 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
   const { data: failover } = useGroupFailover(groupId || undefined);
   const servingById = servingByScopeId(failover);
   const showServing = (failover?.windows_member_count ?? 0) > 0;
+  // #1238 — HA is DHCPv4 only, so a v6 scope on a multi-Kea group is
+  // served uncoordinated by every member. Same cached list the sidebar reads.
+  const { data: groups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+  });
+  const group = groups.find((g) => g.id === groupId);
   const allScopes: (DHCPScope & { subnet_network?: string })[] =
     groupScopes.map((sc) => ({
       ...sc,
@@ -1373,7 +1375,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2 font-mono text-xs">
                           {sc.subnet_network ?? "—"}
                         </td>
-                        <td className="px-3 py-2">{sc.name}</td>
+                        <td className="px-3 py-2">
+                          <span className="inline-flex flex-wrap items-center gap-1.5">
+                            {sc.name}
+                            {group && v6ScopeLacksHa(sc, group) && (
+                              <V6NoHaTag
+                                keaMemberCount={group.kea_member_count}
+                              />
+                            )}
+                          </span>
+                        </td>
                         <td className="px-3 py-2">
                           {sc.enabled ? "yes" : "no"}
                         </td>
@@ -2846,13 +2857,7 @@ function ServerDetailView({
               </span>
               {server.ha_state && (
                 <span
-                  title={
-                    server.ha_last_heartbeat_at
-                      ? `Last HA heartbeat ${new Date(
-                          server.ha_last_heartbeat_at,
-                        ).toLocaleString()}`
-                      : "No HA heartbeat received yet"
-                  }
+                  title={haPillTitle(server.ha_last_heartbeat_at)}
                   className={cn(
                     "rounded-full px-2 py-0.5 text-xs font-medium",
                     server.ha_state === "partner-down" ||
@@ -2866,7 +2871,7 @@ function ServerDetailView({
                         : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
                   )}
                 >
-                  HA: {server.ha_state}
+                  HA v4: {server.ha_state}
                 </span>
               )}
               {!server.agent_approved && !server.is_agentless && (

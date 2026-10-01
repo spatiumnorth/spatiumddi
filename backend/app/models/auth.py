@@ -102,6 +102,18 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    @property
+    def password_change_required(self) -> bool:
+        """``force_password_change`` as enforced: only for a LOCAL account.
+
+        An external account (LDAP / OIDC / SAML / RADIUS / TACACS+) has no
+        password here to change — ``/auth/change-password`` requires a local
+        one — so honouring the flag on it locks the user out until an admin
+        clears it (#1242). Admins can no longer set it on one, and this keeps
+        any row that already carries it from staying stuck.
+        """
+        return self.force_password_change and self.auth_source == "local"
+
     # MFA — TOTP via pyotp + recovery codes (issue #69). The secret
     # is stored Fernet-encrypted; recovery codes are stored as a
     # Fernet-encrypted JSON list of sha256 hashes (raw codes are

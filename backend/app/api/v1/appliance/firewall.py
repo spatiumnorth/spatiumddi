@@ -1295,11 +1295,13 @@ async def apply_posture(
 #
 # The caller's address comes from ``get_trusted_client_ip``, not ``client_ip``
 # — see the two docstrings in ``core/request_meta``. This is a source-IP
-# allowlist gate, and the spoofable value is also simply the WRONG address on
-# a real topology: with a reverse proxy in front of the appliance, uvicorn's
-# ``--forwarded-allow-ips *`` resolves the browser's own IP out of
-# X-Forwarded-For while nftables will judge the packet source, which is the
-# proxy. The guard would clear an operator who is about to be locked out.
+# allowlist gate, and an X-Forwarded-For-derived value is also simply the
+# WRONG address on a real topology: with a reverse proxy in front of the
+# appliance, the XFF chain names the browser's own IP while nftables judges
+# the packet source, which is the proxy. The guard would clear an operator who
+# is about to be locked out. ``get_trusted_client_ip`` is nginx's
+# ``$remote_addr`` via X-Real-IP from a trusted proxy peer (#1221), i.e. the
+# address nftables sees.
 
 
 class WebUIAccessResponse(BaseModel):

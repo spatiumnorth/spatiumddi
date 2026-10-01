@@ -23,6 +23,13 @@ The flow:
        anything; surface ``state="incompatible_newer"`` so the
        operator knows the schema in the database is ahead of this
        install's code.
+     - upgrade fails on an object that "already exists" → the
+       signature of a stale ``alembic_version`` over a schema that is
+       already at head. ``alembic stamp head`` runs only after every
+       table and column head declares is found in the database
+       (``state="auto_recovered"``); otherwise ``state="failed"``,
+       naming what is missing, and ``alembic_version`` is left where
+       the upgrade stopped (#1233).
      - source head is missing from the manifest entirely → an old
        Phase 1 archive that didn't carry ``schema_version``.
        ``state="unknown"`` — operator gets a heads-up, no upgrade
@@ -38,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -45,6 +53,9 @@ from typing import Literal
 import structlog
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from sqlalchemy import inspect, text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.services.backup.archive import _pg_env_from_url
 
@@ -78,10 +89,11 @@ MigrationState = Literal[
 ]
 
 
-# Patterns alembic / asyncpg / psql emit when the schema is already
-# at (or past) the target head but ``alembic_version`` is stale.
-# Hitting one of these on ``alembic upgrade head`` after a restore
-# is the canonical drift-recovery signal — we stamp head instead.
+# Patterns alembic / asyncpg / psql emit when a revision meets an
+# object it would create. After a restore that is the signature of a
+# stale ``alembic_version`` over a schema already at head — but only
+# the signature: head is stamped only once the schema is verified to
+# carry what head declares (#1233).
 _DRIFT_ERROR_PATTERNS = (
     "DuplicateTableError",
     "DuplicateColumnError",
@@ -292,7 +304,17 @@ async def maybe_upgrade_after_restore(
         )
 
     if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
+        output = stderr.decode(errors="replace") or stdout.decode(errors="replace")
+        # Not the head: alembic logs one INFO line per revision before
+        # the traceback, so on a long ladder the first 1500 characters
+        # held only those and cut off the exception (#1233). Not merely
+        # the tail either: SQLAlchemy appends the whole ``[SQL: …]``
+        # statement after the exception line, and a wide CREATE TABLE
+        # pushes that line out of it.
+        msg = _error_excerpt(output)
+        # With one transaction per revision (#1204), every revision
+        # announced before the failing one has committed.
+        applied = _announced_revisions(output)[:-1]
         logger.error(
             "backup_restore_alembic_upgrade_failed",
             source_head=source_head,
@@ -312,33 +334,75 @@ async def maybe_upgrade_after_restore(
         # the stale alembic_version. ``alembic upgrade head`` then
         # fails on the first migration with "table already exists".
         #
-        # Detect that signature and recover by stamping head — the
-        # schema is already correct, alembic_version just needs to
-        # catch up.
-        if any(p in msg for p in _DRIFT_ERROR_PATTERNS):
+        # "already exists" is only the SIGNATURE of that case, not
+        # proof of it (#1233): any revision that meets one object it
+        # would create fails the same way, from any revision. With
+        # one transaction per revision (#1204) everything before it
+        # stays committed and everything after it never ran, so
+        # stamping head on the signature alone records a partially
+        # migrated schema as current. Stamp only once the schema is
+        # shown to carry what head declares; otherwise leave
+        # ``alembic_version`` where the upgrade stopped, so a manual
+        # ``alembic upgrade head`` resumes from the right place.
+        if any(p in output for p in _DRIFT_ERROR_PATTERNS):
+            failed_at = _failing_revision(output)
+            verdict = await _verify_schema_at_head(db_url)
+            if not verdict.ok:
+                logger.error(
+                    "backup_restore_alembic_drift_unverified",
+                    source_head=source_head,
+                    local_head=local_head,
+                    failed_at=failed_at,
+                    stopped_at=verdict.version_num,
+                    missing_tables=verdict.missing_tables[:20],
+                    missing_columns=verdict.missing_columns[:20],
+                    check_error=verdict.error,
+                )
+                return MigrationOutcome(
+                    state="failed",
+                    source_head=source_head,
+                    local_head=local_head,
+                    migrations_applied=applied,
+                    error=_unverified_drift_error(
+                        msg=msg,
+                        failed_at=failed_at,
+                        local_head=local_head,
+                        verdict=verdict,
+                    ),
+                )
             stamp_ok, stamp_err = await _try_alembic_stamp_head(db_url)
             if stamp_ok:
                 logger.info(
                     "backup_restore_alembic_drift_recovered",
                     source_head=source_head,
                     local_head=local_head,
+                    failed_at=failed_at,
                 )
                 return MigrationOutcome(
                     state="auto_recovered",
                     source_head=source_head,
                     local_head=local_head,
-                    migrations_applied=[],
+                    migrations_applied=applied,
                     error=(
-                        "alembic_version was stale but the restored schema is "
-                        f"already at {local_head!r}; stamped head to align. "
-                        "No migrations actually ran."
+                        "alembic_version was stale: the upgrade stopped on an "
+                        "object that already exists"
+                        + (f" (revision {failed_at!r})" if failed_at else "")
+                        + f", and every table and column {local_head!r} declares "
+                        "is present in the restored schema, so head was stamped "
+                        "to align. "
+                        + (
+                            f"{len(applied)} revision(s) before it had already "
+                            f"committed: {', '.join(applied)}."
+                            if applied
+                            else "No migrations actually ran."
+                        )
                     ),
                 )
             return MigrationOutcome(
                 state="failed",
                 source_head=source_head,
                 local_head=local_head,
-                migrations_applied=[],
+                migrations_applied=applied,
                 error=(
                     f"alembic upgrade failed and stamp-head recovery also "
                     f"failed. Upgrade error: {msg}; stamp error: {stamp_err}"
@@ -349,7 +413,7 @@ async def maybe_upgrade_after_restore(
             state="failed",
             source_head=source_head,
             local_head=local_head,
-            migrations_applied=[],
+            migrations_applied=applied,
             error=f"alembic upgrade failed (exit {proc.returncode}): {msg}",
         )
 
@@ -364,6 +428,179 @@ async def maybe_upgrade_after_restore(
         source_head=source_head,
         local_head=local_head,
         migrations_applied=planned,
+    )
+
+
+# ``alembic`` logs each revision to stderr as it starts it:
+#   INFO  [alembic.runtime.migration] Running upgrade a1b2 -> c3d4, message
+_RUNNING_UPGRADE_RE = re.compile(r"Running upgrade .*?-> ([0-9A-Za-z_]+)")
+
+
+def _announced_revisions(output: str) -> list[str]:
+    """Every revision ``alembic upgrade`` announced, in order."""
+    return _RUNNING_UPGRADE_RE.findall(output)
+
+
+def _failing_revision(output: str) -> str | None:
+    """Return the revision ``alembic upgrade`` was running when it failed.
+
+    That is the last one it announced: a revision is logged before its
+    DDL runs, and the upgrade stops at the first that raises. None when
+    the output carries no announcement (it failed before the first one).
+    """
+    found = _announced_revisions(output)
+    return found[-1] if found else None
+
+
+_ERROR_EXCERPT_CHARS = 1500
+
+
+def _error_excerpt(output: str, limit: int = _ERROR_EXCERPT_CHARS) -> str:
+    """The part of a failed alembic run worth showing an operator.
+
+    Starts at the exception line of the LAST traceback (the first
+    unindented line after its header), so the exception type and message
+    lead even when SQLAlchemy follows them with a long ``[SQL: …]``
+    statement. Falls back to the tail when there is no traceback.
+    """
+    marker = "Traceback (most recent call last):"
+    idx = output.rfind(marker)
+    if idx != -1:
+        for m in re.finditer(r"^\S.*$", output[idx + len(marker) :], re.M):
+            start = idx + len(marker) + m.start()
+            return output[start : start + limit]
+    return output[-limit:]
+
+
+@dataclass
+class SchemaVerdict:
+    """Does the database carry every table and column head declares?
+
+    ``ok`` is True only when the check RAN and found nothing missing;
+    a check that could not run is ``ok=False`` with ``error`` set, so
+    the caller fails closed rather than stamping on no evidence.
+    """
+
+    ok: bool
+    missing_tables: list[str]
+    missing_columns: list[str]
+    version_num: str | None = None
+    error: str | None = None
+
+
+def _missing_objects(sync_conn, metadata) -> tuple[list[str], list[str]]:
+    """Tables and ``table.column`` pairs ``metadata`` declares that the
+    connected database lacks.
+
+    Deliberately one-directional, and limited to tables and columns.
+    What head declares must exist: a revision that stopped short leaves
+    exactly that missing, and it is the evidence that holds on a database
+    migrated cleanly to head. The reverse direction does not: measured on
+    a database at head, the models omit a column the initial schema still
+    carries (``subnet.ntp_servers``) and index / constraint names differ
+    in dozens of places, so a full ``compare_metadata`` would refuse the
+    very case this recovery exists for.
+    """
+    insp = inspect(sync_conn)
+    missing_tables: list[str] = []
+    missing_columns: list[str] = []
+    by_schema: dict[str | None, list] = {}
+    for table in metadata.tables.values():
+        by_schema.setdefault(table.schema, []).append(table)
+    for schema, tables in by_schema.items():
+        present = set(insp.get_table_names(schema=schema))
+        columns = insp.get_multi_columns(schema=schema)
+        for table in sorted(tables, key=lambda t: t.name):
+            label = f"{schema}.{table.name}" if schema else table.name
+            if table.name not in present:
+                missing_tables.append(label)
+                continue
+            have = {c["name"] for c in columns.get((schema, table.name), [])}
+            missing_columns.extend(
+                f"{label}.{col.name}" for col in table.columns if col.name not in have
+            )
+    return missing_tables, missing_columns
+
+
+async def _verify_schema_at_head(db_url: str) -> SchemaVerdict:
+    """Check the restored database against the models this build ships.
+
+    ``app.core.schema_check`` cannot answer this: it compares
+    ``alembic_version`` with the bundled head, and that row is exactly
+    what is stale here, and what a stamp would overwrite (#1233).
+    """
+    from app.models import Base  # noqa: PLC0415 — registers every mapped table
+
+    engine = create_async_engine(db_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            tables, columns = await conn.run_sync(_missing_objects, Base.metadata)
+            # Informational only: where the upgrade stopped, for the
+            # operator. Read after the check, and only if the table
+            # exists, so its absence cannot abort the transaction the
+            # check runs in.
+            version_num = None
+            if await conn.run_sync(lambda c: inspect(c).has_table("alembic_version")):
+                row = (await conn.execute(text("SELECT version_num FROM alembic_version"))).first()
+                version_num = row[0] if row else None
+    except Exception as exc:  # noqa: BLE001 — any failure means "not verified"
+        first_line = (str(exc).splitlines() or [""])[0][:300]
+        return SchemaVerdict(
+            ok=False,
+            missing_tables=[],
+            missing_columns=[],
+            error=f"{type(exc).__name__}: {first_line}",
+        )
+    finally:
+        await engine.dispose()
+    return SchemaVerdict(
+        ok=not tables and not columns,
+        missing_tables=tables,
+        missing_columns=columns,
+        version_num=version_num,
+    )
+
+
+def _unverified_drift_error(
+    *, msg: str, failed_at: str | None, local_head: str, verdict: SchemaVerdict
+) -> str:
+    """Operator-facing reason the drift recovery refused to stamp head."""
+    where = f"at revision {failed_at!r} " if failed_at else ""
+    if verdict.error is not None:
+        why = (
+            f"the restored schema could not be checked against {local_head!r} "
+            f"({verdict.error}), so head was NOT stamped."
+        )
+    else:
+
+        def sample(kind: str, names: list[str], cap: int = 10) -> str:
+            more = len(names) - cap
+            return f"{kind} {', '.join(names[:cap])}" + (f" and {more} more" if more > 0 else "")
+
+        shown = [
+            sample(kind, names)
+            for kind, names in (
+                ("tables", verdict.missing_tables),
+                ("columns", verdict.missing_columns),
+            )
+            if names
+        ]
+        why = (
+            f"the restored schema is NOT at {local_head!r}: it lacks "
+            + "; ".join(shown)
+            + ". Head was NOT stamped, because that would record a partially "
+            "migrated schema as current."
+        )
+    stopped = (
+        f" alembic_version is at {verdict.version_num!r}, the last revision that "
+        "committed, so `alembic upgrade head` resumes from there once the "
+        "conflicting object is dealt with."
+        if verdict.version_num
+        else ""
+    )
+    return (
+        f"alembic upgrade stopped {where}on an object that already exists, and "
+        f"{why}{stopped} Upgrade error: {msg}"
     )
 
 
@@ -390,6 +627,6 @@ async def _try_alembic_stamp_head(db_url: str) -> tuple[bool, str | None]:
         await proc.wait()
         return False, f"alembic stamp timed out after {_ALEMBIC_TIMEOUT_SECONDS}s"
     if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:500]
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[-500:]
         return False, f"alembic stamp head failed (exit {proc.returncode}): {msg}"
     return True, None

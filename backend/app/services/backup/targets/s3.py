@@ -68,25 +68,25 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
     RetentionLockedError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
 
 # Same archive-name pattern as the local-volume driver.
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 # boto3 ClientError import is lazy — keeps the import-graph cost off
 # the hot path and avoids forcing every install to ship boto3 once
@@ -124,11 +124,11 @@ def _client(config: dict[str, Any]):
 
 def _key(config: dict[str, Any], filename: str) -> str:
     """Compose the object key from the optional prefix + filename.
-    ``os.path.basename`` defends against operator-typed paths in
-    ``filename`` that try to escape the prefix.
+    ``safe_filename`` refuses operator-typed paths in ``filename``
+    that would escape the prefix.
     """
     prefix = (config.get("prefix") or "").strip("/")
-    safe = os.path.basename(filename)
+    safe = safe_filename(filename)
     if prefix:
         return f"{prefix}/{safe}"
     return safe
@@ -342,7 +342,7 @@ class S3Destination(BackupDestination):
                     for obj in page.get("Contents") or []:
                         key = obj["Key"]
                         filename = _strip_prefix(config, key)
-                        if not _ARCHIVE_NAME_RE.match(filename):
+                        if not ARCHIVE_NAME_RE.match(filename):
                             continue
                         last_modified = obj.get("LastModified")
                         if last_modified is None:

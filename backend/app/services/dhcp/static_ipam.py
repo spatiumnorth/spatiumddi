@@ -37,18 +37,25 @@ that genuinely vanished from the server.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import select
+import structlog
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPScope, DHCPStaticAssignment
+from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
+
+logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "LeaseHandover",
     "detach_ipam_for_static",
+    "publish_handover_ddns",
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
@@ -196,7 +203,7 @@ async def detach_ipam_for_static(
     st: DHCPStaticAssignment,
     *,
     to_status: str = "available",
-) -> None:
+) -> list[LeaseHandover]:
     """Release the IPAM row back to ``available`` when the static is removed.
 
     Also tears down the forward A (DNS sync with action=delete).
@@ -208,11 +215,30 @@ async def detach_ipam_for_static(
     shadow a future dynamic lease at that IP AND never be reaped. ``available``
     lets a new lease reclaim the row (#478).
 
+    Unless a lease already holds the address (#1274). The reserved client's
+    grant usually arrives while the row is still ``static_dhcp``, which the
+    lease mirror leaves alone, and the agent sends a lease again only on its
+    own start, a control-plane recovery or the client's renewal — hours at the
+    default lifetime. Freeing the row showed a live device's address as free
+    until then, for the next-free allocation to hand to a second device. When
+    the product's lease table holds an active lease on the address in this
+    row's subnet, the row becomes that lease's mirror instead: the row the
+    lease-event ingest would have produced had the lease arrived after the
+    delete.
+
     ``to_status="reserved"`` is the opt-in "hold the address in IPAM after the
     DHCP config is gone" variant — the caller must be an explicitly destructive
-    path that asked for it.
+    path that asked for it. A held row stays held whatever holds the address;
+    the lease mirror leaves a reserved row alone as well.
+
+    Returns the rows handed to a live lease. Their DDNS records are the
+    caller's to publish with ``publish_handover_ddns``, and only once the
+    reservation itself is deleted: DDNS lets a reservation's hostname win, so
+    publishing while it still exists would put its name back on the row.
     """
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+    handovers: list[LeaseHandover] = []
 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in res.scalars().all():
@@ -224,7 +250,104 @@ async def detach_ipam_for_static(
                 pass
         row.static_assignment_id = None
         if row.status == "static_dhcp":
-            row.status = to_status
+            lease = await _live_lease_at(db, row) if to_status == "available" else None
+            if lease is not None:
+                _mirror_lease_onto(row, lease)
+                if subnet_row is not None:
+                    handovers.append(LeaseHandover(subnet_row, row, lease))
+            else:
+                row.status = to_status
+    return handovers
+
+
+@dataclass(frozen=True)
+class LeaseHandover:
+    """A row ``detach_ipam_for_static`` handed to the lease that holds it."""
+
+    subnet: Subnet
+    row: IPAddress
+    lease: DHCPLease
+
+
+async def publish_handover_ddns(db: AsyncSession, handovers: list[LeaseHandover]) -> None:
+    """Publish the lease's DDNS records for rows that just became its mirror.
+
+    The reservation's own A / PTR were torn down at the detach, and the
+    ingest runs ``apply_ddns_for_lease`` whenever it takes a row over, so
+    without this the mirror would sit in IPAM with no DNS until the client's
+    next renewal (the same wait #1274 removes for IPAM). A no-op when the
+    subnet's DDNS is off. Call it only after the reservation is deleted and
+    flushed; see ``detach_ipam_for_static``. Best-effort, like the ingest's
+    call: a DNS failure never undoes the IPAM hand-over, and the next lease
+    event or sweep reconciles it.
+    """
+    from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+    for h in handovers:
+        try:
+            await apply_ddns_for_lease(
+                db, subnet=h.subnet, ipam_row=h.row, client_hostname=h.lease.hostname
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            logger.warning(
+                "dhcp_static_delete_lease_ddns_failed",
+                address=str(h.row.address),
+                error=str(exc),
+            )
+
+
+async def _live_lease_at(
+    db: AsyncSession, row: IPAddress, *, now: datetime | None = None
+) -> DHCPLease | None:
+    """The active lease the product holds on ``row``'s address in ``row``'s subnet.
+
+    Active means what the rest of the lease code means by it
+    (``lease_cleanup.peer_holds_active_lease``): state ``active`` and not past
+    its expiry, so a lease the expiry sweep has not reached yet claims nothing.
+    The subnet is resolved the way the lease teardown resolves it — the lease's
+    scope first, the longest prefix for a legacy lease with no scope — because
+    the same address in another IP space is another network. Under HA each
+    server reports its own copy of a lease; the most recently seen one wins.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    leases = (
+        (
+            await db.execute(
+                select(DHCPLease)
+                .where(
+                    DHCPLease.ip_address == row.address,
+                    DHCPLease.state == "active",
+                    or_(DHCPLease.expires_at.is_(None), DHCPLease.expires_at > now),
+                )
+                .order_by(DHCPLease.last_seen_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for lease in leases:
+        if await _resolve_lease_subnet_id(db, lease) == row.subnet_id:
+            return lease
+    return None
+
+
+def _mirror_lease_onto(row: IPAddress, lease: DHCPLease) -> None:
+    """Make ``row`` the IPAM mirror of ``lease``.
+
+    The fields the lease-event ingest stamps on a row it takes over
+    (``_apply_lease_fields`` in ``api/v1/dhcp/agents.py``), taken from the
+    stored lease rather than an event. The sighting is the lease's own report;
+    a later sighting already on the row (a discovery sweep) is kept.
+    """
+    row.hostname = (lease.hostname or row.hostname or "")[:253]
+    row.mac_address = lease.mac_address or row.mac_address
+    row.status = "dhcp"
+    row.auto_from_lease = True
+    row.dhcp_lease_id = str(lease.id)
+    if row.last_seen_at is None or lease.last_seen_at > row.last_seen_at:
+        row.last_seen_at = lease.last_seen_at
+        row.last_seen_method = "dhcp"
 
 
 async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> int:

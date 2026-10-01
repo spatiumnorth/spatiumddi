@@ -5,17 +5,17 @@ name: Build appliance (reusable)
 # ONE copy of the most safety-critical assembly in the repo — fetch-k3s,
 # three chart bakes, the ghcr image bake, mkosi in the privileged builder
 # container, ISO wrap, slot compression — invoked by BOTH release.yml (on a
-# CalVer tag) and nightly.yml (daily from main). That sharing is the whole
+# release tag) and nightly.yml (daily from main). That sharing is the whole
 # point: before #823 these steps only ever ran when a release was cut, so a
 # regression in any of them sat invisible until the worst possible moment.
 # The nightly now exercises the exact code path the next release will run.
 #
 # Callers differ only in the inputs:
 #
-#   release: version = image_tag = the CalVer tag; stable_copies on, so the
+#   release: version = image_tag = the release tag; stable_copies on, so the
 #            un-versioned spatiumddi-appliance-<arch>.* names exist for the
 #            /releases/latest/download/ stable URLs.
-#   nightly: version is the gate's non-CalVer stamp string, image_tag is
+#   nightly: version is the gate's nightly stamp string (not a release), image_tag is
 #            the immutable nightly-YYYYMMDD date tag (never the mutable
 #            :nightly pointer — the bake must record which bytes it baked);
 #            stable_copies off, short artifact retention, and the caller

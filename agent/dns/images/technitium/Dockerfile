@@ -175,3 +175,9 @@ EXPOSE 53/udp 53/tcp
 # healthcheck needs.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
   CMD dig @127.0.0.1 -p 53 healthcheck.invalid A +timeout=2 +tries=1 || exit 1
+
+# #1182 — the version the agent reports: the release tag from release.yml,
+# the nightly stamp from nightly.yml. A build that passes nothing reports
+# "dev". Last, so a new version only rebuilds this layer.
+ARG APP_VERSION=dev
+ENV SPATIUM_AGENT_VERSION=${APP_VERSION}

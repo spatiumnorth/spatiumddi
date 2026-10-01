@@ -582,13 +582,17 @@ export function UsersPage() {
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
-                      <button
-                        onClick={() => setResetUser(user)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
-                        title="Reset password"
-                      >
-                        <KeyRound className="h-3.5 w-3.5" />
-                      </button>
+                      {/* #1242 — an external account's password lives in
+                          its identity provider; the API refuses the reset. */}
+                      {user.auth_source === "local" && (
+                        <button
+                          onClick={() => setResetUser(user)}
+                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          title="Reset password"
+                        >
+                          <KeyRound className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                       {user.locked && <UnlockButton userId={user.id} />}
                       <button
                         onClick={() => setDeleteUser(user)}

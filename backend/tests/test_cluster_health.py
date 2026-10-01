@@ -194,6 +194,64 @@ def test_get_cluster_health_rollup(monkeypatch) -> None:
     assert snap["top_pods_cpu"][0]["cpu_usage_cores"] == pytest.approx(0.5)
 
 
+def _rollup_with(monkeypatch, pods: list[dict]) -> dict[str, dict]:
+    _patch_kube(monkeypatch)
+    monkeypatch.setattr("app.services.appliance.k8s.list_all_pods", lambda: (200, pods))
+    return {w["component"]: w for w in cluster_health.get_cluster_health()["workloads"]}
+
+
+def test_a_running_join_job_is_not_a_ready_database_instance(monkeypatch) -> None:
+    """#1213: while CNPG bootstraps a replica, its running ``-join`` Job pod
+    read as a third ready database pod, so the rollup said 3/3 healthy while
+    CNPG reported two instances. Job pods are not serving instances."""
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster"),
+            _pod("postgresql-2", comp="database", owner="Cluster"),
+            _pod("postgresql-3-join-abcde", comp="database", owner="Job"),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"]) == (2, 2)
+    assert db["status"] == "degraded"
+    # The row says why it is degraded at 2/2.
+    assert db["jobs_running"] == 1
+
+
+def test_the_database_reads_healthy_once_the_join_job_is_done(monkeypatch) -> None:
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster"),
+            _pod("postgresql-2", comp="database", owner="Cluster"),
+            _pod("postgresql-3", comp="database", owner="Cluster"),
+            _pod(
+                "postgresql-3-join-abcde",
+                comp="database",
+                owner="Job",
+                phase="Succeeded",
+                ready=False,
+            ),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["status"]) == (3, 3, "healthy")
+    assert db["jobs_running"] == 0
+
+
+def test_a_component_made_only_of_jobs_is_not_a_workload(monkeypatch) -> None:
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("spatium-control-spatiumddi-api-x", comp="api"),
+            _pod("helm-install-spatium-control-q", comp="helm-install", owner="Job"),
+        ],
+    )
+    assert "helm-install" not in comps
+    assert comps["api"]["status"] == "healthy"
+
+
 def test_cluster_health_degrades_without_kubelet_proxy(monkeypatch) -> None:
     # Neither Summary-API grant → 403 → no live usage, but
     # the node inventory + workload rollup still render.

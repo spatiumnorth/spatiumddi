@@ -234,18 +234,17 @@ def _local_cluster_member_signal() -> bool:
     """Is this node a control-plane cluster member, per purely LOCAL state?
 
     Needs no network, so it answers during the very partition that defeats the
-    kube-API probe. Same two signals heartbeat._is_control_plane_member uses:
-    the node was installed as a control-plane seed, or it was promoted and its
-    host runner reported the join completed. On this appliance a control-plane
-    member always runs embedded etcd, so either implies an etcd member.
+    kube-API probe. The one local membership definition
+    (``appliance_state.is_control_plane_member``, shared with the heartbeat and
+    the role chart values): the node was installed as a control-plane seed, or
+    it was promoted and its host runner reported the join completed. On this
+    appliance a control-plane member always runs embedded etcd, so either
+    implies an etcd member.
     """
     from . import appliance_state  # noqa: PLC0415 — avoid import cycle at load
 
     try:
-        if appliance_state.detect_appliance_variant() == "control-plane":
-            return True
-        join_state, _ = appliance_state.read_cluster_join_state()
-        return join_state == "ready"
+        return appliance_state.is_control_plane_member()
     except Exception:  # noqa: BLE001 — a best-effort fallback must never raise
         return False
 

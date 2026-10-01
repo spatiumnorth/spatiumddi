@@ -104,8 +104,8 @@ Notes worth carrying:
 | [MetalLB](https://metallb.io/) | chart + images 0.15.3 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb/Chart.yaml` |
 | [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.1 (operator 1.30.1) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
-| [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Bare-metal HA overlay | `k8s/ha/` |
-| [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Patroni HA overlay | `k8s/ha/` |
+| [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Compose HA overlay (non-functional, unsupported in 1.0, #1236) | `k8s/ha/` |
+| [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Compose Patroni overlay (non-functional, #1236) | `k8s/ha/` |
 
 Three of these deserve a sentence, because their state is not what you would
 assume from their presence:

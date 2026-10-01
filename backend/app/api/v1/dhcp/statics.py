@@ -14,12 +14,18 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
+from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
-from app.services.dhcp.static_ipam import detach_ipam_for_static, upsert_ipam_for_static
+from app.services.dhcp.option_validation import normalize_options
+from app.services.dhcp.static_ipam import (
+    detach_ipam_for_static,
+    publish_handover_ddns,
+    upsert_ipam_for_static,
+)
 from app.services.dhcp.windows_writethrough import push_static_change
 from app.services.tags import apply_tag_filter
 
@@ -237,6 +243,14 @@ async def create_static(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    if body.options_override:
+        body.options_override = normalize_options(body.options_override)
+        await validate_dhcp_options(
+            db,
+            body.options_override,
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
+            address_family=scope.address_family or "ipv4",
+        )
     await _conflict_check(db, scope, body.ip_address, body.mac_address)
     st = DHCPStaticAssignment(
         scope_id=scope_id,
@@ -278,6 +292,15 @@ async def update_static(
     prev_mac = str(st.mac_address)
     prev_ip = str(st.ip_address)
     changes = body.model_dump(exclude_none=True)
+    if changes.get("options_override"):
+        changes["options_override"] = normalize_options(changes["options_override"])
+        await validate_dhcp_options(
+            db,
+            changes["options_override"],
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
+            address_family=scope.address_family or "ipv4",
+            previous=st.options_override or {},
+        )
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
     if "ip_address" in changes or "mac_address" in changes:
@@ -312,7 +335,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
-    await detach_ipam_for_static(db, st)
+    handovers = await detach_ipam_for_static(db, st)
     write_audit(
         db,
         user=user,
@@ -322,4 +345,8 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
         resource_display=f"{st.mac_address}->{st.ip_address}",
     )
     await db.delete(st)
+    # #1274 — a row handed to a live lease gets its DDNS back, but only once
+    # the reservation is gone: DDNS lets a reservation's hostname win.
+    await db.flush()
+    await publish_handover_ddns(db, handovers)
     await db.commit()

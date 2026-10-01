@@ -40,7 +40,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
-from app.api.v1.dhcp.scopes import validate_domain_options
+from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServerGroup
@@ -51,6 +51,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     slugify_class_name,
 )
+from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
     tags=["dhcp"],
@@ -361,7 +362,10 @@ async def create_device_policy(
     )
     if dupe.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A device policy with that name exists")
-    validate_domain_options(body.options or {})  # #597
+    # Device policies are DHCPv4 only by construction (options 55 / 60).
+    body.options = normalize_options(body.options)
+    # A device policy compiles to a Kea client class: the Kea raw-code rule (#1296).
+    await validate_dhcp_options(db, body.options, group_id=None, address_family="ipv4")
     override = _validate_override(body.match_override)
 
     payload = body.model_dump()
@@ -427,7 +431,14 @@ async def update_device_policy(
         )
 
     if "options" in changes:
-        validate_domain_options(changes["options"] or {}, previous=row.options or {})
+        changes["options"] = normalize_options(changes["options"])
+        await validate_dhcp_options(
+            db,
+            changes["options"],
+            group_id=None,  # rendered by Kea / FortiGate only (#1296)
+            address_family="ipv4",
+            previous=row.options or {},
+        )
     if "match_override" in changes:
         changes["match_override"] = _validate_override(changes["match_override"])
     if "device_classes" in changes:

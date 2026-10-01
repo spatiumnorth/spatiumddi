@@ -19,7 +19,7 @@
 |---|---|---|---|
 | 8077 | Frontend (nginx) | HTTP | Host-published default; configurable via `HTTP_PORT` env var (container listens on 80) |
 | 443 | Frontend (nginx) | HTTPS | When TLS is configured (see §5) |
-| 8000 | API (uvicorn) | HTTP | Configurable via `API_PORT` env var; internal only in production |
+| 8000 | API (uvicorn) | HTTP | Published on `127.0.0.1` only by default (`API_BIND`, `API_PORT`); browsers and remote agents use the frontend |
 | 5432 | PostgreSQL | TCP | Internal only — never expose externally |
 | 6379 | Redis | TCP | Internal only — never expose externally |
 
@@ -38,11 +38,12 @@ cd spatiumddi
 cp .env.example .env
 
 # Edit .env — at minimum change POSTGRES_PASSWORD and SECRET_KEY
-# SECRET_KEY: openssl rand -hex 32
+# SECRET_KEY: openssl rand -hex 32  (the api refuses to boot without a real one)
 nano .env
 
-# Build images
-docker compose build
+# Fetch the release images (docker-compose.yml pins pre-built images from
+# ghcr.io; it has no build: sections, so `docker compose build` does nothing)
+docker compose pull
 
 # Run database migrations
 docker compose run --rm migrate
@@ -65,9 +66,13 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | Variable | Default | Description |
 |---|---|---|
 | `POSTGRES_PASSWORD` | `changeme` | PostgreSQL password — **must change** |
-| `SECRET_KEY` | (none) | JWT signing key — **must change** (use `openssl rand -hex 32`) |
+| `SECRET_KEY` | (none) | JWT signing key, and the source of the credential-encryption key when `CREDENTIAL_ENCRYPTION_KEY` is empty. **Required:** the api refuses to boot on the `.env.example` placeholder, anything under 32 characters, or anything that reads like a placeholder, such as `change-me…` (#1222). Use `openssl rand -hex 32`. To replace one an install already uses, see [Rotating `SECRET_KEY`](#rotating-secret_key) |
+| `CREDENTIAL_ENCRYPTION_KEY` | (empty) | Fernet key for stored credentials. Empty derives it from `SECRET_KEY`. A value that is not a valid Fernet key stops the api from booting |
+| `ALLOW_INSECURE_SECRET_KEY` | `false` | Boot on a placeholder or weak `SECRET_KEY` with a warning instead of refusing. **Local development only** — `docker-compose.dev.yml` sets it; nothing else should |
 | `HTTP_PORT` | `8077` | Host port for the frontend |
-| `API_PORT` | `8000` | Host port for the API (set to `127.0.0.1:8000:8000` to restrict to localhost) |
+| `API_PORT` | `8000` | Host port for the API |
+| `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
+| `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
@@ -173,12 +178,9 @@ See [`docs/features/ACME.md`](../features/ACME.md) for the full ACME provider sp
 
 ## 6. PostgreSQL High Availability (Docker Compose)
 
-For single-server deployments, the default single PostgreSQL container is sufficient. For HA:
+The Compose stack runs one PostgreSQL container, and **Compose HA is not supported in 1.0**. For a highly available database, run the OS appliance's multi-node control plane ([Topology 7](TOPOLOGIES.md#topology-7--appliance-multi-node-control-plane-ha-272)) or Kubernetes with CloudNativePG (see `k8s/README.md`).
 
-- **Patroni + etcd + HAProxy**: See `k8s/ha/postgres-docker-compose.yaml`
-- Connect your `.env` `DATABASE_URL` to HAProxy port 5000 (primary) instead of the `postgres` container
-
-For multi-server deployments, use Kubernetes with CloudNativePG (see `k8s/README.md`).
+The repo's `k8s/ha/postgres-docker-compose.yaml` is **not a working HA path**. Layered on this stack, Patroni never starts, the overlay renames the project onto empty volumes, its network does not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing `.env` at HAProxy changes nothing. The file's header lists the details. Making Compose HA real is tracked in [#137](https://github.com/spatiumnorth/spatiumddi/issues/137).
 
 ---
 
@@ -197,20 +199,84 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 > **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
 
 ```bash
-# Pull latest code
+# Refresh docker-compose.yml and .env.example for any new fields
 git pull
 
-# Rebuild images
-docker compose build
+# Fetch the new images. This is the step that upgrades: the compose file
+# pins pre-built images, so `docker compose build` rebuilds nothing, and
+# without a pull `up` keeps running the images already on the host.
+docker compose pull
 
 # Run new migrations (safe to run — Alembic is idempotent)
 docker compose run --rm migrate
 
-# Restart services with zero-downtime rolling update
-docker compose up -d --force-recreate api worker beat frontend
+# Recreate every service whose image changed
+docker compose up -d
 ```
 
+`docker compose pull` and `docker compose up -d` act only on the profiles that
+are active. If you enable the DNS / DHCP / Looking Glass containers through
+`COMPOSE_PROFILES` in `.env`, they are upgraded with the rest. If you start
+them with `--profile` on the command line instead, pass the same `--profile`
+flags to both `pull` and `up -d`, or those containers keep running the old
+images against the newly migrated control plane.
+To upgrade to a specific release rather than the newest, set
+`SPATIUMDDI_VERSION` in `.env` first; see the README's *Upgrading* section.
+
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
+
+### Rotating `SECRET_KEY`
+
+Needed when an install has been running on the `.env.example` placeholder or another weak key: from #1222 the api refuses to start on one, and an upgrade stops there with an error pointing here. It is also how you rotate a key you suspect has leaked.
+
+`SECRET_KEY` does two jobs. It signs session tokens, which simply stop verifying, so everyone signs in again. And unless `CREDENTIAL_ENCRYPTION_KEY` is set, it is the source of the key every stored credential is encrypted with (LDAP binds, integration tokens, AI provider keys, TSIG secrets, backup-target passwords). Those have to be re-encrypted for the new key before the api uses them, or they all become unreadable:
+
+```bash
+docker compose stop api worker beat
+
+# Keep the key being replaced IN A FILE, not only in this shell: once .env
+# holds the new key, this file is the only copy of the old one, and every
+# stored credential is unreadable without it. Strip quotes, because compose
+# reads SECRET_KEY="abc" as abc. With no SECRET_KEY line at all, the install
+# has been running on the built-in default, which is the placeholder.
+# A second run must not overwrite the saved key with the new one, so it
+# refuses while a rotation is in progress.
+if [ -e .env.old-secret-key ]; then
+  echo "A rotation is in progress (.env.old-secret-key exists): rerun only the" \
+       "docker compose run line below." >&2
+else
+  NEW_SECRET_KEY="$(openssl rand -hex 32)"
+  if grep -q '^SECRET_KEY=' .env; then
+    ( umask 077; grep '^SECRET_KEY=' .env | tail -n 1 | cut -d= -f2- \
+        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" > .env.old-secret-key )
+    # -i.bak works with both GNU and BSD (macOS) sed.
+    sed -i.bak "s|^SECRET_KEY=.*|SECRET_KEY=${NEW_SECRET_KEY}|" .env && rm -f .env.bak
+  else
+    ( umask 077; printf '%s\n' 'change-me-to-a-random-32-char-string' > .env.old-secret-key )
+    echo "SECRET_KEY=${NEW_SECRET_KEY}" >> .env
+  fi
+  unset NEW_SECRET_KEY
+fi
+
+# Re-encrypt every stored credential from the old key to the new one.
+# `-e OLD_SECRET_KEY` with no value passes it through from this shell, so
+# the key never appears on a command line.
+OLD_SECRET_KEY="$(cat .env.old-secret-key)" docker compose run --rm -e OLD_SECRET_KEY api \
+  python -m app.core.rotate_secret_key
+```
+
+Only when that command ends with `Done.`, remove the saved key and start the stack:
+
+```bash
+rm .env.old-secret-key
+docker compose up -d api worker beat
+```
+
+If it reports `NOT COMPLETE`, leave `.env.old-secret-key` where it is: it is the only copy of the old key. Fix what the output names and run the `docker compose run` line again.
+
+The command reports how many values it re-encrypted and records an audit row. It is safe to run again: a value already under the new key is skipped. If `CREDENTIAL_ENCRYPTION_KEY` was already set and you are changing it at the same time, pass the old one as `OLD_CREDENTIAL_ENCRYPTION_KEY` (exported, and `-e OLD_CREDENTIAL_ENCRYPTION_KEY` like above). Leave it unset if the install had no credential key before, including when you are adding one now. If it is set and unchanged, stored credentials never depended on `SECRET_KEY`: the command finds every value already under the current key and moves nothing.
+
+If the install ran on a **placeholder** key, anyone who knew it could sign requests as any user. After rotating, review **Admin → API tokens** and the users and superadmins list, and check the audit log for changes you do not recognise: a token or account created with a forged session survives the rotation.
 
 ---
 
@@ -255,7 +321,7 @@ gunzip -c postgres-only-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -
 
 ### Redis backup
 
-Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. There's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping — so a Redis backup is generally not needed. For point-in-time disaster recovery, copy the `redis_data` volume alongside the SpatiumDDI archive.
+The Compose Redis runs **without AOF persistence** (`redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru`): at most Redis's default periodic RDB snapshots land in the `redis_data` volume, so a Redis restart can lose queued Celery tasks and cached state. That is by design: there's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping, throttle counters — so a Redis backup is not needed. Cached state is rebuilt and periodic tasks fire again on the next beat tick; a one-off task that was queued but not yet run when Redis restarted (a manual backup run, an ACME order, a scan) is lost and has to be started again. (The Helm chart does run Redis with `--appendonly yes`.)
 
 ---
 
@@ -286,7 +352,7 @@ The `looking-glass` service uses `network_mode: host` so BGP (TCP/179) originate
 
 1. Control plane already running somewhere reachable (e.g. `https://spatium.example.com`).
 2. The pre-shared agent bootstrap key from the control plane. These are the `DNS_AGENT_KEY` / `DHCP_AGENT_KEY` env values the control plane was started with; reveal them from the UI at **Settings → Security → Agent bootstrap keys** (`POST /api/v1/admin/agent-keys/reveal`, superadmin + password-confirm). The agent must present this same key — the control plane rejects bootstrap attempts with an unknown key. The agent exchanges the pre-shared key for a rotating JWT on first contact and caches it locally, so it only needs the bootstrap key once.
-3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
+3. The agent verifies the control plane's TLS certificate. With a certificate from a public CA there is nothing to do. With a private CA or a self-signed certificate, put that CA next to the compose file as `spatium-ca.crt`, uncomment the `./spatium-ca.crt:/etc/ssl/spatium-ca.crt:ro` volume line, and set `TLS_CA_PATH=/etc/ssl/spatium-ca.crt` in `.env`. `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` turns verification off instead: lab use only, since anyone on the network path can then read the agent key and serve the agent its configuration. The agent logs a warning on every start while it is off, and `TLS_CA_PATH` wins if both are set. (Until #1220 these files defaulted the skip to `1`; see the upgrade note in the CHANGELOG.)
 
 ### DHCP-only VM
 

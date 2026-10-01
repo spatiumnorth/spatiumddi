@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import Group, User
@@ -37,11 +37,17 @@ class ExternalAuthResult:
 
 
 class ExternalSyncRejected(Exception):
-    """Raised when we refuse to provision or update a user."""
+    """Raised when we refuse to provision or update a user.
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    ``user`` is the existing account the refusal is about, when there is
+    one, so the caller's ``denied`` audit row is linked to it — filtering
+    the audit log by a disabled account shows the attempts to use it.
+    """
+
+    def __init__(self, reason: str, detail: str = "", *, user: User | None = None) -> None:
         self.reason = reason
         self.detail = detail
+        self.user = user
         super().__init__(detail or reason)
 
 
@@ -82,13 +88,14 @@ async def _find_linked_user(
        signed in since (``external_id`` NULL), claimed by username: the
        admin's link is what authorises the name match;
     3. an account from before the provider column (``auth_provider_id``
-       NULL, same type, same external id), adopted only while this is the
-       only provider of its type, so it cannot belong to another one.
-       Otherwise the login is refused until an administrator links it. An
-       account whose provider was deleted also has NULL here, but deleting
-       the provider clears its ``external_id`` too, so it never matches
-       this step: a new provider issuing the same identifier is not the
-       same authority.
+       NULL, same type, same external id) is REFUSED until an administrator
+       links it. The migration (``f4a8c2e71d09``) already linked every
+       account it could prove came from its provider, so one still NULL is
+       one it could not: its provider may have been deleted before the
+       upgrade, and adopting it here would hand it to whoever holds the same
+       identifier at the survivor (GHSA-4gx2). An account whose provider was
+       deleted after the upgrade has its ``external_id`` cleared, so it never
+       matches this step at all.
 
     An account is never adopted by username alone, whatever its type.
     """
@@ -137,19 +144,12 @@ async def _find_linked_user(
     )
     if legacy is None:
         return None
-    same_type = (
-        await db.execute(
-            select(func.count()).select_from(AuthProvider).where(AuthProvider.type == provider.type)
-        )
-    ).scalar_one()
-    if same_type != 1:
-        raise ExternalSyncRejected(
-            "account_link_required",
-            f"{legacy.username!r} is a {provider.type} account not yet linked to a "
-            f"provider, and {same_type} {provider.type} providers exist; an "
-            "administrator must link it",
-        )
-    return legacy
+    raise ExternalSyncRejected(
+        "account_link_required",
+        f"{legacy.username!r} is a {provider.type} account not linked to a provider, "
+        "and it cannot be shown to come from this one; an administrator must link it",
+        user=legacy,
+    )
 
 
 async def sync_external_user(
@@ -160,7 +160,8 @@ async def sync_external_user(
     ``provider.type`` is used as the value for ``User.auth_source`` and
     ``provider.id`` for ``User.auth_provider_id``. Raises
     ``ExternalSyncRejected`` if the login should be refused (no mapping
-    match, username already taken, an unlinked account, auto-create off).
+    match, username already taken, an unlinked account, auto-create off,
+    or a disabled account).
     """
     key = (result.external_id or "").strip()
     if not key:
@@ -192,7 +193,19 @@ async def sync_external_user(
                 "username_collision",
                 f"A {collision.auth_source} user named {username!r} already exists and is "
                 "not linked to this provider",
+                user=collision,
             )
+
+    # 3b) A disabled account is refused HERE, before anything is minted
+    # (#1242). Every later request already 403s on ``is_active``, so no data
+    # was ever reachable — but the login itself completed: a session row, a
+    # token pair and a ``login`` / ``success`` audit row for a login that was
+    # never allowed. Raising routes it through each caller's existing
+    # ``denied`` audit instead. Checked before the refresh below so a
+    # disabled account's profile and group membership are not rewritten by
+    # an attempt to use it either.
+    if user is not None and not user.is_active:
+        raise ExternalSyncRejected("account_disabled", "User account is disabled", user=user)
 
     # 4) Create or refresh.
     if user is None:

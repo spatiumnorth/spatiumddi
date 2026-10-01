@@ -107,3 +107,27 @@ def includes_release(version: str | None, release: str) -> bool | None:
     if nightly is None or target.tagged_on is None or nightly == target.tagged_on:
         return None
     return nightly > target.tagged_on
+
+
+def upgrade_direction(installed: str | None, target: str | None) -> str:
+    """Whether moving a node from ``installed`` to ``target`` goes forward:
+    ``"forward"``, ``"same"``, ``"backward"`` or ``"unknown"``.
+
+    ``"backward"`` covers a nightly that already includes the target:
+    installing the release would drop whatever main gained since.
+    ``"unknown"`` covers a target that is not a release, and an installed
+    build whose relation to it cannot be known (a dev build, or a nightly
+    cut on the tag's own day).
+    """
+    to = parse_release(target)
+    if to is None:
+        return "unknown"
+    installed_release = parse_release(installed)
+    if installed_release is not None:
+        if to > installed_release:
+            return "forward"
+        return "same" if to == installed_release else "backward"
+    includes = includes_release(installed, (target or "").strip())
+    if includes is None:
+        return "unknown"
+    return "backward" if includes else "forward"

@@ -151,21 +151,27 @@ def spawn_guard(state_dir, name: str) -> Iterator[None]:
                 os.close(fd)
 
 
-def wait_for_daemon(comm: str, pid: int, timeout_s: float = 5.0) -> None:
+def wait_for_daemon(comm: str, pid: int, timeout_s: float = 5.0) -> bool:
     """Block until ``pid`` is visible under ``comm``, or the timeout expires.
 
     Held inside :func:`spawn_guard`, this is what makes the NEXT caller's
     ``find_running_daemon`` see the daemon we just started: it does not return
     while the child is still pre-``execve``.
+
+    Returns True only for a live process under ``comm``. A zombie also reads
+    ``comm`` back, and a daemon that exits during startup (a config it
+    refuses, a port in use) is exactly that: it used to count as started, so
+    the caller logged ``named_started`` for a daemon that had already died
+    (#1239). False covers that, an exit before the check, and the timeout.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
             with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
                 if fh.read().strip() == comm:
-                    return
+                    return not is_zombie(str(pid))
         except OSError:
-            return  # exited, or not Linux — nothing to wait for
+            return False  # exited, or not Linux
         time.sleep(0.02)
     # Returning here means the spawn lock is released while the child may
     # still be pre-execve — the race window technically reopens. Should not
@@ -173,3 +179,4 @@ def wait_for_daemon(comm: str, pid: int, timeout_s: float = 5.0) -> None:
     log.warning(
         "daemon_spawn_visibility_timeout", comm=comm, pid=pid, timeout_s=timeout_s
     )
+    return False
