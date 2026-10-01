@@ -497,6 +497,14 @@ the formatter handles the rest.
   exists" match. `migrations_applied` now lists the revisions that
   committed before the failing one, instead of always being empty.
 
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
 - **BIND9 serves each zone's own SOA timers, and changing them moves the
   zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
   stored, editable and exported, but never sent to the BIND9 agent, which

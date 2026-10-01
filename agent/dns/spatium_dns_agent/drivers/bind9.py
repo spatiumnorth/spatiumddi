@@ -1716,7 +1716,11 @@ class Bind9Driver(DriverBase):
         if apex.placeholder_glue:
             lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
         for rec in zone.get("records", []) or []:
-            rec_ttl = rec.get("ttl") or ttl
+            # A record's own TTL wins, 0 included (#1382): 0 is how an operator
+            # says "do not cache this" through a cut-over, and ``or`` served it
+            # with the zone's TTL. Only a record with no TTL of its own takes
+            # the zone's, as on the RFC 2136 path (apply_record_op).
+            rec_ttl = ttl if rec.get("ttl") is None else rec["ttl"]
             name_field = rec.get("name") or "@"
             rtype = rec["type"].upper()
             value = rec["value"]
