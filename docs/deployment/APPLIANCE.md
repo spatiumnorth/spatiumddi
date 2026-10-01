@@ -3255,10 +3255,31 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check. The
-DNS, DHCP and looking-glass role pods on an appliance still skip verification
-toward the control plane; they need the pinned certificate passed through to
-them, which is tracked separately.
+comparing the logged fingerprint with **Appliance → TLS** is the check.
+
+**The role pods use the same pin (#1281).** On an off-cluster appliance the
+DNS, DHCP and looking-glass pods reach the control plane at the same external
+URL, sending the agent key and receiving their DNS / DHCP configuration over
+it. They used to skip verification there. The chart now mounts the
+supervisor's `tls/` directory read-only (`/var/persist/spatium-supervisor/tls`,
+which holds only public material; the private key is in `identity/`) and sets
+`TLS_PINNED_CERTS_PATH` to the pin in it. The agent trusts exactly the
+certificates in that file, with no hostname check, the same way the
+supervisor does, and reads it on every connection, so a certificate the
+supervisor re-pins reaches the agents without a restart. Until the supervisor
+has pinned, every request fails and the agent logs
+`control_plane_pin_unavailable`; it does not fall back to skipping. The one
+exception is a supervisor started by hand with
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins nothing, so it renders its
+agents with the skip too (`controlPlaneTls.insecureSkipVerify`), and they warn
+about it on every start. On a
+control-plane member, including an appliance promoted into the control plane,
+the agents are not given the external URL at all: they use the in-cluster api
+Service, as the member's supervisor does. The pin cannot serve there, because
+a member's supervisor heartbeats in-cluster and so never re-pins, while a
+member joining re-mints the Web UI certificate. An `http://` URL carries no
+certificate to verify; the supervisor upgrades its own traffic to the
+`https://` target, but the role agents do not yet.
 
 ### Pairing code (recommended) — issue #169
 

@@ -467,12 +467,18 @@ async def restore_backup(
             f"applied)."
         )
     elif migration is not None and migration.state == "auto_recovered":
+        n = len(migration.migrations_applied)
         note += (
             f" Schema-version drift detected ({migration.source_head!r} → "
             f"{migration.local_head!r}) and auto-recovered via "
-            f"`alembic stamp head` — the restored schema was already "
-            f"at the local install's expected head, so no migrations "
-            f"actually needed to run. The install is safe to use."
+            f"`alembic stamp head`: the upgrade stopped on an object that "
+            f"already exists, and every table and column the local head "
+            f"declares was found in the restored schema"
+            + (
+                f" ({n} migration{'s' if n != 1 else ''} committed before the stop)."
+                if n
+                else ", so no migrations actually needed to run."
+            )
         )
     elif migration is not None and migration.state == "incompatible_newer":
         note += (
@@ -484,8 +490,9 @@ async def restore_backup(
     elif migration is not None and migration.state == "failed":
         note += (
             f" WARNING: alembic upgrade failed after the data load — "
-            f"run `alembic upgrade head` manually before relying on this "
-            f"install. Reason: {migration.error}"
+            f"run `alembic upgrade head` in the api container before relying "
+            f"on this install (the command for each deployment is under "
+            f"§2.9 Backup and Restore in docs/features/SYSTEM_ADMIN.md). Reason: {migration.error}"
         )
     elif migration is not None and migration.state == "unknown":
         note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."

@@ -557,6 +557,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_bundle_render_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
+    # #1232 — a DNS record change an agent gave up on after every retry.
+    # Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_record_op_failed_alert_rule,
+        )
+
+        await seed_dns_record_op_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.

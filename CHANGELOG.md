@@ -292,6 +292,146 @@ the formatter handles the rest.
   - Also fixed: the Fleet slot cards showed an error as
     `Request failed with status code …` instead of the server's reason.
 
+- **The privacy statement lists the public resolvers PowerDNS
+  uses, and its guard now scans the agents too (#1353).** The agent
+  renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
+  `pdns.conf`, and the setting added on the agent side in #250 to
+  change it was never wired to the control plane. PowerDNS sends two
+  kinds of lookup through it: the target of every ALIAS record, so
+  Cloudflare and Google see those names, and its own built-in
+  security-status poll, which runs on every PowerDNS server at startup
+  and periodically after, and tells them and PowerDNS which PowerDNS
+  version you run. `docs/PRIVACY.md`, which claims to list every
+  outbound connection, mentioned neither. It now does, in a new §3.5
+  for the DNS and DHCP servers; making the resolver configurable is
+  still open. The CI guard that holds the page to that claim scanned
+  `backend/app` only, and this connection was in agent code, as IP
+  addresses its hostname scan could not see. It now also scans the
+  four shipped agent packages, for hostnames and for public IP
+  addresses in string values, matches an address only as a whole
+  address, and fails when a new agent package is missing from the
+  scan or from the CI path filter's carve-outs, which now include
+  those packages so an agent-only change runs the guard.
+
+- **A PXE vendor match, a dynamic-update ACL entry and a BIND9 zone
+  forwarder are checked before they reach the config (#1357).** Each was
+  written verbatim into Kea's or BIND's config, so one malformed value
+  made the server refuse the file and the whole server group stopped
+  converging. A PXE profile's `vendor_class_match` now gets the check a
+  phone profile's has had since #1294 (no `'`, no control characters).
+  On both, a non-ASCII prefix is now measured in bytes and compared as
+  hex, so it can match: quoted, Kea read it a byte short, and a
+  character above U+00FF made Kea refuse the config. An update-ACL
+  entry's `name_pattern` must be a DNS name (a
+  leading `*.` for `wildcard`; `.` or `*` for `self`), and its
+  `record_types` must be types BIND knows, including `DHCID`, `ANY`,
+  `TYPE<n>` and a count such as `A(5)`; lower case is still accepted and
+  upper-cased. A forward zone's forwarders on a BIND9 group must be `ip`
+  or `ip@port` (`ip port <n>` is accepted and rewritten); Technitium
+  zones may still name a hostname or DoH URL, and moving such a zone
+  into a BIND9 group is refused. Each answers 422 naming the offending
+  element; a DNS import into a BIND9 group drops such a forwarder and
+  says so in the result. Rows stored before this are left out of the
+  agent's config with a log line instead of shipped: a bad PXE match
+  drops its class, a bad forwarder drops itself, and a bad update-ACL
+  `grant` drops itself while a bad `deny` also drops the entries after
+  it, so the policy that remains never allows more than the one stored.
+
+- **An unknown URL shows a "Page not found" page instead of a blank
+  screen (#1360).** The route table had no catch-all, so a mistyped
+  or stale URL matched nothing and rendered an empty page with no
+  sidebar and no way back. A signed-out user on such a URL was not
+  sent to the login page either, because the login check never ran.
+  The new page renders inside the app, shows the requested path as
+  plain text, and links back to the dashboard. It also suggests a few
+  pages from the sidebar's own list, closest to the mistyped path
+  first, and skips any whose feature is turned off (Settings →
+  Features). Signed-out users now go to the login page. Also: the
+  legacy `/network/<id>` bookmark route matched any `/network/...`
+  typo and looked it up as a device. It now redirects a real device id
+  to `/network/devices/<id>`, which its comment always said it did,
+  and shows the 404 page for anything else.
+
+- **External URLs from PeeringDB are linked only when they are http
+  or https (#1361).** The website and looking-glass fields on an ASN's
+  BGP footprint tab went into a link whatever their scheme. Now only an
+  `http:` or `https:` URL becomes a link; anything else, including a
+  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
+  are also checked when they are fetched: a website is kept only if it
+  is http(s), and a looking glass only if it is http(s), telnet or ssh,
+  the schemes PeeringDB itself accepts. The GitHub release links on the
+  sidebar and the Releases tab are also linked only when http(s).
+
+- **The backup docs no longer say an archive is encrypted (#1352).**
+  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
+  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
+  in three places: that an unauthenticated NFS export exposes only
+  archive names and sizes, that LUKS on a removable backup disk is
+  optional because the archive is already encrypted, and that the
+  least-privilege pull token "fetches ciphertext". The NFS destination
+  form carried the same claim. Anyone who can read an archive can read
+  the whole database, users, IPAM / DNS / DHCP data and the audit log
+  included. Most stored credentials stay encrypted under the source
+  install's key, but not each DNS server group's internal TSIG key,
+  which is stored in clear and is accepted for zone transfers and
+  dynamic updates from any address (encrypting it is #1364). The docs
+  now say what an archive exposes, the NFS section says to restrict
+  the export, and the removable-disk section no longer recommends
+  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
+  `cryptsetup` to unlock it.
+
+- **A backup taken on an older release restores again (#1363).** A
+  full restore replayed the archive with `pg_restore --clean`, which
+  drops only the objects the archive contains. Every table a later
+  migration had added survived the replay, with its constraints. An
+  archive older than `dns_agent_bundle` (every 2026.09.04-1 archive)
+  therefore failed with a 400: `--clean` could not drop
+  `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on
+  it. A surviving table with no such dependency let the replay through
+  and stopped the post-restore upgrade on "already exists" instead. A
+  full restore now clears the schema and replays the archive in one
+  transaction: every table, view, sequence, standalone type and routine
+  in `public` is dropped (extension members are kept), then the
+  archive's SQL is applied by `psql --single-transaction`. For a
+  custom-format archive that SQL is streamed from `pg_restore`, not
+  staged on disk. If `pg_restore` fails part way, psql is killed before
+  it reaches end of input, so it never commits. A replay counts as
+  complete only when psql acknowledges the end of the script (a per-run
+  `\echo` token), so a psql that left early with exit 0 is a partial
+  restore, not a success. Any failure before end of input rolls back and
+  leaves the database as it was; a timeout after it, while psql may be
+  committing, is reported as an unknown outcome instead. Backups dump the whole database, so clearing loses
+  nothing the archive does not recreate. An error now leads with
+  PostgreSQL's `ERROR` line instead of notices. Also documented: the
+  command for the manual `alembic upgrade head` a `failed` restore asks
+  for, on Compose, the appliance and Helm (`SYSTEM_ADMIN.md` §2.9).
+  Found by amoona6's gate walk of #1349.
+
+- **A restore no longer stamps a half-migrated schema as current
+  (#1233).** When `alembic upgrade head` failed after a restore with
+  "already exists", from any revision, the restore ran `alembic stamp
+  head` and reported `auto_recovered`. That error is the signature of a
+  stale `alembic_version` over a schema already at head, but not proof
+  of it. Any revision that meets one object it would create fails the
+  same way, and since migrations commit one revision at a time (#1204),
+  the revisions before it stay applied and those after it never run.
+  The restore now stamps head only after checking that every table and
+  column this build's models declare exists in the restored database.
+  If anything is missing, or the check cannot run, the restore reports
+  `failed`, names the missing tables and columns and the revision that
+  failed, and leaves `alembic_version` at the last revision that
+  committed, so a manual `alembic upgrade head` resumes from there.
+  The check covers tables and columns in one direction only: on a
+  database migrated cleanly to head, the models omit a column the
+  initial schema still has, and index and constraint names differ in
+  dozens of places, so a full schema comparison would refuse the case
+  the recovery exists for. The restore's upgrade error now starts at
+  the exception line rather than at the start of alembic's output. On
+  a long upgrade the first 1,500 characters held only per-revision
+  INFO lines, which cut off the exception and hid the "already
+  exists" match. `migrations_applied` now lists the revisions that
+  committed before the failing one, instead of always being empty.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:
@@ -523,6 +663,39 @@ the formatter handles the rest.
     also makes re-submitting a batch idempotent. The Copilot's
     `create_dns_record` refuses it. A record in the trash does not
     count.
+
+- **DNS record changes an agent could not apply are retried with
+  backoff, recovered when never acknowledged, and reported when they
+  give up (#1232).** Three faults, all silent. A failed apply was
+  retried on every heartbeat, so a DNS daemon restart of about
+  2.5 minutes spent all five attempts and the change was dropped for
+  good. An op shipped to an agent that restarted before its next
+  heartbeat, or whose long-poll response was lost, stayed `in_flight`
+  forever: never re-shipped, never failed, and the ACME DNS-01 wait
+  timed out on it. The agent could also drop an ack appended while a
+  heartbeat was in flight, with the same result. And nothing reported a
+  failed op: the record was in SpatiumDDI and the UI but not on the
+  server, until the next full render. Now:
+  - A failed op waits 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m between
+    attempts, and fails after 8, about 45 minutes.
+  - An op unacknowledged for 5 minutes returns to the retry path on the
+    agent's next heartbeat. That also recovers ops already stranded.
+  - The agent removes only the acks it actually sent, and sends at most
+    the 5000 per heartbeat the control plane accepts. Each op carries a
+    dispatch number the agent echoes, so a late error for an earlier
+    dispatch is not charged twice.
+  - A failed op on an agent-based server raises the new default-on
+    alert rule `dns_record_op_failed`. The server's Sync tab shows when a
+    backing-off op retries.
+
+  Retrying an older op after a newer one for the same RRset applied
+  would have reverted the newer change, because every op carries the
+  whole RRset (#773). This was possible before, and backoff makes it
+  likelier. Such an older op now becomes `superseded` instead, and the
+  ACME wait follows it to the op that delivered its change. Also, an
+  ack from one agent can no longer change another server's op.
+  Migration `d8e1b5a26c47` (two nullable columns and an index on
+  `(server_id, created_at)`).
 
 - **DHCP option names and values are checked when saved (#1228).**
   Scope, pool, reservation, option-template, client-class and
@@ -1886,10 +2059,8 @@ the formatter handles the rest.
   and session token no longer cross the wire in cleartext before the
   redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
   the CA, so an appliance moved to a rebuilt control plane pins the new one
-  rather than refusing it forever. Still open: the
-  DNS, DHCP and looking-glass role pods on an appliance skip verification
-  toward the control plane, which needs the pinned certificate passed
-  through to them (tracked separately).
+  rather than refusing it forever. The DNS, DHCP and looking-glass role
+  pods were left skipping verification here; #1281 below closes that.
   **Upgrade note:** an already-paired appliance takes its pin at its first
   contact after the upgrade, then checks it against the CA's list; a
   mismatch is logged as `supervisor.tls.pin_not_vouched`.
@@ -1906,6 +2077,38 @@ the formatter handles the rest.
   every real write moves, so the write-back rolls the frontend. Browsers
   stop being shown the first-boot certificate after a reboot as well. The
   revert itself remains #1215.
+
+- **Appliance role pods verify the control plane's TLS certificate
+  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
+  pods reach the control plane at its external URL, and the chart gave
+  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
+  the platform-wide agent key out and the DNS / DHCP configuration back,
+  so anyone on the path could read the key and serve a node its zones and
+  scopes. They now use the certificate their supervisor pinned (#1219): the
+  chart mounts the supervisor's `tls/` directory read-only (public material
+  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
+  trusts exactly the certificates in that file, with a pinned leaf as its
+  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
+  could not do this: it checks the hostname and needs a real CA, so a
+  CA-issued leaf or an IP URL fails there. The file is read on every
+  connection, so a certificate the supervisor re-pins reaches the agents
+  without a restart. Until the supervisor has pinned, every request fails
+  and the agent logs `control_plane_pin_unavailable`; it never falls back to
+  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
+  and is used only for an `https://` URL. The one exception is a supervisor
+  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
+  nothing, so its agents take the skip too (chart value
+  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
+  about it on every start.
+  An appliance promoted into the control plane no longer gives its agents
+  the external URL at all: they use the in-cluster api Service, as its
+  supervisor does. That closes the #409 known limitation and is also
+  required here, because a member's supervisor heartbeats in-cluster and
+  never re-pins, while a member joining re-mints the Web UI certificate.
+  The role apply key now includes the agents' URL, so a promotion re-applies
+  the role chart. Not covered: an `http://` control-plane URL, which the
+  role agents still use as typed (the supervisor upgrades its own traffic
+  to the `https://` target).
 
 - **nmap `extra_args` are an allowlist, and a Network Editor can no longer
   read files through a scan (#1223).** The scan endpoint is gated on

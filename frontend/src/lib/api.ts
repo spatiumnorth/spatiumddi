@@ -5034,6 +5034,10 @@ export interface DNSPendingOpEntry {
   last_error: string | null;
   created_at: string;
   applied_at: string | null;
+  // #1232 — when a backing-off op may ship again (null = now), and the newer
+  // op a `superseded` one was retired in favour of.
+  next_attempt_at?: string | null;
+  superseded_by?: string | null;
 }
 
 export interface DNSPendingOpsResponse {

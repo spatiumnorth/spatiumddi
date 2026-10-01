@@ -53,6 +53,18 @@ def _touch_ready_marker(state_dir: Path) -> None:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
 
 
+
+def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
+    """One op ack. Echoes the page's ``dispatch`` stamp when it has one
+    (#1232), so the control plane can tell a late ack for an earlier dispatch
+    from this one and not charge a failure twice."""
+    ack: dict[str, Any] = {"op_id": op["op_id"], "result": result}
+    if message is not None:
+        ack["message"] = message
+    if "dispatch" in op:
+        ack["dispatch"] = op["dispatch"]
+    return ack
+
 class SyncLoop:
     def __init__(
         self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any
@@ -351,7 +363,7 @@ class SyncLoop:
             try:
                 result = self.driver.apply_record_op(op)
                 self.heartbeat.pending_acks.append(
-                    {"op_id": op["op_id"], "result": "ok"}
+                    _ack(op, "ok")
                 )
                 log.info(
                     "record_op_applied",
@@ -366,7 +378,7 @@ class SyncLoop:
             except Exception as e:
                 log.exception("op_apply_failed", op_id=op.get("op_id"))
                 self.heartbeat.pending_acks.append(
-                    {"op_id": op["op_id"], "result": "error", "message": str(e)}
+                    _ack(op, "error", str(e))
                 )
                 self.heartbeat.failed_ops_count += 1
         if dnssec_states:

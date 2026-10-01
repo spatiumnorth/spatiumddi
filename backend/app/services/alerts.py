@@ -258,6 +258,16 @@ _AGENT_DAEMON_DEGRADED_GRACE = timedelta(minutes=5)
 RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED = "agent_bundle_render_failed"
 _AGENT_BUNDLE_STALL = timedelta(minutes=10)
 
+# Issue #1232 — a record change an agent could not apply after every retry
+# (``dns_record_op.state = 'failed'``). Nothing reported one: the database and
+# the UI hold the record, the live zone does not, and the next structural
+# render or agent restart is the only thing that would bring them back in
+# line. Subject = the dns_server row. Fires for ops that failed within
+# ``_DNS_OP_FAILED_WINDOW`` and auto-resolves after it: failed ops are never
+# pruned, so "any failed op ever" would fire forever.
+RULE_TYPE_DNS_RECORD_OP_FAILED = "dns_record_op_failed"
+_DNS_OP_FAILED_WINDOW = timedelta(hours=24)
+
 # Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
 # Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
 # row for a cluster node).
@@ -592,6 +602,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AGENT_SPOOL_TRIMMED,
         RULE_TYPE_AGENT_DAEMON_DEGRADED,
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
+        RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
@@ -3512,6 +3523,61 @@ async def _matching_agent_spool_trimmed_subjects(
     return matches
 
 
+async def _matching_dns_record_op_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_record_op_failed`` — every agent-based DNS server with a record op
+    that gave up (``failed``) within :data:`_DNS_OP_FAILED_WINDOW` (#1232).
+
+    Agent-based only: an agentless driver (Windows, cloud, ``technitium_api``)
+    applies an op once, inline, and returns the failure to the caller who made
+    the change, and the retry, backoff and "until a render or agent restart"
+    this rule describes do not apply to it.
+    """
+    from app.drivers.dns import AGENTLESS_DRIVERS  # noqa: PLC0415
+    from app.models.dns import DNSRecordOp, DNSServer  # noqa: PLC0415
+
+    now = now or datetime.now(UTC)
+    rows = (
+        await db.execute(
+            select(DNSRecordOp, DNSServer.name)
+            .join(DNSServer, DNSServer.id == DNSRecordOp.server_id)
+            .where(
+                DNSRecordOp.state == "failed",
+                DNSRecordOp.updated_at >= now - _DNS_OP_FAILED_WINDOW,
+                DNSServer.driver.not_in(sorted(AGENTLESS_DRIVERS)),
+            )
+            .order_by(DNSRecordOp.updated_at.desc())
+        )
+    ).all()
+    by_server: dict[Any, list[tuple[Any, str]]] = {}
+    for op, server_name in rows:
+        by_server.setdefault(op.server_id, []).append((op, server_name))
+    matches: list[tuple[str, str, str, str | None]] = []
+    for server_id, ops in by_server.items():
+        server_name = ops[0][1]
+        latest = ops[0][0]
+        record = latest.record or {}
+        # Zone names are stored as FQDNs; drop the root dot so the sentence
+        # does not end "example.com.." (#1298 review).
+        zones = sorted({op.zone_name.rstrip(".") for op, _ in ops})
+        zone_list = ", ".join(zones[:5]) + (f" and {len(zones) - 5} more" if len(zones) > 5 else "")
+        message = (
+            f"DNS server '{server_name}' could not apply {len(ops)} record change(s) in the "
+            f"last 24 h after every retry, in zone(s) {zone_list}. The records are in "
+            "SpatiumDDI but not on this server, which keeps answering with the old data. "
+            "A full config render or an agent restart sends them again, but a change the "
+            "server itself refused fails again until the record is corrected. Most recent: "
+            f"{latest.op} {record.get('name', '?')} {record.get('type', '?')} in "
+            f"{latest.zone_name.rstrip('.')}: {latest.last_error or 'no error text'}. See "
+            "the server's Sync tab for every failed op."
+        )
+        matches.append((f"dns_server:{server_id}", f"{server_name} (DNS)", message, None))
+    return matches
+
+
 async def _matching_dhcp_scope_uncoordinated_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -4980,6 +5046,49 @@ async def seed_agent_bundle_render_failed_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_RECORD_OP_FAILED_RULE_NAME = "DNS record change not applied"
+
+
+async def seed_dns_record_op_failed_alert_rule() -> None:
+    """Seed the #1232 rule, ENABLED by default.
+
+    Silent on every healthy install: an op only fails after ~45 minutes of
+    backed-off retries. When it speaks, a record the operator saved is not
+    being served and nothing else says so. Keyed on ``name``; an operator who
+    disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNS_RECORD_OP_FAILED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNS_RECORD_OP_FAILED_RULE_NAME,
+                description=(
+                    "Fires when a DNS agent could not apply a record change after "
+                    "every retry (about 45 minutes of backed-off attempts). The record "
+                    "is saved in SpatiumDDI but the server keeps answering with the "
+                    "old data. A full config render or an agent restart sends it "
+                    "again; a change the server itself refused needs the record "
+                    "corrected first. "
+                    "Auto-resolves 24 h after the last failure."
+                ),
+                rule_type=RULE_TYPE_DNS_RECORD_OP_FAILED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DHCP_PACKETS_DROPPED_RULE_NAME = "DHCP packets dropped"
 
 
@@ -6291,6 +6400,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # Same shape as agent_config_rejected: the subject_id carries
                 # the source table so a dns_server and a dhcp_server sharing
                 # a UUID never collide into one event.
+                subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DNS_RECORD_OP_FAILED:
+                op_failed = await _matching_dns_record_op_failed_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in op_failed]
+                # Same prefixed subject as the other agent rules.
                 subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED:
                 unrendered = await _matching_agent_bundle_render_failed_subjects(db, rule, now)

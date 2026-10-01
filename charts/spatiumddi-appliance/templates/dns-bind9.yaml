@@ -98,15 +98,18 @@ spec:
             # Precedence: controlPlaneUrl (external; set by the supervisor
             # only on off-cluster Application appliances) → inClusterApiUrl
             # (override for non-standard control-release name/ns) → the in-
-            # cluster api Service default. The external URL carries the
-            # appliance's self-signed cert, so the TLS-skip env below is
-            # emitted on that path (same TOFU model as the supervisor pod —
-            # the pairing code + mTLS client cert are the real auth).
+            # cluster api Service default. On the external URL the agent
+            # verifies the control plane against the certificate the
+            # supervisor pinned (#1281 — TLS_PINNED_CERTS_PATH, see
+            # ``spatiumddi-appliance.cpPin.*`` in _helpers.tpl). It used to
+            # skip verification there, which handed the agent key and the
+            # zone configuration to anyone on the path. A control-plane
+            # member is never given the external URL: the supervisor leaves
+            # it empty there, so its agents take the in-cluster path.
             - name: CONTROL_PLANE_URL
               value: {{ .Values.dnsBind9.controlPlaneUrl | default .Values.dnsBind9.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             {{- if .Values.dnsBind9.controlPlaneUrl }}
-            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
-              value: "1"
+            {{- include "spatiumddi-appliance.cpPin.env" . | nindent 12 }}
             {{- end }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsBind9.agentKey | quote }}
@@ -183,6 +186,9 @@ spec:
             # serving from last-known-good config (non-negotiable #5).
             - name: agent-state
               mountPath: /var/lib/spatium-dns-agent
+            {{- if .Values.dnsBind9.controlPlaneUrl }}
+            {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
+            {{- end }}
       # #292 — per-node hostPath, NOT a shared RWO PVC and NOT emptyDir:
       #   * A single local-path PVC pins its PV to one node, so the other
       #     DaemonSet pods can't bind it → Pending forever.
@@ -191,6 +197,9 @@ spec:
       # /var partition (survives restart + reboot + slot upgrade).
       # Containers run as root, so kubelet-created dirs are writable.
       volumes:
+        {{- if .Values.dnsBind9.controlPlaneUrl }}
+        {{- include "spatiumddi-appliance.cpPin.volume" . | nindent 8 }}
+        {{- end }}
         - name: agent-state
           hostPath:
             path: /var/lib/spatiumddi/agents/dns-bind9/state

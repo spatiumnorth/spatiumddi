@@ -64,8 +64,9 @@ set -euo pipefail
 #   charts/     Helm templates. test_upgrades_chart_bump.py exercises the
 #               chart-bump LOGIC against inline YAML, never the real chart.
 #   k8s/        Static manifests, read by nothing in the suite.
-#   agent/      Agent packages, covered by the Agent — Tests jobs. The one
-#               subtree backend tests read from is carved out in the manifest.
+#   agent/      Agent packages, covered by the Agent — Tests jobs. The
+#               shipped packages backend tests read (the firewall renderer,
+#               the outbound-host guard's scan) are carved out in the manifest.
 #   appliance/  Image build tree, covered by Appliance — Tests. The host
 #               scripts backend tests load are carved out in the manifest.
 #   .github/    Workflows + repo config. ci.yml and the gate machinery are
