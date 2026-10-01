@@ -497,6 +497,25 @@ the formatter handles the rest.
   exists" match. `migrations_applied` now lists the revisions that
   committed before the failing one, instead of always being empty.
 
+- **A record name the group's BIND would refuse is refused when it
+  is saved, not after it has stopped the server (#1378).** The record
+  API checked every owner with the RFC 2181 rule, which allows `_`, so
+  `bad_name A 192.0.2.33` was saved. BIND loads a primary zone under
+  `check-names primary fail`, so the agent's zone check refused the
+  file and quarantined the server's whole config bundle: the record
+  was never served, and no later record change on that server applied
+  while it stayed. Create, update, bulk create and the Copilot now
+  answer 422 when the owner of an A, AAAA or MX record, or the target
+  of an MX, NS, SRV or ServiceMode SVCB/HTTPS record (or of a PTR in a
+  reverse zone), is not a host name — BIND's own check-names rule,
+  zone labels included, with BIND's exceptions for Active Directory's
+  `gc._msdcs` and SPF's `_spf` labels. Underscore TXT, SRV, CNAME and
+  TLSA owners stay legal, as #597 intended. An edit is checked only
+  for the name or value it changes.
+  Rows saved before this still fail BIND's check; the name-conformance
+  report (`GET /diagnostics/name-conformance`) now lists them, and
+  deleting or renaming one lets the server apply again.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:

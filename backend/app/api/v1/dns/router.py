@@ -38,6 +38,7 @@ from app.core.agent_wake import (
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
+    bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
     validate_fqdn,
@@ -1536,6 +1537,36 @@ def _validate_address_record_value(record_type: str, value: str) -> None:
             "list in one record."
         ),
     )
+
+
+def _enforce_bind_check_names(
+    record_type: str,
+    owner_fqdn: str,
+    value: str,
+    zone_name: str,
+    *,
+    check_owner: bool = True,
+    check_target: bool = True,
+) -> None:
+    """422 a record BIND's default ``check-names`` would refuse (#1378).
+
+    The RFC 2181 owner rule lets ``_`` into any owner, but BIND refuses a zone
+    whose A / AAAA / MX owner, or MX / NS / SRV target, is not a host name —
+    and one such record made the agent quarantine the server's whole config
+    bundle, so no later change on that server applied. Refusing it here keeps
+    the API from storing what the group's BIND will not load. The rule lives in
+    ``app.core.dns_names.bind_check_names_error``.
+    """
+    err = bind_check_names_error(
+        record_type,
+        owner_fqdn,
+        value,
+        origin=zone_name,
+        check_owner=check_owner,
+        check_target=check_target,
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 # ── Server Group endpoints ──────────────────────────────────────────────────
@@ -6644,6 +6675,7 @@ async def create_record(
     )
     _validate_address_record_value(body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+    _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
     # not store the same RR twice.
     existing = await find_identical_record(
@@ -6718,6 +6750,7 @@ async def update_record(
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
     changes = body.model_dump(exclude_none=True)
+    before_name, before_value = record.name, record.value
     for k, v in changes.items():
         setattr(record, k, v)
     # #424 — validate the merged per-type fields (record_type is immutable on
@@ -6734,6 +6767,20 @@ async def update_record(
         _validate_address_record_value(record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
+    # #1378 — what the edit actually changes is checked against BIND's
+    # check-names (validate-on-write, as above), so resubmitting a row's own
+    # name or value with a TTL edit does not re-judge a row that predates it.
+    name_changed = (record.name or "").lower() != (before_name or "").lower()
+    value_changed = (record.value or "").strip() != (before_value or "").strip()
+    if zone is not None and (name_changed or value_changed):
+        _enforce_bind_check_names(
+            record.record_type,
+            record.fqdn,
+            record.value,
+            zone.name,
+            check_owner=name_changed,
+            check_target=value_changed,
+        )
     # #1230 — an edit must not turn this row into a twin of another. Only
     # checked when a field that makes up the record's identity changed, so a
     # TTL edit on a twin that predates the rule still goes through.
@@ -7218,6 +7265,7 @@ async def bulk_create_records(
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
+        _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(
             DNSRecord(
                 zone_id=zone_id,

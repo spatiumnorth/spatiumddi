@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import bind_check_names_error
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -2009,6 +2010,13 @@ async def _preview_create_dns_record(
     if not name:
         return PreviewResult(ok=False, detail="name is required (use ``@`` for apex).")
 
+    # #1378 — never propose what the group's BIND would refuse; apply
+    # refuses it too.
+    owner = zone.name if name == "@" else f"{name}.{zone.name}"
+    names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
+    if names_err is not None:
+        return PreviewResult(ok=False, detail=names_err)
+
     # Surface a heads-up if a row with the same (zone, name, type, value)
     # already exists; preview doesn't reject — operator may want a parallel
     # row (e.g. multiple A records for round-robin).
@@ -2072,6 +2080,11 @@ async def _apply_create_dns_record(
         if name in ("@", "")
         else f"{name}.{zone.name}".rstrip(".") + ("." if zone.name.endswith(".") else "")
     )
+
+    # #1378 — the same check-names refusal as the REST create path.
+    names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
+    if names_err is not None:
+        raise ValueError(names_err)
 
     # #1230 — never store the same RR twice; see app.services.dns.record_identity.
     existing = await find_identical_record(
