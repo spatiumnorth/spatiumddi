@@ -6,7 +6,7 @@ whether the release it is going back to can run on this database. Releases
 older than this table are answered from ``app/data/release_schema_heads.json``.
 
 Revision ID: 99e91dcae1e2
-Revises: e6b2d94f1a37
+Revises: d8e1b5a26c47
 Create Date: 2026-09-29
 """
 
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "99e91dcae1e2"
-down_revision = "e6b2d94f1a37"
+down_revision = "d8e1b5a26c47"
 branch_labels = None
 depends_on = None
 

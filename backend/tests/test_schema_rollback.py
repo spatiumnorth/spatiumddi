@@ -41,8 +41,10 @@ from app.services.appliance.slot import SlotStatus
 from app.services.upgrades import preflight
 from app.services.upgrades import schema_rollback as sr
 
-# The tree's own head, and a revision behind it. ``e6b2d94f1a37`` is the
-# head this change chains off, i.e. the nightly amoona6 reproduced from.
+# The tree's own head, and a revision behind it. ``e6b2d94f1a37`` was the
+# head of the nightly amoona6 reproduced from; this change has since been
+# re-chained after #1298's migration, so it is further behind, still an
+# ancestor.
 PREVIOUS_HEAD = "e6b2d94f1a37"
 # The release the reproduction rolled back TO, and the head its tree ended at.
 OLD_RELEASE = "2026.09.04-1"
