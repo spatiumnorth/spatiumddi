@@ -379,9 +379,11 @@ async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.
 
     The set-based form of ``default_conflict_check``'s record rule (#1389):
     a per-record ``SELECT`` made restoring a 250k-record zone 250k queries.
-    Identity is the zone, name, type and value, plus the view: under
-    split-horizon the same record in two views is two records, not a clash.
-    Returns ``{record id: label}``.
+    Identity is the zone, name, type and value, plus the view and the
+    structured fields: under split-horizon the same record in two views is two
+    records, and an MX or SRV with the same target at another priority, weight
+    or port is another record, not a clash. That matches the identity bulk
+    record create dedupes on (#1230). Returns ``{record id: label}``.
     """
     live = aliased(DNSRecord)
     stmt: Any = (
@@ -396,6 +398,9 @@ async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.
                 live.record_type == DNSRecord.record_type,
                 live.value == DNSRecord.value,
                 live.view_id.is_not_distinct_from(DNSRecord.view_id),
+                live.priority.is_not_distinct_from(DNSRecord.priority),
+                live.weight.is_not_distinct_from(DNSRecord.weight),
+                live.port.is_not_distinct_from(DNSRecord.port),
                 live.id != DNSRecord.id,
             )
             .exists(),
@@ -500,7 +505,9 @@ async def restore_batch(
             .values(deleted_at=None, deleted_by_user_id=None, deletion_batch_id=None)
             .execution_options(synchronize_session="evaluate")
         )
-        if updated.rowcount:
+        # Same guard as the delete side: a driver that cannot report a count
+        # answers -1, which must not be added to the total.
+        if updated.rowcount is not None and updated.rowcount > 0:
             result.bulk[zone_id] = {"dns_record": int(updated.rowcount)}
 
     for obj in result.restored:

@@ -213,6 +213,48 @@ async def test_the_same_record_in_another_view_is_not_a_conflict(
 
 
 @pytest.mark.asyncio
+async def test_an_mx_at_another_priority_is_not_a_conflict(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Priority, weight and port are part of a record's identity, as bulk
+    create treats them (#1230): MX 10 and MX 20 to one host are two records."""
+    headers = await _admin(db_session)
+    group_id, zone_id = await _zone_with_records(db_session, 0)
+    zone_name = (
+        await db_session.execute(select(DNSZone.name).where(DNSZone.id == zone_id))
+    ).scalar_one()
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name="@",
+            fqdn=zone_name,
+            record_type="MX",
+            value=f"mail.{zone_name}",
+            priority=10,
+        )
+    )
+    await db_session.commit()
+    await _trash_zone(client, headers, group_id, zone_id)
+
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name="@",
+            fqdn=zone_name,
+            record_type="MX",
+            value=f"mail.{zone_name}",
+            priority=20,
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(f"/api/v1/admin/trash/dns_zone/{zone_id}/restore", headers=headers)
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert all(r.deleted_at is None for r in await _records(db_session, zone_id))
+
+
+@pytest.mark.asyncio
 async def test_a_record_trashed_before_the_zone_stays_in_the_trash(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
