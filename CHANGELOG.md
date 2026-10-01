@@ -267,6 +267,35 @@ the formatter handles the rest.
   reason for a refused save instead of "Request failed with status code
   422".
 
+- **Building a DNS group's config no longer loads every blocklist
+  entry as a database object (#1109).** The bundle the agents
+  long-poll for collected blocklist entries the way #948 stopped
+  collecting records: a full ORM object per entry, the shape that
+  OOM-killed the api on a 250k-record group. The Family filter profile
+  (#878) brings ~596k entries in one click. Entries are now read as
+  plain columns, in a fixed order within each list so the bundle's
+  ETag no longer depends on how Postgres happens to return them. On
+  100k entries this went from 3.4 s and a 100 MiB peak to 1.2 s and
+  38 MiB. The lists themselves are now collected in a fixed order too
+  (a view's own lists first, then the group's, each by name): it
+  decides which list wins a duplicate name, and it used to follow the
+  order Postgres returned the assignments in, so the winner and the
+  ETag could change between two builds of an unchanged group.
+
+- **Deleting a large zone, and opening the Trash, no longer scale with
+  the zone (#1231).** The default zone delete loaded every record,
+  stamped each through the ORM and wrote one audit row per record, all
+  in one transaction and computing each audit hash under the global
+  audit lock, so it blocked every other audited change for its
+  duration. A zone's records are now stamped by one `UPDATE`, and the
+  zone's own audit row records how many it took with it
+  (`old_value.cascaded`). A record already in the trash keeps its own
+  deletion and comes back with that one, not with the zone. The Trash
+  page loaded every soft-deleted row of every type into Python on
+  each view, plus a count per batch per type; it now filters, counts
+  and pages in SQL, and counts batch sizes for the shown rows only.
+  The search stays a literal substring match.
+
 - **Cluster health no longer counts a joining database replica as a
   ready instance (#1213).** The workload rollup on
   `GET /appliance/cluster/health` skipped only finished Job pods, so
