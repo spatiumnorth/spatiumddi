@@ -248,6 +248,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **External URLs from PeeringDB are linked only when they are http
+  or https (#1361).** The website and looking-glass fields on an ASN's
+  BGP footprint tab went into a link whatever their scheme. Now only an
+  `http:` or `https:` URL becomes a link; anything else, including a
+  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
+  are also checked when they are fetched: a website is kept only if it
+  is http(s), and a looking glass only if it is http(s), telnet or ssh,
+  the schemes PeeringDB itself accepts. The GitHub release links on the
+  sidebar and the Releases tab get the same http(s) check.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:

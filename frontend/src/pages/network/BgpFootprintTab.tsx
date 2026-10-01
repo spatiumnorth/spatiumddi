@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { bgpApi } from "@/lib/api";
+import { safeExternalHref } from "@/lib/safeUrl";
 import { cn } from "@/lib/utils";
 
 /**
@@ -456,7 +457,13 @@ function Field({
   );
 }
 
-function externalLink(href: string) {
+// PeeringDB values: only http(s) becomes a link. Anything else, including
+// a telnet: or ssh: looking glass, is shown as plain text (#1361).
+function externalLink(value: string) {
+  const href = safeExternalHref(value);
+  if (!href) {
+    return <span className="break-all">{value}</span>;
+  }
   return (
     <a
       href={href}
@@ -464,7 +471,7 @@ function externalLink(href: string) {
       rel="noreferrer noopener"
       className="inline-flex items-center gap-1 text-primary hover:underline"
     >
-      <span className="break-all">{href}</span>
+      <span className="break-all">{value}</span>
       <ExternalLink className="h-3 w-3 flex-shrink-0" />
     </a>
   );
