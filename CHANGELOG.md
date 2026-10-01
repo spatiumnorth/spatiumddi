@@ -266,6 +266,31 @@ the formatter handles the rest.
   LUKS: the appliance refuses a `crypto_LUKS` disk, having no
   `cryptsetup` to unlock it.
 
+- **A restore no longer stamps a half-migrated schema as current
+  (#1233).** When `alembic upgrade head` failed after a restore with
+  "already exists", from any revision, the restore ran `alembic stamp
+  head` and reported `auto_recovered`. That error is the signature of a
+  stale `alembic_version` over a schema already at head, but not proof
+  of it. Any revision that meets one object it would create fails the
+  same way, and since migrations commit one revision at a time (#1204),
+  the revisions before it stay applied and those after it never run.
+  The restore now stamps head only after checking that every table and
+  column this build's models declare exists in the restored database.
+  If anything is missing, or the check cannot run, the restore reports
+  `failed`, names the missing tables and columns and the revision that
+  failed, and leaves `alembic_version` at the last revision that
+  committed, so a manual `alembic upgrade head` resumes from there.
+  The check covers tables and columns in one direction only: on a
+  database migrated cleanly to head, the models omit a column the
+  initial schema still has, and index and constraint names differ in
+  dozens of places, so a full schema comparison would refuse the case
+  the recovery exists for. The restore's upgrade error now starts at
+  the exception line rather than at the start of alembic's output. On
+  a long upgrade the first 1,500 characters held only per-revision
+  INFO lines, which cut off the exception and hid the "already
+  exists" match. `migrations_applied` now lists the revisions that
+  committed before the failing one, instead of always being empty.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:
