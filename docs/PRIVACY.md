@@ -45,7 +45,7 @@ documented on this page.
 | Crash / error reporting | None. Errors go to your structured logs and the in-app diagnostics table. No Sentry, no Bugsnag, no third-party error sink. |
 | Accounts / registration / licensing | None. SpatiumDDI has no account system of its own, no activation, no entitlement check, and no trial timer. Apache 2.0, run it. |
 | Your DDI data | Never leaves your PostgreSQL unless you configure something that sends it (an integration to your own controller, a backup target you own, an alert webhook you point somewhere). |
-| Web UI tracking | The frontend loads no external script, font, image, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. (Until #1353 the MFA enrolment screen fetched its QR code from `api.qrserver.com`, sending the TOTP secret with it; see §8.) |
+| Web UI tracking | The frontend loads no external script, font, image, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. (Until #1353 the MFA enrolment screen fetched its QR code from `api.qrserver.com`, sending the TOTP secret with it; see §8.) One exception, on one page: the API reference at `/api/redoc` shows ReDoc's "API docs by Redocly" footer logo, an image your browser fetches from `cdn.redoc.ly` when you open that page, carrying nothing but your IP address and the usual browser headers (the Content-Security-Policy allows it there and nowhere else). Blocked or air-gapped, the page loses only the logo. |
 | Docs site tracking | `www.spatiumddi.com` is a static Jekyll site with no analytics tag, no tracker pixel, and no third-party font or CDN include. |
 
 ## 2. The one connection that is on by default
@@ -262,7 +262,9 @@ fetch. Three guards keep this one honest:
   `.github/scripts/ci-backend-must-run.txt`).
 * **`frontend/src/lib/outbound-hosts.test.ts`** does the same for the
   Web UI: every hostname in a string literal, template or JSX text under
-  `frontend/src`, and in `frontend/index.html`, must appear on this page.
+  `frontend/src`, in `frontend/index.html`, and in the web tier's
+  `frontend/default.conf.template` (its Content-Security-Policy), must
+  appear on this page.
   It matches every host rather than only `src=` / `fetch(` uses, because
   a URL built into a variable and handed to an `<img>` later is
   indistinguishable from a link by syntax. That is exactly how the MFA

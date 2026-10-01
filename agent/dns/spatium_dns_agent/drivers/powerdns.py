@@ -26,6 +26,7 @@ the first ship.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -57,23 +58,42 @@ _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
 
 # ``resolver=`` takes ``ip``, ``ip:port`` or ``[v6]:port``, comma-separated.
-_ALIAS_RESOLVER_RE = re.compile(r"^[0-9A-Fa-f.:\[\],]*$")
+_ALIAS_RESOLVER_PORTED_RE = re.compile(r"^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$")
+
+
+def _alias_resolver_entry_ok(entry: str) -> bool:
+    """One ``resolver=`` element: an address, optionally with a port."""
+    ported = _ALIAS_RESOLVER_PORTED_RE.fullmatch(entry)
+    host = (ported.group(1) or ported.group(2)) if ported else entry
+    if ported and not 1 <= int(ported.group(3)) <= 65535:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # A bracketed host must be v6 and an unbracketed ``ip:port`` must be v4;
+    # a zone index (``%eth0``) is not something ``resolver=`` can parse.
+    if ported and (addr.version == 6) != bool(ported.group(1)):
+        return False
+    return "%" not in entry
 
 
 def _safe_alias_resolver(value: Any) -> str:
     """The ALIAS resolver list to write into pdns.conf, or "" for ALIAS off.
 
     The control plane builds the list from validated forwarders (#1353), but
-    it lands in pdns.conf, where a newline would start a new directive, so it
-    is checked again here. Anything that is not an address list turns ALIAS
-    off rather than reaching the file.
+    it lands in pdns.conf, where a newline would start a new directive and a
+    value pdns cannot parse stops it starting, so every element is checked
+    again here. Anything that is not an address list turns ALIAS off rather
+    than reaching the file.
     """
     if not isinstance(value, str) or not value.strip():
         return ""
-    if not _ALIAS_RESOLVER_RE.match(value.strip()):
+    entries = value.strip().split(",")
+    if not all(_alias_resolver_entry_ok(e) for e in entries):
         log.warning("powerdns_alias_resolver_refused", value=value[:200])
         return ""
-    return value.strip()
+    return ",".join(entries)
 
 
 def _quote_txt(value: str) -> str:

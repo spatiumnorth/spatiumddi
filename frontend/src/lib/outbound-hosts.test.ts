@@ -17,7 +17,9 @@
  * sentence a human writes into the document readers actually read.
  *
  * Comments are not scanned (they are not AST nodes); string literals, template
- * chunks, JSX text and attribute values are, plus `index.html`.
+ * chunks, JSX text and attribute values are, plus `index.html` and the web
+ * tier's nginx template, whose Content-Security-Policy names every origin the
+ * browser is allowed to load from.
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -34,7 +36,7 @@ const PRIVACY = fileURLToPath(
 
 // No ``{`` or ``$`` in the class, so an interpolated ``https://${host}/`` yields
 // no match rather than a fragment.
-const URL_RE = /https?:\/\/([A-Za-z0-9._-]+)/g;
+const URL_RE = /(?:https?|wss?):\/\/([A-Za-z0-9._-]+)/g;
 // Only something that looks like a real hostname must be documented; this
 // drops ``https://localhost``, ``https://...`` and loopback literals.
 const HOSTNAME_RE =
@@ -100,7 +102,11 @@ function documented(host: string, privacy: string): boolean {
   return new RegExp(`(?<![\\w.:-])${escaped}(?![\\w:-]|\\.\\w)`).test(privacy);
 }
 
+let scanned: Map<string, Set<string>> | undefined;
+
+/** Parsed once: every test below reads the same scan. */
 function hostsInUi(): Map<string, Set<string>> {
+  if (scanned) return scanned;
   const found = new Map<string, Set<string>>();
   const add = (host: string, where: string) => {
     if (!found.has(host)) found.set(host, new Set());
@@ -112,11 +118,12 @@ function hostsInUi(): Map<string, Set<string>> {
       for (const host of hostsIn(text)) add(host, where);
     }
   }
-  for (const host of hostsIn(
-    readFileSync(join(FRONTEND, "index.html"), "utf-8"),
-  )) {
-    add(host, "index.html");
+  for (const name of ["index.html", "default.conf.template"]) {
+    for (const host of hostsIn(readFileSync(join(FRONTEND, name), "utf-8"))) {
+      add(host, name);
+    }
   }
+  scanned = found;
   return found;
 }
 

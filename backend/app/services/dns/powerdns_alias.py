@@ -40,6 +40,10 @@ def alias_resolver(forwarders: Iterable[str] | None, forward_transport: str | No
             addr = ipaddress.ip_address(host.strip())
         except ValueError:
             continue
+        if isinstance(addr, ipaddress.IPv6Address) and addr.scope_id:
+            # ``fe80::1%eth0`` parses, but PowerDNS's ``resolver=`` has no
+            # zone-index syntax and the agent refuses a list containing one.
+            continue
         if not sep:
             out.append(str(addr))
             continue

@@ -46,6 +46,15 @@ def test_absent_or_empty_is_off(value: object) -> None:
         "10.0.0.53\nlaunch=bind",  # a newline would start a new pdns.conf directive
         "ns.example.com",
         "10.0.0.53;rm",
+        # Address-shaped but not addresses pdns can parse: each would pass a
+        # character-class check and stop pdns starting.
+        ",,,",
+        "deadbeef",
+        "10.0.0.53,",
+        "fe80::1%eth0",
+        "10.0.0.53:99999",
+        "[10.0.0.53]:53",
+        "2001:db8::53:53:53:53:53:53",
     ],
 )
 def test_anything_but_an_address_list_is_refused(value: str) -> None:
@@ -54,3 +63,4 @@ def test_anything_but_an_address_list_is_refused(value: str) -> None:
 
 def test_an_address_list_passes() -> None:
     assert _safe_alias_resolver(" 10.0.0.53:53,::1 ") == "10.0.0.53:53,::1"
+    assert _safe_alias_resolver("[2001:db8::53]:5353") == "[2001:db8::53]:5353"

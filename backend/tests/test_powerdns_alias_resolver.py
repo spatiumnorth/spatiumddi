@@ -100,3 +100,29 @@ async def test_an_alias_is_accepted_with_forwarders(
         url, headers=headers, json={"name": "@", "record_type": "ALIAS", "value": "lb.example.net."}
     )
     assert resp.status_code in (200, 201), resp.text
+
+
+def test_a_scoped_ipv6_forwarder_is_dropped() -> None:
+    # ``ipaddress`` accepts a zone index; ``resolver=`` cannot parse one, and
+    # the agent refuses the whole list when it sees it.
+    assert alias_resolver(["fe80::1%eth0", "10.0.0.2"], "do53") == "10.0.0.2"
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_forwarders_under_live_alias_records_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers, url = await _setup(db_session, ["10.0.0.53"])
+    resp = await client.post(
+        url, headers=headers, json={"name": "@", "record_type": "ALIAS", "value": "lb.example.net."}
+    )
+    assert resp.status_code in (200, 201), resp.text
+    options_url = url.split("/zones/")[0] + "/options"
+
+    resp = await client.put(options_url, headers=headers, json={"forwarders": []})
+    assert resp.status_code == 422, resp.text
+    assert "ALIAS" in resp.json()["detail"]
+
+    # Changing the forwarders while keeping one still saves.
+    resp = await client.put(options_url, headers=headers, json={"forwarders": ["10.0.0.54"]})
+    assert resp.status_code == 200, resp.text

@@ -1953,7 +1953,9 @@ the formatter handles the rest.
   records now resolve through the group's own forwarders over plain DNS.
   With no forwarders, or with forwarders over TLS, HTTPS or QUIC (which
   PowerDNS's resolver cannot speak), ALIAS expansion is off, and the API
-  refuses a new ALIAS record with a 422 naming the fix. **Upgrade
+  refuses a new ALIAS record with a 422 naming the fix. Clearing the
+  forwarders of a PowerDNS group that serves ALIAS records, or moving
+  them to an encrypted transport, is refused the same way. **Upgrade
   note:** a PowerDNS group that serves ALIAS records and has no
   forwarders stops answering A / AAAA for those names until you set
   forwarders under the group's server options. Air-gapped PowerDNS
