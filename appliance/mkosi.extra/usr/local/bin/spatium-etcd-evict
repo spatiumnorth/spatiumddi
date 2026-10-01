@@ -98,6 +98,8 @@ def log(msg: str) -> None:
         with LOG.open("a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {msg}\n")
     except OSError:
+        # Best effort: a log that cannot be written (a full or read-only
+        # /var/log) must not stop an eviction or its answer.
         pass
 
 
@@ -177,6 +179,8 @@ def own_names() -> set[str]:
         if m:
             names.add(m.group(1))
     except OSError:
+        # No etcd config to read: the set still holds the hostname, which is
+        # the k3s node name this node's own member name starts with.
         pass
     return {n for n in names if n}
 
