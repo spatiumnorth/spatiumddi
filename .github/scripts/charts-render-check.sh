@@ -304,6 +304,11 @@ lint "$METALLB" "${METALLB_ALL_ON[@]}"
 render metallb-defaults "$METALLB"
 POSTURE_ARGS="--require-priority"
 render metallb-all-on "$METALLB" "${METALLB_ALL_ON[@]}"
+# #1103 — the webhooks must fail open, or the CRs in the same install are
+# refused while the controller that serves the webhook is still starting.
+# Only a live apiserver shows it; lint and template pass either way.
+python3 "$ROOT/.github/scripts/chart-webhooks-fail-open.py" "$OUT/metallb-all-on.yaml" --require \
+    || failures=$((failures + 1))
 # BGP mode (#566 D1) — the supervisor flips ``frrk8s.enabled`` on together
 # with ``bgp.enabled`` the moment a peer is configured, so this shape reaches
 # real appliances and has to be rendered. The two frr-k8s workloads are

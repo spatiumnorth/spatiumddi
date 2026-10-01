@@ -248,6 +248,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Setting a control-plane VIP installs MetalLB (#1103).** It never
+  did on a k3s with Helm 4 inside (klipper-helm): the
+  `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
+  `IPAddressPool` was created, and the frontend Service's external IP
+  stayed `<pending>`. Helm 4 applies MetalLB's validating webhooks before the
+  pool and `L2Advertisement`, so those were refused while the controller
+  serving the webhook was still starting, and each retry uninstalled
+  first, deleting the controller again. The webhooks now fail open
+  (`crds.validationFailurePolicy: Ignore`) while unreachable; once the
+  controller is up they validate as before. A new chart gate checks the
+  rendered policy, since `helm lint` and `helm template` pass either
+  way. The "known issue" notes in `TOPOLOGIES.md`, `APPLIANCE.md` and
+  `TROUBLESHOOTING.md` are removed.
+
 - **Building a DNS group's config no longer loads every blocklist
   entry as a database object (#1109).** The bundle the agents
   long-poll for collected blocklist entries the way #948 stopped

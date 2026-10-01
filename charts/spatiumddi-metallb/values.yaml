@@ -39,6 +39,21 @@ metallb:
   # double-owner conflict on the metallb.io CRDs.
   crds:
     enabled: false
+    # Fail OPEN when the validating webhook is unreachable (#1103). Helm 4
+    # (klipper-helm, inside k3s) applies the ValidatingWebhookConfigurations
+    # before the IPAddressPool / L2Advertisement below, so those are admitted
+    # while the controller Deployment backing the webhook, created in the
+    # same pass, is not yet ready. At the upstream default ``Fail`` that is a
+    # hard rejection, and every k3s HelmChart retry uninstalls first, deleting
+    # the controller again: setting a control-plane VIP never converged.
+    # ``Ignore`` only changes what happens when the validator cannot be
+    # REACHED; once the controller is up, the CRs are validated as before,
+    # and the pool is already validated by the API's ``control_plane_vip``
+    # check. Not ``webhookMode: disabled``, which drops validation entirely.
+    # MetalLB 0.16.1 still defaults to ``Fail`` (metallb/metallb#3133).
+    # ``chart-webhooks-fail-open.py`` checks the rendered policy, since
+    # ``helm lint`` and ``helm template`` both pass with ``Fail``.
+    validationFailurePolicy: Ignore
 
   # ── L2 (native) mode ──────────────────────────────────────────────
   # Native L2 — no FRR, no frr-k8s. ``frrk8s.enabled=false`` matches the
