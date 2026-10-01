@@ -17,13 +17,20 @@ Flow (the host-runner pattern of spatium-cluster-join / -restore):
      `node<TAB><hostname><TAB><ip>[,<ip>…]` per node) through its
      release-state bind mount.
   2. spatiumddi-etcd-evict.path notices it and runs this script as root.
-  3. This script lists the seed's etcd members, removes each member that
-     belongs to a listed node, lists them again, and writes
+  3. This script takes the request out of the trigger's path, lists the
+     seed's etcd members, removes each member that belongs to a listed
+     node, lists them again, and writes
        /var/lib/spatiumddi/release-state/etcd-evict.state
      (`id <request>`, then `<hostname><TAB><state><TAB><detail>`, where the
      state is one of absent | removed | present | error). The supervisor
      reports a node evicted, and the row settles `left`, only once its
      state is absent or removed.
+  4. The answered request is kept as etcd-evict-pending.done (.failed when
+     the member list was unreadable), so nothing can run it again: a
+     manual start of the unit, or a touch of the trigger, finds no request.
+     A request older than MAX_REQUEST_AGE_S is refused without touching
+     etcd (.stale). The supervisor writes a fresh one whenever it still
+     wants an answer.
 
 Why: k3s removes a server's etcd member only through its k8s Node (the
 Node's deletion, or the etcd.k3s.cattle.io/remove annotation). A node that
@@ -74,6 +81,14 @@ LOG = Path(os.environ.get("SPATIUM_LOG_DIR", "/var/log/spatiumddi")) / "etcd-evi
 # appliance/tests replace the two etcd calls with commands of their own.
 MEMBERS_CMD = os.environ.get("SPATIUM_ETCD_MEMBERS_CMD", "")
 REMOVE_CMD = os.environ.get("SPATIUM_ETCD_REMOVE_CMD", "")
+# A request is acted on only while it is fresh. The path unit starts this
+# script about a second after the supervisor writes one, and the supervisor
+# writes a new request once an answer is 90 s overdue (RUNNER_SILENT_S in its
+# etcd_evict.py). An older request was never run when it was written, and
+# nobody waits on it any more: acting on it would act on the past, and a node
+# promoted again since then (its new member appears about 80 s after the
+# promote) would lose that member as the evicted one's.
+MAX_REQUEST_AGE_S = 60.0
 
 
 def log(msg: str) -> None:
@@ -243,15 +258,51 @@ def describe(m: dict) -> str:
     return f"{m.get('ID')} {m.get('name') or '(unnamed)'}"
 
 
+def retire(taken: Path, outcome: str) -> None:
+    """Keep the request just handled as etcd-evict-pending.<outcome>, out of the
+    trigger's path. Only that request: one the supervisor wrote meanwhile is at
+    the trigger's path, and it is left for the next run."""
+    try:
+        taken.replace(TRIGGER.with_name(f"{TRIGGER.name}.{outcome}"))
+    except OSError as exc:
+        log(f"could not set the handled request aside: {exc}")
+
+
 def run() -> int:
     if not TRIGGER.exists():
         return 0
-    req = read_request(TRIGGER.read_text(encoding="utf-8", errors="replace"))
+    # Take the request before acting on it. Renamed out of the trigger's path,
+    # it can never run twice, whatever starts this unit again. The rename is one
+    # more change on the watched path while this run is active, so systemd
+    # folds it into this run's start job.
+    taken = TRIGGER.with_name(f"{TRIGGER.name}.processing")
+    try:
+        TRIGGER.replace(taken)
+        text = taken.read_text(encoding="utf-8", errors="replace")
+        age = time.time() - taken.stat().st_mtime
+    except OSError:
+        # Gone between the check and the rename: a run started by hand took it.
+        return 0
+    req = read_request(text)
     if req is None:
         log("request without the confirmation marker — refusing, nothing removed")
-        TRIGGER.rename(TRIGGER.with_name(f"{TRIGGER.name}.rejected.{int(time.time())}"))
+        retire(taken, f"rejected.{int(time.time())}")
         return 0
     request_id, nodes = req
+    if abs(age) > MAX_REQUEST_AGE_S:
+        why = (f"refused a request {int(age)}s old (the limit is {int(MAX_REQUEST_AGE_S)}s): "
+               "nothing removed; the supervisor asks again if it still wants it")
+        log(why)
+        write_state(request_id, [f"{host}\terror\t{why}" for host, _ in nodes])
+        retire(taken, "stale")
+        return 0
+    rc = answer(request_id, nodes)
+    retire(taken, "done" if rc == 0 else "failed")
+    return rc
+
+
+def answer(request_id: str, nodes: list[tuple[str, list[str]]]) -> int:
+    """Remove the listed nodes' members and write what etcd lists afterwards."""
     mine = own_names()
     try:
         members = list_members()

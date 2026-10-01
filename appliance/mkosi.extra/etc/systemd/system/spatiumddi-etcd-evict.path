@@ -7,7 +7,10 @@ ConditionKernelCommandLine=!boot=live
 
 [Path]
 # PathChanged fires on close-after-write. The supervisor atomically renames a
-# .new sibling onto the request, so this fires once per request.
+# .new sibling onto the request, so this fires once per request. The runner
+# then moves the request aside while it runs (.processing, then .done), so a
+# request is never run twice; systemd folds that change into the run already
+# active.
 PathChanged=/var/lib/spatiumddi/release-state/etcd-evict-pending
 
 [Install]

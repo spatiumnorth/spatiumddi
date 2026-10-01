@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCRIPT = (
@@ -39,6 +40,10 @@ st = json.load(open(store))
 if sys.argv[1] == "list":
     if st.get("unreadable"):
         print("curl: (7) Failed to connect to 127.0.0.1 port 6443"); sys.exit(7)
+    if st.get("next_request"):
+        # the supervisor writes its next request while the runner is working
+        open(os.environ["FAKE_TRIGGER"], "w").write(st.pop("next_request"))
+        json.dump(st, open(store, "w"))
     print(json.dumps({"members": st["members"]}))
 else:
     mid = int(sys.argv[2])
@@ -65,11 +70,17 @@ M1 = _m(12000000000000000002, "ddipg-member-1-7f072fd9", "192.168.122.160")
 GHOST = _m(18446744073709551557, "ddipg-member-3-7d1c4ad1", "192.168.122.86")  # > 2^63
 
 
-def _run(tmp_path: Path, members: list[dict], request: str, node_name: str = "ddipg-seed",
-         **store) -> tuple[dict, str, dict]:
+def _run(tmp_path: Path, members: list[dict], request: str | None,
+         node_name: str = "ddipg-seed", age_s: float = 0.0, **store) -> tuple[dict, str, dict]:
+    """One run of the runner. `request` None writes no request (the unit started
+    again by hand); `age_s` backdates the request's mtime."""
     rs = tmp_path / "release-state"
     rs.mkdir(exist_ok=True)
-    (rs / "etcd-evict-pending").write_text(request)
+    if request is not None:
+        (rs / "etcd-evict-pending").write_text(request)
+        if age_s:
+            then = time.time() - age_s
+            os.utime(rs / "etcd-evict-pending", (then, then))
     k3s = tmp_path / "k3s-server"
     (k3s / "db" / "etcd").mkdir(parents=True, exist_ok=True)
     (k3s / "db" / "etcd" / "config").write_text("name: ddipg-seed-964d1931\n")
@@ -85,6 +96,7 @@ def _run(tmp_path: Path, members: list[dict], request: str, node_name: str = "dd
         "SPATIUM_ETCD_MEMBERS_CMD": f'"{sys.executable}" "{fake}" list',
         "SPATIUM_ETCD_REMOVE_CMD": f'"{sys.executable}" "{fake}" remove "$1"',
         "FAKE_ETCD_STATE": str(state_file),
+        "FAKE_TRIGGER": str(rs / "etcd-evict-pending"),
         "SPATIUM_NODE_NAME": node_name,
     }
     subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True,
@@ -235,3 +247,74 @@ def test_it_speaks_grpc_over_http2_to_the_loopback_etcd_with_the_client_cert() -
     assert '"--cert", str(tls / "client.crt"), "--key", str(tls / "client.key")' in text
     assert 'ETCD_URL = os.environ.get("SPATIUM_ETCD_URL", "https://127.0.0.1:2379")' in text
     assert "/db/info" in text
+
+
+# ---- a request is run once, and only while it is fresh (#1326 review, finding 3) ----
+
+def test_an_answered_request_is_never_run_again(tmp_path: Path) -> None:
+    """The runner used to leave its request on disk with the last names, and had
+    no expiry of its own: anything that started the unit again (a manual
+    `systemctl start`, a touch of the trigger) re-ran it, against a node that
+    may have re-joined since, and removed its new member. The answered request
+    is now set aside, so a second run finds nothing to do."""
+    results, _, _ = _run(tmp_path, [SEED, M1, GHOST],
+                         _request(("ddipg-member-3", "192.168.122.86")))
+    assert results["ddipg-member-3"][0] == "removed"
+    rs = tmp_path / "release-state"
+    assert not (rs / "etcd-evict-pending").exists()
+    assert (rs / "etcd-evict-pending.done").read_text().startswith(CONFIRM + "\nid a1b2c3\n")
+
+    # member-3 is promoted again and re-joins, under a new member name; then
+    # something starts the unit again.
+    rejoined = _m(4242, "ddipg-member-3-0a1b2c3d", "192.168.122.86")
+    _, _, etcd = _run(tmp_path, [SEED, M1, rejoined], None)
+    assert "removed" not in etcd
+    assert [m["ID"] for m in etcd["members"]] == [SEED["ID"], M1["ID"], 4242]
+
+
+def test_a_stale_request_is_refused_and_removes_nothing(tmp_path: Path) -> None:
+    """A request the path unit never ran when it was written (the runner starts
+    about a second after the supervisor writes one) is refused: nobody waits
+    on it any more, and it may name a node that has re-joined since."""
+    results, _, etcd = _run(tmp_path, [SEED, M1, GHOST],
+                            _request(("ddipg-member-3", "192.168.122.86")), age_s=600)
+    assert "removed" not in etcd
+    state, detail = results["ddipg-member-3"]
+    assert state == "error"
+    assert "s old (the limit is 60s): nothing removed" in detail
+    rs = tmp_path / "release-state"
+    assert not (rs / "etcd-evict-pending").exists()
+    assert (rs / "etcd-evict-pending.stale").exists()
+
+
+def test_a_request_inside_the_limit_is_answered(tmp_path: Path) -> None:
+    results, _, etcd = _run(tmp_path, [SEED, M1, GHOST],
+                            _request(("ddipg-member-3", "192.168.122.86")), age_s=30)
+    assert results["ddipg-member-3"][0] == "removed"
+    assert etcd["removed"] == [GHOST["ID"]]
+
+
+def test_a_failed_request_is_set_aside_too(tmp_path: Path) -> None:
+    """An unreadable member list answers `error`; the supervisor asks again with
+    a new request, so this one is not left to be re-run either."""
+    results, _, _ = _run(tmp_path, [SEED, GHOST], _request(("ddipg-member-3", "192.168.122.86")),
+                         unreadable=True)
+    assert results["ddipg-member-3"][0] == "error"
+    rs = tmp_path / "release-state"
+    assert not (rs / "etcd-evict-pending").exists()
+    assert (rs / "etcd-evict-pending.failed").exists()
+
+
+def test_a_request_written_during_a_run_is_left_for_the_next(tmp_path: Path) -> None:
+    """Only the request this run answered is set aside. One the supervisor writes
+    while the runner works stays at the trigger's path, unexecuted."""
+    nxt = _request(("ddipg-member-1", "192.168.122.160"), rid="d4e5f6")
+    results, answer, etcd = _run(tmp_path, [SEED, M1, GHOST],
+                                 _request(("ddipg-member-3", "192.168.122.86")),
+                                 next_request=nxt)
+    assert answer.startswith("id a1b2c3\n")
+    assert results["ddipg-member-3"][0] == "removed"
+    assert etcd["removed"] == [GHOST["ID"]]
+    rs = tmp_path / "release-state"
+    assert (rs / "etcd-evict-pending").read_text() == nxt
+    assert "id a1b2c3" in (rs / "etcd-evict-pending.done").read_text()

@@ -849,7 +849,9 @@ the formatter handles the rest.
   while an eviction is still pending, for the node itself and for
   any node under the same hostname, and the Fleet no longer offers
   them for promotion: until the eviction settles, the seed removes
-  etcd members under that name.
+  etcd members under that name. The runner acts only on a fresh
+  request and sets each one aside once it has answered it, so
+  starting it again never repeats an old eviction.
 
 - **A join the seed's etcd refuses is rolled back with its reason,
   instead of sitting `joining` for good (#1285).** The join runner's
