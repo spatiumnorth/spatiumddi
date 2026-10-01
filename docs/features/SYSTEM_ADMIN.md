@@ -359,6 +359,12 @@ A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS
 
 The archive is the unit operators move around — single-file, easy to ship over SCP / drop into S3 / download to a laptop.
 
+#### What an archive exposes
+
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase.
+
+So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share, LUKS on a removable disk).
+
 #### Passphrase rules
 
 Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
@@ -397,10 +403,10 @@ squash.
 **NFS has no authentication, and the form says so.** AUTH_SYS is the only
 security flavour v1 supports: the client asserts a uid and the server believes
 it. A passing connection test therefore says nothing about who *else* on the
-network can read the export. Archives are encrypted with the target passphrase,
-so what an unrestricted export exposes is the metadata — archive names, sizes,
-and how often you back up — not the contents. Restrict the export to the control
-plane's address on the server side, and set the destination's `uid` / `gid` to an
+network can read the export, and an archive's database dump is not encrypted
+(see [What an archive exposes](#what-an-archive-exposes)), so an unrestricted
+export exposes the contents of every archive on it. Restrict the export to the
+control plane's address on the server side, and set the destination's `uid` / `gid` to an
 identity the export grants write access (with the usual `root_squash` default,
 presenting uid 0 gets mapped to `nobody` and every write fails; the driver
 detects that errno and names squash as the likely cause rather than reporting a
@@ -502,8 +508,9 @@ a single file at 4 GiB, so an estate whose archive outgrows that would fail
 mid-run, at the end of a long backup, on a destination that had worked for
 months. A disk with no filesystem UUID is refused too — there would be nothing
 stable to mount it by, since the kernel device name is reassigned on the next
-plug. Archives are already encrypted with the target passphrase, so LUKS on the
-disk is your choice, not a requirement.
+plug. An archive's database dump is not encrypted (see
+[What an archive exposes](#what-an-archive-exposes)), so if the disk can leave
+the building, encrypt it: LUKS on the disk is the way to do that here.
 
 On a multi-node cluster the **Kubernetes node** field on the destination is
 filled in for you from the fleet — the disk is plugged into one machine, and
@@ -598,8 +605,11 @@ Three things make this a least-privilege pull rather than a full API key:
   strong `ETag`. A poller that already has the newest archive gets a `304` and
   the destination is not read at all — without this, a nightly poller
   re-downloads a multi-GB archive every run.
-* **The archive is encrypted with the target passphrase**, which the puller
-  never needs and should not have. It fetches ciphertext.
+* **The puller never needs the target passphrase**, and should not have it:
+  without it the stored credentials in the archive stay encrypted. The rest of
+  the database dump is readable (see
+  [What an archive exposes](#what-an-archive-exposes)), so protect the token and
+  wherever the puller writes the archive as you would the install itself.
 
 Two limits: a **destination must exist** — for a pull-only deployment make a
 `local_volume` target the staging destination, because a `GET` that triggers a

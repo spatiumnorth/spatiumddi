@@ -744,8 +744,8 @@ async def download_latest_target_archive(
             "Content-Length": str(len(archive_bytes)),
             "ETag": etag,
             "Last-Modified": format_datetime(newest.created_at, usegmt=True),
-            # The archive is encrypted, but it is still the whole
-            # install — no shared cache should hold it.
+            # Only secrets.enc inside the archive is encrypted; the
+            # database dump is not. No shared cache should hold it.
             "Cache-Control": "private, no-cache",
         },
     )

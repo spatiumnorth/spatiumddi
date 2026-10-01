@@ -248,6 +248,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The backup docs no longer say an archive is encrypted (#1352).**
+  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
+  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
+  in three places: that an unauthenticated NFS export exposes only
+  archive names and sizes, that LUKS on a removable backup disk is
+  optional because the archive is already encrypted, and that the
+  least-privilege pull token "fetches ciphertext". The NFS destination
+  form carried the same claim. Anyone who can read an archive can read
+  the whole database, users, IPAM / DNS / DHCP data and the audit log
+  included; stored credentials stay encrypted under the source
+  install's key. The docs now say what an archive exposes, and the NFS
+  and removable-disk sections say to restrict or encrypt accordingly.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:

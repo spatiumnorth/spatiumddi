@@ -51,9 +51,9 @@ Config shape
 **There are no secret fields, and that is not an oversight.** NFS with
 AUTH_SYS has no credential — the client asserts a uid and the server
 believes it. This is the one destination where "test connection passed"
-says nothing about who else can read the archives. The archive is
-passphrase-encrypted either way, so what is exposed is the metadata
-(names, sizes, cadence), not the contents. Kerberos (``sec=krb5*``) is
+says nothing about who else can read the archives — and only an
+archive's ``secrets.enc`` is encrypted, not its database dump, so an
+unrestricted export exposes the archives' contents (#1352). Kerberos (``sec=krb5*``) is
 out of scope for v1 — the same call ``smb`` made for NTLM-only.
 """
 
@@ -293,10 +293,10 @@ class NfsDestination(BackupDestination):
             description=(
                 "NFS with AUTH_SYS has no credential: the client asserts a uid and "
                 "the server believes it. A successful connection test therefore says "
-                "nothing about who else on the network can read this export. Archives "
-                "are encrypted with the target passphrase, so what is exposed is the "
-                "metadata — filenames, sizes, and how often you back up. Restrict the "
-                "export to this host on the server side."
+                "nothing about who else on the network can read this export. An "
+                "archive's database dump is not encrypted (only its secrets.enc is), "
+                "so anyone who can read the export can read every archive on it. "
+                "Restrict the export to this host on the server side."
             ),
         ),
     )
