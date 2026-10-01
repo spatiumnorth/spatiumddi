@@ -15,6 +15,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { safeExternalHref } from "@/lib/safeUrl";
 import { helmChartVersion } from "@/lib/versions";
 
 // Number of most-recent releases rendered as full cards. Anything older
@@ -170,6 +171,8 @@ function CompactReleaseRow({
   applianceMode: boolean;
 }) {
   const [manualOpen, setManualOpen] = useState(false);
+  // From the GitHub API: linked only when http(s) (#1361).
+  const githubUrl = safeExternalHref(release.html_url);
   return (
     <div className={release.is_installed ? "bg-primary/5" : ""}>
       <div className="flex items-center gap-2 px-4 py-2">
@@ -188,15 +191,17 @@ function CompactReleaseRow({
         <span className="shrink-0 text-xs text-muted-foreground">
           {fmtDate(release.published_at)}
         </span>
-        <a
-          href={release.html_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex shrink-0 items-center text-muted-foreground hover:text-foreground"
-          title="Open on GitHub"
-        >
-          <ExternalLink className="h-3 w-3" />
-        </a>
+        {githubUrl && (
+          <a
+            href={githubUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex shrink-0 items-center text-muted-foreground hover:text-foreground"
+            title="Open on GitHub"
+          >
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
         {/* No per-release apply on the appliance (OS upgrades live on the
             Fleet tab). docker / k8s control planes get the manual command. */}
         {!applianceMode && !release.is_installed && (
@@ -239,6 +244,7 @@ function ReleaseCard({
   applianceMode: boolean;
 }) {
   const [manualOpen, setManualOpen] = useState(false);
+  const githubUrl = safeExternalHref(release.html_url);
   return (
     <div
       className={`rounded-lg border bg-card p-4 shadow-sm ${
@@ -265,15 +271,17 @@ function ReleaseCard({
             <span className="text-xs text-muted-foreground">
               {fmtDate(release.published_at)}
             </span>
-            <a
-              href={release.html_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="ml-auto inline-flex shrink-0 items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground"
-            >
-              <ExternalLink className="h-3 w-3" />
-              GitHub
-            </a>
+            {githubUrl && (
+              <a
+                href={githubUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="ml-auto inline-flex shrink-0 items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground"
+              >
+                <ExternalLink className="h-3 w-3" />
+                GitHub
+              </a>
+            )}
           </div>
           {release.body && (
             <details className="mt-2">

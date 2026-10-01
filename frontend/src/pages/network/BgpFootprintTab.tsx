@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { bgpApi } from "@/lib/api";
+import { safeExternalHref } from "@/lib/safeUrl";
 import { cn } from "@/lib/utils";
 
 /**
@@ -456,7 +457,14 @@ function Field({
   );
 }
 
-function externalLink(href: string) {
+// PeeringDB values: only http(s) becomes a link. Anything else, including
+// a telnet: or ssh: looking glass, is shown as plain text (#1361). A link
+// shows its parsed href, so the text names the host it actually opens.
+function externalLink(value: string) {
+  const href = safeExternalHref(value);
+  if (!href) {
+    return <span className="break-all">{value}</span>;
+  }
   return (
     <a
       href={href}

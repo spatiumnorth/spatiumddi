@@ -272,6 +272,74 @@ the formatter handles the rest.
   `grant` drops itself while a bad `deny` also drops the entries after
   it, so the policy that remains never allows more than the one stored.
 
+- **An unknown URL shows a "Page not found" page instead of a blank
+  screen (#1360).** The route table had no catch-all, so a mistyped
+  or stale URL matched nothing and rendered an empty page with no
+  sidebar and no way back. A signed-out user on such a URL was not
+  sent to the login page either, because the login check never ran.
+  The new page renders inside the app, shows the requested path as
+  plain text, and links back to the dashboard. It also suggests a few
+  pages from the sidebar's own list, closest to the mistyped path
+  first, and skips any whose feature is turned off (Settings →
+  Features). Signed-out users now go to the login page. Also: the
+  legacy `/network/<id>` bookmark route matched any `/network/...`
+  typo and looked it up as a device. It now redirects a real device id
+  to `/network/devices/<id>`, which its comment always said it did,
+  and shows the 404 page for anything else.
+
+- **External URLs from PeeringDB are linked only when they are http
+  or https (#1361).** The website and looking-glass fields on an ASN's
+  BGP footprint tab went into a link whatever their scheme. Now only an
+  `http:` or `https:` URL becomes a link; anything else, including a
+  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
+  are also checked when they are fetched: a website is kept only if it
+  is http(s), and a looking glass only if it is http(s), telnet or ssh,
+  the schemes PeeringDB itself accepts. The GitHub release links on the
+  sidebar and the Releases tab are also linked only when http(s).
+
+- **The backup docs no longer say an archive is encrypted (#1352).**
+  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
+  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
+  in three places: that an unauthenticated NFS export exposes only
+  archive names and sizes, that LUKS on a removable backup disk is
+  optional because the archive is already encrypted, and that the
+  least-privilege pull token "fetches ciphertext". The NFS destination
+  form carried the same claim. Anyone who can read an archive can read
+  the whole database, users, IPAM / DNS / DHCP data and the audit log
+  included. Most stored credentials stay encrypted under the source
+  install's key, but not each DNS server group's internal TSIG key,
+  which is stored in clear and is accepted for zone transfers and
+  dynamic updates from any address (encrypting it is #1364). The docs
+  now say what an archive exposes, the NFS section says to restrict
+  the export, and the removable-disk section no longer recommends
+  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
+  `cryptsetup` to unlock it.
+
+- **A restore no longer stamps a half-migrated schema as current
+  (#1233).** When `alembic upgrade head` failed after a restore with
+  "already exists", from any revision, the restore ran `alembic stamp
+  head` and reported `auto_recovered`. That error is the signature of a
+  stale `alembic_version` over a schema already at head, but not proof
+  of it. Any revision that meets one object it would create fails the
+  same way, and since migrations commit one revision at a time (#1204),
+  the revisions before it stay applied and those after it never run.
+  The restore now stamps head only after checking that every table and
+  column this build's models declare exists in the restored database.
+  If anything is missing, or the check cannot run, the restore reports
+  `failed`, names the missing tables and columns and the revision that
+  failed, and leaves `alembic_version` at the last revision that
+  committed, so a manual `alembic upgrade head` resumes from there.
+  The check covers tables and columns in one direction only: on a
+  database migrated cleanly to head, the models omit a column the
+  initial schema still has, and index and constraint names differ in
+  dozens of places, so a full schema comparison would refuse the case
+  the recovery exists for. The restore's upgrade error now starts at
+  the exception line rather than at the start of alembic's output. On
+  a long upgrade the first 1,500 characters held only per-revision
+  INFO lines, which cut off the exception and hid the "already
+  exists" match. `migrations_applied` now lists the revisions that
+  committed before the failing one, instead of always being empty.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:
