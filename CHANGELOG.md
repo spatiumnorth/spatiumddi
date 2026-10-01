@@ -248,6 +248,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **PowerDNS servers no longer report their version to
+  secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
+  `secpoll.powerdns.com` at startup and periodically, naming the
+  PowerDNS version it runs, and nothing turned it off. Every PowerDNS
+  server sent it, through the hardcoded public resolvers or the system
+  resolver. Both renderers now write an empty `security-poll-suffix`,
+  which disables it; it takes effect the next time the PowerDNS
+  container starts, which an upgrade does. The optional dnsdist front
+  polled the same zone for its own version, also by default; its
+  entrypoint now writes `setSecurityPollSuffix("")`. PRIVACY.md §3.5
+  says so.
+  Still open on #1353: the ALIAS resolver is hardcoded to `1.1.1.1` /
+  `8.8.8.8`, and PowerDNS does not start on a host with no route to
+  them.
+
 - **The privacy statement lists the public resolvers PowerDNS
   uses, and its guard now scans the agents too (#1353).** The agent
   renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
