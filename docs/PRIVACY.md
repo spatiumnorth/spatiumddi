@@ -21,7 +21,8 @@ one exception: a **daily anonymous check of GitHub for a newer
 release** (an unauthenticated GET; GitHub sees your IP address and
 nothing about your install). Turn it off under **Settings →
 Application → Updates → Check for GitHub Releases**, or run fully
-air-gapped — every feature works with no internet access at all.
+air-gapped — every feature works with no internet access at all,
+except PowerDNS server groups for now (§3.5).
 Optional features that do reach third parties (Fingerbank device
 profiling, the Operator Copilot's LLM provider, Let's Encrypt,
 blocklist feeds, cloud DNS / integration mirrors, the whois and RBL
@@ -167,14 +168,21 @@ PowerDNS sends two kinds of lookup through them:
 | `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53, then PowerDNS's `secpoll.powerdns.com` nameservers | PowerDNS security-status polling, a built-in PowerDNS feature SpatiumDDI does not turn off | **On for every PowerDNS server**, at startup and periodically after that, whether or not it serves any zone | A TXT query for `auth-<version>.security-status.secpoll.powerdns.com`, which tells the resolvers and PowerDNS's nameservers which PowerDNS version you run. Observed on the shipped 5.0.7 image. With no network route to the resolvers at all, that image does not start (`Unable to UDP connect to remote nameserver 1.1.1.1:53: Network unreachable`). |
 | `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53 | ALIAS records on a PowerDNS server group | Only on a PowerDNS group that serves an ALIAS record, when a client queries a name that has one | The **ALIAS target name** (A / AAAA queries for it), from the DNS server's own address, unencrypted. Cloudflare and Google see which names your ALIAS records point at, and when they were looked up. |
 
-To avoid both now, use BIND9 or Technitium rather than PowerDNS, or
-block the two addresses at your firewall, which makes ALIAS answers
-fail.
+To avoid both now, use BIND9 or Technitium rather than PowerDNS.
+Blocking the two addresses at a firewall stops the lookups and makes
+ALIAS answers fail. It is not a full workaround: a host with no route
+to them at all does not start PowerDNS (above), and whether PowerDNS
+starts when the packets are dropped rather than unroutable has not
+been verified.
 
 ## 4. Air-gapped operation
 
-Every feature works with all of the above blocked. That is not a
-claim about the happy path — it is non-negotiable #5 in the project's
+Every feature works with all of the above blocked, with one
+exception today: a PowerDNS server group, which needs a route to
+`1.1.1.1` / `8.8.8.8` to start (§3.5,
+[#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)). Use
+BIND9 or Technitium on an air-gapped install. Apart from that, this is
+not a claim about the happy path — it is non-negotiable #5 in the project's
 own build rules: **DNS and DHCP service containers cache their
 last-known-good config locally and keep serving when the control plane
 is unreachable**, and by the same logic nothing in the control plane

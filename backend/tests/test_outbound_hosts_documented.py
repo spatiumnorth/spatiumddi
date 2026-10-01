@@ -95,14 +95,26 @@ _URL_RE = re.compile(r"https?://([A-Za-z0-9._-]+)")
 # and the truncated fragments left by a URL hard-wrapped across two lines.
 _HOSTNAME_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$")
 
-# Candidate IP literals inside a string constant. Both are only candidates —
+# Candidate IP literals inside a string constant. All are only candidates —
 # ``ipaddress`` decides — so a version string or a timestamp that happens to
-# match is discarded rather than reported. The IPv6 lookahead refuses a
-# trailing ``.`` too: otherwise ``64:ff9b::8.8.8.8`` yields the truncated
-# ``64:ff9b::8``, a global address that is not the one written (the IPv4
-# pattern still reports the embedded ``8.8.8.8``).
+# match is discarded rather than reported. An IPv6 address with an embedded
+# IPv4 tail (``64:ff9b::8.8.8.8``) is taken whole first and blanked out, so
+# the IPv4 pattern cannot report just its ``8.8.8.8`` (which the page may
+# document as itself) and the IPv6 pattern cannot report the truncated
+# ``64:ff9b::8``; both are addresses other than the one written.
+_IPV6_MIXED_RE = re.compile(
+    r"(?<![\w:.])((?:[0-9A-Fa-f]{0,4}:){2,6}\d{1,3}(?:\.\d{1,3}){3})(?![\w.:])"
+)
 _IPV4_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
 _IPV6_RE = re.compile(r"(?<![\w:.])([0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})(?![\w:.])")
+
+
+def _ip_candidates(text: str) -> list[str]:
+    """Every IP-shaped token in ``text``, an IPv4-embedded IPv6 address whole."""
+    mixed = _IPV6_MIXED_RE.findall(text)
+    rest = _IPV6_MIXED_RE.sub(" ", text)
+    return mixed + _IPV4_RE.findall(rest) + _IPV6_RE.findall(rest)
+
 
 # Where the CI path filter's carve-outs live (see test_every_agent_package_is_scanned).
 _MUST_RUN_MANIFEST = _REPO_ROOT / ".github" / "scripts" / "ci-backend-must-run.txt"
@@ -187,7 +199,7 @@ def _public_ips_in_agent_source() -> dict[str, set[str]]:
                     continue
                 if id(node) in docstrings:
                     continue
-                for candidate in _IPV4_RE.findall(node.value) + _IPV6_RE.findall(node.value):
+                for candidate in _ip_candidates(node.value):
                     try:
                         addr = ipaddress.ip_address(candidate)
                     except ValueError:
@@ -312,3 +324,18 @@ def test_exactly_one_connection_is_enabled_by_default() -> None:
         f"the one default-on connection should be the release check, "
         f"not {first_cell.group(1)!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("resolver=1.1.1.1,8.8.8.8", ["1.1.1.1", "8.8.8.8"]),
+        ("2606:4700:4700::1111", ["2606:4700:4700::1111"]),
+        # The embedded IPv4 is not reported on its own: the address is the
+        # whole token, which the page has to name as itself.
+        ("64:ff9b::8.8.8.8", ["64:ff9b::8.8.8.8"]),
+        ("::ffff:9.9.9.9 and 1.0.0.1", ["::ffff:9.9.9.9", "1.0.0.1"]),
+    ],
+)
+def test_ip_candidates_take_an_embedded_ipv4_address_whole(text: str, expected: list[str]) -> None:
+    assert sorted(_ip_candidates(text)) == sorted(expected)
