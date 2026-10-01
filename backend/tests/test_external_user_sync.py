@@ -21,6 +21,7 @@ from httpx import AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.core.auth.saml as saml_mod
 from app.core.auth.user_sync import (
     ExternalAuthResult,
     ExternalSyncRejected,
@@ -371,6 +372,50 @@ async def test_a_deleted_providers_accounts_are_not_adopted_by_its_successor(
     assert exc.value.reason == "username_collision"
 
 
+# ── The password-grant fallthrough ───────────────────────────────────────────
+
+
+async def test_a_higher_priority_provider_does_not_lock_out_another_providers_account(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both directories know ``jsmith`` and accept the password; the account
+    belongs to the lower-priority one. The higher-priority provider's
+    ``username_collision`` must not end the login before the owner's turn."""
+    from app.api.v1.auth import router as auth_router
+
+    group = await _group(db_session)
+    domain_a = await _provider(db_session, group)
+    domain_b = await _provider(db_session, group)
+    domain_a.priority = 10
+    domain_b.priority = 20
+    owner = await sync_external_user(db_session, domain_b, _subject("CN=jsmith,DC=b"))
+    await db_session.commit()
+
+    def _authenticate(provider: AuthProvider, username: str, password: str) -> ExternalAuthResult:
+        dc = "a" if provider.id == domain_a.id else "b"
+        return _subject(f"CN=jsmith,DC={dc}")
+
+    async def _not_limited(_ip: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        auth_router, "_PASSWORD_AUTH_DISPATCH", {"ldap": (_authenticate, RuntimeError)}
+    )
+    monkeypatch.setattr(auth_router, "login_rate_limited", _not_limited)
+
+    resp = await client.post(
+        "/api/v1/auth/login", json={"username": "jsmith", "password": "pw-1235"}
+    )
+    assert resp.status_code == 200, resp.text
+    sessions = (
+        (await db_session.execute(select(UserSession).where(UserSession.user_id == owner.id)))
+        .scalars()
+        .all()
+    )
+    assert len(sessions) == 1
+    assert sessions[0].auth_source == domain_b.name
+
+
 # ── The migration's backfill ─────────────────────────────────────────────────
 
 
@@ -385,6 +430,7 @@ def _backfill_sql() -> tuple[str, str]:
 async def test_the_backfill_attributes_only_what_it_can_prove(db_session: AsyncSession) -> None:
     group = await _group(db_session)
     sole_oidc = await _provider(db_session, group, "oidc")
+    db_session.add(_created(sole_oidc))
     await _provider(db_session, group, "ldap")
     await _provider(db_session, group, "ldap")
     radius = await _provider(db_session, group, "radius")
@@ -440,6 +486,11 @@ def _provider_audit(
     )
 
 
+def _created(provider: AuthProvider) -> AuditLog:
+    """The ``create`` row the API writes for every provider it makes."""
+    return _provider_audit("create", provider.id, provider.type, provider.created_at)
+
+
 async def _run_backfill(db: AsyncSession, *users: User) -> None:
     by_prefix, sole_provider = _backfill_sql()
     await db.execute(text(by_prefix))
@@ -469,6 +520,7 @@ async def test_the_backfill_skips_an_account_older_than_the_sole_provider(
     other one, whatever the audit log does or does not say about it."""
     group = await _group(db_session)
     sole = await _provider(db_session, group, "oidc")
+    db_session.add(_created(sole))
     older = _external(db_session, "older", "oidc", sole.created_at - timedelta(days=30))
     newer = _external(db_session, "newer", "oidc", sole.created_at + timedelta(days=1))
     await db_session.flush()
@@ -488,6 +540,7 @@ async def test_the_backfill_skips_an_account_a_deleted_provider_may_have_made(
     now = datetime.now(UTC)
     survivor = await _provider(db_session, group, "oidc")
     survivor.created_at = now - timedelta(days=60)
+    db_session.add(_created(survivor))
     deleted_id = uuid.uuid4()
     db_session.add_all(
         [
@@ -511,6 +564,7 @@ async def test_the_backfill_ignores_a_deleted_provider_of_another_type(
     now = datetime.now(UTC)
     survivor = await _provider(db_session, group, "oidc")
     survivor.created_at = now - timedelta(days=60)
+    db_session.add(_created(survivor))
     deleted_id = uuid.uuid4()
     db_session.add_all(
         [
@@ -534,9 +588,133 @@ async def test_the_backfill_treats_a_deletion_of_unknown_type_as_any_type(
     now = datetime.now(UTC)
     survivor = await _provider(db_session, group, "saml")
     survivor.created_at = now - timedelta(days=60)
+    db_session.add(_created(survivor))
     db_session.add(_provider_audit("delete", uuid.uuid4(), None, now - timedelta(days=10)))
     user = _external(db_session, "u", "saml", now - timedelta(days=20))
     await db_session.flush()
 
     await _run_backfill(db_session, user)
     assert user.auth_provider_id is None
+
+
+async def test_the_backfill_attributes_nothing_without_the_survivors_create_row(
+    db_session: AsyncSession,
+) -> None:
+    """Every provider is created through the API, which audits it. An audit
+    log without that row (restored without its section) cannot show that no
+    other provider was deleted either, so it proves nothing."""
+    group = await _group(db_session)
+    sole = await _provider(db_session, group, "oidc")
+    user = _external(db_session, "u", "oidc", sole.created_at + timedelta(days=1))
+    await db_session.flush()
+
+    await _run_backfill(db_session, user)
+    assert user.auth_provider_id is None
+
+
+# ── Deleting a provider ──────────────────────────────────────────────────────
+
+
+async def test_deleting_a_provider_revokes_its_accounts_sessions(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    group = await _group(db_session)
+    idp = await _provider(db_session, group, "oidc")
+    member = await sync_external_user(db_session, idp, _subject("1"))
+    session_row = UserSession(
+        user_id=member.id,
+        refresh_token_hash=uuid.uuid4().hex,
+        created_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+    db_session.add(session_row)
+    headers = await _superadmin_headers(db_session)
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/auth-providers/{idp.id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    await db_session.refresh(session_row)
+    assert session_row.revoked is True
+
+
+async def test_an_admin_cannot_delete_the_provider_their_own_account_uses(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    group = await _group(db_session)
+    idp = await _provider(db_session, group, "oidc")
+    admin = await sync_external_user(db_session, idp, _subject("1", username="sso-admin"))
+    admin.is_superadmin = True
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+
+    resp = await client.delete(f"/api/v1/auth-providers/{idp.id}", headers=headers)
+    assert resp.status_code == 409, resp.text
+    assert await db_session.get(AuthProvider, idp.id) is not None
+
+
+# ── SAML NameID ──────────────────────────────────────────────────────────────
+
+
+def _consume_with_nameid_format(
+    monkeypatch: pytest.MonkeyPatch, fmt: str
+) -> saml_mod.SAMLConsumeResult:
+    class _FakeAuth:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def process_response(self) -> None:
+            return None
+
+        def get_errors(self) -> list[str]:
+            return []
+
+        def is_authenticated(self) -> bool:
+            return True
+
+        def get_attributes(self) -> dict[str, list[str]]:
+            return {}
+
+        def get_nameid(self) -> str:
+            return "_a1b2c3"
+
+        def get_nameid_format(self) -> str:
+            return fmt
+
+        def get_session_index(self) -> str:
+            return ""
+
+    monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Settings", lambda *_a, **_k: None)
+    monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Auth", _FakeAuth)
+    cfg = saml_mod.SAMLConfig(
+        idp_entity_id="idp",
+        idp_sso_url="https://idp.example.com/sso",
+        idp_slo_url=None,
+        idp_x509_cert="",
+        sp_entity_id="sp",
+        sp_acs_url="https://sp.example.com/acs",
+        sp_slo_url="https://sp.example.com/slo",
+        sp_x509_cert=None,
+        sp_private_key=None,
+        attr_username="uid",
+        attr_email="mail",
+        attr_display_name="cn",
+        attr_groups="groups",
+        idp_metadata_url=None,
+    )
+    return saml_mod.consume_assertion(cfg, "https://sp.example.com", {"SAMLResponse": "x"})
+
+
+def test_a_transient_saml_nameid_is_refused_with_the_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient NameID is new on every sign-in, so it would create an
+    account its own next sign-in is refused (the username is then taken)."""
+    with pytest.raises(saml_mod.SAMLServiceError, match="persistent or emailAddress"):
+        _consume_with_nameid_format(
+            monkeypatch, "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
+        )
+
+
+def test_a_persistent_saml_nameid_is_the_external_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    consumed = _consume_with_nameid_format(
+        monkeypatch, "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
+    )
+    assert consumed.result.external_id == "_a1b2c3"

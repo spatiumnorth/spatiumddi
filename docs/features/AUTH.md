@@ -159,6 +159,11 @@ In order, a login through provider P as subject S with username U:
 4. else refuses with `username_collision` if any other account holds U;
 5. else provisions a new account under P (if `auto_create_users`).
 
+On the password grant (LDAP / RADIUS / TACACS+), a refusal at step 3 or 4
+does not end the login: the next provider by priority still gets its turn,
+so an account owned by a lower-priority provider is not locked out by a
+higher-priority one that also accepts the same username and password.
+
 An account is **never adopted by username alone**, whatever its source. So
 a user whose identifier at the provider changed — an LDAP DN after an OU
 move — is refused until an administrator links the account again from
@@ -167,14 +172,18 @@ and the next sign-in through that provider as the account's username claims
 it; the link also revokes every session the account holds. Deleting a
 provider clears its accounts' identifiers as well as their provider, so a
 new provider of the same type issuing the same `sub` / DN never adopts one
-— they wait for an administrator's link. A local account cannot be linked: it has a password, and linking it
+— they wait for an administrator's link. Deleting a provider also revokes
+those accounts' sessions, and is refused (`409`) for the administrator whose
+own account signs in through it. A local account cannot be linked: it has a password, and linking it
 would hand it to whoever holds the same username at the provider. The
 upgrade attributes existing accounts where it can prove the provider (a
 RADIUS / TACACS+ external id names it; an LDAP / OIDC / SAML account is
 attributed when its type has exactly one provider, the account was created
 after that provider, and no other provider that may have been of its type
 was deleted after the account was created, read from the `audit_log`
-`create` / `delete` rows), and leaves the rest for an administrator. A
+`create` / `delete` rows; an audit log missing the survivor's own `create`
+row, as after a restore without it, attributes nothing), and leaves the rest
+for an administrator. A
 **disabled** provider still counts as a provider of its type: with one
 enabled and one disabled LDAP provider, the upgrade links no LDAP account. They show an **unlinked** chip on the Users page, and
 `list_users` reports their `auth_provider` as null.
@@ -257,6 +266,14 @@ Key config fields:
 | `attr_username` / `attr_email` / `attr_display_name` / `attr_groups` | SAML attribute names. |
 
 Secrets: `sp_private_key` (PEM, optional — only needed for signed requests).
+
+**The IdP must release a stable NameID.** The NameID is the account's key at
+its provider (`external_id`), so it must name the same user on every
+sign-in: `persistent` or `emailAddress` (SpatiumDDI requests the latter). A
+**transient** NameID is new each time and is refused at the ACS with a
+message saying so; without that refusal the first sign-in would create an
+account that every later one is refused, since its username is then taken
+and an account is never adopted by username.
 
 **SAML needs HTTPS with any hosted IdP.** Step 2 above is a *cross-site
 POST*: the browser is on the IdP's origin and submits the assertion to

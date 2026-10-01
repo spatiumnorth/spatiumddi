@@ -2422,9 +2422,8 @@ export interface AppUser {
   force_password_change: boolean;
   auth_source: string;
   /** The provider an external account belongs to (#1235). Null for a local
-   *  account, and for an external one not yet attributed to a provider,
-   *  which with several providers of its type cannot sign in until it is
-   *  linked (``usersApi.linkProvider``). */
+   *  account, and for an external one not attributed to a provider, which
+   *  cannot sign in until it is linked (``usersApi.linkProvider``). */
   auth_provider_id?: string | null;
   last_login_at: string | null;
   /** Lockout state (issue #71). ``locked`` is the live time check;

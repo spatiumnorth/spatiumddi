@@ -443,6 +443,12 @@ async def _try_external_password_login(
     if not providers:
         return None
 
+    # A provider that authenticated the password but whose subject is not
+    # the account holding this username (#1235). That account may belong to
+    # a lower-priority provider, which must still get its turn: stopping
+    # here would lock out the owner whenever a higher-priority provider also
+    # knows the same username and password.
+    refused_as_not_owner = False
     for provider in providers:
         dispatch = _PASSWORD_AUTH_DISPATCH.get(provider.type)
         if dispatch is None:
@@ -525,6 +531,9 @@ async def _try_external_password_login(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled"
                 ) from exc
+            if exc.reason in {"username_collision", "account_link_required"}:
+                refused_as_not_owner = True
+                continue
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials",
@@ -532,6 +541,9 @@ async def _try_external_password_login(
 
         return await _issue_tokens(db, request, user, auth_source=provider.name)
 
+    if refused_as_not_owner:
+        # Already audited per provider above; no generic ``no_match`` row.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     return None
 
 

@@ -47,9 +47,8 @@ class UserResponse(BaseModel):
     force_password_change: bool
     auth_source: str
     # The provider an external account belongs to (#1235); null for a local
-    # account, and for an external one not yet attributed to a provider,
-    # which with several providers of its type cannot sign in until it is
-    # linked (POST /users/{id}/link-provider).
+    # account, and for an external one not attributed to a provider, which
+    # cannot sign in until it is linked (POST /users/{id}/link-provider).
     auth_provider_id: str | None = None
     # Real ``datetime``s (#907); see the audit router for why.
     last_login_at: datetime | None = None

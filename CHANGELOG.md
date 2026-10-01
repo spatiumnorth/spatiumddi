@@ -1912,7 +1912,9 @@ the formatter handles the rest.
     it, and an LDAP / OIDC / SAML account is attributed when its type has
     exactly one provider **and** the account cannot have come from another
     one: it was created after that provider, and after the last deletion of
-    any other provider of its type (read from the audit log). A disabled
+    any other provider of its type (read from the audit log, which must
+    also hold the surviving provider's own `create` row; an audit log
+    restored without its section attributes nothing). A disabled
     provider counts: one enabled and one disabled provider of a type is two,
     and links nothing. Anything else is left unlinked and is refused
     (`account_link_required`) until an administrator links it from
@@ -1935,7 +1937,19 @@ the formatter handles the rest.
     username through that provider claims it; it also revokes the
     account's sessions. Deleting a provider clears its accounts'
     identifiers too, so a replacement provider of the same type that
-    issues the same `sub` or DN cannot adopt them.
+    issues the same `sub` or DN cannot adopt them. It also revokes their
+    sessions, and an administrator cannot delete the provider their own
+    account signs in through (409), which would lock them out.
+  - **SAML needs a stable NameID.** The NameID is the account's key at its
+    provider, and a transient one is new on every sign-in: it used to be
+    re-attached by username, which is the adoption this fix removes. A
+    transient NameID is now refused at the ACS with a message naming the
+    fix: configure the IdP to release a persistent or emailAddress NameID.
+  - On the password grant, a provider that accepts the password but whose
+    subject does not own the account no longer ends the login: the next
+    provider by priority still gets its turn, so a higher-priority
+    directory that also knows the user cannot lock out the account's
+    own provider.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step

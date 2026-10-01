@@ -21,7 +21,9 @@ Backfill, best effort and never guessing:
   no type, so it is joined to the provider's ``create`` row, which has
   recorded ``new_value.type`` since auth providers shipped. A delete whose
   type cannot be recovered counts as every type: it only ever withholds a
-  link, never grants one.
+  link, never grants one. And the survivor's own ``create`` row must be
+  there: an audit log missing it (restored without its section) cannot show
+  that nothing was deleted either, so nothing is attributed.
 * A RADIUS / TACACS+ account whose prefix names no existing provider is left
   NULL rather than given to the survivor.
 
@@ -76,6 +78,17 @@ BACKFILL_SOLE_PROVIDER = """
        AND u.external_id IS NOT NULL
        AND p.type = u.auth_source
        AND (SELECT count(*) FROM auth_provider q WHERE q.type = u.auth_source) = 1
+       -- The audit log covers the survivor's lifetime: every provider is
+       -- created through the API, which writes this row. Without it (a
+       -- restore that left the audit log out) the deletions below are
+       -- unknown too, so nothing is attributed.
+       AND EXISTS (
+           SELECT 1
+             FROM audit_log c
+            WHERE c.action = 'create'
+              AND c.resource_type = 'auth_provider'
+              AND c.resource_id = p.id::text
+       )
        -- The account postdates the survivor, so it was not made before it.
        AND u.created_at >= p.created_at
        -- No other provider that may have been of this type was deleted after

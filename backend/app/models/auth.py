@@ -84,13 +84,13 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # of the same type are two authorities, and keying on ``auth_source``
     # (the TYPE) let one of them log in as the other's users. NULL for a
     # local account, for an external account that predates this column and
-    # could not be attributed, and for one whose provider was deleted. A
-    # predating account is attributed on its next sign-in while its type has
-    # a single provider, and otherwise only by an administrator's link. A
-    # deleted provider's accounts also lose their ``external_id`` (see the
-    # provider delete handler), so only an administrator's link attributes
-    # them: another provider's identical ``sub`` / DN is not the same
-    # person. See ``app.core.auth.user_sync``.
+    # could not be attributed, and for one whose provider was deleted. Such
+    # an account is refused at sign-in (``account_link_required`` or
+    # ``username_collision``) and is attributed only by an administrator's
+    # link (``POST /users/{id}/link-provider``), never by a sign-in: another
+    # provider's identical ``sub`` / DN is not the same person. A deleted
+    # provider's accounts also lose their ``external_id`` (see the provider
+    # delete handler). See ``app.core.auth.user_sync``.
     auth_provider_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("auth_provider.id", ondelete="SET NULL"),

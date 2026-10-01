@@ -287,9 +287,7 @@ function ProviderLink({ user }: { user: AppUser }) {
           </>
         ) : (
           <>
-            Not linked to a provider yet. It is linked on its next sign-in if it
-            is the only provider of its type; with more than one, it cannot sign
-            in until it is linked here.
+            Not linked to a provider. It cannot sign in until it is linked here.
           </>
         )}{" "}
         Linking clears the stored identifier: the next sign-in through the
@@ -523,7 +521,7 @@ export function UsersPage() {
                     {user.auth_source !== "local" && !user.auth_provider_id && (
                       <span
                         className="ml-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300"
-                        title="Not linked to a provider yet. It is linked on its next sign-in if it is the only provider of its type; with more than one, it cannot sign in until an administrator links it (Edit)."
+                        title="Not linked to a provider. It cannot sign in until an administrator links it (Edit)."
                       >
                         unlinked
                       </span>
