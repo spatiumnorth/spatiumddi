@@ -261,6 +261,21 @@ the formatter handles the rest.
   degraded 2/2 says why. The rolling upgrade was
   never affected: its safety check reads CNPG's own `readyInstances`.
 
+- **PowerDNS servers no longer report their version to
+  secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
+  `secpoll.powerdns.com` at startup and periodically, naming the
+  PowerDNS version it runs, and nothing turned it off. Every PowerDNS
+  server sent it, through the hardcoded public resolvers or the system
+  resolver. Both renderers now write an empty `security-poll-suffix`,
+  which disables it; it takes effect the next time the PowerDNS
+  container starts, which an upgrade does. The optional dnsdist front
+  polled the same zone for its own version, also by default; its
+  entrypoint now writes `setSecurityPollSuffix("")`. PRIVACY.md §3.5
+  says so.
+  Still open on #1353: the ALIAS resolver is hardcoded to `1.1.1.1` /
+  `8.8.8.8`, and PowerDNS does not start on a host with no route to
+  them.
+
 - **Unattended upgrades no longer install kernels on the appliance
   (#1249).** `mkosi.conf` said "No kernel upgrades" while the
   unattended-upgrades drop-in allowed security-pocket kernels, and
