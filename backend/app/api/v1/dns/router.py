@@ -3218,7 +3218,10 @@ async def _validated_zone_named_conf_fields(
     group stops converging, not just this zone.
 
     Zone ``forwarders`` join them on a BIND9 group (#1357), normalised to
-    the ``ip@port`` wire shape.
+    the ``ip@port`` wire shape, but only for a forward zone: no other type
+    renders them, so a value there never reaches ``named.conf`` and stays
+    accepted as before. A zone becoming a forward zone has its stored
+    forwarders checked, since they start rendering then.
 
     On update (``zone`` given) only a changed value is checked, for the
     same reason as the options form: a value stored before this gate must
@@ -3232,8 +3235,15 @@ async def _validated_zone_named_conf_fields(
         and (zone is None or v != getattr(zone, k, None))
     }
     cleaned = await _validated_option_changes(group_id, fields, zone, db) if fields else {}
+    zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
+    if zone_type != "forward":
+        return cleaned
+    stored = list(zone.forwarders or []) if zone is not None else None
+    becomes_forward = zone is not None and zone.zone_type != "forward"
     forwarders = changes.get("forwarders")
-    if forwarders and (zone is None or forwarders != list(zone.forwarders or [])):
+    if forwarders is None and becomes_forward:
+        forwarders = stored
+    if forwarders and (stored is None or becomes_forward or forwarders != stored):
         checked = await _bind9_zone_forwarders(group_id, list(forwarders), db)
         if checked is not None:
             cleaned["forwarders"] = checked

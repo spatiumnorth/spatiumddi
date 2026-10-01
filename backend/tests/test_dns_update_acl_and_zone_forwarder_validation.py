@@ -249,6 +249,29 @@ async def test_bind9_zone_forwarders_are_checked_on_create_and_update(
     assert r.json()["detail"]["value"] == "1.1.1.1@0"
 
 
+async def test_forwarders_on_a_non_forward_zone_are_not_checked(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Only a forward zone renders ``forwarders``, so the field stays free-form
+    elsewhere; it is checked once the zone becomes a forward zone."""
+    headers = await _superadmin(db_session)
+    group, _ = await _group(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/zones"
+
+    r = await client.post(
+        url,
+        headers=headers,
+        json={"name": "primary.example", "zone_type": "primary", "forwarders": ["dns.google"]},
+    )
+    assert r.status_code == 201, r.text
+    zone_id = r.json()["id"]
+
+    r = await client.put(f"{url}/{zone_id}", headers=headers, json={"zone_type": "forward"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["value"] == "dns.google"
+
+
 async def test_a_stored_bad_forwarder_does_not_block_an_unrelated_edit(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

@@ -463,7 +463,7 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # Forward-zone-only fields (ignored by the agent for other types).
             "forwarders": (
                 _safe_zone_forwarders(z)
-                if server.driver == "bind9"
+                if server.driver == "bind9" and getattr(z, "zone_type", None) == "forward"
                 else list(getattr(z, "forwarders", []) or [])
             ),
             "forward_only": bool(getattr(z, "forward_only", True)),
