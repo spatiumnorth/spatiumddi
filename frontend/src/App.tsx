@@ -1,4 +1,10 @@
-import { Routes, Route, Navigate } from "react-router-dom";
+import {
+  Routes,
+  Route,
+  Navigate,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useBrandDocumentTitle } from "@/hooks/usePublicSettings";
@@ -91,6 +97,7 @@ import { ChangeRequestsPage } from "@/pages/admin/ChangeRequestsPage";
 import RequestsPage from "@/pages/RequestsPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -106,6 +113,25 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     );
   }
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
+}
+
+// Network device ids are UUIDs (`network_device.id`).
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Legacy device-detail bookmark (/network/:id, pre-#84). Redirects a
+ * device id to its canonical /network/devices/:id; anything else under
+ * /network that matches no real page — a typo like /network/vlna — is a
+ * 404, not a device lookup for "vlna" (#1360).
+ */
+function LegacyDeviceRoute() {
+  const { id = "" } = useParams<{ id: string }>();
+  const { search, hash } = useLocation();
+  if (!UUID_RE.test(id)) return <NotFoundPage />;
+  // Keep the bookmark's query + fragment — the old route rendered the
+  // device page in place, so they used to reach it.
+  return <Navigate to={`/network/devices/${id}${search}${hash}`} replace />;
 }
 
 export default function App() {
@@ -181,7 +207,7 @@ export default function App() {
         />
         {/* Legacy device-detail bookmark (/network/:id) — preserve by
             redirecting to /network/devices/:id. */}
-        <Route path="network/:id" element={<DeviceDetailView />} />
+        <Route path="network/:id" element={<LegacyDeviceRoute />} />
         <Route path="tools/nmap" element={<NmapToolsPage />} />
         <Route path="tools/pcap" element={<PacketCapturePage />} />
         <Route path="tools/network" element={<NetworkToolsPage />} />
@@ -266,6 +292,13 @@ export default function App() {
           element={<Navigate to="/dhcp" replace />}
         />
         <Route path="settings" element={<SettingsPage />} />
+        {/* #1360 — catch-all, deliberately a child of the protected layout
+            (react-router ranks `*` below every other match, so its position
+            among the children does not matter): an unknown URL renders
+            inside the app chrome, and a signed-out user is sent to /login by
+            ProtectedRoute like on any other page. Without it <Routes>
+            rendered null — a blank page. */}
+        <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>
   );

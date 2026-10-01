@@ -18,6 +18,7 @@ on any upstream issue, same as the RIPEstat client.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -32,6 +33,33 @@ logger = structlog.get_logger(__name__)
 _BASE_URL = "https://www.peeringdb.com/api"
 _USER_AGENT = "SpatiumDDI/0.1 (+https://github.com/spatiumnorth/spatiumddi; bgp-enrichment)"
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0, read=15.0)
+
+# Schemes PeeringDB itself accepts for each field. A value with any other
+# scheme is dropped at ingest rather than passed to the UI (#1361).
+_WEBSITE_SCHEMES = frozenset({"http", "https"})
+_LOOKING_GLASS_SCHEMES = frozenset({"http", "https", "telnet", "ssh"})
+
+
+def _url_with_scheme(value: Any, allowed: frozenset[str]) -> str | None:
+    """``value`` if it is an absolute URL with an allowed scheme, else None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    # urlsplit silently drops tabs, newlines and leading C0 controls before
+    # it reads the scheme, so "ht\ttps://x" would pass while the string we
+    # hand on still carries them. Refuse any control character outright.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        # A non-empty netloc is not a host: "https://@", "https://:443" and
+        # "ssh://user@" all have one and no hostname.
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in allowed or not host:
+        return None
+    return value
 
 
 async def _fetch(path: str, params: dict[str, Any], cache_key: str) -> Any:
@@ -115,8 +143,8 @@ async def fetch_asn_network(asn: int) -> dict[str, Any]:
         "policy_general": row.get("policy_general"),
         "policy_locations": row.get("policy_locations"),
         "irr_as_set": row.get("irr_as_set"),
-        "looking_glass": row.get("looking_glass"),
-        "website": row.get("website"),
+        "looking_glass": _url_with_scheme(row.get("looking_glass"), _LOOKING_GLASS_SCHEMES),
+        "website": _url_with_scheme(row.get("website"), _WEBSITE_SCHEMES),
     }
 
 
