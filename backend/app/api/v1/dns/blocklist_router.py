@@ -1547,7 +1547,9 @@ async def effective_for_view(
     return EffectiveBlocklistResponse(
         scope=eff.scope,
         scope_id=eff.scope_id,
-        entries=[EffectiveEntryResponse(**e.__dict__) for e in eff.entries],
+        entries=[
+            EffectiveEntryResponse.model_validate(e, from_attributes=True) for e in eff.entries
+        ],
         exceptions=sorted(eff.exceptions),
         lists=eff.lists,
     )
@@ -1564,7 +1566,9 @@ async def effective_for_group(
     return EffectiveBlocklistResponse(
         scope=eff.scope,
         scope_id=eff.scope_id,
-        entries=[EffectiveEntryResponse(**e.__dict__) for e in eff.entries],
+        entries=[
+            EffectiveEntryResponse.model_validate(e, from_attributes=True) for e in eff.entries
+        ],
         exceptions=sorted(eff.exceptions),
         lists=eff.lists,
     )

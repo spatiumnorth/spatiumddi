@@ -27,7 +27,7 @@ from app.models.dns import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EffectiveEntry:
     """Backend-neutral representation of a blocked domain entry."""
 
@@ -64,35 +64,66 @@ async def _collect_lists(
     exceptions: set[str] = set()
     list_ids: list[uuid.UUID] = []
 
+    # Column rows, not ORM entities (#1109, the #948 pattern): a Family
+    # filter profile is ~596k entries, and hydrating each into a tracked
+    # DNSBlockListEntry on every bundle build is the cost #948 removed for
+    # records. Still one query per list, in the caller's list order, because
+    # that order decides which list wins a duplicate owner name (#878); within
+    # a list the rows come in ``domain`` order so the bundle, and its ETag, are
+    # stable between builds instead of following the heap order. ``domain`` is
+    # unique per list, so the order is total, and it is served by the
+    # ``(list_id, domain)`` unique index rather than a sort of every row (``id``
+    # is a random UUID, so ordering by it bought nothing an index could serve).
     for bl in lists:
         if not bl.enabled:
             continue
         list_ids.append(bl.id)
 
         entry_result = await db.execute(
-            select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == bl.id)
-        )
-        for e in entry_result.scalars().all():
-            entries.append(
-                EffectiveEntry(
-                    domain=e.domain.lower(),
-                    action=e.entry_type,
-                    block_mode=bl.block_mode,
-                    sinkhole_ip=bl.sinkhole_ip,
-                    target=e.target,
-                    is_wildcard=e.is_wildcard,
-                    list_id=bl.id,
-                    list_name=bl.name,
-                )
+            select(
+                DNSBlockListEntry.domain,
+                DNSBlockListEntry.entry_type,
+                DNSBlockListEntry.target,
+                DNSBlockListEntry.is_wildcard,
             )
+            .where(DNSBlockListEntry.list_id == bl.id)
+            .order_by(DNSBlockListEntry.domain)
+        )
+        block_mode, sinkhole_ip, list_id, list_name = bl.block_mode, bl.sinkhole_ip, bl.id, bl.name
+        entries.extend(
+            EffectiveEntry(
+                domain=domain.lower(),
+                action=entry_type,
+                block_mode=block_mode,
+                sinkhole_ip=sinkhole_ip,
+                target=target,
+                is_wildcard=is_wildcard,
+                list_id=list_id,
+                list_name=list_name,
+            )
+            for domain, entry_type, target, is_wildcard in entry_result.tuples()
+        )
 
         exc_result = await db.execute(
-            select(DNSBlockListException).where(DNSBlockListException.list_id == bl.id)
+            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
         )
-        for ex in exc_result.scalars().all():
-            exceptions.add(ex.domain.lower())
+        exceptions.update(domain.lower() for domain in exc_result.scalars())
 
     return entries, exceptions, list_ids
+
+
+def _stable_list_order(lists: list[DNSBlockList]) -> list[DNSBlockList]:
+    """Order lists deterministically, by their (unique) name.
+
+    The ``blocklists`` relationships carry no ``order_by``, so they arrive in
+    whatever order Postgres returns the association rows. The list order
+    decides which list wins a duplicate owner name (#878) and feeds the
+    bundle's ETag, so leaving it to the heap made both flap between builds.
+    ``name`` rather than ``created_at`` because it is always set client-side:
+    a server default can be expired on a just-flushed row, and touching it
+    would lazy-load inside the async session.
+    """
+    return sorted(lists, key=lambda bl: bl.name)
 
 
 async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
@@ -116,9 +147,11 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
     if view is None:
         return EffectiveBlocklist(scope="view", scope_id=view_id)
 
-    combined = {bl.id: bl for bl in view.blocklists}
+    # View-scoped lists precede the group's, so a view's own list wins a
+    # duplicate owner name; each tier is in a stable order of its own.
+    combined = {bl.id: bl for bl in _stable_list_order(list(view.blocklists))}
     if view.group is not None:
-        for bl in view.group.blocklists:
+        for bl in _stable_list_order(list(view.group.blocklists)):
             combined.setdefault(bl.id, bl)
 
     entries, exceptions, list_ids = await _collect_lists(db, list(combined.values()))
@@ -144,7 +177,9 @@ async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> Ef
     if group is None:
         return EffectiveBlocklist(scope="group", scope_id=group_id)
 
-    entries, exceptions, list_ids = await _collect_lists(db, list(group.blocklists))
+    entries, exceptions, list_ids = await _collect_lists(
+        db, _stable_list_order(list(group.blocklists))
+    )
     return EffectiveBlocklist(
         scope="group",
         scope_id=group_id,

@@ -1021,16 +1021,45 @@ class SettingsUpdate(BaseModel):
             s = str(raw).strip()
             if not s:
                 continue
-            # These land inside apt.conf double-quoted strings (the host runner
-            # escapes quotes); reject control chars — C0 (< 0x20) AND ASCII DEL
-            # (0x7f) — plus over-long entries so a value can't smuggle a newline
-            # / extra directive past the render.
-            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in s) or len(s) > 200:
+            # These land inside apt.conf double-quoted strings, and apt.conf has
+            # no escape syntax there (#1384, verified against apt-config): a
+            # backslash is kept literally and a double quote ENDS the string,
+            # so an entry carrying one makes apt-config reject the whole policy
+            # file and the host keeps the old one. Reject quotes, control
+            # chars — C0 (< 0x20) AND ASCII DEL (0x7f) — and over-long entries
+            # so a value can't smuggle a newline / extra directive past the
+            # render.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F or c == '"' for c in s) or len(s) > 200:
                 raise ValueError(
-                    "unattended origin / package entries must be printable and ≤ 200 chars"
+                    "unattended origin / package entries must be printable, contain no "
+                    "double quote, and be ≤ 200 chars"
                 )
             out.append(s)
         return out
+
+    @field_validator("apt_unattended_blocklist")
+    @classmethod
+    def _blocklist_entries_are_regexes(cls, v: list[str] | None) -> list[str] | None:
+        # unattended-upgrades reads each Package-Blacklist entry as a Python
+        # regular expression matched from the start of the package name
+        # (#1384). The form used to call them globs, so ``*`` (an invalid
+        # regex) was a natural thing to type, and an entry that will not
+        # compile is refused here rather than on the host, where it would
+        # break the daily run and stop every security update with it. Runs
+        # after the generic checks above (pydantic applies validators in
+        # declaration order).
+        if v is None:
+            return None
+        for entry in v:
+            try:
+                re.compile(entry)
+            except re.error as exc:
+                raise ValueError(
+                    f"package blocklist entry {entry!r} is not a valid regular expression "
+                    f"({exc}); entries match from the start of the package name, "
+                    "e.g. 'linux-image-' or '^openssl$'"
+                ) from exc
+        return v
 
     @field_validator("apt_proxy_http", "apt_proxy_https")
     @classmethod

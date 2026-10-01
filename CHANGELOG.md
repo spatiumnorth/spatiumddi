@@ -248,6 +248,40 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The unattended-upgrades package blocklist says what it accepts
+  (#1384).** The APT settings form, the model and APPLIANCE.md called
+  its entries globs, but unattended-upgrades reads each one as a regular
+  expression matched from the start of the package name. So `linux-*`
+  matched far more than intended, and `*` is not a valid expression at
+  all and would break the daily run on the host, stopping every
+  security update. All three now say regular expression, with examples,
+  and the API refuses an entry that does not compile (422, naming it).
+  Entries saved before this are not re-checked. Two rendering faults on
+  the same path are fixed with it: the host runner doubled every
+  backslash on the assumption that apt.conf unescapes them, which it
+  does not, so a regex like `linux-image-\d` reached unattended-upgrades
+  as a different expression and blocked nothing; and a double quote,
+  which apt.conf cannot express at all, was accepted and made the whole
+  policy file fail to parse. Values are now written verbatim and a
+  double quote is refused at save. The APT form also shows the server's
+  reason for a refused save instead of "Request failed with status code
+  422".
+
+- **Building a DNS group's config no longer loads every blocklist
+  entry as a database object (#1109).** The bundle the agents
+  long-poll for collected blocklist entries the way #948 stopped
+  collecting records: a full ORM object per entry, the shape that
+  OOM-killed the api on a 250k-record group. The Family filter profile
+  (#878) brings ~596k entries in one click. Entries are now read as
+  plain columns, in a fixed order within each list so the bundle's
+  ETag no longer depends on how Postgres happens to return them. On
+  100k entries this went from 3.4 s and a 100 MiB peak to 1.2 s and
+  38 MiB. The lists themselves are now collected in a fixed order too
+  (a view's own lists first, then the group's, each by name): it
+  decides which list wins a duplicate name, and it used to follow the
+  order Postgres returned the assignments in, so the winner and the
+  ETag could change between two builds of an unchanged group.
+
 - **Deleting a large zone, and opening the Trash, no longer scale with
   the zone (#1231).** The default zone delete loaded every record,
   stamped each through the ORM and wrote one audit row per record, all
