@@ -15,6 +15,8 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -53,6 +55,40 @@ async def test_the_first_list_given_comes_first(db_session: AsyncSession) -> Non
     assert [e.block_mode for e in dup] == ["sinkhole", "nxdomain"]
     assert dup[0].sinkhole_ip == "192.0.2.1" and dup[0].list_name == b.name
     assert exceptions == {"allowed.example"}
+
+
+@pytest.mark.asyncio
+async def test_entries_are_read_as_columns_not_entities(db_session: AsyncSession) -> None:
+    """The point of #1109: a ~596k-entry profile must not be hydrated into
+    ORM objects on every bundle build. Every value assertion here would
+    still pass if the query went back to ``select(DNSBlockListEntry)``, so
+    pin the SQL: the four columns the bundle needs, and nothing an entity
+    load would add (its ``id``, ``list_id``, ``source``, ...). The identity
+    map cannot show this: it holds weak references, and the entities are
+    gone again before the call returns."""
+    a = await _list(db_session, "nxdomain", ["one.example", "two.example"])
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        flat = " ".join(statement.split())
+        if flat.upper().startswith("SELECT") and "FROM dns_blocklist_entry" in flat:
+            statements.append(flat)
+
+    event.listen(Engine, "before_cursor_execute", capture)
+    try:
+        entries, _, _ = await _collect_lists(db_session, [a])
+    finally:
+        event.remove(Engine, "before_cursor_execute", capture)
+
+    assert [e.domain for e in entries] == ["one.example", "two.example"]
+    assert len(statements) == 1, statements
+    selected = statements[0][len("SELECT ") : statements[0].index(" FROM ")]
+    assert [c.strip() for c in selected.split(",")] == [
+        "dns_blocklist_entry.domain",
+        "dns_blocklist_entry.entry_type",
+        "dns_blocklist_entry.target",
+        "dns_blocklist_entry.is_wildcard",
+    ], selected
 
 
 @pytest.mark.asyncio
