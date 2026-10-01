@@ -500,6 +500,15 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
             "primary_ns": getattr(z, "primary_ns", "") or "",
             "admin_email": getattr(z, "admin_email", "") or "",
+            # #1171 — the zone's SOA timers. Stored, editable, exported and in
+            # the control plane's own zone template, never shipped, so the
+            # BIND9 agent wrote 3600/600/86400/300 into every zone's SOA. Like
+            # the apex above they are structural (zones_structural keeps them),
+            # so an edit re-renders the zone.
+            "refresh": getattr(z, "refresh", 86400),
+            "retry": getattr(z, "retry", 7200),
+            "expire": getattr(z, "expire", 3600000),
+            "minimum": getattr(z, "minimum", 3600),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone

@@ -497,6 +497,24 @@ the formatter handles the rest.
   exists" match. `migrations_applied` now lists the revisions that
   committed before the failing one, instead of always being empty.
 
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **On upgrade every zone's
+  SOA changes once to its stored values** and each zone reloads once; with
+  the defaults (RIPE-203's refresh 1 d, retry 2 h, expire about 41 d, and
+  a 1 h negative TTL) negative answers are cached for an hour instead of
+  five minutes, and secondaries keep serving for about 41 days instead of
+  one. The zone API refuses a timer outside 0 to 2147483647, and a stored
+  one BIND would refuse is served as before and logged rather than taking
+  the zone down. PowerDNS and Technitium manage their own SOA and are
+  unchanged.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:
