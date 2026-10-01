@@ -405,3 +405,23 @@ async def test_put_preserves_secret_on_omit(client: AsyncClient, db_session):
     assert settings is not None
     bundle = apt_bundle(settings)
     assert bundle["keyrings"].get("k1") == "KEYBODY"
+
+
+async def test_put_rejects_a_blocklist_entry_that_is_not_a_regex(client: AsyncClient, db_session):
+    """#1384: unattended-upgrades reads each entry as a regex. ``*`` (a glob,
+    which the form used to ask for) does not compile, and would break the
+    daily run on the host if it got there."""
+    _, token = await _superadmin(db_session)
+    r = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_blocklist": ["*"]},
+    )
+    assert r.status_code == 422
+    assert "regular expression" in r.text
+    ok = await client.put(
+        "/api/v1/settings",
+        headers=_hdr(token),
+        json={"apt_unattended_blocklist": ["linux-image-", "^openssl$"]},
+    )
+    assert ok.status_code == 200, ok.text

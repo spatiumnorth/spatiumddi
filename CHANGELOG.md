@@ -248,6 +248,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The unattended-upgrades package blocklist says what it accepts
+  (#1384).** The APT settings form, the model and APPLIANCE.md called
+  its entries globs, but unattended-upgrades reads each one as a regular
+  expression matched from the start of the package name. So `linux-*`
+  matched far more than intended, and `*` is not a valid expression at
+  all and would break the daily run on the host, stopping every
+  security update. All three now say regular expression, with examples,
+  and the API refuses an entry that does not compile (422, naming it).
+  Entries saved before this are not re-checked.
+
 - **Cluster health no longer counts a joining database replica as a
   ready instance (#1213).** The workload rollup on
   `GET /appliance/cluster/health` skipped only finished Job pods, so

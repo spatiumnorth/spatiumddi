@@ -1032,6 +1032,30 @@ class SettingsUpdate(BaseModel):
             out.append(s)
         return out
 
+    @field_validator("apt_unattended_blocklist")
+    @classmethod
+    def _blocklist_entries_are_regexes(cls, v: list[str] | None) -> list[str] | None:
+        # unattended-upgrades reads each Package-Blacklist entry as a Python
+        # regular expression matched from the start of the package name
+        # (#1384). The form used to call them globs, so ``*`` (an invalid
+        # regex) was a natural thing to type, and an entry that will not
+        # compile is refused here rather than on the host, where it would
+        # break the daily run and stop every security update with it. Runs
+        # after the generic checks above (pydantic applies validators in
+        # declaration order).
+        if v is None:
+            return None
+        for entry in v:
+            try:
+                re.compile(entry)
+            except re.error as exc:
+                raise ValueError(
+                    f"package blocklist entry {entry!r} is not a valid regular expression "
+                    f"({exc}); entries match from the start of the package name, "
+                    "e.g. 'linux-image-' or '^openssl$'"
+                ) from exc
+        return v
+
     @field_validator("apt_proxy_http", "apt_proxy_https")
     @classmethod
     def _valid_apt_proxy(cls, v: str | None) -> str | None:

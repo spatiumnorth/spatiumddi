@@ -643,12 +643,14 @@ export function AptSection({
           }}
         />
         <label className="block text-xs font-medium">
-          Package blocklist — globs never auto-upgraded (one per line)
+          Package blocklist — never auto-upgraded. One regular expression per
+          line, matched from the start of the package name (not a glob:{" "}
+          <code>linux-image-</code>, <code>^openssl$</code>)
         </label>
         <textarea
           className={cn(inputCls, "w-full font-mono text-xs")}
           rows={2}
-          placeholder={"linux-image-*\nnvidia-*"}
+          placeholder={"linux-image-\n^openssl$"}
           value={uuBlocklist}
           disabled={ro}
           onChange={(e) => {
