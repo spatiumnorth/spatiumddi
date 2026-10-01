@@ -96,6 +96,9 @@ async def _resolve_usernames(db: Any, user_ids: set[uuid.UUID]) -> dict[uuid.UUI
     return {row.id: row.username for row in res.all()}
 
 
+_WHITESPACE = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f"
+
+
 def _label_expr(model: type) -> Any:
     """The SQL twin of ``soft_delete._row_display`` for the trash listing.
 
@@ -107,7 +110,12 @@ def _label_expr(model: type) -> Any:
         return model.name
     if model in (IPBlock, Subnet):
         network = cast(model.network, String)
-        return func.trim(network + func.coalesce(literal(" ") + func.nullif(model.name, ""), ""))
+        # btrim over the whitespace set, not trim(): Python's ``str.strip``
+        # also drops a trailing tab or newline in the name.
+        return func.btrim(
+            network + func.coalesce(literal(" ") + func.nullif(model.name, ""), ""),
+            _WHITESPACE,
+        )
     if model is DNSZone:
         return model.name
     if model is DNSRecord:
@@ -168,24 +176,33 @@ async def list_trash(
     listing = union_all(*branches).subquery()
 
     # include_deleted on the outer statement: the global soft-delete filter
-    # would otherwise hide exactly the rows this page exists to show.
-    total = int(
-        (
-            await db.execute(
-                select(func.count()).select_from(listing).execution_options(include_deleted=True)
-            )
-        ).scalar_one()
-        or 0
-    )
+    # would otherwise hide exactly the rows this page exists to show. The
+    # total rides the page as a window count, so the UNION is evaluated once;
+    # only a page past the end needs a separate count.
     page = (
         await db.execute(
-            select(listing)
+            select(listing, func.count().over().label("total"))
             .order_by(listing.c.deleted_at.desc(), listing.c.id)
             .limit(limit)
             .offset(offset)
             .execution_options(include_deleted=True)
         )
     ).all()
+    if page:
+        total = int(page[0].total)
+    elif offset == 0:
+        total = 0
+    else:
+        total = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(listing)
+                    .execution_options(include_deleted=True)
+                )
+            ).scalar_one()
+            or 0
+        )
 
     username_map = await _resolve_usernames(
         db, {r.deleted_by_user_id for r in page if r.deleted_by_user_id is not None}

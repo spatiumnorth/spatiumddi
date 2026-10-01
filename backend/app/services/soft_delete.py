@@ -8,7 +8,7 @@ via ``execution_options(include_deleted=True)``.
 Cascading: when soft-deleting a parent (IPSpace / IPBlock / Subnet / DNSZone /
 DHCPScope) we walk every descendant in scope and stamp them with the same
 ``deleted_at`` + ``deletion_batch_id``. ``DNSRecord`` cascades from a parent
-DNSZone; ``DHCPPool`` + ``DHCPStaticAssignment`` cascade from a parent
+DNSZone, stamped set-based rather than walked (``BulkChild``, #1231); ``DHCPPool`` + ``DHCPStaticAssignment`` cascade from a parent
 DHCPScope (#617 — a scope used to be treated as a leaf, which left its pools
 and reservations as live, un-stamped rows pointing at a hidden parent: still
 enforcing group-wide MAC uniqueness and still answering ``GET
@@ -299,7 +299,10 @@ async def apply_soft_delete(
         row.obj.deletion_batch_id = batch.batch_id
     for child in batch.bulk:
         fk = getattr(child.model, child.fk_column)
-        await db.execute(
+        # "evaluate", not False: it walks only the identity map, never the
+        # matched rows, and keeps any record already loaded in this session
+        # from reading as live after the stamp.
+        result = await db.execute(
             update(child.model)
             .where(fk == child.parent.id, child.model.deleted_at.is_(None))
             .values(
@@ -307,8 +310,13 @@ async def apply_soft_delete(
                 deleted_by_user_id=user_id,
                 deletion_batch_id=batch.batch_id,
             )
-            .execution_options(synchronize_session=False)
+            .execution_options(synchronize_session="evaluate")
         )
+        # The rows actually stamped, not the count taken at collect time: a
+        # record committed in between rides this batch and must be counted
+        # on the parent's audit row.
+        if result.rowcount is not None and result.rowcount >= 0:
+            child.count = int(result.rowcount)
     return now
 
 
