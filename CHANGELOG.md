@@ -263,6 +263,21 @@ the formatter handles the rest.
   `8.8.8.8`, and PowerDNS does not start on a host with no route to
   them.
 
+- **Unattended upgrades no longer install kernels on the appliance
+  (#1249).** `mkosi.conf` said "No kernel upgrades" while the
+  unattended-upgrades drop-in allowed security-pocket kernels, and
+  nothing excluded them. Each slot boots `/boot/vmlinuz` and
+  `/boot/initrd.img`, symlinks the slot-image build and the installer
+  point at the image's own kernel. A kernel with a new ABI never ran,
+  because Debian's kernel packages maintain their symlinks in `/`, not
+  `/boot`; it only took space in a fixed-size slot. A revision of the
+  slot's own ABI was worse: it overwrote the very `vmlinuz-<ver>` those
+  symlinks name and rebuilt its initrd on the device, so the slot booted
+  a kernel its image never shipped. `linux-image-` is
+  now on the drop-in's Package-Blacklist, which apt merges with an
+  operator's own blocklist from the APT settings (#164). Kernels
+  arrive with slot images, as before.
+
 - **The privacy statement lists the public resolvers PowerDNS
   uses, and its guard now scans the agents too (#1353).** The agent
   renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
