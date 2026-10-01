@@ -6,11 +6,23 @@
        ``metallb.frrk8s.enabled`` + bake the frr images first.
 
        Renders one BGPPeer per ``metallb.bgp.peers`` entry and one
-       BGPAdvertisement per ``metallb.bgp.advertisements`` entry, both
-       metallb.io/v1beta1 in the controller's namespace (metallb-system). */}}
+       BGPAdvertisement per ``metallb.bgp.advertisements`` entry, in the
+       controller's namespace (metallb-system).
+
+       #1103 — the BGPPeer is metallb.io/v1beta2, its STORAGE version, not
+       v1beta1. The bgppeers CRD converts between the two through a
+       conversion webhook served by the same controller Deployment this
+       install creates, and a conversion webhook has no failurePolicy: a
+       v1beta1 BGPPeer created while that controller is still starting is
+       refused outright, whatever ``crds.validationFailurePolicy`` says.
+       Enabling MetalLB and BGP in one save is exactly that case, and the
+       k3s HelmChart's uninstall-first retry would then delete the
+       controller again on every attempt. Writing the storage version needs
+       no conversion. Every field used here exists unchanged in v1beta2.
+       BGPAdvertisement has only v1beta1, so it needs no conversion either. */}}
 {{- if and .Values.metallb.enabled .Values.metallb.bgp.enabled }}
 {{- range $i, $peer := .Values.metallb.bgp.peers }}
-apiVersion: metallb.io/v1beta1
+apiVersion: metallb.io/v1beta2
 kind: BGPPeer
 metadata:
   name: spatium-peer-{{ $i }}

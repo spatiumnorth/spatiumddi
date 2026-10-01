@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every rendered admission webhook must fail OPEN (#1103).
+"""Every admission webhook in a render must fail OPEN (#1103).
 
 The MetalLB chart validates its ``IPAddressPool`` / ``L2Advertisement`` through
 a webhook served by the controller Deployment the same install creates. Helm 4
@@ -16,6 +16,11 @@ validator; once the controller is up the CRs are validated as before.
 ``helm lint`` and ``helm template`` both pass with ``Fail``: the failure needs a
 live apiserver. So this checks the RENDERED policy, which a typo in the values
 path (the setting silently not reaching the subchart) would also fail.
+
+Run on the MetalLB render only. The BGP render also holds frr-k8s's webhook,
+which stays at ``Fail`` deliberately: it validates ``FRRConfiguration``
+objects the MetalLB speaker creates at RUNTIME and retries, not CRs in the
+same Helm install, so it cannot wedge the install.
 
 Usage: chart-webhooks-fail-open.py <rendered.yaml> [--require]
   --require   also fail when the render holds no webhook at all (the render
@@ -34,8 +39,14 @@ KINDS = {"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration"}
 
 def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if not a.startswith("--")]
-    require = "--require" in argv[1:]
-    if len(args) != 1:
+    flags = [a for a in argv[1:] if a.startswith("--")]
+    require = "--require" in flags
+    # An unknown flag is refused rather than ignored: a typo'd ``--require``
+    # would otherwise silently turn "no webhook rendered" into a pass.
+    unknown = [f for f in flags if f != "--require"]
+    if unknown or len(args) != 1:
+        if unknown:
+            print(f"unknown flag(s): {' '.join(unknown)}", file=sys.stderr)
         print(__doc__, file=sys.stderr)
         return 2
     path = Path(args[0])

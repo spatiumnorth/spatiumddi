@@ -259,8 +259,13 @@ the formatter handles the rest.
   (`crds.validationFailurePolicy: Ignore`) while unreachable; once the
   controller is up they validate as before. A new chart gate checks the
   rendered policy, since `helm lint` and `helm template` pass either
-  way. The "known issue" notes in `TOPOLOGIES.md`, `APPLIANCE.md` and
-  `TROUBLESHOOTING.md` are removed.
+  way. BGP mode had the same loop through a door `Ignore` cannot close:
+  the `BGPPeer` was written as `v1beta1` while its CRD stores `v1beta2`,
+  so creating it needs MetalLB's conversion webhook, and a conversion
+  webhook has no failure policy. Enabling MetalLB and BGP in one save
+  therefore still wedged the install. It is now written at `v1beta2`,
+  which needs no conversion. The "known issue" notes in `TOPOLOGIES.md`,
+  `APPLIANCE.md` and `TROUBLESHOOTING.md` are removed.
 
 - **Building a DNS group's config no longer loads every blocklist
   entry as a database object (#1109).** The bundle the agents
