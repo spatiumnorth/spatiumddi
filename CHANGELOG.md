@@ -248,6 +248,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The privacy statement lists the public resolvers PowerDNS
+  uses, and its guard now scans the agents too (#1353).** The agent
+  renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
+  `pdns.conf`, and the setting added on the agent side in #250 to
+  change it was never wired to the control plane. PowerDNS sends two
+  kinds of lookup through it: the target of every ALIAS record, so
+  Cloudflare and Google see those names, and its own built-in
+  security-status poll, which runs on every PowerDNS server at startup
+  and periodically after, and tells them and PowerDNS which PowerDNS
+  version you run. `docs/PRIVACY.md`, which claims to list every
+  outbound connection, mentioned neither. It now does, in a new §3.5
+  for the DNS and DHCP servers; making the resolver configurable is
+  still open. The CI guard that holds the page to that claim scanned
+  `backend/app` only, and this connection was in agent code, as IP
+  addresses its hostname scan could not see. It now also scans the
+  four shipped agent packages, for hostnames and for public IP
+  addresses in string values, matches an address only as a whole
+  address, and fails when a new agent package is missing from the
+  scan or from the CI path filter's carve-outs, which now include
+  those packages so an agent-only change runs the guard.
+
 - **The Compose upgrade steps upgrade, and the deployment docs stop
   describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
   upgrade procedure ran `docker compose build`, which rebuilds nothing:
