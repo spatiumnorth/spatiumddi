@@ -8707,6 +8707,21 @@ const ADDRESS_STATUSES = [
   "discovered",
 ] as const;
 
+/**
+ * ``options`` with the row's stored ``value`` first when they lack it
+ * (#1305). A controlled ``<select>`` whose value is none of its options
+ * shows its first one, so an address an integration marked
+ * ``docker-container`` read as "available". Kept as an option, the stored
+ * value is what the dialog shows and what an untouched Save sends.
+ * InlineStatusSelect guards its status the same way.
+ */
+function withStoredValue(
+  options: readonly string[],
+  value: string | null | undefined,
+): readonly string[] {
+  return value && !options.includes(value) ? [value, ...options] : options;
+}
+
 // Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
 // ``YYYY-MM-DDTHH:MM``, no TZ suffix). Naively slicing ``toISOString()``
 // yields the *UTC* wall-clock, which the local-time input then misreads — so
@@ -9104,7 +9119,7 @@ export function EditAddressModal({
             value={status}
             onChange={(e) => setStatus(e.target.value)}
           >
-            {ADDRESS_STATUSES.map((s) => (
+            {withStoredValue(ADDRESS_STATUSES, address.status).map((s) => (
               <option key={s} value={s}>
                 {s}
               </option>
@@ -9178,7 +9193,7 @@ export function EditAddressModal({
               onChange={(e) => setRole(e.target.value)}
             >
               <option value="">— None —</option>
-              {IP_ROLE_OPTIONS.map((r) => (
+              {withStoredValue(IP_ROLE_OPTIONS, address.role).map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>

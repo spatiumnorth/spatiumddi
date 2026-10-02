@@ -27,6 +27,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Edit address shows the role and status an address is stored with
+  (#1305).** Its Role menu lacked `web`, `api` and `lb`, which the API
+  accepts, and its Status menu lacked the statuses integrations set
+  (`docker-container`, `proxmox-vm`, …). A select whose value is not
+  among its options shows its first one, so such an address read as Role
+  "— None —" or Status "available" while the table beside it said
+  otherwise, and "— None —" could not be picked to clear a role because
+  it already looked selected. Allocate IP and Edit address now offer the
+  three TLS-serving roles, and Edit address keeps the address's own
+  status or role as an option whenever its menu lacks it.
+
 - **A template picked in New Subnet or New IP Block applies (#1304).**
   The dialogs sent their own defaults for every field a template fills
   (`custom_fields: {}`, DDNS off, DNS and DHCP inherited), and the API's

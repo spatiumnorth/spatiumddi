@@ -575,3 +575,40 @@ describe("a template picked in the dialog is what the dialog sends (#1304)", () 
     });
   });
 });
+// ── #1305 — the status and role an address is stored with ────────────────────
+
+describe("Edit address shows the status and role it is stored with (#1305)", () => {
+  function editAddress(row: IPAddress) {
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    const updateAddress = sink(row);
+    answer("ipamApi", "updateAddress", updateAddress);
+    open(<EditAddressModal address={row} onClose={() => {}} />);
+    return updateAddress;
+  }
+
+  it("a TLS-serving role (web, api, lb) is shown and offered", async () => {
+    const updateAddress = editAddress(address({ role: "web" }));
+
+    const role = control<HTMLSelectElement>("Role");
+    expect(role.value).toBe("web");
+    expect([...role.options].map((o) => o.value)).toEqual(
+      expect.arrayContaining(["web", "api", "lb"]),
+    );
+    await press("Save");
+
+    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
+    expect(updateAddress.mock.calls[0][1]).toMatchObject({ role: "web" });
+  });
+
+  it("an integration-owned status is shown as itself, not as available", async () => {
+    const updateAddress = editAddress(address({ status: "docker-container" }));
+
+    expect(control<HTMLSelectElement>("Status").value).toBe("docker-container");
+    await press("Save");
+
+    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
+    expect(updateAddress.mock.calls[0][1]).toMatchObject({
+      status: "docker-container",
+    });
+  });
+});
