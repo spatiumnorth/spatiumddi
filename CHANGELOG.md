@@ -1942,7 +1942,11 @@ the formatter handles the rest.
   TSIG key** (server group → Edit, or
   `POST /dns/groups/{id}/group-tsig-key/rotate`) replaces it under the
   same name, and the agents pick it up on their next sync; the secret
-  is never returned. **Upgrade notes:** the old plaintext column is kept,
+  is never returned. No copilot tool, deliberately (non-negotiable #13):
+  the rotation re-renders every agent in the group, the broad-blast-radius
+  write that guidance keeps off the copilot. An "exclude secrets"
+  diagnostic archive now also blanks the leftover plaintext column below,
+  which it had been carrying in clear. **Upgrade notes:** the old plaintext column is kept,
   unread, for one release so a rolling upgrade's old api pods keep
   working, and the next release drops it. Until then it still holds the
   pre-upgrade secret, so rotate each group's key once the upgrade has

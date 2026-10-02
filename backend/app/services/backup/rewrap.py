@@ -306,6 +306,20 @@ NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
 )
 
 
+# Plaintext copies of a secret that an expand/contract migration has moved
+# into an ``*_encrypted`` column but not yet dropped (#296): unmapped, unread
+# by the application, and still holding the pre-upgrade value. They are not
+# Fernet tokens, so nothing above covers them, and an "exclude secrets"
+# diagnostic archive must still not carry them. The scrubber writes NULL.
+# Remove an entry in the release whose contract migration drops the column.
+LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # #1364 — moved to ``tsig_key_secret_encrypted``.
+        ("dns_server_group", "tsig_key_secret"),
+    }
+)
+
+
 def redactable_columns() -> tuple[tuple[str, str, str], ...]:
     """ENCRYPTED_COLUMNS minus the machine identity that cannot be re-entered.
 

@@ -397,14 +397,15 @@ def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
     no key at all.
 
     Returns True when a key was generated, False when a usable one already
-    existed. A stored key that no longer decrypts counts as none. Mutates the
-    row; the caller commits.
+    existed. A stored key that no longer decrypts counts as none, and is
+    replaced under its EXISTING name: an operator may cite that name in a
+    view's ``match-clients`` or an ACL, and re-deriving it from a group
+    renamed since would leave those an undefined symbol that makes BIND
+    refuse the whole file. Mutates the row; the caller commits.
     """
     if group_tsig_secret(group):
         return False
-    group.tsig_key_name = _safe_key_label(group)
-    set_group_tsig_secret(group, _new_group_secret())
-    group.tsig_key_algorithm = "hmac-sha256"
+    rotate_group_tsig_key(group)
     return True
 
 

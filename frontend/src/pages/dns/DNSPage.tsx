@@ -1022,6 +1022,8 @@ function GroupModal({
     onSuccess: () => {
       setConfirmRotate(false);
       setRotated(true);
+      // A failed earlier attempt left its message under the form.
+      setError("");
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
     },
     onError: (e: ApiError) => {

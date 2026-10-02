@@ -84,6 +84,59 @@ async def test_an_undecryptable_key_is_reminted(db_session: AsyncSession) -> Non
     assert legacy_group_key(group) is None
     assert ensure_group_tsig_key(group) is True
     assert group_tsig_secret(group)
+    # Under its existing name, not one re-derived from the (since renamed)
+    # group: a view or ACL citing ``key "spatium-old"`` must still resolve.
+    assert group.tsig_key_name == "spatium-old"
+
+
+async def test_a_rotated_key_reaches_the_agent_bundle(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """What the rotation is for: the next bundle carries the new secret."""
+    from app.models.dns import DNSServer
+    from app.services.dns.agent_config import build_config_bundle
+
+    headers = await _admin(db_session)
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", tsig_key_name="spatium-b")
+    set_group_tsig_secret(group, "b2xkLXNlY3JldA==")
+    db_session.add(group)
+    await db_session.flush()
+    server = DNSServer(group_id=group.id, name="s1", driver="bind9", host="127.0.0.1", port=53)
+    db_session.add(server)
+    await db_session.commit()
+    group_id, server_id = group.id, server.id
+
+    resp = await client.post(
+        f"/api/v1/dns/groups/{group_id}/group-tsig-key/rotate", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire_all()
+    loaded = (
+        await db_session.execute(select(DNSServer).where(DNSServer.id == server_id))
+    ).scalar_one()
+    bundle = await build_config_bundle(db_session, loaded)
+    group = await db_session.get(DNSServerGroup, group_id)
+    assert group is not None
+    keys = {k["name"]: k["secret"] for k in bundle["tsig_keys"]}
+    assert keys["spatium-b"] == group_tsig_secret(group) != "b2xkLXNlY3JldA=="
+
+
+def test_an_exclude_secrets_archive_blanks_the_legacy_plaintext_column() -> None:
+    """The plaintext column is kept, unread, for one release; a diagnostic
+    archive that scrubs the encrypted copy must not ship this one in clear."""
+    from app.services.backup.archive import _scrub_dump_text
+
+    dump = (
+        'COPY "public"."dns_server_group" ("id", "name", "tsig_key_secret", '
+        '"tsig_key_secret_encrypted") FROM stdin;\n'
+        "1\tdefault\tcGxhaW4=\t\\\\x6162\n"
+        "2\tother\t\\N\t\\N\n"
+        "\\.\n"
+    )
+    rows = [line.split("\t") for line in _scrub_dump_text(dump).splitlines()[1:3]]
+    assert rows[0] == ["1", "default", "\\N", "\\\\x"]
+    assert rows[1] == ["2", "other", "\\N", "\\N"]
 
 
 async def test_rotate_replaces_the_secret_and_keeps_the_name(
