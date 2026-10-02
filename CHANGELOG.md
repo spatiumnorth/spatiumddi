@@ -25,6 +25,138 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Security
+
+- **The MFA enrolment QR code is drawn in the browser, not fetched from
+  a third party (#1353).** The screen built it as an image from
+  `api.qrserver.com` with the `otpauth://` URI in the query string,
+  which carries the TOTP secret, so every account that enrolled MFA sent
+  its second factor to that service. That happened from 2026.05.05-1,
+  the release that added MFA, until the Content-Security-Policy from
+  #400 began blocking the request in 2026.06.13-1. Since then the QR
+  was a broken image and the secret had to be typed in by hand. The
+  code is now rendered locally, by the component the API-token
+  enrolment QR already uses. **If an account enrolled MFA on a release
+  in that range, disable MFA and enrol again** to get a secret no one
+  else has seen. A new frontend test
+  (`frontend/src/lib/outbound-hosts.test.ts`) holds every hostname the
+  Web UI names against `docs/PRIVACY.md`, as the backend guard already
+  did for `backend/app` and the agents.
+
+- **PowerDNS no longer sends ALIAS lookups to Cloudflare and Google
+  (#1353).** Every PowerDNS server had `resolver=1.1.1.1,8.8.8.8` in its
+  `pdns.conf`, because the control plane never sent the agent a
+  resolver. So ALIAS targets went to two public resolvers nobody chose,
+  and a PowerDNS server with no route to them did not start. ALIAS
+  records now resolve through the group's own forwarders over plain DNS.
+  With no forwarders, or with forwarders over TLS, HTTPS or QUIC (which
+  PowerDNS's resolver cannot speak), ALIAS expansion is off, and the API
+  refuses a new ALIAS record with a 422 naming the fix. Clearing the
+  forwarders of a PowerDNS group that serves ALIAS records, or moving
+  them to an encrypted transport, is refused the same way. **Upgrade
+  note:** a PowerDNS group that serves ALIAS records and has no
+  forwarders stops answering A / AAAA for those names until you set
+  forwarders under the group's server options. Until the upgrade
+  replaces the old PowerDNS pod (on an appliance, a few minutes after
+  the reboot), the previous release's pdns keeps sending its ALIAS and
+  security-status lookups to `1.1.1.1` / `8.8.8.8`. Air-gapped PowerDNS
+  groups now start. A change to a PowerDNS group's server options now
+  restarts `pdns_server`, a sub-second gap in answers: pdns reads
+  `pdns.conf` only at startup, so until now a new log level, query
+  logging, and the resolver all waited for the container to restart.
+  The agent waits that restart out rather than reading the old daemon's
+  exit as a crash, and a `pdns_server` that will not stop fails the
+  apply, which is retried, instead of keeping the old settings.
+
+- **Supervisor registration has an attempt budget, and persistent pairing
+  codes expire by default (#1356).** `POST /appliance/supervisor/register`
+  is unauthenticated: an 8-digit pairing code is the credential. Nothing
+  limited the guesses beyond a fixed half-second delay, persistent codes
+  defaulted to never expiring, and every wrong guess committed its own
+  audit row, so a brute-force run also flooded the append-only audit
+  table. Now ten wrong codes from one address, or a hundred across the
+  install, in 15 minutes get `429` until the window passes. The attempt is
+  spent before the code is checked, so concurrent guesses can't all slip
+  under the limit, and a right code refunds it, so a fleet rollout behind
+  one NAT address is never throttled. A request already refused checks no
+  code and is not charged to the install-wide budget, so one address
+  cannot use it up and lock out every registration. The throttle fails
+  closed (`503`) while Redis is unreachable. The supervisor stops retrying
+  on `429` until its next loop tick, honours a capped `Retry-After` on
+  `503`, and drops a pairing code the control plane rejects rather than
+  re-sending it every 30 seconds, which kept its address throttled for
+  every appliance pairing from behind it (a control-plane node mints a
+  fresh self-bootstrap code instead). An unknown code is audited only for the
+  first failure from an address in each window, plus once when either
+  limit trips; a code that exists but is revoked, expired or exhausted is always
+  audited. **Behaviour change:** a persistent code now expires after 30
+  days unless created with `expires_in_minutes: 0`, and the dialog warns
+  when you choose never. Persistent codes minted before the upgrade,
+  which never expired, now expire 30 days after the upgrade (migration
+  `5e6d56b39ab7`); re-mint one with `expires_in_minutes: 0` if a code
+  that never expires is what you want.
+
+### Migrations
+
+- `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
+  that is not revoked and has no expiry gets `expires_at` 30 days after
+  the upgrade. Downgrade is a no-op: which codes were NULL is not
+  recorded, and restoring NULL would make them never expire again.
+
+## 2026.10.02-1 — 2026-10-02
+
+# ⚠️ Please don't roll back to 2026.09.04-1
+
+> **Once you have upgraded to this release, do not go back to
+> 2026.09.04-1 or any earlier release.** Take a database backup
+> before you upgrade. This release adds 22 database migrations, and
+> 2026.09.04-1 cannot run on the result: its migrate step fails with
+> `Can't locate revision`, and its api, worker and beat wait for that
+> step forever, so the control plane does not come back. This release
+> refuses a slot rollback or Fleet boot change onto a release that
+> cannot run on the database (#1227), but the automatic trial-boot
+> revert and a Compose or Helm redeploy of an older tag are not
+> checked, and 2026.09.04-1 itself cannot tell you what went wrong.
+> Its chart also lacks the fix for #1042, so a reinstall during the
+> rollback can mint a new `SECRET_KEY` and leave every credential
+> encrypted at rest unreadable. If you must go back, restore the
+> backup you took before the upgrade alongside the older release.
+
+**This is not 1.0.0.** 1.0.0 is still being worked on, and this
+release is a waypoint on the way there: a month of QA on the ddi-pg
+proving ground and the Academy course, 147 commits, most of them fixes
+for defects that only show up on a real estate, a real appliance
+fleet, or an upgrade. It is still a CalVer release, and 1.0.0 will be
+announced as its own release when it is ready. **Security:** remote
+agents, appliance supervisors and role pods now verify the control
+plane's TLS certificate (they trusted any certificate before, while
+carrying the platform-wide agent key) (#1219, #1220, #1281); a second
+auth provider of the same type can no longer sign in as another
+provider's user (#1235); the api refuses to boot on a placeholder
+`SECRET_KEY` (#1222); `/metrics` needs a bearer token (#1159); and a
+release now publishes nothing until CI, Trivy and `main` all agree
+(#1226). **Scale:** DNS agent config bundles are rendered once in the
+worker and served as stored bytes, so a million-record group converges
+(#1111), and deleting or restoring a large zone no longer scales with
+it (#1231, #1389). **Agents** spool what they collect during a
+control-plane outage and replay it on reconnect (#1077), and Kea's
+DHCPv6 leases finally reach IPAM and DDNS (#1141). **New:** the
+appliance builds for arm64 (#1026) and installs onto a RAID1 mirror
+(#999), E911 dispatchable location (#972), Windows DHCP failover
+awareness and management (#1110), an enforceable SSH source-CIDR
+allowlist (#1009), and removable USB backup disks. Groundwork for the
+move to SemVer at 1.0.0 is in (#1182). 9 new MCP tools.
+
+**Before you upgrade, check four things.** A Prometheus job scraping
+`/metrics` without a token gets 401 (#1159). A Compose or k8s install
+still on the committed placeholder `SECRET_KEY` will not start
+(#1222). A remote Compose agent that relied on the old
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` default needs `TLS_CA_PATH`
+(#1220). And images now come from `ghcr.io/spatiumnorth/…` after the
+GitHub organization rename. A fresh install also enables fewer
+feature modules than before; existing installs are not changed
+(#1069).
+
 ### Added
 
 - **DHCPv6 leases reach the control plane (#1141).** Kea's DHCPv6
@@ -178,2280 +310,6 @@ the formatter handles the rest.
   without `id`. Every agent's ETag rotates once on the first poll after
   upgrade (one full-body fetch; a full re-render only under
   split-horizon, where records are structural).
-
-### Changed
-
-- **The update check and the upgrade preflight understand SemVer
-  (#1182).** Both compared versions as strings, which the switch to
-  SemVer at 1.0.0 breaks: `"1.0.0" > "2026.09.04-1"` is false, so no
-  install would have been offered 1.0.0, and the preflight's CalVer
-  parser failed it outright, disabling Plan. Both now use the shared
-  version helper from #1183. Every SemVer release is newer than every
-  CalVer one, SemVer compares numerically with pre-release precedence,
-  and a dev build, `latest` or a `0.x` placeholder is unknown rather
-  than a version. The preflight's skip-release warning now counts
-  calendar days, and it does not apply to a jump involving a SemVer
-  version, which has no date. Two existing bugs are gone with the
-  string compare: a same-day release numbered `-10` or higher was not
-  offered over `-2` to `-9`, and an install running `latest`, the
-  `.env.example` default, was never offered an update at all. This is
-  the comparison half of #1182, which the last CalVer release has to
-  carry. The release workflow and docs changes follow separately.
-
-- **The rest of the switch to SemVer at 1.0.0 (#1182).** The last
-  CalVer release, the bridge, now carries everything that has to run
-  in the version being upgraded *from*:
-  - The DNS, DHCP and looking-glass agents report the release their
-    image was built from. Each reported a date string frozen in its
-    package since it was written (`2026.04.14.1` for the DNS agent),
-    whatever release it shipped in; an unstamped build reports `dev`.
-    The supervisor got the same fix in #1183.
-  - A per-box OS upgrade from Fleet records which way it moves the
-    node (`forward`, `same`, `backward` or `unknown`) in its audit row
-    and log, and the Fleet form warns before a rollback. It still
-    refuses nothing: it is also the manual rollback path. The rolling
-    upgrade already refuses a backward target.
-  - The Helm chart version moved from a `sed` in the release workflow
-    to `scripts/release_version.py chart-version`, tested: a CalVer
-    tag drops its leading zeros, a SemVer tag is published unchanged.
-  - The installer's clock check reads the ISO's `BUILD_TIME` instead of
-    parsing a date out of the version, which stops being a date at
-    1.0.0. Local builds now stamp `BUILD_TIME` too.
-  - The docs describe both schemes, and that an install must reach the
-    bridge before it can be offered 1.0.0.
-
-- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
-  2026-09-24 and the backend's requirement had no upper bound, so CI
-  picked it up at once. The test suite passes on it, but its new
-  type annotations fail mypy in 23 files, which blocked every open
-  PR. Adopting 2.1 deliberately, typing work included, is #1187.
-
-- **DNS per-minute metrics now accumulate per bucket, like DHCP
-  (#1077).** `POST /dns/agents/metrics` replaced an existing
-  `(server, bucket_at)` row instead of adding to it — the same jitter
-  collision #980 fixed on the DHCP side: the agent floors `bucket_at`
-  to the minute on a 60 s ± 3 s interval, so about one bucket in forty
-  received two genuinely different deltas and the overwrite discarded
-  one. It accumulates now; that is only safe because a replayed batch
-  is deduplicated by its `batch_id` (above).
-
-- **The Kerberos WinRM transport is no longer offered (#1128).** The
-  Windows DNS and DHCP server forms listed it, but it needs the
-  `gssapi` library and the system Kerberos libraries — neither in
-  the images, and `gssapi` has no Linux wheel — plus realm / KDC
-  configuration the control plane has nowhere to take from, so it
-  failed on every call. It is gone from both forms, the API refuses
-  it at save (422, saying why), and a server saved with it before
-  fails with that explanation instead of a library error; edit it
-  and pick NTLM or CredSSP. NTLM, CredSSP and Basic are unchanged.
-  Real Kerberos support stays on the roadmap as #1128.
-
-### Fixed
-
-- **The unattended-upgrades package blocklist says what it accepts
-  (#1384).** The APT settings form, the model and APPLIANCE.md called
-  its entries globs, but unattended-upgrades reads each one as a regular
-  expression matched from the start of the package name. So `linux-*`
-  matched far more than intended, and `*` is not a valid expression at
-  all and would break the daily run on the host, stopping every
-  security update. All three now say regular expression, with examples,
-  and the API refuses an entry that does not compile (422, naming it).
-  Entries saved before this are not re-checked. Two rendering faults on
-  the same path are fixed with it: the host runner doubled every
-  backslash on the assumption that apt.conf unescapes them, which it
-  does not, so a regex like `linux-image-\d` reached unattended-upgrades
-  as a different expression and blocked nothing; and a double quote,
-  which apt.conf cannot express at all, was accepted and made the whole
-  policy file fail to parse. Values are now written verbatim and a
-  double quote is refused at save. The APT form also shows the server's
-  reason for a refused save instead of "Request failed with status code
-  422".
-
-- **Building a DNS group's config no longer loads every blocklist
-  entry as a database object (#1109).** The bundle the agents
-  long-poll for collected blocklist entries the way #948 stopped
-  collecting records: a full ORM object per entry, the shape that
-  OOM-killed the api on a 250k-record group. The Family filter profile
-  (#878) brings ~596k entries in one click. Entries are now read as
-  plain columns, in a fixed order within each list so the bundle's
-  ETag no longer depends on how Postgres happens to return them. On
-  100k entries this went from 3.4 s and a 100 MiB peak to 1.2 s and
-  38 MiB. The lists themselves are now collected in a fixed order too
-  (a view's own lists first, then the group's, each by name): it
-  decides which list wins a duplicate name, and it used to follow the
-  order Postgres returned the assignments in, so the winner and the
-  ETag could change between two builds of an unchanged group.
-
-- **Deleting a large zone, and opening the Trash, no longer scale with
-  the zone (#1231).** The default zone delete loaded every record,
-  stamped each through the ORM and wrote one audit row per record, all
-  in one transaction and computing each audit hash under the global
-  audit lock, so it blocked every other audited change for its
-  duration. A zone's records are now stamped by one `UPDATE`, and the
-  zone's own audit row records how many it took with it
-  (`old_value.cascaded`). A record already in the trash keeps its own
-  deletion and comes back with that one, not with the zone. The Trash
-  page loaded every soft-deleted row of every type into Python on
-  each view, plus a count per batch per type; it now filters, counts
-  and pages in SQL, and counts batch sizes for the shown rows only.
-  The search stays a literal substring match.
-
-- **Restoring a large zone from the Trash no longer scales with the
-  zone either (#1389).** Restore still had the old shape: one conflict
-  `SELECT` per record and one audit row per record, so bringing back a
-  250k-record zone was 250k of each in one request, blocking every
-  other audited change. The conflicts are now found by one query for
-  the whole batch, the zone's records come back by one `UPDATE`, and
-  the zone's own restore row records how many (`new_value.restored`).
-  The response's `restored` count still includes them. The conflict
-  check now uses the identity record create refuses a duplicate on
-  (#1230): the view, the name compared case-insensitively, the type,
-  the value after trimming, and priority, weight and port. So a record
-  in another view, or an MX or SRV at another priority or port, no
-  longer blocks the restore (neither was ever a duplicate), while a
-  restore can no longer bring back a twin that differs from a live
-  record only in letter case or surrounding spaces. A #963 bulk record
-  delete still restores record by record, since each record is
-  re-pushed to agentless providers.
-
-- **Cluster health no longer counts a joining database replica as a
-  ready instance (#1213).** The workload rollup on
-  `GET /appliance/cluster/health` skipped only finished Job pods, so
-  while CNPG bootstrapped a replica its running `postgresql-N-join` pod
-  counted as a third ready database pod: the Cluster Overview read
-  3/3 healthy while CNPG reported two instances, "Creating a new
-  replica". Job pods no longer count toward a workload's ready or
-  total, and a workload with a Job still running reads `degraded`
-  rather than `healthy` until it finishes, with the count of running
-  Job pods on the row (`jobs_running`, shown as "+1 job") so a
-  degraded 2/2 says why. The rolling upgrade was
-  never affected: its safety check reads CNPG's own `readyInstances`.
-
-- **PowerDNS servers no longer report their version to
-  secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
-  `secpoll.powerdns.com` at startup and periodically, naming the
-  PowerDNS version it runs, and nothing turned it off. Every PowerDNS
-  server sent it, through the hardcoded public resolvers or the system
-  resolver. Both renderers now write an empty `security-poll-suffix`,
-  which disables it; it takes effect the next time the PowerDNS
-  container starts, which an upgrade does. The optional dnsdist front
-  polled the same zone for its own version, also by default; its
-  entrypoint now writes `setSecurityPollSuffix("")`. PRIVACY.md §3.5
-  says so.
-  Still open on #1353: the ALIAS resolver is hardcoded to `1.1.1.1` /
-  `8.8.8.8`, and PowerDNS does not start on a host with no route to
-  them.
-
-- **Unattended upgrades no longer install kernels on the appliance
-  (#1249).** `mkosi.conf` said "No kernel upgrades" while the
-  unattended-upgrades drop-in allowed security-pocket kernels, and
-  nothing excluded them. Each slot boots `/boot/vmlinuz` and
-  `/boot/initrd.img`, symlinks the slot-image build and the installer
-  point at the image's own kernel. A kernel with a new ABI never ran,
-  because Debian's kernel packages maintain their symlinks in `/`, not
-  `/boot`; it only took space in a fixed-size slot. A revision of the
-  slot's own ABI was worse: it overwrote the very `vmlinuz-<ver>` those
-  symlinks name and rebuilt its initrd on the device, so the slot booted
-  a kernel its image never shipped. `linux-image-` is
-  now on the drop-in's Package-Blacklist, which apt merges with an
-  operator's own blocklist from the APT settings (#164). Kernels
-  arrive with slot images, as before.
-
-- **The privacy statement lists the public resolvers PowerDNS
-  uses, and its guard now scans the agents too (#1353).** The agent
-  renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
-  `pdns.conf`, and the setting added on the agent side in #250 to
-  change it was never wired to the control plane. PowerDNS sends two
-  kinds of lookup through it: the target of every ALIAS record, so
-  Cloudflare and Google see those names, and its own built-in
-  security-status poll, which runs on every PowerDNS server at startup
-  and periodically after, and tells them and PowerDNS which PowerDNS
-  version you run. `docs/PRIVACY.md`, which claims to list every
-  outbound connection, mentioned neither. It now does, in a new §3.5
-  for the DNS and DHCP servers; making the resolver configurable is
-  still open. The CI guard that holds the page to that claim scanned
-  `backend/app` only, and this connection was in agent code, as IP
-  addresses its hostname scan could not see. It now also scans the
-  four shipped agent packages, for hostnames and for public IP
-  addresses in string values, matches an address only as a whole
-  address, and fails when a new agent package is missing from the
-  scan or from the CI path filter's carve-outs, which now include
-  those packages so an agent-only change runs the guard.
-
-- **A PXE vendor match, a dynamic-update ACL entry and a BIND9 zone
-  forwarder are checked before they reach the config (#1357).** Each was
-  written verbatim into Kea's or BIND's config, so one malformed value
-  made the server refuse the file and the whole server group stopped
-  converging. A PXE profile's `vendor_class_match` now gets the check a
-  phone profile's has had since #1294 (no `'`, no control characters).
-  On both, a non-ASCII prefix is now measured in bytes and compared as
-  hex, so it can match: quoted, Kea read it a byte short, and a
-  character above U+00FF made Kea refuse the config. An update-ACL
-  entry's `name_pattern` must be a DNS name (a
-  leading `*.` for `wildcard`; `.` or `*` for `self`), and its
-  `record_types` must be types BIND knows, including `DHCID`, `ANY`,
-  `TYPE<n>` and a count such as `A(5)`; lower case is still accepted and
-  upper-cased. A forward zone's forwarders on a BIND9 group must be `ip`
-  or `ip@port` (`ip port <n>` is accepted and rewritten); Technitium
-  zones may still name a hostname or DoH URL, and moving such a zone
-  into a BIND9 group is refused. Each answers 422 naming the offending
-  element; a DNS import into a BIND9 group drops such a forwarder and
-  says so in the result. Rows stored before this are left out of the
-  agent's config with a log line instead of shipped: a bad PXE match
-  drops its class, a bad forwarder drops itself, and a bad update-ACL
-  `grant` drops itself while a bad `deny` also drops the entries after
-  it, so the policy that remains never allows more than the one stored.
-
-- **An unknown URL shows a "Page not found" page instead of a blank
-  screen (#1360).** The route table had no catch-all, so a mistyped
-  or stale URL matched nothing and rendered an empty page with no
-  sidebar and no way back. A signed-out user on such a URL was not
-  sent to the login page either, because the login check never ran.
-  The new page renders inside the app, shows the requested path as
-  plain text, and links back to the dashboard. It also suggests a few
-  pages from the sidebar's own list, closest to the mistyped path
-  first, and skips any whose feature is turned off (Settings →
-  Features). Signed-out users now go to the login page. Also: the
-  legacy `/network/<id>` bookmark route matched any `/network/...`
-  typo and looked it up as a device. It now redirects a real device id
-  to `/network/devices/<id>`, which its comment always said it did,
-  and shows the 404 page for anything else.
-
-- **External URLs from PeeringDB are linked only when they are http
-  or https (#1361).** The website and looking-glass fields on an ASN's
-  BGP footprint tab went into a link whatever their scheme. Now only an
-  `http:` or `https:` URL becomes a link; anything else, including a
-  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
-  are also checked when they are fetched: a website is kept only if it
-  is http(s), and a looking glass only if it is http(s), telnet or ssh,
-  the schemes PeeringDB itself accepts. The GitHub release links on the
-  sidebar and the Releases tab are also linked only when http(s).
-
-- **The backup docs no longer say an archive is encrypted (#1352).**
-  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
-  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
-  in three places: that an unauthenticated NFS export exposes only
-  archive names and sizes, that LUKS on a removable backup disk is
-  optional because the archive is already encrypted, and that the
-  least-privilege pull token "fetches ciphertext". The NFS destination
-  form carried the same claim. Anyone who can read an archive can read
-  the whole database, users, IPAM / DNS / DHCP data and the audit log
-  included. Most stored credentials stay encrypted under the source
-  install's key, but not each DNS server group's internal TSIG key,
-  which is stored in clear and is accepted for zone transfers and
-  dynamic updates from any address (encrypting it is #1364). The docs
-  now say what an archive exposes, the NFS section says to restrict
-  the export, and the removable-disk section no longer recommends
-  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
-  `cryptsetup` to unlock it.
-
-- **A backup taken on an older release restores again (#1363).** A
-  full restore replayed the archive with `pg_restore --clean`, which
-  drops only the objects the archive contains. Every table a later
-  migration had added survived the replay, with its constraints. An
-  archive older than `dns_agent_bundle` (every 2026.09.04-1 archive)
-  therefore failed with a 400: `--clean` could not drop
-  `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on
-  it. A surviving table with no such dependency let the replay through
-  and stopped the post-restore upgrade on "already exists" instead. A
-  full restore now clears the schema and replays the archive in one
-  transaction: every table, view, sequence, standalone type and routine
-  in `public` is dropped (extension members are kept), then the
-  archive's SQL is applied by `psql --single-transaction`. For a
-  custom-format archive that SQL is streamed from `pg_restore`, not
-  staged on disk. If `pg_restore` fails part way, psql is killed before
-  it reaches end of input, so it never commits. A replay counts as
-  complete only when psql acknowledges the end of the script (a per-run
-  `\echo` token), so a psql that left early with exit 0 is a partial
-  restore, not a success. Any failure before end of input rolls back and
-  leaves the database as it was; a timeout after it, while psql may be
-  committing, is reported as an unknown outcome instead. Backups dump the whole database, so clearing loses
-  nothing the archive does not recreate. An error now leads with
-  PostgreSQL's `ERROR` line instead of notices. Also documented: the
-  command for the manual `alembic upgrade head` a `failed` restore asks
-  for, on Compose, the appliance and Helm (`SYSTEM_ADMIN.md` §2.9).
-  Found by amoona6's gate walk of #1349.
-
-- **A restore no longer stamps a half-migrated schema as current
-  (#1233).** When `alembic upgrade head` failed after a restore with
-  "already exists", from any revision, the restore ran `alembic stamp
-  head` and reported `auto_recovered`. That error is the signature of a
-  stale `alembic_version` over a schema already at head, but not proof
-  of it. Any revision that meets one object it would create fails the
-  same way, and since migrations commit one revision at a time (#1204),
-  the revisions before it stay applied and those after it never run.
-  The restore now stamps head only after checking that every table and
-  column this build's models declare exists in the restored database.
-  If anything is missing, or the check cannot run, the restore reports
-  `failed`, names the missing tables and columns and the revision that
-  failed, and leaves `alembic_version` at the last revision that
-  committed, so a manual `alembic upgrade head` resumes from there.
-  The check covers tables and columns in one direction only: on a
-  database migrated cleanly to head, the models omit a column the
-  initial schema still has, and index and constraint names differ in
-  dozens of places, so a full schema comparison would refuse the case
-  the recovery exists for. The restore's upgrade error now starts at
-  the exception line rather than at the start of alembic's output. On
-  a long upgrade the first 1,500 characters held only per-revision
-  INFO lines, which cut off the exception and hid the "already
-  exists" match. `migrations_applied` now lists the revisions that
-  committed before the failing one, instead of always being empty.
-
-- **The Compose upgrade steps upgrade, and the deployment docs stop
-  describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
-  upgrade procedure ran `docker compose build`, which rebuilds nothing:
-  `docker-compose.yml` pins pre-built images and has no `build:`
-  sections, so following it re-ran the images already on the host. It
-  and the install steps in DOCKER.md, README and BAREMETAL.md now run
-  `docker compose pull`. The Compose Patroni overlay
-  (`k8s/ha/postgres-docker-compose.yaml`) was presented as a working HA
-  path in four docs, but Patroni never starts under it, and on an
-  existing install it comes up as a new project on empty volumes. It is
-  now documented as non-functional and unsupported in 1.0, with the
-  reasons in the file's own header; making Compose HA real stays #137.
-  Also corrected: the Compose Redis runs without AOF, not with it;
-  CloudNativePG replication is asynchronous, so a failover can lose the
-  last few commits; the README requirements named Kubernetes 1.31 /
-  Helm 3 and a bare-metal install that does not exist; the feature docs'
-  dated status banners; a missing CHANGELOG link in the docs index and
-  README; and three stale code comments.
-
-- **The manual `helm upgrade` command on the Releases tab never
-  worked (#1182).** It passed no `--version`, and every published chart
-  is a SemVer pre-release (the CalVer `-N`), which Helm's unversioned
-  lookup skips, so Helm answered *Could not locate a version matching
-  provided version string*. The command now names the chart version.
-
-- **A raw option code in the spelling the group's servers drop is
-  refused, not saved and never served (#1296).** Kea and FortiGate read
-  raw options as `code:NN` and skip `opt-NN`; Windows reads `opt-NN` and
-  skips `code:NN`. The option check from #1228 accepted both spellings on
-  every group, so an `opt-NN` on a Kea group, or a `code:NN` on a Windows
-  one, was saved and silently dropped by the server: the failure #1228 set
-  out to stop. Scope options and option templates now check the raw
-  spelling against the group's servers and name the one to use. A group
-  with no servers yet follows the Kea rule, and a group mixing Windows
-  with another driver takes neither spelling. Pool and reservation
-  overrides, client classes and device policies, which only Kea and
-  FortiGate render, always take `code:NN`. Named options are unaffected,
-  and a stored raw option (an imported `opt-NN`, say) stays editable while
-  it is unchanged.
-
-- **A BIND9 apply is reported OK only once named is actually serving it
-  (#1224, #1239).** Validation ran `named-checkconf`, which never reads zone
-  files, and returned success outright if the checker was missing; and
-  `rndc reload <zone>` only *queues* the load and exits 0 even for a file
-  named cannot parse (verified against BIND 9.20). So a zone with a bad
-  record kept serving its old copy, or SERVFAILed if it was new, while the
-  apply reported `ok` and committed the bundle as last-known-good, which
-  left #882's revert nothing to revert to. Three more holes in the same
-  path: a `reconfig` named refused at run time (a DoT cert it could not
-  read, which `named-checkconf` passes) fell back to SIGHUP, which named
-  refuses the same way, and the SIGHUP was never checked; `os.kill` failing
-  was only logged; and a named that died on its first start read back as
-  started, because a zombie still reads `named` in `/proc/<pid>/comm`. Now
-  validate runs `named-checkzone` on every zone file the render added or
-  changed (flags matching named's own `check-integrity no`, and not
-  resolving out-of-zone names over the network) and fails closed without
-  either checker; after the swap each changed zone's serial is read back
-  with `rndc zonestatus` until it matches the file; a runtime-refused
-  `reconfig`, an undeliverable SIGHUP, named exiting after SIGHUP and named
-  dying on first start all fail the reload phase, so #882 reverts and
-  alerts. Every one of those was reproduced against a real named 9.20
-  before and after the change, and SIGHUP is kept only for a control
-  channel that cannot be reached at all.
-
-- **DHCP HA says it covers DHCPv4 only, and a DHCPv6 scope it does not
-  cover is flagged (#1238).** The agent renders Kea's HA hook into the
-  DHCPv4 config alone and reads HA state from the DHCPv4 daemon, but
-  nothing said so. The HA pill on the DHCP page, the server modal and the
-  dashboard read as the health of the whole pair, so an operator with
-  DHCPv6 scopes on an HA group had every reason to think they were
-  protected. They are not: each member serves a v6 scope on its own, and
-  two members can hand the same address to different clients. The pill
-  now reads `HA v4: <state>` with a tooltip saying what HA covers, the
-  dashboard row reads "HA Pairs · DHCPv4", and an enabled stateful DHCPv6
-  scope on a group with two or more Kea members carries a `v6: no HA` tag
-  in the group's scope list and on the IPAM subnet's DHCP tab, with the
-  same warning in the scope form while it is being set up (a `stateless`
-  or `slaac` scope allocates no address, so it is not flagged). The group's Mode hint,
-  the API's `ha_state` field description, the `list_dhcp_servers`
-  Copilot tool, `DHCP.md` and `DHCP_DRIVERS.md` say the same. Two stale
-  claims in DHCP.md's HA constraints are corrected on the way: a third
-  Kea member is a backup peer (#332), not an error, and mixed Kea +
-  Windows groups are refused (#1110). DHCPv6 HA itself is #1258.
-
-- **`make trivy` no longer reports a scan that never ran as a finding
-  (#1272).** Any non-zero exit from the scanner container was printed as
-  FINDINGS, so a Docker error (a refused mount, a pull failure, the daemon
-  down) or a Trivy error (a DB download failure, which Trivy also reports
-  as exit 1) ended in "Trivy found HIGH/CRITICAL vulnerabilities" with no
-  finding listed, for images that scanned clean. The loop moved to
-  `scripts/trivy-scan.sh`, which reports FINDINGS only when Trivy exits 1
-  and its report lists one. Everything else is SCAN FAILED or BUILD FAILED,
-  with the end of the log on screen, and exits 2 rather than 1, so the two
-  can be told apart. An `IMAGE=` that matches no image now fails instead of
-  printing "Trivy clean". The vulnerability-DB cache defaults to
-  `~/.cache/spatiumddi-trivy` rather than a directory in the checkout:
-  Docker Desktop can refuse to mount a checkout on an external volume,
-  which is how this was found. Set `TRIVY_CACHE` to keep the old location.
-
-- **A DHCP HA peer-IP re-render can no longer leave a refused config on
-  disk, race the sync loop, or be skipped while the agent is degraded
-  (#1247).** When an HA peer's hostname resolved to a new address, the
-  agent's watcher re-rendered Kea by calling `_apply_bundle` directly, from
-  its own thread. A render Kea refused was only logged, with no apply
-  verdict on the heartbeat, and the refused document stayed at
-  `kea_config_path` for the next container start to boot into. Nothing
-  serialised it against the sync loop either, so it could put an older
-  bundle back over a newer one while the agent reported the newer etag.
-  The watcher now calls `SyncLoop.reapply_current_bundle`, under the one
-  apply lock every apply takes. It re-renders the bundle Kea is actually
-  running, which the loop now tracks, so a peer that moves while the agent
-  runs on last-known-good is still followed. A re-render forced by host
-  state is not the control-plane bundle's fault, so a refusal does not
-  quarantine it. Instead the Kea documents are put back, and a daemon that
-  had accepted the render (the two reload independently) is reloaded from
-  them; a daemon that refused it is left alone, since a Kea reload restarts
-  the HA hook's state machine. The refusal is reported as a reverted apply
-  naming the reason. The #1140 IPv6-address recheck uses the same path and
-  no longer retries an identical refusal every loop.
-
-- **Audit rows carry the request id, and the worker and beat log JSON
-  like the api (#1245, #1246).** `audit_log.request_id` existed, was part of
-  the tamper-evidence hash, and was never set, although the docs say it
-  links an audit row to its request's log lines. It is now filled from the
-  logging context before the hash is computed, so the chain still verifies.
-  Separately, the Celery worker and beat never configured logging: their
-  output was Celery's plain text plus structlog's console renderer, with no
-  `service` and no `request_id`, against non-negotiable #7. They now share
-  the api's pipeline, Celery's own `Task … received` / `succeeded` lines
-  included, tagged `service=worker` / `service=beat`, and each task binds its
-  task id as `request_id`. The two fixes meet there: an audit row a scheduled
-  task writes now carries the task id, so a change can be traced from the
-  audit log to the worker line that made it. Every line the api logs outside a
-  request now carries `service` too.
-  **`request_id` is now always generated by the api**, never taken from the
-  caller: it is stored inside the audit hash, and a caller-chosen value would
-  let a caller make its audit rows claim another request's id. A caller's
-  own `X-Request-ID` (1–64 characters of `A-Z a-z 0-9 . _ : -`) is logged as
-  `client_request_id` and still echoed back in the response header, so a
-  report quoting it finds the log lines and, through them, the audit row.
-  The 500 handler no longer adopts the raw header either. The worker honours
-  `--loglevel` (when more verbose than `LOG_LEVEL`) and `--logfile`, and a
-  task run eagerly inside a request restores the request's id when it ends.
-  Celery's one-time startup banner is still plain text.
-
-- **A zone's access lists are checked before they reach `named.conf`
-  (#1316).** The zone half of #1244. A zone's `allow_query`,
-  `allow_transfer`, `also_notify` and `notify_enabled` were stored as sent
-  and rendered into its `zone { … }` statement; the agent renders
-  `allow-transfer` there on every BIND9 server. One bad element made BIND
-  refuse the file, which stops every zone in the group converging, not just
-  this one. Zone create and update now run the same checks as the server
-  options and answer 422 naming the field and element; on update only a
-  changed value is checked, so a zone stored before this fix stays
-  editable. A zone move also refuses a zone whose lists cite a TSIG key the
-  target group doesn't define, the same whole-group failure the move
-  already refused for ACL names (#935). A zone's `forwarders` are left
-  alone: a Technitium forward zone may carry a hostname or DoH URL there.
-
-- **The DNS server options editor refuses values BIND cannot load
-  (#1244).** `PUT /dns/groups/{id}/options` stored `allow-query` and the
-  other address lists, `also-notify`, the forwarders, the single-word
-  options (`forward`, `dnssec-validation`, `notify`, the query-log channel
-  and severity) and the query-log and GSS-TSIG keytab paths without any
-  check, and the renderers write them into `named.conf` as they are. One
-  bad element and `named-checkconf` refused the whole group's config:
-  since #882 the agent reverts and raises an alert, but the form had
-  already reported the save as successful. Each field is now checked
-  against BIND's grammar for it, and a bad value is a 422 naming the field
-  and the element, the same shape as the view and ACL checks (#876, #899).
-  A key or ACL name must be defined in the group. `also_notify` takes
-  `<ip> [port <n>] [key <name>]`, not an address list. The query-log file
-  must sit under `/var/log/named/`, where the agent can write it and its
-  shipper reads it, and a keytab under `/etc/` or `/var/lib/`.
-  Only a changed value is checked, because the form sends every field on
-  every save: a value stored before this fix doesn't block an unrelated
-  edit, but can't be saved again once changed.
-
-- **The Fleet drilldown's Packet capture button no longer leads to a
-  form that can't run (#1311).** `tools.pcap` ships disabled, and only its
-  API was gated. The button opened the Packet Capture page anyway, and a
-  capture failed only on Run, with `Feature 'tools.pcap' is disabled` and
-  no hint where to turn it on. The button is now disabled while the module
-  is off, with a link to Features & Integrations. The page itself, reached
-  from a bookmark, says the feature is off and where to enable it, instead
-  of rendering a form whose requests all 404.
-
-- **VoIP phone-profile options reach the phone, and are checked when
-  saved (#1294).** A phone profile rendered each option under its
-  catalogue name (`polycom-config-url`, `yealink-prov-server`,
-  `vendor-encapsulated-options`). The agent does not know those names and
-  dropped them with only a log line, so a Polycom profile saved and option
-  160 never reached a phone. The profile's option **code** now decides what
-  is delivered: its canonical name when SpatiumDDI has one (66, 150), else
-  `code:NN`, which the agent renders with its shipped definition. Values
-  get the #1228 checks: a code listed twice, a name that contradicts its
-  code (SpatiumDDI's own or the VoIP catalogue's), and a value Kea cannot
-  load are each a `422`. A stored row whose name contradicts its code keeps
-  the delivery it had before. Enabling a profile
-  checks every option and refuses the starter pack's `CHANGE-ME`
-  placeholders. Rendered by code, a placeholder in binary option 43 would
-  otherwise make Kea reject the group's whole config. A profile stored
-  before these checks is rendered without the options Kea cannot load,
-  each logged as `dhcp_phone_option_dropped_invalid`.
-  `vendor_class_match` is placed inside a Kea string literal, so a `'` or
-  a control character now gets a 422, and a stored profile containing one
-  is left out of the
-  render instead of breaking the config. It is measured in bytes, so a
-  non-ASCII vendor string can now match. Verified with `kea-dhcp4 -t`.
-
-- **Deleting one of two identical DNS records no longer takes the
-  record off the server (#1230).** Nothing stopped a record being stored
-  twice: `POST …/records` did no duplicate check, so an Ansible retry, a
-  flaky network or a double click made a second identical row. Every
-  record op carries the whole RRset the server should end up with
-  (#773), and a delete dropped the deleted record's *value* from it,
-  taking the twin's copy too. The server stopped answering for a
-  record the zone, and the UI, still listed. Two fixes:
-  - A delete now drops the deleted *row*, named in the op payload as
-    `record_id`, so an identical row that stays keeps the value on the
-    wire. This covers twins that already exist, with no data migration,
-    on every delete path that has the row (single, bulk, trash purge,
-    IPAM sync) and on agent and agentless drivers alike. The wire never
-    carries the same RR twice.
-  - Creating or editing a record into an identical one (same view,
-    owner name case-insensitively, type, value and priority / weight /
-    port; TTL is the RRset's) is a `409` naming the existing record.
-    Bulk create skips it as `identical record already exists`, which
-    also makes re-submitting a batch idempotent. The Copilot's
-    `create_dns_record` refuses it. A record in the trash does not
-    count.
-
-- **DNS record changes an agent could not apply are retried with
-  backoff, recovered when never acknowledged, and reported when they
-  give up (#1232).** Three faults, all silent. A failed apply was
-  retried on every heartbeat, so a DNS daemon restart of about
-  2.5 minutes spent all five attempts and the change was dropped for
-  good. An op shipped to an agent that restarted before its next
-  heartbeat, or whose long-poll response was lost, stayed `in_flight`
-  forever: never re-shipped, never failed, and the ACME DNS-01 wait
-  timed out on it. The agent could also drop an ack appended while a
-  heartbeat was in flight, with the same result. And nothing reported a
-  failed op: the record was in SpatiumDDI and the UI but not on the
-  server, until the next full render. Now:
-  - A failed op waits 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m between
-    attempts, and fails after 8, about 45 minutes.
-  - An op unacknowledged for 5 minutes returns to the retry path on the
-    agent's next heartbeat. That also recovers ops already stranded.
-  - The agent removes only the acks it actually sent, and sends at most
-    the 5000 per heartbeat the control plane accepts. Each op carries a
-    dispatch number the agent echoes, so a late error for an earlier
-    dispatch is not charged twice.
-  - A failed op on an agent-based server raises the new default-on
-    alert rule `dns_record_op_failed`. The server's Sync tab shows when a
-    backing-off op retries.
-
-  Retrying an older op after a newer one for the same RRset applied
-  would have reverted the newer change, because every op carries the
-  whole RRset (#773). This was possible before, and backoff makes it
-  likelier. Such an older op now becomes `superseded` instead, and the
-  ACME wait follows it to the op that delivered its change. Also, an
-  ack from one agent can no longer change another server's op.
-  Migration `d8e1b5a26c47` (two nullable columns and an index on
-  `(server_id, created_at)`).
-
-- **DHCP option names and values are checked when saved (#1228).**
-  Scope, pool, reservation, option-template, client-class and
-  device-policy options were stored as given. Only `domain-name` and
-  `domain-search` were checked. A value Kea cannot parse, such as
-  `routers: "10.0.0.1, bogus"`, an MTU of 70000, or text in raw option
-  43 where hex is required, made Kea reject the whole config for the
-  server group. The agent reverted and alerted (#882), but every later
-  change to the group was stuck behind it. A name the renderer does not
-  know was dropped by the agent with only a log line, so the option
-  was saved and never served. Each of those writes is now a `422` that
-  names the option. Names are checked against what the Kea renderer
-  emits for the scope's address family. A raw `code:NN` is accepted
-  only for the codes SpatiumDDI ships a definition for, since the
-  agent drops any other. `opt-NN` (the Windows importer's spelling) is
-  accepted. Raw `option_data` is refused. Values are typed: IPv4 or
-  IPv6 addresses, integer ranges, FQDNs, non-blank strings, and plain
-  even-length hex for binary codes. The rules were checked against
-  `kea-dhcp4 -t`. An option already stored is not re-checked unless
-  the write changes it, so existing scopes stay editable. Applying an
-  option template checks the merged result against the scope's family.
-  A pick from the custom-options catalogue is now stored under the code
-  it can be delivered as (`code:43`), instead of a catalogue name the
-  agent would drop. This applies in the option-template and client-class
-  editors too, which used to key such a pick by its name or `option-NN`.
-
-- **A slot upgrade survives its image download being cut short
-  (#1216).** The runner read the image until the connection stopped
-  sending and never compared the bytes with `Content-Length`. So a
-  download cut mid-transfer left a partial image, and the apply failed
-  as "checksum mismatch", which reads as a corrupt image. A rolling
-  cluster upgrade can cut it: the frontend pod that serves a node its
-  image is replaced mid-download (#1215). The runner now counts the
-  bytes. A short, dropped or stalled transfer, and an HTTP 408, 429 or
-  5xx answer, gets up to five attempts, with backoff of 5, 10, 20 and
-  40 s, and a retry resumes with `Range` where the server allows it. A
-  4xx answer, a certificate the node cannot verify and a full disk fail
-  at once. A download that never completes fails with its own message:
-  the image download was interrupted, nothing was written to the
-  inactive slot, and the upgrade can be retried.
-
-- **After a DHCP agent restart, an address that has changed hands no
-  longer drops out of IPAM while its new client holds it (#1318).**
-  The agent re-reads its whole lease file on every start, so an old
-  client's grant and release of an address are delivered again after
-  the address has gone to a new client. The lease-events endpoint
-  handled that release by deleting the address's IPAM row: it spared
-  the row only while another server of the group held the lease
-  (#1110), not while another client on the same server did. The
-  address was then missing from IPAM, with its lease listed as active,
-  until the replay reached the new client's own grant, and its row came
-  back as a new row without its MAC history. With New-device watch on,
-  #1172 hid this by losing the replayed batch whole. A release now
-  leaves the row in place while another lease on the address is active
-  and unexpired. The expiry sweep and the lease purge (the Windows
-  poll's absence-delete and the delete-lease endpoint) ask the same
-  question, so an old client's lease left `active` past its expiry no
-  longer takes the new client's IPAM row and DNS records with it either.
-
-- **With New-device watch on, a DHCP lease batch that grants and releases
-  the same address is no longer lost (#1172).** With the watch on, the
-  lease-events endpoint records a MAC sighting for each active lease after
-  the IPAM mirror pass. When the same batch also released, expired or
-  declined that address, the pass had already deleted its IPAM row, so the
-  sighting's insert failed its foreign key. The loop caught the error
-  without a savepoint, the transaction stayed aborted, and the whole batch
-  was lost: its leases, IPAM mirror changes, DDNS changes and dedupe
-  receipt. The agent was answered 200 and did not resend, or 500 when the
-  batch had changed DNS records, which it resent unchanged until its spool
-  quarantined the batch while newer lease events waited behind it. The
-  agent batches every 5 seconds and re-reads its whole lease file on every
-  start, so ordinary churn and any agent restart could trigger it. A
-  sighting is now skipped when the same batch deleted its row, each
-  sighting runs in its own savepoint so one that fails rolls back only
-  itself, and the `device.first_seen` audit rows are written after the
-  last sighting, so none is published before the batch commits.
-
-- **Deleting a DHCP reservation whose client still holds its lease
-  no longer shows the address as free (#1274).** The reserved client's
-  grant arrives while the address is a reservation, which the lease
-  mirror leaves alone, and the delete then freed the row to
-  `available` without looking at the lease. Nothing re-derived it
-  until the DHCP agent sent the lease again (its own restart, a
-  control-plane recovery, or the client's renewal, up to half the
-  lease time later), so IPAM showed a live device's address as free
-  and the next-free allocation could hand it to a second device. When
-  the lease table holds an active lease on the address in that
-  subnet, the delete now makes the row that lease's `dhcp` mirror,
-  linked to it, as if the lease had arrived after the delete. In a
-  DDNS-enabled subnet its A / PTR records are published under the
-  lease's hostname once the reservation is gone, as the lease ingest
-  does, instead of the address staying out of DNS until the renewal.
-  `available` is kept when no active lease holds the address.
-
-- **The version-pin check now sees the Alpine-packaged daemons, and
-  no longer reports a pin as behind when it is ahead (#1240).**
-  BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
-  `versions.json` tracked none of them, so their drift was invisible
-  to `make versions-check` and the weekly upstream report. That is
-  how #1218's CVEs reached a release. Each is now a component, with
-  its Dockerfile floor (`>=`) as the version and a new
-  `alpine-package` upstream that reads Alpine's package index for the
-  branch the images build on. It compares the full version, so an
-  `-rN` security rebuild shows up too. PowerDNS and dnsdist, which
-  were installed unpinned, gain floors at their current versions
-  (5.0.7-r0 and 2.0.8-r0), so nothing changes in the images. The
-  upstream report also compared versions for *inequality*, so a pin
-  ahead of what upstream returns (redoc 2.5.4 against a 2.5.3 GitHub
-  release) was listed as "behind", which invites a downgrade. It now
-  orders them.
-
-- **After a slot upgrade, the node's DNS, DHCP and looking-glass
-  agents run the new release (#1203).** They kept the previous
-  release's images and chart until a role, group or key next changed.
-  The supervisor skips re-applying the role release while nothing it
-  would send has changed, but it judged that from the role settings
-  alone, which carry no image tag or chart. The skip marker also
-  survives a slot upgrade, so the new supervisor skipped from its first
-  heartbeat. The check now also covers the image tag and the chart the
-  release is rendered with. Both change only with a slot upgrade, so
-  the first heartbeat on a new slot re-applies once and steady state
-  still skips.
-
-- **Upgrading to a nightly build no longer deletes the new slot's own
-  images (#1202).** The image prune that runs once the new slot is
-  committed kept only images tagged with a slot's appliance version. A
-  release uses one value for both, but a nightly's appliance version is
-  `0.0.0-nightly-YYYYMMDD+sha` while its images are tagged
-  `nightly-YYYYMMDD`. So the prune removed every new-slot image no
-  container was using yet, and spatium-supervisor, which never pulls
-  its image, stayed in `ErrImageNeverPull`. An air-gapped appliance
-  could not recover. The prune now also keeps images carrying either
-  slot's image tag, recorded in a new
-  `release-state/slot-image-tags.json` beside `slot-versions.json`,
-  which is unchanged.
-
-- **An upgrade no longer deadlocks its own database migration
-  (#1204).** The migration ran every Alembic revision in a single
-  transaction, so each `ALTER TABLE` kept its exclusive lock until the
-  last revision committed. The previous release keeps serving while
-  the migration runs, and its ordinary traffic (agent heartbeats,
-  health probes, API reads) could hold one table while waiting on a
-  table the migration had already altered. When a later revision
-  reached the first table, PostgreSQL found the deadlock and aborted
-  the migration. Upgrading a QA appliance from 2026.09.04-1 failed
-  this way on every attempt, with three different pairs of tables: the
-  migrate Job gave up, and the new api, worker and beat waited for it
-  indefinitely while the previous release kept serving. Each revision
-  now runs in its own transaction and releases its locks when it
-  commits. If one fails, the schema stays at the last revision that
-  committed, and the next attempt resumes from there. The migration
-  runs from the release being upgraded to, so this applies to the
-  upgrade from 2026.09.04-1 itself.
-
-- **The change-report PDF answered 500 for an `until` near year 1,
-  and every 500 lost its request id (#1201).** With no `since`,
-  `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
-  raised `OverflowError` for any `until` in the first 30 days of year
-  1. The window now starts at the earliest representable instant. An
-  `until` that is before year 1 in UTC (`0001-01-01T00:00:00+05:00`)
-  is a 422, as it already was when sent as `since`. Separately, the
-  unhandled-exception handler read the request id from the client's
-  headers only, so a client that sent none got a 500 with no
-  `X-Request-ID`, and the log line and Diagnostics row said
-  `request_id: null`. It now uses the id the request was logged under
-  and returns it on the response.
-
-- **Integration mirrors no longer claim addresses another integration
-  owns (#1135).** Each mirror should skip an IP address another
-  integration already owns and warn "owned by another integration; not
-  claiming". The UniFi, OPNsense, Proxmox, Kubernetes, Docker,
-  Tailscale and Cloud mirrors each kept their own list of the other
-  integrations, and every list had fallen behind as integrations were
-  added: UniFi, for one, didn't know about OPNsense, the common homelab
-  pairing. A claimed address was also marked as edited by hand, so from
-  then on neither integration kept it current, neither removed it when
-  the host went away, and deleting either integration's target deleted
-  it. All mirrors now use one shared list, and a test fails if a new
-  integration's column is missing from it or if a guard anywhere lists
-  the columns by hand.
-  Block move had the same gap. It refused to move a block holding rows
-  owned by four integrations, but not by the other seven, whose
-  reconcilers then re-created the moved rows in the old space.
-  Addresses already claimed twice before this upgrade are not changed:
-  a claim can't be told apart from a real operator edit.
-  `docs/TROUBLESHOOTING.md` has a query that lists them and says how
-  to fix each one.
-
-- **ACME DNS-01 no longer times out on very large DNS groups
-  (#1184).** Since #1111 a DNS agent receives a change with the next
-  render of its whole bundle, and QA measured one render of a
-  1.09M-record group at about 30 s. The ACME TXT record's fixed 30 s
-  apply wait therefore failed intermittently: the certificate order
-  failed, or the acme-dns `/update` endpoint answered 504. The wait now
-  scales with the renders the target servers have stored. Renders share
-  one worker slot, so it waits for the render already running plus one
-  per server, from the slowest recent render, plus 10 s. It never goes
-  below 30 s, so smaller groups are unchanged, and it is capped at
-  5 minutes for the built-in certificate client. `/update` is capped at
-  55 s, because it waits inside an HTTP request and the web frontend
-  ends those at 60 s.
-
-- **Retrying a failed slot upgrade with the same image works again
-  (#1183).** Every supervisor reported the version `2026.05.14.1`, a
-  literal nothing ever updated, and the control plane read it to decide
-  whether an appliance could take the per-apply nonce that makes a
-  repeat apply fire. So no appliance got the nonce, and clicking Apply
-  again after a failed upgrade was silently ignored. The same version
-  made the Fleet upgrade panel tell every operator that their appliance
-  predated live progress reporting.
-  Both checks now read the appliance's installed OS version first,
-  since the code they depend on ships in the slot OS, and fall back to
-  the supervisor's. The supervisor reports the release it was built
-  from, stamped into its image, and the control plane now stores the
-  version from every heartbeat rather than only from registration,
-  which a registered supervisor never repeats. Versions are compared
-  by a shared helper rather than as strings, so the checks keep
-  working under SemVer (#1182). Nightly builds count as including
-  every release tagged before their build date. Dev builds are
-  unknown and keep the safe path. The threshold is now 2026.06.12-2,
-  the first release with the fix it tests for: 2026.06.12-1 was tagged
-  before it merged, and used to count as having it.
-
-- **Worker task failures now reach Diagnostics (#1193).** None had
-  been recorded since the feature shipped (#123); failures in API
-  requests always were. The Celery `task_failure` hook opened a sync
-  database engine on a `postgresql://` URL, which needs psycopg2, and
-  the backend ships only asyncpg. So every failure logged
-  `diagnostics_capture_failed_sync` and recorded nothing, and because
-  the hook swallows its own errors, nothing else noticed. It now runs
-  the api's capture code on a fresh asyncpg engine, on a short-lived
-  thread of its own.
-
-- **The worker renders DNS agent bundles again (#1197).** #1170's merge
-  of main dropped three things #1122 had added to `app/celery_app.py`:
-  `app.tasks.agent_bundles` from the worker's `include` list, the
-  `bundles` route, and the 30 s render-missing sweep. A started worker
-  had no render task registered, so it discarded every render it was
-  sent ("Received unregistered task"), and beat never swept. Agents got
-  a DNS change only when the api's bounded inline fallback built the
-  bundle, 120 s after the change, and never with the fallback off; after
-  an upgrade, an agent-based server last rendered by the previous
-  release was served nothing new until a change marked it and those
-  120 s had passed. All three are back. A test now starts a worker in a
-  fresh interpreter and fails when a task the code defines, or one beat
-  sends, is not registered in it.
-
-- **Five task modules were published to a queue no worker consumes
-  (#1200).** With `task_default_queue` unset, a task whose module has
-  no `task_routes` entry goes to Celery's default queue, `celery`, and
-  every deploy target's worker consumes only
-  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
-  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
-  had no route. So the Looking Glass collector stale sweep and route
-  re-resolve, the conformity evaluator, the revoked-appliance prune and
-  the daily DNSBL sweep never ran, and a rolling upgrade run started or
-  resumed through the api was enqueued to a list nothing reads. All
-  five now route to `default`. Messages already stranded on `celery` are
-  not replayed; `DEL celery` in the broker's Redis database (1 by
-  default) removes them. A test fails when a task routes to a queue the
-  worker does not consume.
-
-- **Typed webhook events and audit forwarding were lost for anything a
-  Celery task committed (#1168).** Two faults. The worker never loaded
-  `event_publisher`: session listeners register on import, and only the
-  api imported them. And loading it was not enough. Both it and
-  `audit_forward` handed their after-commit work to a bare
-  `loop.create_task`, and in a Celery task that loop is the task's own
-  `asyncio.run`, which cancels pending work when the task returns. A task
-  usually commits last. Measured on a scratch database, five task-shaped
-  `backup_target_run_failed` commits wrote 0 of 5 outbox rows (5 of 5
-  with the fix). So scheduled backups and rolling upgrades sent no
-  `system.backup_*` / `system.upgrade.*` webhooks, and syslog/webhook
-  audit forwarding lost what tasks wrote last. Both processes now
-  install one listener list (a guard fails when a new listener module
-  isn't on it). In Celery processes the after-commit work runs on a
-  per-process background loop, switched on from `worker_init` /
-  `beat_init` and started lazily per PID for prefork children.
-
-- **The worker's liveness probe no longer loads every model (#1189).**
-  The session listeners, now including the DNS bundle dirty-mark from
-  #1111, were installed when `app.celery_app` was imported, and the
-  worker's liveness probe (`celery -A app.celery_app inspect ping`,
-  10 s timeout) imports it on every run. That pulled in the models,
-  the DNS drivers, httpx, cryptography and jinja2: 1,002 modules
-  against 744, and under load a three-node cluster's worker missed the
-  probe 14 times in 28 minutes and restarted once. They are installed
-  from `worker_init` / `beat_init` now, which the prefork pool
-  inherits, and a test fails if a bare import loads them again.
-
-- **Two appliances in one Kea HA group could not reach each other
-  (#1167).** Kea's HA hook listens on the port in each member's own
-  `ha_peer_url`, and no appliance firewall layer opened it under the
-  `input` chain's drop policy. The control plane now puts the port and
-  the group's other Kea members' addresses on the role assignment:
-  the IP in the member's URL, else its appliance's node IPs, else its
-  agent's last address. All three firewall renderers open the port to
-  exactly those sources, never to `any`, because Kea's HA API is
-  unauthenticated by default and accepts lease updates. The rule
-  follows the HA hook's own readiness rule, so the port is open
-  exactly while Kea listens. Also fixed: TOPOLOGIES.md and DOCKER.md
-  told operators to set `ha_peer_url` to the *other* peer's URL. It is
-  each server's *own* listener URL.
-
-- **A looking-glass node lost TCP 179 when fleet firewall enforcement
-  was on (#1166).** Only the supervisor's own renderer opened BGP for
-  the role. The backend port table had no entry and no builtin policy
-  existed, so under enforcement every session the router initiated
-  was dropped. The byte-identity test had no looking-glass case to
-  catch it. Now all three renderers carry it: seed migration
-  `b8e2d5c07a14`, plus two looking-glass cases in the test matrix.
-
-- **Relayed DHCPv6 never reached Kea on the appliance (#1139,
-  #1140).** Two faults in series, so fixing either alone changed nothing.
-  **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
-  has no raw-socket mode, so every DHCPv6 packet hit the `input` chain's
-  drop policy. The role now opens **547** in all three firewall renderers
-  and the builtin DHCP fleet policy (seed migration `e6b2f07a3c91`). The
-  base config gains the host's own DHCPv6-client return
-  (`udp sport 547 dport 546`) beside the v4 one. **The socket:** with
-  `interfaces: ["*"]` kea-dhcp6 binds link-local and `ff02::1:2` only, and
-  a relay sends its Relay-Forward to the server's global address. The Kea
-  agent now adds an `iface/address` entry per stable global IPv6 address
-  on the host, for groups with v6 scopes. The addresses are detected, not
-  configured, because (measured on Kea 3.0.3) an entry naming an address
-  the interface doesn't hold makes kea-dhcp6 refuse its whole config. For
-  the same reason the agent re-renders whenever the host's address set
-  changes.
-
-- **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
-  pull path stamped `last_seen_at` on the rows it mirrors; the agent's
-  lease-event path never did. Both do now.
-- **A BIND9 zone's apex comes from the zone — its Primary NS, Admin
-  Email and NS records — instead of a name server at 127.0.0.1
-  (#1153).** The BIND9 agent opened every zone file, reverse zones
-  included, with the same apex: `SOA ns1.<zone> admin.<zone>`,
-  `NS ns1.<zone>` and the glue `ns1 A 127.0.0.1`. A zone's
-  `primary_ns` and `admin_email` were stored and editable but never
-  reached the agent, so editing them changed nothing on the wire,
-  and a zone's own NS records were served *beside* `ns1.<zone>`.
-  Every zone therefore told any resolver following its NS set to
-  query loopback. Both fields now reach the agent. The NS set is the
-  zone's own NS records at `@` when it has any (what the delegation
-  wizard copies to the parent); else its Primary NS, when that can
-  resolve (outside the zone, or inside it with an A/AAAA record in
-  the zone); else, as the last resort, the old placeholder — logged
-  as the warning `bind9_zone_apex_ns_is_loopback`. The SOA MNAME is
-  the Primary NS (else the first NS record), the RNAME the Admin
-  Email. The placeholder glue is never served beside an address the
-  zone holds for `ns1` itself. Editing Primary NS or Admin Email
-  bumps the zone's serial, so secondaries transfer the new apex. A
-  zone that sets none of this renders exactly as before; the zone
-  payload gained two fields, so every agent re-renders once after
-  the upgrade and reloads only the zones whose apex changed.
-
-- **Local-volume backups landed in each container's own filesystem
-  (#1160).** The release `docker-compose.yml` left the
-  `spatium_backups` volume commented out on the api and the worker,
-  and the chart mounted nothing at `/var/lib/spatiumddi/backups`, the
-  path a `local_volume` target suggests. The path is still writable,
-  so the connection test passed and every run reported success — but
-  scheduled runs execute in the worker, so the api never listed their
-  archives (no download, no restore from the UI), and every archive
-  was lost at the next container recreate, each upgrade included.
-  Compose now mounts `spatium_backups` on both services; the appliance
-  mounts a `/var/lib/spatiumddi/backups` hostPath on both pods, which
-  firstboot hands to the pods' uid. On a multi-node appliance that
-  directory is per node, like the packet-capture store: an archive is
-  listed by the api on the node whose pod wrote it; a network
-  destination is the cluster-wide choice. Test connection now warns
-  when a local-volume path is not on a mounted volume, which covers
-  every other deployment shape. Restore's pre-restore safety dump,
-  written to the same path, now survives too.
-  **Operator action on a Compose upgrade:** archives written before
-  it exist only inside the running api and worker containers; copy
-  them out before the upgrade recreates them —
-  `docker compose cp api:/var/lib/spatiumddi/backups ./backups-api`,
-  and the same for `worker`.
-
-- **Console copy described shipped features as future work
-  (#1161).** Administration → Backup said destinations beyond a local
-  volume would come "once those drivers ship" above an Add target
-  list of ten, and its "Security model — Phase 1a" note told operators
-  to carry `SECRET_KEY` across installs by hand, which restore's
-  secret rewrap has done for them since it shipped (the note now says
-  what happens if that rewrap stops part-way). AI Providers said the
-  Anthropic, Gemini and Azure drivers "ship in Phase 2"; Kubernetes
-  said its reconciler had not shipped; the Web UI certificate card
-  said an activated certificate is not served yet, when activation
-  deploys it to nginx. Development-phase labels are gone from the
-  appliance, DNS, multicast and VRF pages, the Appliance Operator
-  role's description and five Copilot tool descriptions, and the
-  README counts ten destination kinds. Two guards keep it that way:
-  a Vitest check over every string and JSX text in the frontend, and
-  a backend test over the built-in role and Copilot tool
-  descriptions.
-
-- **A subnet that inherits its DNS now gets its reverse zone
-  (#1149).** Getting Started promises the matching `in-addr.arpa` /
-  `ip6.arpa` zone once a subnet has an effective DNS group or zone,
-  but subnet create decided from the request body and the subnet's
-  own columns only — so a subnet left on **Inherit from parent** (the
-  console's default, which sends no DNS fields at all) never got one,
-  and no address in it ever got a PTR. The per-allocation catch-up and
-  the reverse-zone backfill (the first step of **Sync DNS**) had the
-  same blind spot. All three now fall back to the DNS the subnet
-  inherits from its block or space when it names none of its own. A
-  subnet with its own binding resolves exactly as before,
-  `skip_reverse_zone` still opts out at create, and the #844 refusal
-  to share a reverse zone with an overlapping subnet in another IP
-  space applies however the group was found. An existing inheriting
-  subnet gets its reverse zone on its next allocation or **Sync DNS**.
-
-- **A new subnet no longer starts "1 DNS record out of sync"
-  (#1150).** Subnet create adds the network, broadcast and gateway
-  placeholder rows and never published the gateway's PTR, so under a
-  reverse zone every new subnet opened with the gateway's PTR missing
-  — the drift banner on day one, and `gateway.<zone>` unresolvable in
-  reverse until someone ran **Sync DNS**. The gateway's PTR is now
-  published at create (still no forward `gateway.<zone>` A record, by
-  design), into the subnet's auto-created reverse zone or whichever
-  reverse zone covers it; `skip_reverse_zone` still creates no zone.
-  The subnet planner's apply built the same placeholder and ran
-  neither DNS step; a planned subnet now gets its reverse zone and
-  gateway PTR at apply, the same as one created directly.
-
-- **Purging a subnet takes its DNS records off the wire (#1151).** A
-  subnet's addresses cascade away when it is deleted for good, but
-  `dns_record.ip_address_id` is `SET NULL`, and neither Trash purge —
-  **Delete permanently** in Trash, or the daily sweep after the
-  retention window — withdrew anything first. Every A record IPAM had
-  published for those addresses (and their PTRs in a reverse zone a
-  sibling subnet kept, extra-zone records and aliases) stayed in its
-  zone, ownerless, and BIND kept answering for addresses IPAM no
-  longer had. Both paths now withdraw every auto-generated record of
-  the subnet's addresses through the record-op queue before the
-  delete, and wake the agents; the direct permanent delete
-  (`?permanent=true`), which withdrew only each address's primary A,
-  does the same. Only what is really going is touched: records made
-  by hand stay, a sibling subnet's records stay, and a subnet still
-  inside the retention window — or restored from Trash — keeps every
-  record. Records already orphaned by an earlier purge are not swept
-  up automatically; **Sync DNS** on a subnet whose zones hold them
-  lists them as stale and withdraws them.
-
-- **The subnet delete dialog says what a delete does (#1152).** Its
-  Danger zone text said the subnet's IP address rows are removed;
-  they are not — the addresses you allocated stay with the trashed
-  subnet, come back on restore, and their A/AAAA records keep
-  resolving while it sits in Trash — and the confirmation step named
-  only the subnet and its DHCP scopes. Both now say what happens:
-  the subnet, its scopes and the reverse zone created for it move to
-  Trash; DHCP lease and reservation addresses are removed at once
-  with their DNS records (reservations return with their scope);
-  purging the subnet deletes its addresses and withdraws their DNS
-  records. Copy only — what a trashed subnet should publish is
-  unchanged.
-
-- **firstboot no longer runs the words of its own #1042 comment as
-  commands (#1132).** `_render_control_helmchart` writes the
-  `spatium-control` HelmChart through an unquoted here-document, so
-  the shell expands everything inside it, and the #1042 comment there
-  wrapped ten words in single backticks. `/bin/sh` ran each one as a
-  command substitution, as root, on every boot: ten `...: not found`
-  lines per boot in `/var/log/spatiumddi/firstboot.log`, and the
-  comment reached the live HelmChart with those words deleted. No
-  command by those names is on the appliance's `PATH`, so nothing
-  ran. The words are now quoted, so the comment renders as written
-  and the HelmChart object is unchanged. A new test renders the chart
-  under dash and scans every unquoted here-document in firstboot for
-  a backtick substitution.
-
-- **A Kea lease in the "released" state was mirrored as active
-  (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
-  released; the DHCP agent's state map knew only `0`–`2` and fell
-  through to `active`, so a released lease kept its IPAM mirror row
-  (and DDNS records) alive until it expired. It is now sent as
-  `released`, which the ingest already treats as not active.
-
-- **Newer agents keep working against an older control plane
-  (#1077).** The heartbeat and lease/MAC-sighting request models are
-  `extra="forbid"`, so a pre-#1077 control plane 422s the new `spool`
-  and `batch_id` fields — and the spool classifies a 422 as a verdict
-  on the body and drops it. Both agents re-send once without the
-  field when the 422 names it, and remember not to send it again, so
-  an agent upgraded ahead of its control plane neither goes stale nor
-  silently discards lease batches. Order of upgrade still recommended:
-  control plane first.
-
-- **Two Windows DHCP servers in one server group no longer end up
-  handing out the same addresses — and failover relationships can be
-  managed from SpatiumDDI (#1110).** SpatiumDDI had
-  no model of a Windows failover relationship. The write-through sent
-  every scope, pool and reservation write to EVERY Windows member of
-  the group, create-or-update: a new scope landed on both servers,
-  and an edit to a scope one server held quietly CREATED it on the
-  other. Two DHCP servers, the same range, no coordination — while
-  both writes returned success, both servers showed the scope, and
-  the UI showed one scope on one group.
-  **Windows failover relationships are now read** —
-  `Get-DhcpServerv4Failover`, on the existing topology poll — along
-  with which scopes each Windows server actually holds, and shown on
-  the group (a *Windows DHCP failover* panel), as a column in the
-  scopes table and as a strip on the IPAM subnet's scope card. REST:
-  `GET /dhcp/server-groups/{id}/failover` and
-  `GET /dhcp/scopes/{id}/failover`. The shared secret is never read.
-  **On a group with two or more Windows members, a write now probes
-  every member live and goes only to the members that hold the
-  scope, update-only** — the "never create it here" check runs in the
-  same PowerShell as the write. A NEW scope goes to ONE member, by
-  the scope's *Windows placement*: into a failover relationship
-  (created on one side and added to it, so Windows copies it to the
-  partner) or on one server only. Without a placement, the one
-  relationship the members share is used; otherwise the create is
-  refused (422) with the choices listed. Activating a scope held by
-  several members that no relationship covers is refused (422).
-  Deleting a scope a failover pair in the group covers takes it out
-  of the relationship on one side (Windows deletes the partner's
-  copy) and deletes it there; a scope whose partner is outside the
-  group is refused (409), because that step deletes a copy on a
-  server SpatiumDDI does not manage. Reservations and exclusions need
-  no probe: the driver skips a member without the scope, and only
-  "no member holds it" is refused.
-  **Relationships are managed from the group's panel** — create,
-  edit, delete, add and remove scopes, and replicate one partner's
-  configuration over the other's — and from REST routes under
-  `/dhcp/server-groups/{id}/failover/relationships` (superadmin,
-  audited, the shared secret never stored, logged or audited). Every
-  `*-DhcpServerv4Failover*` cmdlet runs on one server and acts on its
-  partner from there, so it needs the WinRM logon to make the
-  PowerShell "second hop": only CredSSP can, and any other transport
-  is refused (422) before anything is sent. Where a cmdlet runs is
-  also what it does to the other server — a create or add COPIES the
-  scope from the holder, a removal DELETES the partner's copy and the
-  operator picks which side keeps it, and a load-balance share or
-  hot-standby role is the value of the side it runs on, so an edit
-  names that side (left to pick one itself, the same request could
-  make both partners Active). The first cut shipped every op in one
-  PowerShell script that encoded to ~12,700 characters against
-  WinRM's 7,800-character command-line budget — every call would have
-  been refused before it was sent; a test now pins every op, with
-  maximal inputs, under the budget, and long scope lists go in
-  chunks.
-  **Split scopes are protected.** SpatiumDDI writes one range and one
-  set of exclusions to every server holding a scope, so a new range,
-  or removing an exclusion, could merge two servers' disjoint halves
-  into the outage. Those writes are now simulated per holder and
-  refused (422) when the halves would overlap; everything else goes
-  through.
-  **Kea and Windows servers can no longer share a group** (422 on
-  server create / move): Kea serves every active scope of its group
-  and cannot coordinate with Windows failover. An existing mixed
-  group is flagged on the panel and its shared scopes are reported
-  uncoordinated.
-  **New default-on alert rule, *DHCP scope served uncoordinated***
-  (`dhcp_scope_uncoordinated`, critical): one event per scope two
-  servers serve without coordinating — silent everywhere else, and
-  the only signal there is, since both servers report the scope
-  healthy.
-  **This deliberately deviates from the issue's plan**, which was to
-  write a covered scope to ONE partner and "let Windows replicate".
-  Windows replicates LEASES between failover partners continuously
-  but not CONFIGURATION: option values, exclusions and reservations
-  move only when someone runs `Invoke-DhcpServerv4FailoverReplication`
-  or the console's *Replicate Scope* (Microsoft's own DHCP-team post
-  on this is the reason its auto-sync tool exists). Writing one
-  partner would leave the other serving stale reservations after a
-  failover. Microsoft's IPAM writes both partners, and so does this;
-  replication is offered as an explicit action for drift made in the
-  DHCP console.
-  **The topology poll stopped undoing itself.** Each Windows member's
-  pass merged its own view of the group's scopes — so two partners
-  that disagreed about one reservation (the ordinary state of two
-  servers that do not sync configuration) created it and
-  absence-deleted it again on every poll, along with its IPAM mirror
-  and DNS records. One member now imports each shared scope — the
-  lowest-named member whose last read is under 15 minutes old, so an
-  unreachable partner cannot freeze a scope — and the others are
-  compared against it: a differing configuration hash is reported as
-  drift instead of fought over.
-  **Shared lease teardown waits for the last peer.** A failover or HA
-  pair reports every lease once per partner, but the IPAM mirror and
-  its DDNS records are one row and one A/PTR. `purge_lease`, the
-  expiry sweep and the Kea release/expire event all tore them down
-  when ONE partner stopped reporting the lease — the other's next
-  poll recreated both, so DDNS flapped. They now wait while another
-  server in the same group holds an active, unexpired lease on the
-  address. Scope deletion is exempt, since every copy goes at once.
-  **Found on the way, in the Kea lease-event handler, and fixed
-  because the guard depends on it:** the lookups compared the event's
-  string address with the stored `IPv4Address` (asyncpg decodes INET
-  natively) and never matched. Every renewal event INSERTED another
-  `dhcp_lease` row for the same lease instead of updating the one it
-  had, and a release found no stored IPAM mirror, so the mirror and
-  its DNS records outlived the lease until the expiry sweep. The test
-  client's shared session hid both — the identity map handed the
-  handler the objects the test built, strings and all — so the new
-  tests reload from the database between requests, as production
-  does.
-  **Single-member groups keep the old scope write** (no probe,
-  create-or-update), with three changes to the failure path: a scope
-  delete probes first, so a failover scope gets the explanation
-  rather than Windows' raw error; deleting a scope already gone from
-  the server is now a no-op instead of a 502 that made the scope
-  undeletable in SpatiumDDI; and a reservation for a scope the server
-  does not have is a 409 that says so.
-  1 MCP tool (`find_dhcp_failover_relationships`, read-only, default
-  on); deliberately no `propose_*` write tool — the management routes
-  create and delete scopes on the partner and carry the shared
-  secret — and not a feature module (it extends existing DHCP
-  resources). **Not yet verified against a live
-  Windows failover pair:** the exact JSON `Get-DhcpServerv4Failover`
-  returns, whether it errors or returns nothing on a server with no
-  relationships, and whether `DHCP Users` may run it. The parser
-  reads a failed or unrecognised response as *unknown*, never as
-  *no relationships*, and the write-through refuses rather than
-  guesses on unknown. The management cmdlets follow Microsoft's
-  documented parameters and have not been run against a real pair
-  over CredSSP yet either.
-- **Choosing the CredSSP WinRM transport failed on every call.** The
-  server form has offered it for years, but `requests-credssp` — the
-  library pywinrm imports for it — was never installed, so pywinrm
-  raised before connecting. Now a dependency (MIT; `NOTICE` and
-  `docs/THIRD_PARTY.md`), because #1110's relationship management
-  needs it. Kerberos was in the same position (the images carry no
-  GSSAPI stack) and is no longer offered — see #1128 under Changed.
-- **The docs still described the pre-#631 dynamic-pool guard
-  (#1162).** Getting Started §9 said allocating inside a dynamic pool
-  "is refused", and IPAM.md's status line and allocation-UI notes said
-  a 422 answers it with the submit button disabled. Since #631 a
-  manual allocation there answers a force-overridable `409`
-  (`requires_confirmation`, a `dynamic_pool` warning naming the pool)
-  and the modal offers **Allocate anyway**; the docs now say so, as
-  IPAM.md's own rules table always did. DHCP.md's conflict list still
-  said a reservation inside a dynamic pool is refused until the pool
-  excludes it — #631 removed that 409, and its "exclude it first"
-  advice was the harmful part; the list now says in-pool reservations
-  are allowed. §9 also says what New Scope pre-fills, including its
-  suggested initial pool (the tenth host address to the last usable
-  one), and its worked example now replaces that suggestion: kept, the
-  dynamic pool would take in `10.20.21.10`, the address step 10
-  allocates, and step 10 would stop to ask for confirmation.
-
-- **A DHCP scope created from its subnet keeps the subnet's gateway
-  as Routers (option 3) and gets the suggested pool (#1154).** The
-  New DHCP Scope dialog pre-fills Routers and a pool from the subnet,
-  and the DNS, domain, NTP and lease-time defaults from Settings —
-  but one latch covered both and fired on whichever query answered
-  first. The Dashboard caches the settings, so on the ordinary path
-  (Dashboard → IPAM → subnet → DHCP Pools → Create Scope) Routers and
-  the pool stayed empty, and a scope saved as shown handed out leases
-  with no default gateway; a hard reload lost the Settings defaults
-  instead. Each half now applies when its own query answers, never
-  over a value already there. A subnet picked in the dialog
-  pre-fills the same way (picking another replaces only what the
-  dialog filled in), and an IPv6 subnet no longer puts its gateway in
-  the DHCPv4-only option 3.
-
-- **A read-only operator is no longer offered IPAM and DHCP-scope
-  writes that end in "Permission denied" (#1155).** Every user saw
-  the same controls as a superadmin: New IP Space and Import subnets
-  in the IPAM tree; Edit, Add block, Add Subnet, New Subnet, Add child
-  block, Allocate IP, Import IP addresses and the Tools menus' Bulk
-  allocate, Clean Orphans, Merge, Resize, Split, Move and Scan with
-  nmap in the space, block and subnet headers; Create Scope, Add Pool
-  and the scope and pool edit, delete and enable controls in a
-  subnet's DHCP tab. A Viewer filled in the form and met the refusal
-  at submit. Each is now disabled, with the missing permission as its
-  tooltip, unless the caller holds the write the server asks for
-  (`usePermissions`, which already gated the address rows). The
-  server stays the enforcement point.
-
-- **Every hand-built dialog is announced as a dialog (#1156).**
-  Seventeen dialogs drew their own card instead of using the shared
-  `Modal`: the IPAM tools (Find free space, Split, Merge, Resize, Bulk
-  allocate, Move block, DNS Sync, the address detail, both imports),
-  Factory reset, the backup restore and destination forms, the
-  custom-field and auth-provider editors and the custom-field delete
-  confirm, and the nmap and packet-capture confirms. None had
-  `role="dialog"`, `aria-modal` or an accessible name, their close
-  buttons had no name, and page code that checks for an open dialog
-  could not see them — so **?** opened the shortcuts overlay on top of
-  them. They now take the shared `Modal`'s contract from one hook,
-  `useModalDialog`: named by their heading, modal, focus kept inside,
-  Esc to close, and a named close button (the two backup forms gain
-  one). Their layout is unchanged.
-
-### Changed
-
-- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
-  ships it. The pinned copies move together — `versions.json` plus
-  the Makefile's `alpine/helm` image and the `version:` input in
-  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
-  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
-  joins them as a sixth: its CI-gate table said "Helm 3.21", already
-  stale before this change and wrong at the *major* after it, which
-  would send anyone reproducing CI locally to the wrong binary. It is
-  now spelled as the exact version and enforced by `lint_versions.py`,
-  so it cannot drift again. (That row was stale two further ways, both
-  corrected: "both charts" predates metallb landing as a third, and
-  "six value sets" describes a matrix that is now 14.)
-  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
-  packages the chart with THIS binary; on the node, k3s's
-  helm-controller spawns `klipper-helm` to install it — and the
-  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
-  directly: `helm version --short` in that image). So the appliance
-  has been installing with 4 while CI validated with 3. The CLI
-  major now matches what production actually runs.
-  **The charts render identically.** Both majors were run against the
-  same tree and the 323 rendered objects compared after parsing, not
-  as text. 18 objects differed — but 17 of those also differ between
-  two runs of the *same* 3.22.0 binary, because the charts generate
-  random credentials, so the control run is what identifies them as
-  noise. Exactly one CONTENT difference is attributable to Helm 4: a
-  single trailing blank line inside the `frr.conf` string of the
-  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
-  which is inert. The rest of the textual diff is comment placement
-  and blank lines in the output stream, outside any object.
-  **Helm 4 also reorders objects**, which a set-and-content comparison
-  cannot see, so order was checked separately: 12 of the 14 renders
-  emit identical order, and the two metallb ones do not —
-  `IPAddressPool` and `L2Advertisement` move from *before* the two
-  `ValidatingWebhookConfiguration`s to *after* them. That is not
-  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
-  under the new order the CRs are admitted through a webhook that can
-  reject them, where previously they were created before it existed.
-  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
-  about, and it is not theoretical: a **fresh install of that chart
-  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
-  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
-  created; 4.3.0 exits 1, reporting that server-side apply failed
-  calling the metallb `ipaddresspoolvalidationwebhook` because the
-  service had `no endpoints available`. The webhook is now registered
-  before the CRs are applied, and its backing controller pod — created
-  moments earlier in the same pass — is not ready yet. **A retry
-  succeeds**: `helm upgrade --install` against the half-applied
-  release exits 0 and creates both CRs once the controller is up.
-  This is nonetheless not a change this PR makes, for a specific
-  reason rather than a general one: **the metallb chart is never
-  installed by this CLI.** `bake-chart.sh` packages it and
-  helm-controller installs it on the node via klipper-helm — already
-  4.1.4 — so the appliance has been on the new order since before this
-  branch. Nothing in CI installs it either; `charts-render-check.sh`
-  only templates it.
-  **A default appliance never reaches the failure at all**, which an
-  arm64 ISO built from this branch and booted confirms rather than
-  assumes: `metallb.enabled` is `false` by default and firstboot
-  renders the HelmChart that way, so the chart produces no
-  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
-  and `helm-install-spatium-metallb` completes first time — the release
-  secret is at `v1`, so there was no retry. The ordering bites only
-  where an operator sets a control-plane VIP (#272 multi-node HA),
-  which is what flips metallb on — **and that case is broken today,
-  which setting a VIP on the booted appliance confirmed.** It does not
-  fail once and converge, as this entry previously guessed: it never
-  converges. klipper-helm resolves `SERVER_SIDE=auto` to
-  `--server-side=true`, and every attempt runs `helm uninstall` before
-  `helm install` — so each retry deletes the controller backing the
-  webhook, then reinstalls and applies the CRs while the replacement
-  pod is still starting. Each attempt destroys its own prerequisite.
-  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
-  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
-  so the VIP never materialises.
-  **None of that is this pin's doing** and none of it changes with it:
-  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
-  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
-  so the appliance has behaved this way since that k3s landed, whichever
-  helm packages the chart. It needs its own issue against the appliance.
-  Also exercised under 4.3.0: `helm lint` + `dependency update` +
-  `package` for all three charts (the `bake-chart.sh` and
-  `release.yml` path), and an OCI `helm push` + `helm pull`
-  round-trip against a throwaway registry, digests matching.
-  **No breaking-change exposure**, re-audited against the tree rather
-  than the changelog: no post-renderers, no plugins, no `--atomic`,
-  no helm `--force`, `registry login` is already domain-only
-  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
-  runs unchanged. The flags we do pass — `--set`, `--timeout`,
-  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
-  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
-  in the tree are prose, or commands we print for operators to run
-  with their own helm; those were checked too and use no renamed flag.
-  The one behavioural change is server-side apply, which Helm 4
-  defaults to on **new** installs. The appliance is unaffected — it
-  is already on 4.1.4 — so the only newly-affected path is the single
-  kind `helm install` in `agent-e2e.yml`, and that workflow is
-  path-filtered on itself, so this change exercises it.
-
-
-- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
-  project is now `spatiumnorth/spatiumddi`: the org changed, the
-  repository name did not, and neither did the product, the PyPI
-  package, the image names or any filesystem path — `/etc/spatiumddi/`,
-  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
-  `github.com/` and `ghcr.io/` reference in the tree moved to the new
-  org, along with the shields.io badge paths in the README, which carry
-  the org separately from the link they sit behind and so would have
-  gone on reporting a repo that no longer answers.
-  **Container images move with the org**: pulls are now
-  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
-  `image.repository` default moved with them. CI needed no such change
-  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
-  follows a rename on its own.
-  **Two things do not follow a rename, and both fail silently.** Eight
-  workflows gate on `if: github.repository_owner == '…'` so a fork
-  never publishes; left at the old literal, release, nightly, the
-  weekly Trivy scan, asset pruning and the docs publisher would all
-  have skipped with a green check rather than an error. And the docs
-  site's org-root Pages repo has to be renamed to
-  `spatiumnorth.github.io` — GitHub serves an organization site only
-  from a repo named `<org>.github.io`, so the old name is demoted to an
-  ordinary project site and the root site stops existing;
-  `docs-publish.yml` now targets the new name.
-  **Operator action on upgrade:** `GITHUB_REPO` shipped in
-  `.env.example`, so an install that copied it carries
-  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
-  default and pins the daily release check and the appliance
-  slot-image catalogue to the old path. Update the value, or remove
-  the line to take the default.
-  **Pinned releases pull from the old path (#1163).** Every release
-  up to and including `2026.09.04-1` names its images under
-  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
-  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
-  taken from such a tag, or from a checkout older than this change,
-  fails at `docker compose pull` — `git pull` for the current file,
-  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
-  copy. Every published chart version up to and including
-  `2026.9.4-1` defaults to the old path too: install or upgrade those
-  with `--set image.repository=spatiumnorth` plus
-  `dnsAgents.image.repository`,
-  `dnsAgents.flavors.powerdns.repository`,
-  `dnsAgents.flavors.technitium.repository` and
-  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
-  names (the chart README lists them).
-- **The release check reported a permanently up-to-date install when
-  its repo had moved.** GitHub answers `301` for a renamed repo, which
-  an org rename makes routine — and httpx does not follow redirects by
-  default while `raise_for_status()` does not reject a `3xx`. So the
-  redirect body was parsed as a release: no `tag_name`, so the task
-  stored no version, set `update_available=False`, cleared
-  `latest_check_error` and logged `update_check_ok`. The one default-on
-  connection in the product would have gone on reporting a healthy
-  “you are up to date” forever, which on a notifier whose job is
-  surfacing security fixes is worse than a loud failure. Both GitHub
-  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
-  now follow redirects, which removes the false negative and keeps a
-  stale `GITHUB_REPO` working rather than silently wrong.
-- **The appliance image pruner stopped reclaiming pre-rename images.**
-  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
-  owns them; narrowed to the new org alone, every accumulated
-  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
-  exactly what the timer exists to reclaim — would have been classified
-  as third-party infra and kept forever, while still reporting nothing
-  stale to prune. It now matches both orgs; the in-use and
-  slot-version guards are unchanged, so nothing live can be removed.
-
-### Fixed
-
-- **A boot with the control-plane PriorityClass missing no longer
-  loops the control plane (#1123).** `spatium-control-plane` is
-  rendered by the `spatium-bootstrap` release, and firstboot's
-  degraded path (#983) released the control chart without it when
-  it was absent — but that release's own CloudNativePG operator
-  names the same class, and nothing degraded it. Once the operator's
-  pods had to be re-created (a cluster node loss evicts them within
-  ~20 s; a drain or a pressure eviction does it on one node), its
-  ReplicaSet was refused at admission, `cnpg-webhook-service` had no
-  endpoints, the unranked control chart's `Cluster` was refused by
-  that webhook, and helm-controller's `reinstall` policy uninstalled
-  and reinstalled `spatium-control` on every retry: the Web UI never
-  came up, unranked or otherwise. firstboot now has
-  `spatium-bootstrap` put the class back before it releases the
-  control chart — on an explicit NotFound, with the release
-  `deployed` and its helm-install Job completed, it re-runs that
-  Job (the lever `spatiumddi-helm-stuck-recover` already uses; a
-  running or retrying Job is left to helm-controller), waits up to
-  3 min for the class, then re-queues every ReplicaSet, StatefulSet and
-  DaemonSet in `spatium` with a metadata-only annotation so the
-  creates the apiserver refused are retried now rather than on the
-  controllers' exponential backoff (up to ~16 min). Releasing the
-  control chart unranked stays as the fallback when the class does
-  not come back.
-
-- **DNS agent: `noerror` counted every authoritative NXDOMAIN answer too
-  (#1116).** The poller derived the rcode breakdown from BIND's nsstat
-  answer classes and read `noerror` from `QryAuthAns` + `QryNoauthAns` —
-  every authoritative / non-authoritative response whatever its rcode —
-  so an authoritative NXDOMAIN answer was counted under `noerror` as well
-  as under `nxdomain`, and the dashboard's breakdown summed to more
-  answers than the daemon sent (50 NXDOMAIN answers on the QA fleet:
-  `QryAuthAns` +50, rcode `NOERROR` +0). `noerror`, `nxdomain` and
-  `servfail` now come from the server-level rcode table BIND publishes
-  (`NOERROR` / `NXDOMAIN` / `SERVFAIL`), read from the `<server>` element
-  only, since each view repeats those names as resolver counters; a
-  build without the table falls back to the nsstat classes that carry
-  exactly that rcode (`QrySuccess` + `QryNxrrset`, `QryNXDOMAIN`,
-  `QrySERVFAIL`).
-
-- **DNS agent: `queries_total` counted every query twice on BIND 9.20
-  (#1064).** The poller listed the opcode table's `QUERY` and the
-  nsstat family's `Requestv4`/`Requestv6` under one column so either
-  shape of `named` would light it up, then summed whatever it found —
-  and every current BIND publishes both, so `dns_metric_sample`
-  reported 2.00× the queries the daemon received (the DHCP sampler,
-  whose counters have one spelling, matched kea to the packet in the
-  same window). The spellings are now alternatives in order of
-  preference — the first one present is the value — and the
-  poller's tests carry a 9.20 sample with both. (`noerror` had the
-  same fold; it now reads BIND's rcode table instead — #1116, above.)
-
-- **The storage action route keeps its own answer through the
-  frontend (#1080).** `POST …/appliances/{id}/storage/action` waits
-  up to 90 s for the appliance's supervisor before its own 504, and
-  the supervisor waits 60 s for the host runner before reporting
-  "the host storage runner did not answer within 60s" — but the
-  frontend proxied every `/api/` route with a 60 s read timeout, so
-  nginx answered for the api at 60.000 s every time (its generic
-  "retry shortly" JSON; before #1087 the `405 Not Allowed` page the
-  issue was filed on) and neither message ever reached the operator.
-  Observed live on a single-node QA appliance with the runner's
-  `.path` unit stopped: through the frontend the client got 504 at
-  60.02-60.05 s while the supervisor's report reached the api 60.06 s
-  after the request, ~80 ms after nginx had cut it; the same request
-  made inside the appliance against the api Service answered 200 in
-  60.09 s carrying that report. The route now has its own `location`
-  in both nginx templates with a 120 s budget; `appliance/tests` read
-  the three budgets from source (proxy > route > supervisor) so they
-  cannot drift apart again.
-
-- **A DNS or DHCP agent that is up but not serving now shows as such
-  (#1067).** The agents have always carried a `daemon` object on every
-  heartbeat —
-  `{"status": "degraded", "reason": "start deferred, no bundle yet"}`
-  while a DNS agent waits for its first bundle (#1061), `ok` once the
-  daemon is up — and both heartbeat handlers declared the field and read
-  nothing from it, so a registered, heartbeating server whose `named`
-  never started read `active`, seen seconds ago, config ok, while its pod
-  restarted on the liveness probe every two minutes (measured for twelve
-  minutes on a nested three-node cluster). The state now lands on
-  `dns_server` / `dhcp_server` as `daemon_status`, `daemon_reason` and
-  `daemon_status_since` (the stamp of the heartbeat that began the
-  current state, so the row can say how long), is exposed on both server
-  responses, renders as a chip on the DNS and DHCP server rows and a
-  banner on the server detail, degrades the dashboard's health header,
-  and drives a new `agent_daemon_degraded` alert rule (seeded enabled,
-  critical) once a daemon that is not serving has outlasted a five-minute
-  grace. All of those read one server-side classification,
-  `daemon_not_serving` on both responses: a `degraded` that is the agent
-  echoing a failed config apply (`config_apply_*`, or the DHCP agent's
-  `dhcp4_config_rejected` / `dhcp6_…`) is #882's to report, so it neither
-  pages nor draws a red "not serving" chip beside the config-apply one
-  for a daemon that is up on its last-known-good config. NULL means never
-  reported — a pre-#1061 agent, or an agentless driver — and reads as
-  unknown, never healthy. The DNS agent also now reports `ok` once its
-  daemon is confirmed running instead of an empty object for the life of
-  the process. Migration `b7d21c9e4f06` adds the three nullable columns
-  and a partial index over the unhealthy states to both tables (expand
-  only). `agent_daemon_degraded` and #980's `dhcp_packets_dropped` are
-  also in the rule-type allow-list now: both were seeded and evaluated,
-  but `POST /alerts/rules` refused them with a 422 and the conformity
-  `alert_rule_enabled` check read them as not applicable. A test now
-  fails for the next rule type left out.
-
-- **A DNS agent held `pending_approval` can be approved through the
-  API (#1121).** `DNS_REQUIRE_AGENT_APPROVAL=true` holds a re-registering
-  agent whose fingerprint changed (a wiped agent volume legitimately
-  produces one): its config long-poll answers `pending_approval` and
-  never a bundle, so `named` stays deferred. Nothing cleared the hold —
-  `ServerUpdate` has no approval field and the DNS router had no
-  approve route, while DHCP has had `POST /dhcp/servers/{id}/approve`
-  all along — so the only recovery was a database write or deleting
-  and re-registering the server.
-  `POST /dns/groups/{group_id}/servers/{server_id}/approve`
-  (superadmin) now mirrors the DHCP endpoint: clears the flag, writes a
-  `dns.server.approve` audit event, wakes the agent and returns the
-  server row. Idempotent. The DNS server modal still only shows the flag
-  (the DHCP page has an Approve control); the UI control is follow-up
-  work.
-
-- **The appliance kubelet now evicts on memory before the kernel's OOM
-  killer does (#1124).** k3s's kubelet defaults carry disk eviction
-  thresholds only, so memory exhaustion went straight to the kernel's
-  global OOM killer, which picks by `oom_score_adj`: on a QA node it
-  killed the api's uvicorn while a runaway pod was the cause.
-  `config.yaml` now passes `memory.available<512Mi` (restating k3s's disk
-  floors, since `--eviction-hard` replaces the whole map), a 30 s
-  pressure-transition period instead of 5 min, and
-  `kube-reserved=memory=1Gi` plus `system-reserved=memory=512Mi`, so the
-  kubelet evicts by PriorityClass first. **Upgrade note:** those settings
-  set aside 2 GiB on every node, and pods are scheduled only into the
-  rest. A control plane now needs at least 4 GiB of RAM and a DNS / DHCP
-  appliance at least 3 GiB; a smaller box upgraded to this release comes
-  back with its pods `Pending` on `Insufficient memory`. The recommended
-  sizes (8 GiB control plane, 4 GiB DNS / DHCP) are unaffected.
-
-- **The database's memory limit is sized from the node, with the api
-  and the worker (#1115).** The supervisor sizes the api and worker
-  limits from the node's RAM (#947) and firstboot renders the same
-  numbers into the spatium-control HelmChart (#1003), but the
-  CloudNativePG cluster kept the chart's BYO default of `1Gi` (with
-  `shared_buffers: 256MB`, sized for the same gibibyte) on every
-  appliance whatever the node had. Under a bulk record load the
-  primary hit that cap, the kernel OOM-killed it, CloudNativePG
-  failed over, and every write in the failover window was lost — on
-  a 12 GiB seed with 7.6 GiB free (observed live on a seven-node QA
-  cluster: 93,000 of 1,000,000 records created; the same load
-  completed with zero database restarts once the cap was raised).
-  The three workloads are now one whole-node budget rather than
-  three independent fractions: a 2 GiB reserve for the platform
-  (k3s, the supervisor, the bind9/kea DaemonSets, the CNPG
-  operator — about 1.7 GiB measured on an idle 6 GiB appliance),
-  then the remainder split api one half, worker one quarter,
-  Postgres one quarter, clamped to 1–8, 1–4 and 1–4 GiB, with
-  `shared_buffers` a quarter of the Postgres cap (Postgres' own
-  guidance; the chart's 256MB-of-1Gi is the same ratio). On 8 GiB
-  that is api 3072Mi / worker 1536Mi / Postgres 1536Mi; on 12 GiB
-  5120 / 2560 / 2560; on a 6 GiB appliance every share sits on its
-  floor and Postgres stays at 1024Mi. The api and worker limits are
-  therefore lower than before on nodes under 16 GiB (an 8 GiB
-  node's api was 4096Mi, now 3072Mi): limits are ceilings, and the
-  sum of the three now fits the node beside the reserve instead of
-  exceeding it. The reserve, the shares and the caps are one table
-  in `k8s_api.control_plane_sizing`, mirrored in firstboot and held
-  together by `test_control_plane_sizing.py`; they are the knob to
-  turn if a workload needs a different split. firstboot renders the
-  Postgres sizing into the HelmChart so a fresh install's Cluster is
-  created with it — a resources change on a formed cluster is a
-  CloudNativePG rolling restart, replicas first, then a switchover —
-  and an appliance that upgrades into this sizing takes that one
-  rolling restart on its first heartbeat, after which the #1005
-  guard keeps every later heartbeat quiet. The Postgres memory
-  request follows `shared_buffers` (never below the chart's `256Mi`):
-  CloudNativePG's admission webhook refuses a Cluster whose request
-  is below `shared_buffers`, and with the chart's request left alone
-  an 8 GiB node's `368MB` put the helm release in a failed state,
-  with k3s uninstalling and reinstalling the whole control plane
-  every few minutes.
-
-- **Drift and Sync with Servers work on groups with DNS views
-  (#920).** BIND chooses the view for a request by the requester's
-  address before it looks at `allow-transfer`, and a view's client
-  list never names the control plane. So on a group whose views are
-  scoped to real clients, every drift report and every sync failed
-  with "The peer didn't know the key we used" — for a key that was
-  loaded and granted — and where a broad view did match the api's
-  address, it answered with its own copy of a same-named zone. Each
-  rendered view now admits one key of its own, derived from the
-  group's TSIG key and never shown, and refuses every other view's;
-  drift and sync sign with the key of the view that holds the zone.
-  Every other request is matched to a view exactly as before. An
-  agent that predates this is still read with the group key, and the
-  report says when a comparison may come from another view.
-
-- **An agent-managed zone can read in sync, and Sync with Servers no
-  longer imports a record nobody made.** The BIND9 agent writes
-  `ns1 IN A 127.0.0.1` into every zone it serves, so BIND will load a
-  zone whose NS names an in-zone host. The drift report listed that
-  glue as extra on the server on every agent-managed zone, so none
-  ever read in sync, and every sync imported it into the database as
-  an ordinary record. It is now treated like the apex SOA and NS:
-  zone-level apparatus, left out of the comparison and the import —
-  unless the zone really holds that record, which is then compared
-  like any other. Found once the transfer in the entry above went
-  through.
-
-- **A dead-node replace no longer scales the database down (#1059).**
-  The replace endpoint drops the replaced row from the committed
-  control-plane count at once, so from the seed's next heartbeat —
-  the same tick that deletes the dead Node — until the replacement
-  was promoted, CloudNativePG's `spec.instances` read 3→2, and only
-  the promote restored it. CloudNativePG takes a smaller spec while
-  every instance pod still reads Ready (the dead node's does, for
-  the node-monitor grace) and then removes the highest-serial ready
-  non-primary instance, PVCs and all — the dead one by luck, or a
-  healthy replica on a live node; on a later tick it refuses, and
-  the smaller spec then only stops it re-creating the dead instance
-  until the promote (observed live on nightly-2026.09.13: Postgres
-  two of three for 860 s inside a green replace). A two-node
-  control plane is not a legal steady state, so a replace is never
-  a scale-down by intent. The eviction tick — which only a replace
-  produces — now arms a hold on the CNPG size that lasts until the
-  committed count is back (or the operator shrinks the control plane
-  on purpose), and `patch_cnpg_instances` defers any scale-down the
-  Cluster reports it cannot take (fewer ready instances than it
-  has) — logged as `cnpg_instances_scale_down_deferred` and retried
-  every tick, so a real demote lands on the first tick the cluster
-  is whole. Scale-up and the anti-affinity repair are untouched.
-
-- **PR-time Trivy lanes scanned a frozen package layer, and trusted
-  Trivy's exit code (#1093).** Four workflows build an image on a PR
-  and scan it — DNS, DHCP, looking-glass, supervisor. All four cache
-  on `type=gha`, and BuildKit keys a layer on its RUN text, so each
-  image's `apk upgrade` / `apt-get upgrade` was served from whenever
-  that scope was first written. Three of the four passed no snapshot
-  build-arg at all. Scanning that layer is wrong in **both**
-  directions: it misses a CVE the current index would flag, and it
-  keeps reporting one fixed weeks ago — telling the operator to do
-  something already done, which is #1029's class.
-  They also decided with `exit-code: "1"`. Trivy's "fixed" means the
-  distro's security database names a fix, not that the package is on
-  the mirrors yet, so that fails a PR on findings nothing could have
-  installed — the nightly-20260905 failure relocated to a lane that
-  blocks unrelated work. All four now emit JSON and hand the verdict
-  to `trivy-gate.sh`, which asks the image's own index whether each
-  fix is installable today: installable → fail, not yet → defer with
-  a warning, unverifiable → fail.
-  The Trivy action was also pinned off `@master`. An unpinned
-  third-party action is the same "tooling moves under us" class as
-  the unpinned `aquasec/trivy:latest` in #1095, and there it was
-  load-bearing: an unrecognised flag exits 1, which these lanes would
-  have read as findings.
-  Timed deliberately: the nightly (snapshot-busted) and the weekly
-  (uncached) had just scanned all nine images clean, so arming these
-  lanes could not newly break any PR.
-  **None of the four listed its own workflow file in `paths:`**, so
-  the PR rewiring this gate would have run none of them — the change
-  most needing the proof was the one that could not get it. They now
-  self-trigger, which `build-appliance-builder.yml` was already
-  doing, so this restores a convention rather than inventing one.
-
-- **`nightly.yml` filed a doubly-wrong failure report on a dry run
-  (#1094).** The failure step lacked the `dry_run` guard every
-  sibling side-effecting step carries, and hardcoded ``failed on
-  `main` ``. A dry run publishes nothing and prunes nothing, so one
-  that fails means a candidate build failed — the dry run doing its
-  job — not that the nightly is broken; and a dispatch takes `--ref`,
-  which is the whole point of a dry run. The #1090 dry run was on
-  `issue-1088` and would have filed exactly this had it failed. It
-  now skips on dry runs and reports `github.ref_name`.
-
-### Changed
-
-- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
-  ships it. Five copies, none Dependabot-visible, all moved
-  together — `versions.json` plus the Makefile's `alpine/helm`
-  image and the `version:` input in `ci.yml`, `release.yml`,
-  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
-  and template clean under it.
-  **This is the terminal Helm 3 feature release** — published
-  2026-09-10, matching the project's stated final 3.x feature
-  release of 2026-09-09. After it, 3.x receives security fixes
-  only, until 2027-02-10. So this is a floor, not a resting place;
-  the move to 4.x is #1098.
-  The manifest's note claiming we stay on 3.x because the appliance
-  is "independent of this binary" is **wrong**, and is corrected
-  here rather than repeated: the appliance renders through k3s's
-  helm-controller, which spawns `klipper-helm` — and the pinned
-  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
-  with 3 and install with 4, so a 4.x move closes that gap instead
-  of opening one. See #1098.
-
-### Fixed
-
-- **The weekly Trivy issue reported a CVE count and zero CVEs
-  (#1095).** #1092 is the worked example: it said the api image
-  had 5 HIGH/CRITICAL
-  fix-available vulnerabilities and contained no CVE identifier at
-  all. The scan captured `head -c 12000` of Trivy's *table* output,
-  whose Report Summary carries one row per scanned target — which
-  for that image is every `site-packages/*.dist-info/METADATA`
-  file. Measured: the full table is 107,220 bytes and the first
-  `CVE-` does not appear until byte **76,926**, so the cap could
-  only ever capture summary rows. Not a near miss; the detail
-  starts at 6.4x the cap. The report now renders from
-  `--format json`, which removes the truncation rather than
-  mitigating it — the same 34 findings come to 2,765 bytes against
-  107 KB — and gives severity, package, CVE, installed and fixed
-  version per row.
-  **`rc=1` no longer means "findings" on its own**, which is the
-  sharper half. An unrecognised flag ALSO exits 1 — verified
-  against Trivy 0.74.0 — and writes ~15 KB of usage text to the
-  captured stdout stream. The image is `aquasec/trivy:latest`,
-  unpinned, so a CLI change would have filed a security tracking
-  issue whose body was Trivy's help output, presented as CVEs. A
-  report that does not parse as a Trivy document is now a scan
-  error: never findings, and never a clean bill.
-  Truncation, if it happens at all, is capped by LINE and says
-  what it dropped — a byte cap can cut mid-row, and a partial line
-  still begins with `|`, so it would render as a malformed table
-  row instead of being dropped. Rows sort CRITICAL first, so a
-  truncated report keeps the worst findings. Also corrected the
-  footer, which sent readers to `make trivy` for `backend` and
-  `frontend` — neither is an agent image, and `backend` is the one
-  that actually reports findings.
-
-### Security
-
-- **Supervisor registration has an attempt budget, and persistent pairing
-  codes expire by default (#1356).** `POST /appliance/supervisor/register`
-  is unauthenticated: an 8-digit pairing code is the credential. Nothing
-  limited the guesses beyond a fixed half-second delay, persistent codes
-  defaulted to never expiring, and every wrong guess committed its own
-  audit row, so a brute-force run also flooded the append-only audit
-  table. Now ten wrong codes from one address, or a hundred across the
-  install, in 15 minutes get `429` until the window passes. The attempt is
-  spent before the code is checked, so concurrent guesses can't all slip
-  under the limit, and a right code refunds it, so a fleet rollout behind
-  one NAT address is never throttled. A request already refused checks no
-  code and is not charged to the install-wide budget, so one address
-  cannot use it up and lock out every registration. The throttle fails
-  closed (`503`) while Redis is unreachable. The supervisor stops retrying
-  on `429` until its next loop tick, honours a capped `Retry-After` on
-  `503`, and drops a pairing code the control plane rejects rather than
-  re-sending it every 30 seconds, which kept its address throttled for
-  every appliance pairing from behind it (a control-plane node mints a
-  fresh self-bootstrap code instead). An unknown code is audited only for the
-  first failure from an address in each window, plus once when either
-  limit trips; a code that exists but is revoked, expired or exhausted is always
-  audited. **Behaviour change:** a persistent code now expires after 30
-  days unless created with `expires_in_minutes: 0`, and the dialog warns
-  when you choose never.
-
-- **The api image no longer ships pip (#1392).** The runtime image
-  carried the Python base image's own pip 25.0.1, which has six fixed
-  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
-  only, so it never blocked on them, and `apt-get upgrade` cannot patch
-  pip because it is not a Debian package. So every scan at default
-  severity, such as Harbor's, reported them on every build. Nothing at
-  runtime runs pip, and a production image has no business carrying a
-  package installer, so the runtime stage now uninstalls it, and the
-  `dev` stage (pytest, `make ci-backend-lint`) restores it with
-  `ensurepip`. A Trivy scan of the runtime image now reports no
-  fixable Python-package finding at any severity.
-
-- **Setting up two-factor authentication needs a step-up (#1241).**
-  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
-  that decides whose authenticator the account trusts. A hijacked session
-  could enrol the attacker's: for an SSO superadmin that authenticator then
-  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
-  SNMP communities, provider secrets); for a local user it locks the real
-  owner out, since disabling MFA needs a code only the attacker has. A
-  local user now re-enters their password to start enrolling; an SSO user
-  must have signed in with their identity provider in the last 10 minutes,
-  and is told to sign out and back in otherwise. A token refresh now keeps
-  the session's original sign-in time rather than restamping it, so a
-  stolen session cannot refresh its way into looking recent; the session
-  viewer's "created" column now means when that person signed in. Refused
-  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
-  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
-  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
-  for a caller who already holds a session, so unthrottled each was a
-  password oracle for exactly the hijacked session the step-up exists to
-  stop. That budget fails closed: while Redis is unreachable the three
-  step-ups answer `503` with `Retry-After: 60`, because the account
-  lockout counts sign-in answers only and nothing else would bound the
-  guessing. Sign-in is unaffected.
-
-- **External accounts honour their state (#1242).** A **disabled** LDAP,
-  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
-  and a `login` / `success` audit row, before every later request was
-  refused. The check now runs before anything is issued or updated, answers
-  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
-  as `denied`. And **"must change password"** on an external account, which
-  has no password here to change, locked it out until an admin cleared the
-  flag: setting it, or resetting the password, on an external account is
-  now refused, and an account that already carries the flag is no longer
-  held to it.
-
-- **Remote agents verify the control plane's certificate by default
-  (#1220).** All five `docker-compose.agent-*.yml` files defaulted
-  `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
-  the docs ran agents that trusted any certificate, and anyone on the
-  network path could read the platform-wide agent key (then enrol rogue
-  agents and pull TSIG keys) or serve the agent its DNS / DHCP
-  configuration. Worse, the skip was checked before `TLS_CA_PATH` in the
-  DNS, DHCP and looking-glass agents, so mounting the control plane's CA
-  as `DOCKER.md` said verified nothing either, silently. Now the files
-  default to `0` and pass `TLS_CA_PATH` through from `.env` (with a
-  commented CA volume to uncomment); `TLS_CA_PATH` wins over the skip;
-  and an agent logs `control_plane_tls` on every start while
-  verification is off, or while a skip is being ignored. The DNS agent's
-  seven hand-copied verify decisions are now one `httpx_verify()`, with a
-  test that fails if a copy reappears. `DNS_AGENT.md` named a
-  `CA_BUNDLE_PATH` variable no code reads; it is `TLS_CA_PATH`. The
-  in-stack `docker-compose.yml` agents talk plain `http://api:8000`, so
-  the flag was a no-op there and is removed. The looking-glass agent got
-  its first tests and now runs in CI's agent matrix.
-  **Upgrade note:** a remote agent relying on the old default against a
-  private-CA or self-signed control plane stops connecting after the
-  upgrade. Mount that CA and set `TLS_CA_PATH` (`docs/deployment/DOCKER.md`,
-  distributed agent prerequisites), or set
-  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` explicitly in `.env` to keep the old
-  behaviour in a lab. Appliance role pods and the supervisor are not
-  changed here; they are #1219.
-
-- **A backup archive named `..` can no longer delete the folder above
-  the archives (#1243).** The shared `safe_filename()` was
-  `os.path.basename`, and `basename("..")` is `..`. On a WebDAV target
-  `urljoin` turned that into the parent collection's URL, so
-  `DELETE /backup/targets/{id}/archives/%2E%2E` sent a recursive WebDAV
-  `DELETE` one level above the archives. Superadmin-only, but it
-  deletes data. `safe_filename()` now refuses an empty name, `.`, `..`,
-  anything with a `/` or `\`, and control characters, instead of
-  stripping (stripping also turned `a/b.zip` into `b.zip`, an archive
-  the caller never named). The seven drivers that carried their own
-  inline `basename` (S3, SCP, Azure Blob, SMB, FTP, GCS, WebDAV) now
-  all call it. The WebDAV URL percent-encodes the name as well, so a
-  name that arrives as `%2E%2E` is sent as a literal and never becomes
-  a dot-segment on a server that decodes before normalising.
-  The download, delete and restore-from-archive routes answer **422**
-  for such a name without reaching the destination, and also for any
-  name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
-  are the only names the listing ever shows, so any other name was
-  never offered by this API; the shared name pattern also stops
-  matching a name with a separator in it, so an object-store key under
-  a nested prefix is no longer listed as an archive nothing can then
-  download or delete, and the seven drivers that carried their own copy
-  of it now use the shared one. Thirteen download routes that built
-  `Content-Disposition` by hand now use `content_disposition()`, and an
-  uploaded upgrade image's filename, the one download name an uploader
-  controls, is stored as its last path component with control
-  characters removed, instead of verbatim.
-
-- **A client can no longer choose the source IP the API records
-  and rate-limits (#1221).** Compose published the API on every
-  interface, and the API believed `X-Real-IP` from any caller. nginx
-  overwrites that header, but a client talking to `:8000` directly set
-  its own. That bypassed the per-IP login throttle and the ACME
-  `allowfrom` gate, and wrote any address it liked into audit rows,
-  reopening #626 by another path. Now uvicorn runs with
-  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
-  `X-Forwarded-Proto` only when the real TCP peer is in the new
-  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
-  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
-  longer read at all. Compose also publishes the API on `127.0.0.1`
-  only (`API_BIND`). Browsers and remote agents already go through
-  the frontend, and the looking-glass collector's host networking
-  uses localhost. **Upgrade note:** if you reach `:8000` from another
-  machine, set `API_BIND=0.0.0.0`, and preferably narrow
-  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
-  whose nodes have public addresses, add them to
-  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
-  browser, as the client.
-
-- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
-  `SECRET_KEY` signs every session token and, unless
-  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
-  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
-  both shipped a committed placeholder, and the boot check only warned (and
-  did not recognise the k8s one at all). On such an install any signed-in
-  user could mint a superadmin token, since user ids are visible in the
-  audit log, and a database dump decrypted every stored LDAP, integration
-  and AI provider secret. Now the api refuses to start on either
-  placeholder, on a key under 32 characters, or on one that reads like a
-  placeholder, and says how to generate a key and how to move an existing
-  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
-  instead; `docker-compose.dev.yml` sets it and nothing else should.
-  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
-  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
-  falling back to a different key. Helm and the appliance already generate
-  their own keys and are unaffected.
-  **Upgrade note:** an install that has been running on the placeholder
-  stops at boot. Follow "Rotating `SECRET_KEY`" in
-  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
-  with a one-off Job in `k8s/ops/`): set a new key, then run
-  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
-  starting the api. It re-encrypts every stored credential for the new key
-  (the same walk a cross-install restore uses), is idempotent, and records
-  an audit row; everyone signs in again. Deliberately not "generate a key
-  on first start": compose could only persist it in Postgres, next to the
-  credentials it protects, so a dump would decrypt them anyway. Because
-  anyone could have signed requests on a placeholder key, the doc also
-  says to review API tokens, users and the audit log afterwards.
-  Also: an access token that names no session (`jti`) is refused. Every
-  login has minted one since `2026.05.07-1`, so such a token can only be
-  forged, and it also escaped force-logout. The session a token names must
-  also belong to the token's user, or a forger could pair their own live
-  session with a superadmin's id. And force-logout now reaches
-  the nmap scan stream, which checked its own token without looking at
-  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
-  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
-  the placeholder.
-
-- **Appliance supervisors verify the control plane's TLS certificate
-  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
-  the supervisor unconditionally, calling it trust-on-first-use, and nothing
-  was pinned: every register, heartbeat and proxy poll ran with no
-  verification at all. The heartbeat response carries the platform-wide DNS
-  and DHCP agent keys and the slot image URL plus the sha256 that is its only
-  integrity check, so anyone on the path could read the keys and serve a node
-  a root filesystem of their choosing. Now the supervisor pins the
-  certificate the control plane presents at first contact and verifies every
-  connection against it in the TLS handshake (a self-signed control plane
-  works, and the hostname need not match an operator-typed IP). A rotated
-  certificate (re-minted on member join or VIP change, uploaded, or renewed
-  by ACME) is adopted only if the appliance CA, which every approved
-  supervisor already holds, vouches for it through a new unauthenticated
-  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
-  certificates, signed by the CA. That list names the TLS Secret's
-  certificate as well as the active one, so #1215's revert to the first-boot
-  certificate does not strand supervisors. Once approved, a supervisor also
-  checks that its first-contact pin is on the list, which catches an
-  interception present at pairing (unless it also replaced the CA). The
-  k8s, nettool, pcap and storage proxy loops go through the same pinned
-  trust; before, they verified against system CAs, so against a self-signed
-  control plane they could not connect at all. An `http://` URL is probed
-  once for the `https://` it redirects to, that certificate is pinned, and
-  every request goes straight to the `https://` target, so the pairing code
-  and session token no longer cross the wire in cleartext before the
-  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
-  the CA, so an appliance moved to a rebuilt control plane pins the new one
-  rather than refusing it forever. The DNS, DHCP and looking-glass role
-  pods were left skipping verification here; #1281 below closes that.
-  **Upgrade note:** an already-paired appliance takes its pin at its first
-  contact after the upgrade, then checks it against the CA's list; a
-  mismatch is logged as `supervisor.tls.pin_not_vouched`.
-  **Also fixed, because pinning depends on it:** after a control-plane
-  reboot, the frontend kept serving the first-boot certificate. A k3s start
-  puts it back into the TLS Secret (#1215), the frontend pod that starts
-  then loads it, and when the api wrote the active certificate back, the
-  frontend did not roll. The rollout annotation was a checksum of the
-  certificate's content, and restoring the same content left it unchanged.
-  Found on a two-appliance test: after one reboot the control plane served
-  a certificate its own signed list did not name, and the remote appliance
-  refused it on every heartbeat until the frontend was restarted by hand.
-  The annotation now also covers the Secret's `resourceVersion`, which
-  every real write moves, so the write-back rolls the frontend. Browsers
-  stop being shown the first-boot certificate after a reboot as well. The
-  revert itself remains #1215.
-
-- **Appliance role pods verify the control plane's TLS certificate
-  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
-  pods reach the control plane at its external URL, and the chart gave
-  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
-  the platform-wide agent key out and the DNS / DHCP configuration back,
-  so anyone on the path could read the key and serve a node its zones and
-  scopes. They now use the certificate their supervisor pinned (#1219): the
-  chart mounts the supervisor's `tls/` directory read-only (public material
-  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
-  trusts exactly the certificates in that file, with a pinned leaf as its
-  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
-  could not do this: it checks the hostname and needs a real CA, so a
-  CA-issued leaf or an IP URL fails there. The file is read on every
-  connection, so a certificate the supervisor re-pins reaches the agents
-  without a restart. Until the supervisor has pinned, every request fails
-  and the agent logs `control_plane_pin_unavailable`; it never falls back to
-  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
-  and is used only for an `https://` URL. The one exception is a supervisor
-  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
-  nothing, so its agents take the skip too (chart value
-  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
-  about it on every start.
-  An appliance promoted into the control plane no longer gives its agents
-  the external URL at all: they use the in-cluster api Service, as its
-  supervisor does. That closes the #409 known limitation and is also
-  required here, because a member's supervisor heartbeats in-cluster and
-  never re-pins, while a member joining re-mints the Web UI certificate.
-  The role apply key now includes the agents' URL, so a promotion re-applies
-  the role chart. Not covered: an `http://` control-plane URL, which the
-  role agents still use as typed (the supervisor upgrades its own traffic
-  to the `https://` target).
-
-- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
-  read files through a scan (#1223).** The scan endpoint is gated on
-  `manage_nmap_scans`, which the builtin Network Editor role holds, and
-  `extra_args` was checked only for shell metacharacters and for `/` in
-  `--script` values. So a delegated user could pass `-iL <file>`: nmap
-  reads it as a target list and prints every line it cannot resolve
-  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
-  back, which was verified in the api container as the api user. Also
-  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
-  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
-  target or `-iR` (past target validation and the #722 do-not-probe
-  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
-  intrusive script. Now every token must be an allowed option with a
-  value of the right shape: scan type, host discovery, port selection,
-  timing, service / OS detection, `--reason` / `--open`, and `--script`
-  with script **names** that nmap's own `script.db` puts in none of the
-  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
-  `fuzzer` categories. Category names, wildcards and expressions are
-  refused, because no category is clean: nmap's `safe` category holds 33
-  scripts that are also `external` or `intrusive` (`whois-ip` queries
-  third-party WHOIS servers, against non-negotiable #17), and `default`
-  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
-  in favour of the presets that already offer them. The copilot's scan
-  proposal goes through the same check, and so does a scan already queued
-  with old arguments, since the worker re-validates before it runs.
-
-- **A release publishes nothing until CI, Trivy and main have all said yes
-  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
-  pushed `:latest` alongside each version tag before the ISO, the
-  OpenAPI export or the GitHub release had finished. So #1218's BIND
-  image shipped with 7 HIGH CVEs that nothing on the release path looked
-  for; a release that failed part-way had already moved every compose
-  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
-  covers tags, anyone with write access could release any commit. Now a
-  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
-  to pass on the tagged commit. Each image is built once, pushed by
-  digest with no tag, and both architectures are pulled from that digest
-  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
-  ever scanned amd64); only when every image passes is that same digest
-  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
-  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
-  a final job after the GitHub release exists, all images or none: it
-  records where each `:latest` pointed, retries each move, and puts back
-  the ones already moved if one still fails. Release runs are no longer
-  serialised, because GitHub cancels a queued run when another queues
-  behind it and `meta` can now wait an hour; "is this the newest
-  release" is re-checked right before GitHub's latest release and
-  `:latest` are set instead. The workflow also stops assuming CalVer
-  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
-  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
-  `:latest`, and the previous release, the CHANGELOG section and whether
-  a tag becomes latest are decided in `scripts/release_version.py` on the
-  product's own version ordering, ranking only tags on `main` that have
-  a published release (`.github/scripts/release-tags.sh`), so a stray tag
-  cannot freeze `:latest`. The shell it replaces got all three wrong
-  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
-  one, and the CHANGELOG lookup was a prefix match that returns
-  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
-  one no longer takes over `:latest` or the stable download URLs, or
-  uploads the un-versioned copies behind them. Release candidates no
-  longer take slots in the asset pruner's keep window (eight candidates
-  would have pushed eight final releases' ISOs out early); a candidate
-  keeps its ISO until a final release supersedes it. The image list is
-  one file, `.github/images.json`, read by both workflows and the
-  image-upgrade linter. And `docs-publish.yml` no longer runs on release
-  tags: a tag on an older commit rolled the docs site back behind
-  `main`, and a tag off `main` published unreviewed docs.
-
-- **Pinned images brought current; the CloudNativePG operator and
-  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
-  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
-  operator image 1.30.0, which the appliance bakes for an air-gapped
-  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
-  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
-  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
-  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
-  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
-  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
-  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
-  release.
-
-- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
-  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
-  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
-  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
-  They are triggered by malformed DNS64 responses, a crafted
-  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
-  SVCB/HTTPS records. The `dns-powerdns` image carries the same
-  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
-  9.20.29-r0, which also forces a rebuild of any cached package layer
-  that still has the old version. Upgrade: pull the new DNS images.
-
-- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
-  reachable from outside: the web port proxies it and Docker Compose
-  publishes the API port. So anyone who could load the login page could
-  read per-route request counts. It now answers only
-  `Authorization: Bearer <token>`, where the token is the new scrape
-  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
-  the same revoked / expired / scope / disabled-owner checks as on any
-  other route. The Helm chart generates the scrape token into its app
-  Secret as `metrics-token` and keeps it across upgrades like
-  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
-  optional Secret key. The appliance console reads it from the chart's
-  Secret, so its API panel keeps working.
-  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
-  token gets 401 after this release. Give it the scrape token or an API
-  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
-  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
-
-- **The interactive API docs load through the web port again, and
-  the appliance's HTTPS web tier sends the #400 security headers
-  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
-  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
-  started from an inline `<script>`. The web tier's CSP (#400) allows
-  scripts from the page's own origin only. So on Docker Compose, and
-  on Helm without `frontend.tls.enabled`, the console's API docs
-  links opened blank pages, and an air-gapped install could not load
-  them on any port. The api now serves both bundles itself from
-  `backend/app/static/api-docs/`: byte-for-byte copies of
-  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
-  Swagger's initializer is a static file. Scripts stay `'self'`
-  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
-  search index) and load its footer logo from cdn.redoc.ly, which it
-  hides when offline. **The appliance's TLS config sent none of the
-  #400 headers.** #400 put them in the pre-k3s appliance nginx
-  config, which #194 had already orphaned, so
-  `frontend-tls-config.yaml` never had them. It now sends the same
-  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
-  and Referrer-Policy as the image's template, re-emitted on every
-  location with headers of its own. It also sends
-  `Strict-Transport-Security: max-age=31536000` without
-  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
-  bare IP and over a certificate warning, so it only takes hold on a
-  hostname with a trusted certificate.
-
-- **An API token used only for reads now records that it was used
-  (#1158).** `last_used_at` was set on the request's database session
-  and left for the handler to commit. Read handlers never commit, so a
-  monitoring, inventory or export token showed "Last Used: —" forever,
-  while its first write set it. Operators hunting for stale tokens
-  could revoke live ones. The use is now written in a short-lived
-  transaction of its own, at most once a minute per token, the cadence
-  the session path keeps for `last_seen_at`. A handler that rolls back
-  cannot undo it, and a failed write never fails the request.
-
-- **Every shipped image now patches its base image's own packages
-  (#1088).** The nightly of 2026-09-14 refused to publish the api
-  image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
-  `perl-base` / `perl-modules-5.40` / `libperl5.40`, 2 in
-  `libpcre2-8-0`, 2 in `libsqlite3-0`, 1 in `gzip`, 1 in
-  `libssh2-1t64` — every one of which had a fix sitting on
-  deb.debian.org the whole time. `backend/Dockerfile` installed a
-  package list and upgraded nothing, so those packages could only
-  ever be fixed by upstream rebuilding `python:3.12-slim`, which is
-  not a schedule we control. It now runs `apt-get upgrade` before
-  the installs, the way every Alpine image in the repo has run
-  `apk upgrade`. The same omission applied to the Technitium
-  image, whose Ubuntu base is pinned by digest — so nothing in that
-  file could ever have patched it either — and is fixed alongside.
-  **This changes published release images, not just the nightly:**
-  `release.yml` builds without a layer cache, so its api image was
-  freshly built and still shipped every one of those base-image
-  CVEs.
-- **The nightly's cache no longer freezes the api image's package
-  layer (#1088).** BuildKit keys a layer on its RUN text, so the
-  `type=gha` cache served `backend/Dockerfile`'s whole `apt-get`
-  layer — package set included — from whenever it was first built.
-  That is why the same run reported `perl` at `5.40.1-6` when the
-  index had offered `5.40.1-6+deb13u1` for days: the layer had not
-  executed in weeks. The Alpine images solve this with an
-  `ARG APK_SNAPSHOT` the nightly passes its date tag to; the two
-  Debian-family images declared no such ARG, so they **silently
-  ignored the build arg the workflow was already passing them**.
-  Both now declare `ARG APT_SNAPSHOT` and the nightly passes it.
-  An upgrade line that never runs is indistinguishable, in the
-  built image, from no upgrade line at all — which is why the two
-  halves above are one fix and not two.
-
-### Changed
-
-- **`trivy-gate.sh` can ask an apt index the question it could
-  already ask an apk one (#1088).** The gate sorts each finding into
-  "the index offers the fix today, so a rebuild would cure it" (FAIL)
-  versus "the distro's security database names a fix the mirrors do
-  not carry yet" (DEFER, reported and non-blocking). It only knew
-  `apk`, so every Debian finding took the catch-all
-  `cannot query a debian package index; treating as installable`
-  branch — correct as a refusal, but it told the operator nothing
-  about what to do, and once the images above are fixed it would
-  hard-fail the nightly on the first Debian CVE announced ahead of
-  its mirror, which is the exact Alpine failure the script was
-  written to prevent. Debian/Ubuntu images are now probed with
-  `apt-cache policy` and compared with `dpkg --compare-versions`.
-  **Silence means the opposite thing to the two probes**, which is
-  the one part that had to be got right: `apk upgrade --simulate`
-  lists only what it *would* upgrade, so a package missing from its
-  output means "nothing newer exists" (DEFER), while
-  `apt-cache policy` answers for every package it is asked about,
-  so a package
-  missing from *its* output means the index could not resolve the
-  name at all (FAIL). Reading the second like the first would turn
-  the fail-closed branch into a fail-open one.
-  **The probe also has to prove the index was LOADED**, not merely
-  that `apt-get update` returned: it exits 0 with every mirror
-  unreachable (verified, `--network none`), and `apt-cache policy`
-  then answers from the local dpkg status file — Candidate ==
-  installed, which is non-empty, plausible, and reads as "not
-  published yet" for every finding at once. An offline runner would
-  publish an image on CRITICALs whose fixes were on the mirrors the
-  whole time. It now sets `APT::Update::Error-Mode=any` and asserts
-  a real package file is listed.
-  **The verdict comes from the candidate, the reason from both
-  probes.** apt holds a package back when upgrading it would pull
-  in a new dependency, so `apt-get upgrade` — the line the
-  Dockerfiles run — can install less than the index offers.
-  Deciding on the candidate alone makes that a FAIL whose stated
-  remedy (rebuild the package layer) provably does nothing;
-  deciding on the simulate alone makes it a DEFER that never
-  clears. It fails, and says the fix needs an explicit install or
-  a dist-upgrade.
-- **A linter refuses a shipped image that can never be patched
-  (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
-  Backend Lint job, asserts that every image in the nightly's own
-  matrix both upgrades its packages and declares a cache-busting
-  snapshot ARG that it actually interpolates. It reads the matrix
-  rather than a second copy of the image list, so a new image is
-  covered the moment it is added there. Three things it has to get
-  right, each a live false-pass in the first cut: it checks only
-  the stage that SHIPS (builder stages are discarded, so an
-  `apk upgrade` in one proves nothing — and that is the shape most
-  of these Dockerfiles have), following the target's ancestry
-  because a stage built `FROM` another does inherit its layers; it
-  strips `#` comments in both positions, whole-line and trailing,
-  since these files explain at length *why* `apk upgrade` matters
-  and a raw-text match passes a file that only talks about it; and
-  it raises rather than reporting success if the matrix heredoc is
-  ever restructured, because a guard that evaluates nothing looks
-  exactly like one that passed (#1030).
-
-### Added
 
 - **Removable (USB) backup disks on the appliance (#989 item 3).**
   The last piece of #989, closing it. Items 1, 2 and 4 (write-only +
@@ -2775,22 +633,6 @@ the formatter handles the rest.
   directly, so deleting the wiring inside `compare()` left them green;
   they go through `compare()` now.
 
-### Changed
-
-- **Docs site is documentation only (#1070).** `www.spatiumddi.com`
-  no longer opens on a product landing page — the hero, "Why
-  SpatiumDDI" feature grid, screenshot gallery and install pitch are
-  gone, and `index.html` is now the documentation index itself. The
-  company / product site is a separate project and will be linked
-  from the nav once it exists. The index also gains the pages it
-  had been missing (Troubleshooting, Migration, Performance testing,
-  SHIPPED, the Fleet Firewall design note), `sitemap.xml` lists every
-  page rather than a third of them, and `docs.html` redirects to the
-  index so existing links keep working. No change to how or where the
-  site is published.
-
-### Added
-
 - **`core.dns` / `core.dhcp` — turn a whole subsystem off (#1068).** An
   operator running SpatiumDDI for DNS only, DHCP only or IPAM only had no
   way to put the unused subsystem away: DNS and DHCP were two of four
@@ -2854,7 +696,6 @@ the formatter handles the rest.
   `feature_module` row means "an operator changed this" and the shipped
   default lives in the catalog, so the defaults are declared in
   `backend/tests/test_feature_module_defaults.py` instead.
-
 
 - **E911 dispatchable location — SpatiumDDI answers "which room is
   this phone in, right now?" (#972, Phase 1a).** Behind the default-on
@@ -3522,7 +1363,403 @@ the formatter handles the rest.
   past. The check that sees both settings at once landed in
   #1013, below.
 
+- **The appliance builds for arm64 — ISO and upgrade image, in
+  the release and the nightly (#1026, parts 2 + 3).** Apple
+  Silicon VMs, Graviton / Ampere instances and Raspberry Pi
+  5-class boards. `mkosi.conf` no longer pins `Architecture`;
+  the kernel, GRUB packages and `BiosBootloader` moved to
+  `mkosi.conf.d/` drop-ins matched on architecture, and the
+  Makefile always passes `--architecture` explicitly so an
+  Apple Silicon dev box does not silently start building arm64
+  by default. `release.yml` and `nightly.yml` matrix over
+  `[amd64, arm64]` with `fail-fast: false` — a break in one leg
+  must not withhold the other's ISO from a release — and the
+  arm64 leg runs on `ubuntu-24.04-arm`, a NATIVE runner,
+  because mkosi's builder cannot be emulated: under qemu-user
+  it dies on `mount_setattr(2)` (#991).
+  **arm64 is UEFI-only, and that is the platform rather than a
+  simplification.** There is no i386-pc GRUB target for AArch64
+  and no BIOS to chain-load from, so the installer lays down no
+  BIOS-boot partition, installs only `--target=arm64-efi`, and
+  **refuses before touching the disk** on a machine that did
+  not boot via EFI — a successful install that can never boot
+  is worse than an honest refusal. The partition NUMBERING is
+  identical on both architectures: p1 is simply absent on
+  arm64 rather than the rest shifting down, so `partition_node`,
+  `_MD_NAMES`, the #999 mirror path and the verification pass
+  all work unchanged. Root partitions are typed `8305` (Linux
+  root ARM-64) instead of `8304`, which `build-slot-image.sh`
+  and `wrap-iso.sh` now look up per architecture; the ISO is
+  built with `grub-mkrescue -d` forced to a single platform, so
+  an arm64 ISO cannot silently carry x86 boot paths just
+  because the builder image has the modules for both.
+  **The versioned ISO name gains its architecture.** It never
+  had one while the stable name always did — invisible with a
+  single build leg, a filename COLLISION with two, where
+  whichever leg uploaded second would win silently. The pruner
+  now treats the two architectures as a pair: its `*)`
+  fallthrough leaves unrecognised assets alone, which is right
+  for a genuinely new artifact and exactly wrong for an
+  architecture somebody added to the build matrix — ~3 GB per
+  release that nothing ever reclaims. A test pins the pruner's
+  architecture list against both workflow matrices.
+  Verified end to end on real hardware: the ISO boots in UTM on
+  an M4 (Apple Virtualization, UEFI), the installer runs, and
+  the installed system comes up with `root-arm64` partition
+  types, `BOOTAA64.EFI` on the ESP, no BIOS-boot partition, an
+  `ELF ARM aarch64` k3s binary, a Ready node on kernel
+  `6.12.107+deb13-arm64`, and A/B slot detection working
+  unchanged.
+
+- **Privacy statement (#977).** `docs/PRIVACY.md` states what
+  SpatiumDDI has always done and never said: no telemetry, no
+  analytics, no phone-home. It lists every outbound connection the
+  backend can make, its default and what it sends, and says up front
+  that exactly one is on out of the box: the daily anonymous GitHub
+  release check, whose Settings toggle now says so.
+  `test_outbound_hosts_documented.py` fails CI when a hostname in
+  `backend/app` is missing from the page, and pins the default-on
+  list to that one row. Linked from the README and the docs nav.
+
+- **A password reveal on the forced Change Password screen (#1074).**
+  Each of the three fields gets its own show / hide toggle, via a new
+  shared `PasswordInput`. It starts hidden on every visit and is never
+  remembered.
+
+- **Node pressure on the Cluster screen and an alert for it (#983
+  Phase 2).** Kubernetes 1.36's kubelet reports PSI stall percentages,
+  so the node cards and `find_cluster_metrics` now show CPU, memory
+  and I/O pressure, and a default-on `node_pressure` alert rule fires
+  on sustained stall — the signal #980's packet loss needed, since
+  utilisation cannot tell a busy node from a starved one. No data
+  reads as unrecorded, never as zero. The cluster screen reads kubelet
+  stats directly per node where it can (a `kubelet:` chip says which),
+  falling back to the apiserver proxy; the worker gets its own narrow
+  ServiceAccount so the rule can evaluate. Also opt-in user namespaces
+  (refused when the appliance host mounts are on) and soft topology
+  spread for multi-replica workloads.
+
 ### Changed
+
+- **The update check and the upgrade preflight understand SemVer
+  (#1182).** Both compared versions as strings, which the switch to
+  SemVer at 1.0.0 breaks: `"1.0.0" > "2026.09.04-1"` is false, so no
+  install would have been offered 1.0.0, and the preflight's CalVer
+  parser failed it outright, disabling Plan. Both now use the shared
+  version helper from #1183. Every SemVer release is newer than every
+  CalVer one, SemVer compares numerically with pre-release precedence,
+  and a dev build, `latest` or a `0.x` placeholder is unknown rather
+  than a version. The preflight's skip-release warning now counts
+  calendar days, and it does not apply to a jump involving a SemVer
+  version, which has no date. Two existing bugs are gone with the
+  string compare: a same-day release numbered `-10` or higher was not
+  offered over `-2` to `-9`, and an install running `latest`, the
+  `.env.example` default, was never offered an update at all. This is
+  the comparison half of #1182, which the last CalVer release has to
+  carry. The release workflow and docs changes follow separately.
+
+- **The rest of the switch to SemVer at 1.0.0 (#1182).** The last
+  CalVer release, the bridge, now carries everything that has to run
+  in the version being upgraded *from*:
+  - The DNS, DHCP and looking-glass agents report the release their
+    image was built from. Each reported a date string frozen in its
+    package since it was written (`2026.04.14.1` for the DNS agent),
+    whatever release it shipped in; an unstamped build reports `dev`.
+    The supervisor got the same fix in #1183.
+  - A per-box OS upgrade from Fleet records which way it moves the
+    node (`forward`, `same`, `backward` or `unknown`) in its audit row
+    and log, and the Fleet form warns before a rollback. It still
+    refuses nothing: it is also the manual rollback path. The rolling
+    upgrade already refuses a backward target.
+  - The Helm chart version moved from a `sed` in the release workflow
+    to `scripts/release_version.py chart-version`, tested: a CalVer
+    tag drops its leading zeros, a SemVer tag is published unchanged.
+  - The installer's clock check reads the ISO's `BUILD_TIME` instead of
+    parsing a date out of the version, which stops being a date at
+    1.0.0. Local builds now stamp `BUILD_TIME` too.
+  - The docs describe both schemes, and that an install must reach the
+    bridge before it can be offered 1.0.0.
+
+- **SQLAlchemy is capped below 2.1 (#1186).** 2.1.0 reached PyPI on
+  2026-09-24 and the backend's requirement had no upper bound, so CI
+  picked it up at once. The test suite passes on it, but its new
+  type annotations fail mypy in 23 files, which blocked every open
+  PR. Adopting 2.1 deliberately, typing work included, is #1187.
+
+- **DNS per-minute metrics now accumulate per bucket, like DHCP
+  (#1077).** `POST /dns/agents/metrics` replaced an existing
+  `(server, bucket_at)` row instead of adding to it — the same jitter
+  collision #980 fixed on the DHCP side: the agent floors `bucket_at`
+  to the minute on a 60 s ± 3 s interval, so about one bucket in forty
+  received two genuinely different deltas and the overwrite discarded
+  one. It accumulates now; that is only safe because a replayed batch
+  is deduplicated by its `batch_id` (above).
+
+- **The Kerberos WinRM transport is no longer offered (#1128).** The
+  Windows DNS and DHCP server forms listed it, but it needs the
+  `gssapi` library and the system Kerberos libraries — neither in
+  the images, and `gssapi` has no Linux wheel — plus realm / KDC
+  configuration the control plane has nowhere to take from, so it
+  failed on every call. It is gone from both forms, the API refuses
+  it at save (422, saying why), and a server saved with it before
+  fails with that explanation instead of a library error; edit it
+  and pick NTLM or CredSSP. NTLM, CredSSP and Basic are unchanged.
+  Real Kerberos support stays on the roadmap as #1128.
+
+- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
+  ships it. The pinned copies move together — `versions.json` plus
+  the Makefile's `alpine/helm` image and the `version:` input in
+  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
+  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
+  joins them as a sixth: its CI-gate table said "Helm 3.21", already
+  stale before this change and wrong at the *major* after it, which
+  would send anyone reproducing CI locally to the wrong binary. It is
+  now spelled as the exact version and enforced by `lint_versions.py`,
+  so it cannot drift again. (That row was stale two further ways, both
+  corrected: "both charts" predates metallb landing as a third, and
+  "six value sets" describes a matrix that is now 14.)
+  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
+  packages the chart with THIS binary; on the node, k3s's
+  helm-controller spawns `klipper-helm` to install it — and the
+  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
+  directly: `helm version --short` in that image). So the appliance
+  has been installing with 4 while CI validated with 3. The CLI
+  major now matches what production actually runs.
+  **The charts render identically.** Both majors were run against the
+  same tree and the 323 rendered objects compared after parsing, not
+  as text. 18 objects differed — but 17 of those also differ between
+  two runs of the *same* 3.22.0 binary, because the charts generate
+  random credentials, so the control run is what identifies them as
+  noise. Exactly one CONTENT difference is attributable to Helm 4: a
+  single trailing blank line inside the `frr.conf` string of the
+  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
+  which is inert. The rest of the textual diff is comment placement
+  and blank lines in the output stream, outside any object.
+  **Helm 4 also reorders objects**, which a set-and-content comparison
+  cannot see, so order was checked separately: 12 of the 14 renders
+  emit identical order, and the two metallb ones do not —
+  `IPAddressPool` and `L2Advertisement` move from *before* the two
+  `ValidatingWebhookConfiguration`s to *after* them. That is not
+  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
+  under the new order the CRs are admitted through a webhook that can
+  reject them, where previously they were created before it existed.
+  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
+  about, and it is not theoretical: a **fresh install of that chart
+  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
+  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
+  created; 4.3.0 exits 1, reporting that server-side apply failed
+  calling the metallb `ipaddresspoolvalidationwebhook` because the
+  service had `no endpoints available`. The webhook is now registered
+  before the CRs are applied, and its backing controller pod — created
+  moments earlier in the same pass — is not ready yet. **A retry
+  succeeds**: `helm upgrade --install` against the half-applied
+  release exits 0 and creates both CRs once the controller is up.
+  This is nonetheless not a change this PR makes, for a specific
+  reason rather than a general one: **the metallb chart is never
+  installed by this CLI.** `bake-chart.sh` packages it and
+  helm-controller installs it on the node via klipper-helm — already
+  4.1.4 — so the appliance has been on the new order since before this
+  branch. Nothing in CI installs it either; `charts-render-check.sh`
+  only templates it.
+  **A default appliance never reaches the failure at all**, which an
+  arm64 ISO built from this branch and booted confirms rather than
+  assumes: `metallb.enabled` is `false` by default and firstboot
+  renders the HelmChart that way, so the chart produces no
+  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
+  and `helm-install-spatium-metallb` completes first time — the release
+  secret is at `v1`, so there was no retry. The ordering bites only
+  where an operator sets a control-plane VIP (#272 multi-node HA),
+  which is what flips metallb on — **and that case is broken today,
+  which setting a VIP on the booted appliance confirmed.** It does not
+  fail once and converge, as this entry previously guessed: it never
+  converges. klipper-helm resolves `SERVER_SIDE=auto` to
+  `--server-side=true`, and every attempt runs `helm uninstall` before
+  `helm install` — so each retry deletes the controller backing the
+  webhook, then reinstalls and applies the CRs while the replacement
+  pod is still starting. Each attempt destroys its own prerequisite.
+  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
+  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
+  so the VIP never materialises.
+  **None of that is this pin's doing** and none of it changes with it:
+  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
+  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
+  so the appliance has behaved this way since that k3s landed, whichever
+  helm packages the chart. It needs its own issue against the appliance.
+  Also exercised under 4.3.0: `helm lint` + `dependency update` +
+  `package` for all three charts (the `bake-chart.sh` and
+  `release.yml` path), and an OCI `helm push` + `helm pull`
+  round-trip against a throwaway registry, digests matching.
+  **No breaking-change exposure**, re-audited against the tree rather
+  than the changelog: no post-renderers, no plugins, no `--atomic`,
+  no helm `--force`, `registry login` is already domain-only
+  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
+  runs unchanged. The flags we do pass — `--set`, `--timeout`,
+  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
+  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
+  in the tree are prose, or commands we print for operators to run
+  with their own helm; those were checked too and use no renamed flag.
+  The one behavioural change is server-side apply, which Helm 4
+  defaults to on **new** installs. The appliance is unaffected — it
+  is already on 4.1.4 — so the only newly-affected path is the single
+  kind `helm install` in `agent-e2e.yml`, and that workflow is
+  path-filtered on itself, so this change exercises it.
+
+- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
+  project is now `spatiumnorth/spatiumddi`: the org changed, the
+  repository name did not, and neither did the product, the PyPI
+  package, the image names or any filesystem path — `/etc/spatiumddi/`,
+  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
+  `github.com/` and `ghcr.io/` reference in the tree moved to the new
+  org, along with the shields.io badge paths in the README, which carry
+  the org separately from the link they sit behind and so would have
+  gone on reporting a repo that no longer answers.
+  **Container images move with the org**: pulls are now
+  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
+  `image.repository` default moved with them. CI needed no such change
+  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
+  follows a rename on its own.
+  **Two things do not follow a rename, and both fail silently.** Eight
+  workflows gate on `if: github.repository_owner == '…'` so a fork
+  never publishes; left at the old literal, release, nightly, the
+  weekly Trivy scan, asset pruning and the docs publisher would all
+  have skipped with a green check rather than an error. And the docs
+  site's org-root Pages repo has to be renamed to
+  `spatiumnorth.github.io` — GitHub serves an organization site only
+  from a repo named `<org>.github.io`, so the old name is demoted to an
+  ordinary project site and the root site stops existing;
+  `docs-publish.yml` now targets the new name.
+  **Operator action on upgrade:** `GITHUB_REPO` shipped in
+  `.env.example`, so an install that copied it carries
+  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
+  default and pins the daily release check and the appliance
+  slot-image catalogue to the old path. Update the value, or remove
+  the line to take the default.
+  **Pinned releases pull from the old path (#1163).** Every release
+  up to and including `2026.09.04-1` names its images under
+  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
+  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
+  taken from such a tag, or from a checkout older than this change,
+  fails at `docker compose pull` — `git pull` for the current file,
+  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
+  copy. Every published chart version up to and including
+  `2026.9.4-1` defaults to the old path too: install or upgrade those
+  with `--set image.repository=spatiumnorth` plus
+  `dnsAgents.image.repository`,
+  `dnsAgents.flavors.powerdns.repository`,
+  `dnsAgents.flavors.technitium.repository` and
+  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
+  names (the chart README lists them).
+- **The release check reported a permanently up-to-date install when
+  its repo had moved.** GitHub answers `301` for a renamed repo, which
+  an org rename makes routine — and httpx does not follow redirects by
+  default while `raise_for_status()` does not reject a `3xx`. So the
+  redirect body was parsed as a release: no `tag_name`, so the task
+  stored no version, set `update_available=False`, cleared
+  `latest_check_error` and logged `update_check_ok`. The one default-on
+  connection in the product would have gone on reporting a healthy
+  “you are up to date” forever, which on a notifier whose job is
+  surfacing security fixes is worse than a loud failure. Both GitHub
+  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
+  now follow redirects, which removes the false negative and keeps a
+  stale `GITHUB_REPO` working rather than silently wrong.
+- **The appliance image pruner stopped reclaiming pre-rename images.**
+  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
+  owns them; narrowed to the new org alone, every accumulated
+  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
+  exactly what the timer exists to reclaim — would have been classified
+  as third-party infra and kept forever, while still reporting nothing
+  stale to prune. It now matches both orgs; the in-use and
+  slot-version guards are unchanged, so nothing live can be removed.
+
+- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
+  ships it. Five copies, none Dependabot-visible, all moved
+  together — `versions.json` plus the Makefile's `alpine/helm`
+  image and the `version:` input in `ci.yml`, `release.yml`,
+  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
+  and template clean under it.
+  **This is the terminal Helm 3 feature release** — published
+  2026-09-10, matching the project's stated final 3.x feature
+  release of 2026-09-09. After it, 3.x receives security fixes
+  only, until 2027-02-10. So this is a floor, not a resting place;
+  the move to 4.x is #1098.
+  The manifest's note claiming we stay on 3.x because the appliance
+  is "independent of this binary" is **wrong**, and is corrected
+  here rather than repeated: the appliance renders through k3s's
+  helm-controller, which spawns `klipper-helm` — and the pinned
+  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
+  with 3 and install with 4, so a 4.x move closes that gap instead
+  of opening one. See #1098.
+
+- **`trivy-gate.sh` can ask an apt index the question it could
+  already ask an apk one (#1088).** The gate sorts each finding into
+  "the index offers the fix today, so a rebuild would cure it" (FAIL)
+  versus "the distro's security database names a fix the mirrors do
+  not carry yet" (DEFER, reported and non-blocking). It only knew
+  `apk`, so every Debian finding took the catch-all
+  `cannot query a debian package index; treating as installable`
+  branch — correct as a refusal, but it told the operator nothing
+  about what to do, and once the images above are fixed it would
+  hard-fail the nightly on the first Debian CVE announced ahead of
+  its mirror, which is the exact Alpine failure the script was
+  written to prevent. Debian/Ubuntu images are now probed with
+  `apt-cache policy` and compared with `dpkg --compare-versions`.
+  **Silence means the opposite thing to the two probes**, which is
+  the one part that had to be got right: `apk upgrade --simulate`
+  lists only what it *would* upgrade, so a package missing from its
+  output means "nothing newer exists" (DEFER), while
+  `apt-cache policy` answers for every package it is asked about,
+  so a package
+  missing from *its* output means the index could not resolve the
+  name at all (FAIL). Reading the second like the first would turn
+  the fail-closed branch into a fail-open one.
+  **The probe also has to prove the index was LOADED**, not merely
+  that `apt-get update` returned: it exits 0 with every mirror
+  unreachable (verified, `--network none`), and `apt-cache policy`
+  then answers from the local dpkg status file — Candidate ==
+  installed, which is non-empty, plausible, and reads as "not
+  published yet" for every finding at once. An offline runner would
+  publish an image on CRITICALs whose fixes were on the mirrors the
+  whole time. It now sets `APT::Update::Error-Mode=any` and asserts
+  a real package file is listed.
+  **The verdict comes from the candidate, the reason from both
+  probes.** apt holds a package back when upgrading it would pull
+  in a new dependency, so `apt-get upgrade` — the line the
+  Dockerfiles run — can install less than the index offers.
+  Deciding on the candidate alone makes that a FAIL whose stated
+  remedy (rebuild the package layer) provably does nothing;
+  deciding on the simulate alone makes it a DEFER that never
+  clears. It fails, and says the fix needs an explicit install or
+  a dist-upgrade.
+- **A linter refuses a shipped image that can never be patched
+  (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
+  Backend Lint job, asserts that every image in the nightly's own
+  matrix both upgrades its packages and declares a cache-busting
+  snapshot ARG that it actually interpolates. It reads the matrix
+  rather than a second copy of the image list, so a new image is
+  covered the moment it is added there. Three things it has to get
+  right, each a live false-pass in the first cut: it checks only
+  the stage that SHIPS (builder stages are discarded, so an
+  `apk upgrade` in one proves nothing — and that is the shape most
+  of these Dockerfiles have), following the target's ancestry
+  because a stage built `FROM` another does inherit its layers; it
+  strips `#` comments in both positions, whole-line and trailing,
+  since these files explain at length *why* `apk upgrade` matters
+  and a raw-text match passes a file that only talks about it; and
+  it raises rather than reporting success if the matrix heredoc is
+  ever restructured, because a guard that evaluates nothing looks
+  exactly like one that passed (#1030).
+
+- **Docs site is documentation only (#1070).** `www.spatiumddi.com`
+  no longer opens on a product landing page — the hero, "Why
+  SpatiumDDI" feature grid, screenshot gallery and install pitch are
+  gone, and `index.html` is now the documentation index itself. The
+  company / product site is a separate project and will be linked
+  from the nav once it exists. The index also gains the pages it
+  had been missing (Troubleshooting, Migration, Performance testing,
+  SHIPPED, the Fleet Firewall design note), `sitemap.xml` lists every
+  page rather than a third of them, and `docs.html` redirects to the
+  index so existing links keep working. No change to how or where the
+  site is published.
 
 - **Fewer features are switched on out of the box (#1069).** A fresh
   install enabled **37 of 53** feature modules, because the policy was
@@ -3786,7 +2023,6 @@ the formatter handles the rest.
   issue table had missed. It is in the manifest now, along with
   the prose in four docs pages that named a version as fact.
 
-
 - **The agent images move to Alpine 3.24 / Python 3.14.7, and the
   arg that was supposed to control that becomes real (#1037).**
   The base had been pinned to 3.23 for a year behind a
@@ -3851,7 +2087,6 @@ the formatter handles the rest.
   The `:23` is kept deliberately and must not be rounded to `:00` —
   the top-of-hour cron stampede delays runner scheduling, and these
   runs already start up to 13 h late.
-
 
 - **A slot upgrade could regenerate SECRET_KEY and orphan everything
   encrypted at rest (#1042).** `app/core/crypto.py` derives the
@@ -3921,286 +2156,1658 @@ the formatter handles the rest.
   reports that correct file as a violation, which is how an
   exemption list fills up with noise and stops being read.
 
+- **k3s v1.35.6 → v1.36.4 (Kubernetes 1.36), CloudNativePG 1.29.1 →
+  1.30.0 (#987).** CNPG 1.29.x does not support Kubernetes 1.36 and
+  reached end of life on 2026-09-29. Chart lint now validates against
+  Kubernetes 1.36.0 instead of 1.31.
 
-### Security
+- **The charts adopt Kubernetes 1.36's pod posture (#988).** Three
+  PriorityClasses on the appliance (`spatium-service` above
+  `spatium-control-plane` above `spatium-observability`) so the kubelet
+  evicts the right pod under memory pressure; `seccompProfile:
+  RuntimeDefault` on every pod, which Compose had always applied and
+  Kubernetes had not; Pod Security labels on the namespace; and
+  `kubeVersion` floors raised to versions that are actually run. The
+  umbrella chart's PriorityClass values are empty by default and must
+  stay so unless the classes exist, or the apiserver refuses the pod.
 
-- **The two source restrictions composed into a console-only
-  lockout, and neither guard could see the other (#1013).** The
-  appliance has two independent ways in and a source allowlist for
-  each — the Web UI (#285 Phase 6) and SSH (#1009). Each shipped
-  with an anti-lockout guard that checked only whether the
-  caller's address was inside *its own* list, so an operator could
-  pass both, one at a time, and end up reachable through neither.
-  That is not an exotic sequence: "lock this box down" means
-  scoping the Web UI to the management network and then scoping
-  SSH to the same one, and if that CIDR is stale both guards fire,
-  both offer an override, and each override is individually
-  reasonable. Nothing at any point said the other door was also
-  closing.
-  Before #1009 it could not happen — the port-22 floor was
-  un-removable, so SSH was the guaranteed recovery path the Web UI
-  guard leaned on. Making that floor retireable is what the SSH
-  allowlist needed in order to mean anything, and it removed the
-  guarantee.
+- **The api's probes are sized for a busy single worker, and the
+  request-metrics label set is bounded (#1051, #1055).** One uvicorn
+  worker answers the probes on the same event loop that serves every
+  request, so under load the 5 s budgets killed a healthy api and
+  pulled the only pod out of its Service. Budgets now come from
+  `api.probes` (liveness 30 s × 4, readiness 15 s × 3). `/metrics` is
+  rendered off the event loop, and its per-route labels no longer grow
+  without bound.
 
-  Both write paths now resolve one shared question through
-  `backend/app/services/appliance/access.py`: **after this change,
-  does any remote door still admit the address I am talking to?**
-  When the answer is no they raise the *same* 422 — one state of
-  the appliance, so one sentence about it — requiring
-  `acknowledge_console_only=true`. Deliberately **not** satisfied
-  by the per-door `override_lockout` / `ssh_lockdown_force`: those
-  accept losing one door while another remains, which is a
-  materially smaller thing, and an operator may have ticked one
-  for an unrelated reason. The implication runs one way only —
-  accepting console-only already contains "this door closes on
-  me", so it is not asked for twice, which would be the
-  reflex-training pattern both guards' own comments warn about.
-  Both screens also read a new `GET /appliance/remote-access` and
-  show the *other* door's state at the point of decision; it sits
-  on the always-mounted `/appliance` hub rather than under
-  `/appliance/firewall`, because the SSH screen must be able to
-  ask with that module off.
-
-  **The per-door refusals say more on the way**, because reaching
-  one now *proves* the other door did not exclude the caller's
-  address: had it, the escalation would have raised first. So each
-  names the other list and its scope instead of hedging about it.
-  Only as far as the fact goes, though — every verdict here is
-  about ONE address, the source of the HTTP request, and that is
-  the right address for the Web UI door (the operator is using it,
-  over that door, right now) but only a proxy for the SSH one,
-  since browsing from one network and SSHing from another is
-  legitimate. So the copy is asymmetric on purpose: "you can still
-  reach this UI" is asserted, "you can still SSH" is not — the SSH
-  list is reported as *including the address you are connecting
-  from*, which is what is actually known.
-
-  **An address we cannot read is not covered — everywhere.** The
-  two guards had been scoring that case in opposite directions:
-  the Web UI one counted it as excluded and warned, the SSH one as
-  covered and proceeded. Both had a written rationale and the pair
-  was not defensible. The conservative reading wins because the
-  costs are asymmetric — an unneeded warning costs a checkbox, a
-  missing one costs a trip to the console — and because #1009's
-  argument for the other direction ("a gate that blocks on *I
-  could not tell* gets forced past by reflex") was a claim about
-  frequency, and the frequency is near zero: the trusted
-  client-IP helper falls back to the ASGI peer address, which
-  every real HTTP request has.
-
-  **Found on the way:** the Web UI guard was reading `client_ip`,
-  which `core/request_meta` documents as spoofable and explicitly
-  unsuitable for a source-IP allowlist gate. It is also simply the
-  wrong address on a real topology — behind a reverse proxy,
-  uvicorn's `--forwarded-allow-ips *` resolves the browser's own
-  IP out of `X-Forwarded-For` while nftables judges the packet
-  source, which is the proxy — so the guard would clear an
-  operator who was about to be locked out, with no attacker
-  involved. It now reads the same trusted value the SSH guard
-  does.
-
-  **And the console is not universal.** `spatium-console` runs on
-  `tty1` and `ttyS0`; a remote VM with no virtual serial port and
-  no hypervisor console has no floor at all, so an acknowledged
-  console-only lockout there is a rebuild. The escalation says
-  that in as many words rather than describing the console as a
-  recovery path, and `docs/deployment/APPLIANCE.md` now states it.
-
-  Both 422s are routed in the UI by the **acknowledgement field**
-  each one names, not by its prose: a field name is the API
-  contract and the sentence around it is not, and a test pins that
-  the three markers stay mutually exclusive. `WebUIAccessCard` was
-  lifted out of `FirewallTab.tsx` into its own component so it can
-  be rendered in a test — the failure mode on both sides is a
-  modal or a checkbox that never appears, which neither review nor
-  `tsc` can see. 1 MCP tool (`find_remote_access_doors`,
-  read-only, default on): the composition was the one thing
-  neither existing tool could show, since `find_web_ui_access` is
-  tagged `module="appliance.firewall"` and `find_ssh_settings` is
-  not — so with that module off the copilot could see one door and
-  not the other. No migration, no new column.
-
-- **The SSH source-CIDR allowlist was discarded and the port
-  opened to the world (#1001).** `spatiumddi-ssh-reload` renders
-  the nftables drop-in that scopes the SSH port to the operator's
-  configured networks — sshd has no native source filter, so that
-  fragment *is* the enforcement. It piped the CIDR list into a
-  `python3 -` whose program came from a heredoc, and `python3 -`
-  means *read the program from stdin*: the heredoc, being the
-  later redirection, won and the JSON was discarded. The
-  `except Exception: cidrs = []` then took the documented
-  empty-list branch, which opens the port unconditionally.
-  Nothing reported a problem — the rendered rule is valid
-  nftables, so the pre-reload `nft -c` dry-run passes, the reload
-  succeeds, the applied sidecar reports success, and the Fleet UI
-  shows the CIDR list exactly as typed. The data is now passed as
-  argv, and an unparseable list is **refused** rather than treated
-  as "open to everyone"; an absent list stays the legitimate "any
-  source" answer, and the port-22 accept floor in the firewall
-  renderer keeps a default install reachable.
-
-  **The allowlist only takes effect once SSH is moved off port
-  22**, and that is not what this change fixed. The appliance's
-  base `/etc/nftables.conf` emits an unconditional
-  `tcp dport 22 accept` in its management floor, above the
-  include glob that pulls this drop-in in, and nftables is
-  first-match-wins — verified against a real kernel. That floor
-  is the deliberate un-removable recovery channel that keeps a
-  bad Web-UI source restriction from bricking the box, so it was
-  left alone: retiring it when a scope is configured (what the
-  Web UI does) would turn a wrong CIDR into a console-only
-  recovery, which is a decision rather than a bug fix — tracked
-  as #1009. Said plainly here because the allowlist previously
-  did nothing for two independent reasons and only one of them
-  is now gone.
-
-  The apply order changed with it: the fragment is now staged
-  and validated *before* the sshd drop-in is installed. Both
-  paths that can refuse used to run after it, and `fail` exits
-  before the sshd reload — so the running daemon kept the old
-  port while the installed config had already moved it, and the
-  lockout arrived at the next sshd start rather than at the
-  failure.
-
-- **Blanking the installer's Time source did not disable NTP
-  (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
-  `pool` directive and `sourcedir` is additive, so removing the
-  installer's sources file left the appliance synchronising
-  against the public Debian pool. Four surfaces said "none",
-  including `docs/PRIVACY.md`, which is normative for
-  non-negotiable #17 — a false claim about an outbound connection
-  on the page an operator reads to decide what the box talks to.
-  Blank now means none: the installer comments out the `pool`
-  line and the `/run/chrony-dhcp` sourcedir (marked and exactly
-  reversible), and the answer reaches
-  `platform_settings.ntp_pool_servers` as an empty list, so the
-  control plane's first config push does not put the pool back.
-  `sources.d` and `conf.d` are left in place as the way back.
-
-- **The weekly CVE scan could report "clean" and could never
-  report a CVE (#975).** Found while adding a second job to the
-  same workflow. GitHub Actions runs a `run:` block under
-  `bash -e`, and the `set -uo pipefail` at the top of the scan
-  step does **not** clear that flag — so the bare
-  `docker run ... trivy --exit-code 1` followed by `rc=$?` killed
-  the whole step the moment Trivy found something. That is the
-  first image with findings, which is the only case the job
-  exists for: every branch after it was dead code,
-  `has_findings` was never written, and the reporting step's own
-  fail-safe then correctly refused to touch the tracking issue on
-  an indeterminate result — logging a warning nobody reads on a
-  scheduled run. A clean week and a week full of criticals
-  produced the same visible outcome: no issue.
-  Both status captures now use the `if` form, whose condition is
-  exempt from `-e`. Verified by executing the shipped `run:`
-  bodies under `bash -e` against a stub where `docker build`
-  succeeds and the scan exits 1 — the fixed step reaches its
-  handler and writes `has_findings=1`, the unpatched one exits 1
-  having written nothing. The first attempt at that harness
-  proved nothing, because a stub that failed `docker build` too
-  took the build-failure path and never reached the scan.
-
-
-- **A `run:` step that captures `$?` after a bare command is dead
-  code, and nothing anywhere said so (#1036).** GitHub Actions runs
-  every `run:` block under `bash -e`, and the `set -uo pipefail`
-  several steps open with does **not** clear it — so
-  `cmd; rc=$?` is never reached on the failure it was written to
-  handle. #975 fixed the two live sites; this adds the guard, which
-  that issue deliberately left out of scope.
-  The instance that matters: `trivy-scheduled.yml` captured Trivy's
-  status this way, and Trivy exits 1 **on findings**. The step died
-  at the first image with a CVE, `has_findings` was never written,
-  and the reporting step's fail-safe correctly declined to act on an
-  indeterminate result. **A clean week and a week full of criticals
-  produced the same visible outcome: no issue.**
-  `scripts/lint_workflow_shell.py` refuses the shape in CI's
-  unconditional Backend Lint job and in `make ci`. It is a linter of
-  our own because **neither `actionlint` nor `shellcheck -S style`
-  reports it** (both run against the exact snippet): SC2181 fires on
-  a direct `if [ $? -ne 0 ]` and not on `rc=$?` followed by a test
-  of `$rc`. It is pinned against the REAL pre-fix
-  `trivy-scheduled.yml` body, which it reports at the right line.
-  **The false positive it had to stop making is the interesting
-  half.** Turning the check on for a standalone script requires an
-  UNINDENTED `set -e`, because file order is not execution order and
-  this reads the file: `spatium-install` is `set -uo pipefail` at the
-  top and enables `-e` deep inside `do_install()`, which runs *after*
-  the wizard loop and preseed parser that appear below it. Counting
-  that produced four confident findings about code where `-e` is off
-  — and a linter that cries wolf on the installer is one that gets
-  deleted. Suppressing accepts weaker evidence than asserting, on
-  purpose.
-  **The sweep found a second live instance, in the DHCP agent's own
-  entrypoint** — and only after review caught that the guard was not
-  scanning the files its rationale was built on: it globbed `*.sh`,
-  and all 45 appliance host runners (`spatium-install` among them)
-  are extension-less. It now matches on a shell shebang too, and
-  refuses to print a pass when the script half scanned nothing.
-  What that turned up: `agent/dhcp/images/kea/entrypoint.sh` runs
-  under `set -eu` and ends with
-  `wait -n … || wait …` / `EXIT_CODE=$?` / `_term`. Reproduced
-  against busybox ash — when a supervised child exits non-zero the
-  list returns non-zero, `-e` kills the script on that line, and
-  `EXIT_CODE`, `_term` and `exit` are ALL skipped. So a kea or agent
-  **crash** — the case the supervision block exists for — tore the
-  container down without terminating its siblings, while a clean
-  SIGTERM (which returns 0) ran the cleanup perfectly. The failure
-  path was the only one that skipped it.
-
-
-### Added
-
-- **The appliance builds for arm64 — ISO and upgrade image, in
-  the release and the nightly (#1026, parts 2 + 3).** Apple
-  Silicon VMs, Graviton / Ampere instances and Raspberry Pi
-  5-class boards. `mkosi.conf` no longer pins `Architecture`;
-  the kernel, GRUB packages and `BiosBootloader` moved to
-  `mkosi.conf.d/` drop-ins matched on architecture, and the
-  Makefile always passes `--architecture` explicitly so an
-  Apple Silicon dev box does not silently start building arm64
-  by default. `release.yml` and `nightly.yml` matrix over
-  `[amd64, arm64]` with `fail-fast: false` — a break in one leg
-  must not withhold the other's ISO from a release — and the
-  arm64 leg runs on `ubuntu-24.04-arm`, a NATIVE runner,
-  because mkosi's builder cannot be emulated: under qemu-user
-  it dies on `mount_setattr(2)` (#991).
-  **arm64 is UEFI-only, and that is the platform rather than a
-  simplification.** There is no i386-pc GRUB target for AArch64
-  and no BIOS to chain-load from, so the installer lays down no
-  BIOS-boot partition, installs only `--target=arm64-efi`, and
-  **refuses before touching the disk** on a machine that did
-  not boot via EFI — a successful install that can never boot
-  is worse than an honest refusal. The partition NUMBERING is
-  identical on both architectures: p1 is simply absent on
-  arm64 rather than the rest shifting down, so `partition_node`,
-  `_MD_NAMES`, the #999 mirror path and the verification pass
-  all work unchanged. Root partitions are typed `8305` (Linux
-  root ARM-64) instead of `8304`, which `build-slot-image.sh`
-  and `wrap-iso.sh` now look up per architecture; the ISO is
-  built with `grub-mkrescue -d` forced to a single platform, so
-  an arm64 ISO cannot silently carry x86 boot paths just
-  because the builder image has the modules for both.
-  **The versioned ISO name gains its architecture.** It never
-  had one while the stable name always did — invisible with a
-  single build leg, a filename COLLISION with two, where
-  whichever leg uploaded second would win silently. The pruner
-  now treats the two architectures as a pair: its `*)`
-  fallthrough leaves unrecognised assets alone, which is right
-  for a genuinely new artifact and exactly wrong for an
-  architecture somebody added to the build matrix — ~3 GB per
-  release that nothing ever reclaims. A test pins the pruner's
-  architecture list against both workflow matrices.
-  Verified end to end on real hardware: the ISO boots in UTM on
-  an M4 (Apple Virtualization, UEFI), the installer runs, and
-  the installed system comes up with `root-arm64` partition
-  types, `BOOTAA64.EFI` on the ESP, no BIOS-boot partition, an
-  `ELF ARM aarch64` k3s binary, a Ready node on kernel
-  `6.12.107+deb13-arm64`, and A/B slot detection working
-  unchanged.
+- **Contributions are signed off under the Developer Certificate of
+  Origin (#1331).** `CONTRIBUTING.md` explains the `git commit -s`
+  sign-off, and the PR template asks for it.
 
 ### Fixed
+
+- **Going back to an older release is checked against the database first
+  (#1227).** PostgreSQL lives on `/var`, which an A/B slot swap does not
+  touch. So a slot rollback put the older release's code on a schema the
+  newer release had already migrated. Its migrate Job failed with
+  `Can't locate revision`, its api, worker and beat waited for migrate
+  forever, and on a single node the newer release's api kept serving
+  behind the older UI. Nothing refused the rollback, and after the Job's
+  10-minute TTL nothing said why the control plane was down.
+  - Every path that moves a control-plane node to an older release now
+    compares the database's revision with the one that release was built
+    with: `POST /appliance/slot-upgrade/rollback`, Fleet
+    `set-next-boot` / `set-default-slot` onto the other slot, and a Fleet
+    upgrade to an older image. When the release cannot run on the
+    database, the request is a 409 with `detail.code`
+    `schema_rollback_unsafe` naming both revisions. The Fleet UI shows it
+    as a confirmation, and `acknowledge_schema_rollback: true` proceeds
+    anyway. Data-plane appliances and a commit of the running slot are
+    never checked. A release nobody recorded is `unknown` and proceeds,
+    because refusing on "don't know" would block every rollback on an
+    install that never recorded anything.
+  - Each release records its schema head in a new `release_schema_head`
+    table when it starts, once the schema is at its head, and records
+    the booted slot's version only when that slot is its own release.
+    Tagged releases come from `backend/app/data/release_schema_heads.json`,
+    generated from the release tags by `scripts/release_schema_heads.py`
+    (55 releases, 2026.09.04-1 at `f3b8d21c74ae`), which wins over a
+    recorded row for every release it lists. The table is backed up with
+    `alembic_version`.
+  - A migrate step that meets a database a newer release migrated now
+    says so, in the migrate Job and once in the `wait-for-migrate` init
+    container, and names the way out: re-apply the newer release, or
+    restore a pre-upgrade copy of the database. Only when the unknown
+    revision is the one the database is at; a mistyped
+    `alembic upgrade <rev>` keeps Alembic's plain error. This applies to
+    releases from this one on, not to the ones already published.
+  - The rolling-upgrade preflight gains a warn-only `pre_upgrade_backup`
+    row: no backup target has succeeded in the last 24 hours.
+  - **Not covered:** the trial-boot auto-revert runs on the host with no
+    operator involved, so nothing can refuse it, and no database snapshot
+    is taken before an upgrade yet. See "Rolling back" in
+    `docs/deployment/APPLIANCE.md`.
+  - Also fixed: the Fleet slot cards showed an error as
+    `Request failed with status code …` instead of the server's reason.
+
+- **The unattended-upgrades package blocklist says what it accepts
+  (#1384).** The APT settings form, the model and APPLIANCE.md called
+  its entries globs, but unattended-upgrades reads each one as a regular
+  expression matched from the start of the package name. So `linux-*`
+  matched far more than intended, and `*` is not a valid expression at
+  all and would break the daily run on the host, stopping every
+  security update. All three now say regular expression, with examples,
+  and the API refuses an entry that does not compile (422, naming it).
+  Entries saved before this are not re-checked. Two rendering faults on
+  the same path are fixed with it: the host runner doubled every
+  backslash on the assumption that apt.conf unescapes them, which it
+  does not, so a regex like `linux-image-\d` reached unattended-upgrades
+  as a different expression and blocked nothing; and a double quote,
+  which apt.conf cannot express at all, was accepted and made the whole
+  policy file fail to parse. Values are now written verbatim and a
+  double quote is refused at save. The APT form also shows the server's
+  reason for a refused save instead of "Request failed with status code
+  422".
+
+- **Building a DNS group's config no longer loads every blocklist
+  entry as a database object (#1109).** The bundle the agents
+  long-poll for collected blocklist entries the way #948 stopped
+  collecting records: a full ORM object per entry, the shape that
+  OOM-killed the api on a 250k-record group. The Family filter profile
+  (#878) brings ~596k entries in one click. Entries are now read as
+  plain columns, in a fixed order within each list so the bundle's
+  ETag no longer depends on how Postgres happens to return them. On
+  100k entries this went from 3.4 s and a 100 MiB peak to 1.2 s and
+  38 MiB. The lists themselves are now collected in a fixed order too
+  (a view's own lists first, then the group's, each by name): it
+  decides which list wins a duplicate name, and it used to follow the
+  order Postgres returned the assignments in, so the winner and the
+  ETag could change between two builds of an unchanged group.
+
+- **Deleting a large zone, and opening the Trash, no longer scale with
+  the zone (#1231).** The default zone delete loaded every record,
+  stamped each through the ORM and wrote one audit row per record, all
+  in one transaction and computing each audit hash under the global
+  audit lock, so it blocked every other audited change for its
+  duration. A zone's records are now stamped by one `UPDATE`, and the
+  zone's own audit row records how many it took with it
+  (`old_value.cascaded`). A record already in the trash keeps its own
+  deletion and comes back with that one, not with the zone. The Trash
+  page loaded every soft-deleted row of every type into Python on
+  each view, plus a count per batch per type; it now filters, counts
+  and pages in SQL, and counts batch sizes for the shown rows only.
+  The search stays a literal substring match.
+
+- **Restoring a large zone from the Trash no longer scales with the
+  zone either (#1389).** Restore still had the old shape: one conflict
+  `SELECT` per record and one audit row per record, so bringing back a
+  250k-record zone was 250k of each in one request, blocking every
+  other audited change. The conflicts are now found by one query for
+  the whole batch, the zone's records come back by one `UPDATE`, and
+  the zone's own restore row records how many (`new_value.restored`).
+  The response's `restored` count still includes them. The conflict
+  check now uses the identity record create refuses a duplicate on
+  (#1230): the view, the name compared case-insensitively, the type,
+  the value after trimming, and priority, weight and port. So a record
+  in another view, or an MX or SRV at another priority or port, no
+  longer blocks the restore (neither was ever a duplicate), while a
+  restore can no longer bring back a twin that differs from a live
+  record only in letter case or surrounding spaces. A #963 bulk record
+  delete still restores record by record, since each record is
+  re-pushed to agentless providers.
+
+- **Cluster health no longer counts a joining database replica as a
+  ready instance (#1213).** The workload rollup on
+  `GET /appliance/cluster/health` skipped only finished Job pods, so
+  while CNPG bootstrapped a replica its running `postgresql-N-join` pod
+  counted as a third ready database pod: the Cluster Overview read
+  3/3 healthy while CNPG reported two instances, "Creating a new
+  replica". Job pods no longer count toward a workload's ready or
+  total, and a workload with a Job still running reads `degraded`
+  rather than `healthy` until it finishes, with the count of running
+  Job pods on the row (`jobs_running`, shown as "+1 job") so a
+  degraded 2/2 says why. The rolling upgrade was
+  never affected: its safety check reads CNPG's own `readyInstances`.
+
+- **PowerDNS servers no longer report their version to
+  secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
+  `secpoll.powerdns.com` at startup and periodically, naming the
+  PowerDNS version it runs, and nothing turned it off. Every PowerDNS
+  server sent it, through the hardcoded public resolvers or the system
+  resolver. Both renderers now write an empty `security-poll-suffix`,
+  which disables it; it takes effect the next time the PowerDNS
+  container starts, which an upgrade does. The optional dnsdist front
+  polled the same zone for its own version, also by default; its
+  entrypoint now writes `setSecurityPollSuffix("")`. PRIVACY.md §3.5
+  says so.
+  Still open on #1353: the ALIAS resolver is hardcoded to `1.1.1.1` /
+  `8.8.8.8`, and PowerDNS does not start on a host with no route to
+  them.
+
+- **Unattended upgrades no longer install kernels on the appliance
+  (#1249).** `mkosi.conf` said "No kernel upgrades" while the
+  unattended-upgrades drop-in allowed security-pocket kernels, and
+  nothing excluded them. Each slot boots `/boot/vmlinuz` and
+  `/boot/initrd.img`, symlinks the slot-image build and the installer
+  point at the image's own kernel. A kernel with a new ABI never ran,
+  because Debian's kernel packages maintain their symlinks in `/`, not
+  `/boot`; it only took space in a fixed-size slot. A revision of the
+  slot's own ABI was worse: it overwrote the very `vmlinuz-<ver>` those
+  symlinks name and rebuilt its initrd on the device, so the slot booted
+  a kernel its image never shipped. `linux-image-` is
+  now on the drop-in's Package-Blacklist, which apt merges with an
+  operator's own blocklist from the APT settings (#164). Kernels
+  arrive with slot images, as before.
+
+- **The privacy statement lists the public resolvers PowerDNS
+  uses, and its guard now scans the agents too (#1353).** The agent
+  renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
+  `pdns.conf`, and the setting added on the agent side in #250 to
+  change it was never wired to the control plane. PowerDNS sends two
+  kinds of lookup through it: the target of every ALIAS record, so
+  Cloudflare and Google see those names, and its own built-in
+  security-status poll, which runs on every PowerDNS server at startup
+  and periodically after, and tells them and PowerDNS which PowerDNS
+  version you run. `docs/PRIVACY.md`, which claims to list every
+  outbound connection, mentioned neither. It now does, in a new §3.5
+  for the DNS and DHCP servers; making the resolver configurable is
+  still open. The CI guard that holds the page to that claim scanned
+  `backend/app` only, and this connection was in agent code, as IP
+  addresses its hostname scan could not see. It now also scans the
+  four shipped agent packages, for hostnames and for public IP
+  addresses in string values, matches an address only as a whole
+  address, and fails when a new agent package is missing from the
+  scan or from the CI path filter's carve-outs, which now include
+  those packages so an agent-only change runs the guard.
+
+- **A PXE vendor match, a dynamic-update ACL entry and a BIND9 zone
+  forwarder are checked before they reach the config (#1357).** Each was
+  written verbatim into Kea's or BIND's config, so one malformed value
+  made the server refuse the file and the whole server group stopped
+  converging. A PXE profile's `vendor_class_match` now gets the check a
+  phone profile's has had since #1294 (no `'`, no control characters).
+  On both, a non-ASCII prefix is now measured in bytes and compared as
+  hex, so it can match: quoted, Kea read it a byte short, and a
+  character above U+00FF made Kea refuse the config. An update-ACL
+  entry's `name_pattern` must be a DNS name (a
+  leading `*.` for `wildcard`; `.` or `*` for `self`), and its
+  `record_types` must be types BIND knows, including `DHCID`, `ANY`,
+  `TYPE<n>` and a count such as `A(5)`; lower case is still accepted and
+  upper-cased. A forward zone's forwarders on a BIND9 group must be `ip`
+  or `ip@port` (`ip port <n>` is accepted and rewritten); Technitium
+  zones may still name a hostname or DoH URL, and moving such a zone
+  into a BIND9 group is refused. Each answers 422 naming the offending
+  element; a DNS import into a BIND9 group drops such a forwarder and
+  says so in the result. Rows stored before this are left out of the
+  agent's config with a log line instead of shipped: a bad PXE match
+  drops its class, a bad forwarder drops itself, and a bad update-ACL
+  `grant` drops itself while a bad `deny` also drops the entries after
+  it, so the policy that remains never allows more than the one stored.
+
+- **An unknown URL shows a "Page not found" page instead of a blank
+  screen (#1360).** The route table had no catch-all, so a mistyped
+  or stale URL matched nothing and rendered an empty page with no
+  sidebar and no way back. A signed-out user on such a URL was not
+  sent to the login page either, because the login check never ran.
+  The new page renders inside the app, shows the requested path as
+  plain text, and links back to the dashboard. It also suggests a few
+  pages from the sidebar's own list, closest to the mistyped path
+  first, and skips any whose feature is turned off (Settings →
+  Features). Signed-out users now go to the login page. Also: the
+  legacy `/network/<id>` bookmark route matched any `/network/...`
+  typo and looked it up as a device. It now redirects a real device id
+  to `/network/devices/<id>`, which its comment always said it did,
+  and shows the 404 page for anything else.
+
+- **External URLs from PeeringDB are linked only when they are http
+  or https (#1361).** The website and looking-glass fields on an ASN's
+  BGP footprint tab went into a link whatever their scheme. Now only an
+  `http:` or `https:` URL becomes a link; anything else, including a
+  `telnet:` or `ssh:` looking glass, is shown as plain text. The values
+  are also checked when they are fetched: a website is kept only if it
+  is http(s), and a looking glass only if it is http(s), telnet or ssh,
+  the schemes PeeringDB itself accepts. The GitHub release links on the
+  sidebar and the Releases tab are also linked only when http(s).
+
+- **The backup docs no longer say an archive is encrypted (#1352).**
+  Only `secrets.enc` inside a backup archive is passphrase-wrapped;
+  the database dump next to it is not. SYSTEM_ADMIN.md said otherwise
+  in three places: that an unauthenticated NFS export exposes only
+  archive names and sizes, that LUKS on a removable backup disk is
+  optional because the archive is already encrypted, and that the
+  least-privilege pull token "fetches ciphertext". The NFS destination
+  form carried the same claim. Anyone who can read an archive can read
+  the whole database, users, IPAM / DNS / DHCP data and the audit log
+  included. Most stored credentials stay encrypted under the source
+  install's key, but not each DNS server group's internal TSIG key,
+  which is stored in clear and is accepted for zone transfers and
+  dynamic updates from any address (encrypting it is #1364). The docs
+  now say what an archive exposes, the NFS section says to restrict
+  the export, and the removable-disk section no longer recommends
+  LUKS: the appliance refuses a `crypto_LUKS` disk, having no
+  `cryptsetup` to unlock it.
+
+- **A backup taken on an older release restores again (#1363).** A
+  full restore replayed the archive with `pg_restore --clean`, which
+  drops only the objects the archive contains. Every table a later
+  migration had added survived the replay, with its constraints. An
+  archive older than `dns_agent_bundle` (every 2026.09.04-1 archive)
+  therefore failed with a 400: `--clean` could not drop
+  `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on
+  it. A surviving table with no such dependency let the replay through
+  and stopped the post-restore upgrade on "already exists" instead. A
+  full restore now clears the schema and replays the archive in one
+  transaction: every table, view, sequence, standalone type and routine
+  in `public` is dropped (extension members are kept), then the
+  archive's SQL is applied by `psql --single-transaction`. For a
+  custom-format archive that SQL is streamed from `pg_restore`, not
+  staged on disk. If `pg_restore` fails part way, psql is killed before
+  it reaches end of input, so it never commits. A replay counts as
+  complete only when psql acknowledges the end of the script (a per-run
+  `\echo` token), so a psql that left early with exit 0 is a partial
+  restore, not a success. Any failure before end of input rolls back and
+  leaves the database as it was; a timeout after it, while psql may be
+  committing, is reported as an unknown outcome instead. Backups dump the whole database, so clearing loses
+  nothing the archive does not recreate. An error now leads with
+  PostgreSQL's `ERROR` line instead of notices. Also documented: the
+  command for the manual `alembic upgrade head` a `failed` restore asks
+  for, on Compose, the appliance and Helm (`SYSTEM_ADMIN.md` §2.9).
+  Found by amoona6's gate walk of #1349.
+
+- **A restore no longer stamps a half-migrated schema as current
+  (#1233).** When `alembic upgrade head` failed after a restore with
+  "already exists", from any revision, the restore ran `alembic stamp
+  head` and reported `auto_recovered`. That error is the signature of a
+  stale `alembic_version` over a schema already at head, but not proof
+  of it. Any revision that meets one object it would create fails the
+  same way, and since migrations commit one revision at a time (#1204),
+  the revisions before it stay applied and those after it never run.
+  The restore now stamps head only after checking that every table and
+  column this build's models declare exists in the restored database.
+  If anything is missing, or the check cannot run, the restore reports
+  `failed`, names the missing tables and columns and the revision that
+  failed, and leaves `alembic_version` at the last revision that
+  committed, so a manual `alembic upgrade head` resumes from there.
+  The check covers tables and columns in one direction only: on a
+  database migrated cleanly to head, the models omit a column the
+  initial schema still has, and index and constraint names differ in
+  dozens of places, so a full schema comparison would refuse the case
+  the recovery exists for. The restore's upgrade error now starts at
+  the exception line rather than at the start of alembic's output. On
+  a long upgrade the first 1,500 characters held only per-revision
+  INFO lines, which cut off the exception and hid the "already
+  exists" match. `migrations_applied` now lists the revisions that
+  committed before the failing one, instead of always being empty.
+
+- **The Compose upgrade steps upgrade, and the deployment docs stop
+  describing what does not exist (#1237, #1236, #1248).** DOCKER.md's
+  upgrade procedure ran `docker compose build`, which rebuilds nothing:
+  `docker-compose.yml` pins pre-built images and has no `build:`
+  sections, so following it re-ran the images already on the host. It
+  and the install steps in DOCKER.md, README and BAREMETAL.md now run
+  `docker compose pull`. The Compose Patroni overlay
+  (`k8s/ha/postgres-docker-compose.yaml`) was presented as a working HA
+  path in four docs, but Patroni never starts under it, and on an
+  existing install it comes up as a new project on empty volumes. It is
+  now documented as non-functional and unsupported in 1.0, with the
+  reasons in the file's own header; making Compose HA real stays #137.
+  Also corrected: the Compose Redis runs without AOF, not with it;
+  CloudNativePG replication is asynchronous, so a failover can lose the
+  last few commits; the README requirements named Kubernetes 1.31 /
+  Helm 3 and a bare-metal install that does not exist; the feature docs'
+  dated status banners; a missing CHANGELOG link in the docs index and
+  README; and three stale code comments.
+
+- **The manual `helm upgrade` command on the Releases tab never
+  worked (#1182).** It passed no `--version`, and every published chart
+  is a SemVer pre-release (the CalVer `-N`), which Helm's unversioned
+  lookup skips, so Helm answered *Could not locate a version matching
+  provided version string*. The command now names the chart version.
+
+- **A raw option code in the spelling the group's servers drop is
+  refused, not saved and never served (#1296).** Kea and FortiGate read
+  raw options as `code:NN` and skip `opt-NN`; Windows reads `opt-NN` and
+  skips `code:NN`. The option check from #1228 accepted both spellings on
+  every group, so an `opt-NN` on a Kea group, or a `code:NN` on a Windows
+  one, was saved and silently dropped by the server: the failure #1228 set
+  out to stop. Scope options and option templates now check the raw
+  spelling against the group's servers and name the one to use. A group
+  with no servers yet follows the Kea rule, and a group mixing Windows
+  with another driver takes neither spelling. Pool and reservation
+  overrides, client classes and device policies, which only Kea and
+  FortiGate render, always take `code:NN`. Named options are unaffected,
+  and a stored raw option (an imported `opt-NN`, say) stays editable while
+  it is unchanged.
+
+- **A BIND9 apply is reported OK only once named is actually serving it
+  (#1224, #1239).** Validation ran `named-checkconf`, which never reads zone
+  files, and returned success outright if the checker was missing; and
+  `rndc reload <zone>` only *queues* the load and exits 0 even for a file
+  named cannot parse (verified against BIND 9.20). So a zone with a bad
+  record kept serving its old copy, or SERVFAILed if it was new, while the
+  apply reported `ok` and committed the bundle as last-known-good, which
+  left #882's revert nothing to revert to. Three more holes in the same
+  path: a `reconfig` named refused at run time (a DoT cert it could not
+  read, which `named-checkconf` passes) fell back to SIGHUP, which named
+  refuses the same way, and the SIGHUP was never checked; `os.kill` failing
+  was only logged; and a named that died on its first start read back as
+  started, because a zombie still reads `named` in `/proc/<pid>/comm`. Now
+  validate runs `named-checkzone` on every zone file the render added or
+  changed (flags matching named's own `check-integrity no`, and not
+  resolving out-of-zone names over the network) and fails closed without
+  either checker; after the swap each changed zone's serial is read back
+  with `rndc zonestatus` until it matches the file; a runtime-refused
+  `reconfig`, an undeliverable SIGHUP, named exiting after SIGHUP and named
+  dying on first start all fail the reload phase, so #882 reverts and
+  alerts. Every one of those was reproduced against a real named 9.20
+  before and after the change, and SIGHUP is kept only for a control
+  channel that cannot be reached at all.
+
+- **DHCP HA says it covers DHCPv4 only, and a DHCPv6 scope it does not
+  cover is flagged (#1238).** The agent renders Kea's HA hook into the
+  DHCPv4 config alone and reads HA state from the DHCPv4 daemon, but
+  nothing said so. The HA pill on the DHCP page, the server modal and the
+  dashboard read as the health of the whole pair, so an operator with
+  DHCPv6 scopes on an HA group had every reason to think they were
+  protected. They are not: each member serves a v6 scope on its own, and
+  two members can hand the same address to different clients. The pill
+  now reads `HA v4: <state>` with a tooltip saying what HA covers, the
+  dashboard row reads "HA Pairs · DHCPv4", and an enabled stateful DHCPv6
+  scope on a group with two or more Kea members carries a `v6: no HA` tag
+  in the group's scope list and on the IPAM subnet's DHCP tab, with the
+  same warning in the scope form while it is being set up (a `stateless`
+  or `slaac` scope allocates no address, so it is not flagged). The group's Mode hint,
+  the API's `ha_state` field description, the `list_dhcp_servers`
+  Copilot tool, `DHCP.md` and `DHCP_DRIVERS.md` say the same. Two stale
+  claims in DHCP.md's HA constraints are corrected on the way: a third
+  Kea member is a backup peer (#332), not an error, and mixed Kea +
+  Windows groups are refused (#1110). DHCPv6 HA itself is #1258.
+
+- **`make trivy` no longer reports a scan that never ran as a finding
+  (#1272).** Any non-zero exit from the scanner container was printed as
+  FINDINGS, so a Docker error (a refused mount, a pull failure, the daemon
+  down) or a Trivy error (a DB download failure, which Trivy also reports
+  as exit 1) ended in "Trivy found HIGH/CRITICAL vulnerabilities" with no
+  finding listed, for images that scanned clean. The loop moved to
+  `scripts/trivy-scan.sh`, which reports FINDINGS only when Trivy exits 1
+  and its report lists one. Everything else is SCAN FAILED or BUILD FAILED,
+  with the end of the log on screen, and exits 2 rather than 1, so the two
+  can be told apart. An `IMAGE=` that matches no image now fails instead of
+  printing "Trivy clean". The vulnerability-DB cache defaults to
+  `~/.cache/spatiumddi-trivy` rather than a directory in the checkout:
+  Docker Desktop can refuse to mount a checkout on an external volume,
+  which is how this was found. Set `TRIVY_CACHE` to keep the old location.
+
+- **A DHCP HA peer-IP re-render can no longer leave a refused config on
+  disk, race the sync loop, or be skipped while the agent is degraded
+  (#1247).** When an HA peer's hostname resolved to a new address, the
+  agent's watcher re-rendered Kea by calling `_apply_bundle` directly, from
+  its own thread. A render Kea refused was only logged, with no apply
+  verdict on the heartbeat, and the refused document stayed at
+  `kea_config_path` for the next container start to boot into. Nothing
+  serialised it against the sync loop either, so it could put an older
+  bundle back over a newer one while the agent reported the newer etag.
+  The watcher now calls `SyncLoop.reapply_current_bundle`, under the one
+  apply lock every apply takes. It re-renders the bundle Kea is actually
+  running, which the loop now tracks, so a peer that moves while the agent
+  runs on last-known-good is still followed. A re-render forced by host
+  state is not the control-plane bundle's fault, so a refusal does not
+  quarantine it. Instead the Kea documents are put back, and a daemon that
+  had accepted the render (the two reload independently) is reloaded from
+  them; a daemon that refused it is left alone, since a Kea reload restarts
+  the HA hook's state machine. The refusal is reported as a reverted apply
+  naming the reason. The #1140 IPv6-address recheck uses the same path and
+  no longer retries an identical refusal every loop.
+
+- **Audit rows carry the request id, and the worker and beat log JSON
+  like the api (#1245, #1246).** `audit_log.request_id` existed, was part of
+  the tamper-evidence hash, and was never set, although the docs say it
+  links an audit row to its request's log lines. It is now filled from the
+  logging context before the hash is computed, so the chain still verifies.
+  Separately, the Celery worker and beat never configured logging: their
+  output was Celery's plain text plus structlog's console renderer, with no
+  `service` and no `request_id`, against non-negotiable #7. They now share
+  the api's pipeline, Celery's own `Task … received` / `succeeded` lines
+  included, tagged `service=worker` / `service=beat`, and each task binds its
+  task id as `request_id`. The two fixes meet there: an audit row a scheduled
+  task writes now carries the task id, so a change can be traced from the
+  audit log to the worker line that made it. Every line the api logs outside a
+  request now carries `service` too.
+  **`request_id` is now always generated by the api**, never taken from the
+  caller: it is stored inside the audit hash, and a caller-chosen value would
+  let a caller make its audit rows claim another request's id. A caller's
+  own `X-Request-ID` (1–64 characters of `A-Z a-z 0-9 . _ : -`) is logged as
+  `client_request_id` and still echoed back in the response header, so a
+  report quoting it finds the log lines and, through them, the audit row.
+  The 500 handler no longer adopts the raw header either. The worker honours
+  `--loglevel` (when more verbose than `LOG_LEVEL`) and `--logfile`, and a
+  task run eagerly inside a request restores the request's id when it ends.
+  Celery's one-time startup banner is still plain text.
+
+- **A zone's access lists are checked before they reach `named.conf`
+  (#1316).** The zone half of #1244. A zone's `allow_query`,
+  `allow_transfer`, `also_notify` and `notify_enabled` were stored as sent
+  and rendered into its `zone { … }` statement; the agent renders
+  `allow-transfer` there on every BIND9 server. One bad element made BIND
+  refuse the file, which stops every zone in the group converging, not just
+  this one. Zone create and update now run the same checks as the server
+  options and answer 422 naming the field and element; on update only a
+  changed value is checked, so a zone stored before this fix stays
+  editable. A zone move also refuses a zone whose lists cite a TSIG key the
+  target group doesn't define, the same whole-group failure the move
+  already refused for ACL names (#935). A zone's `forwarders` are left
+  alone: a Technitium forward zone may carry a hostname or DoH URL there.
+
+- **The DNS server options editor refuses values BIND cannot load
+  (#1244).** `PUT /dns/groups/{id}/options` stored `allow-query` and the
+  other address lists, `also-notify`, the forwarders, the single-word
+  options (`forward`, `dnssec-validation`, `notify`, the query-log channel
+  and severity) and the query-log and GSS-TSIG keytab paths without any
+  check, and the renderers write them into `named.conf` as they are. One
+  bad element and `named-checkconf` refused the whole group's config:
+  since #882 the agent reverts and raises an alert, but the form had
+  already reported the save as successful. Each field is now checked
+  against BIND's grammar for it, and a bad value is a 422 naming the field
+  and the element, the same shape as the view and ACL checks (#876, #899).
+  A key or ACL name must be defined in the group. `also_notify` takes
+  `<ip> [port <n>] [key <name>]`, not an address list. The query-log file
+  must sit under `/var/log/named/`, where the agent can write it and its
+  shipper reads it, and a keytab under `/etc/` or `/var/lib/`.
+  Only a changed value is checked, because the form sends every field on
+  every save: a value stored before this fix doesn't block an unrelated
+  edit, but can't be saved again once changed.
+
+- **The Fleet drilldown's Packet capture button no longer leads to a
+  form that can't run (#1311).** `tools.pcap` ships disabled, and only its
+  API was gated. The button opened the Packet Capture page anyway, and a
+  capture failed only on Run, with `Feature 'tools.pcap' is disabled` and
+  no hint where to turn it on. The button is now disabled while the module
+  is off, with a link to Features & Integrations. The page itself, reached
+  from a bookmark, says the feature is off and where to enable it, instead
+  of rendering a form whose requests all 404.
+
+- **VoIP phone-profile options reach the phone, and are checked when
+  saved (#1294).** A phone profile rendered each option under its
+  catalogue name (`polycom-config-url`, `yealink-prov-server`,
+  `vendor-encapsulated-options`). The agent does not know those names and
+  dropped them with only a log line, so a Polycom profile saved and option
+  160 never reached a phone. The profile's option **code** now decides what
+  is delivered: its canonical name when SpatiumDDI has one (66, 150), else
+  `code:NN`, which the agent renders with its shipped definition. Values
+  get the #1228 checks: a code listed twice, a name that contradicts its
+  code (SpatiumDDI's own or the VoIP catalogue's), and a value Kea cannot
+  load are each a `422`. A stored row whose name contradicts its code keeps
+  the delivery it had before. Enabling a profile
+  checks every option and refuses the starter pack's `CHANGE-ME`
+  placeholders. Rendered by code, a placeholder in binary option 43 would
+  otherwise make Kea reject the group's whole config. A profile stored
+  before these checks is rendered without the options Kea cannot load,
+  each logged as `dhcp_phone_option_dropped_invalid`.
+  `vendor_class_match` is placed inside a Kea string literal, so a `'` or
+  a control character now gets a 422, and a stored profile containing one
+  is left out of the
+  render instead of breaking the config. It is measured in bytes, so a
+  non-ASCII vendor string can now match. Verified with `kea-dhcp4 -t`.
+
+- **Deleting one of two identical DNS records no longer takes the
+  record off the server (#1230).** Nothing stopped a record being stored
+  twice: `POST …/records` did no duplicate check, so an Ansible retry, a
+  flaky network or a double click made a second identical row. Every
+  record op carries the whole RRset the server should end up with
+  (#773), and a delete dropped the deleted record's *value* from it,
+  taking the twin's copy too. The server stopped answering for a
+  record the zone, and the UI, still listed. Two fixes:
+  - A delete now drops the deleted *row*, named in the op payload as
+    `record_id`, so an identical row that stays keeps the value on the
+    wire. This covers twins that already exist, with no data migration,
+    on every delete path that has the row (single, bulk, trash purge,
+    IPAM sync) and on agent and agentless drivers alike. The wire never
+    carries the same RR twice.
+  - Creating or editing a record into an identical one (same view,
+    owner name case-insensitively, type, value and priority / weight /
+    port; TTL is the RRset's) is a `409` naming the existing record.
+    Bulk create skips it as `identical record already exists`, which
+    also makes re-submitting a batch idempotent. The Copilot's
+    `create_dns_record` refuses it. A record in the trash does not
+    count.
+
+- **DNS record changes an agent could not apply are retried with
+  backoff, recovered when never acknowledged, and reported when they
+  give up (#1232).** Three faults, all silent. A failed apply was
+  retried on every heartbeat, so a DNS daemon restart of about
+  2.5 minutes spent all five attempts and the change was dropped for
+  good. An op shipped to an agent that restarted before its next
+  heartbeat, or whose long-poll response was lost, stayed `in_flight`
+  forever: never re-shipped, never failed, and the ACME DNS-01 wait
+  timed out on it. The agent could also drop an ack appended while a
+  heartbeat was in flight, with the same result. And nothing reported a
+  failed op: the record was in SpatiumDDI and the UI but not on the
+  server, until the next full render. Now:
+  - A failed op waits 30 s, 1 m, 2 m, 4 m, 8 m, 15 m and 15 m between
+    attempts, and fails after 8, about 45 minutes.
+  - An op unacknowledged for 5 minutes returns to the retry path on the
+    agent's next heartbeat. That also recovers ops already stranded.
+  - The agent removes only the acks it actually sent, and sends at most
+    the 5000 per heartbeat the control plane accepts. Each op carries a
+    dispatch number the agent echoes, so a late error for an earlier
+    dispatch is not charged twice.
+  - A failed op on an agent-based server raises the new default-on
+    alert rule `dns_record_op_failed`. The server's Sync tab shows when a
+    backing-off op retries.
+
+  Retrying an older op after a newer one for the same RRset applied
+  would have reverted the newer change, because every op carries the
+  whole RRset (#773). This was possible before, and backoff makes it
+  likelier. Such an older op now becomes `superseded` instead, and the
+  ACME wait follows it to the op that delivered its change. Also, an
+  ack from one agent can no longer change another server's op.
+  Migration `d8e1b5a26c47` (two nullable columns and an index on
+  `(server_id, created_at)`).
+
+- **DHCP option names and values are checked when saved (#1228).**
+  Scope, pool, reservation, option-template, client-class and
+  device-policy options were stored as given. Only `domain-name` and
+  `domain-search` were checked. A value Kea cannot parse, such as
+  `routers: "10.0.0.1, bogus"`, an MTU of 70000, or text in raw option
+  43 where hex is required, made Kea reject the whole config for the
+  server group. The agent reverted and alerted (#882), but every later
+  change to the group was stuck behind it. A name the renderer does not
+  know was dropped by the agent with only a log line, so the option
+  was saved and never served. Each of those writes is now a `422` that
+  names the option. Names are checked against what the Kea renderer
+  emits for the scope's address family. A raw `code:NN` is accepted
+  only for the codes SpatiumDDI ships a definition for, since the
+  agent drops any other. `opt-NN` (the Windows importer's spelling) is
+  accepted. Raw `option_data` is refused. Values are typed: IPv4 or
+  IPv6 addresses, integer ranges, FQDNs, non-blank strings, and plain
+  even-length hex for binary codes. The rules were checked against
+  `kea-dhcp4 -t`. An option already stored is not re-checked unless
+  the write changes it, so existing scopes stay editable. Applying an
+  option template checks the merged result against the scope's family.
+  A pick from the custom-options catalogue is now stored under the code
+  it can be delivered as (`code:43`), instead of a catalogue name the
+  agent would drop. This applies in the option-template and client-class
+  editors too, which used to key such a pick by its name or `option-NN`.
+
+- **A slot upgrade survives its image download being cut short
+  (#1216).** The runner read the image until the connection stopped
+  sending and never compared the bytes with `Content-Length`. So a
+  download cut mid-transfer left a partial image, and the apply failed
+  as "checksum mismatch", which reads as a corrupt image. A rolling
+  cluster upgrade can cut it: the frontend pod that serves a node its
+  image is replaced mid-download (#1215). The runner now counts the
+  bytes. A short, dropped or stalled transfer, and an HTTP 408, 429 or
+  5xx answer, gets up to five attempts, with backoff of 5, 10, 20 and
+  40 s, and a retry resumes with `Range` where the server allows it. A
+  4xx answer, a certificate the node cannot verify and a full disk fail
+  at once. A download that never completes fails with its own message:
+  the image download was interrupted, nothing was written to the
+  inactive slot, and the upgrade can be retried.
+
+- **A replaced node stays replaced: its Fleet row no longer goes
+  back from `left` to `failed` on the node's own word (#1317).**
+  Replace evicts a node on the seed's word and settles its row
+  `left`. The replaced node can still be alive: a failed joiner back
+  on its standalone control plane, or a member that was cut off and
+  returns. It goes on reporting what its join runner last wrote, and
+  the heartbeat applied whatever a node reported. A failed joiner's
+  `failed` turned the settled row back into a failed joiner, so the
+  Fleet showed a node it had just evicted as a failed join again. (A
+  node retries a failed join on its own, so a retry can still be
+  running when Replace is accepted; it reports when it ends.) A
+  member's `ready`, which a node never stops reporting, re-settled
+  the row as a member etcd no longer has. Only the order decided it:
+  the report did no harm when it landed before the eviction settled,
+  and an eviction that settles within seconds (#1284) often settles
+  first. An evicted row now ignores the join state its node reports,
+  from Replace until something is asked of the node again (a new
+  promote). A row an operator cleared mid-join still settles on the
+  node's `ready`, as before.
+
+- **Fleet → Replace removes the node's etcd member, not only its
+  k8s Node, and the row settles `left` only once etcd agrees
+  (#1284).** The seed evicted a replaced node by deleting its k8s
+  Node, which makes k3s drop a server's etcd member, and settled the
+  row `left` on that alone. A 404 counted as success. A node can be
+  an etcd member with no Node at all: a failed joiner whose own
+  automatic re-join made it a voter, then died before its Node
+  registered. Replace accepts exactly that row, and the dead voter
+  then kept its seat for good. The cluster ran on two live voters of
+  three with no fault tolerance, and etcd refused every later member
+  add ("etcdserver: unhealthy cluster"), so the replacement Replace
+  was for could never join. The seed now also removes the node's
+  etcd member itself, through a new host runner
+  (`spatium-etcd-evict`, behind `spatiumddi-etcd-evict.path`). The
+  member is matched by the name k3s gives it
+  (`<hostname>-<8 hex>`), or, before it has a name, by a peer URL on
+  the node's addresses; the seed's own member is never touched. It
+  reports the node evicted only once etcd no longer lists it. Until
+  then the row stays `evicting`, with the reason in the Fleet UI. A
+  member that appears for the name within five minutes of the
+  eviction is removed too: a re-join that was already in flight when
+  Replace landed. A node that is promoted again in that time is
+  exempt, since its new member is wanted. A seed whose OS slot
+  predates the runner keeps the old behaviour. Promote is refused
+  while an eviction is still pending, for the node itself and for
+  any node under the same hostname, and the Fleet no longer offers
+  them for promotion: until the eviction settles, the seed removes
+  etcd members under that name. The runner acts only on a fresh
+  request and sets each one aside once it has answered it, so
+  starting it again never repeats an old eviction.
+
+- **A join the seed's etcd refuses is rolled back with its reason,
+  instead of sitting `joining` for good (#1285).** The join runner's
+  #1052 guard, which stops a node that already joined the seed's etcd
+  from being rolled back into a ghost voter, counted k3s's `Adding
+  member … to etcd cluster` line as membership. k3s logs that line
+  before it asks etcd to add the member, and again on every retry
+  while etcd refuses the add (`etcdserver: unhealthy cluster` while a
+  dead voter still holds a seat, for example). So a refused join was
+  kept: no rollback, k3s restarting every ~15 minutes, and a `failed`
+  no supervisor could report, so the row read `joining` indefinitely
+  and Replace refused it. Only lines k3s and etcd log after the add
+  succeeded count now. A refused join is rolled back to the node's
+  standalone control plane, with a reason that names the refusal
+  rather than an unreachable seed. When the refusal is a voter the
+  seed cannot reach, the node stays standalone: the reason says to
+  remove that member first, and the join is not retried on its own,
+  since every retry would wipe the node again and be refused again.
+  A learner backlog is still retried. A refusal names the failure
+  only when the attempt ended on it: one refused add early in an
+  attempt that then failed for another reason no longer stops the
+  automatic retry. The journal scan behind this decision is also
+  anchored in UTC, so an appliance set to another time zone no
+  longer scans the wrong window.
+
+- **After a DHCP agent restart, an address that has changed hands no
+  longer drops out of IPAM while its new client holds it (#1318).**
+  The agent re-reads its whole lease file on every start, so an old
+  client's grant and release of an address are delivered again after
+  the address has gone to a new client. The lease-events endpoint
+  handled that release by deleting the address's IPAM row: it spared
+  the row only while another server of the group held the lease
+  (#1110), not while another client on the same server did. The
+  address was then missing from IPAM, with its lease listed as active,
+  until the replay reached the new client's own grant, and its row came
+  back as a new row without its MAC history. With New-device watch on,
+  #1172 hid this by losing the replayed batch whole. A release now
+  leaves the row in place while another lease on the address is active
+  and unexpired. The expiry sweep and the lease purge (the Windows
+  poll's absence-delete and the delete-lease endpoint) ask the same
+  question, so an old client's lease left `active` past its expiry no
+  longer takes the new client's IPAM row and DNS records with it either.
+
+- **With New-device watch on, a DHCP lease batch that grants and releases
+  the same address is no longer lost (#1172).** With the watch on, the
+  lease-events endpoint records a MAC sighting for each active lease after
+  the IPAM mirror pass. When the same batch also released, expired or
+  declined that address, the pass had already deleted its IPAM row, so the
+  sighting's insert failed its foreign key. The loop caught the error
+  without a savepoint, the transaction stayed aborted, and the whole batch
+  was lost: its leases, IPAM mirror changes, DDNS changes and dedupe
+  receipt. The agent was answered 200 and did not resend, or 500 when the
+  batch had changed DNS records, which it resent unchanged until its spool
+  quarantined the batch while newer lease events waited behind it. The
+  agent batches every 5 seconds and re-reads its whole lease file on every
+  start, so ordinary churn and any agent restart could trigger it. A
+  sighting is now skipped when the same batch deleted its row, each
+  sighting runs in its own savepoint so one that fails rolls back only
+  itself, and the `device.first_seen` audit rows are written after the
+  last sighting, so none is published before the batch commits.
+
+- **Deleting a DHCP reservation whose client still holds its lease
+  no longer shows the address as free (#1274).** The reserved client's
+  grant arrives while the address is a reservation, which the lease
+  mirror leaves alone, and the delete then freed the row to
+  `available` without looking at the lease. Nothing re-derived it
+  until the DHCP agent sent the lease again (its own restart, a
+  control-plane recovery, or the client's renewal, up to half the
+  lease time later), so IPAM showed a live device's address as free
+  and the next-free allocation could hand it to a second device. When
+  the lease table holds an active lease on the address in that
+  subnet, the delete now makes the row that lease's `dhcp` mirror,
+  linked to it, as if the lease had arrived after the delete. In a
+  DDNS-enabled subnet its A / PTR records are published under the
+  lease's hostname once the reservation is gone, as the lease ingest
+  does, instead of the address staying out of DNS until the renewal.
+  `available` is kept when no active lease holds the address.
+
+- **The version-pin check now sees the Alpine-packaged daemons, and
+  no longer reports a pin as behind when it is ahead (#1240).**
+  BIND, PowerDNS, dnsdist and Kea come from Alpine packages, and
+  `versions.json` tracked none of them, so their drift was invisible
+  to `make versions-check` and the weekly upstream report. That is
+  how #1218's CVEs reached a release. Each is now a component, with
+  its Dockerfile floor (`>=`) as the version and a new
+  `alpine-package` upstream that reads Alpine's package index for the
+  branch the images build on. It compares the full version, so an
+  `-rN` security rebuild shows up too. PowerDNS and dnsdist, which
+  were installed unpinned, gain floors at their current versions
+  (5.0.7-r0 and 2.0.8-r0), so nothing changes in the images. The
+  upstream report also compared versions for *inequality*, so a pin
+  ahead of what upstream returns (redoc 2.5.4 against a 2.5.3 GitHub
+  release) was listed as "behind", which invites a downgrade. It now
+  orders them.
+
+- **After a slot upgrade, the node's DNS, DHCP and looking-glass
+  agents run the new release (#1203).** They kept the previous
+  release's images and chart until a role, group or key next changed.
+  The supervisor skips re-applying the role release while nothing it
+  would send has changed, but it judged that from the role settings
+  alone, which carry no image tag or chart. The skip marker also
+  survives a slot upgrade, so the new supervisor skipped from its first
+  heartbeat. The check now also covers the image tag and the chart the
+  release is rendered with. Both change only with a slot upgrade, so
+  the first heartbeat on a new slot re-applies once and steady state
+  still skips.
+
+- **Upgrading to a nightly build no longer deletes the new slot's own
+  images (#1202).** The image prune that runs once the new slot is
+  committed kept only images tagged with a slot's appliance version. A
+  release uses one value for both, but a nightly's appliance version is
+  `0.0.0-nightly-YYYYMMDD+sha` while its images are tagged
+  `nightly-YYYYMMDD`. So the prune removed every new-slot image no
+  container was using yet, and spatium-supervisor, which never pulls
+  its image, stayed in `ErrImageNeverPull`. An air-gapped appliance
+  could not recover. The prune now also keeps images carrying either
+  slot's image tag, recorded in a new
+  `release-state/slot-image-tags.json` beside `slot-versions.json`,
+  which is unchanged.
+
+- **An upgrade no longer deadlocks its own database migration
+  (#1204).** The migration ran every Alembic revision in a single
+  transaction, so each `ALTER TABLE` kept its exclusive lock until the
+  last revision committed. The previous release keeps serving while
+  the migration runs, and its ordinary traffic (agent heartbeats,
+  health probes, API reads) could hold one table while waiting on a
+  table the migration had already altered. When a later revision
+  reached the first table, PostgreSQL found the deadlock and aborted
+  the migration. Upgrading a QA appliance from 2026.09.04-1 failed
+  this way on every attempt, with three different pairs of tables: the
+  migrate Job gave up, and the new api, worker and beat waited for it
+  indefinitely while the previous release kept serving. Each revision
+  now runs in its own transaction and releases its locks when it
+  commits. If one fails, the schema stays at the last revision that
+  committed, and the next attempt resumes from there. The migration
+  runs from the release being upgraded to, so this applies to the
+  upgrade from 2026.09.04-1 itself.
+
+- **The change-report PDF answered 500 for an `until` near year 1,
+  and every 500 lost its request id (#1201).** With no `since`,
+  `GET /audit/export.pdf` defaulted it to `until` minus 30 days, which
+  raised `OverflowError` for any `until` in the first 30 days of year
+  1. The window now starts at the earliest representable instant. An
+  `until` that is before year 1 in UTC (`0001-01-01T00:00:00+05:00`)
+  is a 422, as it already was when sent as `since`. Separately, the
+  unhandled-exception handler read the request id from the client's
+  headers only, so a client that sent none got a 500 with no
+  `X-Request-ID`, and the log line and Diagnostics row said
+  `request_id: null`. It now uses the id the request was logged under
+  and returns it on the response.
+
+- **Integration mirrors no longer claim addresses another integration
+  owns (#1135).** Each mirror should skip an IP address another
+  integration already owns and warn "owned by another integration; not
+  claiming". The UniFi, OPNsense, Proxmox, Kubernetes, Docker,
+  Tailscale and Cloud mirrors each kept their own list of the other
+  integrations, and every list had fallen behind as integrations were
+  added: UniFi, for one, didn't know about OPNsense, the common homelab
+  pairing. A claimed address was also marked as edited by hand, so from
+  then on neither integration kept it current, neither removed it when
+  the host went away, and deleting either integration's target deleted
+  it. All mirrors now use one shared list, and a test fails if a new
+  integration's column is missing from it or if a guard anywhere lists
+  the columns by hand.
+  Block move had the same gap. It refused to move a block holding rows
+  owned by four integrations, but not by the other seven, whose
+  reconcilers then re-created the moved rows in the old space.
+  Addresses already claimed twice before this upgrade are not changed:
+  a claim can't be told apart from a real operator edit.
+  `docs/TROUBLESHOOTING.md` has a query that lists them and says how
+  to fix each one.
+
+- **ACME DNS-01 no longer times out on very large DNS groups
+  (#1184).** Since #1111 a DNS agent receives a change with the next
+  render of its whole bundle, and QA measured one render of a
+  1.09M-record group at about 30 s. The ACME TXT record's fixed 30 s
+  apply wait therefore failed intermittently: the certificate order
+  failed, or the acme-dns `/update` endpoint answered 504. The wait now
+  scales with the renders the target servers have stored. Renders share
+  one worker slot, so it waits for the render already running plus one
+  per server, from the slowest recent render, plus 10 s. It never goes
+  below 30 s, so smaller groups are unchanged, and it is capped at
+  5 minutes for the built-in certificate client. `/update` is capped at
+  55 s, because it waits inside an HTTP request and the web frontend
+  ends those at 60 s.
+
+- **Retrying a failed slot upgrade with the same image works again
+  (#1183).** Every supervisor reported the version `2026.05.14.1`, a
+  literal nothing ever updated, and the control plane read it to decide
+  whether an appliance could take the per-apply nonce that makes a
+  repeat apply fire. So no appliance got the nonce, and clicking Apply
+  again after a failed upgrade was silently ignored. The same version
+  made the Fleet upgrade panel tell every operator that their appliance
+  predated live progress reporting.
+  Both checks now read the appliance's installed OS version first,
+  since the code they depend on ships in the slot OS, and fall back to
+  the supervisor's. The supervisor reports the release it was built
+  from, stamped into its image, and the control plane now stores the
+  version from every heartbeat rather than only from registration,
+  which a registered supervisor never repeats. Versions are compared
+  by a shared helper rather than as strings, so the checks keep
+  working under SemVer (#1182). Nightly builds count as including
+  every release tagged before their build date. Dev builds are
+  unknown and keep the safe path. The threshold is now 2026.06.12-2,
+  the first release with the fix it tests for: 2026.06.12-1 was tagged
+  before it merged, and used to count as having it.
+
+- **Worker task failures now reach Diagnostics (#1193).** None had
+  been recorded since the feature shipped (#123); failures in API
+  requests always were. The Celery `task_failure` hook opened a sync
+  database engine on a `postgresql://` URL, which needs psycopg2, and
+  the backend ships only asyncpg. So every failure logged
+  `diagnostics_capture_failed_sync` and recorded nothing, and because
+  the hook swallows its own errors, nothing else noticed. It now runs
+  the api's capture code on a fresh asyncpg engine, on a short-lived
+  thread of its own.
+
+- **The worker renders DNS agent bundles again (#1197).** #1170's merge
+  of main dropped three things #1122 had added to `app/celery_app.py`:
+  `app.tasks.agent_bundles` from the worker's `include` list, the
+  `bundles` route, and the 30 s render-missing sweep. A started worker
+  had no render task registered, so it discarded every render it was
+  sent ("Received unregistered task"), and beat never swept. Agents got
+  a DNS change only when the api's bounded inline fallback built the
+  bundle, 120 s after the change, and never with the fallback off; after
+  an upgrade, an agent-based server last rendered by the previous
+  release was served nothing new until a change marked it and those
+  120 s had passed. All three are back. A test now starts a worker in a
+  fresh interpreter and fails when a task the code defines, or one beat
+  sends, is not registered in it.
+
+- **Five task modules were published to a queue no worker consumes
+  (#1200).** With `task_default_queue` unset, a task whose module has
+  no `task_routes` entry goes to Celery's default queue, `celery`, and
+  every deploy target's worker consumes only
+  `ipam,dns,dhcp,default,bundles`. `looking_glass`, `conformity`,
+  `prune_revoked_appliances`, `upgrade_orchestrator` and `dnsbl_sweep`
+  had no route. So the Looking Glass collector stale sweep and route
+  re-resolve, the conformity evaluator, the revoked-appliance prune and
+  the daily DNSBL sweep never ran, and a rolling upgrade run started or
+  resumed through the api was enqueued to a list nothing reads. All
+  five now route to `default`. Messages already stranded on `celery` are
+  not replayed; `DEL celery` in the broker's Redis database (1 by
+  default) removes them. A test fails when a task routes to a queue the
+  worker does not consume.
+
+- **Typed webhook events and audit forwarding were lost for anything a
+  Celery task committed (#1168).** Two faults. The worker never loaded
+  `event_publisher`: session listeners register on import, and only the
+  api imported them. And loading it was not enough. Both it and
+  `audit_forward` handed their after-commit work to a bare
+  `loop.create_task`, and in a Celery task that loop is the task's own
+  `asyncio.run`, which cancels pending work when the task returns. A task
+  usually commits last. Measured on a scratch database, five task-shaped
+  `backup_target_run_failed` commits wrote 0 of 5 outbox rows (5 of 5
+  with the fix). So scheduled backups and rolling upgrades sent no
+  `system.backup_*` / `system.upgrade.*` webhooks, and syslog/webhook
+  audit forwarding lost what tasks wrote last. Both processes now
+  install one listener list (a guard fails when a new listener module
+  isn't on it). In Celery processes the after-commit work runs on a
+  per-process background loop, switched on from `worker_init` /
+  `beat_init` and started lazily per PID for prefork children.
+
+- **The worker's liveness probe no longer loads every model (#1189).**
+  The session listeners, now including the DNS bundle dirty-mark from
+  #1111, were installed when `app.celery_app` was imported, and the
+  worker's liveness probe (`celery -A app.celery_app inspect ping`,
+  10 s timeout) imports it on every run. That pulled in the models,
+  the DNS drivers, httpx, cryptography and jinja2: 1,002 modules
+  against 744, and under load a three-node cluster's worker missed the
+  probe 14 times in 28 minutes and restarted once. They are installed
+  from `worker_init` / `beat_init` now, which the prefork pool
+  inherits, and a test fails if a bare import loads them again.
+
+- **Two appliances in one Kea HA group could not reach each other
+  (#1167).** Kea's HA hook listens on the port in each member's own
+  `ha_peer_url`, and no appliance firewall layer opened it under the
+  `input` chain's drop policy. The control plane now puts the port and
+  the group's other Kea members' addresses on the role assignment:
+  the IP in the member's URL, else its appliance's node IPs, else its
+  agent's last address. All three firewall renderers open the port to
+  exactly those sources, never to `any`, because Kea's HA API is
+  unauthenticated by default and accepts lease updates. The rule
+  follows the HA hook's own readiness rule, so the port is open
+  exactly while Kea listens. Also fixed: TOPOLOGIES.md and DOCKER.md
+  told operators to set `ha_peer_url` to the *other* peer's URL. It is
+  each server's *own* listener URL.
+
+- **A looking-glass node lost TCP 179 when fleet firewall enforcement
+  was on (#1166).** Only the supervisor's own renderer opened BGP for
+  the role. The backend port table had no entry and no builtin policy
+  existed, so under enforcement every session the router initiated
+  was dropped. The byte-identity test had no looking-glass case to
+  catch it. Now all three renderers carry it: seed migration
+  `b8e2d5c07a14`, plus two looking-glass cases in the test matrix.
+
+- **Relayed DHCPv6 never reached Kea on the appliance (#1139,
+  #1140).** Two faults in series, so fixing either alone changed nothing.
+  **The firewall:** the `dhcp` role opened UDP 67/68 only, and kea-dhcp6
+  has no raw-socket mode, so every DHCPv6 packet hit the `input` chain's
+  drop policy. The role now opens **547** in all three firewall renderers
+  and the builtin DHCP fleet policy (seed migration `e6b2f07a3c91`). The
+  base config gains the host's own DHCPv6-client return
+  (`udp sport 547 dport 546`) beside the v4 one. **The socket:** with
+  `interfaces: ["*"]` kea-dhcp6 binds link-local and `ff02::1:2` only, and
+  a relay sends its Relay-Forward to the server's global address. The Kea
+  agent now adds an `iface/address` entry per stable global IPv6 address
+  on the host, for groups with v6 scopes. The addresses are detected, not
+  configured, because (measured on Kea 3.0.3) an entry naming an address
+  the interface doesn't hold makes kea-dhcp6 refuse its whole config. For
+  the same reason the agent re-renders whenever the host's address set
+  changes.
+
+- **Every Kea-sourced IPAM row read "Seen: Never" (#1141).** The lease
+  pull path stamped `last_seen_at` on the rows it mirrors; the agent's
+  lease-event path never did. Both do now.
+- **A BIND9 zone's apex comes from the zone — its Primary NS, Admin
+  Email and NS records — instead of a name server at 127.0.0.1
+  (#1153).** The BIND9 agent opened every zone file, reverse zones
+  included, with the same apex: `SOA ns1.<zone> admin.<zone>`,
+  `NS ns1.<zone>` and the glue `ns1 A 127.0.0.1`. A zone's
+  `primary_ns` and `admin_email` were stored and editable but never
+  reached the agent, so editing them changed nothing on the wire,
+  and a zone's own NS records were served *beside* `ns1.<zone>`.
+  Every zone therefore told any resolver following its NS set to
+  query loopback. Both fields now reach the agent. The NS set is the
+  zone's own NS records at `@` when it has any (what the delegation
+  wizard copies to the parent); else its Primary NS, when that can
+  resolve (outside the zone, or inside it with an A/AAAA record in
+  the zone); else, as the last resort, the old placeholder — logged
+  as the warning `bind9_zone_apex_ns_is_loopback`. The SOA MNAME is
+  the Primary NS (else the first NS record), the RNAME the Admin
+  Email. The placeholder glue is never served beside an address the
+  zone holds for `ns1` itself. Editing Primary NS or Admin Email
+  bumps the zone's serial, so secondaries transfer the new apex. A
+  zone that sets none of this renders exactly as before; the zone
+  payload gained two fields, so every agent re-renders once after
+  the upgrade and reloads only the zones whose apex changed.
+
+- **Local-volume backups landed in each container's own filesystem
+  (#1160).** The release `docker-compose.yml` left the
+  `spatium_backups` volume commented out on the api and the worker,
+  and the chart mounted nothing at `/var/lib/spatiumddi/backups`, the
+  path a `local_volume` target suggests. The path is still writable,
+  so the connection test passed and every run reported success — but
+  scheduled runs execute in the worker, so the api never listed their
+  archives (no download, no restore from the UI), and every archive
+  was lost at the next container recreate, each upgrade included.
+  Compose now mounts `spatium_backups` on both services; the appliance
+  mounts a `/var/lib/spatiumddi/backups` hostPath on both pods, which
+  firstboot hands to the pods' uid. On a multi-node appliance that
+  directory is per node, like the packet-capture store: an archive is
+  listed by the api on the node whose pod wrote it; a network
+  destination is the cluster-wide choice. Test connection now warns
+  when a local-volume path is not on a mounted volume, which covers
+  every other deployment shape. Restore's pre-restore safety dump,
+  written to the same path, now survives too.
+  **Operator action on a Compose upgrade:** archives written before
+  it exist only inside the running api and worker containers; copy
+  them out before the upgrade recreates them —
+  `docker compose cp api:/var/lib/spatiumddi/backups ./backups-api`,
+  and the same for `worker`.
+
+- **Console copy described shipped features as future work
+  (#1161).** Administration → Backup said destinations beyond a local
+  volume would come "once those drivers ship" above an Add target
+  list of ten, and its "Security model — Phase 1a" note told operators
+  to carry `SECRET_KEY` across installs by hand, which restore's
+  secret rewrap has done for them since it shipped (the note now says
+  what happens if that rewrap stops part-way). AI Providers said the
+  Anthropic, Gemini and Azure drivers "ship in Phase 2"; Kubernetes
+  said its reconciler had not shipped; the Web UI certificate card
+  said an activated certificate is not served yet, when activation
+  deploys it to nginx. Development-phase labels are gone from the
+  appliance, DNS, multicast and VRF pages, the Appliance Operator
+  role's description and five Copilot tool descriptions, and the
+  README counts ten destination kinds. Two guards keep it that way:
+  a Vitest check over every string and JSX text in the frontend, and
+  a backend test over the built-in role and Copilot tool
+  descriptions.
+
+- **A subnet that inherits its DNS now gets its reverse zone
+  (#1149).** Getting Started promises the matching `in-addr.arpa` /
+  `ip6.arpa` zone once a subnet has an effective DNS group or zone,
+  but subnet create decided from the request body and the subnet's
+  own columns only — so a subnet left on **Inherit from parent** (the
+  console's default, which sends no DNS fields at all) never got one,
+  and no address in it ever got a PTR. The per-allocation catch-up and
+  the reverse-zone backfill (the first step of **Sync DNS**) had the
+  same blind spot. All three now fall back to the DNS the subnet
+  inherits from its block or space when it names none of its own. A
+  subnet with its own binding resolves exactly as before,
+  `skip_reverse_zone` still opts out at create, and the #844 refusal
+  to share a reverse zone with an overlapping subnet in another IP
+  space applies however the group was found. An existing inheriting
+  subnet gets its reverse zone on its next allocation or **Sync DNS**.
+
+- **A new subnet no longer starts "1 DNS record out of sync"
+  (#1150).** Subnet create adds the network, broadcast and gateway
+  placeholder rows and never published the gateway's PTR, so under a
+  reverse zone every new subnet opened with the gateway's PTR missing
+  — the drift banner on day one, and `gateway.<zone>` unresolvable in
+  reverse until someone ran **Sync DNS**. The gateway's PTR is now
+  published at create (still no forward `gateway.<zone>` A record, by
+  design), into the subnet's auto-created reverse zone or whichever
+  reverse zone covers it; `skip_reverse_zone` still creates no zone.
+  The subnet planner's apply built the same placeholder and ran
+  neither DNS step; a planned subnet now gets its reverse zone and
+  gateway PTR at apply, the same as one created directly.
+
+- **Purging a subnet takes its DNS records off the wire (#1151).** A
+  subnet's addresses cascade away when it is deleted for good, but
+  `dns_record.ip_address_id` is `SET NULL`, and neither Trash purge —
+  **Delete permanently** in Trash, or the daily sweep after the
+  retention window — withdrew anything first. Every A record IPAM had
+  published for those addresses (and their PTRs in a reverse zone a
+  sibling subnet kept, extra-zone records and aliases) stayed in its
+  zone, ownerless, and BIND kept answering for addresses IPAM no
+  longer had. Both paths now withdraw every auto-generated record of
+  the subnet's addresses through the record-op queue before the
+  delete, and wake the agents; the direct permanent delete
+  (`?permanent=true`), which withdrew only each address's primary A,
+  does the same. Only what is really going is touched: records made
+  by hand stay, a sibling subnet's records stay, and a subnet still
+  inside the retention window — or restored from Trash — keeps every
+  record. Records already orphaned by an earlier purge are not swept
+  up automatically; **Sync DNS** on a subnet whose zones hold them
+  lists them as stale and withdraws them.
+
+- **The subnet delete dialog says what a delete does (#1152).** Its
+  Danger zone text said the subnet's IP address rows are removed;
+  they are not — the addresses you allocated stay with the trashed
+  subnet, come back on restore, and their A/AAAA records keep
+  resolving while it sits in Trash — and the confirmation step named
+  only the subnet and its DHCP scopes. Both now say what happens:
+  the subnet, its scopes and the reverse zone created for it move to
+  Trash; DHCP lease and reservation addresses are removed at once
+  with their DNS records (reservations return with their scope);
+  purging the subnet deletes its addresses and withdraws their DNS
+  records. Copy only — what a trashed subnet should publish is
+  unchanged.
+
+- **firstboot no longer runs the words of its own #1042 comment as
+  commands (#1132).** `_render_control_helmchart` writes the
+  `spatium-control` HelmChart through an unquoted here-document, so
+  the shell expands everything inside it, and the #1042 comment there
+  wrapped ten words in single backticks. `/bin/sh` ran each one as a
+  command substitution, as root, on every boot: ten `...: not found`
+  lines per boot in `/var/log/spatiumddi/firstboot.log`, and the
+  comment reached the live HelmChart with those words deleted. No
+  command by those names is on the appliance's `PATH`, so nothing
+  ran. The words are now quoted, so the comment renders as written
+  and the HelmChart object is unchanged. A new test renders the chart
+  under dash and scans every unquoted here-document in firstboot for
+  a backtick substitution.
+
+- **A Kea lease in the "released" state was mirrored as active
+  (#1077).** Kea 3.0 writes CSV state `3` for a lease the client
+  released; the DHCP agent's state map knew only `0`–`2` and fell
+  through to `active`, so a released lease kept its IPAM mirror row
+  (and DDNS records) alive until it expired. It is now sent as
+  `released`, which the ingest already treats as not active.
+
+- **Newer agents keep working against an older control plane
+  (#1077).** The heartbeat and lease/MAC-sighting request models are
+  `extra="forbid"`, so a pre-#1077 control plane 422s the new `spool`
+  and `batch_id` fields — and the spool classifies a 422 as a verdict
+  on the body and drops it. Both agents re-send once without the
+  field when the 422 names it, and remember not to send it again, so
+  an agent upgraded ahead of its control plane neither goes stale nor
+  silently discards lease batches. Order of upgrade still recommended:
+  control plane first.
+
+- **Two Windows DHCP servers in one server group no longer end up
+  handing out the same addresses — and failover relationships can be
+  managed from SpatiumDDI (#1110).** SpatiumDDI had
+  no model of a Windows failover relationship. The write-through sent
+  every scope, pool and reservation write to EVERY Windows member of
+  the group, create-or-update: a new scope landed on both servers,
+  and an edit to a scope one server held quietly CREATED it on the
+  other. Two DHCP servers, the same range, no coordination — while
+  both writes returned success, both servers showed the scope, and
+  the UI showed one scope on one group.
+  **Windows failover relationships are now read** —
+  `Get-DhcpServerv4Failover`, on the existing topology poll — along
+  with which scopes each Windows server actually holds, and shown on
+  the group (a *Windows DHCP failover* panel), as a column in the
+  scopes table and as a strip on the IPAM subnet's scope card. REST:
+  `GET /dhcp/server-groups/{id}/failover` and
+  `GET /dhcp/scopes/{id}/failover`. The shared secret is never read.
+  **On a group with two or more Windows members, a write now probes
+  every member live and goes only to the members that hold the
+  scope, update-only** — the "never create it here" check runs in the
+  same PowerShell as the write. A NEW scope goes to ONE member, by
+  the scope's *Windows placement*: into a failover relationship
+  (created on one side and added to it, so Windows copies it to the
+  partner) or on one server only. Without a placement, the one
+  relationship the members share is used; otherwise the create is
+  refused (422) with the choices listed. Activating a scope held by
+  several members that no relationship covers is refused (422).
+  Deleting a scope a failover pair in the group covers takes it out
+  of the relationship on one side (Windows deletes the partner's
+  copy) and deletes it there; a scope whose partner is outside the
+  group is refused (409), because that step deletes a copy on a
+  server SpatiumDDI does not manage. Reservations and exclusions need
+  no probe: the driver skips a member without the scope, and only
+  "no member holds it" is refused.
+  **Relationships are managed from the group's panel** — create,
+  edit, delete, add and remove scopes, and replicate one partner's
+  configuration over the other's — and from REST routes under
+  `/dhcp/server-groups/{id}/failover/relationships` (superadmin,
+  audited, the shared secret never stored, logged or audited). Every
+  `*-DhcpServerv4Failover*` cmdlet runs on one server and acts on its
+  partner from there, so it needs the WinRM logon to make the
+  PowerShell "second hop": only CredSSP can, and any other transport
+  is refused (422) before anything is sent. Where a cmdlet runs is
+  also what it does to the other server — a create or add COPIES the
+  scope from the holder, a removal DELETES the partner's copy and the
+  operator picks which side keeps it, and a load-balance share or
+  hot-standby role is the value of the side it runs on, so an edit
+  names that side (left to pick one itself, the same request could
+  make both partners Active). The first cut shipped every op in one
+  PowerShell script that encoded to ~12,700 characters against
+  WinRM's 7,800-character command-line budget — every call would have
+  been refused before it was sent; a test now pins every op, with
+  maximal inputs, under the budget, and long scope lists go in
+  chunks.
+  **Split scopes are protected.** SpatiumDDI writes one range and one
+  set of exclusions to every server holding a scope, so a new range,
+  or removing an exclusion, could merge two servers' disjoint halves
+  into the outage. Those writes are now simulated per holder and
+  refused (422) when the halves would overlap; everything else goes
+  through.
+  **Kea and Windows servers can no longer share a group** (422 on
+  server create / move): Kea serves every active scope of its group
+  and cannot coordinate with Windows failover. An existing mixed
+  group is flagged on the panel and its shared scopes are reported
+  uncoordinated.
+  **New default-on alert rule, *DHCP scope served uncoordinated***
+  (`dhcp_scope_uncoordinated`, critical): one event per scope two
+  servers serve without coordinating — silent everywhere else, and
+  the only signal there is, since both servers report the scope
+  healthy.
+  **This deliberately deviates from the issue's plan**, which was to
+  write a covered scope to ONE partner and "let Windows replicate".
+  Windows replicates LEASES between failover partners continuously
+  but not CONFIGURATION: option values, exclusions and reservations
+  move only when someone runs `Invoke-DhcpServerv4FailoverReplication`
+  or the console's *Replicate Scope* (Microsoft's own DHCP-team post
+  on this is the reason its auto-sync tool exists). Writing one
+  partner would leave the other serving stale reservations after a
+  failover. Microsoft's IPAM writes both partners, and so does this;
+  replication is offered as an explicit action for drift made in the
+  DHCP console.
+  **The topology poll stopped undoing itself.** Each Windows member's
+  pass merged its own view of the group's scopes — so two partners
+  that disagreed about one reservation (the ordinary state of two
+  servers that do not sync configuration) created it and
+  absence-deleted it again on every poll, along with its IPAM mirror
+  and DNS records. One member now imports each shared scope — the
+  lowest-named member whose last read is under 15 minutes old, so an
+  unreachable partner cannot freeze a scope — and the others are
+  compared against it: a differing configuration hash is reported as
+  drift instead of fought over.
+  **Shared lease teardown waits for the last peer.** A failover or HA
+  pair reports every lease once per partner, but the IPAM mirror and
+  its DDNS records are one row and one A/PTR. `purge_lease`, the
+  expiry sweep and the Kea release/expire event all tore them down
+  when ONE partner stopped reporting the lease — the other's next
+  poll recreated both, so DDNS flapped. They now wait while another
+  server in the same group holds an active, unexpired lease on the
+  address. Scope deletion is exempt, since every copy goes at once.
+  **Found on the way, in the Kea lease-event handler, and fixed
+  because the guard depends on it:** the lookups compared the event's
+  string address with the stored `IPv4Address` (asyncpg decodes INET
+  natively) and never matched. Every renewal event INSERTED another
+  `dhcp_lease` row for the same lease instead of updating the one it
+  had, and a release found no stored IPAM mirror, so the mirror and
+  its DNS records outlived the lease until the expiry sweep. The test
+  client's shared session hid both — the identity map handed the
+  handler the objects the test built, strings and all — so the new
+  tests reload from the database between requests, as production
+  does.
+  **Single-member groups keep the old scope write** (no probe,
+  create-or-update), with three changes to the failure path: a scope
+  delete probes first, so a failover scope gets the explanation
+  rather than Windows' raw error; deleting a scope already gone from
+  the server is now a no-op instead of a 502 that made the scope
+  undeletable in SpatiumDDI; and a reservation for a scope the server
+  does not have is a 409 that says so.
+  1 MCP tool (`find_dhcp_failover_relationships`, read-only, default
+  on); deliberately no `propose_*` write tool — the management routes
+  create and delete scopes on the partner and carry the shared
+  secret — and not a feature module (it extends existing DHCP
+  resources). **Not yet verified against a live
+  Windows failover pair:** the exact JSON `Get-DhcpServerv4Failover`
+  returns, whether it errors or returns nothing on a server with no
+  relationships, and whether `DHCP Users` may run it. The parser
+  reads a failed or unrecognised response as *unknown*, never as
+  *no relationships*, and the write-through refuses rather than
+  guesses on unknown. The management cmdlets follow Microsoft's
+  documented parameters and have not been run against a real pair
+  over CredSSP yet either.
+- **Choosing the CredSSP WinRM transport failed on every call.** The
+  server form has offered it for years, but `requests-credssp` — the
+  library pywinrm imports for it — was never installed, so pywinrm
+  raised before connecting. Now a dependency (MIT; `NOTICE` and
+  `docs/THIRD_PARTY.md`), because #1110's relationship management
+  needs it. Kerberos was in the same position (the images carry no
+  GSSAPI stack) and is no longer offered — see #1128 under Changed.
+- **The docs still described the pre-#631 dynamic-pool guard
+  (#1162).** Getting Started §9 said allocating inside a dynamic pool
+  "is refused", and IPAM.md's status line and allocation-UI notes said
+  a 422 answers it with the submit button disabled. Since #631 a
+  manual allocation there answers a force-overridable `409`
+  (`requires_confirmation`, a `dynamic_pool` warning naming the pool)
+  and the modal offers **Allocate anyway**; the docs now say so, as
+  IPAM.md's own rules table always did. DHCP.md's conflict list still
+  said a reservation inside a dynamic pool is refused until the pool
+  excludes it — #631 removed that 409, and its "exclude it first"
+  advice was the harmful part; the list now says in-pool reservations
+  are allowed. §9 also says what New Scope pre-fills, including its
+  suggested initial pool (the tenth host address to the last usable
+  one), and its worked example now replaces that suggestion: kept, the
+  dynamic pool would take in `10.20.21.10`, the address step 10
+  allocates, and step 10 would stop to ask for confirmation.
+
+- **A DHCP scope created from its subnet keeps the subnet's gateway
+  as Routers (option 3) and gets the suggested pool (#1154).** The
+  New DHCP Scope dialog pre-fills Routers and a pool from the subnet,
+  and the DNS, domain, NTP and lease-time defaults from Settings —
+  but one latch covered both and fired on whichever query answered
+  first. The Dashboard caches the settings, so on the ordinary path
+  (Dashboard → IPAM → subnet → DHCP Pools → Create Scope) Routers and
+  the pool stayed empty, and a scope saved as shown handed out leases
+  with no default gateway; a hard reload lost the Settings defaults
+  instead. Each half now applies when its own query answers, never
+  over a value already there. A subnet picked in the dialog
+  pre-fills the same way (picking another replaces only what the
+  dialog filled in), and an IPv6 subnet no longer puts its gateway in
+  the DHCPv4-only option 3.
+
+- **A read-only operator is no longer offered IPAM and DHCP-scope
+  writes that end in "Permission denied" (#1155).** Every user saw
+  the same controls as a superadmin: New IP Space and Import subnets
+  in the IPAM tree; Edit, Add block, Add Subnet, New Subnet, Add child
+  block, Allocate IP, Import IP addresses and the Tools menus' Bulk
+  allocate, Clean Orphans, Merge, Resize, Split, Move and Scan with
+  nmap in the space, block and subnet headers; Create Scope, Add Pool
+  and the scope and pool edit, delete and enable controls in a
+  subnet's DHCP tab. A Viewer filled in the form and met the refusal
+  at submit. Each is now disabled, with the missing permission as its
+  tooltip, unless the caller holds the write the server asks for
+  (`usePermissions`, which already gated the address rows). The
+  server stays the enforcement point.
+
+- **Every hand-built dialog is announced as a dialog (#1156).**
+  Seventeen dialogs drew their own card instead of using the shared
+  `Modal`: the IPAM tools (Find free space, Split, Merge, Resize, Bulk
+  allocate, Move block, DNS Sync, the address detail, both imports),
+  Factory reset, the backup restore and destination forms, the
+  custom-field and auth-provider editors and the custom-field delete
+  confirm, and the nmap and packet-capture confirms. None had
+  `role="dialog"`, `aria-modal` or an accessible name, their close
+  buttons had no name, and page code that checks for an open dialog
+  could not see them — so **?** opened the shortcuts overlay on top of
+  them. They now take the shared `Modal`'s contract from one hook,
+  `useModalDialog`: named by their heading, modal, focus kept inside,
+  Esc to close, and a named close button (the two backup forms gain
+  one). Their layout is unchanged.
+
+- **A boot with the control-plane PriorityClass missing no longer
+  loops the control plane (#1123).** `spatium-control-plane` is
+  rendered by the `spatium-bootstrap` release, and firstboot's
+  degraded path (#983) released the control chart without it when
+  it was absent — but that release's own CloudNativePG operator
+  names the same class, and nothing degraded it. Once the operator's
+  pods had to be re-created (a cluster node loss evicts them within
+  ~20 s; a drain or a pressure eviction does it on one node), its
+  ReplicaSet was refused at admission, `cnpg-webhook-service` had no
+  endpoints, the unranked control chart's `Cluster` was refused by
+  that webhook, and helm-controller's `reinstall` policy uninstalled
+  and reinstalled `spatium-control` on every retry: the Web UI never
+  came up, unranked or otherwise. firstboot now has
+  `spatium-bootstrap` put the class back before it releases the
+  control chart — on an explicit NotFound, with the release
+  `deployed` and its helm-install Job completed, it re-runs that
+  Job (the lever `spatiumddi-helm-stuck-recover` already uses; a
+  running or retrying Job is left to helm-controller), waits up to
+  3 min for the class, then re-queues every ReplicaSet, StatefulSet and
+  DaemonSet in `spatium` with a metadata-only annotation so the
+  creates the apiserver refused are retried now rather than on the
+  controllers' exponential backoff (up to ~16 min). Releasing the
+  control chart unranked stays as the fallback when the class does
+  not come back.
+
+- **DNS agent: `noerror` counted every authoritative NXDOMAIN answer too
+  (#1116).** The poller derived the rcode breakdown from BIND's nsstat
+  answer classes and read `noerror` from `QryAuthAns` + `QryNoauthAns` —
+  every authoritative / non-authoritative response whatever its rcode —
+  so an authoritative NXDOMAIN answer was counted under `noerror` as well
+  as under `nxdomain`, and the dashboard's breakdown summed to more
+  answers than the daemon sent (50 NXDOMAIN answers on the QA fleet:
+  `QryAuthAns` +50, rcode `NOERROR` +0). `noerror`, `nxdomain` and
+  `servfail` now come from the server-level rcode table BIND publishes
+  (`NOERROR` / `NXDOMAIN` / `SERVFAIL`), read from the `<server>` element
+  only, since each view repeats those names as resolver counters; a
+  build without the table falls back to the nsstat classes that carry
+  exactly that rcode (`QrySuccess` + `QryNxrrset`, `QryNXDOMAIN`,
+  `QrySERVFAIL`).
+
+- **DNS agent: `queries_total` counted every query twice on BIND 9.20
+  (#1064).** The poller listed the opcode table's `QUERY` and the
+  nsstat family's `Requestv4`/`Requestv6` under one column so either
+  shape of `named` would light it up, then summed whatever it found —
+  and every current BIND publishes both, so `dns_metric_sample`
+  reported 2.00× the queries the daemon received (the DHCP sampler,
+  whose counters have one spelling, matched kea to the packet in the
+  same window). The spellings are now alternatives in order of
+  preference — the first one present is the value — and the
+  poller's tests carry a 9.20 sample with both. (`noerror` had the
+  same fold; it now reads BIND's rcode table instead — #1116, above.)
+
+- **The storage action route keeps its own answer through the
+  frontend (#1080).** `POST …/appliances/{id}/storage/action` waits
+  up to 90 s for the appliance's supervisor before its own 504, and
+  the supervisor waits 60 s for the host runner before reporting
+  "the host storage runner did not answer within 60s" — but the
+  frontend proxied every `/api/` route with a 60 s read timeout, so
+  nginx answered for the api at 60.000 s every time (its generic
+  "retry shortly" JSON; before #1087 the `405 Not Allowed` page the
+  issue was filed on) and neither message ever reached the operator.
+  Observed live on a single-node QA appliance with the runner's
+  `.path` unit stopped: through the frontend the client got 504 at
+  60.02-60.05 s while the supervisor's report reached the api 60.06 s
+  after the request, ~80 ms after nginx had cut it; the same request
+  made inside the appliance against the api Service answered 200 in
+  60.09 s carrying that report. The route now has its own `location`
+  in both nginx templates with a 120 s budget; `appliance/tests` read
+  the three budgets from source (proxy > route > supervisor) so they
+  cannot drift apart again.
+
+- **A DNS or DHCP agent that is up but not serving now shows as such
+  (#1067).** The agents have always carried a `daemon` object on every
+  heartbeat —
+  `{"status": "degraded", "reason": "start deferred, no bundle yet"}`
+  while a DNS agent waits for its first bundle (#1061), `ok` once the
+  daemon is up — and both heartbeat handlers declared the field and read
+  nothing from it, so a registered, heartbeating server whose `named`
+  never started read `active`, seen seconds ago, config ok, while its pod
+  restarted on the liveness probe every two minutes (measured for twelve
+  minutes on a nested three-node cluster). The state now lands on
+  `dns_server` / `dhcp_server` as `daemon_status`, `daemon_reason` and
+  `daemon_status_since` (the stamp of the heartbeat that began the
+  current state, so the row can say how long), is exposed on both server
+  responses, renders as a chip on the DNS and DHCP server rows and a
+  banner on the server detail, degrades the dashboard's health header,
+  and drives a new `agent_daemon_degraded` alert rule (seeded enabled,
+  critical) once a daemon that is not serving has outlasted a five-minute
+  grace. All of those read one server-side classification,
+  `daemon_not_serving` on both responses: a `degraded` that is the agent
+  echoing a failed config apply (`config_apply_*`, or the DHCP agent's
+  `dhcp4_config_rejected` / `dhcp6_…`) is #882's to report, so it neither
+  pages nor draws a red "not serving" chip beside the config-apply one
+  for a daemon that is up on its last-known-good config. NULL means never
+  reported — a pre-#1061 agent, or an agentless driver — and reads as
+  unknown, never healthy. The DNS agent also now reports `ok` once its
+  daemon is confirmed running instead of an empty object for the life of
+  the process. Migration `b7d21c9e4f06` adds the three nullable columns
+  and a partial index over the unhealthy states to both tables (expand
+  only). `agent_daemon_degraded` and #980's `dhcp_packets_dropped` are
+  also in the rule-type allow-list now: both were seeded and evaluated,
+  but `POST /alerts/rules` refused them with a 422 and the conformity
+  `alert_rule_enabled` check read them as not applicable. A test now
+  fails for the next rule type left out.
+
+- **A DNS agent held `pending_approval` can be approved through the
+  API (#1121).** `DNS_REQUIRE_AGENT_APPROVAL=true` holds a re-registering
+  agent whose fingerprint changed (a wiped agent volume legitimately
+  produces one): its config long-poll answers `pending_approval` and
+  never a bundle, so `named` stays deferred. Nothing cleared the hold —
+  `ServerUpdate` has no approval field and the DNS router had no
+  approve route, while DHCP has had `POST /dhcp/servers/{id}/approve`
+  all along — so the only recovery was a database write or deleting
+  and re-registering the server.
+  `POST /dns/groups/{group_id}/servers/{server_id}/approve`
+  (superadmin) now mirrors the DHCP endpoint: clears the flag, writes a
+  `dns.server.approve` audit event, wakes the agent and returns the
+  server row. Idempotent. The DNS server modal still only shows the flag
+  (the DHCP page has an Approve control); the UI control is follow-up
+  work.
+
+- **The appliance kubelet now evicts on memory before the kernel's OOM
+  killer does (#1124).** k3s's kubelet defaults carry disk eviction
+  thresholds only, so memory exhaustion went straight to the kernel's
+  global OOM killer, which picks by `oom_score_adj`: on a QA node it
+  killed the api's uvicorn while a runaway pod was the cause.
+  `config.yaml` now passes `memory.available<512Mi` (restating k3s's disk
+  floors, since `--eviction-hard` replaces the whole map), a 30 s
+  pressure-transition period instead of 5 min, and
+  `kube-reserved=memory=1Gi` plus `system-reserved=memory=512Mi`, so the
+  kubelet evicts by PriorityClass first. **Upgrade note:** those settings
+  set aside 2 GiB on every node, and pods are scheduled only into the
+  rest. A control plane now needs at least 4 GiB of RAM and a DNS / DHCP
+  appliance at least 3 GiB; a smaller box upgraded to this release comes
+  back with its pods `Pending` on `Insufficient memory`. The recommended
+  sizes (8 GiB control plane, 4 GiB DNS / DHCP) are unaffected.
+
+- **The database's memory limit is sized from the node, with the api
+  and the worker (#1115).** The supervisor sizes the api and worker
+  limits from the node's RAM (#947) and firstboot renders the same
+  numbers into the spatium-control HelmChart (#1003), but the
+  CloudNativePG cluster kept the chart's BYO default of `1Gi` (with
+  `shared_buffers: 256MB`, sized for the same gibibyte) on every
+  appliance whatever the node had. Under a bulk record load the
+  primary hit that cap, the kernel OOM-killed it, CloudNativePG
+  failed over, and every write in the failover window was lost — on
+  a 12 GiB seed with 7.6 GiB free (observed live on a seven-node QA
+  cluster: 93,000 of 1,000,000 records created; the same load
+  completed with zero database restarts once the cap was raised).
+  The three workloads are now one whole-node budget rather than
+  three independent fractions: a 2 GiB reserve for the platform
+  (k3s, the supervisor, the bind9/kea DaemonSets, the CNPG
+  operator — about 1.7 GiB measured on an idle 6 GiB appliance),
+  then the remainder split api one half, worker one quarter,
+  Postgres one quarter, clamped to 1–8, 1–4 and 1–4 GiB, with
+  `shared_buffers` a quarter of the Postgres cap (Postgres' own
+  guidance; the chart's 256MB-of-1Gi is the same ratio). On 8 GiB
+  that is api 3072Mi / worker 1536Mi / Postgres 1536Mi; on 12 GiB
+  5120 / 2560 / 2560; on a 6 GiB appliance every share sits on its
+  floor and Postgres stays at 1024Mi. The api and worker limits are
+  therefore lower than before on nodes under 16 GiB (an 8 GiB
+  node's api was 4096Mi, now 3072Mi): limits are ceilings, and the
+  sum of the three now fits the node beside the reserve instead of
+  exceeding it. The reserve, the shares and the caps are one table
+  in `k8s_api.control_plane_sizing`, mirrored in firstboot and held
+  together by `test_control_plane_sizing.py`; they are the knob to
+  turn if a workload needs a different split. firstboot renders the
+  Postgres sizing into the HelmChart so a fresh install's Cluster is
+  created with it — a resources change on a formed cluster is a
+  CloudNativePG rolling restart, replicas first, then a switchover —
+  and an appliance that upgrades into this sizing takes that one
+  rolling restart on its first heartbeat, after which the #1005
+  guard keeps every later heartbeat quiet. The Postgres memory
+  request follows `shared_buffers` (never below the chart's `256Mi`):
+  CloudNativePG's admission webhook refuses a Cluster whose request
+  is below `shared_buffers`, and with the chart's request left alone
+  an 8 GiB node's `368MB` put the helm release in a failed state,
+  with k3s uninstalling and reinstalling the whole control plane
+  every few minutes.
+
+- **Drift and Sync with Servers work on groups with DNS views
+  (#920).** BIND chooses the view for a request by the requester's
+  address before it looks at `allow-transfer`, and a view's client
+  list never names the control plane. So on a group whose views are
+  scoped to real clients, every drift report and every sync failed
+  with "The peer didn't know the key we used" — for a key that was
+  loaded and granted — and where a broad view did match the api's
+  address, it answered with its own copy of a same-named zone. Each
+  rendered view now admits one key of its own, derived from the
+  group's TSIG key and never shown, and refuses every other view's;
+  drift and sync sign with the key of the view that holds the zone.
+  Every other request is matched to a view exactly as before. An
+  agent that predates this is still read with the group key, and the
+  report says when a comparison may come from another view.
+
+- **An agent-managed zone can read in sync, and Sync with Servers no
+  longer imports a record nobody made.** The BIND9 agent writes
+  `ns1 IN A 127.0.0.1` into every zone it serves, so BIND will load a
+  zone whose NS names an in-zone host. The drift report listed that
+  glue as extra on the server on every agent-managed zone, so none
+  ever read in sync, and every sync imported it into the database as
+  an ordinary record. It is now treated like the apex SOA and NS:
+  zone-level apparatus, left out of the comparison and the import —
+  unless the zone really holds that record, which is then compared
+  like any other. Found once the transfer in the entry above went
+  through.
+
+- **A dead-node replace no longer scales the database down (#1059).**
+  The replace endpoint drops the replaced row from the committed
+  control-plane count at once, so from the seed's next heartbeat —
+  the same tick that deletes the dead Node — until the replacement
+  was promoted, CloudNativePG's `spec.instances` read 3→2, and only
+  the promote restored it. CloudNativePG takes a smaller spec while
+  every instance pod still reads Ready (the dead node's does, for
+  the node-monitor grace) and then removes the highest-serial ready
+  non-primary instance, PVCs and all — the dead one by luck, or a
+  healthy replica on a live node; on a later tick it refuses, and
+  the smaller spec then only stops it re-creating the dead instance
+  until the promote (observed live on nightly-2026.09.13: Postgres
+  two of three for 860 s inside a green replace). A two-node
+  control plane is not a legal steady state, so a replace is never
+  a scale-down by intent. The eviction tick — which only a replace
+  produces — now arms a hold on the CNPG size that lasts until the
+  committed count is back (or the operator shrinks the control plane
+  on purpose), and `patch_cnpg_instances` defers any scale-down the
+  Cluster reports it cannot take (fewer ready instances than it
+  has) — logged as `cnpg_instances_scale_down_deferred` and retried
+  every tick, so a real demote lands on the first tick the cluster
+  is whole. Scale-up and the anti-affinity repair are untouched.
+
+- **PR-time Trivy lanes scanned a frozen package layer, and trusted
+  Trivy's exit code (#1093).** Four workflows build an image on a PR
+  and scan it — DNS, DHCP, looking-glass, supervisor. All four cache
+  on `type=gha`, and BuildKit keys a layer on its RUN text, so each
+  image's `apk upgrade` / `apt-get upgrade` was served from whenever
+  that scope was first written. Three of the four passed no snapshot
+  build-arg at all. Scanning that layer is wrong in **both**
+  directions: it misses a CVE the current index would flag, and it
+  keeps reporting one fixed weeks ago — telling the operator to do
+  something already done, which is #1029's class.
+  They also decided with `exit-code: "1"`. Trivy's "fixed" means the
+  distro's security database names a fix, not that the package is on
+  the mirrors yet, so that fails a PR on findings nothing could have
+  installed — the nightly-20260905 failure relocated to a lane that
+  blocks unrelated work. All four now emit JSON and hand the verdict
+  to `trivy-gate.sh`, which asks the image's own index whether each
+  fix is installable today: installable → fail, not yet → defer with
+  a warning, unverifiable → fail.
+  The Trivy action was also pinned off `@master`. An unpinned
+  third-party action is the same "tooling moves under us" class as
+  the unpinned `aquasec/trivy:latest` in #1095, and there it was
+  load-bearing: an unrecognised flag exits 1, which these lanes would
+  have read as findings.
+  Timed deliberately: the nightly (snapshot-busted) and the weekly
+  (uncached) had just scanned all nine images clean, so arming these
+  lanes could not newly break any PR.
+  **None of the four listed its own workflow file in `paths:`**, so
+  the PR rewiring this gate would have run none of them — the change
+  most needing the proof was the one that could not get it. They now
+  self-trigger, which `build-appliance-builder.yml` was already
+  doing, so this restores a convention rather than inventing one.
+
+- **`nightly.yml` filed a doubly-wrong failure report on a dry run
+  (#1094).** The failure step lacked the `dry_run` guard every
+  sibling side-effecting step carries, and hardcoded ``failed on
+  `main` ``. A dry run publishes nothing and prunes nothing, so one
+  that fails means a candidate build failed — the dry run doing its
+  job — not that the nightly is broken; and a dispatch takes `--ref`,
+  which is the whole point of a dry run. The #1090 dry run was on
+  `issue-1088` and would have filed exactly this had it failed. It
+  now skips on dry runs and reports `github.ref_name`.
+
+- **The weekly Trivy issue reported a CVE count and zero CVEs
+  (#1095).** #1092 is the worked example: it said the api image
+  had 5 HIGH/CRITICAL
+  fix-available vulnerabilities and contained no CVE identifier at
+  all. The scan captured `head -c 12000` of Trivy's *table* output,
+  whose Report Summary carries one row per scanned target — which
+  for that image is every `site-packages/*.dist-info/METADATA`
+  file. Measured: the full table is 107,220 bytes and the first
+  `CVE-` does not appear until byte **76,926**, so the cap could
+  only ever capture summary rows. Not a near miss; the detail
+  starts at 6.4x the cap. The report now renders from
+  `--format json`, which removes the truncation rather than
+  mitigating it — the same 34 findings come to 2,765 bytes against
+  107 KB — and gives severity, package, CVE, installed and fixed
+  version per row.
+  **`rc=1` no longer means "findings" on its own**, which is the
+  sharper half. An unrecognised flag ALSO exits 1 — verified
+  against Trivy 0.74.0 — and writes ~15 KB of usage text to the
+  captured stdout stream. The image is `aquasec/trivy:latest`,
+  unpinned, so a CLI change would have filed a security tracking
+  issue whose body was Trivy's help output, presented as CVEs. A
+  report that does not parse as a Trivy document is now a scan
+  error: never findings, and never a clean bill.
+  Truncation, if it happens at all, is capped by LINE and says
+  what it dropped — a byte cap can cut mid-row, and a partial line
+  still begins with `|`, so it would render as a malformed table
+  row instead of being dropped. Rows sort CRITICAL first, so a
+  truncated report keeps the worst findings. Also corrected the
+  footer, which sent readers to `make trivy` for `backend` and
+  `frontend` — neither is an agent image, and `backend` is the one
+  that actually reports findings.
 
 - **A DNS agent whose first config had not arrived yet exited 2 one
   second after logging `named_conf_missing_startup_deferred`, so every
@@ -4221,7 +3828,6 @@ the formatter handles the rest.
   umbrella chart's DNS agents gain the liveness probe the appliance
   chart already had (tcp :53, 30 s / 30 s), so a bundle that never
   comes is still a bounded restart on both charts.
-
 
 - **A replaced control-plane member's Postgres instance now comes
   back (#1058).** After a dead-node replace — the dead member evicted,
@@ -4768,8 +4374,824 @@ the formatter handles the rest.
   accumulates now, which for a loss counter is the difference
   between reporting the bad minute and losing it.
 
+- **The appliance's role chart never installed on a fresh install
+  (#992).** The appliance chart is installed twice per appliance, and
+  both releases rendered #988's PriorityClasses, so Helm refused the
+  second install whole: no DNS or DHCP DaemonSet ever reached the
+  cluster, silently. `spatium-bootstrap` now owns the classes alone.
+
+- **A healthy first boot no longer leaves a failed console unit or a
+  Warning event (#994).** `spatium-console@ttyS0` treats "no serial
+  device" as success, and the TLS Secret is placed only once its
+  namespace exists.
+
+- **The DNS zone detail header no longer clips `+ Add Record` (#996).**
+  Eleven header buttons collapse into `Data ▾` and `Zone ▾` menus on a
+  new shared `HeaderMenu` with keyboard support, and the header wraps
+  rather than clipping on a narrow window. `+ Add Record` gains a
+  keyboard shortcut, listed in the `?` overlay.
+
+- **A subnet's DDNS opt-in takes effect, and creating a subnet keeps
+  its DNS binding (#1065, #1066).** `ddns_enabled` was read only when
+  the subnet did not inherit DDNS settings, and the form never cleared
+  the inheritance, so the per-subnet switch did nothing. Turning it on
+  now makes the subnet's own DDNS settings the effective ones. A lease
+  DDNS cannot publish now logs `ddns_not_published` with the reason,
+  instead of `ddns_applied` with nothing applied. And
+  `POST /ipam/subnets` dropped the DNS group and zone it was given
+  (the field was declared twice), while a PUT stored them.
+
+- **An appliance keeps its address through a carrier loss (#1084).**
+  NetworkManager withdrew the address and default route the moment the
+  link dropped, so a cable flap or switch reboot turned into a k3s
+  crash loop on a cluster member until the link returned. The
+  interface now stays configured through the flap.
+
+- **A k3s restart no longer re-imports every baked image before the
+  kubelet starts (#1082).** k3s only skips an unchanged image tarball
+  when a `.cache.json` exists in its images directory, and nothing
+  created one, so every restart spent minutes importing ~20 tarballs
+  first. A member rejoining after a partition waited on it.
+
+- **The supervisor's storage-health thread no longer crashes at
+  startup (#1072).** It read a `verify_tls` field `SupervisorConfig`
+  does not have, so storage health was never reported on any
+  appliance.
+
+- **A fresh install no longer crash-loops the agent pods once (#1062).**
+  The supervisor's first apply created every agent DaemonSet before
+  any agent key had arrived, so each scheduled a keyless pod that
+  exited 2 before the keyed one replaced it. A DaemonSet is now
+  rendered only once its key exists; a role assigned without a key is
+  held back and reported instead of crash-looping.
+
+- **Refreshing RPKI ROAs no longer gets the worker OOM-killed
+  (#1054).** The global ROA dump (~100 MB, a million ROAs) was parsed
+  whole into ~460 MB of Python objects that a process never hands
+  back. It is now streamed, keeping only the ASNs asked for.
+
+- **The docs flag the control-plane VIP as broken where they tell you
+  to set it (#1105).** Setting a VIP currently leaves MetalLB never
+  converging (#1103, still open). `TOPOLOGIES.md` and `APPLIANCE.md`
+  say so, and `TROUBLESHOOTING.md` has a recipe for it.
+
+### Security
+
+- **A second provider of the same type can no longer sign in as another
+  provider's user (#1235).** External accounts were matched on
+  `(auth_source, external_id)`, and `auth_source` is the provider's
+  type, not the provider. On a miss, an account of the same type with
+  the same username was adopted. So with two LDAP domains or two OIDC
+  IdPs configured, whoever held `jsmith` in the second one signed in as
+  the first one's `jsmith`, superadmin flag and all; an identical OIDC
+  `sub` from two IdPs did the same without any username at all. Now an
+  external account belongs to one provider (`user.auth_provider_id`,
+  migration `f4a8c2e71d09`), a login matches on the provider and its
+  external id, and **an account is never adopted by username alone**:
+  a taken username is refused as `username_collision`.
+  - **Upgrade note.** The migration attributes existing accounts only
+    where it can prove the provider: RADIUS / TACACS+ external ids name
+    it, and an LDAP / OIDC / SAML account is attributed when its type has
+    exactly one provider **and** the account cannot have come from another
+    one: it was created after that provider, and after the last deletion of
+    any other provider of its type (read from the audit log, which must
+    also hold the surviving provider's own `create` row; an audit log
+    restored without its section attributes nothing). A disabled
+    provider counts: one enabled and one disabled provider of a type is two,
+    and links nothing. Anything else is left unlinked and is refused
+    (`account_link_required`) until an administrator links it from
+    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
+    audited as `user.provider_linked`). The Users page marks those accounts
+    **unlinked**, and `list_users` reports their provider as null.
+  - **A deleted provider's accounts are not handed to its successor
+    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
+    their identifier intact, so "one provider of the type exists now" did
+    not mean "only one ever did". An earlier draft of this fix linked such
+    an account to the surviving provider, both at upgrade and at sign-in,
+    so the survivor's subject with the same `sub` or DN signed in as it.
+    The backfill now checks the audit log as above, and the sign-in path
+    never links an unlinked account itself: it always refuses with
+    `account_link_required`, and the refusal's audit row names the account.
+  - **Behaviour change.** A user whose identifier at the provider changes,
+    such as an LDAP DN after an OU move, was re-attached by username and
+    is now refused until an administrator links the account again. The
+    link clears the stored identifier, and the next sign-in as that
+    username through that provider claims it; it also revokes the
+    account's sessions. Deleting a provider clears its accounts'
+    identifiers too, so a replacement provider of the same type that
+    issues the same `sub` or DN cannot adopt them. It also revokes their
+    sessions, and an administrator cannot delete the provider their own
+    account signs in through (409), which would lock them out.
+  - **SAML needs a stable NameID.** The NameID is the account's key at its
+    provider, and a transient one is new on every sign-in: it used to be
+    re-attached by username, which is the adoption this fix removes. A
+    transient NameID is now refused at the ACS with a message naming the
+    fix: configure the IdP to release a persistent or emailAddress NameID.
+  - On the password grant, a provider that accepts the password but whose
+    subject does not own the account no longer ends the login: the next
+    provider by priority still gets its turn, so a higher-priority
+    directory that also knows the user cannot lock out the account's
+    own provider.
+
+- **A started MFA enrolment is budgeted and expires (#1354).** The first
+  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
+  started enrolment never expired and survived sign-out and a password
+  change. So an abandoned enrolment stayed open to unlimited 6-digit
+  guesses from any of the user's sessions, and a hit turned MFA on with a
+  secret the user never saw, locking a local user out until an admin
+  reset it. Verify now spends the same fail-closed step-up budget as
+  begin, disable and regenerate (`429` when spent, `503` while it cannot
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
+  candidate secret's own Fernet timestamp.
+
+- **The api image no longer ships pip (#1392).** The runtime image
+  carried the Python base image's own pip 25.0.1, which has six fixed
+  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
+  only, so it never blocked on them, and `apt-get upgrade` cannot patch
+  pip because it is not a Debian package. So every scan at default
+  severity, such as Harbor's, reported them on every build. Nothing at
+  runtime runs pip, and a production image has no business carrying a
+  package installer, so the runtime stage now uninstalls it, and the
+  `dev` stage (pytest, `make ci-backend-lint`) restores it with
+  `ensurepip`. A Trivy scan of the runtime image now reports no
+  fixable Python-package finding at any severity.
+
+- **Setting up two-factor authentication needs a step-up (#1241).**
+  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
+  that decides whose authenticator the account trusts. A hijacked session
+  could enrol the attacker's: for an SSO superadmin that authenticator then
+  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
+  SNMP communities, provider secrets); for a local user it locks the real
+  owner out, since disabling MFA needs a code only the attacker has. A
+  local user now re-enters their password to start enrolling; an SSO user
+  must have signed in with their identity provider in the last 10 minutes,
+  and is told to sign out and back in otherwise. A token refresh now keeps
+  the session's original sign-in time rather than restamping it, so a
+  stolen session cannot refresh its way into looking recent; the session
+  viewer's "created" column now means when that person signed in. Refused
+  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
+  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
+  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
+  for a caller who already holds a session, so unthrottled each was a
+  password oracle for exactly the hijacked session the step-up exists to
+  stop. That budget fails closed: while Redis is unreachable the three
+  step-ups answer `503` with `Retry-After: 60`, because the account
+  lockout counts sign-in answers only and nothing else would bound the
+  guessing. Sign-in is unaffected.
+
+- **External accounts honour their state (#1242).** A **disabled** LDAP,
+  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
+  and a `login` / `success` audit row, before every later request was
+  refused. The check now runs before anything is issued or updated, answers
+  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
+  as `denied`. And **"must change password"** on an external account, which
+  has no password here to change, locked it out until an admin cleared the
+  flag: setting it, or resetting the password, on an external account is
+  now refused, and an account that already carries the flag is no longer
+  held to it.
+
+- **Remote agents verify the control plane's certificate by default
+  (#1220).** All five `docker-compose.agent-*.yml` files defaulted
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
+  the docs ran agents that trusted any certificate, and anyone on the
+  network path could read the platform-wide agent key (then enrol rogue
+  agents and pull TSIG keys) or serve the agent its DNS / DHCP
+  configuration. Worse, the skip was checked before `TLS_CA_PATH` in the
+  DNS, DHCP and looking-glass agents, so mounting the control plane's CA
+  as `DOCKER.md` said verified nothing either, silently. Now the files
+  default to `0` and pass `TLS_CA_PATH` through from `.env` (with a
+  commented CA volume to uncomment); `TLS_CA_PATH` wins over the skip;
+  and an agent logs `control_plane_tls` on every start while
+  verification is off, or while a skip is being ignored. The DNS agent's
+  seven hand-copied verify decisions are now one `httpx_verify()`, with a
+  test that fails if a copy reappears. `DNS_AGENT.md` named a
+  `CA_BUNDLE_PATH` variable no code reads; it is `TLS_CA_PATH`. The
+  in-stack `docker-compose.yml` agents talk plain `http://api:8000`, so
+  the flag was a no-op there and is removed. The looking-glass agent got
+  its first tests and now runs in CI's agent matrix.
+  **Upgrade note:** a remote agent relying on the old default against a
+  private-CA or self-signed control plane stops connecting after the
+  upgrade. Mount that CA and set `TLS_CA_PATH` (`docs/deployment/DOCKER.md`,
+  distributed agent prerequisites), or set
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` explicitly in `.env` to keep the old
+  behaviour in a lab. Appliance role pods and the supervisor are not
+  changed here; they are #1219.
+
+- **A backup archive named `..` can no longer delete the folder above
+  the archives (#1243).** The shared `safe_filename()` was
+  `os.path.basename`, and `basename("..")` is `..`. On a WebDAV target
+  `urljoin` turned that into the parent collection's URL, so
+  `DELETE /backup/targets/{id}/archives/%2E%2E` sent a recursive WebDAV
+  `DELETE` one level above the archives. Superadmin-only, but it
+  deletes data. `safe_filename()` now refuses an empty name, `.`, `..`,
+  anything with a `/` or `\`, and control characters, instead of
+  stripping (stripping also turned `a/b.zip` into `b.zip`, an archive
+  the caller never named). The seven drivers that carried their own
+  inline `basename` (S3, SCP, Azure Blob, SMB, FTP, GCS, WebDAV) now
+  all call it. The WebDAV URL percent-encodes the name as well, so a
+  name that arrives as `%2E%2E` is sent as a literal and never becomes
+  a dot-segment on a server that decodes before normalising.
+  The download, delete and restore-from-archive routes answer **422**
+  for such a name without reaching the destination, and also for any
+  name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
+  are the only names the listing ever shows, so any other name was
+  never offered by this API; the shared name pattern also stops
+  matching a name with a separator in it, so an object-store key under
+  a nested prefix is no longer listed as an archive nothing can then
+  download or delete, and the seven drivers that carried their own copy
+  of it now use the shared one. Thirteen download routes that built
+  `Content-Disposition` by hand now use `content_disposition()`, and an
+  uploaded upgrade image's filename, the one download name an uploader
+  controls, is stored as its last path component with control
+  characters removed, instead of verbatim.
+
+- **A client can no longer choose the source IP the API records
+  and rate-limits (#1221).** Compose published the API on every
+  interface, and the API believed `X-Real-IP` from any caller. nginx
+  overwrites that header, but a client talking to `:8000` directly set
+  its own. That bypassed the per-IP login throttle and the ACME
+  `allowfrom` gate, and wrote any address it liked into audit rows,
+  reopening #626 by another path. Now uvicorn runs with
+  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
+  `X-Forwarded-Proto` only when the real TCP peer is in the new
+  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
+  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
+  longer read at all. Compose also publishes the API on `127.0.0.1`
+  only (`API_BIND`). Browsers and remote agents already go through
+  the frontend, and the looking-glass collector's host networking
+  uses localhost. **Upgrade note:** if you reach `:8000` from another
+  machine, set `API_BIND=0.0.0.0`, and preferably narrow
+  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
+  whose nodes have public addresses, add them to
+  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
+  browser, as the client.
+
+- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
+  `SECRET_KEY` signs every session token and, unless
+  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
+  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
+  both shipped a committed placeholder, and the boot check only warned (and
+  did not recognise the k8s one at all). On such an install any signed-in
+  user could mint a superadmin token, since user ids are visible in the
+  audit log, and a database dump decrypted every stored LDAP, integration
+  and AI provider secret. Now the api refuses to start on either
+  placeholder, on a key under 32 characters, or on one that reads like a
+  placeholder, and says how to generate a key and how to move an existing
+  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
+  instead; `docker-compose.dev.yml` sets it and nothing else should.
+  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
+  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
+  falling back to a different key. Helm and the appliance already generate
+  their own keys and are unaffected.
+  **Upgrade note:** an install that has been running on the placeholder
+  stops at boot. Follow "Rotating `SECRET_KEY`" in
+  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
+  with a one-off Job in `k8s/ops/`): set a new key, then run
+  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
+  starting the api. It re-encrypts every stored credential for the new key
+  (the same walk a cross-install restore uses), is idempotent, and records
+  an audit row; everyone signs in again. Deliberately not "generate a key
+  on first start": compose could only persist it in Postgres, next to the
+  credentials it protects, so a dump would decrypt them anyway. Because
+  anyone could have signed requests on a placeholder key, the doc also
+  says to review API tokens, users and the audit log afterwards.
+  Also: an access token that names no session (`jti`) is refused. Every
+  login has minted one since `2026.05.07-1`, so such a token can only be
+  forged, and it also escaped force-logout. The session a token names must
+  also belong to the token's user, or a forger could pair their own live
+  session with a superadmin's id. And force-logout now reaches
+  the nmap scan stream, which checked its own token without looking at
+  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
+  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
+  the placeholder.
+
+- **Appliance supervisors verify the control plane's TLS certificate
+  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
+  the supervisor unconditionally, calling it trust-on-first-use, and nothing
+  was pinned: every register, heartbeat and proxy poll ran with no
+  verification at all. The heartbeat response carries the platform-wide DNS
+  and DHCP agent keys and the slot image URL plus the sha256 that is its only
+  integrity check, so anyone on the path could read the keys and serve a node
+  a root filesystem of their choosing. Now the supervisor pins the
+  certificate the control plane presents at first contact and verifies every
+  connection against it in the TLS handshake (a self-signed control plane
+  works, and the hostname need not match an operator-typed IP). A rotated
+  certificate (re-minted on member join or VIP change, uploaded, or renewed
+  by ACME) is adopted only if the appliance CA, which every approved
+  supervisor already holds, vouches for it through a new unauthenticated
+  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
+  certificates, signed by the CA. That list names the TLS Secret's
+  certificate as well as the active one, so #1215's revert to the first-boot
+  certificate does not strand supervisors. Once approved, a supervisor also
+  checks that its first-contact pin is on the list, which catches an
+  interception present at pairing (unless it also replaced the CA). The
+  k8s, nettool, pcap and storage proxy loops go through the same pinned
+  trust; before, they verified against system CAs, so against a self-signed
+  control plane they could not connect at all. An `http://` URL is probed
+  once for the `https://` it redirects to, that certificate is pinned, and
+  every request goes straight to the `https://` target, so the pairing code
+  and session token no longer cross the wire in cleartext before the
+  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
+  the CA, so an appliance moved to a rebuilt control plane pins the new one
+  rather than refusing it forever. The DNS, DHCP and looking-glass role
+  pods were left skipping verification here; #1281 below closes that.
+  **Upgrade note:** an already-paired appliance takes its pin at its first
+  contact after the upgrade, then checks it against the CA's list; a
+  mismatch is logged as `supervisor.tls.pin_not_vouched`.
+  **Also fixed, because pinning depends on it:** after a control-plane
+  reboot, the frontend kept serving the first-boot certificate. A k3s start
+  puts it back into the TLS Secret (#1215), the frontend pod that starts
+  then loads it, and when the api wrote the active certificate back, the
+  frontend did not roll. The rollout annotation was a checksum of the
+  certificate's content, and restoring the same content left it unchanged.
+  Found on a two-appliance test: after one reboot the control plane served
+  a certificate its own signed list did not name, and the remote appliance
+  refused it on every heartbeat until the frontend was restarted by hand.
+  The annotation now also covers the Secret's `resourceVersion`, which
+  every real write moves, so the write-back rolls the frontend. Browsers
+  stop being shown the first-boot certificate after a reboot as well. The
+  revert itself remains #1215.
+
+- **Appliance role pods verify the control plane's TLS certificate
+  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
+  pods reach the control plane at its external URL, and the chart gave
+  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
+  the platform-wide agent key out and the DNS / DHCP configuration back,
+  so anyone on the path could read the key and serve a node its zones and
+  scopes. They now use the certificate their supervisor pinned (#1219): the
+  chart mounts the supervisor's `tls/` directory read-only (public material
+  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
+  trusts exactly the certificates in that file, with a pinned leaf as its
+  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
+  could not do this: it checks the hostname and needs a real CA, so a
+  CA-issued leaf or an IP URL fails there. The file is read on every
+  connection, so a certificate the supervisor re-pins reaches the agents
+  without a restart. Until the supervisor has pinned, every request fails
+  and the agent logs `control_plane_pin_unavailable`; it never falls back to
+  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
+  and is used only for an `https://` URL. The one exception is a supervisor
+  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
+  nothing, so its agents take the skip too (chart value
+  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
+  about it on every start.
+  An appliance promoted into the control plane no longer gives its agents
+  the external URL at all: they use the in-cluster api Service, as its
+  supervisor does. That closes the #409 known limitation and is also
+  required here, because a member's supervisor heartbeats in-cluster and
+  never re-pins, while a member joining re-mints the Web UI certificate.
+  The role apply key now includes the agents' URL, so a promotion re-applies
+  the role chart. Not covered: an `http://` control-plane URL, which the
+  role agents still use as typed (the supervisor upgrades its own traffic
+  to the `https://` target).
+
+- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
+  read files through a scan (#1223).** The scan endpoint is gated on
+  `manage_nmap_scans`, which the builtin Network Editor role holds, and
+  `extra_args` was checked only for shell metacharacters and for `/` in
+  `--script` values. So a delegated user could pass `-iL <file>`: nmap
+  reads it as a target list and prints every line it cannot resolve
+  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
+  back, which was verified in the api container as the api user. Also
+  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
+  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
+  target or `-iR` (past target validation and the #722 do-not-probe
+  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
+  intrusive script. Now every token must be an allowed option with a
+  value of the right shape: scan type, host discovery, port selection,
+  timing, service / OS detection, `--reason` / `--open`, and `--script`
+  with script **names** that nmap's own `script.db` puts in none of the
+  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
+  `fuzzer` categories. Category names, wildcards and expressions are
+  refused, because no category is clean: nmap's `safe` category holds 33
+  scripts that are also `external` or `intrusive` (`whois-ip` queries
+  third-party WHOIS servers, against non-negotiable #17), and `default`
+  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
+  in favour of the presets that already offer them. The copilot's scan
+  proposal goes through the same check, and so does a scan already queued
+  with old arguments, since the worker re-validates before it runs.
+
+- **A release publishes nothing until CI, Trivy and main have all said yes
+  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
+  pushed `:latest` alongside each version tag before the ISO, the
+  OpenAPI export or the GitHub release had finished. So #1218's BIND
+  image shipped with 7 HIGH CVEs that nothing on the release path looked
+  for; a release that failed part-way had already moved every compose
+  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
+  covers tags, anyone with write access could release any commit. Now a
+  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
+  to pass on the tagged commit. Each image is built once, pushed by
+  digest with no tag, and both architectures are pulled from that digest
+  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
+  ever scanned amd64); only when every image passes is that same digest
+  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
+  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
+  a final job after the GitHub release exists, all images or none: it
+  records where each `:latest` pointed, retries each move, and puts back
+  the ones already moved if one still fails. Release runs are no longer
+  serialised, because GitHub cancels a queued run when another queues
+  behind it and `meta` can now wait an hour; "is this the newest
+  release" is re-checked right before GitHub's latest release and
+  `:latest` are set instead. The workflow also stops assuming CalVer
+  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
+  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
+  `:latest`, and the previous release, the CHANGELOG section and whether
+  a tag becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering, ranking only tags on `main` that have
+  a published release (`.github/scripts/release-tags.sh`), so a stray tag
+  cannot freeze `:latest`. The shell it replaces got all three wrong
+  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
+  one, and the CHANGELOG lookup was a prefix match that returns
+  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
+  one no longer takes over `:latest` or the stable download URLs, or
+  uploads the un-versioned copies behind them. Release candidates no
+  longer take slots in the asset pruner's keep window (eight candidates
+  would have pushed eight final releases' ISOs out early); a candidate
+  keeps its ISO until a final release supersedes it. The image list is
+  one file, `.github/images.json`, read by both workflows and the
+  image-upgrade linter. And `docs-publish.yml` no longer runs on release
+  tags: a tag on an older commit rolled the docs site back behind
+  `main`, and a tag off `main` published unreviewed docs.
+
+- **Pinned images brought current; the CloudNativePG operator and
+  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
+  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
+  operator image 1.30.0, which the appliance bakes for an air-gapped
+  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
+  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
+  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
+  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
+  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
+  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
+  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
+  release.
+
+- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
+  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
+  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
+  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
+  They are triggered by malformed DNS64 responses, a crafted
+  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
+  SVCB/HTTPS records. The `dns-powerdns` image carries the same
+  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
+  9.20.29-r0, which also forces a rebuild of any cached package layer
+  that still has the old version. Upgrade: pull the new DNS images.
+
+- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
+  reachable from outside: the web port proxies it and Docker Compose
+  publishes the API port. So anyone who could load the login page could
+  read per-route request counts. It now answers only
+  `Authorization: Bearer <token>`, where the token is the new scrape
+  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
+  the same revoked / expired / scope / disabled-owner checks as on any
+  other route. The Helm chart generates the scrape token into its app
+  Secret as `metrics-token` and keeps it across upgrades like
+  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
+  optional Secret key. The appliance console reads it from the chart's
+  Secret, so its API panel keeps working.
+  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
+  token gets 401 after this release. Give it the scrape token or an API
+  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
+  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
+
+- **The interactive API docs load through the web port again, and
+  the appliance's HTTPS web tier sends the #400 security headers
+  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
+  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
+  started from an inline `<script>`. The web tier's CSP (#400) allows
+  scripts from the page's own origin only. So on Docker Compose, and
+  on Helm without `frontend.tls.enabled`, the console's API docs
+  links opened blank pages, and an air-gapped install could not load
+  them on any port. The api now serves both bundles itself from
+  `backend/app/static/api-docs/`: byte-for-byte copies of
+  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
+  Swagger's initializer is a static file. Scripts stay `'self'`
+  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
+  search index) and load its footer logo from cdn.redoc.ly, which it
+  hides when offline. **The appliance's TLS config sent none of the
+  #400 headers.** #400 put them in the pre-k3s appliance nginx
+  config, which #194 had already orphaned, so
+  `frontend-tls-config.yaml` never had them. It now sends the same
+  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
+  and Referrer-Policy as the image's template, re-emitted on every
+  location with headers of its own. It also sends
+  `Strict-Transport-Security: max-age=31536000` without
+  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
+  bare IP and over a certificate warning, so it only takes hold on a
+  hostname with a trusted certificate.
+
+- **An API token used only for reads now records that it was used
+  (#1158).** `last_used_at` was set on the request's database session
+  and left for the handler to commit. Read handlers never commit, so a
+  monitoring, inventory or export token showed "Last Used: —" forever,
+  while its first write set it. Operators hunting for stale tokens
+  could revoke live ones. The use is now written in a short-lived
+  transaction of its own, at most once a minute per token, the cadence
+  the session path keeps for `last_seen_at`. A handler that rolls back
+  cannot undo it, and a failed write never fails the request.
+
+- **Every shipped image now patches its base image's own packages
+  (#1088).** The nightly of 2026-09-14 refused to publish the api
+  image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
+  `perl-base` / `perl-modules-5.40` / `libperl5.40`, 2 in
+  `libpcre2-8-0`, 2 in `libsqlite3-0`, 1 in `gzip`, 1 in
+  `libssh2-1t64` — every one of which had a fix sitting on
+  deb.debian.org the whole time. `backend/Dockerfile` installed a
+  package list and upgraded nothing, so those packages could only
+  ever be fixed by upstream rebuilding `python:3.12-slim`, which is
+  not a schedule we control. It now runs `apt-get upgrade` before
+  the installs, the way every Alpine image in the repo has run
+  `apk upgrade`. The same omission applied to the Technitium
+  image, whose Ubuntu base is pinned by digest — so nothing in that
+  file could ever have patched it either — and is fixed alongside.
+  **This changes published release images, not just the nightly:**
+  `release.yml` builds without a layer cache, so its api image was
+  freshly built and still shipped every one of those base-image
+  CVEs.
+- **The nightly's cache no longer freezes the api image's package
+  layer (#1088).** BuildKit keys a layer on its RUN text, so the
+  `type=gha` cache served `backend/Dockerfile`'s whole `apt-get`
+  layer — package set included — from whenever it was first built.
+  That is why the same run reported `perl` at `5.40.1-6` when the
+  index had offered `5.40.1-6+deb13u1` for days: the layer had not
+  executed in weeks. The Alpine images solve this with an
+  `ARG APK_SNAPSHOT` the nightly passes its date tag to; the two
+  Debian-family images declared no such ARG, so they **silently
+  ignored the build arg the workflow was already passing them**.
+  Both now declare `ARG APT_SNAPSHOT` and the nightly passes it.
+  An upgrade line that never runs is indistinguishable, in the
+  built image, from no upgrade line at all — which is why the two
+  halves above are one fix and not two.
+
+- **The two source restrictions composed into a console-only
+  lockout, and neither guard could see the other (#1013).** The
+  appliance has two independent ways in and a source allowlist for
+  each — the Web UI (#285 Phase 6) and SSH (#1009). Each shipped
+  with an anti-lockout guard that checked only whether the
+  caller's address was inside *its own* list, so an operator could
+  pass both, one at a time, and end up reachable through neither.
+  That is not an exotic sequence: "lock this box down" means
+  scoping the Web UI to the management network and then scoping
+  SSH to the same one, and if that CIDR is stale both guards fire,
+  both offer an override, and each override is individually
+  reasonable. Nothing at any point said the other door was also
+  closing.
+  Before #1009 it could not happen — the port-22 floor was
+  un-removable, so SSH was the guaranteed recovery path the Web UI
+  guard leaned on. Making that floor retireable is what the SSH
+  allowlist needed in order to mean anything, and it removed the
+  guarantee.
+
+  Both write paths now resolve one shared question through
+  `backend/app/services/appliance/access.py`: **after this change,
+  does any remote door still admit the address I am talking to?**
+  When the answer is no they raise the *same* 422 — one state of
+  the appliance, so one sentence about it — requiring
+  `acknowledge_console_only=true`. Deliberately **not** satisfied
+  by the per-door `override_lockout` / `ssh_lockdown_force`: those
+  accept losing one door while another remains, which is a
+  materially smaller thing, and an operator may have ticked one
+  for an unrelated reason. The implication runs one way only —
+  accepting console-only already contains "this door closes on
+  me", so it is not asked for twice, which would be the
+  reflex-training pattern both guards' own comments warn about.
+  Both screens also read a new `GET /appliance/remote-access` and
+  show the *other* door's state at the point of decision; it sits
+  on the always-mounted `/appliance` hub rather than under
+  `/appliance/firewall`, because the SSH screen must be able to
+  ask with that module off.
+
+  **The per-door refusals say more on the way**, because reaching
+  one now *proves* the other door did not exclude the caller's
+  address: had it, the escalation would have raised first. So each
+  names the other list and its scope instead of hedging about it.
+  Only as far as the fact goes, though — every verdict here is
+  about ONE address, the source of the HTTP request, and that is
+  the right address for the Web UI door (the operator is using it,
+  over that door, right now) but only a proxy for the SSH one,
+  since browsing from one network and SSHing from another is
+  legitimate. So the copy is asymmetric on purpose: "you can still
+  reach this UI" is asserted, "you can still SSH" is not — the SSH
+  list is reported as *including the address you are connecting
+  from*, which is what is actually known.
+
+  **An address we cannot read is not covered — everywhere.** The
+  two guards had been scoring that case in opposite directions:
+  the Web UI one counted it as excluded and warned, the SSH one as
+  covered and proceeded. Both had a written rationale and the pair
+  was not defensible. The conservative reading wins because the
+  costs are asymmetric — an unneeded warning costs a checkbox, a
+  missing one costs a trip to the console — and because #1009's
+  argument for the other direction ("a gate that blocks on *I
+  could not tell* gets forced past by reflex") was a claim about
+  frequency, and the frequency is near zero: the trusted
+  client-IP helper falls back to the ASGI peer address, which
+  every real HTTP request has.
+
+  **Found on the way:** the Web UI guard was reading `client_ip`,
+  which `core/request_meta` documents as spoofable and explicitly
+  unsuitable for a source-IP allowlist gate. It is also simply the
+  wrong address on a real topology — behind a reverse proxy,
+  uvicorn's `--forwarded-allow-ips *` resolves the browser's own
+  IP out of `X-Forwarded-For` while nftables judges the packet
+  source, which is the proxy — so the guard would clear an
+  operator who was about to be locked out, with no attacker
+  involved. It now reads the same trusted value the SSH guard
+  does.
+
+  **And the console is not universal.** `spatium-console` runs on
+  `tty1` and `ttyS0`; a remote VM with no virtual serial port and
+  no hypervisor console has no floor at all, so an acknowledged
+  console-only lockout there is a rebuild. The escalation says
+  that in as many words rather than describing the console as a
+  recovery path, and `docs/deployment/APPLIANCE.md` now states it.
+
+  Both 422s are routed in the UI by the **acknowledgement field**
+  each one names, not by its prose: a field name is the API
+  contract and the sentence around it is not, and a test pins that
+  the three markers stay mutually exclusive. `WebUIAccessCard` was
+  lifted out of `FirewallTab.tsx` into its own component so it can
+  be rendered in a test — the failure mode on both sides is a
+  modal or a checkbox that never appears, which neither review nor
+  `tsc` can see. 1 MCP tool (`find_remote_access_doors`,
+  read-only, default on): the composition was the one thing
+  neither existing tool could show, since `find_web_ui_access` is
+  tagged `module="appliance.firewall"` and `find_ssh_settings` is
+  not — so with that module off the copilot could see one door and
+  not the other. No migration, no new column.
+
+- **The SSH source-CIDR allowlist was discarded and the port
+  opened to the world (#1001).** `spatiumddi-ssh-reload` renders
+  the nftables drop-in that scopes the SSH port to the operator's
+  configured networks — sshd has no native source filter, so that
+  fragment *is* the enforcement. It piped the CIDR list into a
+  `python3 -` whose program came from a heredoc, and `python3 -`
+  means *read the program from stdin*: the heredoc, being the
+  later redirection, won and the JSON was discarded. The
+  `except Exception: cidrs = []` then took the documented
+  empty-list branch, which opens the port unconditionally.
+  Nothing reported a problem — the rendered rule is valid
+  nftables, so the pre-reload `nft -c` dry-run passes, the reload
+  succeeds, the applied sidecar reports success, and the Fleet UI
+  shows the CIDR list exactly as typed. The data is now passed as
+  argv, and an unparseable list is **refused** rather than treated
+  as "open to everyone"; an absent list stays the legitimate "any
+  source" answer, and the port-22 accept floor in the firewall
+  renderer keeps a default install reachable.
+
+  **The allowlist only takes effect once SSH is moved off port
+  22**, and that is not what this change fixed. The appliance's
+  base `/etc/nftables.conf` emits an unconditional
+  `tcp dport 22 accept` in its management floor, above the
+  include glob that pulls this drop-in in, and nftables is
+  first-match-wins — verified against a real kernel. That floor
+  is the deliberate un-removable recovery channel that keeps a
+  bad Web-UI source restriction from bricking the box, so it was
+  left alone: retiring it when a scope is configured (what the
+  Web UI does) would turn a wrong CIDR into a console-only
+  recovery, which is a decision rather than a bug fix — tracked
+  as #1009. Said plainly here because the allowlist previously
+  did nothing for two independent reasons and only one of them
+  is now gone.
+
+  The apply order changed with it: the fragment is now staged
+  and validated *before* the sshd drop-in is installed. Both
+  paths that can refuse used to run after it, and `fail` exits
+  before the sshd reload — so the running daemon kept the old
+  port while the installed config had already moved it, and the
+  lockout arrived at the next sshd start rather than at the
+  failure.
+
+- **Blanking the installer's Time source did not disable NTP
+  (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
+  `pool` directive and `sourcedir` is additive, so removing the
+  installer's sources file left the appliance synchronising
+  against the public Debian pool. Four surfaces said "none",
+  including `docs/PRIVACY.md`, which is normative for
+  non-negotiable #17 — a false claim about an outbound connection
+  on the page an operator reads to decide what the box talks to.
+  Blank now means none: the installer comments out the `pool`
+  line and the `/run/chrony-dhcp` sourcedir (marked and exactly
+  reversible), and the answer reaches
+  `platform_settings.ntp_pool_servers` as an empty list, so the
+  control plane's first config push does not put the pool back.
+  `sources.d` and `conf.d` are left in place as the way back.
+
+- **The weekly CVE scan could report "clean" and could never
+  report a CVE (#975).** Found while adding a second job to the
+  same workflow. GitHub Actions runs a `run:` block under
+  `bash -e`, and the `set -uo pipefail` at the top of the scan
+  step does **not** clear that flag — so the bare
+  `docker run ... trivy --exit-code 1` followed by `rc=$?` killed
+  the whole step the moment Trivy found something. That is the
+  first image with findings, which is the only case the job
+  exists for: every branch after it was dead code,
+  `has_findings` was never written, and the reporting step's own
+  fail-safe then correctly refused to touch the tracking issue on
+  an indeterminate result — logging a warning nobody reads on a
+  scheduled run. A clean week and a week full of criticals
+  produced the same visible outcome: no issue.
+  Both status captures now use the `if` form, whose condition is
+  exempt from `-e`. Verified by executing the shipped `run:`
+  bodies under `bash -e` against a stub where `docker build`
+  succeeds and the scan exits 1 — the fixed step reaches its
+  handler and writes `has_findings=1`, the unpatched one exits 1
+  having written nothing. The first attempt at that harness
+  proved nothing, because a stub that failed `docker build` too
+  took the build-failure path and never reached the scan.
+
+- **A `run:` step that captures `$?` after a bare command is dead
+  code, and nothing anywhere said so (#1036).** GitHub Actions runs
+  every `run:` block under `bash -e`, and the `set -uo pipefail`
+  several steps open with does **not** clear it — so
+  `cmd; rc=$?` is never reached on the failure it was written to
+  handle. #975 fixed the two live sites; this adds the guard, which
+  that issue deliberately left out of scope.
+  The instance that matters: `trivy-scheduled.yml` captured Trivy's
+  status this way, and Trivy exits 1 **on findings**. The step died
+  at the first image with a CVE, `has_findings` was never written,
+  and the reporting step's fail-safe correctly declined to act on an
+  indeterminate result. **A clean week and a week full of criticals
+  produced the same visible outcome: no issue.**
+  `scripts/lint_workflow_shell.py` refuses the shape in CI's
+  unconditional Backend Lint job and in `make ci`. It is a linter of
+  our own because **neither `actionlint` nor `shellcheck -S style`
+  reports it** (both run against the exact snippet): SC2181 fires on
+  a direct `if [ $? -ne 0 ]` and not on `rc=$?` followed by a test
+  of `$rc`. It is pinned against the REAL pre-fix
+  `trivy-scheduled.yml` body, which it reports at the right line.
+  **The false positive it had to stop making is the interesting
+  half.** Turning the check on for a standalone script requires an
+  UNINDENTED `set -e`, because file order is not execution order and
+  this reads the file: `spatium-install` is `set -uo pipefail` at the
+  top and enables `-e` deep inside `do_install()`, which runs *after*
+  the wizard loop and preseed parser that appear below it. Counting
+  that produced four confident findings about code where `-e` is off
+  — and a linter that cries wolf on the installer is one that gets
+  deleted. Suppressing accepts weaker evidence than asserting, on
+  purpose.
+  **The sweep found a second live instance, in the DHCP agent's own
+  entrypoint** — and only after review caught that the guard was not
+  scanning the files its rationale was built on: it globbed `*.sh`,
+  and all 45 appliance host runners (`spatium-install` among them)
+  are extension-less. It now matches on a shell shebang too, and
+  refuses to print a pass when the script half scanned nothing.
+  What that turned up: `agent/dhcp/images/kea/entrypoint.sh` runs
+  under `set -eu` and ends with
+  `wait -n … || wait …` / `EXIT_CODE=$?` / `_term`. Reproduced
+  against busybox ash — when a supervised child exits non-zero the
+  list returns non-zero, `-e` kills the script on that line, and
+  `EXIT_CODE`, `_term` and `exit` are ALL skipped. So a kea or agent
+  **crash** — the case the supervision block exists for — tore the
+  container down without terminating its siblings, while a clean
+  SIGTERM (which returns 0) ran the cleanup perfectly. The failure
+  path was the only one that skipped it.
+
 ### Migrations
 
+- `f4a8c2e71d09` — #1235: nullable `user.auth_provider_id` (FK to
+  `auth_provider`), the provider an external account belongs to.
+  Backfilled only where the provider can be known for certain:
+  RADIUS / TACACS+ from the provider id in the external id, LDAP /
+  OIDC / SAML only when exactly one provider of that type could have
+  created the account. Anything else stays NULL rather than guessed.
+- `99e91dcae1e2` — #1227: `release_schema_head` (`version` PK,
+  `alembic_head`, `recorded_at` defaulting to `now()`), the schema head
+  each release ran at. No seed: each release writes its own row at
+  startup. In the `platform_internal` backup section beside
+  `alembic_version`.
+- `d8e1b5a26c47` — #1232: nullable `dns_record_op.next_attempt_at`
+  (retry backoff) and `dns_record_op.superseded_by` (the newer op for
+  the same RRset), plus `ix_dns_record_op_server_created` on
+  `(server_id, created_at)`. No backfill.
+- `e6b2d94f1a37` — #1185: nullable `dns_agent_bundle.renderer_revision`
+  and `dns_server.bundle_renderer_revision`. NULL reads as stale, so
+  each server re-renders its bundle once after the upgrade.
+- `b8e2d5c07a14` — #1166, data-only: the builtin `looking-glass`
+  firewall policy, `tcp/179` from anywhere. Idempotent.
+- `f3a9d61c07e4` — #1111: nullable `dns_record_op.xact_id` and
+  `dns_agent_bundle.visible_xacts` — which ops a stored bundle covers,
+  decided by commit rather than by start time. No backfill.
+- `d9a4c27e18f3` — #1111: `dns_agent_bundle.app_version`,
+  `dns_server.bundle_app_version` and `dns_server.bundle_dirty_at`.
+  Existing bundles carry the empty string, so each server re-renders
+  once after the upgrade.
+- `c4d1e7f90a2b` — #1111: `dns_agent_bundle` (one stored, rendered
+  config bundle per DNS server) and the `dns_server.bundle_*` render
+  state columns. All additive, no backfill: until the worker's first
+  render lands, the long-poll builds inline or waits.
+- `f4c8a2d61b37` — #1141: `dhcp_lease.mac_address` (and the lease
+  history table's) becomes nullable; `duid` and `iaid` are added; a
+  CHECK requires a MAC or a DUID; `(server_id, duid)` is indexed. No
+  backfill. Downgrade deletes the leases that have no MAC.
+- `e6b2f07a3c91` — #1139, data-only: adds `udp/547` (DHCPv6) to the
+  builtin `dhcp` firewall policy. Idempotent.
+- `b7d21c9e4f06` — #1067: `daemon_status`, `daemon_reason` and
+  `daemon_status_since` on `dns_server` and `dhcp_server` — the daemon
+  state agents report on every heartbeat. NULL means not reported.
 - `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
   `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed
   for the 35-day prune) — replay dedupe for spooled agent pushes; and
@@ -4797,9 +5219,27 @@ the formatter handles the rest.
   pristine `feature_module` seed rows so the catalog's
   `default_enabled` governs. No schema change; existing installs are
   not touched.
+- `c1f4a90e7d63` — #972: `emergency_response_location` (the 31
+  RFC 5139 civic-address elements as separate columns),
+  `erl_binding` and `e911_resolution_log`. No backfill.
+- `f7c3a91e50b4` — #1026: nullable `appliance.architecture` and
+  `appliance_upgrade_image.architecture`. No backfill on purpose: NULL
+  is unknown, and unknown never blocks an upgrade.
+- `b8f4c02e7a19` — #989: `backup_target.write_only` (boolean, default
+  FALSE) for write-only / immutable backup destinations. Existing
+  targets are unchanged.
+- `e5b1d47a9c62` — #1009: `platform_settings.ssh_lockdown` (boolean,
+  default FALSE). A no-op for every existing install until an operator
+  turns it on.
 - `c93f1a72e408` — `dhcp_metric_sample.receive_drop` /
   `.socket_drop` (both nullable: NULL means unmeasured) and
   `dhcp_server_group.kea_thread_pool_size` / `.kea_packet_logging`.
+- `d4a9e37b2c15` — #993, data-only: adds `tcp/10250` from the pod and
+  service CIDRs to the builtin `control-plane` firewall policy.
+  Idempotent.
+- `b6f2c04a71d8` — #986: `tld_registry_snapshot`, a one-row table
+  holding an operator-refreshed copy of IANA's TLD list, used only
+  when it is newer than the list bundled with the release.
 
 ---
 

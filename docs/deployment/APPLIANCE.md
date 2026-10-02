@@ -2580,8 +2580,10 @@ introduced by an upgrade don't clobber operator-created ones.
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken): no commit happens. Next reboot reverts to the
-   previous `saved_entry` automatically. Worst case is one
-   wasted reboot.
+   previous `saved_entry` automatically. If the new slot's
+   migrate step had already run, the reverted release cannot
+   start on the migrated database: see
+   [Rolling back](#rolling-back-the-database-stays-on-var-1227).
 
 **CLI access (for emergency / scripted upgrades):**
 
@@ -2639,6 +2641,82 @@ amd64.raw.xz` with the kernel + initrd baked in + the image-
 baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
+
+### Rolling back: the database stays on `/var` (#1227)
+
+A slot swap replaces the root filesystem. PostgreSQL lives on the
+persistent `/var`, so it does not go back with the slot. An upgrade's
+migrate step moves the schema forward, and the release you left cannot
+run on that schema afterwards. Alembic cannot migrate backwards from a
+revision it has never heard of. Its migrate Job fails with
+`Can't locate revision`, its api / worker / beat wait for migrate
+forever, and on a single node the newer release's api keeps serving
+behind the older UI. Nothing retries.
+
+**What is checked before you go back.** Every path that moves a
+control-plane node to an older release first compares the database's
+schema revision with the one that release was built with:
+
+- `POST /api/v1/appliance/slot-upgrade/rollback`;
+- **Fleet → set next boot / set default** onto the other slot
+  (`/appliances/{id}/set-next-boot`, `/set-default-slot`);
+- **Fleet → Schedule OS upgrade** with an image older than the one
+  running (`/appliances/{id}/upgrade`).
+
+When the older release cannot run on the database, the request is
+refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
+naming both revisions. The Fleet UI shows that as a confirmation. To go
+ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
+that if you will restore a copy of the database from before the
+upgrade. Data-plane appliances are never checked, because their release
+does not touch the database. Pointing a node at the slot it already
+runs, which commits a trial boot, is not checked either.
+
+The revision each release was built with comes from two places.
+`backend/app/data/release_schema_heads.json` is generated from the
+release tags by `scripts/release_schema_heads.py`, and for a release it
+lists it is the answer. Every release also records its own when it
+starts, once the schema is at its head, in the `release_schema_head`
+table, which is what covers nightly and dev builds no tag names. An api
+records the booted slot's version only when that slot is its own
+release: after a rollback to a slot whose release cannot migrate, the
+newer release's api keeps running there, and recording the older
+version against its own head would let the next rollback to it through.
+A release in neither, such as an older nightly, is reported as `unknown`, and the
+switch goes ahead: refusing on "don't know" would block every rollback
+on an install that never recorded anything.
+
+**What is not covered.** The trial-boot auto-revert (step 8 above)
+happens on the host with no operator involved, so nothing can refuse
+it. No database snapshot is taken before an upgrade yet, so there is
+nothing to restore automatically. The rolling-upgrade preflight's
+`pre_upgrade_backup` row warns when no backup target has succeeded in
+the last 24 hours. Run one before starting.
+
+**Coming from 2026.09.04-1 or earlier: do not go back to it.** Take a
+backup before the upgrade. 2026.10.02-1 adds 22 migrations that
+2026.09.04-1 cannot run on, and 2026.09.04-1 predates both the check
+above and the clearer migrate error, so a trial-boot revert or a
+Compose / Helm redeploy of it leaves the control plane down with only
+`Can't locate revision` to go on. Its chart also lacks the #1042 fix,
+so a reinstall during the rollback can mint a new `SECRET_KEY` and
+leave every credential encrypted at rest unreadable. If you must go
+back, restore the pre-upgrade backup together with the older release.
+
+**If an appliance is already stuck.** The older release's
+`wait-for-migrate` init container prints the cause once, including
+`The database was migrated by a NEWER SpatiumDDI release`, then keeps
+logging `current=<written by a newer release, see above>`:
+
+```bash
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
+```
+
+Re-applying the newer release recovers it. Its migrate step finds
+nothing to do, and every workload rolls out:
+`POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
+**Schedule OS upgrade** in the Fleet UI. The only other way out is to
+restore a pre-upgrade copy of the database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 

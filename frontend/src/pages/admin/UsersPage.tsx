@@ -10,7 +10,7 @@ import {
   Lock,
   LockOpen,
 } from "lucide-react";
-import { usersApi, type AppUser } from "@/lib/api";
+import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
@@ -219,6 +219,7 @@ function EditUserModal({
             Active
           </label>
         </div>
+        {user.auth_source !== "local" && <ProviderLink user={user} />}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -240,6 +241,86 @@ function EditUserModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+// ── Provider link (#1235) ─────────────────────────────────────────────────────
+
+// An external account belongs to one provider. One that predates that, or
+// whose identifier at the provider changed (an LDAP DN after an OU move), is
+// refused at sign-in until it is linked here: it is never adopted by
+// username alone, since that is how a second provider of the same type
+// could sign in as another provider's user.
+function ProviderLink({ user }: { user: AppUser }) {
+  const qc = useQueryClient();
+  const providers = useQuery({
+    queryKey: ["auth-providers"],
+    queryFn: authProvidersApi.list,
+  });
+  const [providerId, setProviderId] = useState(user.auth_provider_id ?? "");
+  const [error, setError] = useState<string | null>(null);
+  const link = useMutation({
+    mutationFn: () => usersApi.linkProvider(user.id, providerId),
+    onSuccess: () => {
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["users"] });
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to link";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+  // ``user`` is the modal's snapshot, so after a link read the provider
+  // from the response rather than reporting the account still unlinked.
+  const linkedId = link.data?.auth_provider_id ?? user.auth_provider_id;
+  const current = providers.data?.find((p) => p.id === linkedId);
+
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <div className="text-sm font-medium">Sign-in provider</div>
+      <p className="text-xs text-muted-foreground">
+        {current ? (
+          <>
+            Linked to <strong>{current.name}</strong>.
+          </>
+        ) : (
+          <>
+            Not linked to a provider. It cannot sign in until it is linked here.
+          </>
+        )}{" "}
+        Linking clears the stored identifier: the next sign-in through the
+        chosen provider as <code>{user.username}</code> claims this account.
+      </p>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <select
+          className={inputCls}
+          value={providerId}
+          onChange={(e) => setProviderId(e.target.value)}
+        >
+          <option value="">(choose a provider)</option>
+          {(providers.data ?? []).map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name} ({p.type})
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={() => link.mutate()}
+          disabled={!providerId || link.isPending}
+          className="shrink-0 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+        >
+          {link.isPending ? "Linking…" : "Link"}
+        </button>
+      </div>
+      {link.isSuccess && (
+        <p className="text-xs text-emerald-700 dark:text-emerald-300">
+          Linked. The next sign-in as {user.username} claims the account.
+        </p>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
   );
 }
 
@@ -437,6 +518,14 @@ export function UsersPage() {
                     <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                       {user.auth_source}
                     </span>
+                    {user.auth_source !== "local" && !user.auth_provider_id && (
+                      <span
+                        className="ml-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300"
+                        title="Not linked to a provider. It cannot sign in until an administrator links it (Edit)."
+                      >
+                        unlinked
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     {user.is_superadmin ? (

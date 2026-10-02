@@ -43,9 +43,11 @@ from app.core.auth.user_sync import (
 )
 from app.core.auth_throttle import (
     StepupThrottleUnavailable,
+    claim_stepup_attempt,
     login_rate_limited,
     mfa_challenge_consume,
     record_stepup_password_failure,
+    refund_stepup_attempt,
     stepup_password_blocked,
 )
 from app.core.demo_mode import forbid_in_demo_mode
@@ -73,10 +75,13 @@ from app.services.account_lockout import (
     register_success,
 )
 from app.services.mfa import (
+    PENDING_ENROLMENT_TTL,
+    clear_pending_enrolment,
     consume_recovery_code,
     decrypt_secret,
     encrypt_recovery_codes,
     encrypt_secret,
+    enrolment_pending,
     generate_recovery_codes,
     generate_secret,
     otpauth_uri,
@@ -443,6 +448,12 @@ async def _try_external_password_login(
     if not providers:
         return None
 
+    # A provider that authenticated the password but whose subject is not
+    # the account holding this username (#1235). That account may belong to
+    # a lower-priority provider, which must still get its turn: stopping
+    # here would lock out the owner whenever a higher-priority provider also
+    # knows the same username and password.
+    refused_as_not_owner = False
     for provider in providers:
         dispatch = _PASSWORD_AUTH_DISPATCH.get(provider.type)
         if dispatch is None:
@@ -525,6 +536,9 @@ async def _try_external_password_login(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled"
                 ) from exc
+            if exc.reason in {"username_collision", "account_link_required"}:
+                refused_as_not_owner = True
+                continue
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials",
@@ -532,6 +546,9 @@ async def _try_external_password_login(
 
         return await _issue_tokens(db, request, user, auth_source=provider.name)
 
+    if refused_as_not_owner:
+        # Already audited per provider above; no generic ``no_match`` row.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     return None
 
 
@@ -896,6 +913,9 @@ async def change_password(
     current_user.force_password_change = False
     current_user.password_changed_at = datetime.now(UTC)
     current_user.password_history_encrypted = new_history
+    # #1354 — a started MFA enrolment does not survive a password change: it
+    # may have been started by whoever made the change necessary.
+    enrolment_dropped = clear_pending_enrolment(current_user)
 
     # SECURITY (#400 / M3): a password change must revoke every other
     # outstanding session + refresh token for this user. Without this a
@@ -920,7 +940,8 @@ async def change_password(
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
-        changed_fields=["hashed_password", "force_password_change", "password_changed_at"],
+        changed_fields=["hashed_password", "force_password_change", "password_changed_at"]
+        + (["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else []),
         result="success",
     )
     db.add(audit)
@@ -931,6 +952,8 @@ async def change_password(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
     _clear_refresh_cookie(response)
+    # #1354 — signing out abandons a started MFA enrolment.
+    enrolment_dropped = clear_pending_enrolment(current_user)
     await db.execute(
         update(UserSession)
         .where(UserSession.user_id == current_user.id, UserSession.revoked.is_(False))
@@ -944,6 +967,9 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
+        changed_fields=(
+            ["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else None
+        ),
         result="success",
     )
     db.add(audit)
@@ -1089,9 +1115,7 @@ async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusRe
     local = uses_local_password(current_user)
     return MfaStatusResponse(
         enabled=current_user.totp_enabled,
-        enrolment_pending=(
-            not current_user.totp_enabled and current_user.totp_secret_encrypted is not None
-        ),
+        enrolment_pending=enrolment_pending(current_user),
         recovery_codes_remaining=remaining_recovery_codes(current_user.recovery_codes_encrypted),
         enrol_requires="password" if local else "recent_sign_in",
         enrol_sign_in_recent=local
@@ -1100,16 +1124,22 @@ async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusRe
     )
 
 
-async def _refuse_if_stepup_blocked(user: User) -> None:
+async def _refuse_if_stepup_blocked(user: User, *, claim: bool = False) -> None:
     """429 once the account has spent its wrong-answer budget on MFA
     step-ups (#1241). These run for a caller who already holds a session —
     the hijacked session they exist to stop — so unthrottled, each is an
     oracle for the password (or, on disable / regenerate, the TOTP code).
 
+    ``claim=True`` spends the attempt atomically up front instead of only
+    reading the count (#1354); the caller refunds it on a right answer.
+
     503 while the budget cannot be read: the throttle fails closed, so a
     Redis outage pauses MFA changes rather than lifting the limit."""
     try:
-        blocked = await stepup_password_blocked(user.id)
+        if claim:
+            blocked = not await claim_stepup_attempt(user.id)
+        else:
+            blocked = await stepup_password_blocked(user.id)
     except StepupThrottleUnavailable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1218,7 +1248,18 @@ async def mfa_enroll_verify(
     this succeeds ``totp_enabled`` stays false and login skips the MFA
     gate. On success we audit-log and the next ``/login`` will MFA-gate.
 
-    #408 — open to every auth source (was local-only)."""
+    #408 — open to every auth source (was local-only).
+
+    #1354 — a wrong code spends the same fail-closed step-up budget as begin,
+    disable and regenerate, and an enrolment more than
+    ``PENDING_ENROLMENT_TTL`` old is discarded instead of verified. Without
+    either, an abandoned enrolment stayed open to unlimited 6-digit guesses
+    from any of the user's sessions, and a hit turned MFA on with a secret
+    the user never saw. The attempt is claimed atomically before the code is
+    checked, so a burst of concurrent guesses cannot all slip past a
+    read-then-count budget. A wrong code is 403, not 401: the SPA reads any
+    401 as an expired token and resubmits, which would spend two attempts on
+    one typo (#1371)."""
     if current_user.totp_enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA already enabled")
     if current_user.totp_secret_encrypted is None:
@@ -1226,9 +1267,39 @@ async def mfa_enroll_verify(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No enrolment in progress — call /mfa/enroll/begin first",
         )
+    if not enrolment_pending(current_user):
+        clear_pending_enrolment(current_user)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                source_ip=_client_ip(request),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
+                action="mfa.enrol_expired",
+                resource_type="user",
+                resource_id=str(current_user.id),
+                resource_display=current_user.username,
+                changed_fields=["totp_secret_encrypted", "recovery_codes_encrypted"],
+                result="success",
+            )
+        )
+        await db.commit()
+        minutes = int(PENDING_ENROLMENT_TTL.total_seconds() // 60)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"This enrolment expired: it has to be completed within {minutes} "
+                "minutes. Start again."
+            ),
+        )
+    # Claimed, not just checked: the attempt is spent before the code is
+    # compared and given back below only if the code was right.
+    await _refuse_if_stepup_blocked(current_user, claim=True)
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid TOTP code")
+    await refund_stepup_attempt(current_user.id)
     current_user.totp_enabled = True
     db.add(
         AuditLog(
