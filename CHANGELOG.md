@@ -25,6 +25,24 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Fixed
+
+- **Moving a DHCP reservation to another address while its client
+  still holds its lease no longer shows the old address as free
+  (#1302).** The move deleted the reservation's row at the old
+  address without looking at the lease table, and nothing re-created
+  it until the DHCP agent sent the lease again (the client's renewal,
+  the lease's expiry, or an agent restart). Until then IPAM showed the
+  address the device was still using as free, and the next-free
+  allocation could hand it to a second device. When the lease table
+  holds an active lease on the old address in that subnet, the move
+  now gives the address that lease's `dhcp` mirror row, linked to it,
+  as the lease ingest would. The reservation's own row, with the
+  operator's fields, still moves to the new address. In a
+  DDNS-enabled subnet the old address's A / PTR records are published
+  under the lease's hostname. The old address is still freed when no
+  active lease holds it.
+
 ### Security
 
 - **The MFA enrolment QR code is drawn in the browser, not fetched from
