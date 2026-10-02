@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A refused action says it was refused (#1344).** The zones tab's
+  bulk Delete sent one request per zone and then closed as if every one
+  had worked: a refused delete cleared the selection and left the zone
+  with no word, and a delete the two-person approval queue took was
+  reported as done too. Delete Zone, a server's Pause (DNS and DHCP),
+  Delete server (DHCP) and Delete role left their dialog open with no
+  word when refused, and the DNS propagation check painted Cloudflare,
+  Google, Quad9 and OpenDNS "OK" when its own request had failed. Each
+  now says why in the dialog it was taken from, in the server's words:
+  the bulk delete says how many zones it could not delete and keeps
+  only those selected, and says above the zones when deletes went to
+  the approval queue; a propagation check that failed shows no resolver
+  status, only the reason. This holds for any failure, not only a
+  Viewer's 403: a scoped role, a revoked grant, a 409, a 500.
+
 - **A list the reader may not see is no longer shown as empty
   (#1343).** When a page's own list read was refused (403), the page
   rendered its empty state, so a read-only Viewer was told "Trash is
