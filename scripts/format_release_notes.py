@@ -22,7 +22,12 @@ release-body-friendly version on stdout that:
    emoji prefixes for readability on GitHub.
 4. Wraps the top prose paragraph (the release summary) in a new
    ``### 🚀 Highlights`` heading so it's visually distinct from the
-   detail bullets below.
+   detail bullets below. A ``#`` / ``##`` banner above the summary
+   (a "don't roll back" warning) does not stop that.
+5. Condenses the result when it is over ``--max-chars`` (default
+   100,000; GitHub refuses a release body over 125,000): each entry
+   is cut to its bold headline, Migrations and Breaking stay whole,
+   and a note links ``--full-notes-url`` for the full text.
 
 The transform is idempotent — re-running on already-transformed
 input is a no-op (the emoji-prefixed headings don't double-prefix,
@@ -71,6 +76,21 @@ def _is_list_item(line: str) -> bool:
 def _is_blockquote(line: str) -> bool:
     """``> foo``. A callout, not prose — see ``flush_para``."""
     return line.lstrip().startswith(">")
+
+
+def _is_heading(line: str) -> bool:
+    """``### Fixed`` — hashes at column 0, then a space.
+
+    Both halves matter. An indented line is a bullet's wrapped
+    continuation, and one that happens to start with an issue number
+    (``  #1140).** Two faults…``) is not a heading: treating it as one
+    split the bullet in two mid-sentence in the release body. And
+    ``#1140`` with no space is not a heading in GFM either."""
+    return bool(re.match(r"#{1,6}(\s|$)", line))
+
+
+def _heading_level(line: str) -> int:
+    return len(line) - len(line.lstrip("#"))
 
 
 def _strip_quote_marker(line: str) -> str:
@@ -180,11 +200,16 @@ def transform(text: str) -> str:
             out.append("")
             continue
 
-        if line.lstrip().startswith("#"):
+        if _is_heading(line):
             flush_para()
             flush_list_item()
             out.append(_rewrite_heading(line))
-            saw_section_heading = True
+            # Only a ``###`` (or deeper) heading starts the detail
+            # sections. A bigger one above the summary is a banner
+            # (``# ⚠️ Don't roll back to …``), and the summary under it
+            # still gets its Highlights heading.
+            if _heading_level(line) >= 3:
+                saw_section_heading = True
             continue
 
         if _is_list_item(line):
@@ -219,8 +244,115 @@ def transform(text: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def main() -> None:
-    sys.stdout.write(transform(sys.stdin.read()))
+# ── Size limit ───────────────────────────────────────────────────────
+# GitHub refuses a release body over 125,000 characters, and the
+# create-release call fails at the very end of release.yml, after every
+# image is built. The notes are not the whole body: the release template
+# adds the appliance ISO and slot-upgrade sections around them. So the
+# default leaves room for those.
+DEFAULT_MAX_CHARS = 100_000
+
+# Sections kept whole when condensing: the summary (the Highlights heading
+# ``transform`` adds), and the two an operator needs every line of — every
+# migration id and every breaking change — which are short.
+_KEEP_WHOLE = {"Highlights", "Migrations", "Breaking"}
+
+_HEADLINE = re.compile(r"^- (\*\*.+?\*\*)")
+
+
+def _section_title(heading: str) -> str:
+    """``### 🗃️ Migrations`` ↦ ``Migrations``."""
+    title = heading.lstrip("#").strip()
+    return re.sub(r"^[^\w`]+", "", title).strip()
+
+
+def _headline(bullet: str, limit: int = 200) -> str:
+    """The bold lead of a bullet, or its first sentence, or a cut."""
+    m = _HEADLINE.match(bullet)
+    if m:
+        return f"- {m.group(1)}"
+    text = bullet[2:]
+    sentence = re.match(r"(.{20,}?[.!?])\s", text)
+    if sentence and len(sentence.group(1)) <= limit:
+        return f"- {sentence.group(1)}"
+    if len(text) <= limit:
+        return bullet
+    return "- " + text[:limit].rsplit(" ", 1)[0] + " …"
+
+
+def condense(text: str, max_chars: int, full_notes_url: str | None = None) -> str:
+    """Fit already-transformed notes under ``max_chars``.
+
+    Everything above the first section heading (a banner), the summary,
+    and the Migrations and Breaking sections are kept as they are.
+    Every other entry is cut to its bold headline, and a note says where
+    the full text is. If even that does not fit, the end is cut at a line
+    boundary, so the result is never over the limit."""
+    if len(text) <= max_chars:
+        return text
+    where = f"[CHANGELOG.md]({full_notes_url})" if full_notes_url else "CHANGELOG.md at this tag"
+    notice = (
+        "> **These notes are condensed.** The full entry is longer than GitHub "
+        "allows in a release, so each item below is cut to its headline. "
+        f"The full text is in {where}."
+    )
+    out: list[str] = []
+    section: str | None = None
+    noticed = False
+    for line in text.splitlines():
+        if _is_heading(line) and _heading_level(line) >= 3:
+            section = _section_title(line)
+            if not noticed and section != "Highlights":
+                if out and out[-1] != "":
+                    out.append("")
+                out += [notice, ""]
+                noticed = True
+            if out and out[-1] != "":
+                out.append("")
+            out += [line, ""]
+            continue
+        if section is None or section in _KEEP_WHOLE:
+            if not (line == "" and out and out[-1] == ""):
+                out.append(line)
+            continue
+        # Inside a condensed section: headlines only, as one tight list.
+        if _is_list_item(line):
+            out.append(_headline(line))
+    if not noticed:
+        out += ["", notice]
+    result = "\n".join(out).strip("\n") + "\n"
+    if len(result) <= max_chars:
+        return result
+    cut = f"\n\n> **Cut short here.** The full text is in {where}.\n"
+    head = result[: max_chars - len(cut)]
+    return head[: head.rfind("\n")].rstrip() + cut
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=DEFAULT_MAX_CHARS,
+        help="condense the notes above this many characters (0 = never)",
+    )
+    parser.add_argument(
+        "--full-notes-url",
+        default=None,
+        help="where the full notes are, linked from condensed notes",
+    )
+    args = parser.parse_args(argv)
+    notes = transform(sys.stdin.read())
+    if args.max_chars and len(notes) > args.max_chars:
+        condensed = condense(notes, args.max_chars, args.full_notes_url)
+        print(
+            f"release notes condensed: {len(notes)} -> {len(condensed)} characters",
+            file=sys.stderr,
+        )
+        notes = condensed
+    sys.stdout.write(notes)
 
 
 if __name__ == "__main__":

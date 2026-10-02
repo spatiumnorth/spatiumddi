@@ -104,6 +104,7 @@ from app.services.dns.named_conf_validation import (
     validate_view_name,
     validate_zone_forwarders,
 )
+from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -3273,6 +3274,41 @@ async def _bind9_zone_forwarders(
         ) from exc
 
 
+async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) -> None:
+    """422 when an options change leaves live ALIAS records with no resolver.
+
+    A PowerDNS group expands ALIAS through its plain-DNS forwarders (#1353),
+    so clearing them, or moving them to an encrypted transport, would leave
+    every ALIAS record in the group answering nothing. Create refuses an
+    ALIAS on such a group; this keeps the same state from being reached the
+    other way round. Only the transition is checked, so a group already in
+    that state (an upgrade) can still save unrelated options.
+    """
+    drivers = set(
+        (await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))).scalars()
+    )
+    if "powerdns" not in drivers:
+        return
+    count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSRecord)
+            .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+            .where(DNSZone.group_id == group_id, DNSRecord.record_type == "ALIAS")
+        )
+    ).scalar_one()
+    if count:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This group serves {count} ALIAS record(s), which PowerDNS resolves "
+                "through the group's plain-DNS (Do53) forwarders. Removing them, or "
+                "switching forwarding to an encrypted transport, would leave those "
+                "records answering nothing. Replace or delete the ALIAS records first."
+            ),
+        )
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -3305,10 +3341,13 @@ async def update_options(
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
+    resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
         setattr(opts, k, v)
 
     await _assert_encrypted_transport_sane(opts, db)
+    if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
+        await _refuse_if_alias_records_lose_resolver(group_id, db)
     # Response logging (#914) has nowhere to go without the query-log
     # channel: the ``responses`` category is routed to ``queries_channel``,
     # which is only defined inside the query-log block, and the agent's
@@ -7849,6 +7888,25 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
                 f"record with a CNAME (off-apex) / explicit A+AAAA pair."
             ),
         )
+    if record_type.upper() == "ALIAS":
+        # PowerDNS expands an ALIAS through the group's own plain-DNS
+        # forwarders and nothing else (#1353); without them the record would
+        # be stored and answer nothing.
+        opts = (
+            await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+        ).scalar_one_or_none()
+        if not alias_resolver(
+            getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "ALIAS records are resolved through the group's forwarders, and this "
+                    "group has none over plain DNS (Do53). Set forwarders under the "
+                    "group's server options first; SpatiumDDI no longer falls back to "
+                    "public resolvers."
+                ),
+            )
 
 
 async def _require_record(

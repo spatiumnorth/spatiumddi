@@ -212,6 +212,11 @@ class _ScriptedDriver(DriverBase):
         #: Runs inside ``daemon_running`` — the place a signal can land
         #: between the tick's stop check and the loop's crash exits.
         self.hook_running: Callable[[], None] | None = None
+        #: What ``daemon_restarting`` answers; the restart tests script it.
+        self.restarting = False
+
+    def daemon_restarting(self) -> bool:
+        return self.restarting
 
     def render(self, bundle: dict[str, Any]) -> None:
         return None
@@ -511,10 +516,11 @@ def test_waiting_sets_the_heartbeat_daemon_status_and_the_launch_clears_it(super
 
     assert rc == 2
     # tick 1 samples before the wait is marked; 2-5 during it; 6-7 after the
-    # launch cleared it.
+    # launch cleared it. Tick 7 reads twice: a death is confirmed by a second
+    # read before the exit, in case a restart finished in between (#1402).
     assert seen[0] == {}
     assert seen[1:5] == [supervisor.DEFERRED_DAEMON_STATUS] * 4
-    assert seen[5:] == [{"status": "ok"}, {"status": "ok"}]
+    assert seen[5:] == [{"status": "ok"}] * 3
     assert sv.idles[0].daemon_status == {"status": "ok"}
 
 
@@ -529,3 +535,120 @@ def test_a_sync_verdict_set_while_waiting_is_left_alone_on_launch(supervised) ->
 
     assert rc == 2
     assert sv.idles[0].daemon_status == theirs
+
+
+# ── a driver restarting its own daemon is not a death (#1402) ─────────────
+#
+# PowerDNS restarts pdns_server in place when pdns.conf changes, on the sync
+# thread. The gate walk saw the agent exit 2 on 2 of 3 forwarder changes:
+# ``powerdns_conf_changed_restarting``, then ``dns_daemon_exited`` 55-222 ms
+# later, because the old pid was gone while ``daemon_pid`` still named it.
+
+
+def _begin_restart(drv: _ScriptedDriver) -> None:
+    """SIGTERM sent: the old daemon is gone, ``daemon_pid`` still names it."""
+    drv.restarting = True
+    drv.running = False
+
+
+def _clear_pid(drv: _ScriptedDriver) -> None:
+    """``_restart_daemon`` clears the pid before spawning the new daemon."""
+    drv.daemon_pid = None
+
+
+def _finish_restart(drv: _ScriptedDriver) -> None:
+    drv.daemon_pid = 4343
+    drv.running = True
+    drv.restarting = False
+
+
+def test_a_restart_is_neither_a_death_nor_a_deferred_start(supervised) -> None:
+    """Every tick of the restart passes without a verdict, and the loop still
+    catches a real death afterwards."""
+    sv = supervised
+    drv = sv.drv
+    seen: list[dict[str, Any]] = []
+
+    def sample() -> None:
+        seen.append(dict(sv.idles[0].daemon_status))
+
+    rc = sv.run({
+        1: drv.launch,
+        3: lambda: _begin_restart(drv),
+        4: lambda: _clear_pid(drv),
+        5: lambda: _finish_restart(drv),
+        6: lambda: setattr(drv, "hook_running", sample),
+        8: drv.die,
+    })
+
+    assert rc == 2
+    assert sv.ticks[-1] == 8
+    assert sv.spy.events.count("dns_daemon_exited") == 1
+    assert "dns_daemon_start_deferred_waiting" not in sv.spy.events
+    # The pid-cleared tick must not have marked the heartbeat as deferred.
+    assert supervisor.DEFERRED_DAEMON_STATUS not in seen
+    assert seen[0] == {"status": "ok"}
+
+
+def test_a_restart_that_begins_inside_the_check_is_not_a_death(supervised) -> None:
+    """The restart flag is read before ``daemon_running()``; a restart that
+    starts between the two is what made the old pid read as dead."""
+    sv = supervised
+    drv = sv.drv
+
+    def restart_starts_now() -> None:
+        drv.hook_running = None
+        _begin_restart(drv)
+
+    rc = sv.run({
+        1: drv.launch,
+        3: lambda: setattr(drv, "hook_running", restart_starts_now),
+        5: lambda: _finish_restart(drv),
+        7: drv.die,
+    })
+
+    assert rc == 2
+    assert sv.ticks[-1] == 7
+
+
+def test_a_restart_that_finishes_inside_the_check_is_not_a_death(supervised) -> None:
+    """The other side of the window: ``daemon_running()`` saw the old pid
+    gone, then the restart completed before the verdict. The re-check finds
+    the new daemon up."""
+    sv = supervised
+    drv = sv.drv
+    calls = {"n": 0}
+
+    def old_gone_then_new_up() -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            drv.running = False  # this read sees the old daemon gone
+        else:
+            drv.hook_running = None
+            _finish_restart(drv)  # ...and by the re-check the new one is up
+
+    rc = sv.run({
+        1: drv.launch,
+        3: lambda: setattr(drv, "hook_running", old_gone_then_new_up),
+        6: drv.die,
+    })
+
+    assert rc == 2
+    assert sv.ticks[-1] == 6
+
+
+def test_a_restart_that_fails_to_bring_the_daemon_up_still_exits_2(supervised) -> None:
+    """The skip lasts only while the restart runs. A replacement that died
+    at startup is a dead daemon on the first tick after the restart ends."""
+    sv = supervised
+    drv = sv.drv
+
+    def restart_ends_with_a_dead_daemon() -> None:
+        drv.daemon_pid = 4343
+        drv.restarting = False  # running stays False: the new pdns exited
+
+    rc = sv.run({1: drv.launch, 3: lambda: _begin_restart(drv), 5: restart_ends_with_a_dead_daemon})
+
+    assert rc == 2
+    assert sv.ticks[-1] == 5
+    assert sv.spy.events[-1] == "dns_daemon_exited"

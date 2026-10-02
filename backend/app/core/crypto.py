@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import sys
+from datetime import UTC, datetime
 from functools import lru_cache
 
 import structlog
@@ -56,6 +57,16 @@ def _fernet() -> Fernet:
 
 def encrypt_str(plaintext: str) -> bytes:
     return _fernet().encrypt(plaintext.encode())
+
+
+def encrypted_at(token: bytes) -> datetime:
+    """When ``token`` was encrypted. A Fernet token carries its own creation
+    time (verified with the signature), so a caller can tell how old a value
+    is without a column for it. ``ValueError`` if the token is not ours."""
+    try:
+        return datetime.fromtimestamp(_fernet().extract_timestamp(token), UTC)
+    except InvalidToken as exc:
+        raise ValueError("encrypted value could not be verified") from exc
 
 
 def decrypt_str(token: bytes) -> str:
