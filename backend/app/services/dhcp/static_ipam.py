@@ -146,12 +146,17 @@ async def upsert_ipam_for_static(
     # per reservation. Deleting the row also snapshots the operator's columns
     # onto the reservation, which the restore below re-applies at the new
     # address — so a move carries them across instead of stranding them.
+    # When a live lease still holds the address left behind, the address
+    # becomes that lease's row instead of free (#1302, ``_release_moved_row``).
+    handovers: list[LeaseHandover] = []
     prior = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in prior.scalars().all():
         if str(row.address) == ip_str:
             continue
         if row.status == "static_dhcp":
-            await _delete_mirror_row(db, row, st)
+            handover = await _release_moved_row(db, row, st)
+            if handover is not None:
+                handovers.append(handover)
         else:
             # Not ours to delete — an operator re-purposed the row's status. Just
             # drop the back-link so it can't dangle.
@@ -196,6 +201,53 @@ async def upsert_ipam_for_static(
             await _sync_dns_record(db, row, subnet_row, action=action)
         except Exception:  # noqa: BLE001 — DNS sync is best-effort
             pass
+    # Last, with the reservation already at its new address: DDNS lets a
+    # reservation's hostname win, and none sits at the address handed over.
+    await publish_handover_ddns(db, handovers)
+
+
+async def _release_moved_row(
+    db: AsyncSession, row: IPAddress, st: DHCPStaticAssignment
+) -> LeaseHandover | None:
+    """Release a reservation's row at the address it has just moved away from.
+
+    The row is deleted, as it always was: the operator's columns move with the
+    reservation. But the reserved client keeps its lease on the old address
+    until it next talks to the server, and its grant arrived while the row was
+    ``static_dhcp``, which the lease mirror leaves alone, so after the delete
+    nothing re-derived the address until the agent sent that lease again — the
+    client's renewal, the lease's expiry, an agent restart. Until then IPAM
+    showed a live device's address as free, for the next-free allocation to
+    hand to a second device (#1302, the re-address sibling of #1274).
+
+    So when the product's lease table holds an active lease on the address in
+    this row's subnet, the address gets that lease's mirror: a new row, as the
+    lease-event ingest would create it had the lease arrived after the move,
+    and nothing of the reservation's (its name, its DNS records, the
+    operator's columns) carried onto it. Returns the hand-over, whose DDNS the
+    caller publishes once the reservation is at its new address.
+    """
+    lease = await _live_lease_at(db, row)
+    subnet_id, address = row.subnet_id, row.address
+    await _delete_mirror_row(db, row, st)
+    if lease is None:
+        return None
+    # The delete has to reach the database before the insert:
+    # (subnet_id, address) is unique (uq_ip_address_subnet_address).
+    await db.flush()
+    candidate = IPAddress(subnet_id=subnet_id, address=str(address))
+    _mirror_lease_onto(candidate, lease)
+    mirror, created = await insert_ipam_mirror_row(db, candidate)
+    if not created:
+        # A concurrent writer's row won the insert. Take it over only when
+        # the ingest would: a free row, or one a lease already owns.
+        if not (mirror.status == "available" or mirror.auto_from_lease):
+            return None
+        _mirror_lease_onto(mirror, lease)
+    subnet_row = await db.get(Subnet, subnet_id)
+    if subnet_row is None:
+        return None
+    return LeaseHandover(subnet_row, mirror, lease)
 
 
 async def detach_ipam_for_static(
@@ -262,7 +314,10 @@ async def detach_ipam_for_static(
 
 @dataclass(frozen=True)
 class LeaseHandover:
-    """A row ``detach_ipam_for_static`` handed to the lease that holds it."""
+    """A row handed to the lease that holds its address: a reservation's row
+    when the reservation is deleted (``detach_ipam_for_static``, #1274), or a
+    new row at the address a reservation moved away from
+    (``upsert_ipam_for_static``, #1302)."""
 
     subnet: Subnet
     row: IPAddress
@@ -276,8 +331,9 @@ async def publish_handover_ddns(db: AsyncSession, handovers: list[LeaseHandover]
     ingest runs ``apply_ddns_for_lease`` whenever it takes a row over, so
     without this the mirror would sit in IPAM with no DNS until the client's
     next renewal (the same wait #1274 removes for IPAM). A no-op when the
-    subnet's DDNS is off. Call it only after the reservation is deleted and
-    flushed; see ``detach_ipam_for_static``. Best-effort, like the ingest's
+    subnet's DDNS is off. Call it only once no reservation sits at the address
+    any more — deleted and flushed (``detach_ipam_for_static``) or moved
+    elsewhere (``upsert_ipam_for_static``). Best-effort, like the ingest's
     call: a DNS failure never undoes the IPAM hand-over, and the next lease
     event or sweep reconciles it.
     """
