@@ -145,7 +145,14 @@ RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
 # pass — that rewrite would materialise a duplicate copy of every
 # file in a new layer (~550 MB doubled). Setting ownership at COPY
 # time keeps the source layer authoritative.
-RUN useradd --no-create-home --shell /bin/false app \
+#
+# The base image's pip is removed (#1392): nothing at runtime runs it, and
+# it is not a Debian package, so ``apt-get upgrade`` can never patch it and
+# every scan at default severity reports its CVEs. A production image also
+# has no business carrying a package installer. The ``dev`` stage below puts
+# it back with ``ensurepip``.
+RUN python -m pip uninstall -y --root-user-action=ignore pip \
+    && useradd --no-create-home --shell /bin/false app \
     && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images /var/lib/spatiumddi/pcaps \
     && chmod 0700 /var/lib/spatiumddi/pcaps \
     && chown app:app /app \
@@ -191,7 +198,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 # writes), then switch back to ``app`` so the runtime CMD stays unchanged.
 FROM runtime AS dev
 USER root
-RUN pip install --no-cache-dir --root-user-action=ignore \
+# The runtime stage removed pip (#1392); ``--default-pip`` restores the plain
+# ``pip`` command too, which ``make ci-backend-lint`` execs into this image.
+RUN python -m ensurepip --default-pip \
+    && python -m pip install --no-cache-dir --root-user-action=ignore \
         "pytest>=8.3.0" \
         "pytest-asyncio>=0.24.0" \
         "pytest-cov>=6.0.0" \
