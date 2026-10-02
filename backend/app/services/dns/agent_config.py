@@ -549,12 +549,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
     tsig_keys: list[dict[str, Any]] = []
-    if grp and grp.tsig_key_name and grp.tsig_key_secret:
+    if (group_key := legacy_group_key(grp)) is not None:
         tsig_keys.append(
             {
-                "name": grp.tsig_key_name,
-                "secret": grp.tsig_key_secret,
-                "algorithm": grp.tsig_key_algorithm,
+                "name": group_key.name,
+                "secret": group_key.secret,
+                "algorithm": group_key.algorithm,
             }
         )
 

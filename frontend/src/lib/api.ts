@@ -5902,6 +5902,12 @@ export const dnsApi = {
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
     api.put<DNSServerGroup>(`/dns/groups/${id}`, data).then((r) => r.data),
+  // #1364 — replace the group's own TSIG key secret. The secret is never
+  // returned; agents get it in their next config bundle.
+  rotateGroupTsigKey: (id: string) =>
+    api
+      .post<DNSServerGroup>(`/dns/groups/${id}/group-tsig-key/rotate`)
+      .then((r) => r.data),
   // #62: returns the full axios response (may be 202 queued-for-approval —
   // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
   // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.

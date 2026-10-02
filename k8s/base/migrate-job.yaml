@@ -32,6 +32,15 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: postgres-password
+            # #1364 — a migration can encrypt existing values with the
+            # install's credential key, so it needs the same SECRET_KEY as
+            # the api (and CREDENTIAL_ENCRYPTION_KEY too, if you set one
+            # there). Without it the migration refuses to start.
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: secret-key
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
           resources:

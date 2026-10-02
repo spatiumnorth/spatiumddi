@@ -134,7 +134,7 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
-from app.services.dns.tsig import group_key_names
+from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -1614,6 +1614,42 @@ async def update_group(
             resource_id=str(group.id),
             resource_display=group.name,
             changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
+    collect_wake(dns_group_channel(group.id))
+    await db.commit()
+    await db.refresh(group)
+    drivers = await _drivers_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+
+
+@router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
+async def rotate_group_key(
+    group_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> ServerGroupResponse:
+    """Replace the group's own TSIG key secret (#1364).
+
+    That key is granted ``allow-update`` and ``allow-transfer`` on every
+    primary zone the group serves, so anyone holding it can transfer and
+    rewrite them. Rotating it is the answer to "it may have leaked" (a
+    database or backup read). The name is kept, so the next bundle carries
+    one changed secret and every agent re-renders its ``key {}`` stanza; an
+    RFC 2136 update signed with the old secret in that window is refused and
+    retried (#1232). The secret is never returned.
+    """
+    group = await _require_group(group_id, db)
+    rotate_group_tsig_key(group)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="rotate",
+            resource_type="dns_server_group",
+            resource_id=str(group.id),
+            resource_display=group.name,
+            new_value={"tsig_key_name": group.tsig_key_name},
             result="success",
         )
     )

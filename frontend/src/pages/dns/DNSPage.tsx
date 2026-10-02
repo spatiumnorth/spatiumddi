@@ -1014,6 +1014,21 @@ function GroupModal({
     group?.is_public_facing ?? false,
   );
   const [error, setError] = useState("");
+  const [confirmRotate, setConfirmRotate] = useState(false);
+  const [rotated, setRotated] = useState(false);
+
+  const rotateMut = useMutation({
+    mutationFn: (id: string) => dnsApi.rotateGroupTsigKey(id),
+    onSuccess: () => {
+      setConfirmRotate(false);
+      setRotated(true);
+      qc.invalidateQueries({ queryKey: ["dns-groups"] });
+    },
+    onError: (e: ApiError) => {
+      setConfirmRotate(false);
+      setError(formatApiError(e));
+    },
+  });
 
   const mut = useMutation({
     mutationFn: (d: Partial<DNSServerGroup>) =>
@@ -1146,6 +1161,33 @@ function GroupModal({
           )}
         </div>
 
+        {group && (
+          <div className="rounded border bg-muted/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="min-w-0 text-sm font-medium">
+                Group TSIG key
+              </span>
+              <button
+                type="button"
+                onClick={() => setConfirmRotate(true)}
+                className="shrink-0 rounded-md border px-2.5 py-1 text-xs hover:bg-muted"
+              >
+                Rotate…
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              The key this group&apos;s agents sign dynamic updates with, and
+              that its BIND9 servers allow zone transfers to. Rotate it if a
+              database or backup copy may have been read.
+            </p>
+            {rotated && (
+              <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                Rotated. Agents pick up the new key on their next config sync.
+              </p>
+            )}
+          </div>
+        )}
+
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
@@ -1153,6 +1195,29 @@ function GroupModal({
           label={group ? "Save" : "Create"}
         />
       </form>
+      {group && confirmRotate && (
+        <ConfirmModal
+          open
+          title="Rotate the group TSIG key?"
+          confirmLabel="Rotate key"
+          loading={rotateMut.isPending}
+          onClose={() => setConfirmRotate(false)}
+          onConfirm={() => rotateMut.mutate(group.id)}
+          message={
+            <div className="space-y-2 text-sm">
+              <p>
+                A new secret replaces the current one, under the same key name.
+                Every agent in the group re-renders its config with it on the
+                next sync.
+              </p>
+              <p>
+                A dynamic update signed with the old secret in that window is
+                refused and retried. Nothing outside SpatiumDDI uses this key.
+              </p>
+            </div>
+          }
+        />
+      )}
     </Modal>
   );
 }

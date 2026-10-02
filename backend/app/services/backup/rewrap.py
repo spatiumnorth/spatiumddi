@@ -84,6 +84,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("dhcp_server", "id", "credentials_encrypted"),
     ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
+    ("dns_server_group", "id", "tsig_key_secret_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
