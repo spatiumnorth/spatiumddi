@@ -27,6 +27,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot rollback to a release older than #1044 no longer lets the
+  next upgrade regenerate `SECRET_KEY` (#1299).** #1044 carried the app
+  Secret through a reinstall with `helm.sh/resource-policy: keep`, but
+  `helm uninstall` reads that annotation from the release's last stored
+  revision, not from the live Secret, and after a rollback to
+  2026.09.04-1 that revision is the old chart's, which has none. On the
+  next forward boot helm-controller re-ran the HelmChart the old release
+  had left, before firstboot placed the new one; that upgrade failed,
+  the `reinstall` failure policy uninstalled the release, the Secret
+  went with it, and the install minted a new key, so everything
+  encrypted before it (the appliance certificate first) could no longer
+  be read. The control release now uses `failurePolicy: retry`, which
+  upgrades a failed release again and never uninstalls it. firstboot
+  sets it on every boot on the `spatium-control` HelmChartConfig, the
+  policy helm-controller actually applies (it overrides the HelmChart's
+  and defaults to `reinstall`) and the one a rollback leaves in place.
+  On a rolled-back release whose k3s predates `retry` (2026.09.04-1), a
+  failed control release now waits for an operator instead of being
+  reinstalled.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
