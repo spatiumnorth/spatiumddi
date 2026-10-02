@@ -228,3 +228,95 @@ def test_a_bare_token_failure_is_still_a_rejection() -> None:
     a CA-hash mismatch both stay 'rejected')."""
     assert "rejected the join token" in _classify('level=fatal msg="failed to validate token"')
     assert "rejected the join token" in _classify('msg="token CA hash does not match"')
+
+
+def test_a_refused_member_add_names_the_refusal_not_the_network() -> None:
+    """#1285 — the seed's etcd refused the member add (a dead voter still held a
+    seat). k3s retried once a second and gave up with "failed to wait for API
+    server to become ready: context deadline exceeded" — which the transport
+    rule would read as an unreachable seed. The seed answered; its etcd said
+    no, and the reason must say that. Verbatim lines from member-4 on
+    nightly-2026.09.28."""
+    adding = (
+        'time="2026-09-29T11:57:34Z" level=info msg="Adding member '
+        "ddipg-member-4-4ee86735=https://192.168.122.195:2380 to etcd cluster "
+        '[ddipg-member-3-7d1c4ad1=https://192.168.122.86:2380]"'
+    )
+    waiting = (
+        'time="2026-09-29T11:57:34Z" level=info msg="Waiting for other members to finish '
+        'joining etcd cluster: etcdserver: unhealthy cluster"'
+    )
+    shutdown = (
+        'time="2026-09-29T12:02:28Z" level=error msg="Shutdown request received: '
+        '\\"failed to wait for API server to become ready: context deadline exceeded'
+        '\\nthe server is currently unable to handle the request\\""'
+    )
+    reason = _classify("\n".join([adding, waiting] * 900 + [shutdown]))
+    assert reason.startswith("the seed's etcd refused this member (etcdserver: unhealthy cluster)")
+    assert "Fleet → Replace" in reason
+    assert "could not reach the seed" not in reason
+
+
+def test_a_learner_backlog_names_the_other_joiner() -> None:
+    log = (
+        'level=info msg="Waiting for other members to finish joining etcd cluster: '
+        'etcdserver: too many learner members in cluster"\n'
+        'level=error msg="Shutdown request received: \\"failed to wait for API server '
+        'to become ready: context deadline exceeded\\""'
+    )
+    reason = _classify(log)
+    assert reason.startswith("the seed's etcd refused this member (etcdserver: too many "
+                             "learner members)")
+    assert "another member is still joining" in reason
+
+
+def test_a_specific_fatal_still_wins_over_an_earlier_refusal() -> None:
+    """A duplicate-name fatal is the verdict even if the add was refused first."""
+    log = (
+        'level=info msg="Waiting for other members to finish joining etcd cluster: '
+        'etcdserver: unhealthy cluster"\n'
+        'level=fatal msg="duplicate node name found, please use a unique name"'
+    )
+    assert "already an etcd member" in _classify(log)
+
+
+
+def test_a_refusal_that_did_not_end_the_attempt_is_not_the_cause() -> None:
+    """#1326 review: one refusal anywhere in the attempt made the failure
+    `refused_unhealthy`, which is permanent upstream (no auto-retry) and tells
+    the operator to Replace a member. Here the attempt died of a closed port;
+    the refusal before it is not the cause, and the reason is the transport's."""
+    log = (
+        'level=info msg="Waiting for other members to finish joining etcd cluster: '
+        'etcdserver: unhealthy cluster"\n'
+        'level=fatal msg="starting kubernetes: preparing server: failed to get CA certs: '
+        'Get \\"https://10.0.0.1:6443/cacerts\\": dial tcp 10.0.0.1:6443: connect: '
+        'connection refused"'
+    )
+    reason = _classify(log)
+    assert reason.startswith("could not reach the seed")
+    assert "refused this member" not in reason
+
+
+def test_the_last_refusal_before_the_give_up_names_it() -> None:
+    """The attempt is named by the refusal it ended on: a learner backlog that
+    cleared, then an unreachable voter, is the voter; the reverse is the
+    backlog, which stays transient."""
+    unhealthy = (
+        'level=info msg="Waiting for other members to finish joining etcd cluster: '
+        'etcdserver: unhealthy cluster"'
+    )
+    learners = (
+        'level=info msg="Waiting for other members to finish joining etcd cluster: '
+        'etcdserver: too many learner members in cluster"'
+    )
+    give_up = (
+        'level=error msg="Shutdown request received: \\"failed to wait for API server '
+        'to become ready: context deadline exceeded\\""'
+    )
+    assert _classify("\n".join([learners, unhealthy, give_up])).startswith(
+        "the seed's etcd refused this member (etcdserver: unhealthy cluster)"
+    )
+    assert _classify("\n".join([unhealthy, learners, give_up])).startswith(
+        "the seed's etcd refused this member (etcdserver: too many learner members)"
+    )

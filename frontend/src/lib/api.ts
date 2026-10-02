@@ -13406,6 +13406,9 @@ export interface ClusterWorkloadHealth {
   ready: number;
   total: number;
   restarts: number;
+  /** Job pods still running for this component (#1213), e.g. a CNPG
+   *  replica join. Not in ready / total; keeps the status off healthy. */
+  jobs_running: number;
   status: string;
 }
 

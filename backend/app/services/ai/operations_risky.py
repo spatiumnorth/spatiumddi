@@ -97,13 +97,11 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     )
 
     batch = await collect_soft_delete_batch(db, root)
-    root_id = getattr(root, "id", None)
+    # ``counts()`` includes the set-based children (a zone's records, #1231),
+    # which are never loaded as rows. The root is the target, not collateral.
+    counts = batch.counts()
     root_rt = _resource_type(root)
-    counts: dict[str, int] = {}
-    for row in batch.rows:
-        if getattr(row.obj, "id", None) == root_id and row.resource_type == root_rt:
-            continue
-        counts[row.resource_type] = counts.get(row.resource_type, 0) + 1
+    counts[root_rt] = counts.get(root_rt, 0) - 1
     labels = {
         "ip_block": "child block",
         "subnet": "subnet",
@@ -335,7 +333,7 @@ async def _apply_delete_subnet(
         )
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
         await _purge_leases_for_scope_batch(db, batch)
-        apply_soft_delete(batch, user.id)
+        await apply_soft_delete(db, batch, user.id)
         for row in batch.rows:
             db.add(
                 _audit(
@@ -344,7 +342,7 @@ async def _apply_delete_subnet(
                     row.resource_type,
                     str(row.obj.id),
                     row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    old_value=batch.audit_old_value(row),
                 )
             )
         await db.commit()
@@ -572,7 +570,7 @@ async def _apply_delete_block(
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
-    apply_soft_delete(batch, user.id)
+    await apply_soft_delete(db, batch, user.id)
     for row in batch.rows:
         db.add(
             _audit(
@@ -581,7 +579,7 @@ async def _apply_delete_block(
                 row.resource_type,
                 str(row.obj.id),
                 row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
+                old_value=batch.audit_old_value(row),
             )
         )
     await db.commit()
@@ -709,7 +707,7 @@ async def _apply_delete_space(
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
-    apply_soft_delete(batch, user.id)
+    await apply_soft_delete(db, batch, user.id)
     for row in batch.rows:
         db.add(
             _audit(
@@ -718,7 +716,7 @@ async def _apply_delete_space(
                 row.resource_type,
                 str(row.obj.id),
                 row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
+                old_value=batch.audit_old_value(row),
             )
         )
     await db.commit()
@@ -814,7 +812,7 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
 
         await sweep_zone_ops(db, zone, zone.group_id)
         batch = await collect_soft_delete_batch(db, zone)
-        apply_soft_delete(batch, user.id)
+        await apply_soft_delete(db, batch, user.id)
         for row in batch.rows:
             db.add(
                 AuditLog(
@@ -825,7 +823,7 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
                     resource_type=row.resource_type,
                     resource_id=str(row.obj.id),
                     resource_display=row.display,
-                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    old_value=batch.audit_old_value(row),
                     result="success",
                 )
             )
@@ -976,7 +974,7 @@ async def _apply_delete_scope(
 
     if not args.permanent:
         batch = await collect_soft_delete_batch(db, scope)
-        apply_soft_delete(batch, user.id)
+        await apply_soft_delete(db, batch, user.id)
         for row in batch.rows:
             write_audit(
                 db,
@@ -985,7 +983,7 @@ async def _apply_delete_scope(
                 resource_type=row.resource_type,
                 resource_id=str(row.obj.id),
                 resource_display=row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id), **cleanup_audit},
+                old_value={**batch.audit_old_value(row), **cleanup_audit},
             )
         await db.commit()
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}

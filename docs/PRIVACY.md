@@ -28,9 +28,8 @@ profiling, the Operator Copilot's LLM provider, Let's Encrypt,
 blocklist feeds, cloud DNS / integration mirrors, the whois and RBL
 tools) are off until you configure them,
 and the table below lists exactly what each one sends and to whom.
-Choosing **PowerDNS** for a server group adds connections that are
-not yet yours to configure: every PowerDNS server polls PowerDNS's
-security-advisory zone, and resolves the targets of ALIAS records,
+Choosing **PowerDNS** for a server group adds a connection that is
+not yet yours to configure: ALIAS records resolve their targets
 through Cloudflare's and Google's public resolvers, which are
 hardcoded today. That is a defect, not a design choice (§3.5,
 [#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353)).
@@ -161,19 +160,34 @@ added on the agent side to change it was never wired to the control
 plane, so **these addresses cannot be changed today**; making them
 configurable is tracked in
 [#1353](https://github.com/spatiumnorth/spatiumddi/issues/1353).
-PowerDNS sends two kinds of lookup through them:
+PowerDNS sends one kind of lookup through them:
 
 | Connection | Feature | Default | What is sent |
 |---|---|---|---|
-| `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53, then PowerDNS's `secpoll.powerdns.com` nameservers | PowerDNS security-status polling, a built-in PowerDNS feature SpatiumDDI does not turn off | **On for every PowerDNS server**, at startup and periodically after that, whether or not it serves any zone | A TXT query for `auth-<version>.security-status.secpoll.powerdns.com`, which tells the resolvers and PowerDNS's nameservers which PowerDNS version you run. Observed on the shipped 5.0.7 image. With no network route to the resolvers at all, that image does not start (`Unable to UDP connect to remote nameserver 1.1.1.1:53: Network unreachable`). |
 | `1.1.1.1` (Cloudflare) and `8.8.8.8` (Google), plain DNS on port 53 | ALIAS records on a PowerDNS server group | Only on a PowerDNS group that serves an ALIAS record, when a client queries a name that has one | The **ALIAS target name** (A / AAAA queries for it), from the DNS server's own address, unencrypted. Cloudflare and Google see which names your ALIAS records point at, and when they were looked up. |
 
-To avoid both now, use BIND9 or Technitium rather than PowerDNS.
-Blocking the two addresses at a firewall stops the lookups and makes
-ALIAS answers fail. It is not a full workaround: a host with no route
-to them at all does not start PowerDNS (above), and whether PowerDNS
-starts when the packets are dropped rather than unroutable has not
-been verified.
+Even with no ALIAS record, the `resolver=` line is there, and PowerDNS
+connects to it when it starts: on a host with **no network route** to
+those addresses the shipped 5.0.7 image does not start
+(`Unable to UDP connect to remote nameserver 1.1.1.1:53: Network
+unreachable`). Whether it starts when a firewall drops the packets,
+rather than having no route, has not been verified.
+
+PowerDNS's own **security-status polling** (a TXT query for
+`auth-<version>.security-status.secpoll.powerdns.com`, which names the
+version you run) is turned off: SpatiumDDI renders an empty
+`security-poll-suffix`. Builds before #1353 sent it from every
+PowerDNS server at startup and periodically; the setting takes effect
+the next time the PowerDNS container starts, which an upgrade does.
+The optional **dnsdist front** (Docker Compose only) has the same
+feature, also on by default, querying
+`dnsdist-<version>.security-status.secpoll.powerdns.com` through the
+container's system resolver; its entrypoint now writes an empty
+`setSecurityPollSuffix("")`, which turns it off from the next restart.
+
+To avoid the ALIAS lookups now, use BIND9 or Technitium rather than
+PowerDNS, or block the two addresses at your firewall, which makes
+ALIAS answers fail.
 
 ## 4. Air-gapped operation
 

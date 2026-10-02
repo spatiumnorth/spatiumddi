@@ -1245,15 +1245,24 @@ class PowerDNSDriver(DriverBase):
                 f"log-dns-details={log_queries_value}",
                 f"log-dns-queries={log_queries_value}",
                 "",
+                # PowerDNS polls a TXT record under secpoll.powerdns.com at
+                # startup and periodically to learn whether its version has
+                # a security advisory. That query leaves through ``resolver=``
+                # (the hardcoded public resolvers below) or the system
+                # resolver, naming the version; it is an outbound connection
+                # nobody configured (non-negotiable #17). An empty suffix
+                # turns it off (#1353). PowerDNS fixes arrive with
+                # SpatiumDDI releases instead. A startup setting: takes effect on
+                # pdns's next start, like ``dnsupdate`` below.
+                "security-poll-suffix=",
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
-                # the configured resolver. The resolver list is
-                # operator-controlled via ``options.alias_resolver``
-                # (#250) so air-gapped + split-horizon deployments can
-                # point at a private resolver instead of leaking
-                # internal-zone lookups to public DNS. Empty string
-                # disables ALIAS entirely.
+                # the configured resolver. #250 made the list overridable
+                # via ``options.alias_resolver`` (empty string disables
+                # ALIAS entirely), but the control plane never sends that
+                # option, so every server gets the 1.1.1.1 / 8.8.8.8
+                # default today — wiring it up is tracked in #1353.
                 *(
                     ["expand-alias=yes", f"resolver={alias_resolver}"]
                     if alias_resolver.strip()

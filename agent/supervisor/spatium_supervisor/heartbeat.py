@@ -43,7 +43,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state, firewall_peer_audit, watchdog
+from . import appliance_state, approval_state, etcd_evict, firewall_peer_audit, watchdog
 from . import cp_tls
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
@@ -317,10 +317,17 @@ _cached_role_health: dict[str, Any] = {}
 _PEER_DRIFT_INTERVAL_S = 300.0  # 5 minutes
 _last_peer_drift_at: float = 0.0
 
-# #272 Phase 9 — k8s Node names this seed has successfully evicted but
-# the backend hasn't yet confirmed cleared. Reported on each heartbeat
-# request; pruned once the backend drops the name from its evict list.
+# #272 Phase 9 — names this seed has evicted but the backend hasn't yet
+# confirmed cleared. Reported on each heartbeat request; pruned once the
+# backend drops the name from its evict list. #1284 — "evicted" means the
+# node's etcd member is gone (etcd_evict), not only its k8s Node.
 _evicted_pending: set[str] = set()
+# #1284 — names whose k8s Node this seed already deleted (or found absent),
+# still waiting for etcd to drop the member; and why, per name, reported as
+# ``evict_pending`` so the row shows it.
+_nodes_deleted: set[str] = set()
+_evict_reasons: dict[str, str] = {}
+_etcd_evictions = etcd_evict.EtcdEvictions()
 
 # #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
 # deferral: the instance was the primary, or the Cluster named none). Handed
@@ -674,10 +681,13 @@ def heartbeat_once(
         # as port_conflicts does; None is reserved for "an old supervisor didn't
         # report", which must leave the stored value untouched.
         "firewall_state": appliance_state.read_firewall_state() or {},
-        # #272 Phase 9 — report the k8s Nodes this seed evicted on prior
-        # ticks so the backend clears their ``evict_requested`` flag +
-        # settles them to ``left``. Empty on non-seed / nothing-evicted.
+        # #272 Phase 9 — report the nodes this seed evicted on prior ticks
+        # so the backend clears their ``evict_requested`` flag + settles them
+        # to ``left``. Empty on non-seed / nothing-evicted. #1284 — only once
+        # etcd no longer lists the node; ``evict_pending`` says why the rest
+        # are still waiting.
         "evicted_node_names": sorted(_evicted_pending),
+        "evict_pending": dict(_evict_reasons),
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -1170,20 +1180,28 @@ def heartbeat_once(
 
         # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
         # Node the backend flagged for eviction (deleting the Node makes
-        # k3s drop the etcd member); newly-deleted names are stashed in
-        # ``_evicted_pending`` and reported on the next heartbeat so the
-        # backend clears the flag. Prune the stash to whatever the
-        # backend still lists as pending (everything else is confirmed).
-        evict_names = body_out.get("evict_node_names") or []
+        # k3s drop the etcd member).
+        #
+        # #1284 — the Node is not the member. A node can be an etcd voter
+        # with no Node (a failed joiner whose own re-join made it a voter,
+        # then died before its Node registered): the DELETE answers 404,
+        # which delete_node counts as success, and k3s has no Node to remove
+        # the member through. So a deleted (or absent) Node only hands the
+        # name to etcd_evict, whose host runner removes the node's etcd
+        # member and reports what etcd lists. A name is stashed in
+        # ``_evicted_pending`` (reported next heartbeat, so the backend
+        # settles the row ``left``) only once etcd no longer has it.
+        evict_names = [str(n) for n in (body_out.get("evict_node_names") or [])]
+        evict_addresses = body_out.get("evict_node_addresses") or {}
         evicted_now: list[str] = []
         for name in evict_names:
-            if name in _evicted_pending:
+            if name in _evicted_pending or name in _nodes_deleted:
                 continue
-            ok, evict_err = k8s_api.delete_node(str(name))
+            ok, evict_err = k8s_api.delete_node(name)
             if ok:
-                _evicted_pending.add(str(name))
-                evicted_now.append(str(name))
-                log.info("supervisor.heartbeat.node_evicted", node=name)
+                _nodes_deleted.add(name)
+                evicted_now.append(name)
+                log.info("supervisor.heartbeat.node_deleted", node=name)
                 # #590 — the deleted node strands any local-path Redis PVC
                 # provisioned on it (node-affine PV): the replacement
                 # replica sits Pending forever and its missing sentinel
@@ -1209,7 +1227,26 @@ def heartbeat_once(
                 log.warning(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
                 )
-        _evicted_pending.intersection_update({str(n) for n in evict_names})
+        confirmed, reasons = _etcd_evictions.tick(
+            {
+                n: [str(a) for a in (evict_addresses.get(n) or [])]
+                for n in evict_names
+                if n in _nodes_deleted and n not in _evicted_pending
+            },
+            # A node promoted again after its eviction is wanted: its new
+            # etcd member is not a late arrival of the evicted one.
+            wanted=[str(n) for n in (body_out.get("join_node_names") or [])],
+        )
+        for name in confirmed:
+            _evicted_pending.add(name)
+            log.info("supervisor.heartbeat.node_evicted", node=name)
+        for name, reason in reasons.items():
+            if _evict_reasons.get(name) != reason:
+                log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
+        _evict_reasons.clear()
+        _evict_reasons.update(reasons)
+        _evicted_pending.intersection_update(set(evict_names))
+        _nodes_deleted.intersection_update(set(evict_names))
 
         # #1058 — the deleted Node strands the CloudNativePG instance claim
         # provisioned on it exactly as it strands Redis's, and the operator

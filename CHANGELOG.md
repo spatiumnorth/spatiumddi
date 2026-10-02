@@ -292,6 +292,115 @@ the formatter handles the rest.
   - Also fixed: the Fleet slot cards showed an error as
     `Request failed with status code …` instead of the server's reason.
 
+- **The unattended-upgrades package blocklist says what it accepts
+  (#1384).** The APT settings form, the model and APPLIANCE.md called
+  its entries globs, but unattended-upgrades reads each one as a regular
+  expression matched from the start of the package name. So `linux-*`
+  matched far more than intended, and `*` is not a valid expression at
+  all and would break the daily run on the host, stopping every
+  security update. All three now say regular expression, with examples,
+  and the API refuses an entry that does not compile (422, naming it).
+  Entries saved before this are not re-checked. Two rendering faults on
+  the same path are fixed with it: the host runner doubled every
+  backslash on the assumption that apt.conf unescapes them, which it
+  does not, so a regex like `linux-image-\d` reached unattended-upgrades
+  as a different expression and blocked nothing; and a double quote,
+  which apt.conf cannot express at all, was accepted and made the whole
+  policy file fail to parse. Values are now written verbatim and a
+  double quote is refused at save. The APT form also shows the server's
+  reason for a refused save instead of "Request failed with status code
+  422".
+
+- **Building a DNS group's config no longer loads every blocklist
+  entry as a database object (#1109).** The bundle the agents
+  long-poll for collected blocklist entries the way #948 stopped
+  collecting records: a full ORM object per entry, the shape that
+  OOM-killed the api on a 250k-record group. The Family filter profile
+  (#878) brings ~596k entries in one click. Entries are now read as
+  plain columns, in a fixed order within each list so the bundle's
+  ETag no longer depends on how Postgres happens to return them. On
+  100k entries this went from 3.4 s and a 100 MiB peak to 1.2 s and
+  38 MiB. The lists themselves are now collected in a fixed order too
+  (a view's own lists first, then the group's, each by name): it
+  decides which list wins a duplicate name, and it used to follow the
+  order Postgres returned the assignments in, so the winner and the
+  ETag could change between two builds of an unchanged group.
+
+- **Deleting a large zone, and opening the Trash, no longer scale with
+  the zone (#1231).** The default zone delete loaded every record,
+  stamped each through the ORM and wrote one audit row per record, all
+  in one transaction and computing each audit hash under the global
+  audit lock, so it blocked every other audited change for its
+  duration. A zone's records are now stamped by one `UPDATE`, and the
+  zone's own audit row records how many it took with it
+  (`old_value.cascaded`). A record already in the trash keeps its own
+  deletion and comes back with that one, not with the zone. The Trash
+  page loaded every soft-deleted row of every type into Python on
+  each view, plus a count per batch per type; it now filters, counts
+  and pages in SQL, and counts batch sizes for the shown rows only.
+  The search stays a literal substring match.
+
+- **Restoring a large zone from the Trash no longer scales with the
+  zone either (#1389).** Restore still had the old shape: one conflict
+  `SELECT` per record and one audit row per record, so bringing back a
+  250k-record zone was 250k of each in one request, blocking every
+  other audited change. The conflicts are now found by one query for
+  the whole batch, the zone's records come back by one `UPDATE`, and
+  the zone's own restore row records how many (`new_value.restored`).
+  The response's `restored` count still includes them. The conflict
+  check now uses the identity record create refuses a duplicate on
+  (#1230): the view, the name compared case-insensitively, the type,
+  the value after trimming, and priority, weight and port. So a record
+  in another view, or an MX or SRV at another priority or port, no
+  longer blocks the restore (neither was ever a duplicate), while a
+  restore can no longer bring back a twin that differs from a live
+  record only in letter case or surrounding spaces. A #963 bulk record
+  delete still restores record by record, since each record is
+  re-pushed to agentless providers.
+
+- **Cluster health no longer counts a joining database replica as a
+  ready instance (#1213).** The workload rollup on
+  `GET /appliance/cluster/health` skipped only finished Job pods, so
+  while CNPG bootstrapped a replica its running `postgresql-N-join` pod
+  counted as a third ready database pod: the Cluster Overview read
+  3/3 healthy while CNPG reported two instances, "Creating a new
+  replica". Job pods no longer count toward a workload's ready or
+  total, and a workload with a Job still running reads `degraded`
+  rather than `healthy` until it finishes, with the count of running
+  Job pods on the row (`jobs_running`, shown as "+1 job") so a
+  degraded 2/2 says why. The rolling upgrade was
+  never affected: its safety check reads CNPG's own `readyInstances`.
+
+- **PowerDNS servers no longer report their version to
+  secpoll.powerdns.com (#1353).** PowerDNS polls a TXT record under
+  `secpoll.powerdns.com` at startup and periodically, naming the
+  PowerDNS version it runs, and nothing turned it off. Every PowerDNS
+  server sent it, through the hardcoded public resolvers or the system
+  resolver. Both renderers now write an empty `security-poll-suffix`,
+  which disables it; it takes effect the next time the PowerDNS
+  container starts, which an upgrade does. The optional dnsdist front
+  polled the same zone for its own version, also by default; its
+  entrypoint now writes `setSecurityPollSuffix("")`. PRIVACY.md §3.5
+  says so.
+  Still open on #1353: the ALIAS resolver is hardcoded to `1.1.1.1` /
+  `8.8.8.8`, and PowerDNS does not start on a host with no route to
+  them.
+
+- **Unattended upgrades no longer install kernels on the appliance
+  (#1249).** `mkosi.conf` said "No kernel upgrades" while the
+  unattended-upgrades drop-in allowed security-pocket kernels, and
+  nothing excluded them. Each slot boots `/boot/vmlinuz` and
+  `/boot/initrd.img`, symlinks the slot-image build and the installer
+  point at the image's own kernel. A kernel with a new ABI never ran,
+  because Debian's kernel packages maintain their symlinks in `/`, not
+  `/boot`; it only took space in a fixed-size slot. A revision of the
+  slot's own ABI was worse: it overwrote the very `vmlinuz-<ver>` those
+  symlinks name and rebuilt its initrd on the device, so the slot booted
+  a kernel its image never shipped. `linux-image-` is
+  now on the drop-in's Package-Blacklist, which apt merges with an
+  operator's own blocklist from the APT settings (#164). Kernels
+  arrive with slot images, as before.
+
 - **The privacy statement lists the public resolvers PowerDNS
   uses, and its guard now scans the agents too (#1353).** The agent
   renders `resolver=1.1.1.1,8.8.8.8` into every PowerDNS server's
@@ -736,6 +845,81 @@ the formatter handles the rest.
   at once. A download that never completes fails with its own message:
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
+
+- **A replaced node stays replaced: its Fleet row no longer goes
+  back from `left` to `failed` on the node's own word (#1317).**
+  Replace evicts a node on the seed's word and settles its row
+  `left`. The replaced node can still be alive: a failed joiner back
+  on its standalone control plane, or a member that was cut off and
+  returns. It goes on reporting what its join runner last wrote, and
+  the heartbeat applied whatever a node reported. A failed joiner's
+  `failed` turned the settled row back into a failed joiner, so the
+  Fleet showed a node it had just evicted as a failed join again. (A
+  node retries a failed join on its own, so a retry can still be
+  running when Replace is accepted; it reports when it ends.) A
+  member's `ready`, which a node never stops reporting, re-settled
+  the row as a member etcd no longer has. Only the order decided it:
+  the report did no harm when it landed before the eviction settled,
+  and an eviction that settles within seconds (#1284) often settles
+  first. An evicted row now ignores the join state its node reports,
+  from Replace until something is asked of the node again (a new
+  promote). A row an operator cleared mid-join still settles on the
+  node's `ready`, as before.
+
+- **Fleet → Replace removes the node's etcd member, not only its
+  k8s Node, and the row settles `left` only once etcd agrees
+  (#1284).** The seed evicted a replaced node by deleting its k8s
+  Node, which makes k3s drop a server's etcd member, and settled the
+  row `left` on that alone. A 404 counted as success. A node can be
+  an etcd member with no Node at all: a failed joiner whose own
+  automatic re-join made it a voter, then died before its Node
+  registered. Replace accepts exactly that row, and the dead voter
+  then kept its seat for good. The cluster ran on two live voters of
+  three with no fault tolerance, and etcd refused every later member
+  add ("etcdserver: unhealthy cluster"), so the replacement Replace
+  was for could never join. The seed now also removes the node's
+  etcd member itself, through a new host runner
+  (`spatium-etcd-evict`, behind `spatiumddi-etcd-evict.path`). The
+  member is matched by the name k3s gives it
+  (`<hostname>-<8 hex>`), or, before it has a name, by a peer URL on
+  the node's addresses; the seed's own member is never touched. It
+  reports the node evicted only once etcd no longer lists it. Until
+  then the row stays `evicting`, with the reason in the Fleet UI. A
+  member that appears for the name within five minutes of the
+  eviction is removed too: a re-join that was already in flight when
+  Replace landed. A node that is promoted again in that time is
+  exempt, since its new member is wanted. A seed whose OS slot
+  predates the runner keeps the old behaviour. Promote is refused
+  while an eviction is still pending, for the node itself and for
+  any node under the same hostname, and the Fleet no longer offers
+  them for promotion: until the eviction settles, the seed removes
+  etcd members under that name. The runner acts only on a fresh
+  request and sets each one aside once it has answered it, so
+  starting it again never repeats an old eviction.
+
+- **A join the seed's etcd refuses is rolled back with its reason,
+  instead of sitting `joining` for good (#1285).** The join runner's
+  #1052 guard, which stops a node that already joined the seed's etcd
+  from being rolled back into a ghost voter, counted k3s's `Adding
+  member … to etcd cluster` line as membership. k3s logs that line
+  before it asks etcd to add the member, and again on every retry
+  while etcd refuses the add (`etcdserver: unhealthy cluster` while a
+  dead voter still holds a seat, for example). So a refused join was
+  kept: no rollback, k3s restarting every ~15 minutes, and a `failed`
+  no supervisor could report, so the row read `joining` indefinitely
+  and Replace refused it. Only lines k3s and etcd log after the add
+  succeeded count now. A refused join is rolled back to the node's
+  standalone control plane, with a reason that names the refusal
+  rather than an unreachable seed. When the refusal is a voter the
+  seed cannot reach, the node stays standalone: the reason says to
+  remove that member first, and the join is not retried on its own,
+  since every retry would wipe the node again and be refused again.
+  A learner backlog is still retried. A refusal names the failure
+  only when the attempt ended on it: one refused add early in an
+  attempt that then failed for another reason no longer stops the
+  automatic retry. The journal scan behind this decision is also
+  anchored in UTC, so an appliance set to another time zone no
+  longer scans the wrong window.
 
 - **After a DHCP agent restart, an address that has changed hands no
   longer drops out of IPAM while its new client holds it (#1318).**
@@ -1881,6 +2065,33 @@ the formatter handles the rest.
   that actually reports findings.
 
 ### Security
+
+- **A started MFA enrolment is budgeted and expires (#1354).** The first
+  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
+  started enrolment never expired and survived sign-out and a password
+  change. So an abandoned enrolment stayed open to unlimited 6-digit
+  guesses from any of the user's sessions, and a hit turned MFA on with a
+  secret the user never saw, locking a local user out until an admin
+  reset it. Verify now spends the same fail-closed step-up budget as
+  begin, disable and regenerate (`429` when spent, `503` while it cannot
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
+  candidate secret's own Fernet timestamp.
+
+- **The api image no longer ships pip (#1392).** The runtime image
+  carried the Python base image's own pip 25.0.1, which has six fixed
+  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
+  only, so it never blocked on them, and `apt-get upgrade` cannot patch
+  pip because it is not a Debian package. So every scan at default
+  severity, such as Harbor's, reported them on every build. Nothing at
+  runtime runs pip, and a production image has no business carrying a
+  package installer, so the runtime stage now uninstalls it, and the
+  `dev` stage (pytest, `make ci-backend-lint`) restores it with
+  `ensurepip`. A Trivy scan of the runtime image now reports no
+  fixable Python-package finding at any severity.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
