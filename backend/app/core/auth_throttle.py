@@ -178,6 +178,60 @@ async def stepup_password_blocked(user_id: object) -> bool:
         raise StepupThrottleUnavailable from exc
 
 
+# Give one claimed attempt back, but only while the window that counted it is
+# still open: a DECR on an expired key would recreate it at -1 with no TTL,
+# and every later INCR would then accumulate on a key that never expires.
+_STEPUP_REFUND_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return redis.call('DECR', KEYS[1])
+end
+return 0
+"""
+
+
+async def claim_stepup_attempt(user_id: object) -> bool:
+    """Spend one attempt from the budget BEFORE the answer is checked, and say
+    whether it was within the budget (#1354).
+
+    ``stepup_password_blocked`` + ``record_stepup_password_failure`` is a
+    read-then-count: a burst of concurrent requests all read the same
+    under-budget count before any of them records, so the budget bounds
+    sequential guessing only. That matters little for a bcrypt-checked
+    password and a lot for a 6-digit code, so the enrolment verify claims
+    the attempt atomically instead, and refunds it on success
+    (``refund_stepup_attempt``) so only wrong answers stay counted.
+
+    The window opens with ``SET NX EX`` before the ``INCR`` (which keeps the
+    TTL), so a key can never be left counting without an expiry.
+
+    Fails CLOSED, like ``stepup_password_blocked``."""
+    key = _stepup_key(user_id)
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            await r.set(key, 0, ex=_STEPUP_FAIL_WINDOW_SECONDS, nx=True)
+            count = await r.incr(key)
+            return int(count) <= _STEPUP_FAIL_MAX
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — any Redis failure means "no budget to spend"
+        logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
+        raise StepupThrottleUnavailable from exc
+
+
+async def refund_stepup_attempt(user_id: object) -> None:
+    """Give back an attempt ``claim_stepup_attempt`` spent on a right answer.
+    Best-effort: failing to refund costs the user one attempt, nothing more."""
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            await r.eval(_STEPUP_REFUND_LUA, 1, _stepup_key(user_id))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — a lost refund only costs one attempt
+        logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
+
+
 async def record_stepup_password_failure(user_id: object) -> None:
     """Count one wrong step-up answer. Only failures count, so a user who
     gets it right is never slowed by their own successes.

@@ -55,6 +55,9 @@ async def _user(db: AsyncSession) -> tuple[User, dict[str, str]]:
 
 
 def _budget(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], dict[str, bool]]:
+    """Stand-in budget. ``failures`` holds one entry per attempt still
+    counted: begin records a wrong password, verify claims up front and
+    refunds a right code, so either way only wrong answers remain."""
     import app.api.v1.auth.router as auth_router
 
     failures: list[object] = []
@@ -66,8 +69,19 @@ def _budget(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], dict[str, bo
     async def _blocked(_user_id: object) -> bool:
         return blocked["now"]
 
+    async def _claim(user_id: object) -> bool:
+        if blocked["now"]:
+            return False
+        failures.append(user_id)
+        return True
+
+    async def _refund(user_id: object) -> None:
+        failures.remove(user_id)
+
     monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
     monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
+    monkeypatch.setattr(auth_router, "claim_stepup_attempt", _claim)
+    monkeypatch.setattr(auth_router, "refund_stepup_attempt", _refund)
     return failures, blocked
 
 
@@ -193,3 +207,64 @@ def test_an_unreadable_token_is_not_pending() -> None:
         totp_secret_encrypted = b"not-a-token"
 
     assert enrolment_pending(_U()) is False
+
+
+@pytest.mark.asyncio
+async def test_claim_is_atomic_and_refund_returns_a_right_answer() -> None:
+    """Against the real Redis: concurrent claims cannot all pass, a refund
+    gives one back, and a refund after the window is gone does not leave a
+    key counting with no expiry."""
+    import asyncio
+
+    from app.config import settings
+    from app.core import auth_throttle as throttle
+    from app.core.redis_client import make_async_redis
+
+    uid = uuid.uuid4()
+    results = await asyncio.gather(*(throttle.claim_stepup_attempt(uid) for _ in range(20)))
+    assert sum(results) == throttle._STEPUP_FAIL_MAX
+
+    r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+    try:
+        key = throttle._stepup_key(uid)
+        assert 0 < await r.ttl(key) <= throttle._STEPUP_FAIL_WINDOW_SECONDS
+        await r.set(key, throttle._STEPUP_FAIL_MAX, keepttl=True)
+        await throttle.refund_stepup_attempt(uid)
+        assert await throttle.claim_stepup_attempt(uid) is True
+
+        await r.delete(key)
+        await throttle.refund_stepup_attempt(uid)
+        assert await r.exists(key) == 0
+    finally:
+        await r.delete(throttle._stepup_key(uid))
+        await r.aclose()
+
+
+@pytest.mark.asyncio
+async def test_an_admin_reset_abandons_a_pending_enrolment(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _budget(monkeypatch)
+    user, headers = await _user(db_session)
+    await _begin(client, headers)
+    admin = User(
+        username=f"a-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@example.test",
+        display_name="a",
+        auth_source="local",
+        hashed_password=hash_password(_PW),
+        is_superadmin=True,
+    )
+    admin.groups = []
+    db_session.add(admin)
+    await db_session.commit()
+    admin_headers = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+    r = await client.post(
+        f"/api/v1/users/{user.id}/reset-password",
+        headers=admin_headers,
+        json={"new_password": "Reset-pw-1354-Xyz!"},
+    )
+    assert r.status_code == 204, r.text
+    await db_session.refresh(user)
+    assert user.totp_secret_encrypted is None
+    assert user.recovery_codes_encrypted is None

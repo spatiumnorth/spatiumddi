@@ -1955,10 +1955,11 @@ the formatter handles the rest.
   secret the user never saw, locking a local user out until an admin
   reset it. Verify now spends the same fail-closed step-up budget as
   begin, disable and regenerate (`429` when spent, `503` while it cannot
-  be read). A wrong code answers `403`, not `401`, so the UI does not
-  resubmit and count it twice. A started enrolment expires after 15
-  minutes (verify answers `400` and discards it), and sign-out or a
-  password change discards it too. No migration: the start time is the
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
   candidate secret's own Fernet timestamp.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**

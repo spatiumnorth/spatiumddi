@@ -79,13 +79,16 @@ session alone doesn't prove and an SSO account has no local password.
   count toward a per-account budget of 5 per 15 minutes, after which the
   step-up answers `429` without checking the credential: these run for a
   caller who already holds a session, so unthrottled each would be a
-  password (or TOTP) oracle. A wrong code at verify answers `403`. The
+  password (or TOTP) oracle. A wrong code at verify answers `403`, and
+  verify claims its attempt atomically before checking the code (refunding
+  it on a right one), so concurrent guesses cannot all slip under the
+  budget. The
   budget lives in Redis and, unlike the login throttle, fails **closed**:
   while Redis is unreachable these step-ups answer `503` with
   `Retry-After: 60`.
   **A started enrolment lasts 15 minutes (#1354).** Verify refuses an older
-  one (`400`) and discards it; sign-out and a password change discard one
-  too, and `GET /auth/mfa/status` reports `enrolment_pending` only while it
+  one (`400`) and discards it; sign-out, a password change and an admin
+  password reset discard one too, and `GET /auth/mfa/status` reports `enrolment_pending` only while it
   is still valid. Its start time is the candidate secret's own Fernet
   timestamp, since begin encrypts a fresh secret every time it runs. An
   abandoned enrolment used to stay open indefinitely to code guesses from

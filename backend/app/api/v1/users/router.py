@@ -21,6 +21,7 @@ from app.services.account_lockout import (
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
     push_history,
@@ -334,6 +335,10 @@ async def reset_password(
     user.password_history_encrypted = push_history(
         hashed, user.password_history_encrypted, policy.history_count
     )
+    # #1354 — like a self-service change, an admin reset discards a started
+    # MFA enrolment: a reset usually means the account was compromised, and
+    # the enrolment may have been started by whoever compromised it.
+    clear_pending_enrolment(user)
     # SECURITY (#400 / M3): an admin password reset must revoke every
     # outstanding session + refresh token for the target user — the whole
     # reason an admin resets a password is usually that the account is

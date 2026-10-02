@@ -43,9 +43,11 @@ from app.core.auth.user_sync import (
 )
 from app.core.auth_throttle import (
     StepupThrottleUnavailable,
+    claim_stepup_attempt,
     login_rate_limited,
     mfa_challenge_consume,
     record_stepup_password_failure,
+    refund_stepup_attempt,
     stepup_password_blocked,
 )
 from app.core.demo_mode import forbid_in_demo_mode
@@ -901,7 +903,7 @@ async def change_password(
     current_user.password_history_encrypted = new_history
     # #1354 — a started MFA enrolment does not survive a password change: it
     # may have been started by whoever made the change necessary.
-    clear_pending_enrolment(current_user)
+    enrolment_dropped = clear_pending_enrolment(current_user)
 
     # SECURITY (#400 / M3): a password change must revoke every other
     # outstanding session + refresh token for this user. Without this a
@@ -926,7 +928,8 @@ async def change_password(
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
-        changed_fields=["hashed_password", "force_password_change", "password_changed_at"],
+        changed_fields=["hashed_password", "force_password_change", "password_changed_at"]
+        + (["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else []),
         result="success",
     )
     db.add(audit)
@@ -938,7 +941,7 @@ async def change_password(
 async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
     _clear_refresh_cookie(response)
     # #1354 — signing out abandons a started MFA enrolment.
-    clear_pending_enrolment(current_user)
+    enrolment_dropped = clear_pending_enrolment(current_user)
     await db.execute(
         update(UserSession)
         .where(UserSession.user_id == current_user.id, UserSession.revoked.is_(False))
@@ -952,6 +955,9 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
+        changed_fields=(
+            ["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else None
+        ),
         result="success",
     )
     db.add(audit)
@@ -1106,16 +1112,22 @@ async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusRe
     )
 
 
-async def _refuse_if_stepup_blocked(user: User) -> None:
+async def _refuse_if_stepup_blocked(user: User, *, claim: bool = False) -> None:
     """429 once the account has spent its wrong-answer budget on MFA
     step-ups (#1241). These run for a caller who already holds a session —
     the hijacked session they exist to stop — so unthrottled, each is an
     oracle for the password (or, on disable / regenerate, the TOTP code).
 
+    ``claim=True`` spends the attempt atomically up front instead of only
+    reading the count (#1354); the caller refunds it on a right answer.
+
     503 while the budget cannot be read: the throttle fails closed, so a
     Redis outage pauses MFA changes rather than lifting the limit."""
     try:
-        blocked = await stepup_password_blocked(user.id)
+        if claim:
+            blocked = not await claim_stepup_attempt(user.id)
+        else:
+            blocked = await stepup_password_blocked(user.id)
     except StepupThrottleUnavailable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1231,12 +1243,13 @@ async def mfa_enroll_verify(
     ``PENDING_ENROLMENT_TTL`` old is discarded instead of verified. Without
     either, an abandoned enrolment stayed open to unlimited 6-digit guesses
     from any of the user's sessions, and a hit turned MFA on with a secret
-    the user never saw. A wrong code is 403, not 401: the SPA reads any 401
-    as an expired token and resubmits, which would spend two attempts on one
-    typo (#1371)."""
+    the user never saw. The attempt is claimed atomically before the code is
+    checked, so a burst of concurrent guesses cannot all slip past a
+    read-then-count budget. A wrong code is 403, not 401: the SPA reads any
+    401 as an expired token and resubmits, which would spend two attempts on
+    one typo (#1371)."""
     if current_user.totp_enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA already enabled")
-    await _refuse_if_stepup_blocked(current_user)
     if current_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1244,6 +1257,21 @@ async def mfa_enroll_verify(
         )
     if not enrolment_pending(current_user):
         clear_pending_enrolment(current_user)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                source_ip=_client_ip(request),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
+                action="mfa.enrol_expired",
+                resource_type="user",
+                resource_id=str(current_user.id),
+                resource_display=current_user.username,
+                changed_fields=["totp_secret_encrypted", "recovery_codes_encrypted"],
+                result="success",
+            )
+        )
         await db.commit()
         minutes = int(PENDING_ENROLMENT_TTL.total_seconds() // 60)
         raise HTTPException(
@@ -1253,10 +1281,13 @@ async def mfa_enroll_verify(
                 "minutes. Start again."
             ),
         )
+    # Claimed, not just checked: the attempt is spent before the code is
+    # compared and given back below only if the code was right.
+    await _refuse_if_stepup_blocked(current_user, claim=True)
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
-        await record_stepup_password_failure(current_user.id)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid TOTP code")
+    await refund_stepup_attempt(current_user.id)
     current_user.totp_enabled = True
     db.add(
         AuditLog(
