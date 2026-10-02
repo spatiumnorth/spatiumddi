@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""spatium-etcd-evict — removes the etcd members of the nodes Fleet → Replace
+evicts, on the seed (#1284).
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⚠️  Removes etcd members. Only the members of a node the control      │
+│ plane is evicting are touched: the name k3s gave it                  │
+│ (<hostname>-<8 hex>, exactly), or no name yet and a peer URL on one  │
+│ of that node's addresses. Never this node's own member.              │
+└─────────────────────────────────────────────────────────────────────┘
+
+Flow (the host-runner pattern of spatium-cluster-join / -restore):
+  1. Fleet → Replace flags a row evict_requested. On its next heartbeat the
+     seed's supervisor deletes the node's k8s Node, then writes
+       /var/lib/spatiumddi/release-state/etcd-evict-pending
+     (the confirm marker, `id <request>`, then
+     `node<TAB><hostname><TAB><ip>[,<ip>…]` per node) through its
+     release-state bind mount.
+  2. spatiumddi-etcd-evict.path notices it and runs this script as root.
+  3. This script takes the request out of the trigger's path, lists the
+     seed's etcd members, removes each member that belongs to a listed
+     node, lists them again, and writes
+       /var/lib/spatiumddi/release-state/etcd-evict.state
+     (`id <request>`, then `<hostname><TAB><state><TAB><detail>`, where the
+     state is one of absent | removed | present | error). The supervisor
+     reports a node evicted, and the row settles `left`, only once its
+     state is absent or removed.
+  4. The answered request is kept as etcd-evict-pending.done (.failed when
+     the member list was unreadable), so nothing can run it again: a
+     manual start of the unit, or a touch of the trigger, finds no request.
+     A request older than MAX_REQUEST_AGE_S is refused without touching
+     etcd (.stale). The supervisor writes a fresh one whenever it still
+     wants an answer.
+
+Why: k3s removes a server's etcd member only through its k8s Node (the
+Node's deletion, or the etcd.k3s.cattle.io/remove annotation). A node that
+became an etcd voter before its Node registered has no Node. That is a failed
+joiner whose own retry re-joined it and which then died. Deleting "its" Node
+answered 404 and removed nothing, and the dead voter kept its seat for good:
+two live voters of three, and every later member add refused (etcdserver:
+unhealthy cluster). The supervisor cannot do this itself, because its process
+user can read neither the etcd client key nor the host's loopback etcd port.
+
+How etcd is reached. The appliance ships no etcdctl, and k3s's embedded etcd
+serves no JSON gateway on its client port. Over HTTP/1.1 the connection is
+closed with an empty reply. Over HTTP/2 the gRPC server answers 415 to
+anything that is not application/grpc. So:
+- the member list is k3s's own /db/info on 127.0.0.1:6443, the endpoint a
+  joining server reads. It uses the server token's basic auth, and its member
+  IDs are uint64s, which Python's json keeps exact;
+- a removal is the etcd gRPC call itself, etcdserverpb.Cluster/MemberRemove,
+  framed here (one uint64 field) and sent by curl over HTTP/2 with k3s's etcd
+  client certificate;
+- what etcd lists afterwards is the verdict, not what the call answered.
+"""
+
+from __future__ import annotations
+
+import base64
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+RELEASE_STATE = Path(os.environ.get("SPATIUM_RELEASE_STATE", "/var/lib/spatiumddi/release-state"))
+TRIGGER = RELEASE_STATE / "etcd-evict-pending"
+STATE = RELEASE_STATE / "etcd-evict.state"
+# Must stay byte-identical to CONFIRM in the supervisor's etcd_evict.py.
+CONFIRM = "SPATIUMDDI-ETCD-EVICT-CONFIRM-V1"
+K3S_SERVER_DIR = Path(os.environ.get("SPATIUM_K3S_SERVER_DIR", "/var/lib/rancher/k3s/server"))
+K3S_URL = os.environ.get("SPATIUM_K3S_URL", "https://127.0.0.1:6443")
+ETCD_URL = os.environ.get("SPATIUM_ETCD_URL", "https://127.0.0.1:2379")
+LOG = Path(os.environ.get("SPATIUM_LOG_DIR", "/var/log/spatiumddi")) / "etcd-evict.log"
+# appliance/tests replace the two etcd calls with commands of their own.
+MEMBERS_CMD = os.environ.get("SPATIUM_ETCD_MEMBERS_CMD", "")
+REMOVE_CMD = os.environ.get("SPATIUM_ETCD_REMOVE_CMD", "")
+# A request is acted on only while it is fresh. The path unit starts this
+# script about a second after the supervisor writes one, and the supervisor
+# writes a new request once an answer is 90 s overdue (RUNNER_SILENT_S in its
+# etcd_evict.py). An older request was never run when it was written, and
+# nobody waits on it any more: acting on it would act on the past, and a node
+# promoted again since then (its new member appears about 80 s after the
+# promote) would lose that member as the evicted one's.
+MAX_REQUEST_AGE_S = 60.0
+
+
+def log(msg: str) -> None:
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {msg}\n")
+    except OSError:
+        # Best effort: a log that cannot be written (a full or read-only
+        # /var/log) must not stop an eviction or its answer.
+        pass
+
+
+# ---- the request -------------------------------------------------------------------
+
+def read_request(text: str) -> tuple[str, list[tuple[str, list[str]]]] | None:
+    """(request id, [(hostname, [ips])]), or None when the confirm marker is
+    missing: a stray or hand-made file must remove nothing."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != CONFIRM:
+        return None
+    request_id = ""
+    nodes: list[tuple[str, list[str]]] = []
+    for line in lines[1:]:
+        if line.startswith("id "):
+            request_id = re.sub(r"[^A-Za-z0-9]", "", line[3:])[:64]
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == "node" and parts[1].strip():
+            ips = [a.strip() for a in (parts[2] if len(parts) > 2 else "").split(",") if a.strip()]
+            nodes.append((parts[1].strip(), ips))
+    return request_id, nodes
+
+
+# ---- which members belong to a node -----------------------------------------------
+
+def canonical_addr(text: str) -> str:
+    """An address in one spelling, so `fd00:0::1` and `fd00::1` (or upper-case
+    hex) compare equal. Anything that is not an IP stays as written, lower-cased."""
+    text = text.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text.lower()
+
+
+def peer_host(url: str) -> str:
+    try:
+        return canonical_addr(urlsplit(url).hostname or "")
+    except ValueError:
+        return ""
+
+
+def _member_name_re(host: str) -> re.Pattern[str]:
+    """The name k3s gives a server's etcd member: `<node name>-<8 hex>`, and
+    nothing after it (`\\Z`: `$` also matches before a trailing newline)."""
+    return re.compile(r"^" + re.escape(host) + r"-[0-9a-f]{8}\Z")
+
+
+def node_members(members: list[dict], host: str, ips: list[str],
+                 own_names: set[str]) -> list[dict]:
+    """The members that belong to one node: the name k3s gives a server's member
+    (<hostname>-<8 hex>, exactly), or, while it has no name yet (a learner that
+    never started), a peer URL on one of the node's addresses. Never one of
+    this node's own."""
+    name_re = _member_name_re(host)
+    own_res = [_member_name_re(o) for o in own_names]
+    addrs = {canonical_addr(a) for a in ips}
+    out = []
+    for m in members:
+        name = str(m.get("name") or "")
+        if name and (name in own_names or any(r.match(name) for r in own_res)):
+            continue
+        if name_re.match(name) or (not name and any(
+                peer_host(u) in addrs for u in (m.get("peerURLs") or []))):
+            out.append(m)
+    return out
+
+
+def own_names() -> set[str]:
+    """This node's own etcd member name (k3s's etcd config) and its hostname:
+    neither may ever be removed here."""
+    names = {os.environ.get("SPATIUM_NODE_NAME") or socket.gethostname()}
+    try:
+        text = (K3S_SERVER_DIR / "db" / "etcd" / "config").read_text(encoding="utf-8")
+        m = re.search(r"(?m)^name:\s*(\S+)", text)
+        if m:
+            names.add(m.group(1))
+    except OSError:
+        # No etcd config to read: the set still holds the hostname, which is
+        # the k3s node name this node's own member name starts with.
+        pass
+    return {n for n in names if n}
+
+
+# ---- etcd --------------------------------------------------------------------------
+
+def list_members() -> list[dict]:
+    """The seed's etcd members through k3s's /db/info. Raises when the list is
+    unreadable, including k3s's canned fallback: when its own MemberList fails
+    it answers a list that names only itself and carries no member IDs."""
+    if MEMBERS_CMD:
+        body = subprocess.run(["sh", "-c", MEMBERS_CMD], capture_output=True, text=True,
+                              timeout=30, check=False).stdout
+    else:
+        token = (K3S_SERVER_DIR / "token").read_text(encoding="utf-8").strip()
+        password = token.split("::server:", 1)[1] if "::server:" in token else token
+        ctx = ssl.create_default_context(cafile=str(K3S_SERVER_DIR / "tls" / "server-ca.crt"))
+        req = urllib.request.Request(f"{K3S_URL}/db/info")
+        req.add_header("Authorization",
+                       "Basic " + base64.b64encode(f"server:{password}".encode()).decode())
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    data = json.loads(body)
+    members = data.get("members") if isinstance(data, dict) else None
+    if not isinstance(members, list) or not members:
+        raise ValueError(f"no member list in the answer: {body[:160]!r}")
+    if not all(isinstance(m, dict) and m.get("ID") for m in members):
+        raise ValueError("k3s answered its fallback list (no member IDs): its MemberList failed")
+    return members
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte, n = n & 0x7F, n >> 7
+        if n:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def remove_frame(member_id: int) -> bytes:
+    """A gRPC frame carrying MemberRemoveRequest{ID: member_id} (field 1, varint)."""
+    msg = b"\x08" + _varint(int(member_id))
+    return b"\x00" + len(msg).to_bytes(4, "big") + msg
+
+
+def remove_member(member_id: int) -> str:
+    """etcdserverpb.Cluster/MemberRemove over HTTP/2; '' when etcd accepted it or
+    the member was already gone, else etcd's error. The list read afterwards is
+    the verdict either way."""
+    if REMOVE_CMD:
+        r = subprocess.run(["sh", "-c", REMOVE_CMD, "remove", str(member_id)],
+                           capture_output=True, text=True, timeout=30, check=False)
+        return "" if r.returncode == 0 else (r.stdout or r.stderr).strip()[:200]
+    tls = K3S_SERVER_DIR / "tls" / "etcd"
+    cmd = ["curl", "-sS", "--http2", "--max-time", "15",
+           "--cacert", str(tls / "server-ca.crt"),
+           "--cert", str(tls / "client.crt"), "--key", str(tls / "client.key"),
+           "-H", "content-type: application/grpc", "-H", "te: trailers",
+           "--data-binary", "@-", "-D", "-", "-o", "/dev/null",
+           f"{ETCD_URL}/etcdserverpb.Cluster/MemberRemove"]
+    try:
+        r = subprocess.run(cmd, input=remove_frame(member_id), capture_output=True,
+                           timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"curl: {exc}"[:200]
+    if r.returncode != 0:
+        return f"curl exit {r.returncode}: {r.stderr.decode(errors='replace').strip()[:160]}"
+    return grpc_error(r.stdout.decode("utf-8", errors="replace"))
+
+
+def grpc_error(headers: str) -> str:
+    """'' when etcd's answer says the member is gone (grpc-status 0, or the
+    member was not found), else what went wrong. curl dumps the HTTP/2 trailers
+    with the headers, and every gRPC answer carries a grpc-status; an answer
+    without one (an HTTP 415 from a server that did not take the call as gRPC)
+    removed nothing, and the log must not say it did."""
+    status = re.search(r"(?im)^grpc-status:\s*(\d+)", headers)
+    message = re.search(r"(?im)^grpc-message:\s*(.*?)\s*$", headers)
+    text = urllib.request.unquote(message.group(1)) if message else ""
+    if status is None:
+        http = re.search(r"(?im)^HTTP/[\d.]+\s+(\d{3})", headers)
+        return f"no grpc-status in etcd's answer (HTTP {http.group(1) if http else '?'})"
+    if status.group(1) == "0" or "member not found" in text:
+        return ""
+    return f"grpc-status {status.group(1)}: {text}"[:200]
+
+
+# ---- the run -----------------------------------------------------------------------
+
+def write_state(request_id: str, lines: list[str]) -> None:
+    tmp = STATE.with_name(f"{STATE.name}.{os.getpid()}.new")
+    tmp.write_text("".join([f"id {request_id}\n", *(f"{ln}\n" for ln in lines)]),
+                   encoding="utf-8")
+    tmp.chmod(0o644)
+    tmp.replace(STATE)
+
+
+def describe(m: dict) -> str:
+    return f"{m.get('ID')} {m.get('name') or '(unnamed)'}"
+
+
+def retire(taken: Path, outcome: str) -> None:
+    """Keep the request just handled as etcd-evict-pending.<outcome>, out of the
+    trigger's path. Only that request: one the supervisor wrote meanwhile is at
+    the trigger's path, and it is left for the next run."""
+    try:
+        taken.replace(TRIGGER.with_name(f"{TRIGGER.name}.{outcome}"))
+    except OSError as exc:
+        log(f"could not set the handled request aside: {exc}")
+
+
+def run() -> int:
+    if not TRIGGER.exists():
+        return 0
+    # Take the request before acting on it. Renamed out of the trigger's path,
+    # it can never run twice, whatever starts this unit again. The rename is one
+    # more change on the watched path while this run is active, so systemd
+    # folds it into this run's start job.
+    taken = TRIGGER.with_name(f"{TRIGGER.name}.processing")
+    try:
+        TRIGGER.replace(taken)
+        text = taken.read_text(encoding="utf-8", errors="replace")
+        age = time.time() - taken.stat().st_mtime
+    except OSError:
+        # Gone between the check and the rename: a run started by hand took it.
+        return 0
+    req = read_request(text)
+    if req is None:
+        log("request without the confirmation marker — refusing, nothing removed")
+        retire(taken, f"rejected.{int(time.time())}")
+        return 0
+    request_id, nodes = req
+    if abs(age) > MAX_REQUEST_AGE_S:
+        why = (f"refused a request {int(age)}s old (the limit is {int(MAX_REQUEST_AGE_S)}s): "
+               "nothing removed; the supervisor asks again if it still wants it")
+        log(why)
+        write_state(request_id, [f"{host}\terror\t{why}" for host, _ in nodes])
+        retire(taken, "stale")
+        return 0
+    rc = answer(request_id, nodes)
+    retire(taken, "done" if rc == 0 else "failed")
+    return rc
+
+
+def answer(request_id: str, nodes: list[tuple[str, list[str]]]) -> int:
+    """Remove the listed nodes' members and write what etcd lists afterwards."""
+    mine = own_names()
+    try:
+        members = list_members()
+    except Exception as exc:  # noqa: BLE001 — every failure is reported per node
+        why = f"the seed's etcd member list is unreadable: {exc}"[:240]
+        log(why)
+        write_state(request_id, [f"{host}\terror\t{why}" for host, _ in nodes])
+        return 1
+    removed: dict[str, list[str]] = {}
+    failed: dict[str, list[str]] = {}
+    for host, ips in nodes:
+        for m in node_members(members, host, ips, mine):
+            err = remove_member(int(m["ID"]))
+            if err:
+                failed.setdefault(host, []).append(f"{describe(m)}: {err}")
+                log(f"could not remove etcd member {describe(m)} of {host}: {err}")
+            else:
+                removed.setdefault(host, []).append(describe(m))
+                log(f"removed etcd member {describe(m)} of {host}")
+    try:
+        after = list_members() if (removed or failed) else members
+    except Exception as exc:  # noqa: BLE001
+        why = f"the seed's etcd member list is unreadable after the removal: {exc}"[:240]
+        write_state(request_id, [f"{host}\terror\t{why}" for host, _ in nodes])
+        return 1
+    lines = []
+    for host, ips in nodes:
+        left = node_members(after, host, ips, mine)
+        if left:
+            detail = "etcd member " + "; ".join(describe(m) for m in left) + " still listed"
+            if failed.get(host):
+                detail += " (remove failed: " + "; ".join(failed[host]) + ")"
+            lines.append(f"{host}\tpresent\t{detail}")
+        elif removed.get(host):
+            lines.append(f"{host}\tremoved\t" + "; ".join(removed[host]))
+        else:
+            lines.append(f"{host}\tabsent\t")
+    write_state(request_id, lines)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

@@ -2421,6 +2421,10 @@ export interface AppUser {
   is_superadmin: boolean;
   force_password_change: boolean;
   auth_source: string;
+  /** The provider an external account belongs to (#1235). Null for a local
+   *  account, and for an external one not attributed to a provider, which
+   *  cannot sign in until it is linked (``usersApi.linkProvider``). */
+  auth_provider_id?: string | null;
   last_login_at: string | null;
   /** Lockout state (issue #71). ``locked`` is the live time check;
    *  ``failed_login_locked_until`` is the wall-clock target so the UI
@@ -2459,6 +2463,15 @@ export const usersApi = {
     api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
+  /** Link an external account to its provider (#1235). Clears the stored
+   *  external id; the next sign-in through that provider with the
+   *  account's username claims it. */
+  linkProvider: (id: string, authProviderId: string) =>
+    api
+      .post<AppUser>(`/users/${id}/link-provider`, {
+        auth_provider_id: authProviderId,
+      })
+      .then((r) => r.data),
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 
@@ -11912,14 +11925,33 @@ export const applianceSlotApi = {
         checksum_url: checksum_url || null,
       })
       .then((r) => r.data),
-  rollback: (target_slot: ApplianceSlot | null) =>
+  rollback: (
+    target_slot: ApplianceSlot | null,
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<{
         scheduled: string;
         target_slot: ApplianceSlot | null;
-      }>("/appliance/slot-upgrade/rollback", { target_slot })
+        schema_check: SchemaRollbackCheck | null;
+      }>("/appliance/slot-upgrade/rollback", {
+        target_slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
 };
+
+// #1227 — whether a release can start on the database as it is now. The
+// database survives an A/B slot swap, so going back to an older release
+// puts its code on a schema a newer release migrated, which it cannot run.
+export interface SchemaRollbackCheck {
+  verdict: "compatible" | "incompatible" | "unknown";
+  target_version: string | null;
+  target_head: string | null;
+  head_source: "recorded" | "bundled" | null;
+  database_revision: string | null;
+  message: string;
+}
 
 // ── Appliance: fleet upgrade orchestration (Phase 8f, issue #138) ──
 export type FleetAgentKind = "dns" | "dhcp";
@@ -12824,6 +12856,7 @@ export const applianceApprovalApi = {
     source:
       | { kind: "url"; url: string }
       | { kind: "uploaded"; slot_image_id: string },
+    acknowledge_schema_rollback = false,
   ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
@@ -12831,6 +12864,7 @@ export const applianceApprovalApi = {
         ...(source.kind === "url"
           ? { desired_slot_image_url: source.url }
           : { slot_image_id: source.slot_image_id }),
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   clearUpgrade: (id: string) =>
@@ -12842,14 +12876,26 @@ export const applianceApprovalApi = {
   // pickup pipeline as ``scheduleUpgrade`` — the backend stamps a
   // desired-state column on the appliance row, the supervisor's next
   // heartbeat reads it + writes the host-side trigger file.
-  setNextBootSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setNextBootSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
-      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, { slot })
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, {
+        slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
-  setDefaultSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setDefaultSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/set-default-slot`, {
         slot,
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   scheduleReboot: (id: string) =>

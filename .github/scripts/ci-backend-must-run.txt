@@ -86,6 +86,13 @@ scripts/lint_image_upgrades.py
 # whether a tag becomes :latest.
 scripts/release_version.py
 
+# test_format_release_notes.py loads the release-body formatter and pins the
+# two ways it can break a release: notes over GitHub's 125,000-character body
+# limit fail the publish step after every image is built, so they must come
+# out condensed under it; and a bullet's wrapped line starting with an issue
+# number must not be taken for a heading.
+scripts/format_release_notes.py
+
 # test_trivy_scan_script.py (#1272) runs the `make trivy` loop against a
 # stubbed docker and pins that a scan which never ran reads as SCAN FAILED,
 # never as FINDINGS — and reads the Makefile to pin that the target still
