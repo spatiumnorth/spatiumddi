@@ -1957,10 +1957,17 @@ the formatter handles the rest.
   install, in 15 minutes get `429` until the window passes. The attempt is
   spent before the code is checked, so concurrent guesses can't all slip
   under the limit, and a right code refunds it, so a fleet rollout behind
-  one NAT address is never throttled. The throttle fails closed (`503`)
-  while Redis is unreachable. An unknown code is audited only for the
-  first failure from an address in each window, plus once when the limit
-  trips; a code that exists but is revoked, expired or exhausted is always
+  one NAT address is never throttled. A request already refused checks no
+  code and is not charged to the install-wide budget, so one address
+  cannot use it up and lock out every registration. The throttle fails
+  closed (`503`) while Redis is unreachable. The supervisor stops retrying
+  on `429` until its next loop tick, honours a capped `Retry-After` on
+  `503`, and drops a pairing code the control plane rejects rather than
+  re-sending it every 30 seconds, which kept its address throttled for
+  every appliance pairing from behind it (a control-plane node mints a
+  fresh self-bootstrap code instead). An unknown code is audited only for the
+  first failure from an address in each window, plus once when either
+  limit trips; a code that exists but is revoked, expired or exhausted is always
   audited. **Behaviour change:** a persistent code now expires after 30
   days unless created with `expires_in_minutes: 0`, and the dialog warns
   when you choose never.

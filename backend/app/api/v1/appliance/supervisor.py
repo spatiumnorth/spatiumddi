@@ -72,6 +72,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.auth_throttle import (
+    PAIRING_FAIL_MAX_GLOBAL,
     PAIRING_FAIL_MAX_PER_IP,
     PairingThrottleUnavailable,
     claim_pairing_attempt,
@@ -816,7 +817,7 @@ async def supervisor_register(
     # accumulate. The fixed delay alone allowed ~2 guesses a second per
     # connection, without limit, against codes that may never expire.
     try:
-        allowed, ip_failures = await claim_pairing_attempt(client_ip)
+        allowed, ip_failures, global_failures = await claim_pairing_attempt(client_ip)
     except PairingThrottleUnavailable:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(
@@ -825,8 +826,15 @@ async def supervisor_register(
             headers={"Retry-After": "60"},
         ) from None
     if not allowed:
+        # Audited once per window when a limit trips, not once per refused
+        # request: per address, and once install-wide, since spreading the
+        # guesses over many addresses is the attack the global budget is for.
+        trip: dict[str, object] | None = None
         if ip_failures == PAIRING_FAIL_MAX_PER_IP + 1:
-            # Once per window per address, not once per refused guess.
+            trip = {"scope": "address", "failures_in_window": ip_failures - 1}
+        elif global_failures == PAIRING_FAIL_MAX_GLOBAL + 1:
+            trip = {"scope": "install", "failures_in_window": global_failures - 1}
+        if trip is not None:
             db.add(
                 AuditLog(
                     user_id=None,
@@ -838,11 +846,16 @@ async def supervisor_register(
                     resource_id="unknown",
                     resource_display="supervisor registration",
                     result="forbidden",
-                    new_value={"failures_in_window": ip_failures - 1},
+                    new_value=trip,
                 )
             )
             await db.commit()
-        logger.warning("supervisor_register_throttled", ip=client_ip, failures=ip_failures)
+        logger.warning(
+            "supervisor_register_throttled",
+            ip=client_ip,
+            failures=ip_failures,
+            global_failures=global_failures,
+        )
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,

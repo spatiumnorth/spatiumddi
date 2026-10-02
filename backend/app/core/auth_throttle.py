@@ -86,6 +86,37 @@ PAIRING_FAIL_MAX_PER_IP = 10
 PAIRING_FAIL_MAX_GLOBAL = 100
 _PAIRING_FAIL_WINDOW_SECONDS = 15 * 60
 
+# Spend one attempt, atomically. Each counter is INCR'd and given the window's
+# expiry whenever it has none, in one script: a separate ``SET NX EX`` then
+# ``INCR`` lets the key expire between the two, and the INCR then recreates it
+# with no TTL, so that address (or, for the global key, the whole install)
+# would stay throttled until someone deleted the key by hand.
+#
+# An address already over its own budget is NOT charged to the global one: a
+# refused request checks no code, so counting it would let a single address
+# exhaust the install-wide budget in a hundred requests and lock out every
+# registration, right codes included. Likewise a request the global budget
+# refuses gives the address its attempt back. Returns {ip_count, global_count},
+# global_count = -1 when it was not charged.
+_CLAIM_LUA = """
+local function bump(key)
+  local n = redis.call('INCR', key)
+  if redis.call('TTL', key) < 0 then
+    redis.call('EXPIRE', key, ARGV[1])
+  end
+  return n
+end
+local ip = bump(KEYS[1])
+if ip > tonumber(ARGV[2]) then
+  return {ip, -1}
+end
+local g = bump(KEYS[2])
+if g > tonumber(ARGV[3]) then
+  ip = redis.call('DECR', KEYS[1])
+end
+return {ip, g}
+"""
+
 # Decrement only a key that still exists and is above zero, so a refund that
 # arrives after the window expired cannot leave a counter with no TTL.
 _REFUND_LUA = """
@@ -227,14 +258,16 @@ def _pairing_keys(ip: str | None) -> tuple[str, str]:
     return f"pair_rl:ip:{ip or 'unknown'}", "pair_rl:global"
 
 
-async def claim_pairing_attempt(ip: str | None) -> tuple[bool, int]:
+async def claim_pairing_attempt(ip: str | None) -> tuple[bool, int, int]:
     """Spend one supervisor-registration attempt (#1356).
 
-    Returns ``(allowed, failures_from_this_ip)``, both counting this attempt.
-    Spent before the code is looked up, so concurrent guesses cannot all read
-    an under-budget count; ``refund_pairing_attempt`` gives it back when the
-    code was right. Each window opens with ``SET NX EX`` before the ``INCR``,
-    so a counter is never left without an expiry.
+    Returns ``(allowed, ip_failures, global_failures)``, each counting this
+    attempt; ``global_failures`` is ``-1`` when the address was already over
+    its own budget and the install-wide one was not charged. Spent before the
+    code is looked up, so concurrent guesses cannot all read an under-budget
+    count; ``refund_pairing_attempt`` gives it back when the code was right.
+    One Lua script, so a counter is never left without an expiry (see
+    ``_CLAIM_LUA``).
 
     Fails CLOSED (``PairingThrottleUnavailable``): this budget is the only
     thing between an unauthenticated caller and the code space.
@@ -243,18 +276,23 @@ async def claim_pairing_attempt(ip: str | None) -> tuple[bool, int]:
     try:
         r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            counts = []
-            for key in (ip_key, global_key):
-                await r.set(key, 0, ex=_PAIRING_FAIL_WINDOW_SECONDS, nx=True)
-                counts.append(int(await r.incr(key)))
+            ip_count, global_count = await r.eval(
+                _CLAIM_LUA,
+                2,
+                ip_key,
+                global_key,
+                _PAIRING_FAIL_WINDOW_SECONDS,
+                PAIRING_FAIL_MAX_PER_IP,
+                PAIRING_FAIL_MAX_GLOBAL,
+            )
         finally:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — any Redis failure means "no budget to spend"
         logger.warning("pairing_throttle_redis_unavailable", error=str(exc))
         raise PairingThrottleUnavailable from exc
-    ip_count, global_count = counts
-    allowed = ip_count <= PAIRING_FAIL_MAX_PER_IP and global_count <= PAIRING_FAIL_MAX_GLOBAL
-    return allowed, ip_count
+    ip_count, global_count = int(ip_count), int(global_count)
+    allowed = 0 <= global_count <= PAIRING_FAIL_MAX_GLOBAL and ip_count <= PAIRING_FAIL_MAX_PER_IP
+    return allowed, ip_count, global_count
 
 
 async def refund_pairing_attempt(ip: str | None) -> None:

@@ -143,8 +143,8 @@ def _no_attempt_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
     which ``test_supervisor_register_throttle_1356.py`` covers. Real Redis
     counters would carry failures from one test into the next."""
 
-    async def _claim(_ip: object) -> tuple[bool, int]:
-        return True, 1
+    async def _claim(_ip: object) -> tuple[bool, int, int]:
+        return True, 1, 1
 
     async def _refund(_ip: object) -> None:
         return None
