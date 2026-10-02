@@ -27,6 +27,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A list the reader may not see is no longer shown as empty
+  (#1343).** When a page's own list read was refused (403), the page
+  rendered its empty state, so a read-only Viewer was told "Trash is
+  empty.", "No subscriptions yet." and "no appliances online" over
+  lists that held rows, and the Users page showed a blank table with
+  no word. Trash, Webhooks, Users, Security › Block Sync, Tools ›
+  Network Tools, AI › Tools, Cutover and Settings' audit-forward and
+  InfluxDB target lists now say the reader may not see the list, with
+  the server's reason; any other failed read says the list could not
+  be loaded, never that it is empty. Cutover no longer invites a first
+  plan beside its "Superadmin required". The polled reads among them
+  (Block Sync's two lists, the Network Tools appliance list, the
+  InfluxDB targets) stop polling once refused: a refusal does not
+  change by asking again, and Block Sync's and the appliance list's
+  refusals each write a `denied` audit row, which made a Viewer with
+  Block Sync open add 240 an hour.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
