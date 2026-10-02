@@ -41,6 +41,18 @@ the formatter handles the rest.
   shown as itself, until it is changed, so an unrelated edit still
   saves.
 
+- **Apply template… in the DHCP scope dialog shows each option in its
+  own field (#1309).** The dialog merged a template's options by name
+  and gave an option the form did not hold yet the code `0`, while the
+  options editor draws its standard fields by code. So a template's
+  TFTP Server Name, Bootfile Name and TFTP Server Address landed in the
+  collapsed Custom options with a blank code. Their fields stayed empty
+  while the values were sent and stored. The editor also kept showing a
+  pre-filled value the template had replaced. Each template option now
+  takes the code its key stands for (`code:NN` included) and lands in
+  its own field. The editor is redrawn when a template is applied, so
+  the dialog shows what it will send.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
