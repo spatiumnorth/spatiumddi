@@ -43,15 +43,17 @@ the formatter handles the rest.
   resolvers cached negative answers for five minutes, whatever the zone
   said. They now ship in the agent bundle and are written into the SOA,
   and an edit of any of them, or of the zone's TTL, bumps the zone's
-  serial so its secondaries transfer the change. **On upgrade every zone's
-  SOA changes once to its stored values** and each zone reloads once; with
-  the defaults (RIPE-203's refresh 1 d, retry 2 h, expire about 41 d, and
-  a 1 h negative TTL) negative answers are cached for an hour instead of
-  five minutes, and secondaries keep serving for about 41 days instead of
-  one. The zone API refuses a timer outside 0 to 2147483647, and a stored
-  one BIND would refuse is served as before and logged rather than taking
-  the zone down. PowerDNS and Technitium manage their own SOA and are
-  unchanged.
+  serial so its secondaries transfer the change. **Nothing changes on the
+  wire at upgrade for a zone left at the defaults:** zones whose timers
+  are exactly the old stored defaults (86400 / 7200 / 3600000 / 3600,
+  never served) are set to the `3600 / 600 / 86400 / 300` they serve
+  today (migration `ff32b91acad8`), and new zones default to those
+  values too, keeping the 5-minute negative TTL a DDNS-driven estate
+  relies on. A zone whose timers were edited starts serving them, and
+  each such zone reloads once. The zone API refuses a timer outside 0 to
+  2147483647, and a stored one BIND would refuse is served as before and
+  logged rather than taking the zone down. PowerDNS and Technitium
+  manage their own SOA and are unchanged.
 
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
@@ -111,6 +113,15 @@ the formatter handles the rest.
   The agent waits that restart out rather than reading the old daemon's
   exit as a crash, and a `pdns_server` that will not stop fails the
   apply, which is retried, instead of keeping the old settings.
+
+### Migrations
+
+- `ff32b91acad8` — #1171, data-only: every `dns_zone` whose SOA timers
+  are exactly the old defaults (refresh 86400, retry 7200, expire
+  3600000, minimum 3600) gets the values the BIND9 agent has always
+  served (3600, 600, 86400, 300), so rendering the stored timers changes
+  nothing on the wire for those zones. No serial bump. Downgrade is a
+  no-op.
 
 ## 2026.10.02-1 — 2026-10-02
 

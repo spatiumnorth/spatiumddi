@@ -64,6 +64,10 @@ from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSSEC_ALGORITHMS,
+    ZONE_DEFAULT_EXPIRE,
+    ZONE_DEFAULT_MINIMUM,
+    ZONE_DEFAULT_REFRESH,
+    ZONE_DEFAULT_RETRY,
     DNSAcl,
     DNSAclEntry,
     DNSKey,
@@ -1024,10 +1028,10 @@ class ZoneCreate(BaseModel):
     zone_type: str = "primary"
     kind: str = "forward"
     ttl: int = 3600
-    refresh: int = Field(86400, ge=0, le=_SOA_TIMER_MAX)
-    retry: int = Field(7200, ge=0, le=_SOA_TIMER_MAX)
-    expire: int = Field(3600000, ge=0, le=_SOA_TIMER_MAX)
-    minimum: int = Field(3600, ge=0, le=_SOA_TIMER_MAX)
+    refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
+    retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
+    expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
+    minimum: int = Field(ZONE_DEFAULT_MINIMUM, ge=0, le=_SOA_TIMER_MAX)
     primary_ns: str = ""
     admin_email: str = ""
     dnssec_enabled: bool = False
@@ -2548,10 +2552,10 @@ async def _sync_single_server(
                 zone_type="primary",
                 kind=kind,
                 ttl=3600,
-                refresh=86400,
-                retry=7200,
-                expire=3600000,
-                minimum=3600,
+                refresh=ZONE_DEFAULT_REFRESH,
+                retry=ZONE_DEFAULT_RETRY,
+                expire=ZONE_DEFAULT_EXPIRE,
+                minimum=ZONE_DEFAULT_MINIMUM,
                 primary_ns="",
                 admin_email="",
                 dnssec_enabled=False,
