@@ -337,7 +337,8 @@ _stranded_pending: set[str] = set()
 
 
 class _ReplaceHold:
-    """#1059 — the CloudNativePG size hold a dead-node replace arms.
+    """#1059 — the CloudNativePG size hold a dead-node replace arms (and,
+    #1313, the size the whole release renders: see :func:`_release_size`).
 
     ``/fleet/control-plane/{id}/replace`` drops the replaced row from the
     committed control-plane count at once and asks the seed to evict its
@@ -394,6 +395,29 @@ class _ReplaceHold:
 
 
 _replace_hold = _ReplaceHold()
+
+
+def _release_size(cp_size: int, hold: str, cnpg_instances: int) -> int:
+    """#1313 — the control-plane size the spatium-control release renders.
+
+    ``cp_size``, except while #1059's hold is armed (``hold`` is its reason):
+    then the size the CNPG Cluster is held at (``cnpg_instances``, the count
+    ``patch_cnpg_instances`` left on it), never below ``cp_size``. A replace
+    is never a scale-down by intent (see :class:`_ReplaceHold`), so it must
+    not re-size the release either. Re-sizing it to the short count changed
+    every pod template that carries ``REDIS_URL`` (api, worker, beat: it lists
+    one sentinel per replica) and cut the api from 3 replicas to 2 on the
+    eviction tick, before the dead node's pods were gone. They can still read
+    Ready then: a replace soon after the death deletes the Node before the
+    node controller marks it NotReady, and PodGC removes its pods about a
+    minute later. So the Deployment counted the dead replica as available
+    and retired both live ones, and the api answered nothing for a minute.
+    The promote then rolled everything back to 3. Held, a replace renders
+    nothing new; the dead node's replicas wait Pending for the replacement,
+    as its CNPG instance does."""
+    if hold:
+        return max(cp_size, cnpg_instances)
+    return cp_size
 
 
 def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[str]:
@@ -1132,6 +1156,10 @@ def heartbeat_once(
         # way until the replacement was promoted. A tick that could not read
         # the Cluster at all does not know that count, so it leaves the
         # release as it is; the next tick retries.
+        #
+        # #1313 — and while the hold is armed the rest of the release keeps
+        # that size too (_release_size): a replace re-sizes nothing, so it
+        # neither rolls the api nor scales it down beside a dead replica.
         cnpg_instances = pg_scale.spec_after(cp_size)
         if cnpg_instances is None:
             log.warning(
@@ -1141,8 +1169,9 @@ def heartbeat_once(
                 size=cp_size,
             )
         else:
+            release_size = _release_size(cp_size, hold, cnpg_instances)
             cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
-                cp_size,
+                release_size,
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
                 mem_total_mib=k8s_api.node_memory_mib(),
@@ -1151,7 +1180,8 @@ def heartbeat_once(
             if cp_changed:
                 log.info(
                     "supervisor.heartbeat.control_plane_overrides_applied",
-                    size=cp_size,
+                    size=release_size,
+                    committed=cp_size,
                     cnpg_instances=cnpg_instances,
                     vip=ml_vip,
                 )

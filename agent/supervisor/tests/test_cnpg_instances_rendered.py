@@ -11,6 +11,12 @@ beat, frontend) and each reinstall failed the same way until the replacement
 was promoted. The invariant these tests pin: after every heartbeat tick, the
 ``cnpg.instances`` the HelmChartConfig renders equals the Cluster's own
 ``spec.instances``, so the chart never asks to change what the patch wrote.
+
+And while that hold is armed the release does not re-size at all
+(``heartbeat._release_size``): a replace is never a scale-down by intent, and
+re-sizing to the short count rolled the api, worker and beat (``REDIS_URL``
+lists one sentinel per replica) and cut the api to 2 while the dead node's
+replica still read Ready, so the rollout retired both live replicas.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ class _Cluster:
         self.reported = instances
         self.chart = yaml.safe_dump({"postgresql": {"cnpg": {"instances": 1}}})
         self.config: str | None = None
+        self.config_writes = 0
         self.fail_cluster_patch = False
         self.fail_cluster_read: str = ""   # "" | "status" | "transport"
 
@@ -64,6 +71,7 @@ class _Cluster:
                     return 404, b""
                 return 200, json.dumps({"spec": {"valuesContent": self.config}}).encode()
             self.config = json.loads(body)["spec"]["valuesContent"]
+            self.config_writes += 1
             return (201 if method == "POST" else 200), b"{}"
         if "/helmcharts/" in path:
             return 200, json.dumps({"spec": {"valuesContent": self.chart}}).encode()
@@ -77,14 +85,17 @@ class _Cluster:
 
 def _tick(kube: _Cluster, hold: _ReplaceHold, cp_size: int, evicting: list[str] = ()) -> None:
     """The heartbeat's cp-size block, in its order: the Cluster first, then the
-    HelmChartConfig with the count the Cluster was left at — or nothing, on a
-    tick that could not read the Cluster."""
+    HelmChartConfig with the count the Cluster was left at, the release sized by
+    ``_release_size`` — or nothing, on a tick that could not read the Cluster."""
     why = hold.reason(list(evicting), cp_size)
     pg = k8s_api.patch_cnpg_instances(cp_size, scale_down=not why, hold_reason=why)
     hold.settle(cp_size, pg.current)
     cnpg_instances = pg.spec_after(cp_size)
     if cnpg_instances is not None:
-        k8s_api.apply_control_plane_overrides(cp_size, "", cnpg_instances=cnpg_instances)
+        k8s_api.apply_control_plane_overrides(
+            heartbeat._release_size(cp_size, why, cnpg_instances), "",
+            cnpg_instances=cnpg_instances,
+        )
 
 
 def test_the_chart_renders_the_cluster_count_through_a_replace(monkeypatch) -> None:
@@ -100,7 +111,7 @@ def test_the_chart_renders_the_cluster_count_through_a_replace(monkeypatch) -> N
 
     _tick(kube, hold, 2, ["ddipg-member-2"])               # the eviction tick
     assert kube.spec["instances"] == 3 and kube.rendered == 3
-    assert yaml.safe_load(kube.config)["api"]["replicas"] == 2   # the rest still re-sizes
+    assert yaml.safe_load(kube.config)["api"]["replicas"] == 3   # nor does the rest
 
     kube.ready = 2
     for _ in range(5):                                     # the replacement installs
@@ -232,3 +243,78 @@ def test_the_heartbeat_patches_the_cluster_before_it_renders_the_chart() -> None
     assert "cnpg_instances = pg_scale.spec_after(cp_size)" in src[patch_at:render_at]
     assert "if cnpg_instances is None:" in src[patch_at:render_at]
     assert "cnpg_instances=cnpg_instances" in src[render_at:render_at + 400]
+
+
+# ---- a replace re-sizes nothing (heartbeat._release_size) ------------------------------
+
+
+def test_a_replace_writes_nothing_to_the_release(monkeypatch) -> None:
+    """From the eviction tick to the promote the committed count is one short,
+    by bookkeeping only. Held, the HelmChartConfig is never written, so the
+    helm-controller has nothing to upgrade at either end: no rollout, and no
+    scale-down beside the dead node's replica."""
+    kube = _Cluster(1)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+    hold = _ReplaceHold()
+    _tick(kube, hold, 3)                                   # formed at three
+    kube.ready = kube.reported = 3
+    formed, writes = kube.config, kube.config_writes
+
+    _tick(kube, hold, 2, ["ddipg-member-2"])               # the eviction tick
+    kube.ready = 2
+    for _ in range(20):                                    # the replacement installs
+        _tick(kube, hold, 2)
+    kube.ready = 3
+    _tick(kube, hold, 3)                                   # the replacement is promoted
+    _tick(kube, hold, 3)
+
+    assert kube.config_writes == writes and kube.config == formed
+    values = yaml.safe_load(kube.config)
+    assert values["api"]["replicas"] == values["worker"]["replicas"] == 3
+    assert values["frontend"]["replicas"] == 3
+    assert values["redis"]["sentinel"]["replicas"] == 3
+    assert kube.spec["instances"] == 3 and not hold.armed
+
+
+def test_a_demote_during_the_replace_shrinks_the_release(monkeypatch) -> None:
+    """The operator gives up on the slot and demotes the survivor: the hold
+    ends (below the count the eviction carried) and the release follows."""
+    kube = _Cluster(3)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+    hold = _ReplaceHold()
+    _tick(kube, hold, 2, ["ddipg-member-2"])               # the eviction tick
+    assert yaml.safe_load(kube.config)["api"]["replicas"] == 3
+
+    _tick(kube, hold, 1)                                   # the demote
+
+    assert not hold.armed
+    assert yaml.safe_load(kube.config)["api"]["replicas"] == 1
+    assert kube.rendered == kube.spec["instances"]
+
+
+def test_release_size_is_the_committed_count_without_a_hold() -> None:
+    for cp_size in (1, 2, 3, 5):
+        assert heartbeat._release_size(cp_size, "", 3) == cp_size
+
+
+def test_release_size_under_the_hold_is_the_count_the_cluster_is_held_at() -> None:
+    assert heartbeat._release_size(2, _HOLD, 3) == 3       # the eviction / install ticks
+    assert heartbeat._release_size(3, _HOLD, 3) == 3       # the promote tick
+    assert heartbeat._release_size(4, _HOLD, 5) == 5       # five nodes, one replaced
+
+
+def test_release_size_never_renders_below_the_committed_count() -> None:
+    """A Cluster smaller than the count (no Cluster yet: spec_after is the
+    count asked for) never pulls the release down: the hold only keeps it up."""
+    assert heartbeat._release_size(3, _HOLD, 1) == 3
+    assert heartbeat._release_size(2, _HOLD, 2) == 2
+
+
+def test_the_heartbeat_renders_the_release_at_the_held_size() -> None:
+    src = inspect.getsource(heartbeat.heartbeat_once)
+    hold_at = src.index("hold = _replace_hold.reason(")
+    render_at = src.index("k8s_api.apply_control_plane_overrides(")
+    assert hold_at < render_at
+    assert "release_size = _release_size(cp_size, hold, cnpg_instances)" in src[hold_at:render_at]
+    call = src[render_at:render_at + 200]
+    assert call.split("(", 1)[1].lstrip().startswith("release_size,")

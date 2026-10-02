@@ -42,7 +42,15 @@ the formatter handles the rest.
   instance count the Cluster actually has (a heartbeat that cannot read the
   Cluster leaves the release alone), so an upgrade never asks to change a
   field the seed wrote. The chart and supervisor comments that said Helm
-  leaves the kept Cluster alone on upgrade are corrected.
+  leaves the kept Cluster alone on upgrade are corrected. Nor does a
+  Replace re-size the rest of the release any more: the committed count is
+  one short only until the replacement is promoted, and re-sizing to it
+  rolled the api, worker and beat (their Redis URL lists one sentinel per
+  replica) and cut the api from three replicas to two while the dead
+  node's replica still read Ready, so the rollout could retire both live
+  replicas and leave the api unanswered for about a minute. Until the
+  promote the release now keeps the size the database Cluster is held at,
+  and the dead node's replicas wait for the replacement.
 
 - **A DNS server's zone serials reach the per-server zone state
   (#1408).** The agent reports the serial of each zone it renders
