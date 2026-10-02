@@ -85,6 +85,19 @@ class DriverBase(ABC):
         """
         return self.daemon_pid is not None
 
+    def daemon_restarting(self) -> bool:
+        """True while the driver is deliberately restarting its own daemon.
+
+        An in-place restart (PowerDNS re-reading a changed ``pdns.conf``,
+        #1353) runs on the sync thread and passes through moments the
+        supervisor's 1 s liveness check would misread: the old daemon is
+        stopping while ``daemon_pid`` still names it (read as a death, exit
+        2), and ``daemon_pid`` is cleared before the new one is spawned (read
+        as a deferred start). The supervisor gives no verdict while this is
+        True. Drivers that never restart in place keep the default.
+        """
+        return False
+
     def daemon_version(self) -> str | None:
         """Version of the DNS daemon binary, e.g. ``"5.0.5"`` / ``"9.20.26"``.
 
