@@ -27,6 +27,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP on an IPv6 subnet no longer names an address it will not
+  allocate (#1307).** "Next available" previews the address with
+  `strategy=sequential`, but for IPv6 the pick follows the subnet's
+  `ipv6_allocation_policy`, `random` by default, and draws a fresh
+  random suffix on every call, so the address shown was never the one
+  allocated. The preview endpoint now reports the strategy that picked
+  its candidate instead of echoing the one asked for, and the dialog
+  names the address only when the pick repeats (sequential, or EUI-64
+  from a MAC). For a random pick it says the address is picked when you
+  allocate. IPv4, and IPv6 subnets that allocate sequentially, are
+  unchanged.
+
 - **Allocate IP no longer offers a DHCP scope for status "dhcp", where
   nothing uses it (#1306).** Choosing status "dhcp" showed a DHCP Scope
   picker with a scope already selected, but only a `static_dhcp`

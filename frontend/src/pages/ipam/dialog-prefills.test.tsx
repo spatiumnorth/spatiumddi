@@ -678,3 +678,35 @@ describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => 
     expect(createStatic.mock.calls[0][0]).toBe("scope-1");
   });
 });
+// ── #1307 — "Next available" on an IPv6 subnet ───────────────────────────────
+
+describe("Allocate IP names as next available only what it allocates (#1307)", () => {
+  it("an IPv6 subnet that picks at random names no address", async () => {
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    // What the preview answers for a subnet whose ipv6_allocation_policy is
+    // random: a free candidate, and the strategy that drew it. The commit
+    // draws its own.
+    answer("ipamApi", "previewNextIp", () =>
+      Promise.resolve({ address: "fd86:929:20::a3f1", strategy: "random" }),
+    );
+    const nextAddress = sink({ id: "ip-new", address: "fd86:929:20::77c2" });
+    answer("ipamApi", "nextAddress", nextAddress);
+    open(<AddAddressModal subnetId="sub-v6" onClose={() => {}} />);
+
+    expect(await screen.findByText(/picked when you allocate/)).toBeTruthy();
+    expect(screen.queryByText("fd86:929:20::a3f1")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+  });
+
+  it("a subnet that allocates in order names the address it allocates", async () => {
+    allocateIp();
+
+    expect(await screen.findByText("10.0.0.2")).toBeTruthy();
+    expect(screen.queryByText(/picked when you allocate/)).toBeNull();
+  });
+});

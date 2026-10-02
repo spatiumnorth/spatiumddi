@@ -3360,9 +3360,11 @@ export function AddAddressModal({
     return null;
   })();
 
-  // Preview the IP the backend would hand out on "next available". Only
-  // meaningful for IPv4; the endpoint returns ``address: null`` on v6
-  // or when the subnet is exhausted — the UI handles both.
+  // Preview the IP the backend would hand out on "next available";
+  // ``address: null`` when the subnet is exhausted. On IPv6 the subnet's
+  // allocation policy picks, and the response names the strategy that
+  // did: a ``random`` pick is drawn again on commit, so its address is
+  // not the one the dialog allocates and is not shown as such (#1307).
   const { data: nextPreview, isFetching: previewFetching } = useQuery({
     queryKey: ["next-ip-preview", subnetId],
     queryFn: () => ipamApi.previewNextIp(subnetId, "sequential"),
@@ -3595,6 +3597,15 @@ export function AddAddressModal({
               <span className="text-muted-foreground">
                 Finding next available IP…
               </span>
+            ) : nextPreview?.address && nextPreview.strategy === "random" ? (
+              <>
+                <span className="text-muted-foreground">Next available:</span>{" "}
+                <span className="font-medium">picked when you allocate</span>
+                <span className="ml-2 text-muted-foreground">
+                  (by this subnet's IPv6 allocation policy; skips dynamic DHCP
+                  pools)
+                </span>
+              </>
             ) : nextPreview?.address ? (
               <>
                 <span className="text-muted-foreground">Next available:</span>{" "}
