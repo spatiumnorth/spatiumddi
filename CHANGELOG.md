@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A provider name longer than 20 characters no longer breaks every
+  sign-in through it (#1337).** An external sign-in writes the provider's
+  name into the session (`user_session.auth_source`, `VARCHAR(64)`) and into
+  the audit log (`audit_log.auth_source`, `VARCHAR(20)`), but a provider name
+  may be 255 characters. A sign-in through a provider named over 20
+  characters failed the audit insert and answered `422` "A supplied value
+  cannot be stored as sent.", leaving no audit row, no session and no
+  `last_login_at`. A name over 64 characters failed at the session first. An
+  unreachable provider with such a name also stopped the sign-in from
+  reaching the providers after it, and a refused sign-in through it left no
+  audit row. Migration `cd10b699d988` widens both columns to 255, the width
+  of the name. In PostgreSQL that is a catalogue-only change. Its downgrade
+  refuses, rather than truncates, while a longer value is stored, because
+  audit rows are covered by the hash chain.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old

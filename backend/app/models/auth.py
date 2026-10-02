@@ -236,9 +236,9 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     # name) so the viewer can show "Logged in via Okta" without a
     # join. ``last_seen_at`` is bumped on each authenticated request
     # (throttled to ~60 s in the auth dep) so the viewer can render
-    # a relative-age hint.
+    # a relative-age hint. As wide as ``auth_provider.name`` (#1337).
     auth_source: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="local", server_default=sa_text("'local'")
+        String(255), nullable=False, default="local", server_default=sa_text("'local'")
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
