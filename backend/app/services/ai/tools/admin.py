@@ -32,6 +32,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import Group, Role, User
+from app.models.auth_provider import AuthProvider
 from app.services.ai.tools.base import register_tool
 
 
@@ -86,9 +87,12 @@ class ListUsersArgs(BaseModel):
     description=(
         "List users (superadmin only). Each row carries username, "
         "email, display_name, is_active, is_superadmin, auth_source, "
-        "MFA enrollment flag, last_login_at + IP, lockout state, and "
-        "the names of the auth groups they belong to. Use for 'who "
-        "has admin', 'list locked-out accounts', or 'who hasn't "
+        "auth_provider (the provider an external account belongs to, or "
+        "null), MFA enrollment flag, last_login_at + IP, lockout state, "
+        "and the names of the auth groups they belong to. An external "
+        "account with a null auth_provider cannot sign in until an admin "
+        "links it (#1235). Use for 'who has admin', 'list locked-out "
+        "accounts', 'which accounts need linking', or 'who hasn't "
         "logged in this quarter'."
     ),
     args_model=ListUsersArgs,
@@ -116,6 +120,9 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
         stmt = stmt.where(User.is_superadmin.is_(True))
     stmt = stmt.order_by(User.username.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().unique().all()
+    provider_names = {
+        pid: name for pid, name in (await db.execute(select(AuthProvider.id, AuthProvider.name)))
+    }
     return [
         {
             "id": str(r.id),
@@ -125,6 +132,7 @@ async def list_users(db: AsyncSession, user: User, args: ListUsersArgs) -> list[
             "is_active": r.is_active,
             "is_superadmin": r.is_superadmin,
             "auth_source": r.auth_source,
+            "auth_provider": provider_names.get(r.auth_provider_id),
             "totp_enabled": r.totp_enabled,
             "last_login_at": r.last_login_at.isoformat() if r.last_login_at else None,
             "last_login_ip": r.last_login_ip,

@@ -400,10 +400,14 @@ ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test ver
 ci-backend-lint:
 	@echo "→ Backend — Lint & Type Check (matches .github/workflows/ci.yml)"
 	@# The prod `api` image doesn't ship dev tools. Install them on first run;
-	@# they persist until the container is recreated.
+	@# they persist until the container is recreated. It doesn't ship pip
+	@# either (#1392) — and `make build` tags its runtime-stage build as the
+	@# same `spatiumddi-api:dev` the dev compose runs — so bootstrap pip from
+	@# the interpreter's bundled ensurepip wheel when it is missing.
 	@$(COMPOSE_DEV) exec -T api python -m ruff --version >/dev/null 2>&1 || \
-	  $(COMPOSE_DEV) exec -T -u root api pip install --quiet --root-user-action=ignore \
-	    ruff black mypy
+	  $(COMPOSE_DEV) exec -T -u root api sh -c \
+	    'python -m pip --version >/dev/null 2>&1 || python -m ensurepip --default-pip >/dev/null; \
+	     python -m pip install --quiet --root-user-action=ignore ruff black mypy'
 	$(COMPOSE_DEV) exec -T api python -m ruff check app tests
 	$(COMPOSE_DEV) exec -T api python -m black --check app tests
 	$(COMPOSE_DEV) exec -T api python -m mypy app

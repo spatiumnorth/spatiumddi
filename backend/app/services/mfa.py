@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from typing import Final
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
 
 import pyotp
 
-from app.core.crypto import decrypt_dict, decrypt_str, encrypt_dict, encrypt_str
+from app.core.crypto import decrypt_dict, decrypt_str, encrypt_dict, encrypt_str, encrypted_at
 
 # Number of recovery codes generated per enrolment. Mirror common
 # practice (GitHub: 16, Google: 10, AWS: 10) — 10 is plenty without
@@ -141,6 +142,39 @@ def remaining_recovery_codes(blob: bytes | None) -> int:
     return len(data.get("hashes") or [])
 
 
+#: How long a started enrolment can be completed (#1354). ``begin`` hands
+#: out a secret and ``verify`` turns MFA on with it; an abandoned one used to
+#: stay open indefinitely to 6-digit guesses from any of the user's sessions.
+PENDING_ENROLMENT_TTL: Final[timedelta] = timedelta(minutes=15)
+
+
+def enrolment_pending(user: Any, now: datetime | None = None) -> bool:
+    """Whether ``user`` has a started, unexpired enrolment.
+
+    The start time is the candidate secret's own Fernet timestamp: ``begin``
+    encrypts a fresh secret each time it runs and nothing else writes one
+    while MFA is off, so the token's age is the enrolment's age.
+    """
+    if user.totp_enabled or user.totp_secret_encrypted is None:
+        return False
+    try:
+        started = encrypted_at(user.totp_secret_encrypted)
+    except ValueError:
+        return False
+    return (now or datetime.now(UTC)) - started <= PENDING_ENROLMENT_TTL
+
+
+def clear_pending_enrolment(user: Any) -> bool:
+    """Drop a started-but-unfinished enrolment (its secret and recovery
+    codes). Never touches an enabled one. Returns whether anything changed;
+    the caller commits."""
+    if user.totp_enabled or user.totp_secret_encrypted is None:
+        return False
+    user.totp_secret_encrypted = None
+    user.recovery_codes_encrypted = None
+    return True
+
+
 def encrypt_secret(secret: str) -> bytes:
     return encrypt_str(secret)
 
@@ -150,6 +184,9 @@ def decrypt_secret(blob: bytes) -> str:
 
 
 __all__ = [
+    "PENDING_ENROLMENT_TTL",
+    "clear_pending_enrolment",
+    "enrolment_pending",
     "generate_secret",
     "otpauth_uri",
     "verify_totp",

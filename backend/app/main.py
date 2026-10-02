@@ -472,6 +472,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_schema_behind_head_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
+    # Record the schema head this release runs at (#1227), so a later
+    # rollback to it can be checked before the switch rather than after.
+    # Only once the schema is at head; never blocks startup.
+    try:
+        from app.services.upgrades.schema_rollback import record_this_release  # noqa: PLC0415
+
+        await record_this_release()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("release_schema_head_record_failed", error=str(exc))
     # cluster-upgrade-failed alert rule — singleton, enabled by default
     # (issue #296 Phase F). Fires when the rolling-upgrade orchestrator
     # flips a SystemUpgradeRun to ``state='failed'``.
