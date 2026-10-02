@@ -49,10 +49,10 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "5e6d56b39ab7"
-down_revision: str | None = "f4a8c2e71d09"
-branch_labels: str | None = None
-depends_on: str | None = None
+revision = "5e6d56b39ab7"
+down_revision = "f4a8c2e71d09"
+branch_labels = None
+depends_on = None
 
 logger = logging.getLogger("alembic.runtime.migration")
 
