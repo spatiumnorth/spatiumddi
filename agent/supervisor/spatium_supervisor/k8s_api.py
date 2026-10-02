@@ -488,7 +488,12 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     the cluster drop its etcd member — so this is how a dead
     control-plane member is evicted (#272 Phase 9 dead-node
     replacement). Only the seed runs it (it holds the admin kubeconfig).
-    Idempotent — a 404 (already gone) counts as success."""
+    Idempotent — a 404 (already gone) counts as success.
+
+    #1284 — success here is about the Node only. A 404 also means "there
+    never was a Node", and a node can be an etcd member without one (it
+    became a voter before its Node registered), so the eviction is
+    confirmed against etcd by etcd_evict, never by this answer."""
     path = f"/api/v1/nodes/{quote(name)}"
     try:
         status, resp = _request("DELETE", path)

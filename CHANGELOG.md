@@ -248,6 +248,50 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Going back to an older release is checked against the database first
+  (#1227).** PostgreSQL lives on `/var`, which an A/B slot swap does not
+  touch. So a slot rollback put the older release's code on a schema the
+  newer release had already migrated. Its migrate Job failed with
+  `Can't locate revision`, its api, worker and beat waited for migrate
+  forever, and on a single node the newer release's api kept serving
+  behind the older UI. Nothing refused the rollback, and after the Job's
+  10-minute TTL nothing said why the control plane was down.
+  - Every path that moves a control-plane node to an older release now
+    compares the database's revision with the one that release was built
+    with: `POST /appliance/slot-upgrade/rollback`, Fleet
+    `set-next-boot` / `set-default-slot` onto the other slot, and a Fleet
+    upgrade to an older image. When the release cannot run on the
+    database, the request is a 409 with `detail.code`
+    `schema_rollback_unsafe` naming both revisions. The Fleet UI shows it
+    as a confirmation, and `acknowledge_schema_rollback: true` proceeds
+    anyway. Data-plane appliances and a commit of the running slot are
+    never checked. A release nobody recorded is `unknown` and proceeds,
+    because refusing on "don't know" would block every rollback on an
+    install that never recorded anything.
+  - Each release records its schema head in a new `release_schema_head`
+    table when it starts, once the schema is at its head, and records
+    the booted slot's version only when that slot is its own release.
+    Tagged releases come from `backend/app/data/release_schema_heads.json`,
+    generated from the release tags by `scripts/release_schema_heads.py`
+    (55 releases, 2026.09.04-1 at `f3b8d21c74ae`), which wins over a
+    recorded row for every release it lists. The table is backed up with
+    `alembic_version`.
+  - A migrate step that meets a database a newer release migrated now
+    says so, in the migrate Job and once in the `wait-for-migrate` init
+    container, and names the way out: re-apply the newer release, or
+    restore a pre-upgrade copy of the database. Only when the unknown
+    revision is the one the database is at; a mistyped
+    `alembic upgrade <rev>` keeps Alembic's plain error. This applies to
+    releases from this one on, not to the ones already published.
+  - The rolling-upgrade preflight gains a warn-only `pre_upgrade_backup`
+    row: no backup target has succeeded in the last 24 hours.
+  - **Not covered:** the trial-boot auto-revert runs on the host with no
+    operator involved, so nothing can refuse it, and no database snapshot
+    is taken before an upgrade yet. See "Rolling back" in
+    `docs/deployment/APPLIANCE.md`.
+  - Also fixed: the Fleet slot cards showed an error as
+    `Request failed with status code …` instead of the server's reason.
+
 - **The unattended-upgrades package blocklist says what it accepts
   (#1384).** The APT settings form, the model and APPLIANCE.md called
   its entries globs, but unattended-upgrades reads each one as a regular
@@ -295,6 +339,24 @@ the formatter handles the rest.
   each view, plus a count per batch per type; it now filters, counts
   and pages in SQL, and counts batch sizes for the shown rows only.
   The search stays a literal substring match.
+
+- **Restoring a large zone from the Trash no longer scales with the
+  zone either (#1389).** Restore still had the old shape: one conflict
+  `SELECT` per record and one audit row per record, so bringing back a
+  250k-record zone was 250k of each in one request, blocking every
+  other audited change. The conflicts are now found by one query for
+  the whole batch, the zone's records come back by one `UPDATE`, and
+  the zone's own restore row records how many (`new_value.restored`).
+  The response's `restored` count still includes them. The conflict
+  check now uses the identity record create refuses a duplicate on
+  (#1230): the view, the name compared case-insensitively, the type,
+  the value after trimming, and priority, weight and port. So a record
+  in another view, or an MX or SRV at another priority or port, no
+  longer blocks the restore (neither was ever a duplicate), while a
+  restore can no longer bring back a twin that differs from a live
+  record only in letter case or surrounding spaces. A #963 bulk record
+  delete still restores record by record, since each record is
+  re-pushed to agentless providers.
 
 - **Cluster health no longer counts a joining database replica as a
   ready instance (#1213).** The workload rollup on
@@ -783,6 +845,81 @@ the formatter handles the rest.
   at once. A download that never completes fails with its own message:
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
+
+- **A replaced node stays replaced: its Fleet row no longer goes
+  back from `left` to `failed` on the node's own word (#1317).**
+  Replace evicts a node on the seed's word and settles its row
+  `left`. The replaced node can still be alive: a failed joiner back
+  on its standalone control plane, or a member that was cut off and
+  returns. It goes on reporting what its join runner last wrote, and
+  the heartbeat applied whatever a node reported. A failed joiner's
+  `failed` turned the settled row back into a failed joiner, so the
+  Fleet showed a node it had just evicted as a failed join again. (A
+  node retries a failed join on its own, so a retry can still be
+  running when Replace is accepted; it reports when it ends.) A
+  member's `ready`, which a node never stops reporting, re-settled
+  the row as a member etcd no longer has. Only the order decided it:
+  the report did no harm when it landed before the eviction settled,
+  and an eviction that settles within seconds (#1284) often settles
+  first. An evicted row now ignores the join state its node reports,
+  from Replace until something is asked of the node again (a new
+  promote). A row an operator cleared mid-join still settles on the
+  node's `ready`, as before.
+
+- **Fleet → Replace removes the node's etcd member, not only its
+  k8s Node, and the row settles `left` only once etcd agrees
+  (#1284).** The seed evicted a replaced node by deleting its k8s
+  Node, which makes k3s drop a server's etcd member, and settled the
+  row `left` on that alone. A 404 counted as success. A node can be
+  an etcd member with no Node at all: a failed joiner whose own
+  automatic re-join made it a voter, then died before its Node
+  registered. Replace accepts exactly that row, and the dead voter
+  then kept its seat for good. The cluster ran on two live voters of
+  three with no fault tolerance, and etcd refused every later member
+  add ("etcdserver: unhealthy cluster"), so the replacement Replace
+  was for could never join. The seed now also removes the node's
+  etcd member itself, through a new host runner
+  (`spatium-etcd-evict`, behind `spatiumddi-etcd-evict.path`). The
+  member is matched by the name k3s gives it
+  (`<hostname>-<8 hex>`), or, before it has a name, by a peer URL on
+  the node's addresses; the seed's own member is never touched. It
+  reports the node evicted only once etcd no longer lists it. Until
+  then the row stays `evicting`, with the reason in the Fleet UI. A
+  member that appears for the name within five minutes of the
+  eviction is removed too: a re-join that was already in flight when
+  Replace landed. A node that is promoted again in that time is
+  exempt, since its new member is wanted. A seed whose OS slot
+  predates the runner keeps the old behaviour. Promote is refused
+  while an eviction is still pending, for the node itself and for
+  any node under the same hostname, and the Fleet no longer offers
+  them for promotion: until the eviction settles, the seed removes
+  etcd members under that name. The runner acts only on a fresh
+  request and sets each one aside once it has answered it, so
+  starting it again never repeats an old eviction.
+
+- **A join the seed's etcd refuses is rolled back with its reason,
+  instead of sitting `joining` for good (#1285).** The join runner's
+  #1052 guard, which stops a node that already joined the seed's etcd
+  from being rolled back into a ghost voter, counted k3s's `Adding
+  member … to etcd cluster` line as membership. k3s logs that line
+  before it asks etcd to add the member, and again on every retry
+  while etcd refuses the add (`etcdserver: unhealthy cluster` while a
+  dead voter still holds a seat, for example). So a refused join was
+  kept: no rollback, k3s restarting every ~15 minutes, and a `failed`
+  no supervisor could report, so the row read `joining` indefinitely
+  and Replace refused it. Only lines k3s and etcd log after the add
+  succeeded count now. A refused join is rolled back to the node's
+  standalone control plane, with a reason that names the refusal
+  rather than an unreachable seed. When the refusal is a voter the
+  seed cannot reach, the node stays standalone: the reason says to
+  remove that member first, and the join is not retried on its own,
+  since every retry would wipe the node again and be refused again.
+  A learner backlog is still retried. A refusal names the failure
+  only when the attempt ended on it: one refused add early in an
+  attempt that then failed for another reason no longer stops the
+  automatic retry. The journal scan behind this decision is also
+  anchored in UTC, so an appliance set to another time zone no
+  longer scans the wrong window.
 
 - **After a DHCP agent restart, an address that has changed hands no
   longer drops out of IPAM while its new client holds it (#1318).**
@@ -1966,6 +2103,89 @@ the formatter handles the rest.
   The agent waits that restart out rather than reading the old daemon's
   exit as a crash, and a `pdns_server` that will not stop fails the
   apply, which is retried, instead of keeping the old settings.
+
+- **A second provider of the same type can no longer sign in as another
+  provider's user (#1235).** External accounts were matched on
+  `(auth_source, external_id)`, and `auth_source` is the provider's
+  type, not the provider. On a miss, an account of the same type with
+  the same username was adopted. So with two LDAP domains or two OIDC
+  IdPs configured, whoever held `jsmith` in the second one signed in as
+  the first one's `jsmith`, superadmin flag and all; an identical OIDC
+  `sub` from two IdPs did the same without any username at all. Now an
+  external account belongs to one provider (`user.auth_provider_id`,
+  migration `f4a8c2e71d09`), a login matches on the provider and its
+  external id, and **an account is never adopted by username alone**:
+  a taken username is refused as `username_collision`.
+  - **Upgrade note.** The migration attributes existing accounts only
+    where it can prove the provider: RADIUS / TACACS+ external ids name
+    it, and an LDAP / OIDC / SAML account is attributed when its type has
+    exactly one provider **and** the account cannot have come from another
+    one: it was created after that provider, and after the last deletion of
+    any other provider of its type (read from the audit log, which must
+    also hold the surviving provider's own `create` row; an audit log
+    restored without its section attributes nothing). A disabled
+    provider counts: one enabled and one disabled provider of a type is two,
+    and links nothing. Anything else is left unlinked and is refused
+    (`account_link_required`) until an administrator links it from
+    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
+    audited as `user.provider_linked`). The Users page marks those accounts
+    **unlinked**, and `list_users` reports their provider as null.
+  - **A deleted provider's accounts are not handed to its successor
+    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
+    their identifier intact, so "one provider of the type exists now" did
+    not mean "only one ever did". An earlier draft of this fix linked such
+    an account to the surviving provider, both at upgrade and at sign-in,
+    so the survivor's subject with the same `sub` or DN signed in as it.
+    The backfill now checks the audit log as above, and the sign-in path
+    never links an unlinked account itself: it always refuses with
+    `account_link_required`, and the refusal's audit row names the account.
+  - **Behaviour change.** A user whose identifier at the provider changes,
+    such as an LDAP DN after an OU move, was re-attached by username and
+    is now refused until an administrator links the account again. The
+    link clears the stored identifier, and the next sign-in as that
+    username through that provider claims it; it also revokes the
+    account's sessions. Deleting a provider clears its accounts'
+    identifiers too, so a replacement provider of the same type that
+    issues the same `sub` or DN cannot adopt them. It also revokes their
+    sessions, and an administrator cannot delete the provider their own
+    account signs in through (409), which would lock them out.
+  - **SAML needs a stable NameID.** The NameID is the account's key at its
+    provider, and a transient one is new on every sign-in: it used to be
+    re-attached by username, which is the adoption this fix removes. A
+    transient NameID is now refused at the ACS with a message naming the
+    fix: configure the IdP to release a persistent or emailAddress NameID.
+  - On the password grant, a provider that accepts the password but whose
+    subject does not own the account no longer ends the login: the next
+    provider by priority still gets its turn, so a higher-priority
+    directory that also knows the user cannot lock out the account's
+    own provider.
+
+- **A started MFA enrolment is budgeted and expires (#1354).** The first
+  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
+  started enrolment never expired and survived sign-out and a password
+  change. So an abandoned enrolment stayed open to unlimited 6-digit
+  guesses from any of the user's sessions, and a hit turned MFA on with a
+  secret the user never saw, locking a local user out until an admin
+  reset it. Verify now spends the same fail-closed step-up budget as
+  begin, disable and regenerate (`429` when spent, `503` while it cannot
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
+  candidate secret's own Fernet timestamp.
+
+- **The api image no longer ships pip (#1392).** The runtime image
+  carried the Python base image's own pip 25.0.1, which has six fixed
+  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
+  only, so it never blocked on them, and `apt-get upgrade` cannot patch
+  pip because it is not a Debian package. So every scan at default
+  severity, such as Harbor's, reported them on every build. Nothing at
+  runtime runs pip, and a production image has no business carrying a
+  package installer, so the runtime stage now uninstalls it, and the
+  `dev` stage (pytest, `make ci-backend-lint`) restores it with
+  `ensurepip`. A Trivy scan of the runtime image now reports no
+  fixable Python-package finding at any severity.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
@@ -4752,6 +4972,12 @@ the formatter handles the rest.
   between reporting the bad minute and losing it.
 
 ### Migrations
+
+- `99e91dcae1e2` — #1227: `release_schema_head` (`version` PK,
+  `alembic_head`, `recorded_at` defaulting to `now()`), the schema head
+  each release ran at. No seed: each release writes its own row at
+  startup. In the `platform_internal` backup section beside
+  `alembic_version`.
 
 - `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
   `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed

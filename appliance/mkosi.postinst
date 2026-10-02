@@ -48,6 +48,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-cluster-join.path \
             spatiumddi-cluster-leave.path \
             spatiumddi-cluster-restore.path \
+            spatiumddi-etcd-evict.path \
             spatiumddi-publish-k3s-token.service \
             k3s.service \
             spatiumddi-snmp-reload.path \
@@ -352,6 +353,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-leave.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-cluster-restore"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-restore.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-cluster-restore.service"
+# #1284 — seed-side etcd member removal for Fleet → Replace.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-evict"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must

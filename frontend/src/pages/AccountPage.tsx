@@ -242,6 +242,7 @@ function EnrollModal({
   const [acknowledgedRecovery, setAcknowledgedRecovery] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const qc = useQueryClient();
 
   const verify = useMutation({
     mutationFn: () => authApi.mfaEnrollVerify(code.trim()),
@@ -250,6 +251,9 @@ function EnrollModal({
       const detail = (err as { response?: { data?: { detail?: string } } })
         ?.response?.data?.detail;
       setError(typeof detail === "string" ? detail : "Verification failed.");
+      // #1354 — an expired enrolment is discarded server-side, so the
+      // "previous enrolment" banner behind this modal is now stale.
+      qc.invalidateQueries({ queryKey: ["mfa-status"] });
     },
   });
 
