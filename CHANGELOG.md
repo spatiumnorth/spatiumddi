@@ -1947,6 +1947,22 @@ the formatter handles the rest.
 
 ### Security
 
+- **Actions that mint a credential need the operator step-up (#1355).**
+  #408 made secret reveals ask for a password or authenticator code so a
+  stolen session cannot read them, but a stolen session could still mint
+  itself a fresh credential and reveal anything after that. Four
+  superadmin actions now re-confirm the caller the same way: reading an
+  auth provider's secrets (the LDAP bind password and the OIDC / SAML /
+  RADIUS / TACACS+ secrets; now `POST /auth-providers/{id}/secrets`, was
+  a GET with no step-up), creating or promoting a superadmin, resetting a
+  superadmin's password, and minting an API token, for every owner.
+  Wrong answers spend the per-account step-up budget, and each attempt is
+  audited with the method used. **Behaviour changes:** API clients that
+  create tokens, superadmins or a superadmin's password must send
+  `stepup_password` (or `stepup_totp_code` for an SSO account), and an
+  SSO account must enrol TOTP before it can mint an API token. The Users
+  and API Tokens dialogs ask for it.
+
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
   that decides whose authenticator the account trusts. A hijacked session

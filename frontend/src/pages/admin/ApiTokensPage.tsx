@@ -20,6 +20,7 @@ import {
   type ApiTokenResourceGrant,
   type ApiTokenScope,
 } from "@/lib/api";
+import { ReauthFields } from "@/components/ReauthFields";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   buildEnrolmentUri,
@@ -82,6 +83,8 @@ function CreateTokenModal({
   );
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const subnetsQ = useQuery({
@@ -119,6 +122,10 @@ function CreateTokenModal({
         expires_in_days: expiryMode === "never" ? null : days,
         scopes,
         resource_grants: resourceGrants,
+        // #1355 — a token outlives the session, so minting one needs a
+        // step-up from its owner.
+        stepup_password: stepPassword || null,
+        stepup_totp_code: stepTotp || null,
       }),
     onSuccess: (token) => {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
@@ -312,6 +319,18 @@ function CreateTokenModal({
             )}
           </div>
         </Field>
+        <div className="rounded-md border bg-muted/20 p-3">
+          <p className="mb-2 text-xs text-muted-foreground">
+            A token outlives this session, so creating one needs you to confirm
+            who you are.
+          </p>
+          <ReauthFields
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        </div>
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
