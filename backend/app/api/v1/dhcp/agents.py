@@ -795,7 +795,18 @@ async def agent_config_longpoll(
                             {
                                 "name": c.name,
                                 "match_expression": c.match_expression,
-                                "options": c.options,
+                                # ``options`` stays for an agent older than
+                                # #1229, which renders it into both daemons.
+                                # A newer agent reads ``address_family`` and
+                                # the per-family maps instead. It carries the
+                                # Dhcp4 share, not the whole map: an ``ipv6``
+                                # or ``dual`` class may now hold an IPv6
+                                # ``dns-servers``, which an old agent would
+                                # put into Dhcp4 and have the config refused.
+                                "options": c.options_v4,
+                                "address_family": c.address_family,
+                                "options_v4": c.options_v4,
+                                "options_v6": c.options_v6,
                             }
                             for c in bundle.client_classes
                         ],

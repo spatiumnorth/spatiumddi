@@ -9383,6 +9383,9 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
+  // Which Kea daemons the class renders into (#1229). A `dual` class sends
+  // each option to whichever family it is valid in.
+  address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;

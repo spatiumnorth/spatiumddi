@@ -475,6 +475,7 @@ async def _commit_client_classes(
                 name=cc.name,
                 match_expression=cc.match_expression or "",
                 description=cc.description or "",
+                address_family=cc.address_family or "ipv4",
                 options=dict(cc.options or {}),
                 import_source=source,
                 imported_at=now,

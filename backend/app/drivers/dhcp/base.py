@@ -75,12 +75,25 @@ class StaticAssignmentDef:
 
 @dataclass(frozen=True)
 class ClientClassDef:
-    """A client class with a match expression and option overrides."""
+    """A client class with a match expression and option overrides.
+
+    ``address_family`` (``ipv4`` | ``ipv6`` | ``dual``) says which daemons the
+    class renders into (#1229). ``options_v4`` / ``options_v6`` are the parts
+    of ``options`` each daemon gets — all of them for a single-family class,
+    split by what each option is valid in for a ``dual`` one (#1295). The
+    control plane computes the split because only it holds the option tables.
+    """
 
     name: str
     match_expression: str = ""
     description: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+    address_family: str = "ipv4"
+    options_v4: dict[str, Any] = field(default_factory=dict)
+    options_v6: dict[str, Any] = field(default_factory=dict)
+
+    def in_family(self, family: str) -> bool:
+        return self.address_family in (family, "dual")
 
 
 @dataclass(frozen=True)
