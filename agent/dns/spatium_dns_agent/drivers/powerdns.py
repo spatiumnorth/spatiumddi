@@ -58,7 +58,9 @@ _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
 
 # ``resolver=`` takes ``ip``, ``ip:port`` or ``[v6]:port``, comma-separated.
-_ALIAS_RESOLVER_PORTED_RE = re.compile(r"^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$")
+_ALIAS_RESOLVER_PORTED_RE = re.compile(
+    r"^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$"
+)
 
 
 def _alias_resolver_entry_ok(entry: str) -> bool:
@@ -76,6 +78,13 @@ def _alias_resolver_entry_ok(entry: str) -> bool:
     if ported and (addr.version == 6) != bool(ported.group(1)):
         return False
     return "%" not in entry
+
+
+def _read_text_or_none(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except OSError:
+        return None
 
 
 def _safe_alias_resolver(value: Any) -> str:
@@ -326,7 +335,6 @@ def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
-
     # ── Render / validate / swap ────────────────────────────────────────────
 
     def render(self, bundle: dict[str, Any]) -> None:
@@ -336,8 +344,10 @@ class PowerDNSDriver(DriverBase):
         ``pdns.conf`` is largely static after first boot — listen
         addresses, the API key, and the LMDB filename don't change at
         runtime. We still rewrite it on every render so operators
-        editing options through the UI (loglevel, listen address) see
-        the change without restarting the container.
+        editing options through the UI (loglevel, query logging, the
+        ALIAS resolver) see the change: ``swap_and_reload`` restarts
+        pdns when the rendered file differs, since pdns reads it only
+        at startup.
         """
         # Re-mode anything a pre-#869 build left world-readable before we
         # render over it — the old trees outlive the upgrade (see the helper).
@@ -641,6 +651,7 @@ class PowerDNSDriver(DriverBase):
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / "rendered"
         backup = self.state_dir / "rendered.prev"
+        old_conf = _read_text_or_none(current / "pdns.conf")
         if current.exists():
             if backup.exists():
                 shutil.rmtree(backup)
@@ -658,6 +669,17 @@ class PowerDNSDriver(DriverBase):
             log.info("powerdns_daemon_starting_after_first_render")
             self.start_daemon()
             self._wait_for_api_up()
+        elif old_conf is not None and old_conf != _read_text_or_none(
+            current / "pdns.conf"
+        ):
+            # pdns reads pdns.conf only when it starts, so a changed one
+            # (the ALIAS resolver from the group's forwarders, #1353; the log
+            # level; query logging) is otherwise ignored until the container
+            # restarts. Zones live in LMDB and survive; the reconcile below
+            # runs against the new daemon. Costs a sub-second gap in answers,
+            # and only when an operator changes a server option.
+            log.info("powerdns_conf_changed_restarting", pid=self.daemon_pid)
+            self._restart_daemon()
 
         api_key = self._load_or_generate_api_key()
         zones_path = current / "zones.json"
@@ -677,6 +699,34 @@ class PowerDNSDriver(DriverBase):
         # failure here used to lose every record on cold-boot when
         # the timing race fired.
         self._reconcile_zones(api_key, payload)
+
+    def _restart_daemon(self, *, stop_timeout_s: float = 15.0) -> None:
+        """Stop ``pdns_server`` and start it from the current render."""
+        pid = self.daemon_pid or find_running_daemon("pdns_server")
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pid = None
+        deadline = time.monotonic() + stop_timeout_s
+        while pid is not None and time.monotonic() < deadline:
+            # We spawned it, so once it exits it is our zombie until reaped.
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    break
+            except ChildProcessError:
+                # Not our child (adopted after an agent restart): poll instead.
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+            time.sleep(0.1)
+        else:
+            if pid is not None:
+                log.warning("pdns_server_stop_timed_out", pid=pid)
+        self.daemon_pid = None
+        self.start_daemon()
+        self._wait_for_api_up()
 
     def _wait_for_api_up(self, *, timeout_s: float = 10.0) -> None:
         """Poll the local PowerDNS REST API until it answers (or
@@ -1318,9 +1368,9 @@ class PowerDNSDriver(DriverBase):
                 # the feature is available; per-zone acceptance is gated by the
                 # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata
                 # the reconciler sets — a zone with neither rejects every
-                # update, so this is a no-op for zones without an ACL. Note:
-                # ``dnsupdate`` is a startup setting, so a pdns already running
-                # with it off only picks this up on the next container restart.
+                # update, so this is a no-op for zones without an ACL.
+                # ``dnsupdate`` is a startup setting, like every line here;
+                # ``swap_and_reload`` restarts pdns when this file changes.
                 "dnsupdate=yes",
                 "",
             ]

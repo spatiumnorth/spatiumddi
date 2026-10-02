@@ -1959,7 +1959,10 @@ the formatter handles the rest.
   note:** a PowerDNS group that serves ALIAS records and has no
   forwarders stops answering A / AAAA for those names until you set
   forwarders under the group's server options. Air-gapped PowerDNS
-  groups now start.
+  groups now start. A change to a PowerDNS group's server options now
+  restarts `pdns_server`, a sub-second gap in answers: pdns reads
+  `pdns.conf` only at startup, so until now a new log level, query
+  logging, and the resolver all waited for the container to restart.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
