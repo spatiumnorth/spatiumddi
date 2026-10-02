@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A template picked in New Subnet or New IP Block applies (#1304).**
+  The dialogs sent their own defaults for every field a template fills
+  (`custom_fields: {}`, DDNS off, DNS and DHCP inherited), and the API's
+  template pre-fill fills only the fields a request leaves out, so the
+  template's custom fields, DDNS settings and DHCP group were dropped:
+  only its tags landed. Its DDNS lock still turned the new subnet's DDNS
+  inheritance off, so DDNS ended up pinned off, and its DHCP group sat
+  behind "inherit" with no effect. Picking a template now fills its
+  custom fields and its DNS, DHCP and DDNS settings into the dialog's own
+  fields, where they can be seen and changed, and the request carries
+  them. The API applies a template's DDNS lock only together with a DDNS
+  value it took from the template: a request that sets every DDNS value
+  the template sets gets the DDNS inheritance it would get with no
+  template.
+
 - **A custom field's Default Value is what the IPAM dialogs send, not
   only what they show (#1303).** Allocate IP, New Subnet and New IP Block
   showed a field's Default Value (Settings → Custom Fields) as its value,

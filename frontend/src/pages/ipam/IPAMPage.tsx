@@ -74,6 +74,7 @@ import {
   type IPAddress,
   type IPRole,
   type CustomField,
+  type IPAMTemplate,
   type DNSZone,
   type FreeCidrRange,
   type Router as NetworkRouter,
@@ -2438,6 +2439,46 @@ function isIPv6Cidr(cidr: string): boolean {
   return cidr.includes(":");
 }
 
+/**
+ * What a template picked in New Subnet / New IP Block puts in the dialog's
+ * own fields (#1304). The API fills only the fields a request leaves out,
+ * and these dialogs send every one of them, so a template's value reaches
+ * the new row only by being shown in the form, and so sent. Each part is
+ * null when the template does not set it, and that part of the form is left
+ * as it is. DDNS counts as set by the same test the API's template lock
+ * uses (services/ipam/templates.py).
+ */
+function templateFormValues(tpl: IPAMTemplate) {
+  const additionalZoneIds = tpl.dns_additional_zone_ids ?? [];
+  return {
+    customFields:
+      Object.keys(tpl.custom_fields ?? {}).length > 0
+        ? tpl.custom_fields
+        : null,
+    ddns:
+      tpl.ddns_enabled ||
+      tpl.ddns_hostname_policy !== "client_or_generated" ||
+      tpl.ddns_domain_override !== null ||
+      tpl.ddns_ttl !== null
+        ? {
+            enabled: tpl.ddns_enabled,
+            policy: tpl.ddns_hostname_policy,
+            domainOverride: tpl.ddns_domain_override,
+            ttl: tpl.ddns_ttl,
+          }
+        : null,
+    dns:
+      tpl.dns_group_id || tpl.dns_zone_id || additionalZoneIds.length > 0
+        ? {
+            groupIds: tpl.dns_group_id ? [tpl.dns_group_id] : [],
+            zoneId: tpl.dns_zone_id,
+            additionalZoneIds,
+          }
+        : null,
+    dhcpGroupId: tpl.dhcp_group_id,
+  };
+}
+
 export function CreateSubnetModal({
   spaceId,
   defaultBlockId,
@@ -2526,6 +2567,34 @@ export function CreateSubnetModal({
     queryKey: ["ipam-templates", "subnet"],
     queryFn: () => ipamApi.listTemplates({ applies_to: "subnet" }),
   });
+
+  // #1304 — a picked template fills the fields it sets, where the operator
+  // sees them; this dialog sends every field, so that is how they apply.
+  function applyTemplate(id: string) {
+    setTemplateId(id);
+    const tpl = subnetTemplates?.find((t) => t.id === id);
+    if (!tpl) return;
+    const v = templateFormValues(tpl);
+    if (v.customFields) {
+      setCustomFields((prev) => ({ ...prev, ...v.customFields }));
+    }
+    if (v.ddns) {
+      setDdnsEnabled(v.ddns.enabled);
+      setDdnsPolicy(v.ddns.policy);
+      setDdnsDomainOverride(v.ddns.domainOverride);
+      setDdnsTtl(v.ddns.ttl);
+    }
+    if (v.dns) {
+      setDnsInherit(false);
+      setDnsGroupIds(v.dns.groupIds);
+      setDnsZoneId(v.dns.zoneId);
+      setDnsAdditionalZoneIds(v.dns.additionalZoneIds);
+    }
+    if (v.dhcpGroupId) {
+      setDhcpInherit(false);
+      setDhcpServerGroupId(v.dhcpGroupId);
+    }
+  }
 
   // Narrow the prefix picker to values valid for the selected block's family
   // and larger than the block's own prefix. /24 stays the default for IPv4,
@@ -2832,7 +2901,7 @@ export function CreateSubnetModal({
               <select
                 className={inputCls}
                 value={templateId}
-                onChange={(e) => setTemplateId(e.target.value)}
+                onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
                 {(subnetTemplates ?? []).map((t) => (
@@ -2844,8 +2913,9 @@ export function CreateSubnetModal({
               </select>
               {templateId && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Operator-supplied fields here override the template's
-                  defaults.
+                  The template's custom fields and its DNS, DHCP and DDNS
+                  settings are filled in on these tabs; change any of them
+                  before you create. Its tags are added to the new subnet.
                 </p>
               )}
             </Field>
@@ -11630,6 +11700,28 @@ export function CreateBlockModal({
     queryFn: () => ipamApi.listTemplates({ applies_to: "block" }),
   });
 
+  // #1304 — as in New Subnet. This dialog has no DDNS fields and sends
+  // none, so the API applies a block template's DDNS itself.
+  function applyTemplate(id: string) {
+    setTemplateId(id);
+    const tpl = blockTemplates?.find((t) => t.id === id);
+    if (!tpl) return;
+    const v = templateFormValues(tpl);
+    if (v.customFields) {
+      setCustomFields((prev) => ({ ...prev, ...v.customFields }));
+    }
+    if (v.dns) {
+      setDnsInherit(false);
+      setDnsGroupIds(v.dns.groupIds);
+      setDnsZoneId(v.dns.zoneId);
+      setDnsAdditionalZoneIds(v.dns.additionalZoneIds);
+    }
+    if (v.dhcpGroupId) {
+      setDhcpInherit(false);
+      setDhcpServerGroupId(v.dhcpGroupId);
+    }
+  }
+
   const flatBlocks = existingBlocks
     ? flattenBlocks(buildBlockTree(existingBlocks, [], null))
     : [];
@@ -11726,7 +11818,7 @@ export function CreateBlockModal({
               <select
                 className={inputCls}
                 value={templateId}
-                onChange={(e) => setTemplateId(e.target.value)}
+                onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
                 {(blockTemplates ?? []).map((t) => (
@@ -11738,9 +11830,10 @@ export function CreateBlockModal({
               </select>
               {templateId && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Operator-supplied fields here override the template's
-                  defaults. Children defined in the template are carved
-                  automatically.
+                  The template's custom fields and its DNS and DHCP settings are
+                  filled in on these tabs; change any of them before you create.
+                  Its tags and DDNS settings are added to the new block, and
+                  children defined in the template are carved automatically.
                 </p>
               )}
             </Field>

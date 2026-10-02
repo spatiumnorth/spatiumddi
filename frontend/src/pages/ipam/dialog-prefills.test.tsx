@@ -20,7 +20,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { CustomField, IPAddress } from "@/lib/api";
+import type { CustomField, IPAddress, IPAMTemplate } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 /** Per API object, the calls a test answers. Anything else stays pending. */
@@ -328,5 +328,250 @@ describe("a custom field's Default Value is what the dialog sends (#1303)", () =
       (updateAddress.mock.calls[0][1] as { custom_fields: unknown })
         .custom_fields,
     ).toEqual({ legacy: "false" });
+  });
+});
+
+// ── #1304 — a template picked in New Subnet / New IP Block ───────────────────
+
+function template(
+  over: Partial<IPAMTemplate> & Pick<IPAMTemplate, "id" | "applies_to">,
+): IPAMTemplate {
+  return {
+    name: `template ${over.id}`,
+    description: "",
+    tags: {},
+    custom_fields: {},
+    dns_group_id: null,
+    dns_zone_id: null,
+    dns_additional_zone_ids: null,
+    dhcp_group_id: null,
+    ddns_enabled: false,
+    ddns_hostname_policy: "client_or_generated",
+    ddns_domain_override: null,
+    ddns_ttl: null,
+    child_layout: null,
+    applied_count: 0,
+    created_at: STAMP,
+    modified_at: STAMP,
+    ...over,
+  };
+}
+
+/** The DNS and DHCP server groups (and the zone) a template can name. */
+function serverGroups() {
+  answer("dhcpApi", "listGroups", () =>
+    Promise.resolve([{ id: "dhcp-grp-1", name: "campus" }]),
+  );
+  answer("dnsApi", "listGroups", () =>
+    Promise.resolve([{ id: "dns-grp-1", name: "corp" }]),
+  );
+  answer("dnsApi", "listZones", () =>
+    Promise.resolve([
+      { id: "zone-1", name: "corp.example.", group_id: "dns-grp-1" },
+    ]),
+  );
+}
+
+function newSubnet(tpl: IPAMTemplate, defs: CustomField[] = []) {
+  answer("ipamApi", "listBlocks", () =>
+    Promise.resolve([
+      { id: "blk-1", space_id: "sp-1", network: "10.84.0.0/16" },
+    ]),
+  );
+  answer("ipamApi", "listTemplates", () => Promise.resolve([tpl]));
+  answer("customFieldsApi", "list", () => Promise.resolve(defs));
+  serverGroups();
+  const createSubnet = sink({ id: "sub-new" });
+  answer("ipamApi", "createSubnet", createSubnet);
+  open(
+    <CreateSubnetModal
+      spaceId="sp-1"
+      defaultBlockId="blk-1"
+      onClose={() => {}}
+    />,
+  );
+  return createSubnet;
+}
+
+async function pickTemplate(id: string) {
+  fireEvent.change(
+    await findControl<HTMLSelectElement>("Apply template (optional)"),
+    { target: { value: id } },
+  );
+}
+
+function tab(name: string) {
+  fireEvent.click(screen.getByRole("button", { name }));
+}
+
+/** The `<select>` under a section's caption (`<p>DHCP Server Group</p>`). */
+function selectUnder(caption: string): HTMLSelectElement {
+  return screen.getByText(caption).nextElementSibling as HTMLSelectElement;
+}
+
+describe("a template picked in the dialog is what the dialog sends (#1304)", () => {
+  const SITE = cf({
+    name: "site",
+    label: "Site code",
+    resource_type: "subnet",
+  });
+
+  it("New Subnet shows and sends the template's custom field and DDNS", async () => {
+    const createSubnet = newSubnet(
+      template({
+        id: "tpl-1",
+        applies_to: "subnet",
+        custom_fields: { site: "from-template" },
+        ddns_enabled: true,
+        ddns_hostname_policy: "always_generate",
+        ddns_ttl: 120,
+      }),
+      [SITE],
+    );
+
+    await pickTemplate("tpl-1");
+    expect((await findControl("Site code")).value).toBe("from-template");
+    tab("DDNS");
+    expect((screen.getByLabelText("Enabled") as HTMLInputElement).checked).toBe(
+      true,
+    );
+    expect(
+      (screen.getByLabelText(/^Hostname policy/) as HTMLSelectElement).value,
+    ).toBe("always_generate");
+    fireEvent.change(control("Network (CIDR)"), {
+      target: { value: "10.84.20.0/24" },
+    });
+    await press("Create");
+
+    await waitFor(() => expect(createSubnet).toHaveBeenCalledTimes(1));
+    expect(createSubnet.mock.calls[0][0]).toMatchObject({
+      template_id: "tpl-1",
+      custom_fields: { site: "from-template" },
+      ddns_enabled: true,
+      ddns_hostname_policy: "always_generate",
+      ddns_ttl: 120,
+    });
+  });
+
+  it("New Subnet shows and sends the template's DNS and DHCP groups", async () => {
+    const createSubnet = newSubnet(
+      template({
+        id: "tpl-2",
+        applies_to: "subnet",
+        dns_group_id: "dns-grp-1",
+        dns_zone_id: "zone-1",
+        dhcp_group_id: "dhcp-grp-1",
+      }),
+    );
+
+    await pickTemplate("tpl-2");
+    tab("DHCP");
+    expect(
+      (screen.getByLabelText("Inherit from parent") as HTMLInputElement)
+        .checked,
+    ).toBe(false);
+    await waitFor(() =>
+      expect(selectUnder("DHCP Server Group").value).toBe("dhcp-grp-1"),
+    );
+    tab("DNS");
+    expect(
+      (screen.getByLabelText("Inherit from parent") as HTMLInputElement)
+        .checked,
+    ).toBe(false);
+    await waitFor(() =>
+      expect(selectUnder("DNS Server Group").value).toBe("dns-grp-1"),
+    );
+    await waitFor(() =>
+      expect(selectUnder("Primary Zone").value).toBe("zone-1"),
+    );
+    fireEvent.change(control("Network (CIDR)"), {
+      target: { value: "10.84.21.0/24" },
+    });
+    await press("Create");
+
+    await waitFor(() => expect(createSubnet).toHaveBeenCalledTimes(1));
+    expect(createSubnet.mock.calls[0][0]).toMatchObject({
+      template_id: "tpl-2",
+      dns_inherit_settings: false,
+      dns_group_ids: ["dns-grp-1"],
+      dns_zone_id: "zone-1",
+      dhcp_inherit_settings: false,
+      dhcp_server_group_id: "dhcp-grp-1",
+    });
+  });
+
+  it("what the operator changes after picking the template wins", async () => {
+    const createSubnet = newSubnet(
+      template({
+        id: "tpl-1",
+        applies_to: "subnet",
+        custom_fields: { site: "from-template" },
+        ddns_enabled: true,
+      }),
+      [SITE],
+    );
+
+    await pickTemplate("tpl-1");
+    fireEvent.change(await findControl("Site code"), {
+      target: { value: "branch-7" },
+    });
+    tab("DDNS");
+    fireEvent.click(screen.getByLabelText("Enabled"));
+    fireEvent.change(control("Network (CIDR)"), {
+      target: { value: "10.84.22.0/24" },
+    });
+    await press("Create");
+
+    await waitFor(() => expect(createSubnet).toHaveBeenCalledTimes(1));
+    expect(createSubnet.mock.calls[0][0]).toMatchObject({
+      custom_fields: { site: "branch-7" },
+      ddns_enabled: false,
+    });
+  });
+
+  it("New IP Block shows and sends the template's custom field and DHCP group", async () => {
+    answer("ipamApi", "listBlocks", () => Promise.resolve([]));
+    answer("ipamApi", "listTemplates", () =>
+      Promise.resolve([
+        template({
+          id: "btpl-1",
+          applies_to: "block",
+          custom_fields: { owner: "neteng" },
+          dhcp_group_id: "dhcp-grp-1",
+        }),
+      ]),
+    );
+    answer("customFieldsApi", "list", () =>
+      Promise.resolve([
+        cf({ name: "owner", label: "Owner team", resource_type: "ip_block" }),
+      ]),
+    );
+    serverGroups();
+    const createBlock = sink({ id: "blk-new" });
+    answer("ipamApi", "createBlock", createBlock);
+    open(<CreateBlockModal spaceId="sp-1" onClose={() => {}} />);
+
+    await pickTemplate("btpl-1");
+    expect((await findControl("Owner team")).value).toBe("neteng");
+    tab("DHCP");
+    expect(
+      (screen.getByLabelText("Inherit from parent") as HTMLInputElement)
+        .checked,
+    ).toBe(false);
+    await waitFor(() =>
+      expect(selectUnder("DHCP Server Group").value).toBe("dhcp-grp-1"),
+    );
+    fireEvent.change(control("Network (CIDR)"), {
+      target: { value: "10.85.0.0/16" },
+    });
+    await press("Create Block");
+
+    await waitFor(() => expect(createBlock).toHaveBeenCalledTimes(1));
+    expect(createBlock.mock.calls[0][0]).toMatchObject({
+      template_id: "btpl-1",
+      custom_fields: { owner: "neteng" },
+      dhcp_inherit_settings: false,
+      dhcp_server_group_id: "dhcp-grp-1",
+    });
   });
 });
