@@ -45,6 +45,8 @@ protection; behind it sits an endpoint with no authentication at all.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from app.config import settings
@@ -223,7 +225,9 @@ async def refund_stepup_attempt(user_id: object) -> None:
     """Give back an attempt ``claim_stepup_attempt`` spent on a right answer.
     Best-effort: failing to refund costs the user one attempt, nothing more."""
     try:
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        # ``Any``: redis-py types ``eval`` as sync-or-async (agent_bundles does
+        # the same).
+        r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
             await r.eval(_STEPUP_REFUND_LUA, 1, _stepup_key(user_id))
         finally:
