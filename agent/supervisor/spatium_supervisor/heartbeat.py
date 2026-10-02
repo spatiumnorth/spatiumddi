@@ -1074,36 +1074,13 @@ def heartbeat_once(
         ml_bgp_peers = body_out.get("desired_metallb_bgp_peers") or []
         ml_bgp_advertisements = body_out.get("desired_metallb_bgp_advertisements") or []
 
-        # The api / worker memory limits and worker concurrency ride along,
-        # sized from this node's RAM (k8s_api.control_plane_resources) — the
-        # chart's BYO-cluster defaults gave way before the VM did on the
-        # appliance, and a kubectl patch never survived a k3s restart.
-        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
-            cp_size,
-            str(ml_vip),
-            web_ui_allowed_cidrs=list(web_ui_cidrs),
-            mem_total_mib=k8s_api.node_memory_mib(),
-        )
-        if cp_changed:
-            log.info(
-                "supervisor.heartbeat.control_plane_overrides_applied",
-                size=cp_size,
-                vip=ml_vip,
-            )
-        elif cp_err:
-            log.warning(
-                "supervisor.heartbeat.control_plane_overrides_failed",
-                error=cp_err,
-                size=cp_size,
-            )
-
         # #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep``
-        # (so a failed-release recovery can't wipe the DB), which also
-        # makes the helm-controller skip patching its spec on upgrade. The
-        # HelmChartConfig above scales api/worker/frontend/redis but the
-        # kept Cluster stays at its initial instance count, so scale it
-        # directly here (a merge-patch isn't a Helm op → keep doesn't
-        # apply). Idempotent — only patches on a real size change.
+        # (so a failed-release recovery can't wipe the DB), and the seed
+        # sizes it directly here. Idempotent — only patches on a real size
+        # change. It runs BEFORE the HelmChartConfig below (#1313): Helm
+        # re-applies the kept Cluster on every upgrade and may not force a
+        # field this patch wrote, so the chart must render the count this
+        # patch leaves, not one it has not written.
         #
         # #1059 — never DOWN while a dead node is being replaced. The replace
         # endpoint drops the replaced row from the committed count at once,
@@ -1140,6 +1117,50 @@ def heartbeat_once(
                 error=pg_scale.error,
                 size=cp_size,
             )
+
+        # The api / worker memory limits and worker concurrency ride along,
+        # sized from this node's RAM (k8s_api.control_plane_resources) — the
+        # chart's BYO-cluster defaults gave way before the VM did on the
+        # appliance, and a kubectl patch never survived a k3s restart.
+        #
+        # #1313 — CNPG's instance count is the one the patch above left on
+        # the Cluster, not cp_size. While #1059's hold keeps the Cluster at
+        # 3 during a replace, cp_size is 2, and rendering 2 made the
+        # helm-controller's apply conflict with the patch's field on every
+        # attempt: the upgrade failed, its recovery uninstalled the release
+        # (api, worker, beat, frontend), and each reinstall failed the same
+        # way until the replacement was promoted. A tick that could not read
+        # the Cluster at all does not know that count, so it leaves the
+        # release as it is; the next tick retries.
+        cnpg_instances = pg_scale.spec_after(cp_size)
+        if cnpg_instances is None:
+            log.warning(
+                "supervisor.heartbeat.control_plane_overrides_deferred",
+                reason="the CNPG Cluster could not be read",
+                error=pg_scale.error,
+                size=cp_size,
+            )
+        else:
+            cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
+                cp_size,
+                str(ml_vip),
+                web_ui_allowed_cidrs=list(web_ui_cidrs),
+                mem_total_mib=k8s_api.node_memory_mib(),
+                cnpg_instances=cnpg_instances,
+            )
+            if cp_changed:
+                log.info(
+                    "supervisor.heartbeat.control_plane_overrides_applied",
+                    size=cp_size,
+                    cnpg_instances=cnpg_instances,
+                    vip=ml_vip,
+                )
+            elif cp_err:
+                log.warning(
+                    "supervisor.heartbeat.control_plane_overrides_failed",
+                    error=cp_err,
+                    size=cp_size,
+                )
 
         bs_changed, bs_err = k8s_api.apply_metallb_overrides(
             metallb_enabled=ml_enabled,

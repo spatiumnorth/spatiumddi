@@ -27,6 +27,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Replacing a dead control-plane node no longer uninstalls the control
+  plane (#1313).** A Replace drops the node from the committed
+  control-plane count, and the seed re-sized the `spatium-control` release
+  to the new count, CloudNativePG's instance count included, while #1059's
+  hold keeps the database Cluster at its old size until the replacement is
+  promoted. Helm re-applies that Cluster on every upgrade, as a server-side
+  apply that may not force a conflict, and the seed's own patch already
+  owned the field, so the upgrade failed on `.spec.instances`. The
+  helm-controller's recovery for a failed release then uninstalled it (api,
+  worker, beat and frontend) and every reinstall failed the same way until
+  the promote, so the control plane went unanswered for 13 to 18 minutes
+  after each Replace. The seed now sizes the Cluster first and renders the
+  instance count the Cluster actually has (a heartbeat that cannot read the
+  Cluster leaves the release alone), so an upgrade never asks to change a
+  field the seed wrote. The chart and supervisor comments that said Helm
+  leaves the kept Cluster alone on upgrade are corrected.
+
 - **A DNS server's zone serials reach the per-server zone state
   (#1408).** The agent reports the serial of each zone it renders
   (`POST /api/v1/dns/agents/zone-state`), but the control plane
