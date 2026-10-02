@@ -917,7 +917,9 @@ async def supervisor_register(
             "supervisor_register_throttled",
             ip=client_ip,
             failures=ip_failures,
-            global_failures=global_failures,
+            # -1 is claim_pairing_attempt's "not charged" sentinel, not a
+            # count; log it as null so the line doesn't read as a bad tally.
+            global_failures=global_failures if global_failures >= 0 else None,
         )
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(
