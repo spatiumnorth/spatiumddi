@@ -378,26 +378,34 @@ def _record_label(fqdn: str, record_type: str) -> str:
     return f"{fqdn} {record_type}"
 
 
-def _live_duplicate_exists() -> Any:
+def _live_duplicate_exists(batch_id: uuid.UUID) -> Any:
     """``EXISTS`` a live record with the same identity as the ``DNSRecord`` row.
 
     The set-based form of the record conflict rule (#1389): a per-record
     ``SELECT`` made restoring a 250k-record zone 250k queries. Identity is the
-    zone, name, type and value, plus the view and the structured fields: under
-    split-horizon the same record in two views is two records, and an MX or SRV
-    with the same target at another priority, weight or port is another record,
-    not a clash. That matches the identity bulk record create dedupes on
-    (#1230).
+    one ``find_identical_record`` refuses a duplicate on (#1230), so a restore
+    cannot bring back the twins a create would have refused: the view, the
+    owner name compared case-insensitively, the type, the value after
+    trimming, and the structured fields. Under split-horizon the same record
+    in two views is two records, and an MX or SRV with the same target at
+    another priority, weight or port is another record, not a clash.
+
+    Postgres turns this into a semi-join; the ``=`` clauses on zone, name,
+    type and value are what it can hash on. The inner side is limited to the
+    batch's zones so that hash covers them, not every live record installed.
     """
     live = aliased(DNSRecord)
+    batch = aliased(DNSRecord)
+    batch_zones = select(batch.zone_id).where(batch.deletion_batch_id == batch_id)
     return (
         select(live.id)
         .where(
             live.deleted_at.is_(None),
+            live.zone_id.in_(batch_zones),
             live.zone_id == DNSRecord.zone_id,
-            live.name == DNSRecord.name,
-            live.record_type == DNSRecord.record_type,
-            live.value == DNSRecord.value,
+            func.lower(live.name) == func.lower(DNSRecord.name),
+            func.upper(live.record_type) == func.upper(DNSRecord.record_type),
+            func.btrim(live.value) == func.btrim(DNSRecord.value),
             live.view_id.is_not_distinct_from(DNSRecord.view_id),
             live.priority.is_not_distinct_from(DNSRecord.priority),
             live.weight.is_not_distinct_from(DNSRecord.weight),
@@ -415,7 +423,7 @@ async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.
     """
     stmt: Any = (
         select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type)
-        .where(DNSRecord.deletion_batch_id == batch_id, _live_duplicate_exists())
+        .where(DNSRecord.deletion_batch_id == batch_id, _live_duplicate_exists(batch_id))
         .execution_options(include_deleted=True)
     )
     return {
@@ -514,7 +522,7 @@ async def restore_batch(
             # predicate that found them, not by a list of ids, which on a large
             # zone would exceed the driver's bind-parameter limit. Python cannot
             # evaluate a correlated EXISTS, hence "fetch".
-            where.append(~_live_duplicate_exists())
+            where.append(~_live_duplicate_exists(batch_id))
             sync = "fetch"
         updated = await db.execute(
             update(DNSRecord)

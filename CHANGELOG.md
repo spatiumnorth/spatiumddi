@@ -304,12 +304,13 @@ the formatter handles the rest.
   the whole batch, the zone's records come back by one `UPDATE`, and
   the zone's own restore row records how many (`new_value.restored`).
   The response's `restored` count still includes them. The conflict
-  check now also compares the record's view, priority, weight and port,
-  the identity bulk record create already dedupes on: under
-  split-horizon a record in another view with the same name, type and
-  value no longer blocks the restore, and neither does an MX or SRV
-  with the same target at another priority or port. Neither was ever a
-  duplicate. A #963 bulk record
+  check now uses the identity record create refuses a duplicate on
+  (#1230): the view, the name compared case-insensitively, the type,
+  the value after trimming, and priority, weight and port. So a record
+  in another view, or an MX or SRV at another priority or port, no
+  longer blocks the restore (neither was ever a duplicate), while a
+  restore can no longer bring back a twin that differs from a live
+  record only in letter case or surrounding spaces. A #963 bulk record
   delete still restores record by record, since each record is
   re-pushed to agentless providers.
 

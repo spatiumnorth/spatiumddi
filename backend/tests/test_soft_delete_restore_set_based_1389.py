@@ -320,3 +320,36 @@ async def test_skip_conflicts_leaves_only_the_duplicate_in_a_zone_batch(
     rows = {r.id: r for r in await _records(db_session, zone_id)}
     trashed = [rid for rid, r in rows.items() if r.deleted_at is not None]
     assert trashed == [dup_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("live_name", "live_value"),
+    [("h0", " 192.0.2.1 "), ("H0", "192.0.2.1")],
+    ids=["value-trimmed", "name-case"],
+)
+async def test_the_conflict_identity_is_the_one_create_refuses(
+    client: AsyncClient, db_session: AsyncSession, live_name: str, live_value: str
+) -> None:
+    """A create refuses a duplicate after trimming the value and ignoring the
+    name's case (#1230); a restore must not bring back the twin it refused."""
+    headers = await _admin(db_session)
+    group_id, zone_id = await _zone_with_records(db_session, 1)
+    await db_session.commit()
+    await _trash_zone(client, headers, group_id, zone_id)
+
+    [trashed] = await _records(db_session, zone_id)
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name=live_name,
+            fqdn=trashed.fqdn,
+            record_type="A",
+            value=live_value,
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(f"/api/v1/admin/trash/dns_zone/{zone_id}/restore", headers=headers)
+    assert resp.status_code == 409, resp.text
+    assert [c["type"] for c in resp.json()["detail"]["conflicts"]] == ["dns_record"]
