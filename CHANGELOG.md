@@ -23,6 +23,51 @@ the formatter handles the rest.
 
 ---
 
+## Unreleased
+
+### Security
+
+- **The MFA enrolment QR code is drawn in the browser, not fetched from
+  a third party (#1353).** The screen built it as an image from
+  `api.qrserver.com` with the `otpauth://` URI in the query string,
+  which carries the TOTP secret, so every account that enrolled MFA sent
+  its second factor to that service. That happened from 2026.05.05-1,
+  the release that added MFA, until the Content-Security-Policy from
+  #400 began blocking the request in 2026.06.13-1. Since then the QR
+  was a broken image and the secret had to be typed in by hand. The
+  code is now rendered locally, by the component the API-token
+  enrolment QR already uses. **If an account enrolled MFA on a release
+  in that range, disable MFA and enrol again** to get a secret no one
+  else has seen. A new frontend test
+  (`frontend/src/lib/outbound-hosts.test.ts`) holds every hostname the
+  Web UI names against `docs/PRIVACY.md`, as the backend guard already
+  did for `backend/app` and the agents.
+
+- **PowerDNS no longer sends ALIAS lookups to Cloudflare and Google
+  (#1353).** Every PowerDNS server had `resolver=1.1.1.1,8.8.8.8` in its
+  `pdns.conf`, because the control plane never sent the agent a
+  resolver. So ALIAS targets went to two public resolvers nobody chose,
+  and a PowerDNS server with no route to them did not start. ALIAS
+  records now resolve through the group's own forwarders over plain DNS.
+  With no forwarders, or with forwarders over TLS, HTTPS or QUIC (which
+  PowerDNS's resolver cannot speak), ALIAS expansion is off, and the API
+  refuses a new ALIAS record with a 422 naming the fix. Clearing the
+  forwarders of a PowerDNS group that serves ALIAS records, or moving
+  them to an encrypted transport, is refused the same way. **Upgrade
+  note:** a PowerDNS group that serves ALIAS records and has no
+  forwarders stops answering A / AAAA for those names until you set
+  forwarders under the group's server options. Until the upgrade
+  replaces the old PowerDNS pod (on an appliance, a few minutes after
+  the reboot), the previous release's pdns keeps sending its ALIAS and
+  security-status lookups to `1.1.1.1` / `8.8.8.8`. Air-gapped PowerDNS
+  groups now start. A change to a PowerDNS group's server options now
+  restarts `pdns_server`, a sub-second gap in answers: pdns reads
+  `pdns.conf` only at startup, so until now a new log level, query
+  logging, and the resolver all waited for the container to restart.
+  The agent waits that restart out rather than reading the old daemon's
+  exit as a crash, and a `pdns_server` that will not stop fails the
+  apply, which is retried, instead of keeping the old settings.
+
 ## 2026.10.02-1 — 2026-10-02
 
 # ⚠️ Please don't roll back to 2026.09.04-1
