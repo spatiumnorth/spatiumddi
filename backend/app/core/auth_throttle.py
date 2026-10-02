@@ -45,6 +45,8 @@ protection; behind it sits an endpoint with no authentication at all.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 
 from app.config import settings
@@ -73,6 +75,26 @@ _STEPUP_FAIL_WINDOW_SECONDS = 15 * 60
 # for the legitimate caller and tight for anything enumerating a VLAN.
 _E911_SELF_RL_MAX = 10
 _E911_SELF_RL_WINDOW_SECONDS = 300
+
+# Supervisor registration (#1356). The endpoint is unauthenticated by design:
+# a new appliance proves itself with an 8-digit pairing code (~26.6 bits),
+# and persistent codes can live for years. Wrong codes per source IP, and
+# across the whole install so spreading guesses over many addresses does not
+# help. Right codes are refunded, so a fleet rollout behind one NAT address
+# never trips it.
+PAIRING_FAIL_MAX_PER_IP = 10
+PAIRING_FAIL_MAX_GLOBAL = 100
+_PAIRING_FAIL_WINDOW_SECONDS = 15 * 60
+
+# Decrement only a key that still exists and is above zero, so a refund that
+# arrives after the window expired cannot leave a counter with no TTL.
+_REFUND_LUA = """
+local v = redis.call('GET', KEYS[1])
+if v and tonumber(v) > 0 then
+  return redis.call('DECR', KEYS[1])
+end
+return 0
+"""
 
 
 async def login_rate_limited(ip: str | None) -> bool:
@@ -195,3 +217,54 @@ async def record_stepup_password_failure(user_id: object) -> None:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — throttle must never break the step-up
         logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
+
+
+class PairingThrottleUnavailable(Exception):
+    """The pairing-attempt budget could not be read; refuse the attempt."""
+
+
+def _pairing_keys(ip: str | None) -> tuple[str, str]:
+    return f"pair_rl:ip:{ip or 'unknown'}", "pair_rl:global"
+
+
+async def claim_pairing_attempt(ip: str | None) -> tuple[bool, int]:
+    """Spend one supervisor-registration attempt (#1356).
+
+    Returns ``(allowed, failures_from_this_ip)``, both counting this attempt.
+    Spent before the code is looked up, so concurrent guesses cannot all read
+    an under-budget count; ``refund_pairing_attempt`` gives it back when the
+    code was right. Each window opens with ``SET NX EX`` before the ``INCR``,
+    so a counter is never left without an expiry.
+
+    Fails CLOSED (``PairingThrottleUnavailable``): this budget is the only
+    thing between an unauthenticated caller and the code space.
+    """
+    ip_key, global_key = _pairing_keys(ip)
+    try:
+        r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            counts = []
+            for key in (ip_key, global_key):
+                await r.set(key, 0, ex=_PAIRING_FAIL_WINDOW_SECONDS, nx=True)
+                counts.append(int(await r.incr(key)))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — any Redis failure means "no budget to spend"
+        logger.warning("pairing_throttle_redis_unavailable", error=str(exc))
+        raise PairingThrottleUnavailable from exc
+    ip_count, global_count = counts
+    allowed = ip_count <= PAIRING_FAIL_MAX_PER_IP and global_count <= PAIRING_FAIL_MAX_GLOBAL
+    return allowed, ip_count
+
+
+async def refund_pairing_attempt(ip: str | None) -> None:
+    """Give back the attempt a successful registration spent. Best-effort."""
+    try:
+        r: Any = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            for key in _pairing_keys(ip):
+                await r.eval(_REFUND_LUA, 1, key)
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — a lost refund only costs one attempt
+        logger.warning("pairing_throttle_redis_unavailable", error=str(exc))

@@ -137,6 +137,22 @@ def _no_failure_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(supervisor_mod, "_CONSUME_FAILURE_DELAY_S", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def _no_attempt_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the code checks, not the attempt budget (#1356),
+    which ``test_supervisor_register_throttle_1356.py`` covers. Real Redis
+    counters would carry failures from one test into the next."""
+
+    async def _claim(_ip: object) -> tuple[bool, int]:
+        return True, 1
+
+    async def _refund(_ip: object) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor_mod, "claim_pairing_attempt", _claim)
+    monkeypatch.setattr(supervisor_mod, "refund_pairing_attempt", _refund)
+
+
 # ── Tests ──────────────────────────────────────────────────────────
 
 

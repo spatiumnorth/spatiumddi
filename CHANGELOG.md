@@ -1947,6 +1947,24 @@ the formatter handles the rest.
 
 ### Security
 
+- **Supervisor registration has an attempt budget, and persistent pairing
+  codes expire by default (#1356).** `POST /appliance/supervisor/register`
+  is unauthenticated: an 8-digit pairing code is the credential. Nothing
+  limited the guesses beyond a fixed half-second delay, persistent codes
+  defaulted to never expiring, and every wrong guess committed its own
+  audit row, so a brute-force run also flooded the append-only audit
+  table. Now ten wrong codes from one address, or a hundred across the
+  install, in 15 minutes get `429` until the window passes. The attempt is
+  spent before the code is checked, so concurrent guesses can't all slip
+  under the limit, and a right code refunds it, so a fleet rollout behind
+  one NAT address is never throttled. The throttle fails closed (`503`)
+  while Redis is unreachable. An unknown code is audited only for the
+  first failure from an address in each window, plus once when the limit
+  trips; a code that exists but is revoked, expired or exhausted is always
+  audited. **Behaviour change:** a persistent code now expires after 30
+  days unless created with `expires_in_minutes: 0`, and the dialog warns
+  when you choose never.
+
 - **The api image no longer ships pip (#1392).** The runtime image
   carried the Python base image's own pip 25.0.1, which has six fixed
   CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL

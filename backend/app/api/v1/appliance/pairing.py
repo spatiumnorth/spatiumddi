@@ -11,7 +11,8 @@ What this module owns:
 
 * ``POST /api/v1/appliance/pairing-codes`` — mint a code. Required:
   ``persistent: bool``. Optional: ``expires_in_minutes`` (defaults:
-  15 min for ephemeral, no expiry for persistent), ``max_claims``
+  15 min for ephemeral, 30 days for persistent; ``0`` = never, persistent
+  only, #1356), ``max_claims``
   (only for persistent; NULL = unlimited), ``note``.
 * ``GET /api/v1/appliance/pairing-codes`` — list every code with
   redacted shape (``code_last_two`` only) + claim count + derived
@@ -77,6 +78,8 @@ _EPHEMERAL_DEFAULT_EXPIRY_MINUTES = 15
 # at 5 years so an admin can't accidentally mint a code that
 # survives every operator currently working at the org.
 _PERSISTENT_MAX_EXPIRY_MINUTES = 60 * 24 * 365 * 5
+# #1356 — a persistent code expires after 30 days unless asked otherwise.
+_PERSISTENT_DEFAULT_EXPIRY_MINUTES = 30 * 24 * 60
 
 
 def _generate_code() -> str:
@@ -99,7 +102,7 @@ class PairingCodeCreate(BaseModel):
         description=(
             "False = single-use code with a short expiry (today's "
             "default). True = multi-claim code that can admit N "
-            "appliances; default no expiry; admin can disable / "
+            "appliances; default 30-day expiry; admin can disable / "
             "re-reveal."
         ),
     )
@@ -109,8 +112,8 @@ class PairingCodeCreate(BaseModel):
             f"Ephemeral codes: defaults to {_EPHEMERAL_DEFAULT_EXPIRY_MINUTES} "
             f"min, range {_EPHEMERAL_MIN_EXPIRY_MINUTES}-"
             f"{_EPHEMERAL_MAX_EXPIRY_MINUTES}. Persistent codes: NULL "
-            "= no expiry (default); 0 also means no expiry; any "
-            "positive integer up to 5 years caps the validity window."
+            "= 30 days (default); 0 = no expiry; any positive integer "
+            "up to 5 years caps the validity window."
         ),
     )
     max_claims: int | None = Field(
@@ -232,10 +235,15 @@ async def create_pairing_code(
     now = datetime.now(UTC)
     expires_at: datetime | None
     if body.persistent:
-        # Persistent code: NULL or 0 means no expiry. Positive value
-        # caps validity; values above the 5-year ceiling rejected.
+        # Persistent code: omitted means the 30-day default (#1356); an
+        # explicit 0 means no expiry. A code is 8 digits, so one that never
+        # expires is a standing fleet-join credential for as long as it
+        # exists, and "never" has to be asked for. Values above the 5-year
+        # ceiling are rejected.
         minutes = body.expires_in_minutes
-        if minutes is None or minutes == 0:
+        if minutes is None:
+            minutes = _PERSISTENT_DEFAULT_EXPIRY_MINUTES
+        if minutes == 0:
             expires_at = None
         elif minutes < 0:
             raise HTTPException(
