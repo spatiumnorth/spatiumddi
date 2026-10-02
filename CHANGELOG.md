@@ -1956,8 +1956,10 @@ the formatter handles the rest.
   RADIUS / TACACS+ secrets; now `POST /auth-providers/{id}/secrets`, was
   a GET with no step-up), creating or promoting a superadmin, resetting a
   superadmin's password, and minting an API token, for every owner.
-  Wrong answers spend the per-account step-up budget, and each attempt is
-  audited with the method used. **Behaviour changes:** API clients that
+  Wrong answers spend the per-account step-up budget (an omitted answer
+  is refused without spending it), and each attempt is audited with the
+  method used. Resetting your own password through the admin path counts:
+  a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
   create tokens, superadmins or a superadmin's password must send
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
   SSO account must enrol TOTP before it can mint an API token. The Users

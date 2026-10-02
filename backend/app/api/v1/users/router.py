@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
@@ -56,6 +57,10 @@ class UserResponse(BaseModel):
     failed_login_count: int = 0
     failed_login_locked_until: datetime | None = None
     locked: bool = False
+    # #1355 — the flag OR a wildcard role. Resetting such an account's
+    # password needs the caller's step-up, and the UI reads this to ask for
+    # it (the flag alone misses a local user in a Superadmin-role group).
+    is_effective_superadmin: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -75,6 +80,12 @@ class UserResponse(BaseModel):
                 c.name: getattr(data, c.name) for c in data.__table__.columns
             }
             cols["locked"] = is_user_locked(data)
+            # ``groups`` is selectin-loaded; never trigger an async lazy load
+            # from this sync validator if a path skipped it.
+            if "groups" in sa_inspect(data).unloaded:
+                cols["is_effective_superadmin"] = bool(data.is_superadmin)
+            else:
+                cols["is_effective_superadmin"] = is_effective_superadmin(data)
             return cols
         return data
 
@@ -382,9 +393,11 @@ async def reset_password(
     # A superadmin's password passes every step-up, so choosing it for them
     # needs one (#1355). Effective superadmin: the flag or a wildcard role.
     # The role path reads ``user.groups``: load it explicitly, since a row
-    # already in this session's identity map may not have it yet.
+    # already in this session's identity map may not have it yet. No
+    # exemption for the caller's own account: a stolen session resetting its
+    # own password would end up holding the password every step-up asks for.
     await db.refresh(user, ["groups"])
-    if is_effective_superadmin(user) and user.id != current_user.id:
+    if is_effective_superadmin(user):
         method = await require_operator_stepup(
             db,
             current_user,

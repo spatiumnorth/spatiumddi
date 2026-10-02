@@ -219,3 +219,67 @@ async def test_an_sso_account_without_mfa_is_told_to_enrol(
     r = await client.post("/api/v1/api-tokens", headers=headers, json={"name": "t"})
     assert r.status_code == 403, r.text
     assert "enrol" in r.json()["detail"]
+
+
+# ── Review follow-ups ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resetting_your_own_password_needs_the_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A stolen session must not be able to choose its own account's password
+    through the admin path: that password passes every later step-up."""
+    admin, headers = await _admin(db_session)
+    url = f"/api/v1/users/{admin.id}/reset-password"
+    r = await client.post(url, headers=headers, json={"new_password": _NEW_PW})
+    assert r.status_code == 403, r.text
+    r = await client.post(
+        url, headers=headers, json={"new_password": _NEW_PW, "stepup_password": _PW}
+    )
+    assert r.status_code == 204, r.text
+
+
+@pytest.mark.asyncio
+async def test_an_omitted_step_up_does_not_spend_the_budget(
+    client: AsyncClient, db_session: AsyncSession, _budget: dict[str, object]
+) -> None:
+    """A client that predates #1355 is refused, but is not counted as a wrong
+    guess: that would lock the account out of every step-up."""
+    _, headers = await _admin(db_session)
+    r = await client.post("/api/v1/api-tokens", headers=headers, json={"name": "t"})
+    assert r.status_code == 403, r.text
+    assert "re-confirmation" in r.json()["detail"]
+    assert _budget["failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_role_superadmin_is_reported_and_needs_the_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The UI asks for the step-up from ``is_effective_superadmin``; the flag
+    alone misses a local user in a wildcard-role group."""
+    from app.models.auth import Group, Role
+
+    _, headers = await _admin(db_session)
+    target = await _user(db_session, superadmin=False)
+    role = Role(
+        name=f"wild-{uuid.uuid4().hex[:6]}",
+        description="",
+        is_builtin=False,
+        permissions=[{"action": "*", "resource_type": "*"}],
+    )
+    group = Group(name=f"g-{uuid.uuid4().hex[:6]}", description="", auth_source="local")
+    group.roles = [role]
+    group.users = [target]
+    db_session.add_all([role, group])
+    await db_session.commit()
+
+    listed = (await client.get("/api/v1/users", headers=headers)).json()
+    row = next(u for u in listed if u["id"] == str(target.id))
+    assert row["is_superadmin"] is False
+    assert row["is_effective_superadmin"] is True
+
+    url = f"/api/v1/users/{target.id}/reset-password"
+    r = await client.post(url, headers=headers, json={"new_password": _NEW_PW})
+    assert r.status_code == 403, r.text

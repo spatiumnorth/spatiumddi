@@ -2429,6 +2429,9 @@ export interface AppUser {
   failed_login_count?: number;
   failed_login_locked_until?: string | null;
   locked?: boolean;
+  /** #1355 — the flag OR a wildcard role; resetting such an account's
+   *  password needs the caller's step-up. */
+  is_effective_superadmin?: boolean;
 }
 
 /** #1355 — the caller's own step-up on actions that mint a credential:

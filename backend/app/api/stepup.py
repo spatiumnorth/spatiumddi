@@ -9,7 +9,8 @@ provider's secrets.
 The check is :func:`app.services.reauth.reverify_operator`: a local user's
 password, or an external user's TOTP code. Wrong answers spend the
 per-account step-up budget (#1241), which fails closed while it cannot be
-read. Every attempt is audited with the method used.
+read; an omitted answer is refused without spending it. Every attempt is
+audited with the method used.
 """
 
 from __future__ import annotations
@@ -67,9 +68,18 @@ async def require_operator_stepup(
     if outcome is ReauthOutcome.OK:
         return stepup_method(user)
 
-    if outcome is ReauthOutcome.BAD_CREDENTIAL:
+    # An omitted step-up is not a guess, so it does not spend the budget: a
+    # client that predates #1355 (or an empty dialog) would otherwise lock
+    # the account out of every step-up, MFA changes included, for 15 min.
+    missing = not password and not totp_code
+    if outcome is ReauthOutcome.BAD_CREDENTIAL and not missing:
         await record_stepup_password_failure(user.id)
-    reason = "mfa_required" if outcome is ReauthOutcome.MFA_REQUIRED else "bad_credential"
+    if outcome is ReauthOutcome.MFA_REQUIRED:
+        reason = "mfa_required"
+    elif missing:
+        reason = "stepup_missing"
+    else:
+        reason = "bad_credential"
     db.add(
         AuditLog(
             user_id=user.id,
@@ -95,6 +105,14 @@ async def require_operator_stepup(
         )
     # 403, not 401: the SPA reads any 401 off a non-login path as an expired
     # token and resubmits, which would spend two attempts on one typo.
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This needs re-confirmation: send your password, or an authenticator "
+                "code if your account has no local password."
+            ),
+        )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Password or authenticator code is incorrect",

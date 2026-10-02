@@ -180,7 +180,13 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
               setError(null);
               mutation.mutate();
             }}
-            disabled={!username || !email || !password || mutation.isPending}
+            disabled={
+              !username ||
+              !email ||
+              !password ||
+              (isSuperadmin && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Creating…" : "Create"}
@@ -290,7 +296,9 @@ function EditUserModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={mutation.isPending}
+            disabled={
+              (promoting && !stepPassword && !stepTotp) || mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
@@ -315,13 +323,16 @@ function ResetPasswordModal({
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // The server asks for a step-up on an effective superadmin (flag or a
+  // wildcard role), the caller's own account included.
+  const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
 
   const mutation = useMutation({
     mutationFn: () =>
       usersApi.resetPassword(
         user.id,
         password,
-        user.is_superadmin ? stepUpBody(stepPassword, stepTotp) : {},
+        needsStepUp ? stepUpBody(stepPassword, stepTotp) : {},
       ),
     onSuccess: onClose,
     onError: (err: unknown) => {
@@ -360,7 +371,7 @@ function ResetPasswordModal({
         <p className="text-xs text-muted-foreground">
           The user will be required to change their password on next login.
         </p>
-        {user.is_superadmin && (
+        {needsStepUp && (
           <StepUpSection
             reason="This account is a superadmin, and its password passes every re-confirmation, so resetting it needs yours."
             password={stepPassword}
@@ -382,7 +393,12 @@ function ResetPasswordModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!password || mismatch || mutation.isPending}
+            disabled={
+              !password ||
+              mismatch ||
+              (needsStepUp && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Resetting…" : "Reset Password"}
