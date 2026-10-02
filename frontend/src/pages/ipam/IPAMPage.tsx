@@ -3302,7 +3302,11 @@ export function AddAddressModal({
   // failed (partial success). The row already exists, so re-submitting would
   // collide; the footer switches from "Allocate" to "Close".
   const [addressCreated, setAddressCreated] = useState(false);
-  const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
+  // Only a reservation is made on a scope (the static_dhcp branch of the
+  // mutation below). A "dhcp" row records an address the DHCP server
+  // leases, and nothing takes a scope for it, so the picker is not shown
+  // for one (#1306). Edit address draws the same line (#867).
+  const needsDhcpScope = ipStatus === "static_dhcp";
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
   // check + pool warnings even before the user flips to ``static_dhcp``.

@@ -27,6 +27,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer offers a DHCP scope for status "dhcp", where
+  nothing uses it (#1306).** Choosing status "dhcp" showed a DHCP Scope
+  picker with a scope already selected, but only a `static_dhcp`
+  allocation makes a reservation on a scope: the `dhcp` request never
+  carried it. The picker now appears for `static_dhcp` only, as it does
+  in Edit address.
+
 - **Edit address shows the role and status an address is stored with
   (#1305).** Its Role menu lacked `web`, `api` and `lb`, which the API
   accepts, and its Status menu lacked the statuses integrations set

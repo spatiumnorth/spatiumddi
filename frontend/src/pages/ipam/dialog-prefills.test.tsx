@@ -612,3 +612,69 @@ describe("Edit address shows the status and role it is stored with (#1305)", () 
     });
   });
 });
+// ── #1306 — the DHCP Scope picker ────────────────────────────────────────────
+
+describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => {
+  function allocateWithScope() {
+    answer("dhcpApi", "listScopesBySubnet", () =>
+      Promise.resolve([
+        {
+          id: "scope-1",
+          subnet_id: "sub-1",
+          group_id: "dhcp-grp-1",
+          name: "staff",
+        },
+      ]),
+    );
+    answer("dhcpApi", "listPools", () => Promise.resolve([]));
+    const createStatic = sink({ id: "static-1" });
+    answer("dhcpApi", "createStatic", createStatic);
+    const nextAddress = allocateIp();
+    return { nextAddress, createStatic };
+  }
+
+  it('status "dhcp" shows no scope, because the request carries none', async () => {
+    const { nextAddress, createStatic } = allocateWithScope();
+    const status = await findControl<HTMLSelectElement>("Type / Status");
+
+    // Positive control first: the dialog has the subnet's scope, and offers
+    // it for a reservation. Only then is its absence below the dialog's
+    // own decision rather than a scope list still loading.
+    fireEvent.change(status, { target: { value: "static_dhcp" } });
+    await waitFor(() =>
+      expect(control<HTMLSelectElement>("DHCP Scope").value).toBe("scope-1"),
+    );
+    fireEvent.change(status, { target: { value: "dhcp" } });
+    expect(screen.queryByText("DHCP Scope", { selector: "label" })).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ status: "dhcp" });
+    expect(createStatic).not.toHaveBeenCalled();
+  });
+
+  it("static_dhcp reserves the address on the scope it shows", async () => {
+    const { nextAddress, createStatic } = allocateWithScope();
+
+    fireEvent.change(await findControl<HTMLSelectElement>("Type / Status"), {
+      target: { value: "static_dhcp" },
+    });
+    await waitFor(() =>
+      expect(control<HTMLSelectElement>("DHCP Scope").value).toBe("scope-1"),
+    );
+    fireEvent.change(control("MAC Address"), {
+      target: { value: "aa:bb:cc:dd:ee:ff" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(createStatic).toHaveBeenCalledTimes(1));
+    expect(nextAddress).toHaveBeenCalledTimes(1);
+    expect(createStatic.mock.calls[0][0]).toBe("scope-1");
+  });
+});
