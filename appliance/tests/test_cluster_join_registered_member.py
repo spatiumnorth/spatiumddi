@@ -73,19 +73,23 @@ STARTING_JOIN = (
 # A refused add, verbatim from member-4 on nightly-2026.09.28 (spatiumddi#1285):
 # the seed kept a dead voter, so its etcd refused every add; k3s retried it once
 # a second and gave up 15 minutes later.
-REFUSED_ADD = "\n".join([
+REFUSED_ADD_ATTEMPT = (
     'time="2026-09-29T11:57:34Z" level=info msg="Adding member '
     "ddipg-member-4-4ee86735=https://192.168.122.195:2380 to etcd cluster "
     "[ddipg-member-3-7d1c4ad1=https://192.168.122.86:2380 "
     "ddipg-seed-c337b117=https://192.168.122.183:2380 "
-    'ddipg-member-1-7f072fd9=https://192.168.122.160:2380]"',
+    'ddipg-member-1-7f072fd9=https://192.168.122.160:2380]"'
+)
+REFUSED_ADD_WAIT = (
     'time="2026-09-29T11:57:34Z" level=info msg="Waiting for other members to finish '
-    'joining etcd cluster: etcdserver: unhealthy cluster"',
-] * 3 + [
+    'joining etcd cluster: etcdserver: unhealthy cluster"'
+)
+REFUSED_ADD_GIVE_UP = (
     'time="2026-09-29T12:02:28Z" level=error msg="Shutdown request received: \\"failed '
     "to wait for API server to become ready: context deadline exceeded\\nthe server is "
-    'currently unable to handle the request\\""',
-])
+    'currently unable to handle the request\\""'
+)
+REFUSED_ADD = "\n".join([REFUSED_ADD_ATTEMPT, REFUSED_ADD_WAIT] * 3 + [REFUSED_ADD_GIVE_UP])
 PUBLISHED = (
     '{"level":"info","ts":"2026-09-10T11:49:34.801802Z",'
     '"caller":"etcdserver/server.go:1836","msg":"published local member to cluster through raft"}'
