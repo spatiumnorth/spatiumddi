@@ -802,6 +802,81 @@ the formatter handles the rest.
   the image download was interrupted, nothing was written to the
   inactive slot, and the upgrade can be retried.
 
+- **A replaced node stays replaced: its Fleet row no longer goes
+  back from `left` to `failed` on the node's own word (#1317).**
+  Replace evicts a node on the seed's word and settles its row
+  `left`. The replaced node can still be alive: a failed joiner back
+  on its standalone control plane, or a member that was cut off and
+  returns. It goes on reporting what its join runner last wrote, and
+  the heartbeat applied whatever a node reported. A failed joiner's
+  `failed` turned the settled row back into a failed joiner, so the
+  Fleet showed a node it had just evicted as a failed join again. (A
+  node retries a failed join on its own, so a retry can still be
+  running when Replace is accepted; it reports when it ends.) A
+  member's `ready`, which a node never stops reporting, re-settled
+  the row as a member etcd no longer has. Only the order decided it:
+  the report did no harm when it landed before the eviction settled,
+  and an eviction that settles within seconds (#1284) often settles
+  first. An evicted row now ignores the join state its node reports,
+  from Replace until something is asked of the node again (a new
+  promote). A row an operator cleared mid-join still settles on the
+  node's `ready`, as before.
+
+- **Fleet → Replace removes the node's etcd member, not only its
+  k8s Node, and the row settles `left` only once etcd agrees
+  (#1284).** The seed evicted a replaced node by deleting its k8s
+  Node, which makes k3s drop a server's etcd member, and settled the
+  row `left` on that alone. A 404 counted as success. A node can be
+  an etcd member with no Node at all: a failed joiner whose own
+  automatic re-join made it a voter, then died before its Node
+  registered. Replace accepts exactly that row, and the dead voter
+  then kept its seat for good. The cluster ran on two live voters of
+  three with no fault tolerance, and etcd refused every later member
+  add ("etcdserver: unhealthy cluster"), so the replacement Replace
+  was for could never join. The seed now also removes the node's
+  etcd member itself, through a new host runner
+  (`spatium-etcd-evict`, behind `spatiumddi-etcd-evict.path`). The
+  member is matched by the name k3s gives it
+  (`<hostname>-<8 hex>`), or, before it has a name, by a peer URL on
+  the node's addresses; the seed's own member is never touched. It
+  reports the node evicted only once etcd no longer lists it. Until
+  then the row stays `evicting`, with the reason in the Fleet UI. A
+  member that appears for the name within five minutes of the
+  eviction is removed too: a re-join that was already in flight when
+  Replace landed. A node that is promoted again in that time is
+  exempt, since its new member is wanted. A seed whose OS slot
+  predates the runner keeps the old behaviour. Promote is refused
+  while an eviction is still pending, for the node itself and for
+  any node under the same hostname, and the Fleet no longer offers
+  them for promotion: until the eviction settles, the seed removes
+  etcd members under that name. The runner acts only on a fresh
+  request and sets each one aside once it has answered it, so
+  starting it again never repeats an old eviction.
+
+- **A join the seed's etcd refuses is rolled back with its reason,
+  instead of sitting `joining` for good (#1285).** The join runner's
+  #1052 guard, which stops a node that already joined the seed's etcd
+  from being rolled back into a ghost voter, counted k3s's `Adding
+  member … to etcd cluster` line as membership. k3s logs that line
+  before it asks etcd to add the member, and again on every retry
+  while etcd refuses the add (`etcdserver: unhealthy cluster` while a
+  dead voter still holds a seat, for example). So a refused join was
+  kept: no rollback, k3s restarting every ~15 minutes, and a `failed`
+  no supervisor could report, so the row read `joining` indefinitely
+  and Replace refused it. Only lines k3s and etcd log after the add
+  succeeded count now. A refused join is rolled back to the node's
+  standalone control plane, with a reason that names the refusal
+  rather than an unreachable seed. When the refusal is a voter the
+  seed cannot reach, the node stays standalone: the reason says to
+  remove that member first, and the join is not retried on its own,
+  since every retry would wipe the node again and be refused again.
+  A learner backlog is still retried. A refusal names the failure
+  only when the attempt ended on it: one refused add early in an
+  attempt that then failed for another reason no longer stops the
+  automatic retry. The journal scan behind this decision is also
+  anchored in UTC, so an appliance set to another time zone no
+  longer scans the wrong window.
+
 - **After a DHCP agent restart, an address that has changed hands no
   longer drops out of IPAM while its new client holds it (#1318).**
   The agent re-reads its whole lease file on every start, so an old
@@ -1961,6 +2036,18 @@ the formatter handles the rest.
   expires after 15 minutes (verify answers `400` and discards it), and
   sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
   candidate secret's own Fernet timestamp.
+
+- **The api image no longer ships pip (#1392).** The runtime image
+  carried the Python base image's own pip 25.0.1, which has six fixed
+  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
+  only, so it never blocked on them, and `apt-get upgrade` cannot patch
+  pip because it is not a Debian package. So every scan at default
+  severity, such as Harbor's, reported them on every build. Nothing at
+  runtime runs pip, and a production image has no business carrying a
+  package installer, so the runtime stage now uninstalls it, and the
+  `dev` stage (pytest, `make ci-backend-lint`) restores it with
+  `ensurepip`. A Trivy scan of the runtime image now reports no
+  fixable Python-package finding at any severity.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step

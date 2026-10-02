@@ -60,6 +60,7 @@ import {
   storageChipClass,
   storageSeverityClass,
 } from "@/lib/storage-health";
+import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
 import { AptTab } from "./AptTab";
@@ -538,7 +539,10 @@ function ClusterMembershipModal({
   // mid-join. ``isControlPlaneRow`` keys off the install variant, so a
   // control-plane node is excluded even before it's formally designated
   // primary (cluster_role is null until the first promote) — you can't
-  // promote a control plane to a control plane.
+  // promote a control plane to a control plane. #1284 — nor a node whose
+  // eviction is still pending, or one sharing its hostname: the seed removes
+  // etcd members under that name until the eviction settles.
+  const evicting = hostnamesBeingEvicted(rows);
   const eligible = rows
     .filter(
       (r) =>
@@ -546,7 +550,8 @@ function ClusterMembershipModal({
         r.deployment_kind === "appliance" &&
         !isControlPlaneRow(r) &&
         !r.cluster_role &&
-        r.desired_cluster_role !== "member",
+        r.desired_cluster_role !== "member" &&
+        !heldByEviction(r, evicting),
     )
     .sort(byHostname);
 

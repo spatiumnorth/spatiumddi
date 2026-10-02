@@ -385,11 +385,17 @@ is a documentation bug, not a support question.
 
 This page can drift. A running system cannot.
 
-Python packages in the API image, with versions and licenses:
+Python packages in the API image, with versions and licenses. The image ships
+no pip (#1392), so read the installed metadata directly:
 
 ```bash
-docker compose exec api python3 -m pip list
-docker compose exec api python3 -m pip show ldap3 paramiko
+docker compose exec api python3 -c 'import importlib.metadata as m
+for d in sorted(m.distributions(), key=lambda d: d.name.lower()):
+    md = d.metadata
+    print(d.name, d.version, md.get("License-Expression") or md.get("License") or "", sep="\t")'
+docker compose exec api python3 -c 'import importlib.metadata as m
+for n in ("ldap3", "paramiko"):
+    print(n, [str(f.locate()) for f in m.files(n) if f.name.upper().startswith(("LICEN", "COPYING"))])'
 ```
 
 OS packages on the appliance:
