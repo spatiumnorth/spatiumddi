@@ -95,6 +95,7 @@ backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_
 backend/alembic/versions/8e317fdd5b12_dhcp_windows_failover_observation.py:drop_table:162
 backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alter_column_type:39
 backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alter_column_type:54
+backend/alembic/versions/99e91dcae1e2_release_schema_head.py:drop_table:40
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:47
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:48
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:41

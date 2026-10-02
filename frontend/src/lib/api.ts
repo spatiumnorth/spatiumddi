@@ -11925,14 +11925,33 @@ export const applianceSlotApi = {
         checksum_url: checksum_url || null,
       })
       .then((r) => r.data),
-  rollback: (target_slot: ApplianceSlot | null) =>
+  rollback: (
+    target_slot: ApplianceSlot | null,
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<{
         scheduled: string;
         target_slot: ApplianceSlot | null;
-      }>("/appliance/slot-upgrade/rollback", { target_slot })
+        schema_check: SchemaRollbackCheck | null;
+      }>("/appliance/slot-upgrade/rollback", {
+        target_slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
 };
+
+// #1227 — whether a release can start on the database as it is now. The
+// database survives an A/B slot swap, so going back to an older release
+// puts its code on a schema a newer release migrated, which it cannot run.
+export interface SchemaRollbackCheck {
+  verdict: "compatible" | "incompatible" | "unknown";
+  target_version: string | null;
+  target_head: string | null;
+  head_source: "recorded" | "bundled" | null;
+  database_revision: string | null;
+  message: string;
+}
 
 // ── Appliance: fleet upgrade orchestration (Phase 8f, issue #138) ──
 export type FleetAgentKind = "dns" | "dhcp";
@@ -12837,6 +12856,7 @@ export const applianceApprovalApi = {
     source:
       | { kind: "url"; url: string }
       | { kind: "uploaded"; slot_image_id: string },
+    acknowledge_schema_rollback = false,
   ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
@@ -12844,6 +12864,7 @@ export const applianceApprovalApi = {
         ...(source.kind === "url"
           ? { desired_slot_image_url: source.url }
           : { slot_image_id: source.slot_image_id }),
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   clearUpgrade: (id: string) =>
@@ -12855,14 +12876,26 @@ export const applianceApprovalApi = {
   // pickup pipeline as ``scheduleUpgrade`` — the backend stamps a
   // desired-state column on the appliance row, the supervisor's next
   // heartbeat reads it + writes the host-side trigger file.
-  setNextBootSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setNextBootSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
-      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, { slot })
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, {
+        slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
-  setDefaultSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setDefaultSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/set-default-slot`, {
         slot,
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   scheduleReboot: (id: string) =>

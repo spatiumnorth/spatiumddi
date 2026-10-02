@@ -44,8 +44,10 @@ import {
   type SupervisorCapabilities,
   type AvailableUpgradeImage,
   type UpgradeImage,
+  type SchemaRollbackCheck,
   formatApiError,
 } from "@/lib/api";
+import { schemaRollbackRefusal } from "@/lib/schema-rollback";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -5660,6 +5662,13 @@ function ApplianceOsUpgradeSection({
   const [imageUrl, setImageUrl] = useState("");
   const [slotImageId, setSlotImageId] = useState<string>("");
   const [rebootConfirm, setRebootConfirm] = useState(false);
+  // #1227 — a slot action or downgrade the server refused because the
+  // release it moves to cannot run on the database. Held so the operator
+  // can read why and retry with the acknowledgement.
+  const [schemaRefusal, setSchemaRefusal] = useState<{
+    check: SchemaRollbackCheck;
+    proceed: () => void;
+  } | null>(null);
 
   const isApplianceHost =
     row.deployment_kind === "appliance" || row.deployment_kind === null;
@@ -5711,14 +5720,23 @@ function ApplianceOsUpgradeSection({
   }
 
   const scheduleUpgrade = useMutation({
-    mutationFn: () =>
+    mutationFn: (acknowledge: boolean) =>
       applianceApprovalApi.scheduleUpgrade(
         row.id,
         tag.trim(),
         sourceKind === "url"
           ? { kind: "url", url: imageUrl.trim() }
           : { kind: "uploaded", slot_image_id: slotImageId },
+        acknowledge,
       ),
+    onError: (err) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => scheduleUpgrade.mutate(true),
+        });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setTag("");
@@ -5735,16 +5753,38 @@ function ApplianceOsUpgradeSection({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  type SlotVars = { slot: "slot_a" | "slot_b"; acknowledge: boolean };
   const setNextBoot = useMutation({
-    mutationFn: (slot: "slot_a" | "slot_b") =>
-      applianceApprovalApi.setNextBootSlot(row.id, slot),
+    mutationFn: ({ slot, acknowledge }: SlotVars) =>
+      applianceApprovalApi.setNextBootSlot(row.id, slot, acknowledge),
+    onError: (err, { slot }) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => setNextBoot.mutate({ slot, acknowledge: true }),
+        });
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
   const setDefault = useMutation({
-    mutationFn: (slot: "slot_a" | "slot_b") =>
-      applianceApprovalApi.setDefaultSlot(row.id, slot),
+    mutationFn: ({ slot, acknowledge }: SlotVars) =>
+      applianceApprovalApi.setDefaultSlot(row.id, slot, acknowledge),
+    onError: (err, { slot }) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => setDefault.mutate({ slot, acknowledge: true }),
+        });
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  // The refusal is shown in its own modal; repeating it inline as an error
+  // would read as a failure the operator still has to deal with.
+  const slotError = [setNextBoot.error, setDefault.error].find(
+    (e) => e && !schemaRollbackRefusal(e),
+  );
   const reboot = useMutation({
     mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
     onSuccess: () => {
@@ -5802,21 +5842,25 @@ function ApplianceOsUpgradeSection({
               key={slot}
               row={row}
               slot={slot}
-              onSetNextBoot={() => setNextBoot.mutate(slot)}
-              onSetDefault={() => setDefault.mutate(slot)}
+              onSetNextBoot={() =>
+                setNextBoot.mutate({ slot, acknowledge: false })
+              }
+              onSetDefault={() =>
+                setDefault.mutate({ slot, acknowledge: false })
+              }
               busyNextBoot={
-                setNextBoot.isPending && setNextBoot.variables === slot
+                setNextBoot.isPending && setNextBoot.variables?.slot === slot
               }
               busyDefault={
-                setDefault.isPending && setDefault.variables === slot
+                setDefault.isPending && setDefault.variables?.slot === slot
               }
             />
           ))}
         </div>
       )}
-      {(setNextBoot.error || setDefault.error) && (
+      {slotError && (
         <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
-          {((setNextBoot.error ?? setDefault.error) as Error).message}
+          {formatApiError(slotError)}
         </p>
       )}
 
@@ -5949,7 +5993,7 @@ function ApplianceOsUpgradeSection({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => scheduleUpgrade.mutate()}
+              onClick={() => scheduleUpgrade.mutate(false)}
               disabled={
                 !tag.trim() ||
                 scheduleUpgrade.isPending ||
@@ -5967,11 +6011,12 @@ function ApplianceOsUpgradeSection({
                 ? "Schedule rollback"
                 : "Schedule OS upgrade"}
             </button>
-            {scheduleUpgrade.error && (
-              <span className="text-xs text-rose-700 dark:text-rose-300">
-                {formatApiError(scheduleUpgrade.error)}
-              </span>
-            )}
+            {scheduleUpgrade.error &&
+              !schemaRollbackRefusal(scheduleUpgrade.error) && (
+                <span className="text-xs text-rose-700 dark:text-rose-300">
+                  {formatApiError(scheduleUpgrade.error)}
+                </span>
+              )}
           </div>
           <p className="text-[11px] text-muted-foreground">
             Stamps <code>desired_appliance_version</code> on the appliance row.
@@ -6030,6 +6075,45 @@ function ApplianceOsUpgradeSection({
           onConfirm={() => reboot.mutate()}
           onClose={() => setRebootConfirm(false)}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
+        />
+      )}
+
+      {schemaRefusal && (
+        <ConfirmModal
+          open
+          title={`${schemaRefusal.check.target_version ?? "That release"} cannot run on this database`}
+          message={
+            <>
+              <p className="text-sm">{schemaRefusal.check.message}</p>
+              <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 text-xs">
+                <dt className="text-muted-foreground">Database is at</dt>
+                <dd className="break-all font-mono">
+                  {schemaRefusal.check.database_revision ?? "unknown"}
+                </dd>
+                <dt className="text-muted-foreground">
+                  {schemaRefusal.check.target_version} was built with
+                </dt>
+                <dd className="break-all font-mono">
+                  {schemaRefusal.check.target_head ?? "unknown"}
+                </dd>
+              </dl>
+              <p className="mt-2 text-xs text-muted-foreground">
+                The database stays on <code>/var</code> when the slot changes.
+                Proceed only if you will restore a copy of the database taken
+                before the upgrade; otherwise the control plane on{" "}
+                <strong>{row.hostname}</strong> will not start.
+              </p>
+            </>
+          }
+          confirmLabel="Proceed anyway"
+          tone="destructive"
+          onConfirm={() => {
+            const { proceed } = schemaRefusal;
+            setSchemaRefusal(null);
+            proceed();
+          }}
+          onClose={() => setSchemaRefusal(null)}
+          requireCheckboxLabel="I will restore a pre-upgrade copy of the database"
         />
       )}
     </div>

@@ -60,6 +60,7 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_va
 from sqlalchemy import func as sa_func
 from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import (
@@ -143,6 +144,8 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades.schema_rollback import check_release_can_run
+from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
 
 logger = structlog.get_logger(__name__)
 
@@ -278,6 +281,20 @@ def _client_ip(request: Request) -> str | None:
 # not-yet-reinstalled box.
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
+
+
+def _hosts_control_plane(a: Appliance) -> bool:
+    """True when this appliance runs the control plane (api / db / frontend).
+
+    A self-bootstrapping install variant, or a node promoted into the
+    control-plane cluster. These are the nodes that share THE database.
+    """
+    return a.appliance_variant in _SELF_BOOTSTRAP_VARIANTS or a.cluster_role in (
+        CLUSTER_ROLE_PRIMARY,
+        CLUSTER_ROLE_MEMBER,
+    )
+
+
 _SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
 
 
@@ -3594,13 +3611,7 @@ async def delete_appliance(
     # it makes its heartbeats 403, trips the supervisor's revocation
     # detector, and tears the control plane down — bricking the cluster.
     # A control-plane node must be demoted (or another promoted) first.
-    def _is_control_plane(a: Appliance) -> bool:
-        return a.appliance_variant in _SELF_BOOTSTRAP_VARIANTS or a.cluster_role in (
-            CLUSTER_ROLE_PRIMARY,
-            CLUSTER_ROLE_MEMBER,
-        )
-
-    if _is_control_plane(row):
+    if _hosts_control_plane(row):
         other_cp = (
             await db.execute(
                 select(sa_func.count())
@@ -5434,6 +5445,9 @@ class ApplianceUpgradeRequest(BaseModel):
     desired_appliance_version: str = Field(min_length=1, max_length=64)
     desired_slot_image_url: str | None = Field(default=None, min_length=1)
     slot_image_id: uuid.UUID | None = Field(default=None)
+    # #1227 — proceed with a control-plane node going to a release that
+    # cannot run on the database as it is now (an older image).
+    acknowledge_schema_rollback: bool = False
 
 
 @router.post(
@@ -5485,6 +5499,14 @@ async def schedule_appliance_upgrade(
             ),
         )
 
+    # #1227 — an "upgrade" to an older image on a control-plane node is a
+    # downgrade of the release that runs on THE database, which that release
+    # may not be able to read. A newer target has recorded no head yet, so
+    # an ordinary forward upgrade reads "unknown" and passes.
+    schema_check = await _schema_check_for_version(
+        db, row, body.desired_appliance_version, body.acknowledge_schema_rollback
+    )
+
     # Resolve slot_image_id → internal URL + integrity/transport hints,
     # then stamp all four desired-state columns. Both live in
     # ``services.appliance.slot_image_target`` so this surface and the
@@ -5517,12 +5539,14 @@ async def schedule_appliance_upgrade(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     resolved_url = row.desired_slot_image_url or target.url
-    # #1182 — which way this moves the node. Never refused: this is also the
-    # manual rollback path, and the label is operator-typed. But a backward
-    # move boots older code against a database the newer release may already
-    # have migrated (#1227), so it is recorded and logged as a warning, and
-    # the Fleet form warns before it is sent. The rolling orchestrator does
-    # refuse a backward target (the preflight's version_path check).
+    # #1182 — which way this moves the node. The direction alone never
+    # refuses: this is also the manual rollback path, and the label is
+    # operator-typed. So a backward move is recorded and logged as a warning,
+    # and the Fleet form warns before it is sent. What does refuse is the
+    # schema check above (#1227): a control-plane node moved onto a release
+    # that cannot run on the database is a 409 unless acknowledged. The
+    # rolling orchestrator refuses a backward target outright (the
+    # preflight's version_path check).
     direction = upgrade_direction(row.installed_appliance_version, body.desired_appliance_version)
     db.add(
         AuditLog(
@@ -5538,6 +5562,8 @@ async def schedule_appliance_upgrade(
                 "desired_appliance_version": body.desired_appliance_version,
                 "desired_slot_image_url": resolved_url,
                 "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
+                "schema_check": schema_check,
+                "acknowledge_schema_rollback": body.acknowledge_schema_rollback,
                 "installed_appliance_version": row.installed_appliance_version,
                 "direction": direction,
             },
@@ -5634,6 +5660,42 @@ class ApplianceSlotActionRequest(BaseModel):
     """
 
     slot: Literal["slot_a", "slot_b"]
+    # #1227 — proceed even though the slot's release cannot run on the
+    # database as it is now. Without it that case is a 409 whose
+    # detail.code is "schema_rollback_unsafe".
+    acknowledge_schema_rollback: bool = False
+
+
+async def _schema_check_for_version(
+    db: AsyncSession, row: Appliance, version: str | None, acknowledged: bool
+) -> dict[str, Any] | None:
+    """Refuse (409) moving a control-plane node onto a release that cannot
+    run on the database as it is now, unless acknowledged (#1227).
+
+    Only control-plane nodes: a data-plane appliance's release never touches
+    the database, so going back on one is always safe. Returns the check for
+    the audit row, or None when nothing was checked.
+    """
+    if not _hosts_control_plane(row):
+        return None
+    check = await check_release_can_run(db, version)
+    enforce_schema_rollback(check, acknowledged=acknowledged)
+    return check.to_dict()
+
+
+async def _schema_check_for_slot(
+    db: AsyncSession, row: Appliance, body: ApplianceSlotActionRequest
+) -> dict[str, Any] | None:
+    """:func:`_schema_check_for_version` for the release installed on a slot.
+
+    The running slot is skipped: pointing a node at the slot it already runs
+    (committing a trial boot) changes nothing about which code meets the
+    database.
+    """
+    if body.slot == row.current_slot:
+        return None
+    version = row.slot_a_version if body.slot == "slot_a" else row.slot_b_version
+    return await _schema_check_for_version(db, row, version, body.acknowledge_schema_rollback)
 
 
 def _check_appliance_slot_action_allowed(row: Appliance) -> None:
@@ -5690,6 +5752,7 @@ async def schedule_appliance_set_next_boot(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
     _check_appliance_slot_action_allowed(row)
+    schema_check = await _schema_check_for_slot(db, row, body)
     row.desired_next_boot_slot = body.slot
     db.add(
         AuditLog(
@@ -5701,7 +5764,11 @@ async def schedule_appliance_set_next_boot(
             resource_id=str(row.id),
             resource_display=row.hostname,
             result="success",
-            new_value={"desired_next_boot_slot": body.slot},
+            new_value={
+                "desired_next_boot_slot": body.slot,
+                "schema_check": schema_check,
+                "acknowledge_schema_rollback": body.acknowledge_schema_rollback,
+            },
         )
     )
     await db.commit()
@@ -5752,6 +5819,7 @@ async def schedule_appliance_set_default_slot(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
     _check_appliance_slot_action_allowed(row)
+    schema_check = await _schema_check_for_slot(db, row, body)
     row.desired_default_slot = body.slot
     db.add(
         AuditLog(
@@ -5763,7 +5831,11 @@ async def schedule_appliance_set_default_slot(
             resource_id=str(row.id),
             resource_display=row.hostname,
             result="success",
-            new_value={"desired_default_slot": body.slot},
+            new_value={
+                "desired_default_slot": body.slot,
+                "schema_check": schema_check,
+                "acknowledge_schema_rollback": body.acknowledge_schema_rollback,
+            },
         )
     )
     await db.commit()

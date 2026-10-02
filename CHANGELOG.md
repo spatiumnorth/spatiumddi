@@ -248,6 +248,50 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Going back to an older release is checked against the database first
+  (#1227).** PostgreSQL lives on `/var`, which an A/B slot swap does not
+  touch. So a slot rollback put the older release's code on a schema the
+  newer release had already migrated. Its migrate Job failed with
+  `Can't locate revision`, its api, worker and beat waited for migrate
+  forever, and on a single node the newer release's api kept serving
+  behind the older UI. Nothing refused the rollback, and after the Job's
+  10-minute TTL nothing said why the control plane was down.
+  - Every path that moves a control-plane node to an older release now
+    compares the database's revision with the one that release was built
+    with: `POST /appliance/slot-upgrade/rollback`, Fleet
+    `set-next-boot` / `set-default-slot` onto the other slot, and a Fleet
+    upgrade to an older image. When the release cannot run on the
+    database, the request is a 409 with `detail.code`
+    `schema_rollback_unsafe` naming both revisions. The Fleet UI shows it
+    as a confirmation, and `acknowledge_schema_rollback: true` proceeds
+    anyway. Data-plane appliances and a commit of the running slot are
+    never checked. A release nobody recorded is `unknown` and proceeds,
+    because refusing on "don't know" would block every rollback on an
+    install that never recorded anything.
+  - Each release records its schema head in a new `release_schema_head`
+    table when it starts, once the schema is at its head, and records
+    the booted slot's version only when that slot is its own release.
+    Tagged releases come from `backend/app/data/release_schema_heads.json`,
+    generated from the release tags by `scripts/release_schema_heads.py`
+    (55 releases, 2026.09.04-1 at `f3b8d21c74ae`), which wins over a
+    recorded row for every release it lists. The table is backed up with
+    `alembic_version`.
+  - A migrate step that meets a database a newer release migrated now
+    says so, in the migrate Job and once in the `wait-for-migrate` init
+    container, and names the way out: re-apply the newer release, or
+    restore a pre-upgrade copy of the database. Only when the unknown
+    revision is the one the database is at; a mistyped
+    `alembic upgrade <rev>` keeps Alembic's plain error. This applies to
+    releases from this one on, not to the ones already published.
+  - The rolling-upgrade preflight gains a warn-only `pre_upgrade_backup`
+    row: no backup target has succeeded in the last 24 hours.
+  - **Not covered:** the trial-boot auto-revert runs on the host with no
+    operator involved, so nothing can refuse it, and no database snapshot
+    is taken before an upgrade yet. See "Rolling back" in
+    `docs/deployment/APPLIANCE.md`.
+  - Also fixed: the Fleet slot cards showed an error as
+    `Request failed with status code …` instead of the server's reason.
+
 - **The unattended-upgrades package blocklist says what it accepts
   (#1384).** The APT settings form, the model and APPLIANCE.md called
   its entries globs, but unattended-upgrades reads each one as a regular
@@ -4890,6 +4934,12 @@ the formatter handles the rest.
   between reporting the bad minute and losing it.
 
 ### Migrations
+
+- `99e91dcae1e2` — #1227: `release_schema_head` (`version` PK,
+  `alembic_head`, `recorded_at` defaulting to `now()`), the schema head
+  each release ran at. No seed: each release writes its own row at
+  startup. In the `platform_internal` backup section beside
+  `alembic_version`.
 
 - `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
   `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed

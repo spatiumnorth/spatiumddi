@@ -3,11 +3,13 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
+from alembic.util import CommandError
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models so Alembic can detect them for autogenerate
+from app.core.schema_check import explain_unknown_revision
 from app.models import Base  # noqa: F401 — registers all mapped classes
 
 config = context.config
@@ -48,6 +50,36 @@ target_metadata = Base.metadata
 TRANSACTION_PER_MIGRATION = True
 
 
+def _run_migrations() -> None:
+    """``context.run_migrations()``, with a message that names the real cause
+    when the database is at a revision this release does not know (#1227).
+
+    That is what a rollback, an auto-revert or a downgrade leaves behind, and
+    it is raised from inside ``run_migrations`` for ``upgrade`` and
+    ``current`` alike, so the migrate Job and the ``wait-for-migrate`` init
+    container both say it. The error is re-raised either way: no command that
+    fails today succeeds now, so ``alembic stamp`` recovery is untouched.
+    """
+    try:
+        context.run_migrations()
+    except CommandError as exc:
+        explained = explain_unknown_revision(str(exc), _database_revisions())
+        if explained is None:
+            raise
+        raise CommandError(explained) from exc
+
+
+def _database_revisions() -> tuple[str, ...]:
+    """What ``alembic_version`` holds, or nothing when it cannot be read
+    (offline mode has no database to ask)."""
+    if context.is_offline_mode():
+        return ()
+    try:
+        return tuple(context.get_context().get_current_heads())
+    except Exception:  # noqa: BLE001 — no explanation beats a second error
+        return ()
+
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
@@ -59,7 +91,7 @@ def run_migrations_offline() -> None:
         transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
     with context.begin_transaction():
-        context.run_migrations()
+        _run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
@@ -70,7 +102,7 @@ def do_run_migrations(connection: Connection) -> None:
         transaction_per_migration=TRANSACTION_PER_MIGRATION,
     )
     with context.begin_transaction():
-        context.run_migrations()
+        _run_migrations()
 
 
 async def run_async_migrations() -> None:

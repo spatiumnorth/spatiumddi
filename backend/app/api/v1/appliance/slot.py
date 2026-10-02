@@ -30,6 +30,11 @@ from app.services.appliance.slot import (
     schedule_apply,
     schedule_rollback,
 )
+from app.services.upgrades.schema_rollback import (
+    SchemaRollbackCheck,
+    check_release_can_run,
+    enforce,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -207,11 +212,35 @@ class RollbackRequest(BaseModel):
             "'go back to the previously-running slot' intent."
         ),
     )
+    acknowledge_schema_rollback: bool = Field(
+        default=False,
+        description=(
+            "Proceed even though the target slot's release cannot run on the "
+            "database as it is now (#1227). Without it that case is a 409 "
+            "whose detail.code is 'schema_rollback_unsafe'."
+        ),
+    )
+
+
+class SchemaRollbackCheckOut(BaseModel):
+    """Whether a release can start on the database as it is now (#1227)."""
+
+    # "incompatible" is only ever returned with the acknowledgement; without
+    # it that verdict is the 409.
+    verdict: Literal["compatible", "incompatible", "unknown"]
+    target_version: str | None
+    target_head: str | None
+    head_source: Literal["recorded", "bundled"] | None
+    database_revision: str | None
+    message: str
 
 
 class RollbackResponse(BaseModel):
     scheduled: str
     target_slot: str | None
+    # The target slot's release judged against the database. None when
+    # rolling onto the slot already running, which changes nothing.
+    schema_check: SchemaRollbackCheckOut | None = None
 
 
 @router.post(
@@ -236,6 +265,11 @@ async def rollback(
     'I just upgraded and want to revert' button — explicit operator
     choice, no health gate. Calls ``grub-set-default`` durably; the
     swap doesn't take effect until the operator reboots.
+
+    Refused with 409 when the target slot's release cannot run on the
+    database as it is now, unless ``acknowledge_schema_rollback`` is set
+    (#1227): the database survives the swap, and an older release cannot
+    start on a schema a newer one migrated.
     """
     await _reject_if_clustered(db, "slot-upgrade rollback")
     if is_apply_in_flight():
@@ -248,6 +282,21 @@ async def rollback(
             status.HTTP_409_CONFLICT,
             "rollback isn't available — appliance_mode off, or active slot couldn't be detected",
         )
+
+    # #1227 — the database stays on /var across the swap. Judge the release
+    # being switched TO before writing the trigger, because afterwards the
+    # only thing that can still answer is gone.
+    slots = get_slot_status()
+    target = body.target_slot or (
+        "slot_b" if slots.current_slot == "slot_a" else "slot_a" if slots.current_slot else None
+    )
+    schema_check: SchemaRollbackCheck | None = None
+    if target is not None and target != slots.current_slot:
+        check = await check_release_can_run(
+            db, slots.slot_a_version if target == "slot_a" else slots.slot_b_version
+        )
+        enforce(check, acknowledged=body.acknowledge_schema_rollback)
+        schema_check = check
 
     try:
         schedule_rollback(body.target_slot)
@@ -263,7 +312,11 @@ async def rollback(
             resource_type="appliance",
             resource_id="slot",
             resource_display=body.target_slot or "(inactive)",
-            new_value={"target_slot": body.target_slot},
+            new_value={
+                "target_slot": body.target_slot,
+                "schema_check": schema_check.to_dict() if schema_check else None,
+                "acknowledge_schema_rollback": body.acknowledge_schema_rollback,
+            },
             result="success",
         )
     )
@@ -273,4 +326,8 @@ async def rollback(
         target_slot=body.target_slot,
         user=user.username,
     )
-    return RollbackResponse(scheduled="rollback", target_slot=body.target_slot)
+    return RollbackResponse(
+        scheduled="rollback",
+        target_slot=body.target_slot,
+        schema_check=(SchemaRollbackCheckOut(**schema_check.to_dict()) if schema_check else None),
+    )
