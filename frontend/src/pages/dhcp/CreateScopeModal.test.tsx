@@ -23,6 +23,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { DHCPScope } from "@/lib/api";
 
 type SubnetFixture = {
   id: string;
@@ -35,6 +36,7 @@ const getSubnet = vi.fn<(id: string) => Promise<SubnetFixture>>();
 const getSettings = vi.fn<() => Promise<unknown>>();
 const createScope = vi.fn();
 const createPool = vi.fn();
+const updateScope = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   dhcpApi: {
@@ -44,6 +46,7 @@ vi.mock("@/lib/api", () => ({
     listPxeProfiles: () => Promise.resolve([]),
     createScope: (...args: unknown[]) => createScope(...args),
     createPool: (...args: unknown[]) => createPool(...args),
+    updateScope: (...args: unknown[]) => updateScope(...args),
   },
   ipamApi: {
     getSubnet: (id: string) => getSubnet(id),
@@ -301,5 +304,107 @@ describe("CreateScopeModal pre-fill (#1154)", () => {
     );
     await act(async () => {});
     expect(control("Routers (option 3)").value).toBe("");
+  });
+});
+
+/** A stored scope, as `GET /dhcp/scopes/{id}` returns it, for the edit dialog. */
+function storedScope(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "scope-1",
+    subnet_id: SUBNET_A.id,
+    group_id: "grp-1",
+    name: "staff-scope",
+    description: "",
+    enabled: true,
+    lease_time: 86400,
+    min_lease_time: null,
+    max_lease_time: null,
+    lease_cache_threshold: null,
+    lease_cache_max_age: null,
+    ddns_enabled: true,
+    ddns_hostname_policy: "client",
+    hostname_sync_mode: "on_static_only",
+    dns_track_dynamic_leases: true,
+    address_family: "ipv4",
+    relay_addresses: [],
+    options: [],
+    pxe_profile_id: null,
+    ...overrides,
+  };
+}
+
+function openEdit(qc: QueryClient, scope: ReturnType<typeof storedScope>) {
+  render(
+    <QueryClientProvider client={qc}>
+      <CreateScopeModal
+        scope={scope as unknown as DHCPScope}
+        onClose={() => {}}
+      />
+    </QueryClientProvider>,
+  );
+}
+
+function policySelect(): HTMLSelectElement {
+  return control("Hostname Policy") as unknown as HTMLSelectElement;
+}
+
+describe("CreateScopeModal DDNS Hostname Policy (#1308)", () => {
+  // The scope API's vocabulary (VALID_HOSTNAME_POLICIES in
+  // backend/app/api/v1/dhcp/scopes.py). The dialog offered client / ipam /
+  // generate: create refused the last two with a 422, and a stored
+  // server_name / derived / none showed as "Client-supplied".
+  const API_POLICIES = ["client", "server_name", "derived", "none"];
+
+  it("offers exactly the policies the scope API accepts, and sends the one picked", async () => {
+    const qc = client();
+    qc.setQueryData(["settings"], SETTINGS);
+    getSettings.mockResolvedValue(SETTINGS);
+    getSubnet.mockResolvedValue(SUBNET_A);
+    createScope.mockResolvedValue({ id: "scope-1" });
+    createPool.mockResolvedValue({});
+
+    open(qc, SUBNET_A.id);
+    fireEvent.click(screen.getByLabelText(/^DDNS — push lease updates/));
+    const offered = Array.from(policySelect().options).map((o) => o.value);
+    expect(offered).toEqual(API_POLICIES);
+
+    fireEvent.change(policySelect(), { target: { value: "derived" } });
+    expect(policySelect().value).toBe("derived");
+    await save();
+    expect(createScope.mock.calls[0][1]).toMatchObject({
+      ddns_enabled: true,
+      ddns_hostname_policy: "derived",
+    });
+  });
+
+  it("shows a scope's stored policy as itself", async () => {
+    for (const stored of ["server_name", "derived", "none"]) {
+      openEdit(client(), storedScope({ ddns_hostname_policy: stored }));
+      expect(policySelect().value).toBe(stored);
+      expect(policySelect().selectedOptions[0].value).toBe(stored);
+      cleanup();
+    }
+  });
+
+  it("shows a stored value outside the vocabulary as itself, and sends it back unchanged", async () => {
+    // Stored through the edit path before it was checked (here the subnet's
+    // vocabulary, which docs/features/DHCP.md listed for the scope). The
+    // update handler grandfathers an unchanged value, so an unrelated edit
+    // saves; the dialog must not show it as "Client-supplied" meanwhile.
+    updateScope.mockResolvedValue({ id: "scope-1" });
+    openEdit(
+      client(),
+      storedScope({ ddns_hostname_policy: "client_or_generated" }),
+    );
+    expect(policySelect().value).toBe("client_or_generated");
+    expect(policySelect().selectedOptions[0].textContent).toContain(
+      "client_or_generated",
+    );
+
+    fireEvent.submit(control("Name").form!);
+    await waitFor(() => expect(updateScope).toHaveBeenCalledTimes(1));
+    expect(updateScope.mock.calls[0][1]).toMatchObject({
+      ddns_hostname_policy: "client_or_generated",
+    });
   });
 });

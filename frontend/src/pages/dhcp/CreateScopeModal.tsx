@@ -19,6 +19,18 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
+// #1308 — the scope API's own vocabulary (``VALID_HOSTNAME_POLICIES`` in
+// backend/app/api/v1/dhcp/scopes.py). The dialog used to offer client / ipam /
+// generate: create refused the last two with a 422, update stored them
+// unchecked, and a stored server_name / derived / none showed as
+// "Client-supplied".
+const DDNS_HOSTNAME_POLICIES: { value: string; label: string }[] = [
+  { value: "client", label: "Client-supplied" },
+  { value: "server_name", label: "Server name" },
+  { value: "derived", label: "Derived" },
+  { value: "none", label: "None" },
+];
+
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
 // for IPv6 or subnets too small to be useful.
@@ -973,9 +985,21 @@ export function CreateScopeModal({
                   value={ddnsPolicy}
                   onChange={(e) => setDdnsPolicy(e.target.value)}
                 >
-                  <option value="client">Client-supplied</option>
-                  <option value="ipam">From IPAM</option>
-                  <option value="generate">Generate</option>
+                  {DDNS_HOSTNAME_POLICIES.map((p) => (
+                    <option key={p.value} value={p.value}>
+                      {p.label}
+                    </option>
+                  ))}
+                  {/* A value stored before edits were checked (#1308) shows
+                      as itself, and is sent back unchanged until another
+                      policy is picked. */}
+                  {!DDNS_HOSTNAME_POLICIES.some(
+                    (p) => p.value === ddnsPolicy,
+                  ) && (
+                    <option value={ddnsPolicy}>
+                      {ddnsPolicy} (not a supported policy)
+                    </option>
+                  )}
                 </select>
               </Field>
               {/* #784 — a "Domain Override" input used to sit here. Nothing
