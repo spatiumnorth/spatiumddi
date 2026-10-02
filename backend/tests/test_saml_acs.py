@@ -12,11 +12,16 @@ against the URL it is told the Response arrived at.
 These tests drive the whole flow: the metadata, the authorize redirect, and the
 IdP's POST of a Response signed with a throwaway IdP key, so the strict checks
 run for real. #873's tests only ever post a bogus ``SAMLResponse``.
+
+Turning SAML on also takes the two checks the last section pins: a Response
+must answer the AuthnRequest of the flow that delivers it, and its Assertion
+signs in once (SAML core 3.2.2, profiles 4.1.4.5).
 """
 
 from __future__ import annotations
 
 import base64
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
@@ -32,6 +37,7 @@ from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.auth import router as auth_router
 from app.models.audit import AuditLog
 from app.models.auth import Group, User
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
@@ -77,7 +83,7 @@ _ASSERTION = (
     '<saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">'
     "{name_id}</saml:NameID>"
     '<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">'
-    '<saml:SubjectConfirmationData InResponseTo="{in_response_to}"'
+    "<saml:SubjectConfirmationData{in_response_to}"
     ' NotOnOrAfter="{later}" Recipient="{destination}"/>'
     "</saml:SubjectConfirmation>"
     "</saml:Subject>"
@@ -101,7 +107,7 @@ _RESPONSE = (
     '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"'
     ' xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"'
     ' ID="{response_id}" Version="2.0" IssueInstant="{now}"'
-    ' Destination="{destination}" InResponseTo="{in_response_to}">'
+    ' Destination="{destination}"{in_response_to}>'
     "<saml:Issuer>{issuer}</saml:Issuer>"
     '<samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>'
     "</samlp:Status>"
@@ -110,17 +116,18 @@ _RESPONSE = (
 )
 
 
-def _signed_response(*, destination: str, in_response_to: str, audience: str) -> str:
+def _signed_response(*, destination: str, in_response_to: str | None, audience: str) -> str:
     """The form value an IdP posts: a Response whose Assertion is signed
     RSA-SHA256 with the IdP's key, its ``Destination`` and ``Recipient`` both
-    ``destination``."""
+    ``destination``, answering the AuthnRequest ``in_response_to`` (or none,
+    as an unsolicited Response)."""
     now = datetime.now(UTC)
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     fields = {
         "issuer": IDP_ENTITY_ID,
         "name_id": NAME_ID,
         "destination": destination,
-        "in_response_to": in_response_to,
+        "in_response_to": f' InResponseTo="{in_response_to}"' if in_response_to else "",
         "audience": audience,
         "now": now.strftime(stamp),
         "earlier": (now - timedelta(minutes=1)).strftime(stamp),
@@ -205,23 +212,33 @@ async def _start_sign_in(client: AsyncClient, provider: AuthProvider) -> dict[st
     }
 
 
+async def _deliver(
+    client: AsyncClient, provider: AuthProvider, flow: dict[str, str], saml_response: str
+) -> Response:
+    """The browser delivering ``saml_response`` to the provider's ACS through
+    ``flow``: its RelayState and its flow cookie."""
+    return await client.post(
+        f"/api/v1/auth/{provider.id}/callback",
+        data={"SAMLResponse": saml_response, "RelayState": flow["relay_state"]},
+        # The flow cookie is ``Secure`` behind an HTTPS base URL, so this
+        # client's plain-HTTP cookie jar would hold it back; a browser sends it.
+        headers={"Cookie": flow["cookie"]},
+    )
+
+
 async def _idp_posts(
     client: AsyncClient, provider: AuthProvider, flow: dict[str, str], *, destination: str
 ) -> Response:
     """The browser delivering the IdP's Response to the provider's ACS."""
-    return await client.post(
-        f"/api/v1/auth/{provider.id}/callback",
-        data={
-            "SAMLResponse": _signed_response(
-                destination=destination,
-                in_response_to=flow["request_id"],
-                audience=flow["sp_entity_id"],
-            ),
-            "RelayState": flow["relay_state"],
-        },
-        # The flow cookie is ``Secure`` behind an HTTPS base URL, so this
-        # client's plain-HTTP cookie jar would hold it back; a browser sends it.
-        headers={"Cookie": flow["cookie"]},
+    return await _deliver(
+        client,
+        provider,
+        flow,
+        _signed_response(
+            destination=destination,
+            in_response_to=flow["request_id"],
+            audience=flow["sp_entity_id"],
+        ),
     )
 
 
@@ -311,3 +328,169 @@ async def test_a_response_addressed_to_any_other_url_is_refused(
     )
     users = await db_session.execute(select(User).where(User.auth_source == "saml"))
     assert users.scalars().all() == []
+
+
+# ── One Response, one sign-in, through the flow it answers (#1335) ──────────
+#
+# With the ACS fixed, SAML signs people in, and two more checks become
+# necessary. A Response lifted from one browser's sign-in (a proxy or WAF that
+# logs request bodies, an extension, a shared machine) must not sign in
+# through another browser's flow, so each Response must answer the AuthnRequest
+# of the flow that delivers it (SAML core 3.2.2). And a bearer Assertion is
+# single-use (SAML profiles 4.1.4.5), so it must not sign in twice through its
+# own.
+
+
+def _where(resp: Response) -> str:
+    """Where the ACS sent the browser, without the access token's fragment."""
+    return resp.headers.get("location", "").split("#", 1)[0]
+
+
+def _signed_in(resp: Response) -> bool:
+    return resp.status_code == 302 and resp.headers["location"].startswith(
+        "/login/callback#access_token="
+    )
+
+
+def _refused(resp: Response) -> bool:
+    return (
+        resp.status_code == 302
+        and resp.headers["location"] == "/login?error=saml_assertion_rejected"
+    )
+
+
+async def test_a_response_signs_in_once(client: AsyncClient, db_session: AsyncSession) -> None:
+    provider, _ = await _saml_provider(db_session)
+    flow = await _start_sign_in(client, provider)
+    response = _signed_response(
+        destination=flow["request_acs"],
+        in_response_to=flow["request_id"],
+        audience=flow["sp_entity_id"],
+    )
+
+    first = await _deliver(client, provider, flow, response)
+    again = await _deliver(client, provider, flow, response)
+
+    assert _signed_in(first), (_where(first), await _rejection(db_session, provider))
+    assert _refused(again), f"a second delivery of the same Response went to {_where(again)}"
+    rejection = await _rejection(db_session, provider)
+    assert isinstance(rejection, dict), rejection
+    assert "has already been used to sign in" in rejection["detail"]
+
+
+async def test_a_response_signs_in_only_through_the_flow_it_answers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    provider, _ = await _saml_provider(db_session)
+    victim = await _start_sign_in(client, provider)
+    other = await _start_sign_in(client, provider)
+    response = _signed_response(
+        destination=victim["request_acs"],
+        in_response_to=victim["request_id"],
+        audience=victim["sp_entity_id"],
+    )
+
+    elsewhere = await _deliver(client, provider, other, response)
+
+    assert _refused(elsewhere), f"another flow's delivery went to {_where(elsewhere)}"
+    rejection = await _rejection(db_session, provider)
+    assert isinstance(rejection, dict), rejection
+    assert f"does not match the ID of the AuthNRequest sent by the SP: {other['request_id']}" in (
+        rejection["detail"]
+    )
+    # The refused delivery spent nothing: through its own flow it still signs in.
+    own = await _deliver(client, provider, victim, response)
+    assert _signed_in(own), (_where(own), await _rejection(db_session, provider))
+
+
+async def test_a_response_that_answers_no_request_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Unsolicited (no InResponseTo): python3-saml lets it through, so the SP
+    must refuse it itself. Every sign-in here starts with an AuthnRequest."""
+    provider, _ = await _saml_provider(db_session)
+    flow = await _start_sign_in(client, provider)
+    unsolicited = _signed_response(
+        destination=flow["request_acs"], in_response_to=None, audience=flow["sp_entity_id"]
+    )
+
+    resp = await _deliver(client, provider, flow, unsolicited)
+
+    assert _refused(resp), f"an unsolicited Response went to {_where(resp)}"
+    rejection = await _rejection(db_session, provider)
+    assert isinstance(rejection, dict), rejection
+    assert "has no InResponseTo" in rejection["detail"]
+    users = await db_session.execute(select(User).where(User.auth_source == "saml"))
+    assert users.scalars().all() == []
+
+
+async def test_a_flow_that_kept_no_request_id_starts_again(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A flow cookie minted before the AuthnRequest's ID was kept cannot tell
+    its own Response from another flow's, so even a valid Response does not
+    sign in through it."""
+    provider, _ = await _saml_provider(db_session)
+    fresh = await _start_sign_in(client, provider)
+    legacy = {
+        "relay_state": "legacy-relay",
+        "cookie": "saml_flow="
+        + auth_router._sign_flow_token(
+            {
+                "provider_id": str(provider.id),
+                "relay_state": "legacy-relay",
+                "exp": int(time.time()) + 300,
+            }
+        ),
+    }
+    response = _signed_response(
+        destination=fresh["request_acs"],
+        in_response_to=fresh["request_id"],
+        audience=fresh["sp_entity_id"],
+    )
+
+    resp = await _deliver(client, provider, legacy, response)
+
+    assert resp.status_code == 302, resp.text
+    assert _where(resp) == "/login?error=saml_state_invalid", _where(resp)
+
+
+async def test_an_assertion_is_remembered_until_it_could_no_longer_be_delivered() -> None:
+    from app.core.auth.saml import SAMLConsumeResult
+    from app.core.auth.user_sync import ExternalAuthResult
+
+    def consumed(not_on_or_after: int | None) -> SAMLConsumeResult:
+        return SAMLConsumeResult(
+            result=ExternalAuthResult(external_id="x", username="x"),
+            relay_state=None,
+            attributes={},
+            assertion_id="_a1",
+            not_on_or_after=not_on_or_after,
+        )
+
+    # The bearer confirmation's NotOnOrAfter, plus python3-saml's clock drift.
+    assert consumed(1_000_300).replay_window_seconds(now=1_000_000) == 300 + 300
+    assert consumed(1_000_300).replay_window_seconds(now=1_000_400) == 300
+    # None breaks the profile; a day bounds it anyway.
+    assert consumed(None).replay_window_seconds(now=1_000_000) == 24 * 3600
+
+
+async def test_the_replay_guard_fails_open_without_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """As the MFA challenge guard does (auth_throttle.mfa_challenge_consume):
+    a Redis outage must not stop SAML sign-in, and the Response stays bound to
+    its own flow's AuthnRequest meanwhile."""
+    import app.core.auth.saml as saml_mod
+    from app.core.auth.user_sync import ExternalAuthResult
+
+    def redis_down(*_args: object, **_kwargs: object) -> None:
+        raise ConnectionError("redis unreachable")
+
+    monkeypatch.setattr(saml_mod, "make_async_redis", redis_down)
+    consumed = saml_mod.SAMLConsumeResult(
+        result=ExternalAuthResult(external_id="x", username="x"),
+        relay_state=None,
+        attributes={},
+        assertion_id=f"_{uuid.uuid4().hex}",
+        not_on_or_after=None,
+    )
+    assert await saml_mod.claim_assertion(consumed) is True

@@ -60,6 +60,24 @@ the formatter handles the rest.
 
 ### Security
 
+- **A SAML Response signs in once, and only through the sign-in that
+  asked for it (#1335).** With the ACS fixed (#1335 under Fixed), SAML
+  sign-in still lacked two checks the Web Browser SSO profile requires
+  of a service provider. The Response was never compared with the
+  AuthnRequest the sign-in sent, so a Response lifted from one browser's
+  sign-in (a proxy or WAF that logs request bodies, an extension, a
+  shared machine) signed in through any other browser's flow. And
+  nothing remembered a consumed Assertion, so the same Response signed
+  in again until it expired. The flow cookie now carries the
+  AuthnRequest's ID, and the Response's `InResponseTo` must match it; a
+  Response without one is refused too. Each Assertion's ID is claimed in
+  Redis until its `NotOnOrAfter`, plus the clock drift python3-saml
+  allows, so it signs in once (SAML profiles 4.1.4.5). Like the MFA
+  challenge's claim, it fails open when Redis is unreachable; the binding
+  to the sign-in's own request holds regardless. A sign-in that was
+  started before the upgrade is asked to start again
+  (`saml_state_invalid`).
+
 - **The MFA enrolment QR code is drawn in the browser, not fetched from
   a third party (#1353).** The screen built it as an image from
   `api.qrserver.com` with the `otpauth://` URI in the query string,
