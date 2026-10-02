@@ -1009,16 +1009,25 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
     return cleaned
 
 
+# The SOA timers the agent writes into a zone file (#1171), with the zone's
+# default TTL ($TTL): a change to any of them is a change to what the zone
+# serves, so it moves the serial (update_zone).
+_ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
+# RFC 2181 section 8 bounds a TTL at 2^31 - 1; it is also the column's (int4).
+# BIND refuses a zone whose SOA carries a negative timer, so one never reaches it.
+_SOA_TIMER_MAX = 2**31 - 1
+
+
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
     zone_type: str = "primary"
     kind: str = "forward"
     ttl: int = 3600
-    refresh: int = 86400
-    retry: int = 7200
-    expire: int = 3600000
-    minimum: int = 3600
+    refresh: int = Field(86400, ge=0, le=_SOA_TIMER_MAX)
+    retry: int = Field(7200, ge=0, le=_SOA_TIMER_MAX)
+    expire: int = Field(3600000, ge=0, le=_SOA_TIMER_MAX)
+    minimum: int = Field(3600, ge=0, le=_SOA_TIMER_MAX)
     primary_ns: str = ""
     admin_email: str = ""
     dnssec_enabled: bool = False
@@ -1104,10 +1113,10 @@ class ZoneUpdate(BaseModel):
     zone_type: str | None = None
     kind: str | None = None
     ttl: int | None = None
-    refresh: int | None = None
-    retry: int | None = None
-    expire: int | None = None
-    minimum: int | None = None
+    refresh: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
+    retry: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
+    expire: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
+    minimum: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     primary_ns: str | None = None
     admin_email: str | None = None
     dnssec_enabled: bool | None = None
@@ -4936,16 +4945,17 @@ async def update_zone(
         if dnssec_flip == "dnssec_sign":
             await _check_driver_gated_operation(dnssec_flip, group_id, db)
     # #1153 — the agent renders the SOA MNAME / RNAME (and, for a zone with no
-    # NS records of its own, the apex NS) from these two fields. A new apex
-    # served under the old serial never reaches a secondary: it transfers only
-    # when the serial moves.
-    apex_changed = any(
+    # NS records of its own, the apex NS) from these two fields. #1171 — and the
+    # zone file's $TTL and the SOA's REFRESH / RETRY / EXPIRE / MINIMUM from
+    # these. A change to any of them served under the old serial never reaches
+    # a secondary: it transfers only when the serial moves.
+    soa_changed = any(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
-    )
+    ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
     for k, v in changes.items():
         setattr(zone, k, v)
-    if apex_changed:
+    if soa_changed:
         bump_zone_serial(zone)
     if dnssec_flip == "dnssec_sign":
         await enqueue_dnssec_op(db, zone, "dnssec_sign")

@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -809,6 +810,36 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
 
 
+# The SOA timers in wire order, each with the value every zone was served with
+# before the control plane shipped them (#1171). A bundle from a control plane
+# that sends none renders exactly the bytes it did before.
+_SOA_TIMERS = (("refresh", 3600), ("retry", 600), ("expire", 86400), ("minimum", 300))
+# RFC 2181 section 8's TTL ceiling, and the zone API's (int4) column's.
+_SOA_TIMER_MAX = 2**31 - 1
+
+
+def _soa_timers(zone: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """``REFRESH RETRY EXPIRE MINIMUM`` for a zone's SOA, and a note for each
+    value that could not be used (issue #1171).
+
+    The zone's own timers are written. One the bundle does not carry (an older
+    control plane) is served as every zone was before they shipped; one it
+    carries that BIND would refuse — anything but a whole number of seconds
+    from 0 to 2^31-1 — is served the same way and noted, rather than making
+    named refuse the zone, and with it the group's whole config."""
+    values: list[str] = []
+    notes: list[tuple[str, str]] = []
+    for key, before in _SOA_TIMERS:
+        value = zone.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SOA_TIMER_MAX:
+            values.append(str(value))
+            continue
+        if value is not None:
+            notes.append(("unusable_timer", f"{key}={value!r}"))
+        values.append(str(before))
+    return " ".join(values), tuple(notes)
+
+
 _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
     "placeholder": (
         "bind9_zone_apex_ns_is_loopback",
@@ -843,6 +874,16 @@ _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
         (
             "The zone's Primary NS or Admin Email is not a usable domain name "
             "and was ignored."
+        ),
+    ),
+    "unusable_timer": (
+        "bind9_zone_soa_timer_unusable",
+        (
+            "A zone's SOA refresh, retry, expire or minimum is not a whole "
+            "number of seconds from 0 to 2147483647, and BIND would refuse the "
+            "zone over it. It was served with the value every zone carried "
+            "before the timers were rendered (3600/600/86400/300) instead. Fix "
+            "the zone's timers."
         ),
     ),
 }
@@ -982,6 +1023,12 @@ _NAMED_START_TIMEOUT_S = 30.0
 _SIGHUP_SETTLE_S = 1.0
 # Per-call bound on the rndc queries those loops make (see ``_rndc_run``).
 _RNDC_QUERY_TIMEOUT_S = 10.0
+# How long ``swap_and_reload`` waits, before the new render goes in, for named to
+# write a zone it has just frozen back to the zone's file (#1407). ``rndc freeze``
+# answers once the write is queued, not done. A small zone takes milliseconds; the
+# bound is a load's, since a large zone writes as slowly as it loads.
+_ZONE_DUMP_TIMEOUT_S = 60.0
+_ZONE_DUMP_POLL_S = 0.1
 
 
 def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
@@ -1064,6 +1111,31 @@ def _soa_serial(path: Path) -> int | None:
 def _serial_at_least(got: int, want: int) -> bool:
     """RFC 1982 serial comparison: ``got`` is ``want`` or later."""
     return got == want or 0 < (got - want) % 2**32 < 2**31
+
+
+def _serial_later(new: int, old: int) -> bool:
+    """RFC 1982 serial comparison: ``new`` is strictly later than ``old``."""
+    return 0 < (new - old) % 2**32 < 2**31
+
+
+_RENDERED_SOA_SERIAL = re.compile(r"^(@ IN SOA \S+ \S+ \( )(\d+)( )", re.MULTILINE)
+
+
+def _set_rendered_serial(path: Path, serial: int) -> bool:
+    """Rewrite the SOA serial of a zone file ``_write_zone_file`` wrote.
+
+    Only the render's own one-line SOA is touched (the shape named writes back
+    on a freeze is never staged). False when the file does not carry it.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    new, count = _RENDERED_SOA_SERIAL.subn(rf"\g<1>{serial}\g<3>", text, count=1)
+    if count != 1:
+        return False
+    path.write_text(new)
+    return True
 
 
 def _zonestatus_serial(out: str) -> int | None:
@@ -1667,15 +1739,20 @@ class Bind9Driver(DriverBase):
         # 127.0.0.1`` is left only for a zone that names no name server —
         # BIND will not load a zone without one — and is logged when served.
         apex = _zone_apex(zone)
+        timers, timer_notes = _soa_timers(zone)
         lines = [
             f"$TTL {ttl}",
-            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} 3600 600 86400 300 )",
+            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} {timers} )",
             *(f"@ IN NS {ns}" for ns in apex.ns),
         ]
         if apex.placeholder_glue:
             lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
         for rec in zone.get("records", []) or []:
-            rec_ttl = rec.get("ttl") or ttl
+            # A record's own TTL wins, 0 included (#1382): 0 is how an operator
+            # says "do not cache this" through a cut-over, and ``or`` served it
+            # with the zone's TTL. Only a record with no TTL of its own takes
+            # the zone's, as on the RFC 2136 path (apply_record_op).
+            rec_ttl = ttl if rec.get("ttl") is None else rec["ttl"]
             name_field = rec.get("name") or "@"
             rtype = rec["type"].upper()
             value = rec["value"]
@@ -1696,7 +1773,7 @@ class Bind9Driver(DriverBase):
                 value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
-        return apex.notes
+        return apex.notes + timer_notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file.
@@ -1933,30 +2010,91 @@ class Bind9Driver(DriverBase):
         Every way this can fail raises, so the #882 revert puts the previous
         config back and the failure is reported, instead of the apply being
         recorded as OK and committed as last-known-good (#1224, #1239).
+
+        The render has to land over whatever named holds that its zone file
+        does not (#1407). named keeps an RFC 2136 update in memory and in the
+        zone's journal, and writes it into the zone's file up to 15 minutes
+        later. Swapped in first and frozen after, a zone in that state had
+        named dump its own copy, asynchronously, over the new render, and the
+        thaw loaded the dump: a zone-level change (its TTL, SOA timers, apex)
+        was dropped while the apply reported it served, and the served serial
+        could go backwards. So each changed zone named serves is frozen BEFORE
+        the swap, and the swap waits until named has written it out to the
+        file it is replacing (``_freeze_before_swap``). A frozen zone takes no
+        update, so nothing can be dumped over the render afterwards.
         """
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / self.rendered_dir_name
         backup = self.state_dir / "rendered.prev"
+        rndc = shutil.which("rndc")
+        base = self._rndc_base() if rndc else []
+        # What moved, against the tree being replaced: the live one, or (no live
+        # tree) whatever the last swap left as the backup.
+        changed = self._changed_zones(new_dir, current if current.exists() else backup)
+        frozen: dict[tuple[str, str | None], int | None] = {}
+        if rndc and current.exists() and self.daemon_running():
+            frozen = self._freeze_before_swap(base, new_dir, current, changed)
+        # The serial each changed zone has to be served under: the render's,
+        # read before the swap, so nothing written to the live file afterwards
+        # can stand in for it.
+        rendered = {
+            zv: _soa_serial(new_dir / _zone_rel(*zv))
+            for zv in _zone_views_under(new_dir)
+            if changed is None or zv in changed
+        }
+        # Until thawed, a zone frozen here refuses every update: whatever
+        # fails below, nothing may leave it frozen.
+        still_frozen = set(frozen)
+        try:
+            self._swap_in(new_dir, current, backup)
+            # If start_daemon deferred at boot (no rendered config existed
+            # yet), this is the moment we have one — start named now. Without
+            # this, a fresh agent that joins a brand-new control plane (no
+            # zones yet) never launches the daemon, port 53 stays unbound,
+            # and the K8s readiness probe (tcpSocket: 53) never passes.
+            if not self.daemon_running():
+                still_frozen.clear()  # a new named holds no freeze
+                self.start_daemon()
+                if self._await_named_started():
+                    self._verify_zones_loaded(self._rndc_base(), None)
+                return
+            self._signal_reload(base if rndc else None, changed, frozen, still_frozen, rendered)
+        finally:
+            if still_frozen:
+                self._thaw(base, still_frozen)
+
+    def _swap_in(self, new_dir: Path, current: Path, backup: Path) -> None:
         if current.exists():
             if backup.exists():
                 shutil.rmtree(backup)
             current.rename(backup)
         new_dir.rename(current)
-        # If start_daemon deferred at boot (no rendered config existed
-        # yet), this is the moment we have one — start named now. Without
-        # this, a fresh agent that joins a brand-new control plane (no
-        # zones yet) never launches the daemon, port 53 stays unbound,
-        # and the K8s readiness probe (tcpSocket: 53) never passes.
-        if not self.daemon_running():
-            self.start_daemon()
-            if self._await_named_started():
-                self._verify_zones_loaded(self._rndc_base(), None)
-            return
+
+    def _thaw(self, base: list[str], zones: Collection[tuple[str, str | None]]) -> None:
+        """Best-effort thaw of the zones ``_freeze_before_swap`` froze, on the way
+        out of an apply that failed before its own thaw: a zone left frozen
+        refuses every update until named restarts."""
+        for zname, view in zones:
+            rc, _out, err = _rndc_run(base, "thaw", zname, *(["in", view] if view else []))
+            if rc != 0:
+                log.warning("bind9_zone_thaw_failed", zone=zname, view=view, stderr=err[:200])
+
+    def _signal_reload(
+        self,
+        base: list[str] | None,
+        changed: set[tuple[str, str | None]] | None,
+        frozen: dict[tuple[str, str | None], int | None],
+        still_frozen: set[tuple[str, str | None]],
+        rendered: dict[tuple[str, str | None], int | None],
+    ) -> None:
+        """Have the running named take the swapped-in tree, and confirm it did.
+
+        ``frozen`` maps each zone frozen before the swap to the serial named
+        served it under; ``still_frozen`` is emptied once they are thawed."""
         # Signal daemon. Try rndc first; if the control channel cannot be
         # reached, fall back to SIGHUP, which named handles as a config +
         # zone reload.
-        if shutil.which("rndc"):
-            base = self._rndc_base()
+        if base is not None:
             # ``reconfig`` picks up config changes and zones that were ADDED or
             # REMOVED — but by BIND's documented definition it "does not reload
             # existing zone files even if they have changed". That was fine
@@ -1978,11 +2116,21 @@ class Bind9Driver(DriverBase):
                 [*base, "reconfig"], capture_output=True, text=True, check=False
             )
             if res.returncode == 0:
-                changed = self._changed_zones(backup)
-                before = self._serving_serials(base, changed)
-                self._reload_rendered_zones(base, changed)
+                # A frozen zone's serial was read once it was frozen; nothing
+                # has moved it since.
+                if changed is None:
+                    rest = {
+                        zv
+                        for zv in _zone_views_under(self.state_dir / self.rendered_dir_name)
+                        if zv not in frozen
+                    }
+                else:
+                    rest = changed - frozen.keys()
+                before = {**self._serving_serials(base, rest), **frozen}
+                self._reload_rendered_zones(base, changed, already_frozen=frozen.keys())
+                still_frozen.clear()
                 self._sync_response_log_runtime(base)
-                self._verify_zones_loaded(base, changed, before)
+                self._verify_zones_loaded(base, changed, before, rendered)
                 return
             error = _first_line(res.stderr, res.stdout)
             # "rndc: 'reconfig' failed: TLS error" is named ANSWERING, and
@@ -1995,6 +2143,10 @@ class Bind9Driver(DriverBase):
             if "'reconfig' failed:" in error:
                 raise RuntimeError(f"named rejected the new config: {error}")
             log.warning("rndc_failed_falling_back_to_sighup", stderr=error)
+            # Whatever was frozen before the swap must not stay frozen through
+            # the fallback; the channel may well refuse this too.
+            self._thaw(base, still_frozen)
+            still_frozen.clear()
         self._sighup_reload()
 
     def _sighup_reload(self) -> None:
@@ -2058,6 +2210,105 @@ class Bind9Driver(DriverBase):
                 return False
             time.sleep(0.25)
 
+    def _freeze_before_swap(
+        self,
+        base: list[str],
+        new_dir: Path,
+        live: Path,
+        changed: set[tuple[str, str | None]] | None,
+    ) -> dict[tuple[str, str | None], int | None]:
+        """Freeze each changed zone named serves, and wait until named has
+        written it to its live file, before the new render goes in (#1407).
+
+        ``rndc freeze`` makes named write its in-memory copy of a zone, the
+        RFC 2136 updates it holds included, into the zone's file, and it
+        answers once that write is queued, not done. Frozen after the swap, a
+        zone holding updates had that write land on the new render (the file
+        at the same path), where the thaw loaded it. Frozen before, the write
+        lands on the file being replaced, and this waits for it: the file's
+        serial equals the one named serves, frozen, from then on. A zone with
+        nothing unwritten matches at once. A frozen zone takes no update, so
+        none can start another write before ``_reload_rendered_zones`` reloads
+        and thaws it.
+
+        A zone the freeze refuses (named does not serve it yet, it is not
+        dynamic, an operator froze it) keeps the freeze/reload/thaw after the
+        swap. Its file, if any, is not touched here.
+
+        The render must also be served under a serial later than named's
+        (RFC 1982), or a secondary that holds named's serial never transfers
+        the change, and a lower one is a serial going backwards. named runs
+        ahead of the database's serial when something other than the control
+        plane wrote the zone (a third party, #641) or the database went back
+        (a revert, a restore). Such a render is staged under named's serial
+        plus one.
+
+        Returns each zone it froze, with the serial named serves it under.
+        A write that has not landed by ``_ZONE_DUMP_TIMEOUT_S`` is logged and
+        the swap goes on, as it did before: named can serve a serial its file
+        does not carry with nothing left to write (the file edited outside the
+        agent, or a zone the old order left with named's copy on disk after
+        the render loaded), and an apply that waited on it forever would never
+        land again. ``_verify_zones_loaded`` still fails the apply if named
+        then serves anything but the render.
+        """
+        frozen: dict[tuple[str, str | None], int | None] = {}
+        for zname, view in _zone_views_under(new_dir):
+            if changed is not None and (zname, view) not in changed:
+                continue
+            if not (live / _zone_rel(zname, view)).exists():
+                continue  # new to named, or moved between views: no file of it to replace
+            scope = [zname, *(["in", view] if view else [])]
+            rc, _out, _err = _rndc_run(base, "freeze", *scope)
+            if rc != 0:
+                continue
+            rc, out, err = _rndc_run(base, "zonestatus", *scope)
+            serving = _zonestatus_serial(out) if rc == 0 else None
+            if serving is None:
+                log.warning(
+                    "bind9_frozen_zone_serial_unknown",
+                    zone=zname,
+                    view=view,
+                    stderr=_first_line(err, out)[:200],
+                )
+            frozen[(zname, view)] = serving
+        pending = {zv: s for zv, s in frozen.items() if s is not None}
+        deadline = time.monotonic() + _ZONE_DUMP_TIMEOUT_S
+        while pending:
+            for zv, serving in list(pending.items()):
+                if _soa_serial(live / _zone_rel(*zv)) == serving:
+                    del pending[zv]
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(_ZONE_DUMP_POLL_S)
+        for (zname, view), serving in pending.items():
+            log.warning(
+                "bind9_frozen_zone_not_written_out",
+                zone=zname,
+                view=view,
+                serving=serving,
+                file_serial=_soa_serial(live / _zone_rel(zname, view)),
+                waited_s=_ZONE_DUMP_TIMEOUT_S,
+            )
+        for (zname, view), serving in frozen.items():
+            staged = new_dir / _zone_rel(zname, view)
+            serial = _soa_serial(staged)
+            if serving is None or serial is None or _serial_later(serial, serving):
+                continue
+            # Past 2**32 - 1 the next serial is 0, which the render reads as
+            # "no serial" (``_write_zone_file``); 1 is later too.
+            later = (serving + 1) % 2**32 or 1
+            if _set_rendered_serial(staged, later):
+                log.info(
+                    "bind9_zone_serial_moved_past_served",
+                    zone=zname,
+                    view=view,
+                    rendered=serial,
+                    serving=serving,
+                    serial=later,
+                )
+        return frozen
+
     def _serving_serials(
         self, base: list[str], only: set[tuple[str, str | None]] | None
     ) -> dict[tuple[str, str | None], int | None]:
@@ -2086,6 +2337,7 @@ class Bind9Driver(DriverBase):
         base: list[str],
         only: set[tuple[str, str | None]] | None,
         before: dict[tuple[str, str | None], int | None] | None = None,
+        rendered: dict[tuple[str, str | None], int | None] | None = None,
     ) -> None:
         """Confirm named is serving what was just rendered (#1224, #1239).
 
@@ -2096,14 +2348,19 @@ class Bind9Driver(DriverBase):
         So ask each zone for its serial until it matches the file, or give
         up at ``_ZONE_LOAD_TIMEOUT_S`` and raise.
 
-        The expected serial is read from the file NOW, after the reload, not
-        from the render: ``freeze`` writes named's in-memory zone back over a
-        journal-dirty file first (see ``_reload_rendered_zones``), and that
-        is the copy named loads. A serial later than the file's is accepted
-        too, since an RFC 2136 update can land in between, but only if it
-        MOVED from what named served before the reload (``before``): a zone
-        whose in-memory serial was already ahead of the file, and still
-        reads that same serial, may never have loaded the file at all.
+        The expected serial is the render's, as staged before the swap
+        (``rendered``), not the live file's read back after the reload. A
+        freeze issued after the swap used to write named's own copy of a zone
+        over the render, serial included, and reading the file back then
+        passed named's copy as the render (#1407); the zones are now frozen
+        before the swap (``_freeze_before_swap``), and this holds the apply
+        to the render either way. A zone missing from ``rendered`` (or a call
+        without it, as at first start) is checked against its live file. A
+        serial later than the expected one is accepted too, since an RFC 2136
+        update can land after the thaw, but only if it MOVED from what named
+        served before the reload (``before``): a zone whose in-memory serial
+        was already ahead of the render, and still reads that same serial,
+        may never have loaded the render at all.
 
         An RPZ's serial never moves (its SOA is fixed at 1), so its content
         is covered by the pre-swap ``named-checkzone`` rather than here.
@@ -2112,7 +2369,11 @@ class Bind9Driver(DriverBase):
             return
         live = self.state_dir / self.rendered_dir_name
         pending = {
-            zv: _soa_serial(live / _zone_rel(*zv))
+            zv: (
+                rendered[zv]
+                if rendered is not None and zv in rendered
+                else _soa_serial(live / _zone_rel(*zv))
+            )
             for zv in _zone_views_under(live)
             if only is None or zv in only
         }
@@ -2214,8 +2475,10 @@ class Bind9Driver(DriverBase):
         """
         return _zone_views_under(self.state_dir / self.rendered_dir_name)
 
-    def _changed_zones(self, prev_dir: Path) -> set[tuple[str, str | None]] | None:
-        """Which rendered zones differ from the previous render.
+    def _changed_zones(
+        self, new_dir: Path, prev_dir: Path
+    ) -> set[tuple[str, str | None]] | None:
+        """Which zones of the render in ``new_dir`` differ from the previous one.
 
         ``None`` means "cannot tell — reload everything": no previous tree (first
         render after a cold start), or a read error. Returning the empty set is
@@ -2230,12 +2493,13 @@ class Bind9Driver(DriverBase):
         Comparing the rendered bytes costs one read per zone and collapses it to
         the zones that actually moved.
         """
-        return _zones_differing(self.state_dir / self.rendered_dir_name, prev_dir)
+        return _zones_differing(new_dir, prev_dir)
 
     def _reload_rendered_zones(
         self,
         base: list[str],
         only: set[tuple[str, str | None]] | None = None,
+        already_frozen: Collection[tuple[str, str | None]] = (),
     ) -> None:
         """Make named re-read the zone files ``reconfig`` just ignored.
 
@@ -2257,16 +2521,16 @@ class Bind9Driver(DriverBase):
 
         Two known subtleties, recorded so nobody chases them as bugs:
 
-        * **Journal-dirty flat zones.** ``freeze`` syncs the journal into the
-          master file — i.e. it overwrites the fresh render with named's
-          in-memory zone before ``reload`` reads it back. Views groups (the
-          case this fix exists for) never journal, so it is moot there. For a
-          flat zone with RFC 2136 activity it means the render does not truly
-          land (no regression — ``reconfig`` never read it either, and DB and
-          journal converge through the record-op path), and the clobbered
-          on-disk file no longer byte-matches render output, so that zone
-          diffs as "changed" on every later structural render and reloads
-          each time. Harmless: flat structural renders are infrequent.
+        * **Zones holding RFC 2136 updates.** ``freeze`` makes named write its
+          in-memory zone into the zone's file, asynchronously. Issued here,
+          after the swap, that write landed on the new render and the thaw
+          loaded it, so the render never landed (#1407: a zone-level edit
+          dropped, the served serial going backwards). ``swap_and_reload``
+          therefore freezes every changed zone named serves before the swap
+          and waits for that write (``_freeze_before_swap``); those zones
+          arrive here in ``already_frozen`` and are only reloaded and thawed.
+          The freeze here remains for the zones it could not freeze then: new
+          to named, or not dynamic, where it fails harmlessly.
         * **DNSSEC inline-signed zones.** ``freeze``/``thaw`` semantics for
           inline-signed dynamic zones vary across BIND versions (older ones
           refuse, or do not re-read the raw zone on thaw). On BIND 9.20 it
@@ -2279,7 +2543,12 @@ class Bind9Driver(DriverBase):
         targets = all_zones if only is None else [z for z in all_zones if z in only]
         for zname, view in targets:
             scope = [zname] + (["in", view] if view else [])
-            for verb in ("freeze", "reload", "thaw"):
+            verbs = (
+                ("reload", "thaw")
+                if (zname, view) in already_frozen
+                else ("freeze", "reload", "thaw")
+            )
+            for verb in verbs:
                 res = subprocess.run(
                     [*base, verb, *scope],
                     capture_output=True,

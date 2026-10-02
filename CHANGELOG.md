@@ -27,6 +27,71 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A record change no longer re-renders and reloads its zone on a DNS
+  group without views (#1373).** The BIND9 agent re-renders and reloads
+  named only when the bundle's structural fingerprint moves; a record
+  change is meant to stay out of it and reach named as an RFC 2136
+  update. Since #430 each zone's payload also carries its serial (for
+  the agent's zone-state report), and every record change bumps it, so
+  every record change on a group without views was followed by a full
+  render and a freeze, reload and thaw of its zone beside the update:
+  the reload the RFC 2136 path exists to avoid, a served value that no
+  longer followed the record op's state, and a manual `rndc freeze` that
+  lasted only until the next record change. The serial is now left out
+  of the fingerprint, with the records, and the bundle lists a group's
+  zones by name: they came in whatever order the database read them, and
+  the zone a record change touched could move in that order, which moved
+  the fingerprint of any group of two zones or more on its own. The
+  serial stays in the payload, and the agent now also reports the serial
+  a record change brings once the op that carries it has applied, beside
+  the report it sends after a reload. Groups with views are unchanged:
+  there every record change re-renders, by design.
+
+- **A change to a BIND9 zone is served even while named holds RFC 2136
+  updates for it (#1407).** named writes an RFC 2136 update into the
+  zone's file up to 15 minutes after taking it. A change to the zone
+  itself (its TTL, SOA timers or apex) reaches named as a new render of
+  the zone file, which the agent swapped in and then froze, reloaded and
+  thawed; the freeze made named write its own copy of the zone over the
+  new render, and the thaw loaded that copy. The change was not served
+  while the API, the zone page and the apply status said it was, and the
+  served serial could go backwards, which a secondary refuses. A zone
+  holds such updates after a record op that changes it (on a group
+  without views) or a third party's update (#641). The agent now freezes
+  each changed zone before the new render goes in and waits until named
+  has written it out, serves the render under a serial later than the
+  one named served, and fails the apply if named serves anything else.
+  On a zone that takes third-party updates, a record a third party added
+  after the ingest-back last copied the zone (at most three minutes
+  earlier) is now replaced with the rest of the zone, as on a full
+  re-render, instead of overriding the change.
+
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **On upgrade every zone's
+  SOA changes once to its stored values** and each zone reloads once; with
+  the defaults (RIPE-203's refresh 1 d, retry 2 h, expire about 41 d, and
+  a 1 h negative TTL) negative answers are cached for an hour instead of
+  five minutes, and secondaries keep serving for about 41 days instead of
+  one. The zone API refuses a timer outside 0 to 2147483647, and a stored
+  one BIND would refuse is served as before and logged rather than taking
+  the zone down. PowerDNS and Technitium manage their own SOA and are
+  unchanged.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old

@@ -53,7 +53,6 @@ def _touch_ready_marker(state_dir: Path) -> None:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
 
 
-
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
     """One op ack. Echoes the page's ``dispatch`` stamp when it has one
     (#1232), so the control plane can tell a late ack for an earlier dispatch
@@ -64,6 +63,32 @@ def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[st
     if "dispatch" in op:
         ack["dispatch"] = op["dispatch"]
     return ack
+
+
+def _serial_later(new: int, old: int) -> bool:
+    """RFC 1982 serial arithmetic: ``new`` is later than ``old``."""
+    return 0 < (new - old) % 2**32 < 2**31
+
+
+def _zone_key(name: Any) -> str:
+    """A zone name as the zone-state bookkeeping keys it: the bundle names
+    zones with the trailing dot, and nothing here depends on whether an op
+    does."""
+    return str(name or "").rstrip(".")
+
+
+def _note_reached(reached: dict[str, int], op: dict[str, Any]) -> None:
+    """Note the serial an applied op brought its zone to (#1373).
+
+    Each op carries ``target_serial``, the zone's serial after the change it
+    makes. Ops are paged oldest first; the latest serial wins either way."""
+    zone, target = _zone_key(op.get("zone_name")), op.get("target_serial")
+    if not zone or not isinstance(target, int) or isinstance(target, bool):
+        return
+    prev = reached.get(zone)
+    if prev is None or _serial_later(target, prev):
+        reached[zone] = target
+
 
 class SyncLoop:
     def __init__(
@@ -81,6 +106,9 @@ class SyncLoop:
         # but leave structural_etag alone — the agent then drains record ops
         # via RFC 2136 over loopback without bouncing the daemon.
         self._current_structural_etag: str | None = None
+        # #1373 — the serial last reported per zone (zone-state), so the late
+        # retry of an older op can never report a zone backwards.
+        self._reported_serials: dict[str, int] = {}
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-applying it every poll;
         # ``apply_status`` is what the heartbeat reports upward.
@@ -359,6 +387,10 @@ class SyncLoop:
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
         dnssec_states: list[dict[str, Any]] = []
+        # #1373 — per zone, the serial the ops applied below brought it to,
+        # and the zones an op failed for in this pass.
+        reached: dict[str, int] = {}
+        failed_zones: set[str] = set()
         for op in bundle.get("pending_record_ops", []):
             try:
                 result = self.driver.apply_record_op(op)
@@ -371,6 +403,7 @@ class SyncLoop:
                     op=op.get("op"),
                     zone=op.get("zone_name"),
                 )
+                _note_reached(reached, op)
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.
                 if isinstance(result, dict) and "dnssec_state" in result:
@@ -381,8 +414,12 @@ class SyncLoop:
                     _ack(op, "error", str(e))
                 )
                 self.heartbeat.failed_ops_count += 1
+                failed_zones.add(_zone_key(op.get("zone_name")))
         if dnssec_states:
             self._report_dnssec_state(dnssec_states)
+        self._report_reached_serials(
+            {zone: serial for zone, serial in reached.items() if zone not in failed_zones}
+        )
 
         # #882 — we got here with nothing quarantined and nothing to
         # re-render, so whatever the control plane is serving is what we are
@@ -558,6 +595,29 @@ class SyncLoop:
             entries.append({"zone_name": str(name), "serial": int(serial)})
         if not entries:
             return
+        self._post_zone_state(entries)
+
+    def _report_reached_serials(self, reached: dict[str, int]) -> None:
+        """POST the serial each zone reached through the record ops this pass
+        applied (#1373).
+
+        In a group without views a record-only change no longer re-renders the
+        zone (its serial is not part of the structural fingerprint), so the
+        post-reload report above never sees it. The serial is reported here
+        instead, once the op that carries it (``target_serial``) has applied.
+        A zone moves only forward of what was last reported for it, so the late
+        retry of an older op cannot report it backwards.
+        """
+        entries = [
+            {"zone_name": zone, "serial": serial}
+            for zone, serial in sorted(reached.items())
+            if zone not in self._reported_serials
+            or _serial_later(serial, self._reported_serials[zone])
+        ]
+        if entries:
+            self._post_zone_state(entries)
+
+    def _post_zone_state(self, entries: list[dict[str, Any]]) -> None:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         try:
             with self._client() as c:
@@ -572,8 +632,12 @@ class SyncLoop:
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
+                return
         except httpx.HTTPError as e:
             log.warning("zone_state_report_failed", error=str(e))
+            return
+        for entry in entries:
+            self._reported_serials[_zone_key(entry["zone_name"])] = int(entry["serial"])
 
     def _report_dnssec_state(self, states: list[dict[str, Any]]) -> None:
         """POST the DS rrset(s) the driver just produced after a sign /
