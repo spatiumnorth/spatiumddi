@@ -145,20 +145,24 @@ RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
 # pass — that rewrite would materialise a duplicate copy of every
 # file in a new layer (~550 MB doubled). Setting ownership at COPY
 # time keeps the source layer authoritative.
-#
-# The base image's pip is removed (#1392): nothing at runtime runs it, and
-# it is not a Debian package, so ``apt-get upgrade`` can never patch it and
-# every scan at default severity reports its CVEs. A production image also
-# has no business carrying a package installer. The ``dev`` stage below puts
-# it back with ``ensurepip``.
-RUN python -m pip uninstall -y --root-user-action=ignore pip \
-    && useradd --no-create-home --shell /bin/false app \
+RUN useradd --no-create-home --shell /bin/false app \
     && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images /var/lib/spatiumddi/pcaps \
     && chmod 0700 /var/lib/spatiumddi/pcaps \
     && chown app:app /app \
     && chown -R app:app /var/lib/spatiumddi
 
 COPY --from=builder /install /usr/local
+
+# The base image's pip is removed (#1392): nothing at runtime runs it, and
+# it is not a Debian package, so ``apt-get upgrade`` can never patch it and
+# every scan at default severity reports its CVEs. A production image also
+# has no business carrying a package installer. The ``dev`` stage below puts
+# it back with ``ensurepip``. This runs AFTER the builder COPY, and asserts,
+# so a dependency that ever pulls pip in transitively cannot quietly put it
+# back into /usr/local.
+RUN python -m pip uninstall -y --root-user-action=ignore pip \
+    && ! python -c "import pip" 2>/dev/null
+
 COPY --chown=app:app . .
 
 USER app
