@@ -27,6 +27,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A change to a BIND9 zone is served even while named holds RFC 2136
+  updates for it (#1407).** named writes an RFC 2136 update into the
+  zone's file up to 15 minutes after taking it. A change to the zone
+  itself (its TTL, SOA timers or apex) reaches named as a new render of
+  the zone file, which the agent swapped in and then froze, reloaded and
+  thawed; the freeze made named write its own copy of the zone over the
+  new render, and the thaw loaded that copy. The change was not served
+  while the API, the zone page and the apply status said it was, and the
+  served serial could go backwards, which a secondary refuses. A zone
+  holds such updates after a record op that changes it (on a group
+  without views) or a third party's update (#641). The agent now freezes
+  each changed zone before the new render goes in and waits until named
+  has written it out, serves the render under a serial later than the
+  one named served, and fails the apply if named serves anything else.
+  On a zone that takes third-party updates, a record a third party added
+  after the ingest-back last copied the zone (at most three minutes
+  earlier) is now replaced with the rest of the zone, as on a full
+  re-render, instead of overriding the change.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
