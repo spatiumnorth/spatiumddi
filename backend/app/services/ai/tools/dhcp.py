@@ -45,7 +45,10 @@ class ListDHCPServersArgs(BaseModel):
     name="list_dhcp_servers",
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, driver, operational status, and HA state."
+        "includes name, group, driver, operational status, and HA state. "
+        "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
+        "and DHCPv6 scopes on an HA group are served by each member "
+        "independently, with no lease coordination."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",

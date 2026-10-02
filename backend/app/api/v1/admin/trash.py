@@ -16,7 +16,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, literal, select, union_all
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
@@ -24,7 +24,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import Subnet
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -96,6 +96,38 @@ async def _resolve_usernames(db: Any, user_ids: set[uuid.UUID]) -> dict[uuid.UUI
     return {row.id: row.username for row in res.all()}
 
 
+# Exactly the characters Python's ``str.strip()`` removes, Unicode included
+# (NBSP, U+3000, ...), so the SQL label below matches ``_row_display`` for
+# any name. Derived rather than spelled out so the two cannot drift.
+_WHITESPACE = "".join(c for c in map(chr, range(0x110000)) if c.isspace())
+
+
+def _label_expr(model: type) -> Any:
+    """The SQL twin of ``soft_delete._row_display`` for the trash listing.
+
+    The two must agree, or the ``q`` filter would match a different string
+    from the one shown; ``test_trash_listing_label_matches_row_display``
+    pins that.
+    """
+    if model is IPSpace:
+        return model.name
+    if model in (IPBlock, Subnet):
+        network = cast(model.network, String)
+        # btrim over the whitespace set, not trim(): Python's ``str.strip``
+        # also drops a trailing tab or newline in the name.
+        return func.btrim(
+            network + func.coalesce(literal(" ") + func.nullif(model.name, ""), ""),
+            _WHITESPACE,
+        )
+    if model is DNSZone:
+        return model.name
+    if model is DNSRecord:
+        return model.fqdn + literal(" ") + model.record_type
+    if model is DHCPScope:
+        return func.coalesce(func.nullif(model.name, ""), cast(model.id, String))
+    raise ValueError(f"no trash label for {model.__name__}")
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────
 
 
@@ -119,78 +151,100 @@ async def list_trash(
         )
 
     types_to_query = [type] if type else list(SOFT_DELETE_RESOURCE_TYPES)
-    items: list[TrashEntry] = []
-    user_ids: set[uuid.UUID] = set()
-    batch_size_cache: dict[uuid.UUID, int] = {}
 
-    # Collect rows from every requested model. Each query opts into
-    # include_deleted so it sees soft-deleted rows; without that, the
-    # global filter hides them.
+    # Filter, count, sort and paginate in SQL (#1231). This used to load
+    # every soft-deleted row of every type into Python on every page view,
+    # so one trashed 250k-record zone meant 250k ORM objects per load, plus
+    # a COUNT per batch per model. One UNION of light column selects now,
+    # and the batch sizes for the page's rows only.
+    branches = []
     for resource_type in types_to_query:
         model = TYPE_TO_MODEL[resource_type]
-        stmt: Any = (
-            select(model)
-            .where(model.deleted_at.is_not(None))
+        label = _label_expr(model)
+        branch: Any = select(
+            model.id.label("id"),
+            literal(resource_type).label("type"),
+            label.label("label"),
+            model.deleted_at.label("deleted_at"),
+            model.deleted_by_user_id.label("deleted_by_user_id"),
+            model.deletion_batch_id.label("deletion_batch_id"),
+        ).where(model.deleted_at.is_not(None))
+        if since is not None:
+            branch = branch.where(model.deleted_at >= since)
+        if until is not None:
+            branch = branch.where(model.deleted_at <= until)
+        if q:
+            branch = branch.where(func.lower(label).contains(q.lower(), autoescape=True))
+        branches.append(branch)
+    listing = union_all(*branches).subquery()
+
+    # include_deleted on the outer statement: the global soft-delete filter
+    # would otherwise hide exactly the rows this page exists to show. The
+    # total rides the page as a window count, so the UNION is evaluated once;
+    # only a page past the end needs a separate count.
+    page = (
+        await db.execute(
+            select(listing, func.count().over().label("total"))
+            .order_by(listing.c.deleted_at.desc(), listing.c.id)
+            .limit(limit)
+            .offset(offset)
             .execution_options(include_deleted=True)
         )
-        if since is not None:
-            stmt = stmt.where(model.deleted_at >= since)
-        if until is not None:
-            stmt = stmt.where(model.deleted_at <= until)
-        res = await db.execute(stmt)
-        for row in res.scalars().all():
-            label = _row_label(row)
-            if q and q.lower() not in label.lower():
-                continue
-            if row.deleted_by_user_id is not None:
-                user_ids.add(row.deleted_by_user_id)
-            items.append(
-                TrashEntry(
-                    id=row.id,
-                    type=resource_type,
-                    name_or_cidr=label,
-                    deleted_at=row.deleted_at,
-                    deleted_by_user_id=row.deleted_by_user_id,
-                    deleted_by_username=None,
-                    deletion_batch_id=row.deletion_batch_id,
-                    batch_size=0,  # filled after we collect everything
+    ).all()
+    if page:
+        total = int(page[0].total)
+    elif offset == 0:
+        total = 0
+    else:
+        total = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(listing)
+                    .execution_options(include_deleted=True)
                 )
-            )
+            ).scalar_one()
+            or 0
+        )
 
-    # Resolve usernames once for all collected rows.
-    username_map = await _resolve_usernames(db, user_ids)
-
-    # Compute batch sizes by counting rows per batch_id across every model.
-    seen_batches: set[uuid.UUID] = {
-        item.deletion_batch_id for item in items if item.deletion_batch_id is not None
-    }
-    for batch_id in seen_batches:
-        size = 0
+    username_map = await _resolve_usernames(
+        db, {r.deleted_by_user_id for r in page if r.deleted_by_user_id is not None}
+    )
+    batch_ids = {r.deletion_batch_id for r in page if r.deletion_batch_id is not None}
+    batch_sizes: dict[uuid.UUID, int] = {}
+    if batch_ids:
         # TYPE_TO_MODEL, not SOFT_DELETE_RESOURCE_TYPES: the batch carries
         # cascade-only children (a scope's pools + reservations) that the trash
         # list deliberately doesn't browse, but that must still be counted or
         # the blast radius under-reports (#617).
         for model in TYPE_TO_MODEL.values():
             res = await db.execute(
-                select(func.count())
-                .select_from(model)
-                .where(model.deletion_batch_id == batch_id)
+                select(model.deletion_batch_id, func.count())
+                .where(model.deletion_batch_id.in_(batch_ids))
+                .group_by(model.deletion_batch_id)
                 .execution_options(include_deleted=True)
             )
-            size += int(res.scalar_one() or 0)
-        batch_size_cache[batch_id] = size
+            for batch_id, n in res.all():
+                batch_sizes[batch_id] = batch_sizes.get(batch_id, 0) + int(n)
 
-    for item in items:
-        if item.deletion_batch_id is not None:
-            item.batch_size = batch_size_cache.get(item.deletion_batch_id, 1)
-        else:
-            item.batch_size = 1
-        if item.deleted_by_user_id is not None:
-            item.deleted_by_username = username_map.get(item.deleted_by_user_id)
-
-    items.sort(key=lambda i: i.deleted_at, reverse=True)
-    total = len(items)
-    return TrashListResponse(items=items[offset : offset + limit], total=total)
+    items = [
+        TrashEntry(
+            id=r.id,
+            type=r.type,
+            name_or_cidr=r.label,
+            deleted_at=r.deleted_at,
+            deleted_by_user_id=r.deleted_by_user_id,
+            deleted_by_username=(
+                username_map.get(r.deleted_by_user_id) if r.deleted_by_user_id else None
+            ),
+            deletion_batch_id=r.deletion_batch_id,
+            batch_size=(
+                batch_sizes.get(r.deletion_batch_id, 1) if r.deletion_batch_id is not None else 1
+            ),
+        )
+        for r in page
+    ]
+    return TrashListResponse(items=items, total=total)
 
 
 # Types a partial restore is safe for (#963 review). ``skip_conflicts`` leaves
@@ -265,9 +319,8 @@ async def restore_row(
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
 
-    restored, conflicts = await restore_batch(
-        db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts
-    )
+    result = await restore_batch(db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts)
+    restored, conflicts = result.restored, result.conflicts
     if conflicts and not skip_conflicts:
         raise HTTPException(
             status_code=409,
@@ -311,7 +364,9 @@ async def restore_row(
                 resource_type=resource_type_for(obj),
                 resource_id=str(obj.id),
                 resource_display=_row_label(obj),
-                new_value={"deletion_batch_id": str(batch_id)},
+                # A zone's records get no row of their own: they were restored
+                # by one UPDATE and are counted here (#1389).
+                new_value=result.audit_new_value(obj, batch_id),
                 result="success",
             )
         )
@@ -323,13 +378,13 @@ async def restore_row(
     logger.info(
         "trash.restore",
         batch_id=str(batch_id),
-        restored=len(restored),
+        restored=result.total,
         skipped=len(conflicts),
         user_id=str(current_user.id),
     )
     return RestoreResponse(
         batch_id=batch_id,
-        restored=len(restored),
+        restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
     )
 

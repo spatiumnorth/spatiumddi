@@ -21,8 +21,9 @@ and offline-resilience spec.
 | `HEARTBEAT_INTERVAL` | Seconds between heartbeats (default `30`) |
 | `AGENT_GROUP` | Optional DHCP server group to join |
 | `AGENT_ROLES` | Comma-separated: `primary,secondary,failover` (default `primary`) |
-| `TLS_CA_PATH` | Optional custom CA bundle |
-| `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` | Dev only |
+| `TLS_CA_PATH` | CA bundle to verify the control plane against (private CA or self-signed). Wins over the skip flag |
+| `TLS_PINNED_CERTS_PATH` | Trust exactly the certificates in this file, with no hostname check (#1281). Read on every connection; fails closed while the file is missing. The appliance chart sets it to the supervisor's pinned certificate. Wins over `TLS_CA_PATH` and the skip flag |
+| `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` | Turns verification off. Lab only: the agent key is readable on the network path. Logged as a warning on every start |
 
 ## Cache layout
 

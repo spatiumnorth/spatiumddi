@@ -453,7 +453,8 @@ the reference topologies are in
 - **PostgreSQL HA = CloudNativePG.** The operator-managed `Cluster` CR
   is the permanent appliance default (`postgresql.kind=cnpg`); instances
   scale with the committed member count (1 → 3/5/7, primary + streaming
-  replicas + automatic failover). The CNPG **operator** pod itself is
+  replicas + automatic failover). Replication is asynchronous, so a
+  failover can lose the last few commits (RPO > 0). The CNPG **operator** pod itself is
   pinned to a small Burstable footprint (`cnpg.resources`: 50m/128Mi
   requests, 500m/512Mi limits) so it isn't the first thing kubelet OOM-
   kills when the all-in-one control node gets tight — an unbounded
@@ -1550,7 +1551,7 @@ tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
 - nftables base-config strip — `/etc/nftables.conf` currently has hardcoded DNS / DHCP / HTTP "belt-and-braces" rules from the pre-#170 5-role world; on Application appliances the supervisor's drop-in should be the sole source of truth so the operator can verify role-driven rules are actually being enforced.
 - Per-appliance scoped agent keys — current implementation passes the platform-wide global `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`; a per-appliance scoped key would limit blast radius if a supervisor cert ever leaked.
 - Host-OS config plane (#155–#166) — **APT sources / proxy / GPG keys + private-mirror auth landed in 2026.06.19-1 (#155)** via `platform_settings.apt_*` → `apt_bundle` heartbeat → the `spatiumddi-apt-reload` host runner (staged `apt-get update` validate-before-swap), joining the already-shipped SNMP / NTP / SSH / resolver / syslog planes. Still pending on the same `ConfigBundle long-poll → trigger-file → host runner` pattern: static routes and the remaining #156–#166 surfaces.
-- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist globs), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
+- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist entries: Python regular expressions matched from the start of the package name, not globs, and refused at save when they do not compile, #1384), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
 
 ---
 
@@ -1731,13 +1732,13 @@ Hybrid BIOS + UEFI boot via grub (`Bootable=yes`, `Bootloader=grub`,
 ### Future build pipeline (Phases 2–5)
 
 ```
-trigger: tag push (CalVer)
+trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
   ↓
 1. Reuse the existing image-build workflows
-   - ghcr.io/spatiumnorth/spatiumddi-api:<calver>
-   - ghcr.io/spatiumnorth/spatiumddi-frontend:<calver>
-   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<calver>
-   - ghcr.io/spatiumnorth/dhcp-kea:<calver>
+   - ghcr.io/spatiumnorth/spatiumddi-api:<release tag>
+   - ghcr.io/spatiumnorth/spatiumddi-frontend:<release tag>
+   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<release tag>
+   - ghcr.io/spatiumnorth/dhcp-kea:<release tag>
   ↓
 2. Build appliance images via the builder container
    - Phase 1: amd64 qcow2 (all-in-one)
@@ -2496,7 +2497,7 @@ OS. The `/appliance` Releases card lists recent GitHub releases;
 operator clicks Apply, the api pod writes a trigger file the
 host-side `spatiumddi-release-update.path` unit watches, the
 runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
-new CalVer tag. helm-controller picks up the change and runs
+new release tag. helm-controller picks up the change and runs
 `helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
 — which pulls images from the local containerd image store (already
 loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
@@ -2667,7 +2668,7 @@ drives upgrades for all of them from a single screen.
   pending operator-set desired version.
 * Clicking **Upgrade** on an appliance row opens a release picker
   (same `applianceReleasesApi.list` source as the per-box UI).
-  The picked CalVer tag is written to that agent's
+  The picked release tag is written to that agent's
   `desired_appliance_version` + `desired_slot_image_url` columns.
 * The agent's next ConfigBundle long-poll picks it up via the new
   `fleet_upgrade` block on the bundle. The agent's
@@ -2697,6 +2698,7 @@ picker plus a pre-filled copy-paste command:
   # Kubernetes:
   helm upgrade spatiumddi-dns-bind9 \
     oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+    --version 2026.5.12-2 \
     --set image.tag=2026.05.12-2 \
     --reuse-values
   ```
@@ -2878,8 +2880,12 @@ so a first-time operator never gets stuck looking for the upload.
 **Flow (operator-facing):**
 
 1. Operator opens `/appliance` → **Rolling Upgrade**.
-2. Types the **Target version (CalVer)**. Tab refuses any tag that
-   doesn't match `YYYY.MM.DD-N` (preflight's `version_path` check).
+2. Types the **Target version**: a release tag, CalVer (`YYYY.MM.DD-N`)
+   up to the bridge or SemVer (`1.0.0`) from 1.0.0 on. Preflight's
+   `version_path` check fails a tag that is not a release, and a target
+   that is not newer than the running release (SemVer → CalVer is
+   backward). A build that is not a release (`dev`, a nightly) is
+   unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict`, `replication_lag`, `disk_headroom`,
@@ -2988,7 +2994,7 @@ you — the `etcd_snapshot_freshness` row warns when the newest snapshot
 the seed has reported is older than the cron interval, or when there is
 none — but it can only report; taking one is still a manual step, and
 nothing can tell preflight whether a given target crosses a Kubernetes
-minor (the target is a CalVer tag; the k3s it bakes is not known until
+minor (the target is a release tag; the k3s it bakes is not known until
 the image boots). Read the release notes.
 
 Same-minor bumps are unaffected — revert the slot and you are done.
@@ -3015,7 +3021,7 @@ Same-minor bumps are unaffected — revert the slot and you are done.
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):
      a. Fleet → Upgrade images → Upload .raw.xz + paste the SHA-256 +
-        type the CalVer tag → Upload. Bytes stream through the api
+        type the release tag → Upload. Bytes stream through the api
         to the mirror PVC. (Connected installs can skip steps 1-2 and
         use the "Pick from GitHub Releases" tab here instead.)
      b. Rolling Upgrade → type 2026.06.01-1 → leave source as
@@ -3181,10 +3187,31 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check. The
-DNS, DHCP and looking-glass role pods on an appliance still skip verification
-toward the control plane; they need the pinned certificate passed through to
-them, which is tracked separately.
+comparing the logged fingerprint with **Appliance → TLS** is the check.
+
+**The role pods use the same pin (#1281).** On an off-cluster appliance the
+DNS, DHCP and looking-glass pods reach the control plane at the same external
+URL, sending the agent key and receiving their DNS / DHCP configuration over
+it. They used to skip verification there. The chart now mounts the
+supervisor's `tls/` directory read-only (`/var/persist/spatium-supervisor/tls`,
+which holds only public material; the private key is in `identity/`) and sets
+`TLS_PINNED_CERTS_PATH` to the pin in it. The agent trusts exactly the
+certificates in that file, with no hostname check, the same way the
+supervisor does, and reads it on every connection, so a certificate the
+supervisor re-pins reaches the agents without a restart. Until the supervisor
+has pinned, every request fails and the agent logs
+`control_plane_pin_unavailable`; it does not fall back to skipping. The one
+exception is a supervisor started by hand with
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins nothing, so it renders its
+agents with the skip too (`controlPlaneTls.insecureSkipVerify`), and they warn
+about it on every start. On a
+control-plane member, including an appliance promoted into the control plane,
+the agents are not given the external URL at all: they use the in-cluster api
+Service, as the member's supervisor does. The pin cannot serve there, because
+a member's supervisor heartbeats in-cluster and so never re-pins, while a
+member joining re-mints the Web UI certificate. An `http://` URL carries no
+certificate to verify; the supervisor upgrades its own traffic to the
+`https://` target, but the role agents do not yet.
 
 ### Pairing code (recommended) — issue #169
 

@@ -13,6 +13,8 @@ import {
 
 function humanizeError(code: string | null): string {
   if (!code) return "";
+  if (code === "account_disabled")
+    return "Your account is disabled. Contact an administrator.";
   if (code === "oidc_rejected")
     return "OIDC login rejected: your account could not be provisioned (group mapping, username collision, or auto-create disabled).";
   // Defensive: the backend allowlist (`_LOGIN_ERROR_REASONS`) only emits the

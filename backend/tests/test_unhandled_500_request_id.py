@@ -81,3 +81,25 @@ async def test_a_500_echoes_the_request_id_the_client_sent(
         )
     assert r.status_code == 500
     assert r.headers.get("x-request-id") == "client-chosen-id"
+
+
+async def test_a_500_raised_before_the_middleware_ran_does_not_adopt_a_raw_header(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception from a middleware outside RequestContextMiddleware leaves
+    nothing on ``request.state``. The handler must generate the id rather than
+    adopt the raw header: a long one would fail the Diagnostics row's
+    64-character column and lose the record, and it is echoed unvalidated."""
+    # MaintenanceModeMiddleware sits outside RequestContextMiddleware and, on
+    # a mutating request, reads the maintenance flag before passing it on.
+    import app.core.maintenance_mode as maintenance
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("before request_id was bound")
+
+    monkeypatch.setattr(maintenance, "get_maintenance_state", _boom)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post("/api/v1/dns/groups", json={}, headers={"X-Request-ID": "x" * 200})
+    assert r.status_code == 500
+    assert _UUID.match(r.headers.get("x-request-id", "")), r.headers

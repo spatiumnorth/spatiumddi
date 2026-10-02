@@ -137,6 +137,27 @@ def legacy_group_key(group: DNSServerGroup | None) -> TsigKey | None:
     )
 
 
+async def group_key_names(db: AsyncSession, group_id: uuid.UUID) -> frozenset[str]:
+    """Every ``key {}`` name a group's rendered config defines.
+
+    The operator ``DNSTSIGKey`` rows plus the legacy group key — the latter
+    only when :func:`legacy_group_key` would ship it, i.e. it has a secret,
+    because the agent renders it on exactly that condition. A ``key <name>``
+    citing anything else is an undefined symbol that makes BIND refuse the
+    whole file. Shared by the address-match-list validators and the zone
+    move (#1316) so the two cannot disagree about what a group defines.
+    """
+    names = set(
+        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    legacy = legacy_group_key(await db.get(DNSServerGroup, group_id))
+    if legacy is not None:
+        names.add(legacy.name)
+    return frozenset(names)
+
+
 def view_transfer_key(group_key: TsigKey, view_name: str) -> TsigKey:
     """The key that selects ``view_name`` for the control plane's own transfers (#920).
 
@@ -299,6 +320,7 @@ async def pull_zone_records_signed(
 
 __all__ = [
     "VIEW_TRANSFER_KEY_PREFIX",
+    "group_key_names",
     "is_view_transfer_key",
     "legacy_group_key",
     "pull_zone_records_signed",

@@ -53,6 +53,18 @@ def _touch_ready_marker(state_dir: Path) -> None:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
 
 
+
+def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
+    """One op ack. Echoes the page's ``dispatch`` stamp when it has one
+    (#1232), so the control plane can tell a late ack for an earlier dispatch
+    from this one and not charge a failure twice."""
+    ack: dict[str, Any] = {"op_id": op["op_id"], "result": result}
+    if message is not None:
+        ack["message"] = message
+    if "dispatch" in op:
+        ack["dispatch"] = op["dispatch"]
+    return ack
+
 class SyncLoop:
     def __init__(
         self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any
@@ -214,11 +226,7 @@ class SyncLoop:
         self._stop.set()
 
     def _client(self) -> httpx.Client:
-        verify: bool | str = True
-        if self.cfg.insecure_skip_tls_verify:
-            verify = False
-        elif self.cfg.tls_ca_path:
-            verify = self.cfg.tls_ca_path
+        verify = self.cfg.httpx_verify()
         # server holds for ~30s, give client a bit more
         return httpx.Client(
             base_url=self.cfg.control_plane_url, verify=verify, timeout=60.0
@@ -355,7 +363,7 @@ class SyncLoop:
             try:
                 result = self.driver.apply_record_op(op)
                 self.heartbeat.pending_acks.append(
-                    {"op_id": op["op_id"], "result": "ok"}
+                    _ack(op, "ok")
                 )
                 log.info(
                     "record_op_applied",
@@ -370,7 +378,7 @@ class SyncLoop:
             except Exception as e:
                 log.exception("op_apply_failed", op_id=op.get("op_id"))
                 self.heartbeat.pending_acks.append(
-                    {"op_id": op["op_id"], "result": "error", "message": str(e)}
+                    _ack(op, "error", str(e))
                 )
                 self.heartbeat.failed_ops_count += 1
         if dnssec_states:

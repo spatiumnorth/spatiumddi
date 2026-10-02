@@ -58,7 +58,7 @@ MKOSI_ARCH := $(if $(filter arm64,$(notdir $(APPLIANCE_ARCH))),arm64,x86-64)
 # build a running stack came from.
 #
 # Override by exporting SPATIUMDDI_VERSION before invoking make. CI
-# release builds set it to the CalVer tag (e.g. 2026.05.14-1) and
+# release builds set it to the release tag (e.g. 2026.05.14-1, or 1.0.0) and
 # BAKE_SOURCE=ghcr to pull pre-published images.
 ifeq ($(origin SPATIUMDDI_VERSION), undefined)
 SPATIUMDDI_VERSION := dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)-$(shell openssl rand -hex 2 2>/dev/null || date +%s | tail -c5)
@@ -125,17 +125,17 @@ build: build-supervisor
 	# the api at its ``runtime`` (prod) stage, NOT ``dev`` (which adds
 	# pytest + a 1M-line test tree we don't want in the appliance).
 	docker build -t spatiumddi-api:dev --target runtime $(BACKEND_DIR)
-	docker build -t spatiumddi-dns-bind9:dev -f agent/dns/images/bind9/Dockerfile .
-	docker build -t spatiumddi-dns-powerdns:dev -f agent/dns/images/powerdns/Dockerfile .
-	docker build -t spatiumddi-dns-technitium:dev -f agent/dns/images/technitium/Dockerfile .
-	docker build -t spatiumddi-dhcp-kea:dev -f agent/dhcp/images/kea/Dockerfile .
+	docker build -t spatiumddi-dns-bind9:dev -f agent/dns/images/bind9/Dockerfile --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) .
+	docker build -t spatiumddi-dns-powerdns:dev -f agent/dns/images/powerdns/Dockerfile --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) .
+	docker build -t spatiumddi-dns-technitium:dev -f agent/dns/images/technitium/Dockerfile --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) .
+	docker build -t spatiumddi-dhcp-kea:dev -f agent/dhcp/images/kea/Dockerfile --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) .
 	# #573 — the BGP Looking Glass collector (#566) is in bake-images.sh's
 	# IMAGES set but the PROD compose pins its ``image:`` with no ``build:``,
 	# so — exactly like the DNS/DHCP agents above — it needs an explicit
 	# build here or ``make build`` leaves ``spatiumddi-looking-glass:dev``
 	# stale and the baked ISO ships an old collector (or trips the #272 >24h
 	# stale-source guard when nothing rebuilt it recently).
-	docker build -t spatiumddi-looking-glass:dev -f agent/looking-glass/images/gobgp/Dockerfile .
+	docker build -t spatiumddi-looking-glass:dev -f agent/looking-glass/images/gobgp/Dockerfile --build-arg APP_VERSION=$(SPATIUMDDI_VERSION) .
 	# #272 Phase 1 — retag compose-built images under the canonical
 	# ``ghcr.io/spatiumnorth/<name>:dev`` form so
 	# ``appliance/scripts/bake-images.sh``'s resolve_source_tag picks
@@ -283,7 +283,12 @@ test-durations:
 # ``dockerfile:context:name``.
 #
 # IMAGE=<name> scans one image; omit to scan all eight.
-TRIVY_CACHE ?= $(CURDIR)/.trivy-cache
+#
+# The loop lives in scripts/trivy-scan.sh, which tells a finding apart from a
+# scan that never ran (#1272) — see its header. The DB cache defaults to a
+# path OUTSIDE the checkout: Docker Desktop can refuse to mount a checkout on
+# an external volume, and that refusal used to be reported as a finding.
+TRIVY_CACHE ?= $(HOME)/.cache/spatiumddi-trivy
 TRIVY_IMAGES ?= \
 	agent/dhcp/images/kea/Dockerfile:.:kea \
 	agent/dns/images/bind9/Dockerfile:.:bind9 \
@@ -295,38 +300,11 @@ TRIVY_IMAGES ?= \
 	frontend/Dockerfile:frontend:frontend
 
 trivy:
-	@mkdir -p $(TRIVY_CACHE)
-	@fail=0; \
-	for spec in $(TRIVY_IMAGES); do \
-	  df=$${spec%%:*}; name=$${spec##*:}; ctx=$${spec#*:}; ctx=$${ctx%:*}; \
-	  if [ -n "$(IMAGE)" ] && [ "$(IMAGE)" != "$$name" ]; then continue; fi; \
-	  printf "→ %-14s building… " "$$name"; \
-	  if ! docker build -q -f "$$df" -t "spatiumddi-trivy-$$name:scan" "$$ctx" >/dev/null 2>&1; then \
-	    printf "BUILD FAILED\n"; fail=1; continue; \
-	  fi; \
-	  printf "scanning… "; \
-	  if docker run --rm \
-	      -v /var/run/docker.sock:/var/run/docker.sock \
-	      -v "$(TRIVY_CACHE)":/root/.cache/ \
-	      aquasec/trivy:latest image \
-	      --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --scanners vuln -q \
-	      "spatiumddi-trivy-$$name:scan" >/tmp/trivy-$$name.txt 2>&1; then \
-	    printf "clean\n"; \
-	  else \
-	    printf "FINDINGS\n"; \
-	    grep -E "CVE-|Total:" /tmp/trivy-$$name.txt | head -8 | sed 's/^/     /'; \
-	    fail=1; \
-	  fi; \
-	done; \
-	if [ $$fail -ne 0 ]; then \
-	  echo ""; echo "✗ Trivy found HIGH/CRITICAL vulnerabilities — fix before pushing."; \
-	  exit 1; \
-	fi; \
-	echo ""; echo "✓ Trivy clean (HIGH/CRITICAL, ignore-unfixed) — safe to push."
+	@IMAGE="$(IMAGE)" TRIVY_CACHE="$(TRIVY_CACHE)" bash scripts/trivy-scan.sh $(TRIVY_IMAGES)
 
 # ── OpenAPI contract export (#903) ──────────────────────────────────────────
 #
-# Produces the same openapi.json the release workflow attaches to every CalVer
+# Produces the same openapi.json the release workflow attaches to every release
 # tag, so a client repo (spatiumnorth/spatiumddi-mobile) can regenerate and diff
 # the contract without waiting for a release.
 #
@@ -422,10 +400,14 @@ ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test ver
 ci-backend-lint:
 	@echo "→ Backend — Lint & Type Check (matches .github/workflows/ci.yml)"
 	@# The prod `api` image doesn't ship dev tools. Install them on first run;
-	@# they persist until the container is recreated.
+	@# they persist until the container is recreated. It doesn't ship pip
+	@# either (#1392) — and `make build` tags its runtime-stage build as the
+	@# same `spatiumddi-api:dev` the dev compose runs — so bootstrap pip from
+	@# the interpreter's bundled ensurepip wheel when it is missing.
 	@$(COMPOSE_DEV) exec -T api python -m ruff --version >/dev/null 2>&1 || \
-	  $(COMPOSE_DEV) exec -T -u root api pip install --quiet --root-user-action=ignore \
-	    ruff black mypy
+	  $(COMPOSE_DEV) exec -T -u root api sh -c \
+	    'python -m pip --version >/dev/null 2>&1 || python -m ensurepip --default-pip >/dev/null; \
+	     python -m pip install --quiet --root-user-action=ignore ruff black mypy'
 	$(COMPOSE_DEV) exec -T api python -m ruff check app tests
 	$(COMPOSE_DEV) exec -T api python -m black --check app tests
 	$(COMPOSE_DEV) exec -T api python -m mypy app
@@ -643,11 +625,11 @@ appliance-clean:
 # Bake every container image into the appliance rootfs overlay so the
 # next ``make appliance`` ships them inside the ISO. See
 # appliance/scripts/bake-images.sh for what's covered + how source
-# selection (local :dev tags vs pulled :<calver> from ghcr) works.
+# selection (local :dev tags vs pulled :<release tag> from ghcr) works.
 #
 # Source defaults to ``local`` (uses spatiumddi-*:dev) when
 # SPATIUMDDI_VERSION is empty/dev; the release workflow sets
-# SPATIUMDDI_VERSION=<calver> + BAKE_SOURCE=ghcr to pull the cut
+# SPATIUMDDI_VERSION=<release tag> + BAKE_SOURCE=ghcr to pull the cut
 # tag from the just-published images.
 #
 # Depends on ``build-supervisor`` so a stale supervisor image (the
@@ -850,7 +832,7 @@ appliance-clean-baked-images:
 # Stamp a dev version into mkosi.extra/etc/spatiumddi/appliance-release
 # so a freshly-installed local-build appliance reports a non-empty
 # ``installed_appliance_version`` in the Fleet view. The release
-# workflow does the same thing in CI with a CalVer tag; for local
+# workflow does the same thing in CI with the release tag; for local
 # builds we use ``dev-<short-sha>`` so each WIP ISO has a unique stamp
 # tied to the commit it came from. The file is gitignored — see
 # ``appliance/.gitignore``.
@@ -859,8 +841,9 @@ appliance-stamp-dev:
 	mkdir -p $$(dirname $$f); \
 	{ \
 	  echo "# Generated by ``make appliance-stamp-dev`` for local-build ISOs."; \
-	  echo "# CI release builds overwrite this with the real CalVer tag."; \
+	  echo "# CI release builds overwrite this with the real release tag."; \
 	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
+	  echo "BUILD_TIME=\"$$(date -u +%Y-%m-%dT%H:%M:%SZ)\""; \
 	  echo "APPLIANCE_ARCH=\"$(notdir $(APPLIANCE_ARCH))\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"

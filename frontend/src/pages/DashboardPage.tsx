@@ -104,6 +104,7 @@ import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
+import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
 
 /**
@@ -2554,9 +2555,12 @@ export function DashboardPage() {
             </div>
             {haGroups.length > 0 && (
               <>
-                <div className="flex items-center gap-1.5 border-t bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                <div
+                  className="flex items-center gap-1.5 border-t bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+                  title={HA_V4_ONLY_NOTE}
+                >
                   <Shield className="h-3 w-3" />
-                  HA Pairs ({haGroups.length})
+                  HA Pairs · DHCPv4 ({haGroups.length})
                 </div>
                 <div className="divide-y">
                   {haGroups.map((g) => (
@@ -3161,7 +3165,7 @@ function FailoverRow({ group }: { group: DHCPServerGroup }) {
                 "inline-block h-2 w-2 rounded-full",
                 haStateDotCls(s.ha_state),
               )}
-              title={`${s.name}: ${s.ha_state ?? "unknown"}`}
+              title={`${s.name}: ${s.ha_state ?? "unknown"}. ${HA_V4_ONLY_NOTE}`}
             />
             <span className="text-muted-foreground">
               {s.name}

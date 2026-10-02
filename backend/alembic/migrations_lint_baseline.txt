@@ -359,8 +359,8 @@ backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rena
 backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rename_table:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:46
-backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:125
-backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:127
+backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:127
+backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:129
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_column:106
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:104
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:105
@@ -381,8 +381,8 @@ backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:289
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:297
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:36
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:37
-backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_column:62
-backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_table:64
+backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_column:63
+backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_table:65
 backend/alembic/versions/c5f1a2b3d4e6_firewall_logging_enabled.py:drop_column:37
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:110
 backend/alembic/versions/c5f2a9b18e34_ipam_linkage_subnet_domains_bulk.py:drop_column:111
@@ -570,6 +570,8 @@ backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:68
 backend/alembic/versions/d7f2a91c4b58_server_maintenance_mode.py:drop_column:69
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:82
 backend/alembic/versions/d8c5f12a47b9_query_log_entries.py:drop_table:85
+backend/alembic/versions/d8e1b5a26c47_dns_record_op_backoff.py:drop_column:54
+backend/alembic/versions/d8e1b5a26c47_dns_record_op_backoff.py:drop_column:55
 backend/alembic/versions/d8e4a73f12c5_dns_catalog_zones.py:drop_column:43
 backend/alembic/versions/d8e4a73f12c5_dns_catalog_zones.py:drop_column:44
 backend/alembic/versions/d8f3a1c6e09b_dnsdist_options.py:drop_column:56

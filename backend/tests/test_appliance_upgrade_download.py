@@ -30,6 +30,7 @@ from app.models.appliance import (
     Appliance,
     ApplianceUpgradeImage,
 )
+from app.models.audit import AuditLog
 from app.models.auth import User
 
 _SHA = "a" * 64
@@ -204,3 +205,44 @@ async def test_clear_upgrade_nulls_download_hints(
     ).scalar_one()
     assert refreshed.desired_slot_image_sha256 is None
     assert refreshed.desired_slot_image_tls_insecure is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "direction"),
+    [
+        # The fixture's box runs 2026.06.13-2.
+        ("2026.07.01-1", "forward"),
+        ("1.0.0", "forward"),
+        ("2026.06.13-2", "same"),
+        # Allowed: this is also the manual rollback path. But recorded.
+        ("2026.06.12-1", "backward"),
+        ("my-hand-built-image", "unknown"),
+    ],
+)
+async def test_the_audit_row_records_which_way_the_upgrade_moves_the_node(
+    client: AsyncClient, db_session: AsyncSession, target: str, direction: str
+) -> None:
+    """#1182: the per-box upgrade compared no versions, so a rollback and an
+    upgrade looked identical in the audit log. It still refuses neither."""
+    headers = await _make_superadmin(db_session)
+    appliance = await _seed_appliance(db_session)
+    image = await _seed_image(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/upgrade",
+        headers=headers,
+        json={"desired_appliance_version": target, "slot_image_id": str(image.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == "appliance.upgrade_scheduled",
+                AuditLog.resource_id == str(appliance.id),
+            )
+        )
+    ).scalar_one()
+    assert row.new_value["direction"] == direction
+    assert row.new_value["installed_appliance_version"] == "2026.06.13-2"

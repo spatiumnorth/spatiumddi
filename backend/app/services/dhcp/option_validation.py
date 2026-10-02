@@ -30,6 +30,15 @@ Accepted keys:
   canonicalise. Only the Windows driver reads it, and the Windows cmdlet
   checks the value, so only the code range is checked here.
 
+Which raw spelling a group accepts depends on its servers (#1296), because
+each driver silently drops the other's: Kea and FortiGate read ``code:NN``
+and skip ``opt-NN``, Windows reads ``opt-NN`` and skips ``code:NN``. So the
+caller passes ``raw_codes``: ``"code"`` for a group with no Windows member
+(Kea, FortiGate, or no servers yet), ``"opt"`` for an all-Windows group, and
+``"none"`` for a group mixing Windows with another driver, where neither
+spelling reaches every member. (#1110 refuses only the Kea + Windows mix for
+new servers; FortiGate + Windows can still be assembled.)
+
 Everything else — including ``option_data``, the raw Kea passthrough that
 internal producers (#972) merge in at bundle time — is refused.
 """
@@ -317,7 +326,30 @@ def _supported(address_family: str) -> str:
     return ", ".join(names)
 
 
-def _check_one(key: str, value: Any, address_family: str) -> None:
+RAW_CODES_KEA = "code"
+RAW_CODES_WINDOWS = "opt"
+RAW_CODES_NONE = "none"
+
+
+def _refuse_raw_spelling(key: str, code: str, raw_codes: str) -> None:
+    """Refuse a raw-code key the group's servers would drop (#1296)."""
+    if raw_codes == RAW_CODES_NONE:
+        raise ValueError(
+            f"option '{key}': this group mixes Windows and non-Windows DHCP servers, and "
+            "each drops the other's raw option spelling (Windows reads opt-NN, Kea and "
+            "FortiGate read code:NN), so no raw code reaches every server; use a named "
+            "option, or move the servers into single-driver groups"
+        )
+    if key.startswith("opt-") and raw_codes != RAW_CODES_WINDOWS:
+        raise ValueError(
+            f"option '{key}': opt-NN is the Windows DHCP spelling, and this group's "
+            f"servers drop it; use code:{code}"
+        )
+    if key.startswith("code:") and raw_codes == RAW_CODES_WINDOWS:
+        raise ValueError(f"option '{key}': Windows DHCP servers drop code:NN; use opt-{code}")
+
+
+def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_CODES_KEA) -> None:
     """Raise ``ValueError`` naming ``key`` when it cannot be rendered."""
     if key == "option_data":
         raise ValueError(
@@ -328,8 +360,11 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
     raw = _RAW_CODE.fullmatch(key)
     if raw:
         code = int(raw.group(1))
+        # Before the spelling check: naming the other spelling on a v6 scope
+        # would send the operator to a key that is refused too.
         if address_family == "ipv6":
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
+        _refuse_raw_spelling(key, raw.group(1), raw_codes)
         if code not in _KEA_VENDOR_OPTION_DEFS:
             supported = ", ".join(f"code:{c}" for c in sorted(_KEA_VENDOR_OPTION_DEFS))
             raise ValueError(
@@ -346,6 +381,10 @@ def _check_one(key: str, value: Any, address_family: str) -> None:
 
     win = _WINDOWS_CODE.fullmatch(key)
     if win:
+        if address_family == "ipv6" and raw_codes != RAW_CODES_WINDOWS:
+            # The ``code:NN`` the spelling check would suggest is v4-only.
+            raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
+        _refuse_raw_spelling(key, win.group(1), raw_codes)
         if not 1 <= int(win.group(1)) <= 254:
             raise ValueError(f"option '{key}': option codes run 1..254")
         return
@@ -380,24 +419,42 @@ def validate_options(
     *,
     address_family: str = "ipv4",
     previous: Mapping[str, Any] | None = None,
+    raw_codes: str = RAW_CODES_KEA,
 ) -> None:
     """Raise ``ValueError`` naming the first option that cannot be rendered.
 
     ``address_family`` is ``ipv4``, ``ipv6``, or ``any`` for a client class,
     which always renders into Dhcp4 and so is checked against Dhcp4 first.
+    ``raw_codes`` is the raw-code spelling the group's servers read; see the
+    module docstring.
 
     A key whose value is unchanged from ``previous`` is skipped, so an edit
     that round-trips a grandfathered option — stored before this check existed,
     or brought in by an importer — is not blocked by it (the #597 stance).
     """
+    for key, value in _changed_options(options, previous):
+        _check_one(key, value, address_family, raw_codes)
+
+
+def _changed_options(
+    options: Mapping[str, Any], previous: Mapping[str, Any] | None
+) -> list[tuple[str, Any]]:
+    """The ``(key, value)`` pairs of ``options`` not unchanged from ``previous``."""
     # Compare against the stored map under canonical names, so a row stored
     # under a legacy alias (``domain-name-servers``, #583) that the write
     # normalised still counts as unchanged.
     prev = {OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in (previous or {}).items()}
-    for key, value in options.items():
-        if key in prev and prev[key] == value:
-            continue
-        _check_one(str(key), value, address_family)
+    return [
+        (str(key), value)
+        for key, value in options.items()
+        if not (str(key) in prev and prev[str(key)] == value)
+    ]
+
+
+def changes_raw_code(options: Mapping[str, Any], previous: Mapping[str, Any] | None = None) -> bool:
+    """Whether ``options`` sets a raw-code key (``code:NN`` / ``opt-NN``) that
+    ``validate_options`` would check — the only case ``raw_codes`` matters."""
+    return any(_is_code_key(key) for key, _ in _changed_options(options, previous))
 
 
 # ── Phone profiles (#1294) ──────────────────────────────────────────────────
@@ -563,3 +620,50 @@ def phone_options_loadable(rows: Any) -> tuple[dict[str, Any], list[str]]:
             continue
         kept[key] = value
     return kept, dropped
+
+
+# ── option-60 vendor-class match (#1294, #1357) ──────────────────────────────
+
+
+def vendor_class_match_renderable(value: str | None) -> bool:
+    """True when *value* can sit inside Kea's ``=='<match>'`` string literal.
+
+    A phone profile (#1294) and a PXE arch-match (#1357) both render their
+    ``vendor_class_match`` as ``substring(option[60].hex,0,N)=='<match>'``.
+    A ``'`` ends the literal early and Kea's lexer refuses a newline inside
+    one; either rejects the WHOLE config (measured, kea-dhcp4 3.0.3).
+    Control characters have no business in option 60 anyway.
+    """
+    return value is None or ("'" not in value and not contains_control_chars(value))
+
+
+def check_vendor_class_match(value: str | None) -> str | None:
+    """Pydantic validator body for ``vendor_class_match`` on write."""
+    if not vendor_class_match_renderable(value):
+        raise ValueError(
+            f"vendor_class_match {value!r} may not contain ' or control characters — "
+            "it is rendered inside a Kea string literal"
+        )
+    return value
+
+
+def vendor_class_match_test(value: str) -> str:
+    """The Kea ``test`` term matching an option-60 prefix.
+
+    Measured in bytes, not characters: ``option[60].hex`` is the raw
+    option, so a non-ASCII prefix measured in characters never matched.
+    The caller must have checked :func:`vendor_class_match_renderable`.
+
+    A non-ASCII prefix renders as a hex literal, not a quoted string. The
+    agent writes Kea's config with ``json.dumps``' default ASCII escaping,
+    and Kea's JSON lexer reads ``\\u00XX`` as ONE byte and refuses anything
+    above ``\\u00ff`` outright (measured, kea-dhcp4 3.0.3): ``'Vendör'``
+    would compare six bytes against a seven-byte prefix and never match,
+    and ``'V€'`` would reject the group's whole config. ASCII keeps the
+    quoted form so an existing bundle's ETag does not move.
+    """
+    raw = value.encode("utf-8")
+    n = len(raw)
+    if value.isascii():
+        return f"substring(option[60].hex,0,{n})=='{value}'"
+    return f"substring(option[60].hex,0,{n})==0x{raw.hex().upper()}"

@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from sqlalchemy import and_, func, select, tuple_
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +27,7 @@ from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.models.ipam import IPAddress
+from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 
@@ -35,8 +36,199 @@ logger = structlog.get_logger(__name__)
 
 # Queued-op states. ``in_flight`` is queued work too: an op already shipped is
 # not finished with — ``ack_op`` returns a NACKed one to ``pending`` — so any
-# sweep of a zone's queue must cover both (the #934 review finding).
+# sweep of a zone's queue must cover both (the #934 review finding). The
+# terminal states are ``applied``, ``failed`` and ``superseded`` (#1232).
 QUEUED_OP_STATES: tuple[str, ...] = ("pending", "in_flight")
+
+
+# #1232 — retry policy for an op the agent failed to apply. Exponential,
+# 30 s doubling to a 15 min cap: 30 s, 1 m, 2 m, 4 m, 8 m, 15 m, 15 m, i.e.
+# about 45 minutes before the op is given up on. Retries used to go out on
+# every heartbeat, so five attempts were spent inside a ~2.5 minute daemon
+# restart or upgrade — exactly the outage a retry exists to ride out.
+MAX_OP_ATTEMPTS = 8
+OP_RETRY_BASE_SECONDS = 30
+OP_RETRY_MAX_SECONDS = 15 * 60
+# An op shipped and never acknowledged — the agent restarted before its next
+# heartbeat (it keeps its acks in memory), or the long-poll response was lost
+# after its commit — used to stay ``in_flight`` forever. The agent acks on its
+# next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
+# five minutes is several missed heartbeats, not a slow one.
+IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
+# Keys per ``IN`` list when matching RRsets in SQL: three bind parameters a
+# key, well under asyncpg's 32767.
+RRSET_KEY_CHUNK = 3000
+
+
+def retry_delay(attempts: int) -> timedelta:
+    """Backoff after the ``attempts``-th failed attempt (1-based)."""
+    exp = max(0, attempts - 1)
+    return timedelta(seconds=min(OP_RETRY_BASE_SECONDS * (2 ** min(exp, 16)), OP_RETRY_MAX_SECONDS))
+
+
+def op_rrset_key(op: DNSRecordOp) -> tuple[str, str, str] | None:
+    """``(zone, name, type)`` of the RRset an op rewrites, or None when the op
+    carries no whole-RRset state.
+
+    Only an op with an ``rrset`` (#773) is a complete statement of what the
+    RRset should be; one that opted out via ``rrset_action`` (DNS pools) or
+    carries none (the DNSSEC signal op) says nothing about a sibling op, so it
+    neither supersedes nor is superseded. Name and type are normalised by the
+    same ``rrset.rrset_key`` the RRset stamping uses (an empty name is ``@``).
+    """
+    record = op.record or {}
+    if "rrset" not in record:
+        return None
+    key = record_rrset_key(record)
+    return None if key is None else (op.zone_name, key[0], key[1])
+
+
+def _op_name_sql() -> Any:
+    """``op_rrset_key``'s name, in SQL."""
+    return func.lower(func.coalesce(func.nullif(DNSRecordOp.record["name"].astext, ""), "@"))
+
+
+def _op_type_sql() -> Any:
+    return func.upper(DNSRecordOp.record["type"].astext)
+
+
+def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
+    """WHERE clause matching ops whose RRset is one of ``keys``."""
+    return and_(
+        DNSRecordOp.record.has_key("rrset"),
+        tuple_(DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()).in_(list(keys)),
+    )
+
+
+async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uuid.UUID, uuid.UUID]:
+    """For each op, the newest op queued STRICTLY after it for the same server
+    and RRset, if any (#1232). One query per server per key chunk.
+
+    That newer op carries the whole desired RRset as of a later moment, so it
+    already delivers the older op's change; retrying the older one after it
+    would put the old state back. Strictly after: ``created_at`` is the
+    transaction START, so ops queued by one transaction tie, and a tie says
+    nothing about which was stamped last. A ``failed`` or ``superseded`` op is
+    not a successor.
+    """
+    out: dict[uuid.UUID, uuid.UUID] = {}
+    by_server: dict[uuid.UUID, list[tuple[DNSRecordOp, tuple[str, str, str]]]] = {}
+    for op in ops:
+        key = op_rrset_key(op)
+        if key is not None:
+            by_server.setdefault(op.server_id, []).append((op, key))
+    for server_id, keyed in by_server.items():
+        earliest = min(op.created_at for op, _ in keyed)
+        keys = sorted({k for _, k in keyed})
+        newest: dict[tuple[str, str, str], list[tuple[datetime, uuid.UUID]]] = {}
+        for i in range(0, len(keys), RRSET_KEY_CHUNK):
+            rows = (
+                await db.execute(
+                    select(
+                        DNSRecordOp.id,
+                        DNSRecordOp.zone_name,
+                        _op_name_sql(),
+                        _op_type_sql(),
+                        DNSRecordOp.created_at,
+                    ).where(
+                        DNSRecordOp.server_id == server_id,
+                        DNSRecordOp.created_at > earliest,
+                        DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                    )
+                )
+            ).all()
+            for row_id, zone, name, rtype, created in rows:
+                newest.setdefault((zone, name, rtype), []).append((created, row_id))
+        for op, key in keyed:
+            later = [(c, i) for c, i in newest.get(key, ()) if c > op.created_at]
+            if later:
+                out[op.id] = max(later)[1]
+    return out
+
+
+def supersede(op: DNSRecordOp, successor_id: uuid.UUID, now: datetime) -> None:
+    op.state = "superseded"
+    op.superseded_by = successor_id
+    op.next_attempt_at = None
+    op.updated_at = now
+
+
+async def fail_attempts(
+    db: AsyncSession, failures: Collection[tuple[DNSRecordOp, str]], *, now: datetime
+) -> None:
+    """Account for one failed or unacknowledged attempt at each op (#1232).
+
+    Superseded when a newer op for its RRset exists; otherwise back to
+    ``pending`` with a backoff, or ``failed`` once the budget is spent.
+    """
+    successors = await _successors(db, [op for op, _ in failures])
+    for op, message in failures:
+        op.attempts += 1
+        op.last_error = message
+        op.updated_at = now
+        successor = successors.get(op.id)
+        if successor is not None:
+            supersede(op, successor, now)
+        elif op.attempts >= MAX_OP_ATTEMPTS:
+            op.state = "failed"
+            op.next_attempt_at = None
+            logger.warning(
+                "dns_record_op_failed",
+                op_id=str(op.id),
+                server_id=str(op.server_id),
+                zone=op.zone_name,
+                name=(op.record or {}).get("name"),
+                type=(op.record or {}).get("type"),
+                attempts=op.attempts,
+                error=message,
+            )
+        else:
+            op.state = "pending"
+            op.next_attempt_at = now + retry_delay(op.attempts)
+
+
+async def reset_unacknowledged_ops(db: AsyncSession, server_id: uuid.UUID) -> int:
+    """Return ops shipped and never acknowledged to the retry path (#1232).
+
+    The agent keeps its acks in memory until a heartbeat succeeds, so a
+    restart in between, or a long-poll response lost after its commit, left
+    the op ``in_flight`` forever: never re-shipped, never failed, and anything
+    waiting for ``applied`` (the ACME DNS-01 wait) timed out. Counted as a
+    failed attempt, so an op that crashes the agent cannot loop forever.
+
+    Called from the heartbeat, after that heartbeat's own acks: a live agent
+    is exactly when re-shipping can help, and the heartbeat always commits.
+    (The long-poll does not — a 304 rolls its transaction back — which is why
+    this is not done there.)
+    """
+    now = datetime.now(UTC)
+    stale = (
+        (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    DNSRecordOp.server_id == server_id,
+                    DNSRecordOp.state == "in_flight",
+                    DNSRecordOp.updated_at < now - IN_FLIGHT_ACK_TIMEOUT,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not stale:
+        return 0
+    minutes = int(IN_FLIGHT_ACK_TIMEOUT.total_seconds() // 60)
+    message = (
+        f"no acknowledgement from the agent within {minutes} minutes "
+        "(it restarted, or the response was lost); retrying"
+    )
+    await fail_attempts(db, [(op, message) for op in stale], now=now)
+    logger.warning(
+        "dns_record_ops_unacknowledged_reset", server_id=str(server_id), count=len(stale)
+    )
+    await db.flush()
+    return len(stale)
 
 
 def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
@@ -843,23 +1035,77 @@ async def _apply_agentless_batch(
     return list(op_rows)
 
 
-async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None = None) -> None:
-    """Mark an op applied (ok) or failed."""
-    from datetime import UTC, datetime
+async def apply_acks(
+    db: AsyncSession, server_id: uuid.UUID, acks: Collection[dict[str, Any]]
+) -> None:
+    """Record an agent's verdicts on its ops (#1232). One load, one batched
+    successor lookup, however many acks.
 
-    op = await db.get(DNSRecordOp, op_id)
-    if op is None:
+    Only this server's ops: an ack for another server's op is ignored, where
+    it used to be applied to whatever op the id named.
+
+    An ``ok`` marks the op applied from any state — a late ack for an op the
+    unacknowledged-op reset already returned to ``pending`` is still true. An
+    error is a failed attempt only while the op is ``in_flight`` AND the ack
+    answers the current dispatch: the page stamps each op with ``dispatch``
+    (its attempt count when shipped) and the agent echoes it. A late error for
+    an earlier dispatch has already been counted — by the reset — and counting
+    it again would spend the retry budget twice. An agent too old to echo
+    ``dispatch`` is taken at its word, as before.
+    """
+    parsed: list[tuple[uuid.UUID, dict[str, Any]]] = []
+    for ack in acks:
+        try:
+            parsed.append((uuid.UUID(str(ack.get("op_id"))), ack))
+        except ValueError:
+            continue
+    if not parsed:
         return
-    op.attempts += 1
-    if result == "ok":
-        op.state = "applied"
-        op.applied_at = datetime.now(UTC)
-        op.last_error = None
-    else:
-        op.last_error = message
-        if op.attempts >= 5:
-            op.state = "failed"
-        else:
-            # Reset to pending so it gets re-shipped in the next bundle.
-            op.state = "pending"
+    ops = {
+        op.id: op
+        for op in (
+            await db.execute(
+                select(DNSRecordOp).where(
+                    DNSRecordOp.id.in_([i for i, _ in parsed]),
+                    DNSRecordOp.server_id == server_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    now = datetime.now(UTC)
+    failures: dict[uuid.UUID, tuple[DNSRecordOp, str]] = {}
+    for op_id, ack in parsed:
+        op = ops.get(op_id)
+        if op is None:
+            continue
+        dispatch = ack.get("dispatch")
+        current = not isinstance(dispatch, int) or dispatch == op.attempts
+        if ack.get("result", "error") == "ok":
+            if op.state != "applied":
+                if op.state == "in_flight" and current:
+                    op.attempts += 1
+                op.state = "applied"
+                op.applied_at = now
+                op.last_error = None
+                op.next_attempt_at = None
+                op.updated_at = now
+                failures.pop(op_id, None)
+        elif op.state == "in_flight" and current and op_id not in failures:
+            failures[op_id] = (op, str(ack.get("message") or "the agent reported an error"))
+    if failures:
+        await fail_attempts(db, list(failures.values()), now=now)
     await db.flush()
+
+
+async def ack_op(
+    db: AsyncSession,
+    op_id: str,
+    result: str,
+    message: str | None = None,
+    *,
+    server_id: uuid.UUID,
+) -> None:
+    """One ack; see :func:`apply_acks`."""
+    await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])

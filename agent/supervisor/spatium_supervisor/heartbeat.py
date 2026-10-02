@@ -126,10 +126,7 @@ def _is_control_plane_member() -> bool:
         that was promoted into the control plane and whose host
         runner has reported the join completed.
     """
-    if appliance_state.detect_appliance_variant() == "control-plane":
-        return True
-    join_state, _ = appliance_state.read_cluster_join_state()
-    return join_state == "ready"
+    return appliance_state.is_control_plane_member()
 
 
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:

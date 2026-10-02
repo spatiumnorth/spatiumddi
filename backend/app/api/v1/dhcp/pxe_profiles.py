@@ -46,6 +46,7 @@ from app.models.dhcp import (
     DHCPPXEProfile,
     DHCPServerGroup,
 )
+from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
     tags=["dhcp"],
@@ -65,10 +66,15 @@ class ArchMatchInput(BaseModel):
 
     priority: int = 100
     match_kind: str = "first_stage"
-    vendor_class_match: str | None = None
+    vendor_class_match: str | None = Field(default=None, max_length=255)
     arch_codes: list[int] | None = None
     boot_filename: str = Field(..., min_length=1, max_length=512)
     boot_file_url_v6: str | None = None
+
+    # #1357 — rendered inside Kea's ``=='<match>'`` literal, same as a phone
+    # profile's (#1294): a ``'`` or a control character rejects the group's
+    # whole config.
+    _vendor_match = field_validator("vendor_class_match")(check_vendor_class_match)
 
     @field_validator("match_kind")
     @classmethod

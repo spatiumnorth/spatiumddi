@@ -18,6 +18,7 @@ Subcommands (tags on stdin, one per line, where noted):
   is-newest TAG        print ``true`` when TAG is a final release no other
                        final release is newer than            (stdin: tags)
   notes TAG FILE       print TAG's section of the CHANGELOG at FILE
+  chart-version TAG    print the Helm chart version TAG is published as
 
 stdlib only: it runs on a bare runner, before anything is installed.
 """
@@ -147,8 +148,28 @@ def changelog_section(version: str, text: str) -> str:
     return "\n".join(out)
 
 
+def chart_version(current: Tag) -> str:
+    """The Helm chart version ``current`` is published as.
+
+    Helm requires strict SemVer 2, which forbids leading zeros in
+    ``MAJOR.MINOR.PATCH``, so a CalVer tag drops them: ``2026.04.20-1``
+    is published as chart ``2026.4.20-1``. The ``-N`` makes every CalVer
+    chart a SemVer pre-release, which is why Helm never picks one without
+    an explicit ``--version``. A SemVer tag is already a valid chart
+    version (the tag pattern forbids leading zeros) and is published
+    unchanged, so ``1.0.0`` is the first chart Helm resolves as the latest
+    stable one.
+    """
+    if not _CALVER_TAG.match(current.name):
+        return current.name
+    date_part, n = current.name.split("-", 1)
+    year, month, day = date_part.split(".")
+    return f"{int(year)}.{int(month)}.{int(day)}-{int(n)}"
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[0] not in {"check", "previous", "is-newest", "notes"}:
+    commands = {"check", "previous", "is-newest", "notes", "chart-version"}
+    if len(argv) < 2 or argv[0] not in commands:
         print(__doc__, file=sys.stderr)
         return 2
     command, name = argv[0], argv[1]
@@ -169,6 +190,9 @@ def main(argv: list[str]) -> int:
         return 1
     if command == "check":
         print(f"prerelease={'true' if current.prerelease else 'false'}")
+        return 0
+    if command == "chart-version":
+        print(chart_version(current))
         return 0
 
     lines = sys.stdin.read().splitlines()

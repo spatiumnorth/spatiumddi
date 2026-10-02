@@ -8,6 +8,15 @@ Title format: `<type>(<scope>): <short summary>`
 See CLAUDE.md + docs/DEVELOPMENT.md for conventions.
 -->
 
+## Before you open this PR
+
+Thanks for taking the time to contribute. So that nothing comes as a
+surprise, we ask everyone to read [CONTRIBUTING.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CONTRIBUTING.md) first. It is
+short, and it explains how we review and merge.
+
+- [ ] I have read [CONTRIBUTING.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CONTRIBUTING.md)
+- [ ] Every commit is signed off (`git commit -s`) under the [Developer Certificate of Origin](https://github.com/spatiumnorth/spatiumddi/blob/main/CONTRIBUTING.md#developer-certificate-of-origin-dco)
+
 ## Summary
 
 <!-- What does this PR change and why? -->

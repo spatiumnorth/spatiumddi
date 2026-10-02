@@ -1037,7 +1037,7 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
     operator can still act on while the Start button is unpressed.
 
     Nothing here can tell whether *this* upgrade crosses a minor: the
-    target is a CalVer appliance tag and the k3s version it bakes is not
+    target is an appliance release tag and the k3s version it bakes is not
     known to the control plane until the image boots. So the check
     reports what it can measure — how much history a restore would
     discard — and leaves the minor-or-not judgement to the operator, who
