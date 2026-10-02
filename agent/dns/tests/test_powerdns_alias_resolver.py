@@ -118,3 +118,98 @@ def test_the_first_render_starts_rather_than_restarts(
 
     driver.swap_and_reload()
     assert calls == ["start"]
+
+
+# ── the restart itself (#1402's gate walk + review) ───────────────────────
+
+
+def test_the_restart_flag_covers_the_whole_stop_and_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supervisor reads ``daemon_restarting`` from another thread, so it
+    must be up from before the stop until after the new daemon answers, and
+    down again even when the start raises."""
+    from spatium_dns_agent.drivers import powerdns
+
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    monkeypatch.setattr(powerdns, "find_running_daemon", lambda comm: None)
+    seen: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        driver, "start_daemon", lambda: seen.append(("start", driver.daemon_restarting()))
+    )
+    monkeypatch.setattr(
+        driver, "_wait_for_api_up", lambda: seen.append(("api", driver.daemon_restarting()))
+    )
+
+    assert driver.daemon_restarting() is False
+    driver._restart_daemon()
+    assert seen == [("start", True), ("api", True)]
+    assert driver.daemon_restarting() is False
+
+    def boom() -> None:
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(driver, "start_daemon", boom)
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        driver._restart_daemon()
+    assert driver.daemon_restarting() is False
+
+
+def test_a_daemon_that_will_not_stop_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adopting the survivor would reconcile against the old process and
+    record an apply pdns never loaded. The restart raises instead, before
+    clearing the pid or starting anything."""
+    from spatium_dns_agent.drivers import powerdns
+
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    driver.daemon_pid = 31337
+    signals: list[int] = []
+    monkeypatch.setattr(powerdns.os, "kill", lambda pid, sig: signals.append(sig))
+    started: list[str] = []
+    monkeypatch.setattr(driver, "start_daemon", lambda: started.append("start"))
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        driver._restart_daemon(stop_timeout_s=0.0)
+
+    assert signals == [powerdns.signal.SIGTERM]
+    assert started == []
+    assert driver.daemon_pid == 31337
+    assert driver.daemon_restarting() is False
+
+
+def test_a_failed_restart_is_retried_by_the_next_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap has already put the new pdns.conf in place, so the retry
+    compares the file with itself. The restart stays owed until one
+    succeeds, and is not repeated after that."""
+    new = "expand-alias=yes\nresolver=10.0.0.53\n"
+    driver = _staged(tmp_path, "expand-alias=no\n", new)
+    attempts: list[str] = []
+
+    def restart() -> None:
+        attempts.append("restart")
+        if len(attempts) == 1:
+            raise RuntimeError("pdns_server did not stop")
+
+    monkeypatch.setattr(driver, "daemon_running", lambda: True)
+    monkeypatch.setattr(driver, "_restart_daemon", restart)
+    monkeypatch.setattr(driver, "_load_or_generate_api_key", lambda: "k")
+    monkeypatch.setattr(driver, "_reconcile_zones", lambda *_a: None)
+
+    with pytest.raises(RuntimeError):
+        driver.swap_and_reload()
+
+    def restage() -> None:
+        (tmp_path / "rendered.new").mkdir()
+        (tmp_path / "rendered.new" / "pdns.conf").write_text(new)
+        (tmp_path / "rendered.new" / "zones.json").write_text("[]")
+
+    restage()
+    driver.swap_and_reload()  # the retry: same render, the restart still owed
+    restage()
+    driver.swap_and_reload()  # paid: an identical render restarts nothing
+
+    assert attempts == ["restart", "restart"]

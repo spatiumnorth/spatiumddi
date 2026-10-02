@@ -96,10 +96,30 @@ function hostsIn(text: string): string[] {
   return hosts;
 }
 
-/** The host written on the page as itself, not inside a longer name. */
+const isWordChar = (c: string): boolean => /^\w$/.test(c);
+
+/**
+ * The host written on the page as itself, not inside a longer name: nothing
+ * name-like right before it, and nothing after it that would extend it (a
+ * word character, `:` or `-`, or a `.` followed by a word character). A
+ * plain substring scan rather than a regex built from the host, so the dots
+ * in a hostname can never act as wildcards.
+ */
 function documented(host: string, privacy: string): boolean {
-  const escaped = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\w.:-])${escaped}(?![\\w:-]|\\.\\w)`).test(privacy);
+  for (
+    let i = privacy.indexOf(host);
+    i !== -1;
+    i = privacy.indexOf(host, i + 1)
+  ) {
+    const before = privacy.charAt(i - 1);
+    const after = privacy.charAt(i + host.length);
+    const next = privacy.charAt(i + host.length + 1);
+    if (before && (isWordChar(before) || ".:-".includes(before))) continue;
+    if (after && (isWordChar(after) || ":-".includes(after))) continue;
+    if (after === "." && next && isWordChar(next)) continue;
+    return true;
+  }
+  return false;
 }
 
 let scanned: Map<string, Set<string>> | undefined;
@@ -161,5 +181,7 @@ describe("outbound hosts in the Web UI (#1353)", () => {
   it("does not take a host inside a longer name as documented", () => {
     expect(documented("example.com", "see app.example.com.")).toBe(false);
     expect(documented("app.example.com", "see `app.example.com`.")).toBe(true);
+    // A dot in the host is a dot, never a wildcard.
+    expect(documented("app.example.com", "see appXexample.com.")).toBe(false);
   });
 });

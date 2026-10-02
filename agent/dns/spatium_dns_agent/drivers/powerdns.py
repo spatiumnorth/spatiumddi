@@ -335,6 +335,15 @@ def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
+    #: Set for the length of ``_restart_daemon``; read by the supervisor's
+    #: liveness check on another thread (see ``daemon_restarting``).
+    _restarting: bool = False
+    #: A changed ``pdns.conf`` that the running daemon has not loaded yet.
+    #: Cleared only by a restart that succeeded: once the render is swapped
+    #: in, a retry compares the new file with itself and would otherwise
+    #: never restart, leaving pdns on the old settings for good.
+    _conf_restart_owed: bool = False
+
     # ── Render / validate / swap ────────────────────────────────────────────
 
     def render(self, bundle: dict[str, Any]) -> None:
@@ -665,21 +674,27 @@ class PowerDNSDriver(DriverBase):
         # Before that check existed this comment was simply wrong —
         # start_daemon only verified the config file and the binary,
         # and would happily spawn a second daemon.
+        if old_conf is not None and old_conf != _read_text_or_none(current / "pdns.conf"):
+            self._conf_restart_owed = True
         if not self.daemon_running():
             log.info("powerdns_daemon_starting_after_first_render")
             self.start_daemon()
             self._wait_for_api_up()
-        elif old_conf is not None and old_conf != _read_text_or_none(
-            current / "pdns.conf"
-        ):
+            # A fresh daemon reads the current render, so nothing is owed.
+            self._conf_restart_owed = False
+        elif self._conf_restart_owed:
             # pdns reads pdns.conf only when it starts, so a changed one
             # (the ALIAS resolver from the group's forwarders, #1353; the log
             # level; query logging) is otherwise ignored until the container
             # restarts. Zones live in LMDB and survive; the reconcile below
             # runs against the new daemon. Costs a sub-second gap in answers,
-            # and only when an operator changes a server option.
+            # and only when an operator changes a server option. A restart
+            # that raises leaves the debt in place, so the sync loop's retry
+            # of this apply restarts again rather than comparing the swapped-in
+            # file with itself.
             log.info("powerdns_conf_changed_restarting", pid=self.daemon_pid)
             self._restart_daemon()
+            self._conf_restart_owed = False
 
         api_key = self._load_or_generate_api_key()
         zones_path = current / "zones.json"
@@ -700,33 +715,57 @@ class PowerDNSDriver(DriverBase):
         # the timing race fired.
         self._reconcile_zones(api_key, payload)
 
+    def daemon_restarting(self) -> bool:
+        return self._restarting
+
     def _restart_daemon(self, *, stop_timeout_s: float = 15.0) -> None:
-        """Stop ``pdns_server`` and start it from the current render."""
-        pid = self.daemon_pid or find_running_daemon("pdns_server")
-        if pid is not None:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pid = None
-        deadline = time.monotonic() + stop_timeout_s
-        while pid is not None and time.monotonic() < deadline:
-            # We spawned it, so once it exits it is our zombie until reaped.
-            try:
-                if os.waitpid(pid, os.WNOHANG)[0] == pid:
-                    break
-            except ChildProcessError:
-                # Not our child (adopted after an agent restart): poll instead.
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    break
-            time.sleep(0.1)
-        else:
+        """Stop ``pdns_server`` and start it from the current render.
+
+        Runs on the sync thread while the supervisor checks liveness every
+        second on its own, so ``_restarting`` covers the whole stop/start:
+        without it a tick between the SIGTERM and the new spawn read the old
+        pid as a dead daemon and the agent exited 2 (#1402's gate walk: 2 of 3
+        forwarder changes, DNS down ~13 s through kubelet's back-off).
+
+        A daemon that outlives the stop timeout is NOT adopted: the start
+        below would find it running and keep it, the reconcile would succeed
+        against the old process, and the apply would be recorded although
+        pdns never loaded the new file. Raising fails the apply instead, and
+        ``_conf_restart_owed`` makes the retry restart again.
+        """
+        self._restarting = True
+        try:
+            pid = self.daemon_pid or find_running_daemon("pdns_server")
             if pid is not None:
-                log.warning("pdns_server_stop_timed_out", pid=pid)
-        self.daemon_pid = None
-        self.start_daemon()
-        self._wait_for_api_up()
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pid = None
+            deadline = time.monotonic() + stop_timeout_s
+            while pid is not None and time.monotonic() < deadline:
+                # We spawned it, so once it exits it is our zombie until reaped.
+                try:
+                    if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                        break
+                except ChildProcessError:
+                    # Not our child (adopted after an agent restart): poll instead.
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                time.sleep(0.1)
+            else:
+                if pid is not None:
+                    log.warning("pdns_server_stop_timed_out", pid=pid)
+                    raise RuntimeError(
+                        f"pdns_server (pid {pid}) did not stop within {stop_timeout_s:g}s "
+                        "of SIGTERM, so it is still serving the previous pdns.conf"
+                    )
+            self.daemon_pid = None
+            self.start_daemon()
+            self._wait_for_api_up()
+        finally:
+            self._restarting = False
 
     def _wait_for_api_up(self, *, timeout_s: float = 10.0) -> None:
         """Poll the local PowerDNS REST API until it answers (or

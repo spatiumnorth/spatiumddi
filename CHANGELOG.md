@@ -1963,6 +1963,9 @@ the formatter handles the rest.
   restarts `pdns_server`, a sub-second gap in answers: pdns reads
   `pdns.conf` only at startup, so until now a new log level, query
   logging, and the resolver all waited for the container to restart.
+  The agent waits that restart out rather than reading the old daemon's
+  exit as a crash, and a `pdns_server` that will not stop fails the
+  apply, which is retried, instead of keeping the old settings.
 
 - **Setting up two-factor authentication needs a step-up (#1241).**
   `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
