@@ -54,6 +54,12 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "2ff144dc196f8f186e9a3ba3dcfc6b9f988839d9bf2e2ad6f5ee0596e32138d9",
         "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
     },
+    # #1373: the zones are listed by name, so the plain group's reverse zone
+    # now comes before its forward one (the views group has one zone).
+    4: {
+        "plain": "90082e1b1aebf1f15faecfdecaa1056b5316cdd884a9479dbad94a84aae1d6ab",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
 }
 
 

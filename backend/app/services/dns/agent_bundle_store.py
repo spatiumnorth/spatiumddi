@@ -65,7 +65,9 @@ _MAX_ERROR = 2000
 # 2 (#1171): every zone copy carries its SOA timers.
 # 3 (#1373): a zone's serial left the structural fingerprint of a group
 #   without views.
-RENDERER_REVISION = 3
+# 4 (#1373): a group's zones are listed by name, not in the order Postgres
+#   happened to read them.
+RENDERER_REVISION = 4
 
 
 def _serves(revision: int | None) -> bool:

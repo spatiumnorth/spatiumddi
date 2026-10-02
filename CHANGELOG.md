@@ -38,11 +38,14 @@ the formatter handles the rest.
   the reload the RFC 2136 path exists to avoid, a served value that no
   longer followed the record op's state, and a manual `rndc freeze` that
   lasted only until the next record change. The serial is now left out
-  of the fingerprint, with the records. It stays in the payload, and the
-  agent now also reports the serial a record change brings once the op
-  that carries it has applied, beside the report it sends after a
-  reload. Groups with views are unchanged: there every record change
-  re-renders, by design.
+  of the fingerprint, with the records, and the bundle lists a group's
+  zones by name: they came in whatever order the database read them, and
+  the zone a record change touched could move in that order, which moved
+  the fingerprint of any group of two zones or more on its own. The
+  serial stays in the payload, and the agent now also reports the serial
+  a record change brings once the op that carries it has applied, beside
+  the report it sends after a reload. Groups with views are unchanged:
+  there every record change re-renders, by design.
 
 - **A change to a BIND9 zone is served even while named holds RFC 2136
   updates for it (#1407).** named writes an RFC 2136 update into the

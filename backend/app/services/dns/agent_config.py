@@ -341,8 +341,17 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     )
     acls = acls_res.scalars().all()
 
-    # Zones (+ records for primary only)
-    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
+    # Zones (+ records for primary only), by name like every other list the
+    # structural fingerprint hashes, then by id (two views may each hold a
+    # zone of the same name). Unordered, Postgres returned them in whatever
+    # order its plan read them, and the UPDATE a record change makes to its
+    # zone (``last_serial``) moved that zone in it, so a record change moved
+    # the structural etag of any group of two zones or more (#1373).
+    zones_res = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id == server.group_id)
+        .order_by(DNSZone.name, DNSZone.id)
+    )
     zones = zones_res.scalars().all()
 
     # Dynamic-update ACLs (issue #641). One JOIN across every ACL row in the
