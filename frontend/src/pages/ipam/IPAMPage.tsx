@@ -95,6 +95,10 @@ import {
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
+import {
+  customFieldChecked,
+  withCustomFieldDefaults,
+} from "@/lib/customFieldValues";
 import { hostnameError } from "@/lib/dnsNames";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
@@ -787,8 +791,11 @@ function CustomFieldsSection({
             // Displayed value: local if set, else empty (so the inherited
             // value shows through the HTML placeholder). We never pre-fill
             // the input with the inherited value — that would flip it from
-            // "inherited" to "locally set" the moment the user saves.
-            const val = rawLocal ?? def.default_value ?? "";
+            // "inherited" to "locally set" the moment the user saves. Nor
+            // with the definition's Default Value: a create dialog puts it
+            // in ``values``, which is what it sends (#1303), and an edit
+            // dialog shows only what is stored.
+            const val = rawLocal ?? "";
             const inheritedBadge =
               localUnset && hasInherited ? (
                 <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
@@ -816,7 +823,7 @@ function CustomFieldsSection({
                   <input
                     type="checkbox"
                     className="rounded"
-                    checked={!!val}
+                    checked={customFieldChecked(val)}
                     onChange={(e) => onChange(def.name, e.target.checked)}
                   />
                 ) : def.field_type === "select" && def.options ? (
@@ -2431,7 +2438,7 @@ function isIPv6Cidr(cidr: string): boolean {
   return cidr.includes(":");
 }
 
-function CreateSubnetModal({
+export function CreateSubnetModal({
   spaceId,
   defaultBlockId,
   defaultNetwork,
@@ -2548,6 +2555,9 @@ function CreateSubnetModal({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -2599,7 +2609,7 @@ function CreateSubnetModal({
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status: "active",
         skip_auto_addresses: skipAuto,
-        custom_fields: customFields,
+        custom_fields: shownCustomFields,
         dns_inherit_settings: dnsInherit,
         ...(dnsInherit
           ? {}
@@ -2887,7 +2897,7 @@ function CreateSubnetModal({
           </Field>
           <CustomFieldsSection
             definitions={cfDefs}
-            values={customFields}
+            values={shownCustomFields}
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
@@ -3175,7 +3185,7 @@ function CollisionWarningBanner({
   );
 }
 
-function AddAddressModal({
+export function AddAddressModal({
   subnetId,
   presetRange,
   onClose,
@@ -3291,6 +3301,9 @@ function AddAddressModal({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   // Fetch effective DNS for this subnet to know which zones are available
   const { data: effectiveDns } = useQuery({
@@ -3366,7 +3379,7 @@ function AddAddressModal({
               status: ipStatus,
               mac_address: mac || undefined,
               description: description || undefined,
-              custom_fields: customFields,
+              custom_fields: shownCustomFields,
               dns_zone_id: zoneParam,
               extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
@@ -3381,7 +3394,7 @@ function AddAddressModal({
               mac_address: mac || undefined,
               description: description || undefined,
               status: ipStatus,
-              custom_fields: customFields,
+              custom_fields: shownCustomFields,
               dns_zone_id: zoneParam,
               extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
@@ -3869,7 +3882,7 @@ function AddAddressModal({
         </Field>
         <CustomFieldsSection
           definitions={cfDefs}
-          values={customFields}
+          values={shownCustomFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -8637,7 +8650,7 @@ function toLocalDatetimeInput(iso: string): string {
     .slice(0, 16);
 }
 
-function EditAddressModal({
+export function EditAddressModal({
   address,
   onClose,
 }: {
@@ -11558,7 +11571,7 @@ function flattenBlocks(
 
 // ─── Create Block Modal ───────────────────────────────────────────────────────
 
-function CreateBlockModal({
+export function CreateBlockModal({
   spaceId,
   defaultParentBlockId,
   onClose,
@@ -11608,6 +11621,9 @@ function CreateBlockModal({
     queryKey: ["custom-fields", "ip_block"],
     queryFn: () => customFieldsApi.list("ip_block"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   const { data: blockTemplates } = useQuery({
     queryKey: ["ipam-templates", "block"],
@@ -11626,7 +11642,7 @@ function CreateBlockModal({
         name: name || undefined,
         description: description || undefined,
         parent_block_id: parentBlockId || undefined,
-        custom_fields: customFields,
+        custom_fields: shownCustomFields,
         dns_inherit_settings: dnsInherit,
         ...(dnsInherit
           ? {}
@@ -11747,7 +11763,7 @@ function CreateBlockModal({
           )}
           <CustomFieldsSection
             definitions={cfDefs}
-            values={customFields}
+            values={shownCustomFields}
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }

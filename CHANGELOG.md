@@ -27,6 +27,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A custom field's Default Value is what the IPAM dialogs send, not
+  only what they show (#1303).** Allocate IP, New Subnet and New IP Block
+  showed a field's Default Value (Settings → Custom Fields) as its value,
+  but sent `custom_fields: {}`, and the API applies no default on create,
+  so the object was stored without it. Edit subnet, Edit IP Block and
+  Edit address showed the default too, on objects that never had the
+  field. The create dialogs now start the field at its default and send
+  it; the edit dialogs show only what is stored. A boolean default of
+  "false" rendered checked: boolean values are now read as true / false
+  words, and a select default its options do not offer, or a number
+  default that is not a number, is left out. The default stays a console
+  pre-fill: a create through the API or an import gets what it sends.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
