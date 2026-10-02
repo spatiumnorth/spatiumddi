@@ -2693,6 +2693,16 @@ nothing to restore automatically. The rolling-upgrade preflight's
 `pre_upgrade_backup` row warns when no backup target has succeeded in
 the last 24 hours. Run one before starting.
 
+**Coming from 2026.09.04-1 or earlier: do not go back to it.** Take a
+backup before the upgrade. 2026.10.02-1 adds 22 migrations that
+2026.09.04-1 cannot run on, and 2026.09.04-1 predates both the check
+above and the clearer migrate error, so a trial-boot revert or a
+Compose / Helm redeploy of it leaves the control plane down with only
+`Can't locate revision` to go on. Its chart also lacks the #1042 fix,
+so a reinstall during the rollback can mint a new `SECRET_KEY` and
+leave every credential encrypted at rest unreadable. If you must go
+back, restore the pre-upgrade backup together with the older release.
+
 **If an appliance is already stuck.** The older release's
 `wait-for-migrate` init container prints the cause once, including
 `The database was migrated by a NEWER SpatiumDDI release`, then keeps

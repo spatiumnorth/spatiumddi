@@ -23,7 +23,59 @@ the formatter handles the rest.
 
 ---
 
-## Unreleased
+## 2026.10.02-1 — 2026-10-02
+
+# ⚠️ Please don't roll back to 2026.09.04-1
+
+> **Once you have upgraded to this release, do not go back to
+> 2026.09.04-1 or any earlier release.** Take a database backup
+> before you upgrade. This release adds 22 database migrations, and
+> 2026.09.04-1 cannot run on the result: its migrate step fails with
+> `Can't locate revision`, and its api, worker and beat wait for that
+> step forever, so the control plane does not come back. This release
+> refuses a slot rollback or Fleet boot change onto a release that
+> cannot run on the database (#1227), but the automatic trial-boot
+> revert and a Compose or Helm redeploy of an older tag are not
+> checked, and 2026.09.04-1 itself cannot tell you what went wrong.
+> Its chart also lacks the fix for #1042, so a reinstall during the
+> rollback can mint a new `SECRET_KEY` and leave every credential
+> encrypted at rest unreadable. If you must go back, restore the
+> backup you took before the upgrade alongside the older release.
+
+**This is not 1.0.0.** 1.0.0 is still being worked on, and this
+release is a waypoint on the way there: a month of QA on the ddi-pg
+proving ground and the Academy course, 147 commits, most of them fixes
+for defects that only show up on a real estate, a real appliance
+fleet, or an upgrade. It is still a CalVer release, and 1.0.0 will be
+announced as its own release when it is ready. **Security:** remote
+agents, appliance supervisors and role pods now verify the control
+plane's TLS certificate (they trusted any certificate before, while
+carrying the platform-wide agent key) (#1219, #1220, #1281); a second
+auth provider of the same type can no longer sign in as another
+provider's user (#1235); the api refuses to boot on a placeholder
+`SECRET_KEY` (#1222); `/metrics` needs a bearer token (#1159); and a
+release now publishes nothing until CI, Trivy and `main` all agree
+(#1226). **Scale:** DNS agent config bundles are rendered once in the
+worker and served as stored bytes, so a million-record group converges
+(#1111), and deleting or restoring a large zone no longer scales with
+it (#1231, #1389). **Agents** spool what they collect during a
+control-plane outage and replay it on reconnect (#1077), and Kea's
+DHCPv6 leases finally reach IPAM and DDNS (#1141). **New:** the
+appliance builds for arm64 (#1026) and installs onto a RAID1 mirror
+(#999), E911 dispatchable location (#972), Windows DHCP failover
+awareness and management (#1110), an enforceable SSH source-CIDR
+allowlist (#1009), and removable USB backup disks. Groundwork for the
+move to SemVer at 1.0.0 is in (#1182). 9 new MCP tools.
+
+**Before you upgrade, check four things.** A Prometheus job scraping
+`/metrics` without a token gets 401 (#1159). A Compose or k8s install
+still on the committed placeholder `SECRET_KEY` will not start
+(#1222). A remote Compose agent that relied on the old
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` default needs `TLS_CA_PATH`
+(#1220). And images now come from `ghcr.io/spatiumnorth/…` after the
+GitHub organization rename. A fresh install also enables fewer
+feature modules than before; existing installs are not changed
+(#1069).
 
 ### Added
 
@@ -179,6 +231,1134 @@ the formatter handles the rest.
   upgrade (one full-body fetch; a full re-render only under
   split-horizon, where records are structural).
 
+- **Removable (USB) backup disks on the appliance (#989 item 3).**
+  The last piece of #989, closing it. Items 1, 2 and 4 (write-only +
+  S3 Object Lock, the `https_put` kind, and `ETag` / `If-None-Match` on
+  the pull routes) landed earlier in this same cycle, under #1024.
+  The single-appliance operator with no NAS and no cloud account backs
+  up to a USB disk, and there was no supported way to: `local_volume`
+  writes to a path *inside* the api and worker pods, and nothing
+  managed a host mount. #971 avoided the
+  same problem for NFS by speaking the protocol in userspace — a block
+  device has no userspace escape hatch, so this is the host mount
+  plane. Fleet → the appliance → **Removable storage**; 3 REST routes;
+  1 MCP tool (`find_appliance_removable`, read-only, default on).
+  Migration `e3b9d7412c5a`.
+  **The failure this must never produce is a backup that reports
+  success.** `local_volume`'s write does `mkdir -p` first, so a path
+  whose disk is absent is *created* and written to — on the appliance's
+  own `/var`, with the run green, retention pruning happily, and the
+  operator believing they have backups. That is strictly worse than a
+  destination that never worked, because it displaced the worry. Three
+  independent things stop it, in descending order of how much they can
+  be trusted: the per-disk mountpoint is `0500` root-owned whenever
+  nothing is mounted on it (the kernel refusing, which holds even if
+  everything above it is wrong); every read and write under the
+  removable root refuses unless the path is still on a live mountpoint
+  (one test, four causes — ejected, yanked, mount unit failed, wrong
+  node); and the destination records which node the disk is on so the
+  error names it.
+  **`mountPropagation: HostToContainer` is the contract, not a chart
+  detail.** A hostPath volume defaults to *private* propagation, under
+  which a mount the host makes after the pod started is invisible
+  inside it — so without this the pod writes to the empty underlying
+  directory and reports success, which is the same silent failure by
+  another route. Measured against a real kernel in both modes rather
+  than assumed; `os.path.ismount` was checked the same way, and does
+  correctly flip back to "plain directory" after an unmount.
+  **Two deviations from the issue, both because the premise did not
+  survive contact.** It asked for a `.automount` "so a disk pulled
+  without ejecting does not hang boot" — but what delivers that is the
+  unit being `WantedBy` its `dev-disk-by-uuid-….device` rather than
+  `local-fs.target`, so udev mounts the disk when it appears and boot
+  waits for nothing. autofs adds nothing there and subtracts: a process
+  touching an autofs mountpoint whose device is absent blocks in the
+  kernel, and the processes touching this path are the api and the
+  Celery worker. `BindsTo=` the device gives the rest — a yanked disk
+  is torn down rather than left as a stale mountpoint. And the issue
+  wanted a multi-node run to "fail with `disk is on node X`", which
+  ships — but the honest framing is that on an N-node control plane a
+  run lands on the right node about 1 time in N, since api and worker
+  each run one replica per node. The refusal is the deliverable;
+  routing is a tracked follow-up, and the docs say to prefer `nfs` /
+  `s3` / `smb` on a cluster.
+  **ext4 and exFAT only, and the refusals each have a reason worth
+  stating.** FAT32 caps one file at 4 GiB, so an archive that outgrows
+  it fails at the *end* of a long run on a destination that had worked
+  for months — better refused up front. A filesystem with no UUID has
+  nothing stable for `What=`, since the kernel device name is
+  reassigned on the next plug. And the appliance's **own** partitions
+  are refused by reserved PARTLABEL / filesystem label: a box that
+  boots from USB reports its root, ESP and STATE as removable
+  candidates with perfectly good filesystems on them, and offering the
+  running root as a backup destination is the worst thing this could
+  do. Unusable disks are listed *with the reason* rather than hidden —
+  a disk that simply does not appear is indistinguishable from one not
+  noticed yet (#1026's picker rule).
+  **ext4 rejects `uid=` at mount time** (measured: `ext4: Unknown
+  parameter 'uid'`), so archives go in `<mount>/spatiumddi` — chowning
+  the root of a disk that may hold the operator's other data is ruder
+  than creating one directory on it. A separate
+  `spatiumddi-removable-prepare.service`, pulled in by each `.mount`
+  unit, does that after the mount *however it happened* — including a
+  disk plugged in hours later and mounted by udev with no operator
+  action, which the apply path never sees.
+  **One bug found by the tests, of the class this repo keeps finding.**
+  The teardown loop matched its own units with a shell glob built from
+  the escaped mount root — and `systemd-escape` emits `\x2d` for a
+  literal dash, where in a glob `\x` is an *escaped x*. So the moment
+  the root path contained a dash the pattern stopped matching the very
+  filenames it was derived from, silently, and eject became a no-op
+  that still reported success. It now matches with `case` against a
+  quoted prefix, which has no escaping semantics at all. The prefix is
+  also derived from the root rather than written out as a literal, so
+  the two cannot drift.
+  Also: the worker gained `NODE_NAME` (the api has had it since #983),
+  without which a *scheduled* run could not say which node the disk was
+  on — only that nothing was mounted. The destination's node is
+  **derived from the fleet**, not typed: exactly one appliance has a
+  given mount name and it reports its own node name, so asking the
+  operator to paste a Kubernetes node into a generic text box would
+  have left the defence unarmed on every default install.
+  **/code-review found fourteen more, and the cluster is worth
+  recording because they share one root: three namespaces that look
+  alike.** Host paths, container paths and desired-vs-reported state
+  were each conflated somewhere.
+  *The worst was silent and catastrophic.* `_RESERVED_LABELS` was
+  hand-retyped from the installer and **omitted `var`** — the partition
+  holding PostgreSQL, the container images and `/var/lib/spatiumddi`
+  itself. On a USB-booted appliance it passed every check and was
+  offered in the picker; mounting it binds the same superblock twice,
+  so archives land on the appliance's own `/var` while `ismount`
+  passes, the `0500` guard passes and the run reports success — all
+  three advertised defences green. It now has `var`, has lost the
+  invented `boot` (no partition carries that label), and is backstopped
+  by a booted-disk check that needs no list at all. The refusals were
+  also **reordered**: ownership before filesystem, because the ESP is
+  `vfat` and asking the fstype question first told the operator to
+  reformat the partition their box boots from.
+  *The second was structural.* `_host_mounted_sources` parses
+  `/proc/1/mountinfo`, which under `hostPID: true` renders paths against
+  HOST init's root — and it was compared against the CONTAINER-side
+  `/host-removable`. That can never match, so every disk this feature
+  successfully mounted reported `usable: false, "already mounted at …"`
+  and could not be re-mounted. Two named constants now, and a test
+  built at the production shape: the one it replaced derived both sides
+  from a single fixture value, i.e. modelled the one world where the
+  two namespaces coincide, and was structurally incapable of failing.
+  *The empty set was overloaded three ways.* It hashed to `""` — which
+  is also what a MISSING applied sidecar reads as, so an eject after a
+  failed apply fired nothing at all; and `_write_fire_state` emits
+  `f"{hash}\t{attempts}\t{iso}"` while `_read_fire_state` `.strip()`s
+  the leading tab back off, so an empty hash round-trips as
+  `hash="1"` — pinning the #387 backoff at one attempt (re-firing every
+  tick forever) and making a *successful* eject report `retrying` for
+  the rest of the node's life. It hashes `[]` for real now; `enabled:
+  false` carries the disable semantics. And the validation fallback no
+  longer ships an empty list at all: on this plane empty means *tear
+  everything down*, so a row that stopped validating would have
+  silently unmounted every backup disk on the node. It ships
+  `mounts: null` — "no instruction" — and the supervisor does nothing.
+  *The runner reported success on four different no-ops.* A failed
+  `systemctl disable --now` (EBUSY — a backup holding the mount open)
+  was discarded, the unit deleted anyway and the eject reported
+  applied, leaving the disk mounted with nothing managing it and
+  invisible on every surface; `install` and `systemctl enable` failures
+  were unchecked, so a full or read-only `/etc` overlay produced an
+  apply that armed nothing and stamped the hash; and the `python3`
+  substitution's exit status was unchecked, so an OOM-killed
+  interpreter produced an empty desired set, i.e. the teardown command.
+  The teardown also keyed on "not VERIFIED" rather than "not DESIRED",
+  so an entry this runner's allowlist dropped had its LIVE unit
+  unmounted and its mountpoint removed — while the drop path left the
+  exit status at 0. Teardown is now skipped entirely unless the desired
+  set was understood completely, and a drop fails the apply.
+  *Three more.* `nofail` was missing, so systemd's implicit
+  `Before=local-fs.target` applied and a disk present at boot ordered
+  k3s behind its own mount. Nothing daemon-reloaded after `etc.mount`,
+  so a disk left plugged in across a reboot could have its unit and its
+  symlink both on disk and neither loaded — a new
+  `spatiumddi-removable-boot.service` closes that. And `flock -n`
+  abandoned a deferred run, which with an edge-triggered `.path` and a
+  no-stacking trigger guard wedged the plane permanently.
+  *Honesty fixes.* `supported` and `present` were both computed,
+  shipped and read by nobody — the "written, never read" class — and
+  they are the two fields that separate "your disk is unplugged" from
+  "this node cannot look" and from "the disk is in the port and the
+  mount failed". Both are surfaced now, as `blind` and `present`
+  states. The runner's failure *reason* sidecar was written and
+  discarded (the #882 deferred item, in a new plane); it is read and
+  rendered. `str(None)` is `"None"` and truthy, so a block missing
+  `node_name` rendered "Disks here are on node None" — `_s()` now,
+  which already existed. And the eject mutation had no `onError`, so a
+  503 under maintenance mode left the modal sitting there after
+  promising the disk was safe to pull.
+  *Plus:* an unlocked read-modify-**append** on the desired list (the
+  file's first, where a lost update loses an action rather than
+  overwriting one) now takes `FOR UPDATE`; `local_volume.write`
+  translates `OSError` so a full USB stick records a failure instead of
+  wedging the target at `in_progress` forever; `_path` moved inside the
+  worker threads, since it now walks mountpoints on a device that may
+  have been yanked and was doing it on the api event loop; and
+  `exfatprogs` reached `NOTICE` + `THIRD_PARTY.md`.
+  **No `propose_*` MCP tool** (explicit decision per non-negotiable
+  #13): mounting names a disk that the operator is physically holding
+  and ejecting takes a live backup destination offline. Both are the
+  broad-blast-radius, physical-world-coupled shape that guidance says
+  to keep off the copilot.
+
+- **Interface MTU (#1017).** The appliance could not set one anywhere:
+  not in the installer, not in the preseed schema, not in STATE, not in
+  the host-config plane. The only route was `nmtui`, and per #1016 an
+  edit there reverts at the next boot. Now `network_mtu` in
+  `spatium-config.yaml`, asked for by the wizard in **both** network
+  modes, accepted as `network.mtu` in a #549 answer file, round-tripped
+  by the #995 answers export, and rendered into the `[ethernet]` section
+  of whichever NetworkManager keyfile applies.
+  **The case for it is not jumbo frames**, and the docs say so rather
+  than leaving it to be inferred. SpatiumDDI's own traffic is small UDP
+  and small JSON — post-flag-day EDNS0 buffers sit at 1232 precisely to
+  avoid fragmentation — and raising the MTU on a DHCP-served segment is
+  actively hazardous because PXE ROMs are 1500. The gap is the other
+  direction: an appliance reached over a WireGuard / IPsec / GRE tunnel,
+  PPPoE, or a reduced-MTU provider underlay needs an MTU *below* 1500,
+  and that failure is nasty and common — ping and small requests work,
+  large TCP hangs, and it reads as an application fault.
+  **One rule, three doors**, because a value one door accepts and
+  another drops is a setting the operator was told took effect and did
+  not. 576-9000; below 1280 is **refused** alongside a pinned static
+  IPv6 address rather than warned about, since RFC 8200 makes 1280 the
+  IPv6 minimum link MTU and such a node is broken by specification —
+  while IPv6 on its RA / SLAAC default has no configured address to
+  break, so the 1200-byte tunnel this feature exists for is allowed. The
+  renderer validates too and **drops** a value it cannot trust with a
+  reason in `etc-render.log`: STATE is hand-editable, an unparseable
+  `mtu=` risks NetworkManager rejecting the profile, and a box with no
+  network at all is far worse than one at the default. A test drives all
+  three doors and asserts they reach the same verdict; it caught the
+  wizard accepting `+1400` — which `int()` takes and the other two
+  refuse — before it shipped.
+  **DHCP with no pinned interface is refused, not accepted-and-ignored.**
+  etc-render writes no keyfile in that shape, so there is no `[ethernet]`
+  section for the value to live in; the wizard does not offer the field
+  and the parser fails the key rather than storing something that reaches
+  nothing.
+  **Mixed-MTU clusters are the appliance-specific hazard**, so this is a
+  fleet check and not a per-node one — the #1013 lesson applied before
+  the fact. k3s runs `flannel-backend: host-gw`, which writes plain
+  routes instead of encapsulating, so the pod network inherits the node
+  MTU with **no tunnel headroom**: one node at 9000 and two at 1500
+  black-holes pod-to-pod traffic and presents as random timeouts with
+  nothing in the UI explaining it. The supervisor reports what was
+  *applied* — not what STATE asked for, or the control plane would call a
+  node running 9000 and a node that asked for 9000 and was refused
+  consistent — through a sidecar in the bind mount `role-config` already
+  uses, so **no chart change, no heartbeat field, no migration**. A
+  warning on **Appliance → Fleet** names the nodes on each side; the
+  per-node value shows in the drilldown and, when there is something to
+  say, on the console.
+  **"Unset" is compared as itself, never as 1500.** Scoring an
+  unconfigured node at the Ethernet default is a guess about hardware
+  nobody read, and would tell an operator whose switches are genuinely
+  all-9000 that their cluster disagrees when it does not — so the banner
+  states the default was not read from the node. A node that has not
+  reported is excluded rather than assumed, or a genuine mismatch would
+  read as agreement on exactly the nodes that could not answer. Every
+  appliance installed before this reports `default`, one distinct answer,
+  so the check is silent on the existing estate.
+  **`ethernet.mtu` becomes adoptable**, closing the gap #1016 shipped
+  with — it was that issue's headline *un*adoptable setting. It is the
+  one adoptable key whose absence carries meaning, since NetworkManager
+  omits a property at its default rather than writing `mtu=0`: clearing
+  one in nmtui and never having had one arrive identically, so
+  `spatium-network-adopt` reports `network_mtu` unconditionally for a
+  managed profile and clearing it is drift you can adopt. No new MCP tool
+  (explicit decision per non-negotiable #13 — `find_appliance_fleet`
+  answers exactly this and gained the field plus the fleet verdict) and
+  not a feature module (#14 — it extends an existing resource). Applied
+  at boot, and every surface says so.
+  **A ten-angle /code-review found the design right and the plumbing
+  wrong. Every confirmed finding is fixed; the ones worth knowing:**
+  **The fleet comparison spanned the wrong nodes** — it filtered on
+  *approved*, and approved is not "in the k3s cluster": an un-promoted
+  Additional node has `cluster_role IS NULL` and runs its own
+  single-node k3s, which APPLIANCE.md says outright. So this feature's
+  own headline deployment — a branch DNS appliance on a 1400-MTU tunnel
+  beside a control plane at the default — raised a permanent,
+  unclearable banner claiming flannel would black-hole traffic between
+  two boxes sharing no pod network. Membership is `cluster_role` now, in
+  one predicate both the REST list and the copilot call.
+  **The wizard validated one value and stored another.** It checked a
+  stripped copy and wrote the raw string, so a pasted `" 1400"` was
+  accepted, shown on Confirm, written to STATE and dropped at boot —
+  this feature's own failure mode, inside the feature. Leading zeros
+  were worse: `01400` is a fine `int` to both writing doors and is
+  refused by the renderer, and written through, NetworkManager
+  normalises it on its next save and the adopt tool then offers phantom
+  drift forever.
+  **The rule was transcribed instead of shared.** #995 built
+  `--check-field` precisely so the wizard carries no second copy of a
+  validator, and the two copies had already drifted at birth. There is
+  one `validate_mtu` now, which also closes the `isdigit()`/`int()`
+  domain gap in both directions (`'٤'` converts, so it would be stored
+  then dropped; `'²'` raises, which on the parse path was an uncaught
+  traceback) and applies the "DHCP needs a pinned interface" rule at
+  every door rather than one.
+  **`echo` is not `printf`.** The sidecar is written by `/bin/sh` =
+  dash, whose `echo` expands backslash escapes, so a hand-edited
+  `network_mtu` containing one emitted a SECOND `MTU=` line — and every
+  reader assigns while iterating, so the last wins. The supervisor would
+  report 9000 on a node at the link default: the one invariant the
+  sidecar exists to hold, defeated downstream of the validation that
+  exists because STATE is hand-editable.
+  **A skipped keyfile left the previous boot's MTU in force** while the
+  sidecar said `n/a`, so a node genuinely running 1400 was compared as
+  the link default. The stale profile is removed now.
+  **`--adopt` was a fourth door with no rule** — an nmtui `mtu=500` is
+  legal to NetworkManager and below our floor, so the console printed
+  "Adopted 1 setting(s)" and the next boot dropped it. And a suppressed
+  difference made `--check` print "Live profile matches STATE" directly
+  above the note contradicting it and exit 0 against a documented
+  exit-code contract, while `--adopt` dropped the note entirely.
+  Refusals are a field on the drift entry now, so every surface sees
+  them.
+  **The 576-9000 guard was bypassed by an over-long digit string.** The
+  shell's `[ -lt ]` does not fail safe — dash and bash both print
+  "Illegal number" and exit non-zero, which reads as "not out of range"
+  — so a 20-digit MTU reached the keyfile, NM rejected the profile, and
+  every surface reported it applied. `set -e` does not catch it inside
+  an `if`.
+  **The static-network loop had flipped from exit status to
+  output-emptiness** while both validators merge stderr into stdout, so
+  one `DeprecationWarning` from a future image's python would have made
+  a valid config permanently unacceptable and trapped the operator on
+  the screen with no way forward.
+  **The console chip ran a file read on the 0.5 s render tick**,
+  breaking an invariant that file documents twice, and sat ahead of
+  `Build` on a no-wrap line — so a refused MTU pushed the running
+  version off an 80-column serial console, on exactly the screen an
+  operator opens when something is wrong.
+  **Plus:** unvalidated JSONB reached a typed response model, so one
+  malformed heartbeat would have 500'd the appliance list for the whole
+  fleet; the copilot row did the double-read its REST sibling's
+  docstring forbids and shipped two of five fields; the tool description
+  never mentioned MTU, so the capability #13 compliance rests on was
+  unroutable; and the banner asserted flannel host-gw as a constant
+  while `Appliance.dataplane_backend` already records it per node.
+  **The tests changed too, and one change paid for itself.** The parity
+  test drove two doors while the claim was three, and compared what the
+  operator typed rather than what the wizard stores — it executes all
+  three on the stored value now, and that is what caught the
+  leading-zero divergence. The adopt-suppression tests called the helper
+  directly, so deleting the wiring inside `compare()` left them green;
+  they go through `compare()` now.
+
+- **`core.dns` / `core.dhcp` — turn a whole subsystem off (#1068).** An
+  operator running SpatiumDDI for DNS only, DHCP only or IPAM only had no
+  way to put the unused subsystem away: DNS and DHCP were two of four
+  fixed sidebar anchors that no feature module gated, so a DNS-only
+  install carried a DHCP sidebar entry, a DHCP dashboard tab, DHCP
+  affordances throughout IPAM, the DHCP copilot tools and the DHCP alert
+  rules, all pointing at nothing. Both modules ship **enabled**, so no
+  existing install changes; 16 of 55 modules now ship on.
+  **The agent routers are deliberately outside the gate**, and that is
+  the whole reason `dhcp/__init__.py` changed: `require_module` answers
+  **404**, and 404 is precisely the status that makes an agent discard
+  its JWT and re-bootstrap from its PSK. Gating the agent path would not
+  disable a fleet, it would put every live Kea agent into a re-bootstrap
+  loop. The DHCP agent router was nested inside `dhcp_router` and had to
+  be lifted out and mounted separately at the same `/dhcp` prefix (the
+  DNS side already had this shape). It keeps `wake_publishing` — unlike
+  the DNS agent router, which really is a pure consumer — because
+  `/dhcp/agents/lease-events` runs subnet DDNS through
+  `enqueue_record_op`, and `collect_wake` is a silent no-op with no
+  collector installed: dropping it would not error, lease-driven DNS
+  updates would just stop waking DNS agents and converge on the 12 s
+  safety tick.
+  **Disabling is refused while the subsystem still owns rows** (422
+  naming the counts), the same fail-closed stance as the #934 / #935
+  moves — the agents keep serving from cached config either way, so the
+  alternative is live state hidden behind a 404 with no way to reach it
+  from the UI. `/agents/register` is the one agent call that CREATES a
+  server row, so it now declines with **403** while the module is off;
+  without that, a still-running agent re-registers seconds after the
+  toggle and strands exactly the state the refusal exists to protect.
+  403 rather than 404 for the same re-bootstrap reason.
+  **`ModuleSpec` gained `requires`**, and it is a real gate rather than a
+  UI hint: `get_enabled_modules` resolves a module enabled only when its
+  whole ancestry is, so `dhcp.import`, `ipv6.router_advertisements`,
+  `dns.import`, `dns.dynamic_update_acl`, `security.dns_threat` and
+  `security.dnsbl` follow their parent and need no gate of their own. An
+  operator row saying ON does not outrank a disabled parent. The
+  frontend hook resolves the chain the same way — it previously read each
+  module's own `enabled` flag, which would have shown a sidebar row for a
+  child whose router had already resolved it off (the two-renderers class
+  from #878). Catalog integrity — no dangling parent, no cycles, core
+  modules stay roots — is pinned by a test, because `_resolve_with_parents`
+  is deliberately forgiving at runtime (an unknown parent resolves TRUE so
+  a rename can never black out a subtree) and the catalog is therefore the
+  only place a typo can be caught.
+  Also gated: 12 beat tasks, 13 alert rule types, 42 copilot tools, 8
+  global-search providers (which otherwise returned zones and scopes that
+  link into 404 pages), the sidebar anchors and DNS section, the dashboard
+  tabs and their queries, and the DNS/DHCP reads inside IPAM.
+  **`rogue_dhcp` is deliberately NOT gated**, the one entry that needed
+  arguing: its subject rows keep arriving on the ungated agent router, and
+  the rule matters MOST to an install that does not run DHCP, where
+  anything answering DHCP is by definition unauthorised. Its drill-down
+  page does 404 with the module off — the cost — but an alert naming the
+  offending IP and MAC beats silence.
+  The module gate in `evaluate_all` falls through with an empty match set
+  rather than `continue`-ing: a `continue` skips the open-event
+  reconciliation too, so a DHCP pool-exhaustion event that was firing when
+  the operator disabled DHCP would stay open forever with no evaluator
+  left that could ever close it. No migration — per #1069 a
+  `feature_module` row means "an operator changed this" and the shipped
+  default lives in the catalog, so the defaults are declared in
+  `backend/tests/test_feature_module_defaults.py` instead.
+
+- **E911 dispatchable location — SpatiumDDI answers "which room is
+  this phone in, right now?" (#972, Phase 1a).** Behind the default-on
+  `network.e911` module: Emergency Response Locations, bindings from a
+  network identity to an ERL, and a resolver over data already
+  collected for IPAM. `dhcp_lease` / `ip_mac_history` give IP↔MAC,
+  `network_fdb_entry` gives MAC↔switch-port, `network_neighbour` gives
+  the phone's own LLDP claim, `subnet.site_id` gives the building and
+  `subnet.subnet_role='voice'` says which networks are phones. Every
+  input existed; nothing joined them. 3 tables (migration
+  `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3 MCP tools.
+  **RAY BAUM'S Act §506 puts the dispatchable-location duty on the
+  ENTERPRISE, not the carrier**, so this is a location *source* and the
+  docs say plainly that installing it makes nobody compliant: no call
+  routing, no ALI upload, no ELIN provisioning, no PSAP. It also never
+  asserts an address is valid on its own say-so — validation is the
+  provider's verdict against the MSAG / NG911 LVF, recorded here, and
+  `unvalidated` means "nobody has confirmed this", not "this is wrong".
+  Editing any civic element **resets** the verdict, because a provider
+  validated the OLD address and keeping `validated` would leave an
+  estate reporting an address nobody ever checked.
+  **The load-bearing property: a stale precise answer is worse than a
+  fresh coarse one.** A phone re-patched onto another floor stays in the
+  switch's FDB on the old port until it ages out, and in *our* copy
+  until the next poll — so a port-level answer older than the freshness
+  window is REFUSED, the resolver falls back to a coarser rule, and the
+  response carries `confidence="degraded"` with the reason. There is no
+  code path that returns an address with no provenance. The window is
+  the polling device's own `poll_interval_seconds` × 2, so one missed
+  poll is tolerated and two are not; a fixed global number would be too
+  tight for a 15-minute poller and uselessly loose for a 60-second one.
+  **Two independent staleness signals, and the second is the one that
+  matters:** age, and an LLDP neighbour on the same port announcing a
+  different chassis-id than the FDB puts there. LLDP is the device's own
+  announcement, so on disagreement the FDB row is the one to distrust —
+  and this fires immediately where age must wait out the whole window,
+  which is the only way a phone swapped for a different phone on the
+  same port is caught quickly.
+  **The civic address is 31 separate RFC 5139 columns**, not one string
+  and not JSONB. PIDF-LO and every provider API want the elements apart,
+  a string cannot be decomposed later, and #917 established that an
+  unconstrained object publishes as `{"type": "object"}` with no
+  properties — unusable to a code generator, on the one field every
+  external consumer of this feature reads. `CIVIC_ELEMENTS` carries the
+  columns *with* their RFC 4776 CAtype numbers and PIDF-LO tag names, so
+  the deferred option-99 encoder and PIDF-LO renderer cannot drift from
+  the schema the way #878's two renderers did; a test pins the API
+  schema's field set to the column set.
+  **Binding precedence is a constant, not a column**, and one ERL per
+  target per kind is a UNIQUE constraint. An operator able to reorder
+  the rules could put `site_default` above `switch_port` and send every
+  ambulance to the front door while the UI still showed a rule for the
+  room, and a tie would otherwise be broken by whichever row the planner
+  returned. **The shipped order deviates from the issue's**, which
+  numbered the manual pin below `subnet` and `vlan`: that makes the pin
+  dead code, since every pinned device is also on some subnet, while the
+  pin exists precisely for the phone on a port nothing polls. Reverting
+  the constant to the issue's ordering makes
+  `test_a_manual_pin_beats_the_subnet` fail, which is the proof rather
+  than the argument.
+  Three conformity policies, the **first in the tree carrying a real
+  regulatory citation** (`47 CFR 9.16(b)`) rather than
+  `framework: custom`. `e911_voice_subnet_unbound` counts the site
+  default as a pass — the front door is a poor answer and still a
+  dispatchable location, where a check demanding room-level bindings
+  everywhere would fail every site on day one and be switched off.
+  `e911_erl_validated` fails harder on a REJECTED verdict than a missing
+  one, because somebody checked and the answer was no, and warns rather
+  than fails on an old one. `e911_port_binding_evidence_fresh` is keyed
+  on the switch's own poll state and not on stale FDB rows, because an
+  unpolled switch eventually has none and a stale-row check would PASS
+  on the worst case.
+  A third-party caller — a PBX, Cisco Emergency Responder, RedSky — uses
+  an existing API token scoped to `/api/v1/e911` with one read
+  permission; no new credential mechanism. **Every lookup writes an
+  `e911_resolution_log` row**, found or not, recording which token asked
+  about which identity: it is a query about which desk a named person
+  sits at, and "nobody could tell me where this phone was" is exactly
+  what an after-action review needs to see. To make that honest,
+  `deps.py` now records *which* API token authenticated a request —
+  token auth resolves to the owning User, so a handler otherwise cannot
+  tell a PBX's service token from the same person's browser session.
+  **No `propose_*` MCP tools**, an explicit decision under
+  non-negotiable #13: a wrong ERL binding misroutes an ambulance.
+  **/code-review found twelve, and the two sharpest were both about a
+  thing looking fine while being wrong.** `ip_address.address` is
+  unique only PER SUBNET — overlapping prefixes are normal, and this
+  feature's own tests carve a /28 out of a /24 — so an unscoped
+  `scalar_one_or_none()` raised MultipleResultsFound and 500'd the
+  whole lookup *before* the audit row was written. And the validation
+  reset keyed on a civic key being PRESENT while the edit form sends
+  all 31 elements on every save, so renaming an ERL or fixing a typo
+  in its notes silently destroyed a provider's `validated` verdict; it
+  now compares values and names the elements that actually moved.
+  Also: an unvalidated `ip` string reaching an INET comparison raises
+  22P02, and through the copilot tool the aborted transaction takes
+  out every later tool call in the chat turn, so a malformed address
+  is now a "no location" answer that still records what was asked;
+  `ERLUpdate` admitted an explicit `null` into NOT NULL columns
+  (surfacing as a bogus 409 name conflict) and skipped the ELIN
+  validator the create path had; a `chassis_id`-only lookup logged its
+  identity as `unknown` / empty, losing the one thing the trail exists
+  for; `observed_at` and `evidence_age_seconds` came from port
+  evidence even when a *config* rule matched, putting an unrelated
+  stale age beside a green `observed` answer; a blanket
+  `except IntegrityError` reported foreign-key violations as "already
+  exists", worst on `create_binding` where five of seven targets are
+  hand-pasted UUIDs; and no builtin role granted `e911_location`,
+  unlike all four sibling vertical registries on Network Editor, so
+  writes were undocumented superadmin-only with the UI quietly hiding
+  its own buttons.
+  **Two findings were the "a guard that cannot fire" class again.**
+  The port-binding check ignored `poll_fdb` / `poll_lldp`, so a switch
+  polled perfectly on schedule while collecting neither passed — which
+  is precisely the silent degradation it claims to catch. And it
+  tested `status not in ("ok", "success")` where the real vocabulary
+  is `pending | success | partial | failed | timeout`: `"ok"` is a
+  value no poller writes, so a `partial` poll whose only failure was
+  the unrelated IGMP leg was reported as "not polled", while the test
+  pinning that behaviour asserted on `"error"` — also not a real
+  value, which is how it survived.
+  **One finding changed a design decision rather than fixing a slip.**
+  The LLDP-disagreement signal fired on *any* other chassis-id on the
+  port, which makes a room-level answer permanently unreachable for a
+  PC daisy-chained behind an LLDP desk phone — the commonest wiring in
+  exactly these estates, where the PC is in the FDB and only the phone
+  announces LLDP. The signal is now NEWER, not merely different: the
+  FDB row is distrusted only when a contradicting neighbour was seen
+  more recently than it. After a swap the new device's LLDP is fresh
+  and the old device's FDB row is not, which is the case it exists
+  for; on a daisy chain both are current and neither displaces the
+  other.
+  **A second /code-review round found eleven more, and one would have
+  failed CI.** The three new tables were in no backup `Section` and not
+  in the unclassified baseline, so a selective restore of `ownership` or
+  `ipam` would TRUNCATE-CASCADE every ERL and binding and never
+  repopulate them — the #700 defect verbatim, and
+  `test_section_catalog_gap_does_not_grow` fails without the fix
+  (confirmed by reverting it). The resolver also compared an INET by
+  SPELLING via `cast(address, String)`, which is the #877 failure: an
+  IPv6 address in expanded form is a different string and the same host,
+  so those lookups silently answered "no location", on the flagship
+  query and non-sargably. And the FDB fallback picked the most recently
+  seen entry across ALL devices — but a MAC sits in the forwarding table
+  of every switch on the path to it, so on a two-tier network the
+  room-level binding fired only when the access switch happened to be
+  polled more recently than the core, intermittently, with the evidence
+  row naming the wrong port. It now prefers the interface with the
+  FEWEST MACs learned on it, which is how an edge port is identified
+  from bridge-MIB data and is a property of the topology rather than of
+  polling luck.
+  Also: an `IpMacHistory` row is only the last time anything was
+  OBSERVED at an address, unlike a lease, so a years-old mapping could
+  drive a `mac` pin to `confidence="observed"` — it is now gated, and a
+  stale inference disqualifies the rules that hang off the MAC while
+  leaving those that derive from the IP; `BindingUpdate` lacked the
+  explicit-null guard its ERL sibling had (a 23502 the global handler
+  re-raises as a 500); the reset verdict kept `validation_source`, so a
+  list rendered "unvalidated  RedSky Horizon"; `q` went into `ILIKE`
+  unescaped in both the router and the copilot tool (#879's `50%`); the
+  `is_dispatchable` field tested truthiness while its SQL filter tested
+  `IS NOT NULL`, so they disagreed on `""` and the gap report
+  under-counted; a dead `elif` hid the reachable "pending with a
+  completed poll" case; the ERL form never sent `site_id`, leaving the
+  column, the site filter and the copilot's argument unreachable from
+  the product; and `Number("12.3x")` is NaN, which serialises as null —
+  so typed garbage in a coordinate field saved silently as "no point"
+  and wiped an existing one on edit.
+  **Phase 1b — HELD and PIDF-LO.** `POST /held` takes an RFC 5985
+  `locationRequest` and returns PIDF-LO (RFC 4119 + RFC 5139 civic +
+  RFC 5491 geodetic) — the protocol CUCM, Cisco MPP firmware, the
+  Webex app, RedSky "HELD+", Intrado ERS and Bandwidth DLR already
+  speak, which is what makes this usable with **no phone-side
+  change**. Mounted at the application root because a HELD client is
+  configured with a whole URL and the protocol names the path. This is
+  the payoff for the 31-column decision: the element names come from
+  `CIVIC_ELEMENTS`, and `PIDF_ELEMENT_ORDER` fixes the WIRE order
+  separately, because the RFC 5139 schema sequence is not the column
+  order and a consumer validating an `xs:sequence` rejects
+  out-of-order children; a test pins the two lists to each other.
+  The `method` element is not decoration — RFC 4119 registers those
+  tokens and consumers treat them differently, so a switch-port answer
+  goes out as `Wiremap` and a subnet or site answer as `Manual`.
+  `retransmission-allowed` is `no`: this is the location of a person
+  at a desk, and a 911 path needs no onward distribution rights. The
+  resolver's confidence and matched rule ride on response headers,
+  because PIDF-LO has nowhere to say "this is a fallback answer". An
+  unknown device is a 404 with `locationUnknown`, which is what a
+  provider's retry logic expects, where an empty 200 would read as
+  "this device has no location by design".
+  **The load-bearing refusal is that a request with no identity is
+  refused.** RFC 5985's default is to answer from the requester's own
+  address, so falling through would hand a PBX the location of its own
+  server in response to a question about a phone — a perfectly-formed
+  answer that is completely wrong. A recognised-but-unresolvable
+  identity (`msisdn`, `imsi`) is reported rather than ignored, because
+  treating it as "no identity given" takes that same fall-through. XML
+  from the network is size-capped before parsing, a DOCTYPE is refused
+  outright rather than trusted to be inert, and parsing goes through
+  stdlib ElementTree, which supports no DTD and no external entities
+  at all — XXE and entity expansion are unavailable rather than
+  mitigated.
+  **Phase 2 — the device self-query and the DHCP options.** The
+  self-query is off behind `E911_SELF_QUERY_ENABLED`: 404 rather than
+  403 when disabled so it does not advertise itself to a scanner;
+  identity forced to the TCP source address with every body-supplied
+  identity discarded, including one that matches, since accepting it
+  when it matches would leak by timing whether a guessed address is
+  the caller's; rate-limited per source IP and **failing closed**, the
+  only inverted throttle in `auth_throttle`, because this throttle IS
+  the protection where the login one has lockout and a second factor
+  behind it; and the response carries the location only, not even the
+  confidence headers, which describe our internal evidence.
+  DHCP options 99 (RFC 4776 civic) and 123 (RFC 6225 geodetic) render
+  automatically into a scope whose subnet resolves to an ERL. Per
+  scope, never per client: DHCP can know the subnet and nothing finer,
+  so a switch-port or MAC binding is deliberately not consulted — a
+  DHCP option is written once for every client in the scope, and
+  honouring a device rule would hand every phone on the floor the
+  location of one desk.
+  **The encoders were verified by measurement, and the first attempt
+  produced a config Kea REFUSED OUTRIGHT** — which stops DHCP for
+  every client on the server. Against kea-dhcp4 3.0.3, option 99 has a
+  standard definition Kea will not let you override, so it goes out
+  under Kea's own name `geoconf-civic`, while 123 has none and rides
+  on ours. A second real hole surfaced the same way:
+  `option_defs_for_option_maps` scanned only `code:NN` keys and not
+  the raw `option_data` passthrough these ride on, so the definition
+  for 123 was never shipped and Kea would have rejected the whole
+  config.
+  Everything in the encoders fails closed to "emit no option": a value
+  that will not fit is dropped rather than truncated, because
+  truncating UTF-8 mid-sequence yields bytes a consumer cannot decode;
+  a total over 255 bytes stops at an element boundary rather than
+  emitting a partial TLV; no two-letter country means no option at
+  all; and an out-of-range coordinate yields nothing, because a
+  wrapped fixed-point value is a valid-looking location somewhere
+  else. Every test decodes the bytes back rather than comparing them
+  to a hex literal — a literal proves the encoder still does what it
+  did when the test was written, not that it does what the RFC says.
+  **Phase 3 — exports, with the provider connectors still deferred.**
+  One CSV of every ERL and its bindings, and one file of
+  `location civic-location` / `location elin-location` stanzas plus
+  the per-interface lines, as text the operator reviews and applies.
+  SpatiumDDI pushes no switch configuration (#60), and the snippet
+  says so in its own header.
+  **The real work in the exports is sanitisation.** A room name
+  carrying a newline followed by `no logging console` is arbitrary
+  configuration pasted into a switch by someone who trusted us, and a
+  building whose name starts with `=` executes as a formula when the
+  CSV is opened in Excel. A value that cannot be expressed safely is
+  omitted AND listed under its stanza, never shortened — an ERL
+  visibly missing its room is a problem an operator fixes, where a
+  silently truncated one is a phone in the wrong place that looks
+  correct. The three provider push reconcilers stay their own issues,
+  as #972 itself specifies, because each needs its API shape checked
+  against current vendor documentation rather than recalled.
+  **Also fixed on the way: two successive circular imports, the second
+  subtler than the first.** `canonicalize_mac` lived in
+  `app/api/v1/dhcp/_mac.py`; the E911 resolver needs it and the DHCP
+  config bundle imports that resolver, so reaching into `app.api`
+  broke the app at startup. Moving it to
+  `app/services/dhcp/normalize.py` replaced that with a cycle that
+  only appeared when something imported the e911 package FIRST,
+  because importing any `app.services.dhcp` submodule executes a
+  package `__init__` that imports `config_bundle`. It now lives in
+  `app/core/mac.py`, whose package `__init__` is empty, so a pure
+  string function cannot participate in a cycle at all.
+  **A third /code-review round found thirteen more, and the worst
+  would have stopped DHCP entirely.** `_with_location_options` ignored
+  address family, so an ERL reached by a `vlan` or `site_default`
+  binding injected `dhcp4`-space options 99 and 123 into an IPv6 scope
+  — the agent's v6 renderer passes the raw passthrough through
+  verbatim and kea-dhcp6 then rejects the WHOLE config, which is
+  exactly the outcome the encoders are otherwise so careful to avoid.
+  It is now an explicit IPv4 gate with a v6 test.
+  Two more made the feature unreachable rather than wrong. `/held` had
+  no nginx `location` block in either template, so it fell through to
+  the SPA `location /` and a PBX asking where a phone is got
+  `index.html` with a 200 — on compose, Helm and the appliance alike.
+  And neither HELD path was exempt from maintenance mode, so a change
+  window silently killed location delivery to CUCM while the
+  equivalent JSON lookup kept working, which was incoherent as well as
+  dangerous.
+  **One was a silent data loss in exactly the field that matters.**
+  The option-99 encoder stops at an element boundary when it runs out
+  of 255 bytes, so whatever is encoded LAST is what gets dropped — and
+  in column order that was building, floor, unit, room and seat,
+  because `lmk` / `loc` / `nam` are declared ahead of them and are the
+  free-text fields an operator writes a sentence into. A long
+  "additional location information" therefore produced a street
+  address with no room, which is the one thing RAY BAUM'S §506 is
+  about. Encoding order is now explicit and separate from column
+  order: street address first, then the dispatchable detail, then the
+  free text, which is the right thing to lose.
+  Also: the control-plane renderer had no `option_data` passthrough
+  (the agent's has always had one), so the rendered-config preview
+  stringified the whole list into one bogus entry and showed an
+  operator a config that would not load; `locationType` and `exact`
+  were parsed and read by nothing, so a caller asking exactly for
+  `geodetic` against a civic-only ERL got a 200 carrying civic data it
+  had said it could not use; the bundle had no `network.e911` module
+  gate, so disabling the module hid every surface for inspecting
+  bindings while the scopes kept shipping the options; and the subnet
+  lookup cost three queries per scope on the agent long-poll path,
+  which is 600 round trips on a 200-scope server with no bindings at
+  all, now one.
+  Three in the exports. The IOS snippet emitted bare interface names,
+  and `Gi1/0/12` exists on every switch in the estate — a file with no
+  device context gives an operator no way to tell which lines belong
+  to the switch in front of them, and pasting the wrong ones
+  mis-assigns ports to rooms. `_identifier_for` was positional while
+  its own docstring called it stable, so inserting one ERL renumbered
+  every later stanza and re-pointed port assignments an operator had
+  already applied; it now derives from the ERL's id. And `-` in the
+  CSV formula-leader list quoted every negative latitude and longitude
+  as text, in the spreadsheet the export exists for — the check is now
+  "is it a number", not "does it start with a hyphen".
+  Last two were smaller: an unknown client address answered 429
+  because the fail-closed throttle ran before the address check,
+  making the accurate 400 unreachable; and `auth_throttle`'s module
+  docstring still said "Both fail open" after a third, deliberately
+  fail-closed throttle joined it.
+  **And CodeQL found a real one that three review rounds missed, in a
+  docstring I had written confidently.** The HELD parser used stdlib
+  `xml.etree.ElementTree` and claimed that supports "no DTD and no
+  external entities at all — so XXE and entity-expansion are not
+  mitigated here, they are unavailable". Measured: half of that is
+  false. ET does refuse an EXTERNAL entity, so XXE really is
+  unavailable — but it expands INTERNAL ones happily, and a four-level
+  billion-laughs payload expanded to 50,000 characters. The only thing
+  standing between an unauthenticated XML endpoint and an expansion
+  bomb was a single `DOCTYPE` regex. `py/xml-bomb` was right and the
+  prose was wrong.
+  Parsing now goes through `lxml` with `resolve_entities=False`, which
+  leaves an entity reference unexpanded rather than growing it — lxml
+  is already in the image (python3-saml pulls it), so this adds no
+  dependency where `defusedxml` would have needed a NOTICE entry and a
+  `versions.json` pin. The `DOCTYPE` refusal is KEPT precisely because
+  it is no longer load-bearing: a guard that is the sole defence is
+  one regex away from being none. Two new tests go at the parser
+  directly, bypassing the guard, because the lesson is that reasoning
+  about a parser's behaviour is not the same as measuring it.
+  **Four more from the PR's own bot reviewers, and the first is the
+  sharpest finding in the whole change.** The IP→MAC lease lookup was
+  unscoped across servers: DHCP leases are per-scope and the same
+  address legitimately exists in two overlapping networks — a 10.x
+  range reused behind two sites is the ordinary case, not a
+  pathological one. "Newest active lease for this IP" therefore
+  attached the caller to ANOTHER network's MAC, and from there to that
+  MAC's switch port and that port's room. A confident, precise,
+  completely wrong answer, which is the single failure mode this
+  module exists to prevent. It is now scoped to the subnet (resolved
+  first, for that reason), and an address resolving to more than one
+  distinct MAC makes the resolver decline to guess rather than pick
+  one.
+  The scoping is an OUTER join whose filter admits a lease with no
+  `scope_id`, and that detail is pinned by a test. An inner join
+  looked right and silently discarded every such lease — legitimate
+  and common, because a lease pulled from a server whose scopes
+  SpatiumDDI does not manage has nothing to point at. Admitting them
+  costs no safety: two candidate MACs decline either way.
+  The other three: a caller supplying `chassis_id` AND `port_id` fell
+  through to a MAC-only port lookup when that exact pair was not
+  found, so a stale or mistyped port returned the MAC's OTHER port and
+  the wrong room while looking authoritative — a named port now yields
+  no port match rather than a different one. The explicit chassis+port
+  path compared the raw lowercased string, so `aabb.cc11.2233` could
+  never match the same address stored as `aa:bb:cc:11:22:33` despite
+  the endpoint documenting that any common separator is accepted; a
+  MAC-shaped chassis-id is canonicalised now while an opaque subtype-7
+  identifier is still compared as given. And two unused locals in a
+  test.
+  216 backend tests. The resolver's were written before any API existed
+  and both mutations were run against the shipped code to prove they
+  bite — removing the staleness gate fails 4, reverting the precedence
+  fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
+  (RFC 5985 + 6155, the protocol CUCM, Cisco MPP phones, Webex, RedSky,
+  Intrado and Bandwidth already speak, and what makes this work with
+  zero phone-side change); the provider validation *call*, which is a
+  new outbound connection needing a `docs/PRIVACY.md` row under
+  non-negotiable #17; DHCP options 99/123; device self-query; bulk CSV
+  import; the CER-format and IOS-snippet exports; and wireless, a data
+  gap rather than a design one — the UniFi and Meraki mirrors carry no
+  client→AP association, so the `wireless_ap` rule has nothing to match
+  and its precedence slot is reserved for when they do. See
+  `docs/features/E911.md`.
+- **The appliance can install onto a RAID1 mirror, and arrays can be
+  managed from the Fleet UI (#999 Parts B + C).** #995 shipped the
+  honest refusal — a SAN LUN's paths collapsed and an md member marked
+  `[UNSUPPORTED]` — because the image had no way to create or even see
+  either. `mkosi.conf` now ships `mdadm`, `multipath-tools`, `kpartx`
+  and `lvm2`, and the refusal becomes an offer.
+  **What is mirrored is decided by what firmware can read.** `state`,
+  `root_A`, `root_B` and `var` become raid1 members; `bios_boot` and
+  the **ESP cannot** — firmware reads the ESP before any md driver
+  exists — so each disk keeps its own and `spatiumddi-esp-sync` keeps
+  them in step. That sync is the part that is easy to skip and fatal to
+  skip: every slot upgrade writes a kernel and re-stamps `grub.cfg`,
+  every set-default writes `grubenv`, and all of it lands on the
+  primary ESP. Without the sync, pulling that disk after an upgrade
+  leaves the survivor booting the OLD kernel from a stale menu — a
+  mirror that protected the data and lost the appliance. So it is
+  called from the installer, `spatium-upgrade-slot apply`,
+  `set-next-boot` and `set-default`, and is a no-op on a single-disk
+  box so no caller has to branch. The second ESP is labelled `ESP2`,
+  because two filesystems sharing `ESP` would make the fstab's
+  `LABEL=ESP` resolve to whichever udev enumerated last — `/boot/efi`
+  would be a different disk between boots and the sync would have no
+  fixed direction.
+  Arrays are **named** (`/dev/md/root_a`), not `md0..3`: kernel md
+  minor numbers are assigned in ASSEMBLY order, so a numeric name is
+  not stable across a boot with one member missing, which is the boot
+  the feature exists to survive. `metadata=1.2` puts the superblock at
+  the start, so a member is not mountable as a bare filesystem — 0.90
+  would leave it mountable, and mounting one member of a live mirror
+  read-write silently forks the data.
+  **Everything that would quietly produce something lesser is refused
+  instead**: a member smaller than the target (a RAID1 is the size of
+  its smallest member, so it would shrink `/var`), a member that
+  resolves to the target, an existing md member or multipath path, and
+  the live install medium — the #554 guard, which a preseed naming the
+  USB as `mirror_disk` would otherwise walk straight through. The
+  initrd's `mdadm.conf` is generated and **checked for ARRAY lines**,
+  because one without them yields an initrd that cannot find root, and
+  that is better discovered in the installer than at the first reboot.
+  **Multipath (C3):** the picker lists the maps themselves with their
+  path counts, `partition_node` learned kpartx's `-partN` naming, and
+  `kpartx -a` runs after the table is written — without which `mkfs`
+  against a non-existent node creates a regular FILE on the installer's
+  tmpfs and reports success. Not verified on hardware for want of a
+  SAN, and documented as such.
+  **Part B** makes the Fleet drilldown's Storage block interactive
+  (scrub start/cancel, fail / remove / add a member, reinstate a path)
+  over `POST /appliance/appliances/{id}/storage/action` — superadmin,
+  audited before dispatch so a failed attempt is recorded like a
+  successful one — plus 1 MCP tool (`propose_storage_action`, default
+  **off** per non-negotiable #13: broad-blast-radius writes whose
+  safety rests on a human typing a device path back). Nothing runs
+  `mdadm` in a container: the supervisor writes a request for the
+  host-side `spatiumddi-storage-action` runner over the trigger-file
+  plane and relays the result, so the operator gets the outcome in the
+  HTTP response rather than waiting for a heartbeat.
+  **The gates are in two places on purpose.** The control plane decides
+  what may be ASKED for — it knows who the operator is, and it is where
+  a destructive action demands the device path typed back, because a
+  generic "yes" cannot catch the mistake that actually happens (meaning
+  one disk and clicking the row for the other). The host runner decides
+  what is safe to do AT THE MOMENT of the action, re-counting the
+  array's in-sync members from the kernel, because the control plane's
+  view is up to one heartbeat old and a member can have failed since.
+  Removing the last in-sync member and removing the member the
+  bootloader lives on are **refused, not confirmed** — the first leaves
+  no array to inspect, the second leaves an array that stays green
+  while the machine silently stops booting.
+  **Found by its own test rather than by review:** the device allowlist
+  needs both `.` and `/` in its character class, and that alone admits
+  `/dev/../etc/passwd` — a traversal is now rejected by a separate
+  component check that runs first, in both the service and the runner.
+  **Two review passes found eighteen defects, and the pattern is worth
+  recording: the ones that mattered were all about the survivor.** The
+  array is the easy half. Three separate things had to be right before a
+  mirrored box would boot on one disk — `insmod mdraid1x` in `grub.cfg`
+  (without which GRUB cannot see an array and *no* mirrored install
+  boots at all), disk 2's BIOS `core.img` embedding **its own** ESP
+  rather than the primary's, and `nofail` on the ESP mount so the
+  survivor does not boot successfully and then drop into
+  `emergency.target`. Each fails silently and only on the day the disk
+  dies. Also fixed: the supervisor's reply omitted `request_id` so every
+  Part B action 422'd and timed out; `--zero-superblock` was handed a
+  sysfs path and the failure swallowed; a mirrored appliance could not be
+  reinstalled at all (both members were refused as md members, and the
+  keep-/var path pointed at a full install that was equally impossible);
+  the last-member refusal ignored the RAID level, so a 4-disk raid5 could
+  be destroyed; `add_member` refused the commonest repair there is
+  (re-adding a member on the disk you are running from); the ESP sync
+  used `--no-times`, so `--check` could never report "in sync" and every
+  sync re-copied everything; the trigger was edge-triggered, losing any
+  request written while the runner was busy; and each multipath LUN was
+  offered twice, with the raw `dm-N` row yielding partition paths kpartx
+  never creates.
+  **Then it was installed on a real two-disk box, and the boot test
+  found the one that mattered.** The install was correct; first boot
+  destroyed it. `spatium-grub-render`'s `discover_live_uuids()` — the
+  #395 fallback used when no UUIDs are passed — resolves the slot by
+  **PARTLABEL** and takes that partition's UUID. On a mirror the slot
+  partition is a `linux_raid_member`, so that UUID is the *array's*, not
+  the filesystem's. The installer passes the correct UUIDs explicitly,
+  so `grub.cfg` was right and the box booted; then the host-migration
+  re-render on first boot called this with no arguments and overwrote
+  the working menu with UUIDs `search --fs-uuid` can never match —
+  `error: no such device`, `file '/boot/vmlinuz' not found`. **Install,
+  boot once, unbootable from then on**, on a box whose arrays were
+  perfectly healthy. The fix descends to the md child (and accepts a
+  filesystem-LABEL match as a second route, which is unambiguous on both
+  layouts); a single-disk install is byte-for-byte unchanged, pinned by
+  its own test. A pre-existing #395 bug that only a mirror exposes.
+  **What the degraded boot then proved, on one disk with the other
+  detached:** GRUB found the array (`insmod mdraid1x`), booted from the
+  survivor's own `core.img` and its own ESP, and came up in 40 seconds
+  with all four arrays serving `[2/1] [_U]`, root on `/dev/md126`, and
+  `/boot/efi` **not mounted at all** — which without `nofail` would have
+  been `emergency.target`. Three separate fixes, each invisible until
+  that moment. The console read CRITICAL naming the offender throughout,
+  and the mirror was rebuilt afterwards through Part B's own `add_member`
+  — the repair the pre-review code would have refused.
+  **Two more found only by running it.** `spatiumddi-esp-sync --check`
+  reported the whole ESP as drifted on every run and re-copied it every
+  time: `-r` does not imply `-t`, so rsync compared mtimes it never
+  preserved (`--modify-window` alone fixed nothing). And the host
+  runner did not claim its request, so with `PathExistsGlob` being
+  level-triggered the service re-fired the instant it exited, tripped
+  systemd's start limit within a second, and left the **path unit itself
+  `failed`** — after which no storage action ever runs again. The first
+  request answered; the next two vanished silently. The runner now
+  renames the request to `.request.running` to claim it, exactly as the
+  pcap sibling does and as its own comment had described without
+  implementing.
+  **One alarm was removed rather than fixed.** #999 asked for "a LUN
+  down to its last path" to be critical; that needs a baseline nothing
+  has, and the installer explicitly permits a single-path LUN — so on
+  those appliances it would be critical forever, red on the console
+  forever, and clearable by no action. Zero paths is still critical; one
+  path is reported and not alarmed on.
+
+- **Storage redundancy is monitored across the fleet (#999 Part A).**
+  A mirrored root with no degraded-array alarm is a mirror that
+  silently becomes a single disk: the operator pays for two disks, the
+  array loses a member at 03:00, nothing says so, and the appliance
+  keeps serving perfectly until the survivor dies. That is strictly
+  worse than never mirroring, because it displaced the backup
+  discipline they would otherwise have kept. So the monitoring ships
+  **before** the ability to install onto a mirror (#999 Parts B + C) —
+  it is a precondition for offering the capability, not a follow-on,
+  and it is useful today on any appliance whose data disk is an
+  operator-built array. `read_storage_health()` in the supervisor
+  reads `/proc/mdstat` + `/sys/block` — the HOST's, through the
+  `privileged` + `hostPID` window `_current_slot_from_cmdline()` has
+  read the host's `/proc/cmdline` through since #170, so **no manifest
+  change** — and folds the reading into the `cluster_health` dict the
+  backend already stores verbatim, so there is **no new heartbeat
+  field, no column and no migration** (the #402 pattern). Surfaced as
+  a chip per array / map on the Cluster → Overview node cards, a
+  **Storage redundancy** block with per-member and per-path tables in
+  the Fleet drilldown, and on the TTY console's Disk row — where an
+  alarming chip goes *before* the capacity list and a healthy one
+  *after* it, because the vitals row right-truncates: a degraded array
+  must never be elided to make room for a percentage that looks normal
+  either way, and a green chip that never changes has no business
+  evicting the disk readout at 80 columns. Plus the default-on
+  `appliance_storage_degraded` alert rule and
+  1 MCP tool (`find_appliance_storage`, read-only, default on).
+  **Array state is derived, not copied.** A raid1 down to one member
+  reports `array_state=clean` — the survivor IS internally consistent
+  — so passing the kernel's word through would show a single point of
+  failure as healthy, which is the exact silence this exists to end.
+  State comes from member counts instead.
+  **Severity keys off redundancy remaining, never off that state
+  string.** `2 of 3` in a three-way mirror and `1 of 2` in a pair both
+  read "degraded", and only the second has nothing left to lose;
+  collapsing them would either page for something that can wait or
+  fail to page for something that cannot. One function
+  (`services/appliance/storage_health.py`) makes that call and the
+  alert matcher, the copilot tool and both dashboard surfaces all call
+  it, so a green chip can never sit over a red alert.
+  **A routine scrub or resync is shown on every screen and is
+  deliberately not an alert.** The issue asked for it as
+  "informational, auto-clears", which would be right if the `info`
+  severity were quiet — it is not: delivery filters a target's
+  `min_severity` against `payload["result"]`, a key alert payloads
+  never carry, and the column defaults to NULL, so an `info` event
+  notifies exactly like a critical one. Debian runs `checkarray`
+  monthly by cron, so that row would mail every operator with an
+  array, every month, about their array working correctly, which is
+  how an alarm gets muted before the night it matters. The rebuild
+  that DOES matter never reaches that branch anyway: an array with a
+  member out of sync reports `degraded` and is classified on
+  redundancy like any other.
+  **Multipath is under-sensitive by construction, and every surface
+  says so.** dm-multipath's own per-path verdict lives in the target's
+  status line, reachable only through the device-mapper ioctl
+  (`multipathd show topology`) — Part B tooling, absent from this
+  image. Fabricating `active` would turn a missing reading into a
+  false all-clear, the one answer worse than "unknown". What sysfs
+  *does* answer is each path's SCSI device state, reported alongside
+  under a different name and counted the negative way round
+  (`paths_faulted`, definite faults only) so an NVMe path with no
+  `device/state` never inflates a clean bill of health. But that
+  signal stays `running` for the commonest dm path failure there is —
+  multipathd's checker failing a path while the device is still
+  present — so **the absence of a multipath finding is not a clean
+  bill of health**, and a finding-less map renders NEUTRAL everywhere
+  rather than in the green an md array earns.
+  **Nothing unreadable is ever rendered as healthy.** An assembled
+  array whose `raid_disks` cannot be read reports `unknown` plus a
+  warning — a 0 standing in for "could not read it" would make every
+  degradation test false and drop it through to clean. One that failed
+  to *assemble* is `failed` regardless of its member count, which is
+  often 0 too, so deciding on the count first would demote a real
+  failure. `sync_completed` with no denominator reports no percentage
+  rather than borrowing `/sys/block/mdX/size`, which is the ARRAY's
+  size and would give a plausible wrong number on raid5/6. And a
+  reading that **disappears** is not a recovery: the alert engine
+  resolves any open event whose subject stops matching, so an A/B
+  rollback to a pre-#999 supervisor would announce a recovery on a node
+  whose mirror is still one disk from data loss — an appliance with an
+  open event and no current reading is held at its existing severity
+  instead. Three readings that are NOT the same are kept apart
+  throughout: no `storage` key at all means the supervisor is too old
+  to have looked (UNKNOWN — no chip, no alert), `md_supported: false`
+  means the kernel has no md support, and an empty `md_arrays` with md
+  loaded means there are genuinely no arrays. IMSM / DDF metadata
+  `container` devices are skipped entirely — permanently inactive with
+  `raid_disks=0` on a perfectly healthy box, they would otherwise raise
+  a critical alert nothing could ever clear. An appliance with neither
+  arrays nor multipath renders nothing on any surface, so the common
+  single-disk case gains no clutter.
+  Installing *to* a mirror or a LUN is still refused (#995); the
+  `mkosi.conf` packages, the initramfs work and the two-ESP sync that
+  needs are #999 Parts B + C.
+
+- **The SSH source-CIDR allowlist can now actually be enforced
+  (#1009).** It has shipped since #157 and, on the default port,
+  restricted nothing: `/etc/nftables.conf` opened `tcp dport 22`
+  unconditionally *above* the drop-in include glob, and nftables
+  is first-match-wins, so the scoped rule was dead code. #1001
+  fixed the rendering; this makes it reachable. The floor moved
+  to the retireable sentinel
+  `/etc/nftables.d/00-spatium-ssh.nft`, the three firewall
+  renderers stamp `# spatium-ssh: retire|keep`, and the host
+  runner retires it through the same machinery the Web-UI
+  sentinel has used since #769.
+  A new **Enforce source restriction** switch
+  (`ssh_lockdown`) is what retires it, and it is deliberately a
+  second control rather than a consequence of typing a CIDR:
+  retiring the floor removes what
+  `docs/design/FLEET_FIREWALL.md` §6.1 calls the irreducible
+  recovery channel, and that document's risk register names the
+  same floor as the mitigation for every *other* firewall
+  mistake. It is the anti-lockout pattern pfSense and OPNsense
+  ship, and the shape §6.1 already specified (as
+  `firewall_mgmt_lockdown`).
+  **Default off, including on upgrade** — an operator who
+  configured an allowlist while it was inert does not get their
+  SSH tightened by an upgrade they never asked for. Enforcement
+  then applies on port 22 and on a moved port alike, so the
+  behaviour no longer depends on which port SSH is running on.
+  Two guards on the way in: enforcing with an empty list is
+  refused outright (that closes SSH from everywhere, not
+  restricts it), and enforcing from an address the list does not
+  cover asks for an explicit acknowledgement first — the mistake
+  operators actually make, caught at the moment they make it
+  rather than at their next SSH attempt.
+
+  **The two lockdowns compose.** Scope the Web UI *and* enable
+  this with a scope that excludes you, and the console is what
+  remains. #1009 shipped with neither setting able to see the
+  other, so neither warned; every surface that used to promise SSH
+  as an unconditional recovery path now names the console first
+  and treats SSH as conditional.
+  `scripts/lint_ssh_recovery_claims.py` asserts on the *claim*
+  rather than its wording — three earlier passes each grepped for
+  the previous phrasing and missed the next paraphrase, and the
+  guard caught two false UI strings that all three had walked
+  past. The check that sees both settings at once landed in
+  #1013, below.
+
+- **The appliance builds for arm64 — ISO and upgrade image, in
+  the release and the nightly (#1026, parts 2 + 3).** Apple
+  Silicon VMs, Graviton / Ampere instances and Raspberry Pi
+  5-class boards. `mkosi.conf` no longer pins `Architecture`;
+  the kernel, GRUB packages and `BiosBootloader` moved to
+  `mkosi.conf.d/` drop-ins matched on architecture, and the
+  Makefile always passes `--architecture` explicitly so an
+  Apple Silicon dev box does not silently start building arm64
+  by default. `release.yml` and `nightly.yml` matrix over
+  `[amd64, arm64]` with `fail-fast: false` — a break in one leg
+  must not withhold the other's ISO from a release — and the
+  arm64 leg runs on `ubuntu-24.04-arm`, a NATIVE runner,
+  because mkosi's builder cannot be emulated: under qemu-user
+  it dies on `mount_setattr(2)` (#991).
+  **arm64 is UEFI-only, and that is the platform rather than a
+  simplification.** There is no i386-pc GRUB target for AArch64
+  and no BIOS to chain-load from, so the installer lays down no
+  BIOS-boot partition, installs only `--target=arm64-efi`, and
+  **refuses before touching the disk** on a machine that did
+  not boot via EFI — a successful install that can never boot
+  is worse than an honest refusal. The partition NUMBERING is
+  identical on both architectures: p1 is simply absent on
+  arm64 rather than the rest shifting down, so `partition_node`,
+  `_MD_NAMES`, the #999 mirror path and the verification pass
+  all work unchanged. Root partitions are typed `8305` (Linux
+  root ARM-64) instead of `8304`, which `build-slot-image.sh`
+  and `wrap-iso.sh` now look up per architecture; the ISO is
+  built with `grub-mkrescue -d` forced to a single platform, so
+  an arm64 ISO cannot silently carry x86 boot paths just
+  because the builder image has the modules for both.
+  **The versioned ISO name gains its architecture.** It never
+  had one while the stable name always did — invisible with a
+  single build leg, a filename COLLISION with two, where
+  whichever leg uploaded second would win silently. The pruner
+  now treats the two architectures as a pair: its `*)`
+  fallthrough leaves unrecognised assets alone, which is right
+  for a genuinely new artifact and exactly wrong for an
+  architecture somebody added to the build matrix — ~3 GB per
+  release that nothing ever reclaims. A test pins the pruner's
+  architecture list against both workflow matrices.
+  Verified end to end on real hardware: the ISO boots in UTM on
+  an M4 (Apple Virtualization, UEFI), the installer runs, and
+  the installed system comes up with `root-arm64` partition
+  types, `BOOTAA64.EFI` on the ESP, no BIOS-boot partition, an
+  `ELF ARM aarch64` k3s binary, a Ready node on kernel
+  `6.12.107+deb13-arm64`, and A/B slot detection working
+  unchanged.
+
+- **Privacy statement (#977).** `docs/PRIVACY.md` states what
+  SpatiumDDI has always done and never said: no telemetry, no
+  analytics, no phone-home. It lists every outbound connection the
+  backend can make, its default and what it sends, and says up front
+  that exactly one is on out of the box: the daily anonymous GitHub
+  release check, whose Settings toggle now says so.
+  `test_outbound_hosts_documented.py` fails CI when a hostname in
+  `backend/app` is missing from the page, and pins the default-on
+  list to that one row. Linked from the README and the docs nav.
+
+- **A password reveal on the forced Change Password screen (#1074).**
+  Each of the three fields gets its own show / hide toggle, via a new
+  shared `PasswordInput`. It starts hidden on every visit and is never
+  remembered.
+
+- **Node pressure on the Cluster screen and an alert for it (#983
+  Phase 2).** Kubernetes 1.36's kubelet reports PSI stall percentages,
+  so the node cards and `find_cluster_metrics` now show CPU, memory
+  and I/O pressure, and a default-on `node_pressure` alert rule fires
+  on sustained stall — the signal #980's packet loss needed, since
+  utilisation cannot tell a busy node from a starved one. No data
+  reads as unrecorded, never as zero. The cluster screen reads kubelet
+  stats directly per node where it can (a `kubelet:` chip says which),
+  falling back to the apiserver proxy; the worker gets its own narrow
+  ServiceAccount so the rule can evaluate. Also opt-in user namespaces
+  (refused when the appliance host mounts are on) and soft topology
+  spread for multi-replica workloads.
+
 ### Changed
 
 - **The update check and the upgrade preflight understand SemVer
@@ -245,6 +1425,684 @@ the formatter handles the rest.
   fails with that explanation instead of a library error; edit it
   and pick NTLM or CredSSP. NTLM, CredSSP and Basic are unchanged.
   Real Kerberos support stays on the roadmap as #1128.
+
+- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
+  ships it. The pinned copies move together — `versions.json` plus
+  the Makefile's `alpine/helm` image and the `version:` input in
+  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
+  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
+  joins them as a sixth: its CI-gate table said "Helm 3.21", already
+  stale before this change and wrong at the *major* after it, which
+  would send anyone reproducing CI locally to the wrong binary. It is
+  now spelled as the exact version and enforced by `lint_versions.py`,
+  so it cannot drift again. (That row was stale two further ways, both
+  corrected: "both charts" predates metallb landing as a third, and
+  "six value sets" describes a matrix that is now 14.)
+  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
+  packages the chart with THIS binary; on the node, k3s's
+  helm-controller spawns `klipper-helm` to install it — and the
+  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
+  directly: `helm version --short` in that image). So the appliance
+  has been installing with 4 while CI validated with 3. The CLI
+  major now matches what production actually runs.
+  **The charts render identically.** Both majors were run against the
+  same tree and the 323 rendered objects compared after parsing, not
+  as text. 18 objects differed — but 17 of those also differ between
+  two runs of the *same* 3.22.0 binary, because the charts generate
+  random credentials, so the control run is what identifies them as
+  noise. Exactly one CONTENT difference is attributable to Helm 4: a
+  single trailing blank line inside the `frr.conf` string of the
+  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
+  which is inert. The rest of the textual diff is comment placement
+  and blank lines in the output stream, outside any object.
+  **Helm 4 also reorders objects**, which a set-and-content comparison
+  cannot see, so order was checked separately: 12 of the 14 renders
+  emit identical order, and the two metallb ones do not —
+  `IPAddressPool` and `L2Advertisement` move from *before* the two
+  `ValidatingWebhookConfiguration`s to *after* them. That is not
+  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
+  under the new order the CRs are admitted through a webhook that can
+  reject them, where previously they were created before it existed.
+  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
+  about, and it is not theoretical: a **fresh install of that chart
+  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
+  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
+  created; 4.3.0 exits 1, reporting that server-side apply failed
+  calling the metallb `ipaddresspoolvalidationwebhook` because the
+  service had `no endpoints available`. The webhook is now registered
+  before the CRs are applied, and its backing controller pod — created
+  moments earlier in the same pass — is not ready yet. **A retry
+  succeeds**: `helm upgrade --install` against the half-applied
+  release exits 0 and creates both CRs once the controller is up.
+  This is nonetheless not a change this PR makes, for a specific
+  reason rather than a general one: **the metallb chart is never
+  installed by this CLI.** `bake-chart.sh` packages it and
+  helm-controller installs it on the node via klipper-helm — already
+  4.1.4 — so the appliance has been on the new order since before this
+  branch. Nothing in CI installs it either; `charts-render-check.sh`
+  only templates it.
+  **A default appliance never reaches the failure at all**, which an
+  arm64 ISO built from this branch and booted confirms rather than
+  assumes: `metallb.enabled` is `false` by default and firstboot
+  renders the HelmChart that way, so the chart produces no
+  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
+  and `helm-install-spatium-metallb` completes first time — the release
+  secret is at `v1`, so there was no retry. The ordering bites only
+  where an operator sets a control-plane VIP (#272 multi-node HA),
+  which is what flips metallb on — **and that case is broken today,
+  which setting a VIP on the booted appliance confirmed.** It does not
+  fail once and converge, as this entry previously guessed: it never
+  converges. klipper-helm resolves `SERVER_SIDE=auto` to
+  `--server-side=true`, and every attempt runs `helm uninstall` before
+  `helm install` — so each retry deletes the controller backing the
+  webhook, then reinstalls and applies the CRs while the replacement
+  pod is still starting. Each attempt destroys its own prerequisite.
+  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
+  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
+  so the VIP never materialises.
+  **None of that is this pin's doing** and none of it changes with it:
+  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
+  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
+  so the appliance has behaved this way since that k3s landed, whichever
+  helm packages the chart. It needs its own issue against the appliance.
+  Also exercised under 4.3.0: `helm lint` + `dependency update` +
+  `package` for all three charts (the `bake-chart.sh` and
+  `release.yml` path), and an OCI `helm push` + `helm pull`
+  round-trip against a throwaway registry, digests matching.
+  **No breaking-change exposure**, re-audited against the tree rather
+  than the changelog: no post-renderers, no plugins, no `--atomic`,
+  no helm `--force`, `registry login` is already domain-only
+  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
+  runs unchanged. The flags we do pass — `--set`, `--timeout`,
+  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
+  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
+  in the tree are prose, or commands we print for operators to run
+  with their own helm; those were checked too and use no renamed flag.
+  The one behavioural change is server-side apply, which Helm 4
+  defaults to on **new** installs. The appliance is unaffected — it
+  is already on 4.1.4 — so the only newly-affected path is the single
+  kind `helm install` in `agent-e2e.yml`, and that workflow is
+  path-filtered on itself, so this change exercises it.
+
+- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
+  project is now `spatiumnorth/spatiumddi`: the org changed, the
+  repository name did not, and neither did the product, the PyPI
+  package, the image names or any filesystem path — `/etc/spatiumddi/`,
+  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
+  `github.com/` and `ghcr.io/` reference in the tree moved to the new
+  org, along with the shields.io badge paths in the README, which carry
+  the org separately from the link they sit behind and so would have
+  gone on reporting a repo that no longer answers.
+  **Container images move with the org**: pulls are now
+  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
+  `image.repository` default moved with them. CI needed no such change
+  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
+  follows a rename on its own.
+  **Two things do not follow a rename, and both fail silently.** Eight
+  workflows gate on `if: github.repository_owner == '…'` so a fork
+  never publishes; left at the old literal, release, nightly, the
+  weekly Trivy scan, asset pruning and the docs publisher would all
+  have skipped with a green check rather than an error. And the docs
+  site's org-root Pages repo has to be renamed to
+  `spatiumnorth.github.io` — GitHub serves an organization site only
+  from a repo named `<org>.github.io`, so the old name is demoted to an
+  ordinary project site and the root site stops existing;
+  `docs-publish.yml` now targets the new name.
+  **Operator action on upgrade:** `GITHUB_REPO` shipped in
+  `.env.example`, so an install that copied it carries
+  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
+  default and pins the daily release check and the appliance
+  slot-image catalogue to the old path. Update the value, or remove
+  the line to take the default.
+  **Pinned releases pull from the old path (#1163).** Every release
+  up to and including `2026.09.04-1` names its images under
+  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
+  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
+  taken from such a tag, or from a checkout older than this change,
+  fails at `docker compose pull` — `git pull` for the current file,
+  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
+  copy. Every published chart version up to and including
+  `2026.9.4-1` defaults to the old path too: install or upgrade those
+  with `--set image.repository=spatiumnorth` plus
+  `dnsAgents.image.repository`,
+  `dnsAgents.flavors.powerdns.repository`,
+  `dnsAgents.flavors.technitium.repository` and
+  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
+  names (the chart README lists them).
+- **The release check reported a permanently up-to-date install when
+  its repo had moved.** GitHub answers `301` for a renamed repo, which
+  an org rename makes routine — and httpx does not follow redirects by
+  default while `raise_for_status()` does not reject a `3xx`. So the
+  redirect body was parsed as a release: no `tag_name`, so the task
+  stored no version, set `update_available=False`, cleared
+  `latest_check_error` and logged `update_check_ok`. The one default-on
+  connection in the product would have gone on reporting a healthy
+  “you are up to date” forever, which on a notifier whose job is
+  surfacing security fixes is worse than a loud failure. Both GitHub
+  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
+  now follow redirects, which removes the false negative and keeps a
+  stale `GITHUB_REPO` working rather than silently wrong.
+- **The appliance image pruner stopped reclaiming pre-rename images.**
+  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
+  owns them; narrowed to the new org alone, every accumulated
+  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
+  exactly what the timer exists to reclaim — would have been classified
+  as third-party infra and kept forever, while still reporting nothing
+  stale to prune. It now matches both orgs; the in-use and
+  slot-version guards are unchanged, so nothing live can be removed.
+
+- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
+  ships it. Five copies, none Dependabot-visible, all moved
+  together — `versions.json` plus the Makefile's `alpine/helm`
+  image and the `version:` input in `ci.yml`, `release.yml`,
+  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
+  and template clean under it.
+  **This is the terminal Helm 3 feature release** — published
+  2026-09-10, matching the project's stated final 3.x feature
+  release of 2026-09-09. After it, 3.x receives security fixes
+  only, until 2027-02-10. So this is a floor, not a resting place;
+  the move to 4.x is #1098.
+  The manifest's note claiming we stay on 3.x because the appliance
+  is "independent of this binary" is **wrong**, and is corrected
+  here rather than repeated: the appliance renders through k3s's
+  helm-controller, which spawns `klipper-helm` — and the pinned
+  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
+  with 3 and install with 4, so a 4.x move closes that gap instead
+  of opening one. See #1098.
+
+- **`trivy-gate.sh` can ask an apt index the question it could
+  already ask an apk one (#1088).** The gate sorts each finding into
+  "the index offers the fix today, so a rebuild would cure it" (FAIL)
+  versus "the distro's security database names a fix the mirrors do
+  not carry yet" (DEFER, reported and non-blocking). It only knew
+  `apk`, so every Debian finding took the catch-all
+  `cannot query a debian package index; treating as installable`
+  branch — correct as a refusal, but it told the operator nothing
+  about what to do, and once the images above are fixed it would
+  hard-fail the nightly on the first Debian CVE announced ahead of
+  its mirror, which is the exact Alpine failure the script was
+  written to prevent. Debian/Ubuntu images are now probed with
+  `apt-cache policy` and compared with `dpkg --compare-versions`.
+  **Silence means the opposite thing to the two probes**, which is
+  the one part that had to be got right: `apk upgrade --simulate`
+  lists only what it *would* upgrade, so a package missing from its
+  output means "nothing newer exists" (DEFER), while
+  `apt-cache policy` answers for every package it is asked about,
+  so a package
+  missing from *its* output means the index could not resolve the
+  name at all (FAIL). Reading the second like the first would turn
+  the fail-closed branch into a fail-open one.
+  **The probe also has to prove the index was LOADED**, not merely
+  that `apt-get update` returned: it exits 0 with every mirror
+  unreachable (verified, `--network none`), and `apt-cache policy`
+  then answers from the local dpkg status file — Candidate ==
+  installed, which is non-empty, plausible, and reads as "not
+  published yet" for every finding at once. An offline runner would
+  publish an image on CRITICALs whose fixes were on the mirrors the
+  whole time. It now sets `APT::Update::Error-Mode=any` and asserts
+  a real package file is listed.
+  **The verdict comes from the candidate, the reason from both
+  probes.** apt holds a package back when upgrading it would pull
+  in a new dependency, so `apt-get upgrade` — the line the
+  Dockerfiles run — can install less than the index offers.
+  Deciding on the candidate alone makes that a FAIL whose stated
+  remedy (rebuild the package layer) provably does nothing;
+  deciding on the simulate alone makes it a DEFER that never
+  clears. It fails, and says the fix needs an explicit install or
+  a dist-upgrade.
+- **A linter refuses a shipped image that can never be patched
+  (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
+  Backend Lint job, asserts that every image in the nightly's own
+  matrix both upgrades its packages and declares a cache-busting
+  snapshot ARG that it actually interpolates. It reads the matrix
+  rather than a second copy of the image list, so a new image is
+  covered the moment it is added there. Three things it has to get
+  right, each a live false-pass in the first cut: it checks only
+  the stage that SHIPS (builder stages are discarded, so an
+  `apk upgrade` in one proves nothing — and that is the shape most
+  of these Dockerfiles have), following the target's ancestry
+  because a stage built `FROM` another does inherit its layers; it
+  strips `#` comments in both positions, whole-line and trailing,
+  since these files explain at length *why* `apk upgrade` matters
+  and a raw-text match passes a file that only talks about it; and
+  it raises rather than reporting success if the matrix heredoc is
+  ever restructured, because a guard that evaluates nothing looks
+  exactly like one that passed (#1030).
+
+- **Docs site is documentation only (#1070).** `www.spatiumddi.com`
+  no longer opens on a product landing page — the hero, "Why
+  SpatiumDDI" feature grid, screenshot gallery and install pitch are
+  gone, and `index.html` is now the documentation index itself. The
+  company / product site is a separate project and will be linked
+  from the nav once it exists. The index also gains the pages it
+  had been missing (Troubleshooting, Migration, Performance testing,
+  SHIPPED, the Fleet Firewall design note), `sitemap.xml` lists every
+  page rather than a third of them, and `docs.html` redirects to the
+  index so existing links keep working. No change to how or where the
+  site is published.
+
+- **Fewer features are switched on out of the box (#1069).** A fresh
+  install enabled **37 of 53** feature modules, because the policy was
+  "default-on so operators discover what exists" — so a new operator
+  met BACnet, DICOM, OT Purdue zoning, E911, a BGP looking glass and
+  SD-WAN overlays in the sidebar before creating their first subnet.
+  That policy is replaced by a criterion: a module ships **on** only
+  if it is core IPAM / DNS / DHCP workflow, a zero-footprint UI
+  convenience, or a read-only diagnostic invoked by hand; it ships
+  **off** if it is a domain-specific registry most installs never
+  populate, emits traffic or writes to infrastructure once armed,
+  calls off-prem, or is one-shot migration tooling. Day-one importers
+  are the deliberate exception to that last clause — a fresh install
+  is exactly when an estate gets imported, so DNS / DHCP / NetBox
+  import stay on while the Windows cutover does not. **14 of 53**
+  modules now ship enabled. Discovery is unaffected: Settings →
+  Features has always listed every module with its description
+  whether or not it is on, which is why the sidebar does not have to.
+  **Existing installs are untouched** — an operator already running
+  E911 or Conformity does not lose it to an upgrade they did not ask
+  for.
+
+  **The mechanism was the bug.** Non-negotiable #14 told every
+  module's migration to seed a `feature_module` row at its shipped
+  default, and the resolver prefers a row over the catalog — so
+  `default_enabled` was dead code on every install, fresh ones
+  included, since a fresh install runs the same seed migrations an
+  upgrade does. Flipping a default in the catalog would have changed
+  nothing at all. A row now means one thing, "an operator changed
+  this"; migrations no longer seed one; and the new migration deletes
+  the pristine historical seeds **on a fresh install only**. Its
+  downgrade is a genuine no-op rather than a stub: the old code carries
+  the old catalog, whose defaults were true, so an absent row resolves
+  to the old behaviour on its own.
+
+  **"Fresh" is `audit_log` being empty, not the `user` table.** The
+  obvious test is "no users yet", and it is wrong in the direction that
+  fails silently: the API seeds the default admin at lifespan start,
+  and on Compose the `api` service waited only for postgres and redis,
+  so on a cold `docker compose up -d` it could insert that admin while
+  the 291 revisions were still running. The row count would be 1, the
+  migration would call the install an upgrade, skip, and #1069 would
+  quietly do nothing on exactly the installs it is aimed at.
+  Non-negotiable #4 puts an audit row behind every mutation, and
+  logging in writes one, while nothing on the startup path does — so a
+  racing API
+  cannot manufacture the evidence, and an empty table means nobody has
+  configured anything worth preserving. Proven on a real database in
+  three shapes: a clean fresh install clears all 51 seed rows, an
+  install with 1,033 audit rows keeps all 51, and the race itself — one
+  user, zero audit rows — is still correctly treated as fresh.
+
+- **Compose waits for the schema, not just the database (#1069).** The
+  `api` and `worker` services now depend on `migrate` completing.
+  Without it the API could serve against a half-migrated schema, and
+  worse, `_seed_default_admin` runs at lifespan start and never
+  retries: if it lost the race badly enough that the `user` table did
+  not exist yet, it skipped silently and the install had no account
+  anyone could log in with. Kubernetes has had a wait-for-migrate init
+  container all along; this is Compose catching up. `beat` is left
+  alone — it only schedules, and its `depends_on` is the short list
+  form.
+
+- **Settings → Features lists every module again (#1069).** Its two
+  tabs were driven by a hardcoded list of catalog group names that had
+  fallen five groups behind, so both DNS toggles, DHCP import, NetBox
+  import, Fleet Firewall and Saved views rendered on neither tab and
+  were untoggleable anywhere in the product. The split is now derived
+  from the catalog — Integrations on one tab, everything else on the
+  other — so a new group cannot go missing by omission. That page is
+  load-bearing for the change above, which hides most modules from the
+  sidebar on the argument that this one lists all of them.
+
+  Two guards keep it from drifting back. The first, in
+  `tests/test_feature_module_defaults.py`, writes out the shipped
+  value of all 53 modules, so changing one is two deliberate edits and
+  adding a module fails until somebody states which way it ships — and
+  it parses the catalog *source* rather than importing it, so it
+  cannot be masked by the new `conftest` fixture that turns every
+  module on for the test suite. The second fails any new migration
+  that touches `feature_module` at all.
+
+  Verified on a real database both ways: a full migration chain on an
+  empty database leaves zero rows, so the catalog governs; the dev
+  database with its 51 seeded rows keeps all 51.
+
+  `scripts/seed_demo.py` now enables the nine gated modules it
+  populates before it starts. It POSTs to routers the flip turns off,
+  and its HTTP helper logs a failure and walks on — so left alone it
+  would have printed a wall of 404s and produced a demo dataset with
+  no ASNs, customers, providers, circuits, services, overlays,
+  network devices, multicast groups or conformity policy in it.
+
+- **CI: a backend PR no longer waits 28 minutes on one test shard
+  (#1019).** The eight `Backend — Tests` shards were split by test
+  COUNT — no `.test_durations` file existed anywhere in the repo, so
+  pytest-split had nothing else to go on — and the alphabetical
+  slice holding the heavy DB-bound files ran 25–28 min while the
+  other seven took ~11 for the same 595 tests. The split is now
+  balanced by duration from a committed `backend/.test_durations`,
+  there are twelve shards, and every full run re-measures: each
+  shard uploads what it timed, the aggregator merges the pieces into
+  a `test-durations` artifact — normalizing each shard by its
+  runner's speed first, since hosted runners vary ~2× run to run
+  and a raw measurement bakes one slow runner into every test it
+  held — and warns when the file stops describing relative costs;
+  `make test-durations` pulls the newest artifact down for a human
+  to commit at release prep. A stale file only costs balance (an
+  unknown test is assumed average), never correctness. Measured on
+  the PR itself: 28 min → 15–16 min wall clock, the remainder being
+  one runner in twelve landing ~2× slower, which no split removes.
+  **Found on the way: coverage was still being traced on every
+  shard.** #435 removed `--cov` from the workflow command, but
+  `addopts` in `backend/pyproject.toml` re-added it silently, so
+  every shard log ended with the full coverage table and every
+  `make test-one` paid the same 15–30 % for output nothing read.
+  Coverage is now opt-in via `make test-cov`.
+- **CI: a PR runs only the backend tests its diff can affect
+  (#1020).** The push-to-main shards now record which test executed
+  each line (`--cov-context=test`); the aggregator folds that into a
+  `test-impact-map` artifact, and the next PR's change-detection job
+  narrows the shards to the test files the changed `app/` modules
+  were observed to reach. **Every rule fails open** — toward the
+  full suite: no map, a migration, `pyproject.toml`, a data file,
+  `conftest.py`, a module only ever executed at import (models,
+  registries), or a selection covering most of the suite all run
+  everything, and push to main always does, so a wrong selection is
+  caught after merge rather than lost. Why not a file-name mapping:
+  only 65 of 358 test files are named after an `app/` module, and
+  228 of them build the whole app through the `client` fixture, so
+  a static import graph reaches every test from any change.
+- **CI: `agent-e2e.yml` no longer runs on backend-only PRs
+  (#1021).** It installs the control plane from the `:latest`
+  release image and builds only the DNS agent images from PR
+  source, so on a backend change it spent 4–20 minutes probing a
+  cluster that did not contain the change — the workflow's own
+  header already made this argument for excluding `frontend/**`.
+  Its path filter now lists what it actually exercises.
+- **CI hygiene (#1022).** The `protect-main` ruleset now requires
+  every stable check name, not just Backend Lint and the two
+  Frontend jobs — `Backend — Tests` had been documented as "a
+  required-check aggregator" while not being one. The four
+  per-image build workflows lose a `docker/login-action` and a
+  "Build and push (main / tag)" step that their PR-only triggers
+  made reachable solely by hand (where it pushed `:<branch>` tags
+  nothing consumes), and drop `packages: write`. Both frontend
+  jobs cache npm. Stale ci.yml comments ("~1900 tests", "coverage
+  is no longer collected") corrected. The two GitHub-managed CodeQL
+  runs per PR (default setup + Code Quality) are documented in the
+  trigger table and kept — the Code Quality bot threads are acted
+  on.
+
+- **Every version pin Dependabot cannot see now lives in one
+  manifest, and CI fails when a copy drifts (#975).** Dependabot
+  covers four ecosystems here; it has no Helm ecosystem and does
+  not read Dockerfile `ARG` values, chart `values.yaml`, action
+  `with:` inputs, CI script defaults or the appliance bake
+  arrays. Those pins were spread across nine file types, several
+  behind upstream, two past end-of-life, and one component sat on
+  two different versions because only one of its copies was
+  Dependabot-visible: the appliance chart's nginx had fallen a
+  minor behind the frontend image's, with nothing connecting
+  them. Root `versions.json` now declares all 28, and
+  `scripts/lint_versions.py` asserts each still appears in each
+  file that carries it — 89 assertions, run in CI's
+  unconditional Backend Lint job and by `make ci`.
+  **Bumping is one edit**, because every site's expected string
+  is a template over the component's `version` field.
+  **The literals stay in the files rather than being read from
+  the manifest at build time.** A build-time read that yields an
+  empty string is the failure class this repo has hit repeatedly
+  (#1028, #1029, #1030): an action input resolving to `""` falls
+  back to the action's own default — for `azure/setup-helm`,
+  `latest` — with no error anywhere. The lint gives the same
+  single-source guarantee with no new build-time failure mode.
+  **The one Dependabot-owned pin that IS listed is nginx's
+  `FROM`**, deliberately: pairing it with the copies Dependabot
+  cannot see is what turns the next bot bump into a failing lint
+  instead of a silent minor of drift.
+  **`count` is the load-bearing field.** The Patroni overlay runs
+  three etcd services and three Redis containers; a substring
+  check with no count passes a bump that moved two of three and
+  left a mixed-version cluster.
+  A weekly `pin-drift` job in `trivy-scheduled.yml` resolves each
+  declared upstream and files the delta, separating pins that are
+  behind ON PURPOSE from real drift — the `hold` field carries
+  each reason, so a known hold never reads as neglect.
+  `make versions-upstream` runs it locally.
+  **Seven defects in the guard itself, found by /code-review and
+  CodeQL before it shipped, and every one was it failing open.**
+  `--check` — the mode the script's own docstring documents — was
+  not a flag: argparse resolves an unambiguous prefix, so it ran
+  `--check-upstream`, the advisory network mode that always exits
+  0. Following the documentation turned the check off. It is a
+  real flag now and `allow_abbrev=False` stops the next one.
+  An unknown key was silently ignored, so `"counts": 3` left
+  `count` unset and downgraded an exact assertion to "at least
+  one" — a 2-of-3 partial bump passed; unknown keys are refused
+  at every level. The weekly job scraped the first number off a
+  prose line that opens "0 behind upstream" *when every lookup
+  failed*, so a rate-limited run would have reported the fleet
+  current and CLOSED the drift issue; the script now prints a
+  machine-readable `RESULT` line carrying `failed`, and any
+  component that could not be checked makes the verdict
+  indeterminate rather than clean. Technitium is pinned by tag
+  AND digest and only the tag was asserted, so bumping `version`
+  alone passed while the build stayed on the old image — the
+  digest is a manifest field now, asserted offline and resolved
+  against Docker Hub weekly. `ghcr.io/cloudnative-pg/postgresql`
+  was the one bake-array/chart-values pair still unguarded, and
+  the worst one to lose: the appliance never pulls, so a
+  divergence there is ImagePullBackOff on an air-gapped box. And
+  `docs/DEVELOPMENT.md` referred twice to a section that did not
+  exist, now written as §9. And the GitHub token was scoped to a
+  URL SUBSTRING — `"api.github.com" in url` is equally true of
+  `https://evil.example/api.github.com/x`, which is the token
+  handed to whoever owns that domain. It is matched on the parsed
+  hostname now, against an allowlist of the four endpoints this
+  script has any business reaching, https only.
+
+- **The pins the sweep found behind, bumped (#975).** Out of
+  support: `ruby:3.2-slim` (EOL 2026-03-31) → 3.4, and with it
+  `webrick` 1.8.1 → 1.9.2 — 1.8.1 predates the request-smuggling
+  fix in 1.8.2 (CVE-2024-47220) and was the only known-vulnerable
+  web server in the tree, seen by no lockfile and no bot;
+  `jekyll` 4.3.4 → 4.4.1; `haproxy:2.9-alpine`, a short-lived
+  non-LTS branch with no release since March 2025, → 3.4. Behind
+  upstream: Helm v3.20.2 → v3.21.4 across all five copies,
+  `redis` 8.8 → 8.10.1 across every one of them, the appliance
+  chart's nginx 1.30.3 → 1.31.5, kube-state-metrics → v2.20.0,
+  node-exporter v1.11.1 → v1.12.1, GoBGP 4.7.0 → 4.9.0
+  (`make trivy IMAGE=looking-glass` clean), and the Patroni
+  overlay's etcd v3.5.30 → v3.5.33 on all three services. Every
+  non-held pin is now current.
+  **The HAProxy jump is the one an existing deployment must read
+  before upgrading**, because that overlay's `haproxy.cfg` is
+  operator-supplied and 3.x turned keywords deprecated across the
+  2.x series into hard failures. The canonical Patroni config was
+  validated unchanged on both 2.9 and 3.4, so a config of that
+  shape needs no edit; `BAREMETAL.md` now says so and gives the
+  one-line `haproxy -c` command to check a config that is not.
+  **MetalLB stays on 0.15.3**, re-verified rather than assumed:
+  metallb/metallb#3063 is still open, so the hold and its three
+  vendored sub-pins (frr-k8s, frr, kube-rbac-proxy) stand and are
+  now recorded with the reason.
+  **Three things the sweep got right that the issue text had
+  wrong.** `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve
+  to the same digest, so 3.4 IS the LTS branch — 3.2 is not.
+  Alpine 3.24 ships Python **3.14.7**, not the 3.13 the
+  `dependabot.yml` comment had claimed for as long as the hold
+  existed, which makes the agent-image blocker a 3.12 → 3.14 jump
+  needing every dependency re-verified, not the one-minor step
+  the wrong number implied. And `patroni-spatiumddi:latest` is
+  not an unpinned pull — the HA overlay BUILDS it inline from
+  `postgres:16-alpine`, so it names a purely local image; what is
+  genuinely unpinned there is the `pip install patroni[etcd3]`
+  beside it, now documented in `BAREMETAL.md`.
+  **Found while writing the manifest:** the backend test shards'
+  own Redis service in `ci.yml` was still on 8.8 — a real pin, in
+  the file the sweep was being written in, that the hand-written
+  issue table had missed. It is in the manifest now, along with
+  the prose in four docs pages that named a version as fact.
+
+- **The agent images move to Alpine 3.24 / Python 3.14.7, and the
+  arg that was supposed to control that becomes real (#1037).**
+  The base had been pinned to 3.23 for a year behind a
+  `dependabot.yml` comment that said 3.24 moves Python "3.12→3.13";
+  the #975 sweep checked the package index and found **3.14.7**, so
+  the task was a two-minor interpreter jump, not a one-minor step —
+  which is most of why nobody had done it. All three agent suites
+  were run on 3.14 first (dhcp 188, dns 276, supervisor 374; the
+  supervisor's 11 apparent failures were a test container with no
+  `bash`, identical on 3.12). The looking-glass agent has no suite
+  at all, so it and the others were additionally checked by
+  importing **every** submodule inside the shipped image — 96
+  across the five agents, none failing.
+  **The real pin was never `PYTHON_VERSION`.** Four of the five
+  images declared `ARG PYTHON_VERSION=3.12` and referenced it
+  **nowhere** — bumping it changed the image not at all — while
+  `PYTHONPATH=/usr/local/lib/python3.12/site-packages`, hardcoded,
+  was what actually located the agent. That is the exact shape #672
+  hit: base moves, PYTHONPATH does not, the image builds perfectly
+  and the pod CrashLoopBackOffs on `ModuleNotFoundError`. So
+  `PYTHONPATH` now interpolates the arg, and every agent image
+  asserts `import <agent>` as a build step — verified by building
+  with a deliberately stale `--build-arg PYTHON_VERSION=3.12`,
+  which now fails the BUILD instead of shipping.
+  **The technitium image needed a different assertion**, which
+  review caught it not having at all: it is the one agent that is
+  not Alpine-based, and its arg drives BOTH the builder and
+  `PYTHONPATH`, so those move together and an import alone still
+  passes when the arg is wrong (they resolve, because `cryptography`
+  and `pydantic-core` ship abi3 wheels that load across 3.x). What
+  can drift there is the interpreter inside the upstream
+  `technitium/dns-server` base, so that image compares
+  `sys.version_info` to the arg directly. Verified both ways.
+  Carried along by the same index: pdns 5.0.5 → 5.0.7 (a patch
+  within pdns 5, so the #638 LMDB schema guard correctly takes no
+  snapshot — the 4.9 → 5.0 crossing already happened on 3.22 →
+  3.23), dnsdist → 2.0.8, bind → 9.20.27, Kea unchanged at 3.0.3.
+  All eight images `make trivy` covers build clean and scan clean.
+  **CI surfaced one CVE the local scan had not**, which is the
+  path-filter effect this repo has hit before (#639): touching a
+  Dockerfile is what makes CI scan that image, so the PR inherits
+  everything published since the last time anything touched it.
+  `google.golang.org/grpc` was pinned at 1.83.1 for CVE-2026-84304
+  and 1.83.1 now carries CVE-2026-84445 (HIGH, xDS server DoS).
+  Clearing it took three rounds, because those `go get` pins are a
+  coupled set that `go get` refuses rather than resolves: grpc 1.83.2
+  wanted x/net 0.58.0, and both then wanted x/text 0.41.0.
+  **`Agent — Tests` moves to 3.14 with them.** It ran on 3.12 while
+  the images shipped 3.14, which is the skew that lets a
+  3.14-only regression reach a pod with every check green. The
+  backend stays on 3.12 — a separate, deliberate hold.
+
+- **The nightly build moves from 02:23 to 03:23 America/New_York,
+  which also closes a hole it had every spring.** Cron is UTC-only,
+  so the schedule is two twin crons plus a gate that keeps the one
+  whose slot reads the target hour on the Eastern clock. On the
+  spring-forward night the Eastern clock jumps 01:59 → 03:00, so
+  **no 02:xx exists and BOTH twins skipped** — the nightly silently
+  built nothing once a year. 03:xx exists on every night there is.
+  Verified against tzdata for normal EDT, normal EST and both DST
+  nights across 2026-2028: exactly one twin builds in every case.
+  The `:23` is kept deliberately and must not be rounded to `:00` —
+  the top-of-hour cron stampede delays runner scheduling, and these
+  runs already start up to 13 h late.
+
+- **A slot upgrade could regenerate SECRET_KEY and orphan everything
+  encrypted at rest (#1042).** `app/core/crypto.py` derives the
+  at-rest Fernet key from SECRET_KEY whenever no explicit
+  `CREDENTIAL_ENCRYPTION_KEY` is set — which is every appliance — so
+  the chart-owned Secret carrying `secret-key` is the root of the
+  appliance CA private key, appliance certs, integration credentials,
+  OIDC/SAML secrets and every JWT.
+  A k3s HelmChart defaults to **`failurePolicy: reinstall`**,
+  documented as "a clean uninstall and reinstall of the chart". On
+  three ddi-pg slot-upgrade walks helm-controller took that path for
+  `spatium-control`, the Secret was deleted, the reinstall's `lookup`
+  found nothing, `randAlphaNum 64` minted a new key, and cluster
+  member approval started answering 500 with
+  `ValueError: encrypted value could not be decrypted` — while the
+  control plane reported healthy and the data plane kept serving.
+  **The fix is the annotation, and `failurePolicy` is deliberately
+  left alone.** The Secret gains `helm.sh/resource-policy: keep` — it
+  was the ONLY credential Secret in the chart without it, and the
+  Postgres and Redis secrets came through the very same event purely
+  because they carry it. With it, the uninstall half retains the
+  Secret and the reinstall's `lookup` finds the same key.
+  **`failurePolicy: abort` was written, then reverted in review**, and
+  the reason is worth recording: it looks like the safer setting and
+  is not. `spatiumddi-helm-stuck-recover` only acts on a HelmChart
+  carrying a `Failed` condition, and only after a 600 s latch on a
+  5 min tick — so a release left `pending-upgrade` by the slot reboot,
+  which is the scenario this was found in, may never qualify at all.
+  `abort` there risks an indefinite outage with no API and no UI,
+  where the default `reinstall` recovers in seconds. What made
+  `reinstall` dangerous was never the reinstall; it was the missing
+  annotation. Disruptive and self-healing is fine. Lossy was not.
+  The chart guard is written against the *generator* rather than the
+  filename — any Secret template that mints a credential with
+  `randAlphaNum` must carry the annotation — with a negative control
+  asserting SECRET_KEY's own template is still one of the templates
+  being checked, so the guard cannot pass by looking at nothing.
+  **Both of the first-cut guards were themselves vacuous**, which
+  review proved rather than argued: deleting the entire `annotations:`
+  block left all four tests passing, because the template's own header
+  prose mentions the annotation; and the unit guard matched a name
+  anywhere in `mkosi.postinst`, where dozens of units are `chmod`'d by
+  name — so adding the chmod line its siblings have would have
+  satisfied it while the unit stayed unenabled (`spatium-etc-render`
+  already slipped through that way). They now strip Helm and shell
+  comments and match the annotation as a real YAML entry *with the
+  value `keep`*, and parse the `for unit in … ; do` list plus the
+  explicit `*.target.wants/` symlinks rather than the whole file.
+  A third check runs on the **rendered** manifest in
+  `charts-render-check.sh`, where a value typo or an annotation hidden
+  behind a false condition is visible and a template-text scan is not;
+  it reports how many Secrets it examined, so "checked nothing" cannot
+  read as "checked and clean".
+  **Making `abort` safe turned up a third defect.** The recovery it
+  leans on had never run: `spatiumddi-helm-stuck-recover.timer` ships
+  in the image, carries `WantedBy=timers.target`, and has its runner
+  covered by `test_helm_stuck_recover.py` — and was absent from
+  `mkosi.postinst`'s unit-enable loop, so on every appliance ever
+  built it was inert. Same class as #550, where a host runner shipped
+  without the `+x` its ExecStart needed: present, reviewed, tested,
+  and dead for one missing line of image plumbing. It is enabled now,
+  and a sweep of all 38 shipped units with an `[Install]` section
+  found no others. The guard that would have caught it matches
+  `[Install]` as a SECTION HEADER, never as a substring —
+  `spatiumddi-pcap.service` carries the comment "No [Install] —
+  invoked only by spatiumddi-pcap.path", and a substring match
+  reports that correct file as a violation, which is how an
+  exemption list fills up with noise and stops being read.
+
+- **k3s v1.35.6 → v1.36.4 (Kubernetes 1.36), CloudNativePG 1.29.1 →
+  1.30.0 (#987).** CNPG 1.29.x does not support Kubernetes 1.36 and
+  reached end of life on 2026-09-29. Chart lint now validates against
+  Kubernetes 1.36.0 instead of 1.31.
+
+- **The charts adopt Kubernetes 1.36's pod posture (#988).** Three
+  PriorityClasses on the appliance (`spatium-service` above
+  `spatium-control-plane` above `spatium-observability`) so the kubelet
+  evicts the right pod under memory pressure; `seccompProfile:
+  RuntimeDefault` on every pod, which Compose had always applied and
+  Kubernetes had not; Pod Security labels on the namespace; and
+  `kubeVersion` floors raised to versions that are actually run. The
+  umbrella chart's PriorityClass values are empty by default and must
+  stay so unless the classes exist, or the apiserver refuses the pod.
+
+- **The api's probes are sized for a busy single worker, and the
+  request-metrics label set is bounded (#1051, #1055).** One uvicorn
+  worker answers the probes on the same event loop that serves every
+  request, so under load the 5 s budgets killed a healthy api and
+  pulled the only pod out of its Service. Budgets now come from
+  `api.probes` (liveness 30 s × 4, readiness 15 s × 3). `/metrics` is
+  rendered off the event loop, and its per-route labels no longer grow
+  without bound.
+
+- **Contributions are signed off under the Developer Certificate of
+  Origin (#1331).** `CONTRIBUTING.md` explains the `git commit -s`
+  sign-off, and the PR template asks for it.
 
 ### Fixed
 
@@ -1567,176 +3425,6 @@ the formatter handles the rest.
   Esc to close, and a named close button (the two backup forms gain
   one). Their layout is unchanged.
 
-### Changed
-
-- **helm 3.22.0 → 4.3.0 (#1098).** Build-time tool only; nothing
-  ships it. The pinned copies move together — `versions.json` plus
-  the Makefile's `alpine/helm` image and the `version:` input in
-  `ci.yml`, `release.yml`, `build-appliance.yml` and `agent-e2e.yml`
-  — and the manifest's `track` becomes `^v4\.`. `docs/DEVELOPMENT.md`
-  joins them as a sixth: its CI-gate table said "Helm 3.21", already
-  stale before this change and wrong at the *major* after it, which
-  would send anyone reproducing CI locally to the wrong binary. It is
-  now spelled as the exact version and enforced by `lint_versions.py`,
-  so it cannot drift again. (That row was stale two further ways, both
-  corrected: "both charts" predates metallb landing as a third, and
-  "six value sets" describes a matrix that is now 14.)
-  **This CLOSES a divergence rather than opening one.** `bake-chart.sh`
-  packages the chart with THIS binary; on the node, k3s's
-  helm-controller spawns `klipper-helm` to install it — and the
-  pinned `v0.13.3-build20260727` ships **Helm 4.1.4** (verified
-  directly: `helm version --short` in that image). So the appliance
-  has been installing with 4 while CI validated with 3. The CLI
-  major now matches what production actually runs.
-  **The charts render identically.** Both majors were run against the
-  same tree and the 323 rendered objects compared after parsing, not
-  as text. 18 objects differed — but 17 of those also differ between
-  two runs of the *same* 3.22.0 binary, because the charts generate
-  random credentials, so the control run is what identifies them as
-  noise. Exactly one CONTENT difference is attributable to Helm 4: a
-  single trailing blank line inside the `frr.conf` string of the
-  `metallb-bgp-frr-k8s-frr-startup` ConfigMap (227 → 228 bytes),
-  which is inert. The rest of the textual diff is comment placement
-  and blank lines in the output stream, outside any object.
-  **Helm 4 also reorders objects**, which a set-and-content comparison
-  cannot see, so order was checked separately: 12 of the 14 renders
-  emit identical order, and the two metallb ones do not —
-  `IPAddressPool` and `L2Advertisement` move from *before* the two
-  `ValidatingWebhookConfiguration`s to *after* them. That is not
-  cosmetic in principle: those webhooks are `failurePolicy: Fail`, so
-  under the new order the CRs are admitted through a webhook that can
-  reject them, where previously they were created before it existed.
-  Measured against a real k3s v1.36.4+k3s1 cluster rather than reasoned
-  about, and it is not theoretical: a **fresh install of that chart
-  fails under Helm 4 and succeeds under Helm 3**. Same chart, same
-  cluster, same values, apply-only — 3.22.0 exits 0 with both CRs
-  created; 4.3.0 exits 1, reporting that server-side apply failed
-  calling the metallb `ipaddresspoolvalidationwebhook` because the
-  service had `no endpoints available`. The webhook is now registered
-  before the CRs are applied, and its backing controller pod — created
-  moments earlier in the same pass — is not ready yet. **A retry
-  succeeds**: `helm upgrade --install` against the half-applied
-  release exits 0 and creates both CRs once the controller is up.
-  This is nonetheless not a change this PR makes, for a specific
-  reason rather than a general one: **the metallb chart is never
-  installed by this CLI.** `bake-chart.sh` packages it and
-  helm-controller installs it on the node via klipper-helm — already
-  4.1.4 — so the appliance has been on the new order since before this
-  branch. Nothing in CI installs it either; `charts-render-check.sh`
-  only templates it.
-  **A default appliance never reaches the failure at all**, which an
-  arm64 ISO built from this branch and booted confirms rather than
-  assumes: `metallb.enabled` is `false` by default and firstboot
-  renders the HelmChart that way, so the chart produces no
-  `IPAddressPool` and no `L2Advertisement`, the namespace stays empty,
-  and `helm-install-spatium-metallb` completes first time — the release
-  secret is at `v1`, so there was no retry. The ordering bites only
-  where an operator sets a control-plane VIP (#272 multi-node HA),
-  which is what flips metallb on — **and that case is broken today,
-  which setting a VIP on the booted appliance confirmed.** It does not
-  fail once and converge, as this entry previously guessed: it never
-  converges. klipper-helm resolves `SERVER_SIDE=auto` to
-  `--server-side=true`, and every attempt runs `helm uninstall` before
-  `helm install` — so each retry deletes the controller backing the
-  webhook, then reinstalls and applies the CRs while the replacement
-  pod is still starting. Each attempt destroys its own prerequisite.
-  Observed: `CrashLoopBackOff` at 5 restarts after ~5 minutes, no
-  `IPAddressPool`, and the frontend `LoadBalancer` stuck `<pending>`,
-  so the VIP never materialises.
-  **None of that is this pin's doing** and none of it changes with it:
-  klipper-helm ships with the k3s pin (`v1.36.4+k3s1`) and
-  `k3s-images.txt` is generated by `fetch-k3s.sh` rather than tracked,
-  so the appliance has behaved this way since that k3s landed, whichever
-  helm packages the chart. It needs its own issue against the appliance.
-  Also exercised under 4.3.0: `helm lint` + `dependency update` +
-  `package` for all three charts (the `bake-chart.sh` and
-  `release.yml` path), and an OCI `helm push` + `helm pull`
-  round-trip against a throwaway registry, digests matching.
-  **No breaking-change exposure**, re-audited against the tree rather
-  than the changelog: no post-renderers, no plugins, no `--atomic`,
-  no helm `--force`, `registry login` is already domain-only
-  (`ghcr.io`), and all three charts are `apiVersion: v2`, which Helm 4
-  runs unchanged. The flags we do pass — `--set`, `--timeout`,
-  `--kube-version`, `--create-namespace`, `--wait`, `--reuse-values`
-  — are unrenamed. The `helm upgrade` / `uninstall` strings elsewhere
-  in the tree are prose, or commands we print for operators to run
-  with their own helm; those were checked too and use no renamed flag.
-  The one behavioural change is server-side apply, which Helm 4
-  defaults to on **new** installs. The appliance is unaffected — it
-  is already on 4.1.4 — so the only newly-affected path is the single
-  kind `helm install` in `agent-e2e.yml`, and that workflow is
-  path-filtered on itself, so this change exercises it.
-
-
-- **GitHub organization renamed `spatiumddi` → `spatiumnorth`.** The
-  project is now `spatiumnorth/spatiumddi`: the org changed, the
-  repository name did not, and neither did the product, the PyPI
-  package, the image names or any filesystem path — `/etc/spatiumddi/`,
-  `/usr/lib/spatiumddi/` and `spatiumddi-api` are all untouched. Every
-  `github.com/` and `ghcr.io/` reference in the tree moved to the new
-  org, along with the shields.io badge paths in the README, which carry
-  the org separately from the link they sit behind and so would have
-  gone on reporting a repo that no longer answers.
-  **Container images move with the org**: pulls are now
-  `ghcr.io/spatiumnorth/…`, and the umbrella chart's
-  `image.repository` default moved with them. CI needed no such change
-  — it builds from `ghcr.io/${{ github.repository_owner }}`, which
-  follows a rename on its own.
-  **Two things do not follow a rename, and both fail silently.** Eight
-  workflows gate on `if: github.repository_owner == '…'` so a fork
-  never publishes; left at the old literal, release, nightly, the
-  weekly Trivy scan, asset pruning and the docs publisher would all
-  have skipped with a green check rather than an error. And the docs
-  site's org-root Pages repo has to be renamed to
-  `spatiumnorth.github.io` — GitHub serves an organization site only
-  from a repo named `<org>.github.io`, so the old name is demoted to an
-  ordinary project site and the root site stops existing;
-  `docs-publish.yml` now targets the new name.
-  **Operator action on upgrade:** `GITHUB_REPO` shipped in
-  `.env.example`, so an install that copied it carries
-  `spatiumddi/spatiumddi` in its own `.env`, which overrides the new
-  default and pins the daily release check and the appliance
-  slot-image catalogue to the old path. Update the value, or remove
-  the line to take the default.
-  **Pinned releases pull from the old path (#1163).** Every release
-  up to and including `2026.09.04-1` names its images under
-  `ghcr.io/spatiumddi/`, which now answers `denied`; the same tags
-  are published under `ghcr.io/spatiumnorth/`. A `docker-compose.yml`
-  taken from such a tag, or from a checkout older than this change,
-  fails at `docker compose pull` — `git pull` for the current file,
-  or change `ghcr.io/spatiumddi/` to `ghcr.io/spatiumnorth/` in your
-  copy. Every published chart version up to and including
-  `2026.9.4-1` defaults to the old path too: install or upgrade those
-  with `--set image.repository=spatiumnorth` plus
-  `dnsAgents.image.repository`,
-  `dnsAgents.flavors.powerdns.repository`,
-  `dnsAgents.flavors.technitium.repository` and
-  `dhcpAgents.image.repository` set to their `ghcr.io/spatiumnorth/…`
-  names (the chart README lists them).
-- **The release check reported a permanently up-to-date install when
-  its repo had moved.** GitHub answers `301` for a renamed repo, which
-  an org rename makes routine — and httpx does not follow redirects by
-  default while `raise_for_status()` does not reject a `3xx`. So the
-  redirect body was parsed as a release: no `tag_name`, so the task
-  stored no version, set `update_available=False`, cleared
-  `latest_check_error` and logged `update_check_ok`. The one default-on
-  connection in the product would have gone on reporting a healthy
-  “you are up to date” forever, which on a notifier whose job is
-  surfacing security fixes is worse than a loud failure. Both GitHub
-  clients (`tasks/update_check.py`, `services/appliance/releases.py`)
-  now follow redirects, which removes the false negative and keeps a
-  stale `GITHUB_REPO` working rather than silently wrong.
-- **The appliance image pruner stopped reclaiming pre-rename images.**
-  Its prefix guard exempts non-SpatiumDDI images so kubelet image-GC
-  owns them; narrowed to the new org alone, every accumulated
-  `ghcr.io/spatiumddi/*` release already on a deployed appliance —
-  exactly what the timer exists to reclaim — would have been classified
-  as third-party infra and kept forever, while still reporting nothing
-  stale to prune. It now matches both orgs; the in-use and
-  slot-version guards are unchanged, so nothing live can be removed.
-
-### Fixed
-
 - **A boot with the control-plane PriorityClass missing no longer
   loops the control plane (#1123).** `spatium-control-plane` is
   rendered by the `spatium-bootstrap` release, and firstboot's
@@ -2009,29 +3697,6 @@ the formatter handles the rest.
   `issue-1088` and would have filed exactly this had it failed. It
   now skips on dry runs and reports `github.ref_name`.
 
-### Changed
-
-- **helm 3.21.4 → 3.22.0 (#1091).** Build-time tool only; nothing
-  ships it. Five copies, none Dependabot-visible, all moved
-  together — `versions.json` plus the Makefile's `alpine/helm`
-  image and the `version:` input in `ci.yml`, `release.yml`,
-  `build-appliance.yml` and `agent-e2e.yml`. All three charts lint
-  and template clean under it.
-  **This is the terminal Helm 3 feature release** — published
-  2026-09-10, matching the project's stated final 3.x feature
-  release of 2026-09-09. After it, 3.x receives security fixes
-  only, until 2027-02-10. So this is a floor, not a resting place;
-  the move to 4.x is #1098.
-  The manifest's note claiming we stay on 3.x because the appliance
-  is "independent of this binary" is **wrong**, and is corrected
-  here rather than repeated: the appliance renders through k3s's
-  helm-controller, which spawns `klipper-helm` — and the pinned
-  `v0.13.3-build20260727` ships **Helm 4.1.4**. We already package
-  with 3 and install with 4, so a 4.x move closes that gap instead
-  of opening one. See #1098.
-
-### Fixed
-
 - **The weekly Trivy issue reported a CVE count and zero CVEs
   (#1095).** #1092 is the worked example: it said the api image
   had 5 HIGH/CRITICAL
@@ -2064,2309 +3729,6 @@ the formatter handles the rest.
   `frontend` — neither is an agent image, and `backend` is the one
   that actually reports findings.
 
-### Security
-
-- **A second provider of the same type can no longer sign in as another
-  provider's user (#1235).** External accounts were matched on
-  `(auth_source, external_id)`, and `auth_source` is the provider's
-  type, not the provider. On a miss, an account of the same type with
-  the same username was adopted. So with two LDAP domains or two OIDC
-  IdPs configured, whoever held `jsmith` in the second one signed in as
-  the first one's `jsmith`, superadmin flag and all; an identical OIDC
-  `sub` from two IdPs did the same without any username at all. Now an
-  external account belongs to one provider (`user.auth_provider_id`,
-  migration `f4a8c2e71d09`), a login matches on the provider and its
-  external id, and **an account is never adopted by username alone**:
-  a taken username is refused as `username_collision`.
-  - **Upgrade note.** The migration attributes existing accounts only
-    where it can prove the provider: RADIUS / TACACS+ external ids name
-    it, and an LDAP / OIDC / SAML account is attributed when its type has
-    exactly one provider **and** the account cannot have come from another
-    one: it was created after that provider, and after the last deletion of
-    any other provider of its type (read from the audit log, which must
-    also hold the surviving provider's own `create` row; an audit log
-    restored without its section attributes nothing). A disabled
-    provider counts: one enabled and one disabled provider of a type is two,
-    and links nothing. Anything else is left unlinked and is refused
-    (`account_link_required`) until an administrator links it from
-    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
-    audited as `user.provider_linked`). The Users page marks those accounts
-    **unlinked**, and `list_users` reports their provider as null.
-  - **A deleted provider's accounts are not handed to its successor
-    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
-    their identifier intact, so "one provider of the type exists now" did
-    not mean "only one ever did". An earlier draft of this fix linked such
-    an account to the surviving provider, both at upgrade and at sign-in,
-    so the survivor's subject with the same `sub` or DN signed in as it.
-    The backfill now checks the audit log as above, and the sign-in path
-    never links an unlinked account itself: it always refuses with
-    `account_link_required`, and the refusal's audit row names the account.
-  - **Behaviour change.** A user whose identifier at the provider changes,
-    such as an LDAP DN after an OU move, was re-attached by username and
-    is now refused until an administrator links the account again. The
-    link clears the stored identifier, and the next sign-in as that
-    username through that provider claims it; it also revokes the
-    account's sessions. Deleting a provider clears its accounts'
-    identifiers too, so a replacement provider of the same type that
-    issues the same `sub` or DN cannot adopt them. It also revokes their
-    sessions, and an administrator cannot delete the provider their own
-    account signs in through (409), which would lock them out.
-  - **SAML needs a stable NameID.** The NameID is the account's key at its
-    provider, and a transient one is new on every sign-in: it used to be
-    re-attached by username, which is the adoption this fix removes. A
-    transient NameID is now refused at the ACS with a message naming the
-    fix: configure the IdP to release a persistent or emailAddress NameID.
-  - On the password grant, a provider that accepts the password but whose
-    subject does not own the account no longer ends the login: the next
-    provider by priority still gets its turn, so a higher-priority
-    directory that also knows the user cannot lock out the account's
-    own provider.
-
-- **A started MFA enrolment is budgeted and expires (#1354).** The first
-  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
-  started enrolment never expired and survived sign-out and a password
-  change. So an abandoned enrolment stayed open to unlimited 6-digit
-  guesses from any of the user's sessions, and a hit turned MFA on with a
-  secret the user never saw, locking a local user out until an admin
-  reset it. Verify now spends the same fail-closed step-up budget as
-  begin, disable and regenerate (`429` when spent, `503` while it cannot
-  be read), claimed atomically before the code is checked so concurrent
-  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
-  so the UI does not resubmit and count it twice. A started enrolment
-  expires after 15 minutes (verify answers `400` and discards it), and
-  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
-  candidate secret's own Fernet timestamp.
-
-- **The api image no longer ships pip (#1392).** The runtime image
-  carried the Python base image's own pip 25.0.1, which has six fixed
-  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
-  only, so it never blocked on them, and `apt-get upgrade` cannot patch
-  pip because it is not a Debian package. So every scan at default
-  severity, such as Harbor's, reported them on every build. Nothing at
-  runtime runs pip, and a production image has no business carrying a
-  package installer, so the runtime stage now uninstalls it, and the
-  `dev` stage (pytest, `make ci-backend-lint`) restores it with
-  `ensurepip`. A Trivy scan of the runtime image now reports no
-  fixable Python-package finding at any severity.
-
-- **Setting up two-factor authentication needs a step-up (#1241).**
-  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
-  that decides whose authenticator the account trusts. A hijacked session
-  could enrol the attacker's: for an SSO superadmin that authenticator then
-  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
-  SNMP communities, provider secrets); for a local user it locks the real
-  owner out, since disabling MFA needs a code only the attacker has. A
-  local user now re-enters their password to start enrolling; an SSO user
-  must have signed in with their identity provider in the last 10 minutes,
-  and is told to sign out and back in otherwise. A token refresh now keeps
-  the session's original sign-in time rather than restamping it, so a
-  stolen session cannot refresh its way into looking recent; the session
-  viewer's "created" column now means when that person signed in. Refused
-  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
-  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
-  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
-  for a caller who already holds a session, so unthrottled each was a
-  password oracle for exactly the hijacked session the step-up exists to
-  stop. That budget fails closed: while Redis is unreachable the three
-  step-ups answer `503` with `Retry-After: 60`, because the account
-  lockout counts sign-in answers only and nothing else would bound the
-  guessing. Sign-in is unaffected.
-
-- **External accounts honour their state (#1242).** A **disabled** LDAP,
-  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
-  and a `login` / `success` audit row, before every later request was
-  refused. The check now runs before anything is issued or updated, answers
-  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
-  as `denied`. And **"must change password"** on an external account, which
-  has no password here to change, locked it out until an admin cleared the
-  flag: setting it, or resetting the password, on an external account is
-  now refused, and an account that already carries the flag is no longer
-  held to it.
-
-- **Remote agents verify the control plane's certificate by default
-  (#1220).** All five `docker-compose.agent-*.yml` files defaulted
-  `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
-  the docs ran agents that trusted any certificate, and anyone on the
-  network path could read the platform-wide agent key (then enrol rogue
-  agents and pull TSIG keys) or serve the agent its DNS / DHCP
-  configuration. Worse, the skip was checked before `TLS_CA_PATH` in the
-  DNS, DHCP and looking-glass agents, so mounting the control plane's CA
-  as `DOCKER.md` said verified nothing either, silently. Now the files
-  default to `0` and pass `TLS_CA_PATH` through from `.env` (with a
-  commented CA volume to uncomment); `TLS_CA_PATH` wins over the skip;
-  and an agent logs `control_plane_tls` on every start while
-  verification is off, or while a skip is being ignored. The DNS agent's
-  seven hand-copied verify decisions are now one `httpx_verify()`, with a
-  test that fails if a copy reappears. `DNS_AGENT.md` named a
-  `CA_BUNDLE_PATH` variable no code reads; it is `TLS_CA_PATH`. The
-  in-stack `docker-compose.yml` agents talk plain `http://api:8000`, so
-  the flag was a no-op there and is removed. The looking-glass agent got
-  its first tests and now runs in CI's agent matrix.
-  **Upgrade note:** a remote agent relying on the old default against a
-  private-CA or self-signed control plane stops connecting after the
-  upgrade. Mount that CA and set `TLS_CA_PATH` (`docs/deployment/DOCKER.md`,
-  distributed agent prerequisites), or set
-  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` explicitly in `.env` to keep the old
-  behaviour in a lab. Appliance role pods and the supervisor are not
-  changed here; they are #1219.
-
-- **A backup archive named `..` can no longer delete the folder above
-  the archives (#1243).** The shared `safe_filename()` was
-  `os.path.basename`, and `basename("..")` is `..`. On a WebDAV target
-  `urljoin` turned that into the parent collection's URL, so
-  `DELETE /backup/targets/{id}/archives/%2E%2E` sent a recursive WebDAV
-  `DELETE` one level above the archives. Superadmin-only, but it
-  deletes data. `safe_filename()` now refuses an empty name, `.`, `..`,
-  anything with a `/` or `\`, and control characters, instead of
-  stripping (stripping also turned `a/b.zip` into `b.zip`, an archive
-  the caller never named). The seven drivers that carried their own
-  inline `basename` (S3, SCP, Azure Blob, SMB, FTP, GCS, WebDAV) now
-  all call it. The WebDAV URL percent-encodes the name as well, so a
-  name that arrives as `%2E%2E` is sent as a literal and never becomes
-  a dot-segment on a server that decodes before normalising.
-  The download, delete and restore-from-archive routes answer **422**
-  for such a name without reaching the destination, and also for any
-  name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
-  are the only names the listing ever shows, so any other name was
-  never offered by this API; the shared name pattern also stops
-  matching a name with a separator in it, so an object-store key under
-  a nested prefix is no longer listed as an archive nothing can then
-  download or delete, and the seven drivers that carried their own copy
-  of it now use the shared one. Thirteen download routes that built
-  `Content-Disposition` by hand now use `content_disposition()`, and an
-  uploaded upgrade image's filename, the one download name an uploader
-  controls, is stored as its last path component with control
-  characters removed, instead of verbatim.
-
-- **A client can no longer choose the source IP the API records
-  and rate-limits (#1221).** Compose published the API on every
-  interface, and the API believed `X-Real-IP` from any caller. nginx
-  overwrites that header, but a client talking to `:8000` directly set
-  its own. That bypassed the per-IP login throttle and the ACME
-  `allowfrom` gate, and wrote any address it liked into audit rows,
-  reopening #626 by another path. Now uvicorn runs with
-  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
-  `X-Forwarded-Proto` only when the real TCP peer is in the new
-  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
-  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
-  longer read at all. Compose also publishes the API on `127.0.0.1`
-  only (`API_BIND`). Browsers and remote agents already go through
-  the frontend, and the looking-glass collector's host networking
-  uses localhost. **Upgrade note:** if you reach `:8000` from another
-  machine, set `API_BIND=0.0.0.0`, and preferably narrow
-  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
-  whose nodes have public addresses, add them to
-  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
-  browser, as the client.
-
-- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
-  `SECRET_KEY` signs every session token and, unless
-  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
-  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
-  both shipped a committed placeholder, and the boot check only warned (and
-  did not recognise the k8s one at all). On such an install any signed-in
-  user could mint a superadmin token, since user ids are visible in the
-  audit log, and a database dump decrypted every stored LDAP, integration
-  and AI provider secret. Now the api refuses to start on either
-  placeholder, on a key under 32 characters, or on one that reads like a
-  placeholder, and says how to generate a key and how to move an existing
-  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
-  instead; `docker-compose.dev.yml` sets it and nothing else should.
-  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
-  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
-  falling back to a different key. Helm and the appliance already generate
-  their own keys and are unaffected.
-  **Upgrade note:** an install that has been running on the placeholder
-  stops at boot. Follow "Rotating `SECRET_KEY`" in
-  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
-  with a one-off Job in `k8s/ops/`): set a new key, then run
-  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
-  starting the api. It re-encrypts every stored credential for the new key
-  (the same walk a cross-install restore uses), is idempotent, and records
-  an audit row; everyone signs in again. Deliberately not "generate a key
-  on first start": compose could only persist it in Postgres, next to the
-  credentials it protects, so a dump would decrypt them anyway. Because
-  anyone could have signed requests on a placeholder key, the doc also
-  says to review API tokens, users and the audit log afterwards.
-  Also: an access token that names no session (`jti`) is refused. Every
-  login has minted one since `2026.05.07-1`, so such a token can only be
-  forged, and it also escaped force-logout. The session a token names must
-  also belong to the token's user, or a forger could pair their own live
-  session with a superadmin's id. And force-logout now reaches
-  the nmap scan stream, which checked its own token without looking at
-  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
-  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
-  the placeholder.
-
-- **Appliance supervisors verify the control plane's TLS certificate
-  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
-  the supervisor unconditionally, calling it trust-on-first-use, and nothing
-  was pinned: every register, heartbeat and proxy poll ran with no
-  verification at all. The heartbeat response carries the platform-wide DNS
-  and DHCP agent keys and the slot image URL plus the sha256 that is its only
-  integrity check, so anyone on the path could read the keys and serve a node
-  a root filesystem of their choosing. Now the supervisor pins the
-  certificate the control plane presents at first contact and verifies every
-  connection against it in the TLS handshake (a self-signed control plane
-  works, and the hostname need not match an operator-typed IP). A rotated
-  certificate (re-minted on member join or VIP change, uploaded, or renewed
-  by ACME) is adopted only if the appliance CA, which every approved
-  supervisor already holds, vouches for it through a new unauthenticated
-  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
-  certificates, signed by the CA. That list names the TLS Secret's
-  certificate as well as the active one, so #1215's revert to the first-boot
-  certificate does not strand supervisors. Once approved, a supervisor also
-  checks that its first-contact pin is on the list, which catches an
-  interception present at pairing (unless it also replaced the CA). The
-  k8s, nettool, pcap and storage proxy loops go through the same pinned
-  trust; before, they verified against system CAs, so against a self-signed
-  control plane they could not connect at all. An `http://` URL is probed
-  once for the `https://` it redirects to, that certificate is pinned, and
-  every request goes straight to the `https://` target, so the pairing code
-  and session token no longer cross the wire in cleartext before the
-  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
-  the CA, so an appliance moved to a rebuilt control plane pins the new one
-  rather than refusing it forever. The DNS, DHCP and looking-glass role
-  pods were left skipping verification here; #1281 below closes that.
-  **Upgrade note:** an already-paired appliance takes its pin at its first
-  contact after the upgrade, then checks it against the CA's list; a
-  mismatch is logged as `supervisor.tls.pin_not_vouched`.
-  **Also fixed, because pinning depends on it:** after a control-plane
-  reboot, the frontend kept serving the first-boot certificate. A k3s start
-  puts it back into the TLS Secret (#1215), the frontend pod that starts
-  then loads it, and when the api wrote the active certificate back, the
-  frontend did not roll. The rollout annotation was a checksum of the
-  certificate's content, and restoring the same content left it unchanged.
-  Found on a two-appliance test: after one reboot the control plane served
-  a certificate its own signed list did not name, and the remote appliance
-  refused it on every heartbeat until the frontend was restarted by hand.
-  The annotation now also covers the Secret's `resourceVersion`, which
-  every real write moves, so the write-back rolls the frontend. Browsers
-  stop being shown the first-boot certificate after a reboot as well. The
-  revert itself remains #1215.
-
-- **Appliance role pods verify the control plane's TLS certificate
-  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
-  pods reach the control plane at its external URL, and the chart gave
-  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
-  the platform-wide agent key out and the DNS / DHCP configuration back,
-  so anyone on the path could read the key and serve a node its zones and
-  scopes. They now use the certificate their supervisor pinned (#1219): the
-  chart mounts the supervisor's `tls/` directory read-only (public material
-  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
-  trusts exactly the certificates in that file, with a pinned leaf as its
-  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
-  could not do this: it checks the hostname and needs a real CA, so a
-  CA-issued leaf or an IP URL fails there. The file is read on every
-  connection, so a certificate the supervisor re-pins reaches the agents
-  without a restart. Until the supervisor has pinned, every request fails
-  and the agent logs `control_plane_pin_unavailable`; it never falls back to
-  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
-  and is used only for an `https://` URL. The one exception is a supervisor
-  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
-  nothing, so its agents take the skip too (chart value
-  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
-  about it on every start.
-  An appliance promoted into the control plane no longer gives its agents
-  the external URL at all: they use the in-cluster api Service, as its
-  supervisor does. That closes the #409 known limitation and is also
-  required here, because a member's supervisor heartbeats in-cluster and
-  never re-pins, while a member joining re-mints the Web UI certificate.
-  The role apply key now includes the agents' URL, so a promotion re-applies
-  the role chart. Not covered: an `http://` control-plane URL, which the
-  role agents still use as typed (the supervisor upgrades its own traffic
-  to the `https://` target).
-
-- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
-  read files through a scan (#1223).** The scan endpoint is gated on
-  `manage_nmap_scans`, which the builtin Network Editor role holds, and
-  `extra_args` was checked only for shell metacharacters and for `/` in
-  `--script` values. So a delegated user could pass `-iL <file>`: nmap
-  reads it as a target list and prints every line it cannot resolve
-  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
-  back, which was verified in the api container as the api user. Also
-  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
-  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
-  target or `-iR` (past target validation and the #722 do-not-probe
-  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
-  intrusive script. Now every token must be an allowed option with a
-  value of the right shape: scan type, host discovery, port selection,
-  timing, service / OS detection, `--reason` / `--open`, and `--script`
-  with script **names** that nmap's own `script.db` puts in none of the
-  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
-  `fuzzer` categories. Category names, wildcards and expressions are
-  refused, because no category is clean: nmap's `safe` category holds 33
-  scripts that are also `external` or `intrusive` (`whois-ip` queries
-  third-party WHOIS servers, against non-negotiable #17), and `default`
-  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
-  in favour of the presets that already offer them. The copilot's scan
-  proposal goes through the same check, and so does a scan already queued
-  with old arguments, since the worker re-validates before it runs.
-
-- **A release publishes nothing until CI, Trivy and main have all said yes
-  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
-  pushed `:latest` alongside each version tag before the ISO, the
-  OpenAPI export or the GitHub release had finished. So #1218's BIND
-  image shipped with 7 HIGH CVEs that nothing on the release path looked
-  for; a release that failed part-way had already moved every compose
-  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
-  covers tags, anyone with write access could release any commit. Now a
-  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
-  to pass on the tagged commit. Each image is built once, pushed by
-  digest with no tag, and both architectures are pulled from that digest
-  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
-  ever scanned amd64); only when every image passes is that same digest
-  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
-  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
-  a final job after the GitHub release exists, all images or none: it
-  records where each `:latest` pointed, retries each move, and puts back
-  the ones already moved if one still fails. Release runs are no longer
-  serialised, because GitHub cancels a queued run when another queues
-  behind it and `meta` can now wait an hour; "is this the newest
-  release" is re-checked right before GitHub's latest release and
-  `:latest` are set instead. The workflow also stops assuming CalVer
-  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
-  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
-  `:latest`, and the previous release, the CHANGELOG section and whether
-  a tag becomes latest are decided in `scripts/release_version.py` on the
-  product's own version ordering, ranking only tags on `main` that have
-  a published release (`.github/scripts/release-tags.sh`), so a stray tag
-  cannot freeze `:latest`. The shell it replaces got all three wrong
-  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
-  one, and the CHANGELOG lookup was a prefix match that returns
-  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
-  one no longer takes over `:latest` or the stable download URLs, or
-  uploads the un-versioned copies behind them. Release candidates no
-  longer take slots in the asset pruner's keep window (eight candidates
-  would have pushed eight final releases' ISOs out early); a candidate
-  keeps its ISO until a final release supersedes it. The image list is
-  one file, `.github/images.json`, read by both workflows and the
-  image-upgrade linter. And `docs-publish.yml` no longer runs on release
-  tags: a tag on an older commit rolled the docs site back behind
-  `main`, and a tag off `main` published unreviewed docs.
-
-- **Pinned images brought current; the CloudNativePG operator and
-  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
-  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
-  operator image 1.30.0, which the appliance bakes for an air-gapped
-  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
-  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
-  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
-  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
-  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
-  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
-  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
-  release.
-
-- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
-  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
-  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
-  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
-  They are triggered by malformed DNS64 responses, a crafted
-  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
-  SVCB/HTTPS records. The `dns-powerdns` image carries the same
-  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
-  9.20.29-r0, which also forces a rebuild of any cached package layer
-  that still has the old version. Upgrade: pull the new DNS images.
-
-- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
-  reachable from outside: the web port proxies it and Docker Compose
-  publishes the API port. So anyone who could load the login page could
-  read per-route request counts. It now answers only
-  `Authorization: Bearer <token>`, where the token is the new scrape
-  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
-  the same revoked / expired / scope / disabled-owner checks as on any
-  other route. The Helm chart generates the scrape token into its app
-  Secret as `metrics-token` and keeps it across upgrades like
-  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
-  optional Secret key. The appliance console reads it from the chart's
-  Secret, so its API panel keeps working.
-  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
-  token gets 401 after this release. Give it the scrape token or an API
-  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
-  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
-
-- **The interactive API docs load through the web port again, and
-  the appliance's HTTPS web tier sends the #400 security headers
-  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
-  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
-  started from an inline `<script>`. The web tier's CSP (#400) allows
-  scripts from the page's own origin only. So on Docker Compose, and
-  on Helm without `frontend.tls.enabled`, the console's API docs
-  links opened blank pages, and an air-gapped install could not load
-  them on any port. The api now serves both bundles itself from
-  `backend/app/static/api-docs/`: byte-for-byte copies of
-  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
-  Swagger's initializer is a static file. Scripts stay `'self'`
-  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
-  search index) and load its footer logo from cdn.redoc.ly, which it
-  hides when offline. **The appliance's TLS config sent none of the
-  #400 headers.** #400 put them in the pre-k3s appliance nginx
-  config, which #194 had already orphaned, so
-  `frontend-tls-config.yaml` never had them. It now sends the same
-  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
-  and Referrer-Policy as the image's template, re-emitted on every
-  location with headers of its own. It also sends
-  `Strict-Transport-Security: max-age=31536000` without
-  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
-  bare IP and over a certificate warning, so it only takes hold on a
-  hostname with a trusted certificate.
-
-- **An API token used only for reads now records that it was used
-  (#1158).** `last_used_at` was set on the request's database session
-  and left for the handler to commit. Read handlers never commit, so a
-  monitoring, inventory or export token showed "Last Used: —" forever,
-  while its first write set it. Operators hunting for stale tokens
-  could revoke live ones. The use is now written in a short-lived
-  transaction of its own, at most once a minute per token, the cadence
-  the session path keeps for `last_seen_at`. A handler that rolls back
-  cannot undo it, and a failed write never fails the request.
-
-- **Every shipped image now patches its base image's own packages
-  (#1088).** The nightly of 2026-09-14 refused to publish the api
-  image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
-  `perl-base` / `perl-modules-5.40` / `libperl5.40`, 2 in
-  `libpcre2-8-0`, 2 in `libsqlite3-0`, 1 in `gzip`, 1 in
-  `libssh2-1t64` — every one of which had a fix sitting on
-  deb.debian.org the whole time. `backend/Dockerfile` installed a
-  package list and upgraded nothing, so those packages could only
-  ever be fixed by upstream rebuilding `python:3.12-slim`, which is
-  not a schedule we control. It now runs `apt-get upgrade` before
-  the installs, the way every Alpine image in the repo has run
-  `apk upgrade`. The same omission applied to the Technitium
-  image, whose Ubuntu base is pinned by digest — so nothing in that
-  file could ever have patched it either — and is fixed alongside.
-  **This changes published release images, not just the nightly:**
-  `release.yml` builds without a layer cache, so its api image was
-  freshly built and still shipped every one of those base-image
-  CVEs.
-- **The nightly's cache no longer freezes the api image's package
-  layer (#1088).** BuildKit keys a layer on its RUN text, so the
-  `type=gha` cache served `backend/Dockerfile`'s whole `apt-get`
-  layer — package set included — from whenever it was first built.
-  That is why the same run reported `perl` at `5.40.1-6` when the
-  index had offered `5.40.1-6+deb13u1` for days: the layer had not
-  executed in weeks. The Alpine images solve this with an
-  `ARG APK_SNAPSHOT` the nightly passes its date tag to; the two
-  Debian-family images declared no such ARG, so they **silently
-  ignored the build arg the workflow was already passing them**.
-  Both now declare `ARG APT_SNAPSHOT` and the nightly passes it.
-  An upgrade line that never runs is indistinguishable, in the
-  built image, from no upgrade line at all — which is why the two
-  halves above are one fix and not two.
-
-### Changed
-
-- **`trivy-gate.sh` can ask an apt index the question it could
-  already ask an apk one (#1088).** The gate sorts each finding into
-  "the index offers the fix today, so a rebuild would cure it" (FAIL)
-  versus "the distro's security database names a fix the mirrors do
-  not carry yet" (DEFER, reported and non-blocking). It only knew
-  `apk`, so every Debian finding took the catch-all
-  `cannot query a debian package index; treating as installable`
-  branch — correct as a refusal, but it told the operator nothing
-  about what to do, and once the images above are fixed it would
-  hard-fail the nightly on the first Debian CVE announced ahead of
-  its mirror, which is the exact Alpine failure the script was
-  written to prevent. Debian/Ubuntu images are now probed with
-  `apt-cache policy` and compared with `dpkg --compare-versions`.
-  **Silence means the opposite thing to the two probes**, which is
-  the one part that had to be got right: `apk upgrade --simulate`
-  lists only what it *would* upgrade, so a package missing from its
-  output means "nothing newer exists" (DEFER), while
-  `apt-cache policy` answers for every package it is asked about,
-  so a package
-  missing from *its* output means the index could not resolve the
-  name at all (FAIL). Reading the second like the first would turn
-  the fail-closed branch into a fail-open one.
-  **The probe also has to prove the index was LOADED**, not merely
-  that `apt-get update` returned: it exits 0 with every mirror
-  unreachable (verified, `--network none`), and `apt-cache policy`
-  then answers from the local dpkg status file — Candidate ==
-  installed, which is non-empty, plausible, and reads as "not
-  published yet" for every finding at once. An offline runner would
-  publish an image on CRITICALs whose fixes were on the mirrors the
-  whole time. It now sets `APT::Update::Error-Mode=any` and asserts
-  a real package file is listed.
-  **The verdict comes from the candidate, the reason from both
-  probes.** apt holds a package back when upgrading it would pull
-  in a new dependency, so `apt-get upgrade` — the line the
-  Dockerfiles run — can install less than the index offers.
-  Deciding on the candidate alone makes that a FAIL whose stated
-  remedy (rebuild the package layer) provably does nothing;
-  deciding on the simulate alone makes it a DEFER that never
-  clears. It fails, and says the fix needs an explicit install or
-  a dist-upgrade.
-- **A linter refuses a shipped image that can never be patched
-  (#1088).** `scripts/lint_image_upgrades.py`, in `make ci` and CI's
-  Backend Lint job, asserts that every image in the nightly's own
-  matrix both upgrades its packages and declares a cache-busting
-  snapshot ARG that it actually interpolates. It reads the matrix
-  rather than a second copy of the image list, so a new image is
-  covered the moment it is added there. Three things it has to get
-  right, each a live false-pass in the first cut: it checks only
-  the stage that SHIPS (builder stages are discarded, so an
-  `apk upgrade` in one proves nothing — and that is the shape most
-  of these Dockerfiles have), following the target's ancestry
-  because a stage built `FROM` another does inherit its layers; it
-  strips `#` comments in both positions, whole-line and trailing,
-  since these files explain at length *why* `apk upgrade` matters
-  and a raw-text match passes a file that only talks about it; and
-  it raises rather than reporting success if the matrix heredoc is
-  ever restructured, because a guard that evaluates nothing looks
-  exactly like one that passed (#1030).
-
-### Added
-
-- **Removable (USB) backup disks on the appliance (#989 item 3).**
-  The last piece of #989, closing it. Items 1, 2 and 4 (write-only +
-  S3 Object Lock, the `https_put` kind, and `ETag` / `If-None-Match` on
-  the pull routes) landed earlier in this same cycle, under #1024.
-  The single-appliance operator with no NAS and no cloud account backs
-  up to a USB disk, and there was no supported way to: `local_volume`
-  writes to a path *inside* the api and worker pods, and nothing
-  managed a host mount. #971 avoided the
-  same problem for NFS by speaking the protocol in userspace — a block
-  device has no userspace escape hatch, so this is the host mount
-  plane. Fleet → the appliance → **Removable storage**; 3 REST routes;
-  1 MCP tool (`find_appliance_removable`, read-only, default on).
-  Migration `e3b9d7412c5a`.
-  **The failure this must never produce is a backup that reports
-  success.** `local_volume`'s write does `mkdir -p` first, so a path
-  whose disk is absent is *created* and written to — on the appliance's
-  own `/var`, with the run green, retention pruning happily, and the
-  operator believing they have backups. That is strictly worse than a
-  destination that never worked, because it displaced the worry. Three
-  independent things stop it, in descending order of how much they can
-  be trusted: the per-disk mountpoint is `0500` root-owned whenever
-  nothing is mounted on it (the kernel refusing, which holds even if
-  everything above it is wrong); every read and write under the
-  removable root refuses unless the path is still on a live mountpoint
-  (one test, four causes — ejected, yanked, mount unit failed, wrong
-  node); and the destination records which node the disk is on so the
-  error names it.
-  **`mountPropagation: HostToContainer` is the contract, not a chart
-  detail.** A hostPath volume defaults to *private* propagation, under
-  which a mount the host makes after the pod started is invisible
-  inside it — so without this the pod writes to the empty underlying
-  directory and reports success, which is the same silent failure by
-  another route. Measured against a real kernel in both modes rather
-  than assumed; `os.path.ismount` was checked the same way, and does
-  correctly flip back to "plain directory" after an unmount.
-  **Two deviations from the issue, both because the premise did not
-  survive contact.** It asked for a `.automount` "so a disk pulled
-  without ejecting does not hang boot" — but what delivers that is the
-  unit being `WantedBy` its `dev-disk-by-uuid-….device` rather than
-  `local-fs.target`, so udev mounts the disk when it appears and boot
-  waits for nothing. autofs adds nothing there and subtracts: a process
-  touching an autofs mountpoint whose device is absent blocks in the
-  kernel, and the processes touching this path are the api and the
-  Celery worker. `BindsTo=` the device gives the rest — a yanked disk
-  is torn down rather than left as a stale mountpoint. And the issue
-  wanted a multi-node run to "fail with `disk is on node X`", which
-  ships — but the honest framing is that on an N-node control plane a
-  run lands on the right node about 1 time in N, since api and worker
-  each run one replica per node. The refusal is the deliverable;
-  routing is a tracked follow-up, and the docs say to prefer `nfs` /
-  `s3` / `smb` on a cluster.
-  **ext4 and exFAT only, and the refusals each have a reason worth
-  stating.** FAT32 caps one file at 4 GiB, so an archive that outgrows
-  it fails at the *end* of a long run on a destination that had worked
-  for months — better refused up front. A filesystem with no UUID has
-  nothing stable for `What=`, since the kernel device name is
-  reassigned on the next plug. And the appliance's **own** partitions
-  are refused by reserved PARTLABEL / filesystem label: a box that
-  boots from USB reports its root, ESP and STATE as removable
-  candidates with perfectly good filesystems on them, and offering the
-  running root as a backup destination is the worst thing this could
-  do. Unusable disks are listed *with the reason* rather than hidden —
-  a disk that simply does not appear is indistinguishable from one not
-  noticed yet (#1026's picker rule).
-  **ext4 rejects `uid=` at mount time** (measured: `ext4: Unknown
-  parameter 'uid'`), so archives go in `<mount>/spatiumddi` — chowning
-  the root of a disk that may hold the operator's other data is ruder
-  than creating one directory on it. A separate
-  `spatiumddi-removable-prepare.service`, pulled in by each `.mount`
-  unit, does that after the mount *however it happened* — including a
-  disk plugged in hours later and mounted by udev with no operator
-  action, which the apply path never sees.
-  **One bug found by the tests, of the class this repo keeps finding.**
-  The teardown loop matched its own units with a shell glob built from
-  the escaped mount root — and `systemd-escape` emits `\x2d` for a
-  literal dash, where in a glob `\x` is an *escaped x*. So the moment
-  the root path contained a dash the pattern stopped matching the very
-  filenames it was derived from, silently, and eject became a no-op
-  that still reported success. It now matches with `case` against a
-  quoted prefix, which has no escaping semantics at all. The prefix is
-  also derived from the root rather than written out as a literal, so
-  the two cannot drift.
-  Also: the worker gained `NODE_NAME` (the api has had it since #983),
-  without which a *scheduled* run could not say which node the disk was
-  on — only that nothing was mounted. The destination's node is
-  **derived from the fleet**, not typed: exactly one appliance has a
-  given mount name and it reports its own node name, so asking the
-  operator to paste a Kubernetes node into a generic text box would
-  have left the defence unarmed on every default install.
-  **/code-review found fourteen more, and the cluster is worth
-  recording because they share one root: three namespaces that look
-  alike.** Host paths, container paths and desired-vs-reported state
-  were each conflated somewhere.
-  *The worst was silent and catastrophic.* `_RESERVED_LABELS` was
-  hand-retyped from the installer and **omitted `var`** — the partition
-  holding PostgreSQL, the container images and `/var/lib/spatiumddi`
-  itself. On a USB-booted appliance it passed every check and was
-  offered in the picker; mounting it binds the same superblock twice,
-  so archives land on the appliance's own `/var` while `ismount`
-  passes, the `0500` guard passes and the run reports success — all
-  three advertised defences green. It now has `var`, has lost the
-  invented `boot` (no partition carries that label), and is backstopped
-  by a booted-disk check that needs no list at all. The refusals were
-  also **reordered**: ownership before filesystem, because the ESP is
-  `vfat` and asking the fstype question first told the operator to
-  reformat the partition their box boots from.
-  *The second was structural.* `_host_mounted_sources` parses
-  `/proc/1/mountinfo`, which under `hostPID: true` renders paths against
-  HOST init's root — and it was compared against the CONTAINER-side
-  `/host-removable`. That can never match, so every disk this feature
-  successfully mounted reported `usable: false, "already mounted at …"`
-  and could not be re-mounted. Two named constants now, and a test
-  built at the production shape: the one it replaced derived both sides
-  from a single fixture value, i.e. modelled the one world where the
-  two namespaces coincide, and was structurally incapable of failing.
-  *The empty set was overloaded three ways.* It hashed to `""` — which
-  is also what a MISSING applied sidecar reads as, so an eject after a
-  failed apply fired nothing at all; and `_write_fire_state` emits
-  `f"{hash}\t{attempts}\t{iso}"` while `_read_fire_state` `.strip()`s
-  the leading tab back off, so an empty hash round-trips as
-  `hash="1"` — pinning the #387 backoff at one attempt (re-firing every
-  tick forever) and making a *successful* eject report `retrying` for
-  the rest of the node's life. It hashes `[]` for real now; `enabled:
-  false` carries the disable semantics. And the validation fallback no
-  longer ships an empty list at all: on this plane empty means *tear
-  everything down*, so a row that stopped validating would have
-  silently unmounted every backup disk on the node. It ships
-  `mounts: null` — "no instruction" — and the supervisor does nothing.
-  *The runner reported success on four different no-ops.* A failed
-  `systemctl disable --now` (EBUSY — a backup holding the mount open)
-  was discarded, the unit deleted anyway and the eject reported
-  applied, leaving the disk mounted with nothing managing it and
-  invisible on every surface; `install` and `systemctl enable` failures
-  were unchecked, so a full or read-only `/etc` overlay produced an
-  apply that armed nothing and stamped the hash; and the `python3`
-  substitution's exit status was unchecked, so an OOM-killed
-  interpreter produced an empty desired set, i.e. the teardown command.
-  The teardown also keyed on "not VERIFIED" rather than "not DESIRED",
-  so an entry this runner's allowlist dropped had its LIVE unit
-  unmounted and its mountpoint removed — while the drop path left the
-  exit status at 0. Teardown is now skipped entirely unless the desired
-  set was understood completely, and a drop fails the apply.
-  *Three more.* `nofail` was missing, so systemd's implicit
-  `Before=local-fs.target` applied and a disk present at boot ordered
-  k3s behind its own mount. Nothing daemon-reloaded after `etc.mount`,
-  so a disk left plugged in across a reboot could have its unit and its
-  symlink both on disk and neither loaded — a new
-  `spatiumddi-removable-boot.service` closes that. And `flock -n`
-  abandoned a deferred run, which with an edge-triggered `.path` and a
-  no-stacking trigger guard wedged the plane permanently.
-  *Honesty fixes.* `supported` and `present` were both computed,
-  shipped and read by nobody — the "written, never read" class — and
-  they are the two fields that separate "your disk is unplugged" from
-  "this node cannot look" and from "the disk is in the port and the
-  mount failed". Both are surfaced now, as `blind` and `present`
-  states. The runner's failure *reason* sidecar was written and
-  discarded (the #882 deferred item, in a new plane); it is read and
-  rendered. `str(None)` is `"None"` and truthy, so a block missing
-  `node_name` rendered "Disks here are on node None" — `_s()` now,
-  which already existed. And the eject mutation had no `onError`, so a
-  503 under maintenance mode left the modal sitting there after
-  promising the disk was safe to pull.
-  *Plus:* an unlocked read-modify-**append** on the desired list (the
-  file's first, where a lost update loses an action rather than
-  overwriting one) now takes `FOR UPDATE`; `local_volume.write`
-  translates `OSError` so a full USB stick records a failure instead of
-  wedging the target at `in_progress` forever; `_path` moved inside the
-  worker threads, since it now walks mountpoints on a device that may
-  have been yanked and was doing it on the api event loop; and
-  `exfatprogs` reached `NOTICE` + `THIRD_PARTY.md`.
-  **No `propose_*` MCP tool** (explicit decision per non-negotiable
-  #13): mounting names a disk that the operator is physically holding
-  and ejecting takes a live backup destination offline. Both are the
-  broad-blast-radius, physical-world-coupled shape that guidance says
-  to keep off the copilot.
-
-- **Interface MTU (#1017).** The appliance could not set one anywhere:
-  not in the installer, not in the preseed schema, not in STATE, not in
-  the host-config plane. The only route was `nmtui`, and per #1016 an
-  edit there reverts at the next boot. Now `network_mtu` in
-  `spatium-config.yaml`, asked for by the wizard in **both** network
-  modes, accepted as `network.mtu` in a #549 answer file, round-tripped
-  by the #995 answers export, and rendered into the `[ethernet]` section
-  of whichever NetworkManager keyfile applies.
-  **The case for it is not jumbo frames**, and the docs say so rather
-  than leaving it to be inferred. SpatiumDDI's own traffic is small UDP
-  and small JSON — post-flag-day EDNS0 buffers sit at 1232 precisely to
-  avoid fragmentation — and raising the MTU on a DHCP-served segment is
-  actively hazardous because PXE ROMs are 1500. The gap is the other
-  direction: an appliance reached over a WireGuard / IPsec / GRE tunnel,
-  PPPoE, or a reduced-MTU provider underlay needs an MTU *below* 1500,
-  and that failure is nasty and common — ping and small requests work,
-  large TCP hangs, and it reads as an application fault.
-  **One rule, three doors**, because a value one door accepts and
-  another drops is a setting the operator was told took effect and did
-  not. 576-9000; below 1280 is **refused** alongside a pinned static
-  IPv6 address rather than warned about, since RFC 8200 makes 1280 the
-  IPv6 minimum link MTU and such a node is broken by specification —
-  while IPv6 on its RA / SLAAC default has no configured address to
-  break, so the 1200-byte tunnel this feature exists for is allowed. The
-  renderer validates too and **drops** a value it cannot trust with a
-  reason in `etc-render.log`: STATE is hand-editable, an unparseable
-  `mtu=` risks NetworkManager rejecting the profile, and a box with no
-  network at all is far worse than one at the default. A test drives all
-  three doors and asserts they reach the same verdict; it caught the
-  wizard accepting `+1400` — which `int()` takes and the other two
-  refuse — before it shipped.
-  **DHCP with no pinned interface is refused, not accepted-and-ignored.**
-  etc-render writes no keyfile in that shape, so there is no `[ethernet]`
-  section for the value to live in; the wizard does not offer the field
-  and the parser fails the key rather than storing something that reaches
-  nothing.
-  **Mixed-MTU clusters are the appliance-specific hazard**, so this is a
-  fleet check and not a per-node one — the #1013 lesson applied before
-  the fact. k3s runs `flannel-backend: host-gw`, which writes plain
-  routes instead of encapsulating, so the pod network inherits the node
-  MTU with **no tunnel headroom**: one node at 9000 and two at 1500
-  black-holes pod-to-pod traffic and presents as random timeouts with
-  nothing in the UI explaining it. The supervisor reports what was
-  *applied* — not what STATE asked for, or the control plane would call a
-  node running 9000 and a node that asked for 9000 and was refused
-  consistent — through a sidecar in the bind mount `role-config` already
-  uses, so **no chart change, no heartbeat field, no migration**. A
-  warning on **Appliance → Fleet** names the nodes on each side; the
-  per-node value shows in the drilldown and, when there is something to
-  say, on the console.
-  **"Unset" is compared as itself, never as 1500.** Scoring an
-  unconfigured node at the Ethernet default is a guess about hardware
-  nobody read, and would tell an operator whose switches are genuinely
-  all-9000 that their cluster disagrees when it does not — so the banner
-  states the default was not read from the node. A node that has not
-  reported is excluded rather than assumed, or a genuine mismatch would
-  read as agreement on exactly the nodes that could not answer. Every
-  appliance installed before this reports `default`, one distinct answer,
-  so the check is silent on the existing estate.
-  **`ethernet.mtu` becomes adoptable**, closing the gap #1016 shipped
-  with — it was that issue's headline *un*adoptable setting. It is the
-  one adoptable key whose absence carries meaning, since NetworkManager
-  omits a property at its default rather than writing `mtu=0`: clearing
-  one in nmtui and never having had one arrive identically, so
-  `spatium-network-adopt` reports `network_mtu` unconditionally for a
-  managed profile and clearing it is drift you can adopt. No new MCP tool
-  (explicit decision per non-negotiable #13 — `find_appliance_fleet`
-  answers exactly this and gained the field plus the fleet verdict) and
-  not a feature module (#14 — it extends an existing resource). Applied
-  at boot, and every surface says so.
-  **A ten-angle /code-review found the design right and the plumbing
-  wrong. Every confirmed finding is fixed; the ones worth knowing:**
-  **The fleet comparison spanned the wrong nodes** — it filtered on
-  *approved*, and approved is not "in the k3s cluster": an un-promoted
-  Additional node has `cluster_role IS NULL` and runs its own
-  single-node k3s, which APPLIANCE.md says outright. So this feature's
-  own headline deployment — a branch DNS appliance on a 1400-MTU tunnel
-  beside a control plane at the default — raised a permanent,
-  unclearable banner claiming flannel would black-hole traffic between
-  two boxes sharing no pod network. Membership is `cluster_role` now, in
-  one predicate both the REST list and the copilot call.
-  **The wizard validated one value and stored another.** It checked a
-  stripped copy and wrote the raw string, so a pasted `" 1400"` was
-  accepted, shown on Confirm, written to STATE and dropped at boot —
-  this feature's own failure mode, inside the feature. Leading zeros
-  were worse: `01400` is a fine `int` to both writing doors and is
-  refused by the renderer, and written through, NetworkManager
-  normalises it on its next save and the adopt tool then offers phantom
-  drift forever.
-  **The rule was transcribed instead of shared.** #995 built
-  `--check-field` precisely so the wizard carries no second copy of a
-  validator, and the two copies had already drifted at birth. There is
-  one `validate_mtu` now, which also closes the `isdigit()`/`int()`
-  domain gap in both directions (`'٤'` converts, so it would be stored
-  then dropped; `'²'` raises, which on the parse path was an uncaught
-  traceback) and applies the "DHCP needs a pinned interface" rule at
-  every door rather than one.
-  **`echo` is not `printf`.** The sidecar is written by `/bin/sh` =
-  dash, whose `echo` expands backslash escapes, so a hand-edited
-  `network_mtu` containing one emitted a SECOND `MTU=` line — and every
-  reader assigns while iterating, so the last wins. The supervisor would
-  report 9000 on a node at the link default: the one invariant the
-  sidecar exists to hold, defeated downstream of the validation that
-  exists because STATE is hand-editable.
-  **A skipped keyfile left the previous boot's MTU in force** while the
-  sidecar said `n/a`, so a node genuinely running 1400 was compared as
-  the link default. The stale profile is removed now.
-  **`--adopt` was a fourth door with no rule** — an nmtui `mtu=500` is
-  legal to NetworkManager and below our floor, so the console printed
-  "Adopted 1 setting(s)" and the next boot dropped it. And a suppressed
-  difference made `--check` print "Live profile matches STATE" directly
-  above the note contradicting it and exit 0 against a documented
-  exit-code contract, while `--adopt` dropped the note entirely.
-  Refusals are a field on the drift entry now, so every surface sees
-  them.
-  **The 576-9000 guard was bypassed by an over-long digit string.** The
-  shell's `[ -lt ]` does not fail safe — dash and bash both print
-  "Illegal number" and exit non-zero, which reads as "not out of range"
-  — so a 20-digit MTU reached the keyfile, NM rejected the profile, and
-  every surface reported it applied. `set -e` does not catch it inside
-  an `if`.
-  **The static-network loop had flipped from exit status to
-  output-emptiness** while both validators merge stderr into stdout, so
-  one `DeprecationWarning` from a future image's python would have made
-  a valid config permanently unacceptable and trapped the operator on
-  the screen with no way forward.
-  **The console chip ran a file read on the 0.5 s render tick**,
-  breaking an invariant that file documents twice, and sat ahead of
-  `Build` on a no-wrap line — so a refused MTU pushed the running
-  version off an 80-column serial console, on exactly the screen an
-  operator opens when something is wrong.
-  **Plus:** unvalidated JSONB reached a typed response model, so one
-  malformed heartbeat would have 500'd the appliance list for the whole
-  fleet; the copilot row did the double-read its REST sibling's
-  docstring forbids and shipped two of five fields; the tool description
-  never mentioned MTU, so the capability #13 compliance rests on was
-  unroutable; and the banner asserted flannel host-gw as a constant
-  while `Appliance.dataplane_backend` already records it per node.
-  **The tests changed too, and one change paid for itself.** The parity
-  test drove two doors while the claim was three, and compared what the
-  operator typed rather than what the wizard stores — it executes all
-  three on the stored value now, and that is what caught the
-  leading-zero divergence. The adopt-suppression tests called the helper
-  directly, so deleting the wiring inside `compare()` left them green;
-  they go through `compare()` now.
-
-### Changed
-
-- **Docs site is documentation only (#1070).** `www.spatiumddi.com`
-  no longer opens on a product landing page — the hero, "Why
-  SpatiumDDI" feature grid, screenshot gallery and install pitch are
-  gone, and `index.html` is now the documentation index itself. The
-  company / product site is a separate project and will be linked
-  from the nav once it exists. The index also gains the pages it
-  had been missing (Troubleshooting, Migration, Performance testing,
-  SHIPPED, the Fleet Firewall design note), `sitemap.xml` lists every
-  page rather than a third of them, and `docs.html` redirects to the
-  index so existing links keep working. No change to how or where the
-  site is published.
-
-### Added
-
-- **`core.dns` / `core.dhcp` — turn a whole subsystem off (#1068).** An
-  operator running SpatiumDDI for DNS only, DHCP only or IPAM only had no
-  way to put the unused subsystem away: DNS and DHCP were two of four
-  fixed sidebar anchors that no feature module gated, so a DNS-only
-  install carried a DHCP sidebar entry, a DHCP dashboard tab, DHCP
-  affordances throughout IPAM, the DHCP copilot tools and the DHCP alert
-  rules, all pointing at nothing. Both modules ship **enabled**, so no
-  existing install changes; 16 of 55 modules now ship on.
-  **The agent routers are deliberately outside the gate**, and that is
-  the whole reason `dhcp/__init__.py` changed: `require_module` answers
-  **404**, and 404 is precisely the status that makes an agent discard
-  its JWT and re-bootstrap from its PSK. Gating the agent path would not
-  disable a fleet, it would put every live Kea agent into a re-bootstrap
-  loop. The DHCP agent router was nested inside `dhcp_router` and had to
-  be lifted out and mounted separately at the same `/dhcp` prefix (the
-  DNS side already had this shape). It keeps `wake_publishing` — unlike
-  the DNS agent router, which really is a pure consumer — because
-  `/dhcp/agents/lease-events` runs subnet DDNS through
-  `enqueue_record_op`, and `collect_wake` is a silent no-op with no
-  collector installed: dropping it would not error, lease-driven DNS
-  updates would just stop waking DNS agents and converge on the 12 s
-  safety tick.
-  **Disabling is refused while the subsystem still owns rows** (422
-  naming the counts), the same fail-closed stance as the #934 / #935
-  moves — the agents keep serving from cached config either way, so the
-  alternative is live state hidden behind a 404 with no way to reach it
-  from the UI. `/agents/register` is the one agent call that CREATES a
-  server row, so it now declines with **403** while the module is off;
-  without that, a still-running agent re-registers seconds after the
-  toggle and strands exactly the state the refusal exists to protect.
-  403 rather than 404 for the same re-bootstrap reason.
-  **`ModuleSpec` gained `requires`**, and it is a real gate rather than a
-  UI hint: `get_enabled_modules` resolves a module enabled only when its
-  whole ancestry is, so `dhcp.import`, `ipv6.router_advertisements`,
-  `dns.import`, `dns.dynamic_update_acl`, `security.dns_threat` and
-  `security.dnsbl` follow their parent and need no gate of their own. An
-  operator row saying ON does not outrank a disabled parent. The
-  frontend hook resolves the chain the same way — it previously read each
-  module's own `enabled` flag, which would have shown a sidebar row for a
-  child whose router had already resolved it off (the two-renderers class
-  from #878). Catalog integrity — no dangling parent, no cycles, core
-  modules stay roots — is pinned by a test, because `_resolve_with_parents`
-  is deliberately forgiving at runtime (an unknown parent resolves TRUE so
-  a rename can never black out a subtree) and the catalog is therefore the
-  only place a typo can be caught.
-  Also gated: 12 beat tasks, 13 alert rule types, 42 copilot tools, 8
-  global-search providers (which otherwise returned zones and scopes that
-  link into 404 pages), the sidebar anchors and DNS section, the dashboard
-  tabs and their queries, and the DNS/DHCP reads inside IPAM.
-  **`rogue_dhcp` is deliberately NOT gated**, the one entry that needed
-  arguing: its subject rows keep arriving on the ungated agent router, and
-  the rule matters MOST to an install that does not run DHCP, where
-  anything answering DHCP is by definition unauthorised. Its drill-down
-  page does 404 with the module off — the cost — but an alert naming the
-  offending IP and MAC beats silence.
-  The module gate in `evaluate_all` falls through with an empty match set
-  rather than `continue`-ing: a `continue` skips the open-event
-  reconciliation too, so a DHCP pool-exhaustion event that was firing when
-  the operator disabled DHCP would stay open forever with no evaluator
-  left that could ever close it. No migration — per #1069 a
-  `feature_module` row means "an operator changed this" and the shipped
-  default lives in the catalog, so the defaults are declared in
-  `backend/tests/test_feature_module_defaults.py` instead.
-
-
-- **E911 dispatchable location — SpatiumDDI answers "which room is
-  this phone in, right now?" (#972, Phase 1a).** Behind the default-on
-  `network.e911` module: Emergency Response Locations, bindings from a
-  network identity to an ERL, and a resolver over data already
-  collected for IPAM. `dhcp_lease` / `ip_mac_history` give IP↔MAC,
-  `network_fdb_entry` gives MAC↔switch-port, `network_neighbour` gives
-  the phone's own LLDP claim, `subnet.site_id` gives the building and
-  `subnet.subnet_role='voice'` says which networks are phones. Every
-  input existed; nothing joined them. 3 tables (migration
-  `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3 MCP tools.
-  **RAY BAUM'S Act §506 puts the dispatchable-location duty on the
-  ENTERPRISE, not the carrier**, so this is a location *source* and the
-  docs say plainly that installing it makes nobody compliant: no call
-  routing, no ALI upload, no ELIN provisioning, no PSAP. It also never
-  asserts an address is valid on its own say-so — validation is the
-  provider's verdict against the MSAG / NG911 LVF, recorded here, and
-  `unvalidated` means "nobody has confirmed this", not "this is wrong".
-  Editing any civic element **resets** the verdict, because a provider
-  validated the OLD address and keeping `validated` would leave an
-  estate reporting an address nobody ever checked.
-  **The load-bearing property: a stale precise answer is worse than a
-  fresh coarse one.** A phone re-patched onto another floor stays in the
-  switch's FDB on the old port until it ages out, and in *our* copy
-  until the next poll — so a port-level answer older than the freshness
-  window is REFUSED, the resolver falls back to a coarser rule, and the
-  response carries `confidence="degraded"` with the reason. There is no
-  code path that returns an address with no provenance. The window is
-  the polling device's own `poll_interval_seconds` × 2, so one missed
-  poll is tolerated and two are not; a fixed global number would be too
-  tight for a 15-minute poller and uselessly loose for a 60-second one.
-  **Two independent staleness signals, and the second is the one that
-  matters:** age, and an LLDP neighbour on the same port announcing a
-  different chassis-id than the FDB puts there. LLDP is the device's own
-  announcement, so on disagreement the FDB row is the one to distrust —
-  and this fires immediately where age must wait out the whole window,
-  which is the only way a phone swapped for a different phone on the
-  same port is caught quickly.
-  **The civic address is 31 separate RFC 5139 columns**, not one string
-  and not JSONB. PIDF-LO and every provider API want the elements apart,
-  a string cannot be decomposed later, and #917 established that an
-  unconstrained object publishes as `{"type": "object"}` with no
-  properties — unusable to a code generator, on the one field every
-  external consumer of this feature reads. `CIVIC_ELEMENTS` carries the
-  columns *with* their RFC 4776 CAtype numbers and PIDF-LO tag names, so
-  the deferred option-99 encoder and PIDF-LO renderer cannot drift from
-  the schema the way #878's two renderers did; a test pins the API
-  schema's field set to the column set.
-  **Binding precedence is a constant, not a column**, and one ERL per
-  target per kind is a UNIQUE constraint. An operator able to reorder
-  the rules could put `site_default` above `switch_port` and send every
-  ambulance to the front door while the UI still showed a rule for the
-  room, and a tie would otherwise be broken by whichever row the planner
-  returned. **The shipped order deviates from the issue's**, which
-  numbered the manual pin below `subnet` and `vlan`: that makes the pin
-  dead code, since every pinned device is also on some subnet, while the
-  pin exists precisely for the phone on a port nothing polls. Reverting
-  the constant to the issue's ordering makes
-  `test_a_manual_pin_beats_the_subnet` fail, which is the proof rather
-  than the argument.
-  Three conformity policies, the **first in the tree carrying a real
-  regulatory citation** (`47 CFR 9.16(b)`) rather than
-  `framework: custom`. `e911_voice_subnet_unbound` counts the site
-  default as a pass — the front door is a poor answer and still a
-  dispatchable location, where a check demanding room-level bindings
-  everywhere would fail every site on day one and be switched off.
-  `e911_erl_validated` fails harder on a REJECTED verdict than a missing
-  one, because somebody checked and the answer was no, and warns rather
-  than fails on an old one. `e911_port_binding_evidence_fresh` is keyed
-  on the switch's own poll state and not on stale FDB rows, because an
-  unpolled switch eventually has none and a stale-row check would PASS
-  on the worst case.
-  A third-party caller — a PBX, Cisco Emergency Responder, RedSky — uses
-  an existing API token scoped to `/api/v1/e911` with one read
-  permission; no new credential mechanism. **Every lookup writes an
-  `e911_resolution_log` row**, found or not, recording which token asked
-  about which identity: it is a query about which desk a named person
-  sits at, and "nobody could tell me where this phone was" is exactly
-  what an after-action review needs to see. To make that honest,
-  `deps.py` now records *which* API token authenticated a request —
-  token auth resolves to the owning User, so a handler otherwise cannot
-  tell a PBX's service token from the same person's browser session.
-  **No `propose_*` MCP tools**, an explicit decision under
-  non-negotiable #13: a wrong ERL binding misroutes an ambulance.
-  **/code-review found twelve, and the two sharpest were both about a
-  thing looking fine while being wrong.** `ip_address.address` is
-  unique only PER SUBNET — overlapping prefixes are normal, and this
-  feature's own tests carve a /28 out of a /24 — so an unscoped
-  `scalar_one_or_none()` raised MultipleResultsFound and 500'd the
-  whole lookup *before* the audit row was written. And the validation
-  reset keyed on a civic key being PRESENT while the edit form sends
-  all 31 elements on every save, so renaming an ERL or fixing a typo
-  in its notes silently destroyed a provider's `validated` verdict; it
-  now compares values and names the elements that actually moved.
-  Also: an unvalidated `ip` string reaching an INET comparison raises
-  22P02, and through the copilot tool the aborted transaction takes
-  out every later tool call in the chat turn, so a malformed address
-  is now a "no location" answer that still records what was asked;
-  `ERLUpdate` admitted an explicit `null` into NOT NULL columns
-  (surfacing as a bogus 409 name conflict) and skipped the ELIN
-  validator the create path had; a `chassis_id`-only lookup logged its
-  identity as `unknown` / empty, losing the one thing the trail exists
-  for; `observed_at` and `evidence_age_seconds` came from port
-  evidence even when a *config* rule matched, putting an unrelated
-  stale age beside a green `observed` answer; a blanket
-  `except IntegrityError` reported foreign-key violations as "already
-  exists", worst on `create_binding` where five of seven targets are
-  hand-pasted UUIDs; and no builtin role granted `e911_location`,
-  unlike all four sibling vertical registries on Network Editor, so
-  writes were undocumented superadmin-only with the UI quietly hiding
-  its own buttons.
-  **Two findings were the "a guard that cannot fire" class again.**
-  The port-binding check ignored `poll_fdb` / `poll_lldp`, so a switch
-  polled perfectly on schedule while collecting neither passed — which
-  is precisely the silent degradation it claims to catch. And it
-  tested `status not in ("ok", "success")` where the real vocabulary
-  is `pending | success | partial | failed | timeout`: `"ok"` is a
-  value no poller writes, so a `partial` poll whose only failure was
-  the unrelated IGMP leg was reported as "not polled", while the test
-  pinning that behaviour asserted on `"error"` — also not a real
-  value, which is how it survived.
-  **One finding changed a design decision rather than fixing a slip.**
-  The LLDP-disagreement signal fired on *any* other chassis-id on the
-  port, which makes a room-level answer permanently unreachable for a
-  PC daisy-chained behind an LLDP desk phone — the commonest wiring in
-  exactly these estates, where the PC is in the FDB and only the phone
-  announces LLDP. The signal is now NEWER, not merely different: the
-  FDB row is distrusted only when a contradicting neighbour was seen
-  more recently than it. After a swap the new device's LLDP is fresh
-  and the old device's FDB row is not, which is the case it exists
-  for; on a daisy chain both are current and neither displaces the
-  other.
-  **A second /code-review round found eleven more, and one would have
-  failed CI.** The three new tables were in no backup `Section` and not
-  in the unclassified baseline, so a selective restore of `ownership` or
-  `ipam` would TRUNCATE-CASCADE every ERL and binding and never
-  repopulate them — the #700 defect verbatim, and
-  `test_section_catalog_gap_does_not_grow` fails without the fix
-  (confirmed by reverting it). The resolver also compared an INET by
-  SPELLING via `cast(address, String)`, which is the #877 failure: an
-  IPv6 address in expanded form is a different string and the same host,
-  so those lookups silently answered "no location", on the flagship
-  query and non-sargably. And the FDB fallback picked the most recently
-  seen entry across ALL devices — but a MAC sits in the forwarding table
-  of every switch on the path to it, so on a two-tier network the
-  room-level binding fired only when the access switch happened to be
-  polled more recently than the core, intermittently, with the evidence
-  row naming the wrong port. It now prefers the interface with the
-  FEWEST MACs learned on it, which is how an edge port is identified
-  from bridge-MIB data and is a property of the topology rather than of
-  polling luck.
-  Also: an `IpMacHistory` row is only the last time anything was
-  OBSERVED at an address, unlike a lease, so a years-old mapping could
-  drive a `mac` pin to `confidence="observed"` — it is now gated, and a
-  stale inference disqualifies the rules that hang off the MAC while
-  leaving those that derive from the IP; `BindingUpdate` lacked the
-  explicit-null guard its ERL sibling had (a 23502 the global handler
-  re-raises as a 500); the reset verdict kept `validation_source`, so a
-  list rendered "unvalidated  RedSky Horizon"; `q` went into `ILIKE`
-  unescaped in both the router and the copilot tool (#879's `50%`); the
-  `is_dispatchable` field tested truthiness while its SQL filter tested
-  `IS NOT NULL`, so they disagreed on `""` and the gap report
-  under-counted; a dead `elif` hid the reachable "pending with a
-  completed poll" case; the ERL form never sent `site_id`, leaving the
-  column, the site filter and the copilot's argument unreachable from
-  the product; and `Number("12.3x")` is NaN, which serialises as null —
-  so typed garbage in a coordinate field saved silently as "no point"
-  and wiped an existing one on edit.
-  **Phase 1b — HELD and PIDF-LO.** `POST /held` takes an RFC 5985
-  `locationRequest` and returns PIDF-LO (RFC 4119 + RFC 5139 civic +
-  RFC 5491 geodetic) — the protocol CUCM, Cisco MPP firmware, the
-  Webex app, RedSky "HELD+", Intrado ERS and Bandwidth DLR already
-  speak, which is what makes this usable with **no phone-side
-  change**. Mounted at the application root because a HELD client is
-  configured with a whole URL and the protocol names the path. This is
-  the payoff for the 31-column decision: the element names come from
-  `CIVIC_ELEMENTS`, and `PIDF_ELEMENT_ORDER` fixes the WIRE order
-  separately, because the RFC 5139 schema sequence is not the column
-  order and a consumer validating an `xs:sequence` rejects
-  out-of-order children; a test pins the two lists to each other.
-  The `method` element is not decoration — RFC 4119 registers those
-  tokens and consumers treat them differently, so a switch-port answer
-  goes out as `Wiremap` and a subnet or site answer as `Manual`.
-  `retransmission-allowed` is `no`: this is the location of a person
-  at a desk, and a 911 path needs no onward distribution rights. The
-  resolver's confidence and matched rule ride on response headers,
-  because PIDF-LO has nowhere to say "this is a fallback answer". An
-  unknown device is a 404 with `locationUnknown`, which is what a
-  provider's retry logic expects, where an empty 200 would read as
-  "this device has no location by design".
-  **The load-bearing refusal is that a request with no identity is
-  refused.** RFC 5985's default is to answer from the requester's own
-  address, so falling through would hand a PBX the location of its own
-  server in response to a question about a phone — a perfectly-formed
-  answer that is completely wrong. A recognised-but-unresolvable
-  identity (`msisdn`, `imsi`) is reported rather than ignored, because
-  treating it as "no identity given" takes that same fall-through. XML
-  from the network is size-capped before parsing, a DOCTYPE is refused
-  outright rather than trusted to be inert, and parsing goes through
-  stdlib ElementTree, which supports no DTD and no external entities
-  at all — XXE and entity expansion are unavailable rather than
-  mitigated.
-  **Phase 2 — the device self-query and the DHCP options.** The
-  self-query is off behind `E911_SELF_QUERY_ENABLED`: 404 rather than
-  403 when disabled so it does not advertise itself to a scanner;
-  identity forced to the TCP source address with every body-supplied
-  identity discarded, including one that matches, since accepting it
-  when it matches would leak by timing whether a guessed address is
-  the caller's; rate-limited per source IP and **failing closed**, the
-  only inverted throttle in `auth_throttle`, because this throttle IS
-  the protection where the login one has lockout and a second factor
-  behind it; and the response carries the location only, not even the
-  confidence headers, which describe our internal evidence.
-  DHCP options 99 (RFC 4776 civic) and 123 (RFC 6225 geodetic) render
-  automatically into a scope whose subnet resolves to an ERL. Per
-  scope, never per client: DHCP can know the subnet and nothing finer,
-  so a switch-port or MAC binding is deliberately not consulted — a
-  DHCP option is written once for every client in the scope, and
-  honouring a device rule would hand every phone on the floor the
-  location of one desk.
-  **The encoders were verified by measurement, and the first attempt
-  produced a config Kea REFUSED OUTRIGHT** — which stops DHCP for
-  every client on the server. Against kea-dhcp4 3.0.3, option 99 has a
-  standard definition Kea will not let you override, so it goes out
-  under Kea's own name `geoconf-civic`, while 123 has none and rides
-  on ours. A second real hole surfaced the same way:
-  `option_defs_for_option_maps` scanned only `code:NN` keys and not
-  the raw `option_data` passthrough these ride on, so the definition
-  for 123 was never shipped and Kea would have rejected the whole
-  config.
-  Everything in the encoders fails closed to "emit no option": a value
-  that will not fit is dropped rather than truncated, because
-  truncating UTF-8 mid-sequence yields bytes a consumer cannot decode;
-  a total over 255 bytes stops at an element boundary rather than
-  emitting a partial TLV; no two-letter country means no option at
-  all; and an out-of-range coordinate yields nothing, because a
-  wrapped fixed-point value is a valid-looking location somewhere
-  else. Every test decodes the bytes back rather than comparing them
-  to a hex literal — a literal proves the encoder still does what it
-  did when the test was written, not that it does what the RFC says.
-  **Phase 3 — exports, with the provider connectors still deferred.**
-  One CSV of every ERL and its bindings, and one file of
-  `location civic-location` / `location elin-location` stanzas plus
-  the per-interface lines, as text the operator reviews and applies.
-  SpatiumDDI pushes no switch configuration (#60), and the snippet
-  says so in its own header.
-  **The real work in the exports is sanitisation.** A room name
-  carrying a newline followed by `no logging console` is arbitrary
-  configuration pasted into a switch by someone who trusted us, and a
-  building whose name starts with `=` executes as a formula when the
-  CSV is opened in Excel. A value that cannot be expressed safely is
-  omitted AND listed under its stanza, never shortened — an ERL
-  visibly missing its room is a problem an operator fixes, where a
-  silently truncated one is a phone in the wrong place that looks
-  correct. The three provider push reconcilers stay their own issues,
-  as #972 itself specifies, because each needs its API shape checked
-  against current vendor documentation rather than recalled.
-  **Also fixed on the way: two successive circular imports, the second
-  subtler than the first.** `canonicalize_mac` lived in
-  `app/api/v1/dhcp/_mac.py`; the E911 resolver needs it and the DHCP
-  config bundle imports that resolver, so reaching into `app.api`
-  broke the app at startup. Moving it to
-  `app/services/dhcp/normalize.py` replaced that with a cycle that
-  only appeared when something imported the e911 package FIRST,
-  because importing any `app.services.dhcp` submodule executes a
-  package `__init__` that imports `config_bundle`. It now lives in
-  `app/core/mac.py`, whose package `__init__` is empty, so a pure
-  string function cannot participate in a cycle at all.
-  **A third /code-review round found thirteen more, and the worst
-  would have stopped DHCP entirely.** `_with_location_options` ignored
-  address family, so an ERL reached by a `vlan` or `site_default`
-  binding injected `dhcp4`-space options 99 and 123 into an IPv6 scope
-  — the agent's v6 renderer passes the raw passthrough through
-  verbatim and kea-dhcp6 then rejects the WHOLE config, which is
-  exactly the outcome the encoders are otherwise so careful to avoid.
-  It is now an explicit IPv4 gate with a v6 test.
-  Two more made the feature unreachable rather than wrong. `/held` had
-  no nginx `location` block in either template, so it fell through to
-  the SPA `location /` and a PBX asking where a phone is got
-  `index.html` with a 200 — on compose, Helm and the appliance alike.
-  And neither HELD path was exempt from maintenance mode, so a change
-  window silently killed location delivery to CUCM while the
-  equivalent JSON lookup kept working, which was incoherent as well as
-  dangerous.
-  **One was a silent data loss in exactly the field that matters.**
-  The option-99 encoder stops at an element boundary when it runs out
-  of 255 bytes, so whatever is encoded LAST is what gets dropped — and
-  in column order that was building, floor, unit, room and seat,
-  because `lmk` / `loc` / `nam` are declared ahead of them and are the
-  free-text fields an operator writes a sentence into. A long
-  "additional location information" therefore produced a street
-  address with no room, which is the one thing RAY BAUM'S §506 is
-  about. Encoding order is now explicit and separate from column
-  order: street address first, then the dispatchable detail, then the
-  free text, which is the right thing to lose.
-  Also: the control-plane renderer had no `option_data` passthrough
-  (the agent's has always had one), so the rendered-config preview
-  stringified the whole list into one bogus entry and showed an
-  operator a config that would not load; `locationType` and `exact`
-  were parsed and read by nothing, so a caller asking exactly for
-  `geodetic` against a civic-only ERL got a 200 carrying civic data it
-  had said it could not use; the bundle had no `network.e911` module
-  gate, so disabling the module hid every surface for inspecting
-  bindings while the scopes kept shipping the options; and the subnet
-  lookup cost three queries per scope on the agent long-poll path,
-  which is 600 round trips on a 200-scope server with no bindings at
-  all, now one.
-  Three in the exports. The IOS snippet emitted bare interface names,
-  and `Gi1/0/12` exists on every switch in the estate — a file with no
-  device context gives an operator no way to tell which lines belong
-  to the switch in front of them, and pasting the wrong ones
-  mis-assigns ports to rooms. `_identifier_for` was positional while
-  its own docstring called it stable, so inserting one ERL renumbered
-  every later stanza and re-pointed port assignments an operator had
-  already applied; it now derives from the ERL's id. And `-` in the
-  CSV formula-leader list quoted every negative latitude and longitude
-  as text, in the spreadsheet the export exists for — the check is now
-  "is it a number", not "does it start with a hyphen".
-  Last two were smaller: an unknown client address answered 429
-  because the fail-closed throttle ran before the address check,
-  making the accurate 400 unreachable; and `auth_throttle`'s module
-  docstring still said "Both fail open" after a third, deliberately
-  fail-closed throttle joined it.
-  **And CodeQL found a real one that three review rounds missed, in a
-  docstring I had written confidently.** The HELD parser used stdlib
-  `xml.etree.ElementTree` and claimed that supports "no DTD and no
-  external entities at all — so XXE and entity-expansion are not
-  mitigated here, they are unavailable". Measured: half of that is
-  false. ET does refuse an EXTERNAL entity, so XXE really is
-  unavailable — but it expands INTERNAL ones happily, and a four-level
-  billion-laughs payload expanded to 50,000 characters. The only thing
-  standing between an unauthenticated XML endpoint and an expansion
-  bomb was a single `DOCTYPE` regex. `py/xml-bomb` was right and the
-  prose was wrong.
-  Parsing now goes through `lxml` with `resolve_entities=False`, which
-  leaves an entity reference unexpanded rather than growing it — lxml
-  is already in the image (python3-saml pulls it), so this adds no
-  dependency where `defusedxml` would have needed a NOTICE entry and a
-  `versions.json` pin. The `DOCTYPE` refusal is KEPT precisely because
-  it is no longer load-bearing: a guard that is the sole defence is
-  one regex away from being none. Two new tests go at the parser
-  directly, bypassing the guard, because the lesson is that reasoning
-  about a parser's behaviour is not the same as measuring it.
-  **Four more from the PR's own bot reviewers, and the first is the
-  sharpest finding in the whole change.** The IP→MAC lease lookup was
-  unscoped across servers: DHCP leases are per-scope and the same
-  address legitimately exists in two overlapping networks — a 10.x
-  range reused behind two sites is the ordinary case, not a
-  pathological one. "Newest active lease for this IP" therefore
-  attached the caller to ANOTHER network's MAC, and from there to that
-  MAC's switch port and that port's room. A confident, precise,
-  completely wrong answer, which is the single failure mode this
-  module exists to prevent. It is now scoped to the subnet (resolved
-  first, for that reason), and an address resolving to more than one
-  distinct MAC makes the resolver decline to guess rather than pick
-  one.
-  The scoping is an OUTER join whose filter admits a lease with no
-  `scope_id`, and that detail is pinned by a test. An inner join
-  looked right and silently discarded every such lease — legitimate
-  and common, because a lease pulled from a server whose scopes
-  SpatiumDDI does not manage has nothing to point at. Admitting them
-  costs no safety: two candidate MACs decline either way.
-  The other three: a caller supplying `chassis_id` AND `port_id` fell
-  through to a MAC-only port lookup when that exact pair was not
-  found, so a stale or mistyped port returned the MAC's OTHER port and
-  the wrong room while looking authoritative — a named port now yields
-  no port match rather than a different one. The explicit chassis+port
-  path compared the raw lowercased string, so `aabb.cc11.2233` could
-  never match the same address stored as `aa:bb:cc:11:22:33` despite
-  the endpoint documenting that any common separator is accepted; a
-  MAC-shaped chassis-id is canonicalised now while an opaque subtype-7
-  identifier is still compared as given. And two unused locals in a
-  test.
-  216 backend tests. The resolver's were written before any API existed
-  and both mutations were run against the shipped code to prove they
-  bite — removing the staleness gate fails 4, reverting the precedence
-  fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
-  (RFC 5985 + 6155, the protocol CUCM, Cisco MPP phones, Webex, RedSky,
-  Intrado and Bandwidth already speak, and what makes this work with
-  zero phone-side change); the provider validation *call*, which is a
-  new outbound connection needing a `docs/PRIVACY.md` row under
-  non-negotiable #17; DHCP options 99/123; device self-query; bulk CSV
-  import; the CER-format and IOS-snippet exports; and wireless, a data
-  gap rather than a design one — the UniFi and Meraki mirrors carry no
-  client→AP association, so the `wireless_ap` rule has nothing to match
-  and its precedence slot is reserved for when they do. See
-  `docs/features/E911.md`.
-- **The appliance can install onto a RAID1 mirror, and arrays can be
-  managed from the Fleet UI (#999 Parts B + C).** #995 shipped the
-  honest refusal — a SAN LUN's paths collapsed and an md member marked
-  `[UNSUPPORTED]` — because the image had no way to create or even see
-  either. `mkosi.conf` now ships `mdadm`, `multipath-tools`, `kpartx`
-  and `lvm2`, and the refusal becomes an offer.
-  **What is mirrored is decided by what firmware can read.** `state`,
-  `root_A`, `root_B` and `var` become raid1 members; `bios_boot` and
-  the **ESP cannot** — firmware reads the ESP before any md driver
-  exists — so each disk keeps its own and `spatiumddi-esp-sync` keeps
-  them in step. That sync is the part that is easy to skip and fatal to
-  skip: every slot upgrade writes a kernel and re-stamps `grub.cfg`,
-  every set-default writes `grubenv`, and all of it lands on the
-  primary ESP. Without the sync, pulling that disk after an upgrade
-  leaves the survivor booting the OLD kernel from a stale menu — a
-  mirror that protected the data and lost the appliance. So it is
-  called from the installer, `spatium-upgrade-slot apply`,
-  `set-next-boot` and `set-default`, and is a no-op on a single-disk
-  box so no caller has to branch. The second ESP is labelled `ESP2`,
-  because two filesystems sharing `ESP` would make the fstab's
-  `LABEL=ESP` resolve to whichever udev enumerated last — `/boot/efi`
-  would be a different disk between boots and the sync would have no
-  fixed direction.
-  Arrays are **named** (`/dev/md/root_a`), not `md0..3`: kernel md
-  minor numbers are assigned in ASSEMBLY order, so a numeric name is
-  not stable across a boot with one member missing, which is the boot
-  the feature exists to survive. `metadata=1.2` puts the superblock at
-  the start, so a member is not mountable as a bare filesystem — 0.90
-  would leave it mountable, and mounting one member of a live mirror
-  read-write silently forks the data.
-  **Everything that would quietly produce something lesser is refused
-  instead**: a member smaller than the target (a RAID1 is the size of
-  its smallest member, so it would shrink `/var`), a member that
-  resolves to the target, an existing md member or multipath path, and
-  the live install medium — the #554 guard, which a preseed naming the
-  USB as `mirror_disk` would otherwise walk straight through. The
-  initrd's `mdadm.conf` is generated and **checked for ARRAY lines**,
-  because one without them yields an initrd that cannot find root, and
-  that is better discovered in the installer than at the first reboot.
-  **Multipath (C3):** the picker lists the maps themselves with their
-  path counts, `partition_node` learned kpartx's `-partN` naming, and
-  `kpartx -a` runs after the table is written — without which `mkfs`
-  against a non-existent node creates a regular FILE on the installer's
-  tmpfs and reports success. Not verified on hardware for want of a
-  SAN, and documented as such.
-  **Part B** makes the Fleet drilldown's Storage block interactive
-  (scrub start/cancel, fail / remove / add a member, reinstate a path)
-  over `POST /appliance/appliances/{id}/storage/action` — superadmin,
-  audited before dispatch so a failed attempt is recorded like a
-  successful one — plus 1 MCP tool (`propose_storage_action`, default
-  **off** per non-negotiable #13: broad-blast-radius writes whose
-  safety rests on a human typing a device path back). Nothing runs
-  `mdadm` in a container: the supervisor writes a request for the
-  host-side `spatiumddi-storage-action` runner over the trigger-file
-  plane and relays the result, so the operator gets the outcome in the
-  HTTP response rather than waiting for a heartbeat.
-  **The gates are in two places on purpose.** The control plane decides
-  what may be ASKED for — it knows who the operator is, and it is where
-  a destructive action demands the device path typed back, because a
-  generic "yes" cannot catch the mistake that actually happens (meaning
-  one disk and clicking the row for the other). The host runner decides
-  what is safe to do AT THE MOMENT of the action, re-counting the
-  array's in-sync members from the kernel, because the control plane's
-  view is up to one heartbeat old and a member can have failed since.
-  Removing the last in-sync member and removing the member the
-  bootloader lives on are **refused, not confirmed** — the first leaves
-  no array to inspect, the second leaves an array that stays green
-  while the machine silently stops booting.
-  **Found by its own test rather than by review:** the device allowlist
-  needs both `.` and `/` in its character class, and that alone admits
-  `/dev/../etc/passwd` — a traversal is now rejected by a separate
-  component check that runs first, in both the service and the runner.
-  **Two review passes found eighteen defects, and the pattern is worth
-  recording: the ones that mattered were all about the survivor.** The
-  array is the easy half. Three separate things had to be right before a
-  mirrored box would boot on one disk — `insmod mdraid1x` in `grub.cfg`
-  (without which GRUB cannot see an array and *no* mirrored install
-  boots at all), disk 2's BIOS `core.img` embedding **its own** ESP
-  rather than the primary's, and `nofail` on the ESP mount so the
-  survivor does not boot successfully and then drop into
-  `emergency.target`. Each fails silently and only on the day the disk
-  dies. Also fixed: the supervisor's reply omitted `request_id` so every
-  Part B action 422'd and timed out; `--zero-superblock` was handed a
-  sysfs path and the failure swallowed; a mirrored appliance could not be
-  reinstalled at all (both members were refused as md members, and the
-  keep-/var path pointed at a full install that was equally impossible);
-  the last-member refusal ignored the RAID level, so a 4-disk raid5 could
-  be destroyed; `add_member` refused the commonest repair there is
-  (re-adding a member on the disk you are running from); the ESP sync
-  used `--no-times`, so `--check` could never report "in sync" and every
-  sync re-copied everything; the trigger was edge-triggered, losing any
-  request written while the runner was busy; and each multipath LUN was
-  offered twice, with the raw `dm-N` row yielding partition paths kpartx
-  never creates.
-  **Then it was installed on a real two-disk box, and the boot test
-  found the one that mattered.** The install was correct; first boot
-  destroyed it. `spatium-grub-render`'s `discover_live_uuids()` — the
-  #395 fallback used when no UUIDs are passed — resolves the slot by
-  **PARTLABEL** and takes that partition's UUID. On a mirror the slot
-  partition is a `linux_raid_member`, so that UUID is the *array's*, not
-  the filesystem's. The installer passes the correct UUIDs explicitly,
-  so `grub.cfg` was right and the box booted; then the host-migration
-  re-render on first boot called this with no arguments and overwrote
-  the working menu with UUIDs `search --fs-uuid` can never match —
-  `error: no such device`, `file '/boot/vmlinuz' not found`. **Install,
-  boot once, unbootable from then on**, on a box whose arrays were
-  perfectly healthy. The fix descends to the md child (and accepts a
-  filesystem-LABEL match as a second route, which is unambiguous on both
-  layouts); a single-disk install is byte-for-byte unchanged, pinned by
-  its own test. A pre-existing #395 bug that only a mirror exposes.
-  **What the degraded boot then proved, on one disk with the other
-  detached:** GRUB found the array (`insmod mdraid1x`), booted from the
-  survivor's own `core.img` and its own ESP, and came up in 40 seconds
-  with all four arrays serving `[2/1] [_U]`, root on `/dev/md126`, and
-  `/boot/efi` **not mounted at all** — which without `nofail` would have
-  been `emergency.target`. Three separate fixes, each invisible until
-  that moment. The console read CRITICAL naming the offender throughout,
-  and the mirror was rebuilt afterwards through Part B's own `add_member`
-  — the repair the pre-review code would have refused.
-  **Two more found only by running it.** `spatiumddi-esp-sync --check`
-  reported the whole ESP as drifted on every run and re-copied it every
-  time: `-r` does not imply `-t`, so rsync compared mtimes it never
-  preserved (`--modify-window` alone fixed nothing). And the host
-  runner did not claim its request, so with `PathExistsGlob` being
-  level-triggered the service re-fired the instant it exited, tripped
-  systemd's start limit within a second, and left the **path unit itself
-  `failed`** — after which no storage action ever runs again. The first
-  request answered; the next two vanished silently. The runner now
-  renames the request to `.request.running` to claim it, exactly as the
-  pcap sibling does and as its own comment had described without
-  implementing.
-  **One alarm was removed rather than fixed.** #999 asked for "a LUN
-  down to its last path" to be critical; that needs a baseline nothing
-  has, and the installer explicitly permits a single-path LUN — so on
-  those appliances it would be critical forever, red on the console
-  forever, and clearable by no action. Zero paths is still critical; one
-  path is reported and not alarmed on.
-
-- **Storage redundancy is monitored across the fleet (#999 Part A).**
-  A mirrored root with no degraded-array alarm is a mirror that
-  silently becomes a single disk: the operator pays for two disks, the
-  array loses a member at 03:00, nothing says so, and the appliance
-  keeps serving perfectly until the survivor dies. That is strictly
-  worse than never mirroring, because it displaced the backup
-  discipline they would otherwise have kept. So the monitoring ships
-  **before** the ability to install onto a mirror (#999 Parts B + C) —
-  it is a precondition for offering the capability, not a follow-on,
-  and it is useful today on any appliance whose data disk is an
-  operator-built array. `read_storage_health()` in the supervisor
-  reads `/proc/mdstat` + `/sys/block` — the HOST's, through the
-  `privileged` + `hostPID` window `_current_slot_from_cmdline()` has
-  read the host's `/proc/cmdline` through since #170, so **no manifest
-  change** — and folds the reading into the `cluster_health` dict the
-  backend already stores verbatim, so there is **no new heartbeat
-  field, no column and no migration** (the #402 pattern). Surfaced as
-  a chip per array / map on the Cluster → Overview node cards, a
-  **Storage redundancy** block with per-member and per-path tables in
-  the Fleet drilldown, and on the TTY console's Disk row — where an
-  alarming chip goes *before* the capacity list and a healthy one
-  *after* it, because the vitals row right-truncates: a degraded array
-  must never be elided to make room for a percentage that looks normal
-  either way, and a green chip that never changes has no business
-  evicting the disk readout at 80 columns. Plus the default-on
-  `appliance_storage_degraded` alert rule and
-  1 MCP tool (`find_appliance_storage`, read-only, default on).
-  **Array state is derived, not copied.** A raid1 down to one member
-  reports `array_state=clean` — the survivor IS internally consistent
-  — so passing the kernel's word through would show a single point of
-  failure as healthy, which is the exact silence this exists to end.
-  State comes from member counts instead.
-  **Severity keys off redundancy remaining, never off that state
-  string.** `2 of 3` in a three-way mirror and `1 of 2` in a pair both
-  read "degraded", and only the second has nothing left to lose;
-  collapsing them would either page for something that can wait or
-  fail to page for something that cannot. One function
-  (`services/appliance/storage_health.py`) makes that call and the
-  alert matcher, the copilot tool and both dashboard surfaces all call
-  it, so a green chip can never sit over a red alert.
-  **A routine scrub or resync is shown on every screen and is
-  deliberately not an alert.** The issue asked for it as
-  "informational, auto-clears", which would be right if the `info`
-  severity were quiet — it is not: delivery filters a target's
-  `min_severity` against `payload["result"]`, a key alert payloads
-  never carry, and the column defaults to NULL, so an `info` event
-  notifies exactly like a critical one. Debian runs `checkarray`
-  monthly by cron, so that row would mail every operator with an
-  array, every month, about their array working correctly, which is
-  how an alarm gets muted before the night it matters. The rebuild
-  that DOES matter never reaches that branch anyway: an array with a
-  member out of sync reports `degraded` and is classified on
-  redundancy like any other.
-  **Multipath is under-sensitive by construction, and every surface
-  says so.** dm-multipath's own per-path verdict lives in the target's
-  status line, reachable only through the device-mapper ioctl
-  (`multipathd show topology`) — Part B tooling, absent from this
-  image. Fabricating `active` would turn a missing reading into a
-  false all-clear, the one answer worse than "unknown". What sysfs
-  *does* answer is each path's SCSI device state, reported alongside
-  under a different name and counted the negative way round
-  (`paths_faulted`, definite faults only) so an NVMe path with no
-  `device/state` never inflates a clean bill of health. But that
-  signal stays `running` for the commonest dm path failure there is —
-  multipathd's checker failing a path while the device is still
-  present — so **the absence of a multipath finding is not a clean
-  bill of health**, and a finding-less map renders NEUTRAL everywhere
-  rather than in the green an md array earns.
-  **Nothing unreadable is ever rendered as healthy.** An assembled
-  array whose `raid_disks` cannot be read reports `unknown` plus a
-  warning — a 0 standing in for "could not read it" would make every
-  degradation test false and drop it through to clean. One that failed
-  to *assemble* is `failed` regardless of its member count, which is
-  often 0 too, so deciding on the count first would demote a real
-  failure. `sync_completed` with no denominator reports no percentage
-  rather than borrowing `/sys/block/mdX/size`, which is the ARRAY's
-  size and would give a plausible wrong number on raid5/6. And a
-  reading that **disappears** is not a recovery: the alert engine
-  resolves any open event whose subject stops matching, so an A/B
-  rollback to a pre-#999 supervisor would announce a recovery on a node
-  whose mirror is still one disk from data loss — an appliance with an
-  open event and no current reading is held at its existing severity
-  instead. Three readings that are NOT the same are kept apart
-  throughout: no `storage` key at all means the supervisor is too old
-  to have looked (UNKNOWN — no chip, no alert), `md_supported: false`
-  means the kernel has no md support, and an empty `md_arrays` with md
-  loaded means there are genuinely no arrays. IMSM / DDF metadata
-  `container` devices are skipped entirely — permanently inactive with
-  `raid_disks=0` on a perfectly healthy box, they would otherwise raise
-  a critical alert nothing could ever clear. An appliance with neither
-  arrays nor multipath renders nothing on any surface, so the common
-  single-disk case gains no clutter.
-  Installing *to* a mirror or a LUN is still refused (#995); the
-  `mkosi.conf` packages, the initramfs work and the two-ESP sync that
-  needs are #999 Parts B + C.
-
-- **The SSH source-CIDR allowlist can now actually be enforced
-  (#1009).** It has shipped since #157 and, on the default port,
-  restricted nothing: `/etc/nftables.conf` opened `tcp dport 22`
-  unconditionally *above* the drop-in include glob, and nftables
-  is first-match-wins, so the scoped rule was dead code. #1001
-  fixed the rendering; this makes it reachable. The floor moved
-  to the retireable sentinel
-  `/etc/nftables.d/00-spatium-ssh.nft`, the three firewall
-  renderers stamp `# spatium-ssh: retire|keep`, and the host
-  runner retires it through the same machinery the Web-UI
-  sentinel has used since #769.
-  A new **Enforce source restriction** switch
-  (`ssh_lockdown`) is what retires it, and it is deliberately a
-  second control rather than a consequence of typing a CIDR:
-  retiring the floor removes what
-  `docs/design/FLEET_FIREWALL.md` §6.1 calls the irreducible
-  recovery channel, and that document's risk register names the
-  same floor as the mitigation for every *other* firewall
-  mistake. It is the anti-lockout pattern pfSense and OPNsense
-  ship, and the shape §6.1 already specified (as
-  `firewall_mgmt_lockdown`).
-  **Default off, including on upgrade** — an operator who
-  configured an allowlist while it was inert does not get their
-  SSH tightened by an upgrade they never asked for. Enforcement
-  then applies on port 22 and on a moved port alike, so the
-  behaviour no longer depends on which port SSH is running on.
-  Two guards on the way in: enforcing with an empty list is
-  refused outright (that closes SSH from everywhere, not
-  restricts it), and enforcing from an address the list does not
-  cover asks for an explicit acknowledgement first — the mistake
-  operators actually make, caught at the moment they make it
-  rather than at their next SSH attempt.
-
-  **The two lockdowns compose.** Scope the Web UI *and* enable
-  this with a scope that excludes you, and the console is what
-  remains. #1009 shipped with neither setting able to see the
-  other, so neither warned; every surface that used to promise SSH
-  as an unconditional recovery path now names the console first
-  and treats SSH as conditional.
-  `scripts/lint_ssh_recovery_claims.py` asserts on the *claim*
-  rather than its wording — three earlier passes each grepped for
-  the previous phrasing and missed the next paraphrase, and the
-  guard caught two false UI strings that all three had walked
-  past. The check that sees both settings at once landed in
-  #1013, below.
-
-### Changed
-
-- **Fewer features are switched on out of the box (#1069).** A fresh
-  install enabled **37 of 53** feature modules, because the policy was
-  "default-on so operators discover what exists" — so a new operator
-  met BACnet, DICOM, OT Purdue zoning, E911, a BGP looking glass and
-  SD-WAN overlays in the sidebar before creating their first subnet.
-  That policy is replaced by a criterion: a module ships **on** only
-  if it is core IPAM / DNS / DHCP workflow, a zero-footprint UI
-  convenience, or a read-only diagnostic invoked by hand; it ships
-  **off** if it is a domain-specific registry most installs never
-  populate, emits traffic or writes to infrastructure once armed,
-  calls off-prem, or is one-shot migration tooling. Day-one importers
-  are the deliberate exception to that last clause — a fresh install
-  is exactly when an estate gets imported, so DNS / DHCP / NetBox
-  import stay on while the Windows cutover does not. **14 of 53**
-  modules now ship enabled. Discovery is unaffected: Settings →
-  Features has always listed every module with its description
-  whether or not it is on, which is why the sidebar does not have to.
-  **Existing installs are untouched** — an operator already running
-  E911 or Conformity does not lose it to an upgrade they did not ask
-  for.
-
-  **The mechanism was the bug.** Non-negotiable #14 told every
-  module's migration to seed a `feature_module` row at its shipped
-  default, and the resolver prefers a row over the catalog — so
-  `default_enabled` was dead code on every install, fresh ones
-  included, since a fresh install runs the same seed migrations an
-  upgrade does. Flipping a default in the catalog would have changed
-  nothing at all. A row now means one thing, "an operator changed
-  this"; migrations no longer seed one; and the new migration deletes
-  the pristine historical seeds **on a fresh install only**. Its
-  downgrade is a genuine no-op rather than a stub: the old code carries
-  the old catalog, whose defaults were true, so an absent row resolves
-  to the old behaviour on its own.
-
-  **"Fresh" is `audit_log` being empty, not the `user` table.** The
-  obvious test is "no users yet", and it is wrong in the direction that
-  fails silently: the API seeds the default admin at lifespan start,
-  and on Compose the `api` service waited only for postgres and redis,
-  so on a cold `docker compose up -d` it could insert that admin while
-  the 291 revisions were still running. The row count would be 1, the
-  migration would call the install an upgrade, skip, and #1069 would
-  quietly do nothing on exactly the installs it is aimed at.
-  Non-negotiable #4 puts an audit row behind every mutation, and
-  logging in writes one, while nothing on the startup path does — so a
-  racing API
-  cannot manufacture the evidence, and an empty table means nobody has
-  configured anything worth preserving. Proven on a real database in
-  three shapes: a clean fresh install clears all 51 seed rows, an
-  install with 1,033 audit rows keeps all 51, and the race itself — one
-  user, zero audit rows — is still correctly treated as fresh.
-
-- **Compose waits for the schema, not just the database (#1069).** The
-  `api` and `worker` services now depend on `migrate` completing.
-  Without it the API could serve against a half-migrated schema, and
-  worse, `_seed_default_admin` runs at lifespan start and never
-  retries: if it lost the race badly enough that the `user` table did
-  not exist yet, it skipped silently and the install had no account
-  anyone could log in with. Kubernetes has had a wait-for-migrate init
-  container all along; this is Compose catching up. `beat` is left
-  alone — it only schedules, and its `depends_on` is the short list
-  form.
-
-- **Settings → Features lists every module again (#1069).** Its two
-  tabs were driven by a hardcoded list of catalog group names that had
-  fallen five groups behind, so both DNS toggles, DHCP import, NetBox
-  import, Fleet Firewall and Saved views rendered on neither tab and
-  were untoggleable anywhere in the product. The split is now derived
-  from the catalog — Integrations on one tab, everything else on the
-  other — so a new group cannot go missing by omission. That page is
-  load-bearing for the change above, which hides most modules from the
-  sidebar on the argument that this one lists all of them.
-
-  Two guards keep it from drifting back. The first, in
-  `tests/test_feature_module_defaults.py`, writes out the shipped
-  value of all 53 modules, so changing one is two deliberate edits and
-  adding a module fails until somebody states which way it ships — and
-  it parses the catalog *source* rather than importing it, so it
-  cannot be masked by the new `conftest` fixture that turns every
-  module on for the test suite. The second fails any new migration
-  that touches `feature_module` at all.
-
-  Verified on a real database both ways: a full migration chain on an
-  empty database leaves zero rows, so the catalog governs; the dev
-  database with its 51 seeded rows keeps all 51.
-
-  `scripts/seed_demo.py` now enables the nine gated modules it
-  populates before it starts. It POSTs to routers the flip turns off,
-  and its HTTP helper logs a failure and walks on — so left alone it
-  would have printed a wall of 404s and produced a demo dataset with
-  no ASNs, customers, providers, circuits, services, overlays,
-  network devices, multicast groups or conformity policy in it.
-
-- **CI: a backend PR no longer waits 28 minutes on one test shard
-  (#1019).** The eight `Backend — Tests` shards were split by test
-  COUNT — no `.test_durations` file existed anywhere in the repo, so
-  pytest-split had nothing else to go on — and the alphabetical
-  slice holding the heavy DB-bound files ran 25–28 min while the
-  other seven took ~11 for the same 595 tests. The split is now
-  balanced by duration from a committed `backend/.test_durations`,
-  there are twelve shards, and every full run re-measures: each
-  shard uploads what it timed, the aggregator merges the pieces into
-  a `test-durations` artifact — normalizing each shard by its
-  runner's speed first, since hosted runners vary ~2× run to run
-  and a raw measurement bakes one slow runner into every test it
-  held — and warns when the file stops describing relative costs;
-  `make test-durations` pulls the newest artifact down for a human
-  to commit at release prep. A stale file only costs balance (an
-  unknown test is assumed average), never correctness. Measured on
-  the PR itself: 28 min → 15–16 min wall clock, the remainder being
-  one runner in twelve landing ~2× slower, which no split removes.
-  **Found on the way: coverage was still being traced on every
-  shard.** #435 removed `--cov` from the workflow command, but
-  `addopts` in `backend/pyproject.toml` re-added it silently, so
-  every shard log ended with the full coverage table and every
-  `make test-one` paid the same 15–30 % for output nothing read.
-  Coverage is now opt-in via `make test-cov`.
-- **CI: a PR runs only the backend tests its diff can affect
-  (#1020).** The push-to-main shards now record which test executed
-  each line (`--cov-context=test`); the aggregator folds that into a
-  `test-impact-map` artifact, and the next PR's change-detection job
-  narrows the shards to the test files the changed `app/` modules
-  were observed to reach. **Every rule fails open** — toward the
-  full suite: no map, a migration, `pyproject.toml`, a data file,
-  `conftest.py`, a module only ever executed at import (models,
-  registries), or a selection covering most of the suite all run
-  everything, and push to main always does, so a wrong selection is
-  caught after merge rather than lost. Why not a file-name mapping:
-  only 65 of 358 test files are named after an `app/` module, and
-  228 of them build the whole app through the `client` fixture, so
-  a static import graph reaches every test from any change.
-- **CI: `agent-e2e.yml` no longer runs on backend-only PRs
-  (#1021).** It installs the control plane from the `:latest`
-  release image and builds only the DNS agent images from PR
-  source, so on a backend change it spent 4–20 minutes probing a
-  cluster that did not contain the change — the workflow's own
-  header already made this argument for excluding `frontend/**`.
-  Its path filter now lists what it actually exercises.
-- **CI hygiene (#1022).** The `protect-main` ruleset now requires
-  every stable check name, not just Backend Lint and the two
-  Frontend jobs — `Backend — Tests` had been documented as "a
-  required-check aggregator" while not being one. The four
-  per-image build workflows lose a `docker/login-action` and a
-  "Build and push (main / tag)" step that their PR-only triggers
-  made reachable solely by hand (where it pushed `:<branch>` tags
-  nothing consumes), and drop `packages: write`. Both frontend
-  jobs cache npm. Stale ci.yml comments ("~1900 tests", "coverage
-  is no longer collected") corrected. The two GitHub-managed CodeQL
-  runs per PR (default setup + Code Quality) are documented in the
-  trigger table and kept — the Code Quality bot threads are acted
-  on.
-
-- **Every version pin Dependabot cannot see now lives in one
-  manifest, and CI fails when a copy drifts (#975).** Dependabot
-  covers four ecosystems here; it has no Helm ecosystem and does
-  not read Dockerfile `ARG` values, chart `values.yaml`, action
-  `with:` inputs, CI script defaults or the appliance bake
-  arrays. Those pins were spread across nine file types, several
-  behind upstream, two past end-of-life, and one component sat on
-  two different versions because only one of its copies was
-  Dependabot-visible: the appliance chart's nginx had fallen a
-  minor behind the frontend image's, with nothing connecting
-  them. Root `versions.json` now declares all 28, and
-  `scripts/lint_versions.py` asserts each still appears in each
-  file that carries it — 89 assertions, run in CI's
-  unconditional Backend Lint job and by `make ci`.
-  **Bumping is one edit**, because every site's expected string
-  is a template over the component's `version` field.
-  **The literals stay in the files rather than being read from
-  the manifest at build time.** A build-time read that yields an
-  empty string is the failure class this repo has hit repeatedly
-  (#1028, #1029, #1030): an action input resolving to `""` falls
-  back to the action's own default — for `azure/setup-helm`,
-  `latest` — with no error anywhere. The lint gives the same
-  single-source guarantee with no new build-time failure mode.
-  **The one Dependabot-owned pin that IS listed is nginx's
-  `FROM`**, deliberately: pairing it with the copies Dependabot
-  cannot see is what turns the next bot bump into a failing lint
-  instead of a silent minor of drift.
-  **`count` is the load-bearing field.** The Patroni overlay runs
-  three etcd services and three Redis containers; a substring
-  check with no count passes a bump that moved two of three and
-  left a mixed-version cluster.
-  A weekly `pin-drift` job in `trivy-scheduled.yml` resolves each
-  declared upstream and files the delta, separating pins that are
-  behind ON PURPOSE from real drift — the `hold` field carries
-  each reason, so a known hold never reads as neglect.
-  `make versions-upstream` runs it locally.
-  **Seven defects in the guard itself, found by /code-review and
-  CodeQL before it shipped, and every one was it failing open.**
-  `--check` — the mode the script's own docstring documents — was
-  not a flag: argparse resolves an unambiguous prefix, so it ran
-  `--check-upstream`, the advisory network mode that always exits
-  0. Following the documentation turned the check off. It is a
-  real flag now and `allow_abbrev=False` stops the next one.
-  An unknown key was silently ignored, so `"counts": 3` left
-  `count` unset and downgraded an exact assertion to "at least
-  one" — a 2-of-3 partial bump passed; unknown keys are refused
-  at every level. The weekly job scraped the first number off a
-  prose line that opens "0 behind upstream" *when every lookup
-  failed*, so a rate-limited run would have reported the fleet
-  current and CLOSED the drift issue; the script now prints a
-  machine-readable `RESULT` line carrying `failed`, and any
-  component that could not be checked makes the verdict
-  indeterminate rather than clean. Technitium is pinned by tag
-  AND digest and only the tag was asserted, so bumping `version`
-  alone passed while the build stayed on the old image — the
-  digest is a manifest field now, asserted offline and resolved
-  against Docker Hub weekly. `ghcr.io/cloudnative-pg/postgresql`
-  was the one bake-array/chart-values pair still unguarded, and
-  the worst one to lose: the appliance never pulls, so a
-  divergence there is ImagePullBackOff on an air-gapped box. And
-  `docs/DEVELOPMENT.md` referred twice to a section that did not
-  exist, now written as §9. And the GitHub token was scoped to a
-  URL SUBSTRING — `"api.github.com" in url` is equally true of
-  `https://evil.example/api.github.com/x`, which is the token
-  handed to whoever owns that domain. It is matched on the parsed
-  hostname now, against an allowlist of the four endpoints this
-  script has any business reaching, https only.
-
-- **The pins the sweep found behind, bumped (#975).** Out of
-  support: `ruby:3.2-slim` (EOL 2026-03-31) → 3.4, and with it
-  `webrick` 1.8.1 → 1.9.2 — 1.8.1 predates the request-smuggling
-  fix in 1.8.2 (CVE-2024-47220) and was the only known-vulnerable
-  web server in the tree, seen by no lockfile and no bot;
-  `jekyll` 4.3.4 → 4.4.1; `haproxy:2.9-alpine`, a short-lived
-  non-LTS branch with no release since March 2025, → 3.4. Behind
-  upstream: Helm v3.20.2 → v3.21.4 across all five copies,
-  `redis` 8.8 → 8.10.1 across every one of them, the appliance
-  chart's nginx 1.30.3 → 1.31.5, kube-state-metrics → v2.20.0,
-  node-exporter v1.11.1 → v1.12.1, GoBGP 4.7.0 → 4.9.0
-  (`make trivy IMAGE=looking-glass` clean), and the Patroni
-  overlay's etcd v3.5.30 → v3.5.33 on all three services. Every
-  non-held pin is now current.
-  **The HAProxy jump is the one an existing deployment must read
-  before upgrading**, because that overlay's `haproxy.cfg` is
-  operator-supplied and 3.x turned keywords deprecated across the
-  2.x series into hard failures. The canonical Patroni config was
-  validated unchanged on both 2.9 and 3.4, so a config of that
-  shape needs no edit; `BAREMETAL.md` now says so and gives the
-  one-line `haproxy -c` command to check a config that is not.
-  **MetalLB stays on 0.15.3**, re-verified rather than assumed:
-  metallb/metallb#3063 is still open, so the hold and its three
-  vendored sub-pins (frr-k8s, frr, kube-rbac-proxy) stand and are
-  now recorded with the reason.
-  **Three things the sweep got right that the issue text had
-  wrong.** `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve
-  to the same digest, so 3.4 IS the LTS branch — 3.2 is not.
-  Alpine 3.24 ships Python **3.14.7**, not the 3.13 the
-  `dependabot.yml` comment had claimed for as long as the hold
-  existed, which makes the agent-image blocker a 3.12 → 3.14 jump
-  needing every dependency re-verified, not the one-minor step
-  the wrong number implied. And `patroni-spatiumddi:latest` is
-  not an unpinned pull — the HA overlay BUILDS it inline from
-  `postgres:16-alpine`, so it names a purely local image; what is
-  genuinely unpinned there is the `pip install patroni[etcd3]`
-  beside it, now documented in `BAREMETAL.md`.
-  **Found while writing the manifest:** the backend test shards'
-  own Redis service in `ci.yml` was still on 8.8 — a real pin, in
-  the file the sweep was being written in, that the hand-written
-  issue table had missed. It is in the manifest now, along with
-  the prose in four docs pages that named a version as fact.
-
-
-- **The agent images move to Alpine 3.24 / Python 3.14.7, and the
-  arg that was supposed to control that becomes real (#1037).**
-  The base had been pinned to 3.23 for a year behind a
-  `dependabot.yml` comment that said 3.24 moves Python "3.12→3.13";
-  the #975 sweep checked the package index and found **3.14.7**, so
-  the task was a two-minor interpreter jump, not a one-minor step —
-  which is most of why nobody had done it. All three agent suites
-  were run on 3.14 first (dhcp 188, dns 276, supervisor 374; the
-  supervisor's 11 apparent failures were a test container with no
-  `bash`, identical on 3.12). The looking-glass agent has no suite
-  at all, so it and the others were additionally checked by
-  importing **every** submodule inside the shipped image — 96
-  across the five agents, none failing.
-  **The real pin was never `PYTHON_VERSION`.** Four of the five
-  images declared `ARG PYTHON_VERSION=3.12` and referenced it
-  **nowhere** — bumping it changed the image not at all — while
-  `PYTHONPATH=/usr/local/lib/python3.12/site-packages`, hardcoded,
-  was what actually located the agent. That is the exact shape #672
-  hit: base moves, PYTHONPATH does not, the image builds perfectly
-  and the pod CrashLoopBackOffs on `ModuleNotFoundError`. So
-  `PYTHONPATH` now interpolates the arg, and every agent image
-  asserts `import <agent>` as a build step — verified by building
-  with a deliberately stale `--build-arg PYTHON_VERSION=3.12`,
-  which now fails the BUILD instead of shipping.
-  **The technitium image needed a different assertion**, which
-  review caught it not having at all: it is the one agent that is
-  not Alpine-based, and its arg drives BOTH the builder and
-  `PYTHONPATH`, so those move together and an import alone still
-  passes when the arg is wrong (they resolve, because `cryptography`
-  and `pydantic-core` ship abi3 wheels that load across 3.x). What
-  can drift there is the interpreter inside the upstream
-  `technitium/dns-server` base, so that image compares
-  `sys.version_info` to the arg directly. Verified both ways.
-  Carried along by the same index: pdns 5.0.5 → 5.0.7 (a patch
-  within pdns 5, so the #638 LMDB schema guard correctly takes no
-  snapshot — the 4.9 → 5.0 crossing already happened on 3.22 →
-  3.23), dnsdist → 2.0.8, bind → 9.20.27, Kea unchanged at 3.0.3.
-  All eight images `make trivy` covers build clean and scan clean.
-  **CI surfaced one CVE the local scan had not**, which is the
-  path-filter effect this repo has hit before (#639): touching a
-  Dockerfile is what makes CI scan that image, so the PR inherits
-  everything published since the last time anything touched it.
-  `google.golang.org/grpc` was pinned at 1.83.1 for CVE-2026-84304
-  and 1.83.1 now carries CVE-2026-84445 (HIGH, xDS server DoS).
-  Clearing it took three rounds, because those `go get` pins are a
-  coupled set that `go get` refuses rather than resolves: grpc 1.83.2
-  wanted x/net 0.58.0, and both then wanted x/text 0.41.0.
-  **`Agent — Tests` moves to 3.14 with them.** It ran on 3.12 while
-  the images shipped 3.14, which is the skew that lets a
-  3.14-only regression reach a pod with every check green. The
-  backend stays on 3.12 — a separate, deliberate hold.
-
-- **The nightly build moves from 02:23 to 03:23 America/New_York,
-  which also closes a hole it had every spring.** Cron is UTC-only,
-  so the schedule is two twin crons plus a gate that keeps the one
-  whose slot reads the target hour on the Eastern clock. On the
-  spring-forward night the Eastern clock jumps 01:59 → 03:00, so
-  **no 02:xx exists and BOTH twins skipped** — the nightly silently
-  built nothing once a year. 03:xx exists on every night there is.
-  Verified against tzdata for normal EDT, normal EST and both DST
-  nights across 2026-2028: exactly one twin builds in every case.
-  The `:23` is kept deliberately and must not be rounded to `:00` —
-  the top-of-hour cron stampede delays runner scheduling, and these
-  runs already start up to 13 h late.
-
-
-- **A slot upgrade could regenerate SECRET_KEY and orphan everything
-  encrypted at rest (#1042).** `app/core/crypto.py` derives the
-  at-rest Fernet key from SECRET_KEY whenever no explicit
-  `CREDENTIAL_ENCRYPTION_KEY` is set — which is every appliance — so
-  the chart-owned Secret carrying `secret-key` is the root of the
-  appliance CA private key, appliance certs, integration credentials,
-  OIDC/SAML secrets and every JWT.
-  A k3s HelmChart defaults to **`failurePolicy: reinstall`**,
-  documented as "a clean uninstall and reinstall of the chart". On
-  three ddi-pg slot-upgrade walks helm-controller took that path for
-  `spatium-control`, the Secret was deleted, the reinstall's `lookup`
-  found nothing, `randAlphaNum 64` minted a new key, and cluster
-  member approval started answering 500 with
-  `ValueError: encrypted value could not be decrypted` — while the
-  control plane reported healthy and the data plane kept serving.
-  **The fix is the annotation, and `failurePolicy` is deliberately
-  left alone.** The Secret gains `helm.sh/resource-policy: keep` — it
-  was the ONLY credential Secret in the chart without it, and the
-  Postgres and Redis secrets came through the very same event purely
-  because they carry it. With it, the uninstall half retains the
-  Secret and the reinstall's `lookup` finds the same key.
-  **`failurePolicy: abort` was written, then reverted in review**, and
-  the reason is worth recording: it looks like the safer setting and
-  is not. `spatiumddi-helm-stuck-recover` only acts on a HelmChart
-  carrying a `Failed` condition, and only after a 600 s latch on a
-  5 min tick — so a release left `pending-upgrade` by the slot reboot,
-  which is the scenario this was found in, may never qualify at all.
-  `abort` there risks an indefinite outage with no API and no UI,
-  where the default `reinstall` recovers in seconds. What made
-  `reinstall` dangerous was never the reinstall; it was the missing
-  annotation. Disruptive and self-healing is fine. Lossy was not.
-  The chart guard is written against the *generator* rather than the
-  filename — any Secret template that mints a credential with
-  `randAlphaNum` must carry the annotation — with a negative control
-  asserting SECRET_KEY's own template is still one of the templates
-  being checked, so the guard cannot pass by looking at nothing.
-  **Both of the first-cut guards were themselves vacuous**, which
-  review proved rather than argued: deleting the entire `annotations:`
-  block left all four tests passing, because the template's own header
-  prose mentions the annotation; and the unit guard matched a name
-  anywhere in `mkosi.postinst`, where dozens of units are `chmod`'d by
-  name — so adding the chmod line its siblings have would have
-  satisfied it while the unit stayed unenabled (`spatium-etc-render`
-  already slipped through that way). They now strip Helm and shell
-  comments and match the annotation as a real YAML entry *with the
-  value `keep`*, and parse the `for unit in … ; do` list plus the
-  explicit `*.target.wants/` symlinks rather than the whole file.
-  A third check runs on the **rendered** manifest in
-  `charts-render-check.sh`, where a value typo or an annotation hidden
-  behind a false condition is visible and a template-text scan is not;
-  it reports how many Secrets it examined, so "checked nothing" cannot
-  read as "checked and clean".
-  **Making `abort` safe turned up a third defect.** The recovery it
-  leans on had never run: `spatiumddi-helm-stuck-recover.timer` ships
-  in the image, carries `WantedBy=timers.target`, and has its runner
-  covered by `test_helm_stuck_recover.py` — and was absent from
-  `mkosi.postinst`'s unit-enable loop, so on every appliance ever
-  built it was inert. Same class as #550, where a host runner shipped
-  without the `+x` its ExecStart needed: present, reviewed, tested,
-  and dead for one missing line of image plumbing. It is enabled now,
-  and a sweep of all 38 shipped units with an `[Install]` section
-  found no others. The guard that would have caught it matches
-  `[Install]` as a SECTION HEADER, never as a substring —
-  `spatiumddi-pcap.service` carries the comment "No [Install] —
-  invoked only by spatiumddi-pcap.path", and a substring match
-  reports that correct file as a violation, which is how an
-  exemption list fills up with noise and stops being read.
-
-
-### Security
-
-- **The two source restrictions composed into a console-only
-  lockout, and neither guard could see the other (#1013).** The
-  appliance has two independent ways in and a source allowlist for
-  each — the Web UI (#285 Phase 6) and SSH (#1009). Each shipped
-  with an anti-lockout guard that checked only whether the
-  caller's address was inside *its own* list, so an operator could
-  pass both, one at a time, and end up reachable through neither.
-  That is not an exotic sequence: "lock this box down" means
-  scoping the Web UI to the management network and then scoping
-  SSH to the same one, and if that CIDR is stale both guards fire,
-  both offer an override, and each override is individually
-  reasonable. Nothing at any point said the other door was also
-  closing.
-  Before #1009 it could not happen — the port-22 floor was
-  un-removable, so SSH was the guaranteed recovery path the Web UI
-  guard leaned on. Making that floor retireable is what the SSH
-  allowlist needed in order to mean anything, and it removed the
-  guarantee.
-
-  Both write paths now resolve one shared question through
-  `backend/app/services/appliance/access.py`: **after this change,
-  does any remote door still admit the address I am talking to?**
-  When the answer is no they raise the *same* 422 — one state of
-  the appliance, so one sentence about it — requiring
-  `acknowledge_console_only=true`. Deliberately **not** satisfied
-  by the per-door `override_lockout` / `ssh_lockdown_force`: those
-  accept losing one door while another remains, which is a
-  materially smaller thing, and an operator may have ticked one
-  for an unrelated reason. The implication runs one way only —
-  accepting console-only already contains "this door closes on
-  me", so it is not asked for twice, which would be the
-  reflex-training pattern both guards' own comments warn about.
-  Both screens also read a new `GET /appliance/remote-access` and
-  show the *other* door's state at the point of decision; it sits
-  on the always-mounted `/appliance` hub rather than under
-  `/appliance/firewall`, because the SSH screen must be able to
-  ask with that module off.
-
-  **The per-door refusals say more on the way**, because reaching
-  one now *proves* the other door did not exclude the caller's
-  address: had it, the escalation would have raised first. So each
-  names the other list and its scope instead of hedging about it.
-  Only as far as the fact goes, though — every verdict here is
-  about ONE address, the source of the HTTP request, and that is
-  the right address for the Web UI door (the operator is using it,
-  over that door, right now) but only a proxy for the SSH one,
-  since browsing from one network and SSHing from another is
-  legitimate. So the copy is asymmetric on purpose: "you can still
-  reach this UI" is asserted, "you can still SSH" is not — the SSH
-  list is reported as *including the address you are connecting
-  from*, which is what is actually known.
-
-  **An address we cannot read is not covered — everywhere.** The
-  two guards had been scoring that case in opposite directions:
-  the Web UI one counted it as excluded and warned, the SSH one as
-  covered and proceeded. Both had a written rationale and the pair
-  was not defensible. The conservative reading wins because the
-  costs are asymmetric — an unneeded warning costs a checkbox, a
-  missing one costs a trip to the console — and because #1009's
-  argument for the other direction ("a gate that blocks on *I
-  could not tell* gets forced past by reflex") was a claim about
-  frequency, and the frequency is near zero: the trusted
-  client-IP helper falls back to the ASGI peer address, which
-  every real HTTP request has.
-
-  **Found on the way:** the Web UI guard was reading `client_ip`,
-  which `core/request_meta` documents as spoofable and explicitly
-  unsuitable for a source-IP allowlist gate. It is also simply the
-  wrong address on a real topology — behind a reverse proxy,
-  uvicorn's `--forwarded-allow-ips *` resolves the browser's own
-  IP out of `X-Forwarded-For` while nftables judges the packet
-  source, which is the proxy — so the guard would clear an
-  operator who was about to be locked out, with no attacker
-  involved. It now reads the same trusted value the SSH guard
-  does.
-
-  **And the console is not universal.** `spatium-console` runs on
-  `tty1` and `ttyS0`; a remote VM with no virtual serial port and
-  no hypervisor console has no floor at all, so an acknowledged
-  console-only lockout there is a rebuild. The escalation says
-  that in as many words rather than describing the console as a
-  recovery path, and `docs/deployment/APPLIANCE.md` now states it.
-
-  Both 422s are routed in the UI by the **acknowledgement field**
-  each one names, not by its prose: a field name is the API
-  contract and the sentence around it is not, and a test pins that
-  the three markers stay mutually exclusive. `WebUIAccessCard` was
-  lifted out of `FirewallTab.tsx` into its own component so it can
-  be rendered in a test — the failure mode on both sides is a
-  modal or a checkbox that never appears, which neither review nor
-  `tsc` can see. 1 MCP tool (`find_remote_access_doors`,
-  read-only, default on): the composition was the one thing
-  neither existing tool could show, since `find_web_ui_access` is
-  tagged `module="appliance.firewall"` and `find_ssh_settings` is
-  not — so with that module off the copilot could see one door and
-  not the other. No migration, no new column.
-
-- **The SSH source-CIDR allowlist was discarded and the port
-  opened to the world (#1001).** `spatiumddi-ssh-reload` renders
-  the nftables drop-in that scopes the SSH port to the operator's
-  configured networks — sshd has no native source filter, so that
-  fragment *is* the enforcement. It piped the CIDR list into a
-  `python3 -` whose program came from a heredoc, and `python3 -`
-  means *read the program from stdin*: the heredoc, being the
-  later redirection, won and the JSON was discarded. The
-  `except Exception: cidrs = []` then took the documented
-  empty-list branch, which opens the port unconditionally.
-  Nothing reported a problem — the rendered rule is valid
-  nftables, so the pre-reload `nft -c` dry-run passes, the reload
-  succeeds, the applied sidecar reports success, and the Fleet UI
-  shows the CIDR list exactly as typed. The data is now passed as
-  argv, and an unparseable list is **refused** rather than treated
-  as "open to everyone"; an absent list stays the legitimate "any
-  source" answer, and the port-22 accept floor in the firewall
-  renderer keeps a default install reachable.
-
-  **The allowlist only takes effect once SSH is moved off port
-  22**, and that is not what this change fixed. The appliance's
-  base `/etc/nftables.conf` emits an unconditional
-  `tcp dport 22 accept` in its management floor, above the
-  include glob that pulls this drop-in in, and nftables is
-  first-match-wins — verified against a real kernel. That floor
-  is the deliberate un-removable recovery channel that keeps a
-  bad Web-UI source restriction from bricking the box, so it was
-  left alone: retiring it when a scope is configured (what the
-  Web UI does) would turn a wrong CIDR into a console-only
-  recovery, which is a decision rather than a bug fix — tracked
-  as #1009. Said plainly here because the allowlist previously
-  did nothing for two independent reasons and only one of them
-  is now gone.
-
-  The apply order changed with it: the fragment is now staged
-  and validated *before* the sshd drop-in is installed. Both
-  paths that can refuse used to run after it, and `fail` exits
-  before the sshd reload — so the running daemon kept the old
-  port while the installed config had already moved it, and the
-  lockout arrived at the next sshd start rather than at the
-  failure.
-
-- **Blanking the installer's Time source did not disable NTP
-  (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
-  `pool` directive and `sourcedir` is additive, so removing the
-  installer's sources file left the appliance synchronising
-  against the public Debian pool. Four surfaces said "none",
-  including `docs/PRIVACY.md`, which is normative for
-  non-negotiable #17 — a false claim about an outbound connection
-  on the page an operator reads to decide what the box talks to.
-  Blank now means none: the installer comments out the `pool`
-  line and the `/run/chrony-dhcp` sourcedir (marked and exactly
-  reversible), and the answer reaches
-  `platform_settings.ntp_pool_servers` as an empty list, so the
-  control plane's first config push does not put the pool back.
-  `sources.d` and `conf.d` are left in place as the way back.
-
-- **The weekly CVE scan could report "clean" and could never
-  report a CVE (#975).** Found while adding a second job to the
-  same workflow. GitHub Actions runs a `run:` block under
-  `bash -e`, and the `set -uo pipefail` at the top of the scan
-  step does **not** clear that flag — so the bare
-  `docker run ... trivy --exit-code 1` followed by `rc=$?` killed
-  the whole step the moment Trivy found something. That is the
-  first image with findings, which is the only case the job
-  exists for: every branch after it was dead code,
-  `has_findings` was never written, and the reporting step's own
-  fail-safe then correctly refused to touch the tracking issue on
-  an indeterminate result — logging a warning nobody reads on a
-  scheduled run. A clean week and a week full of criticals
-  produced the same visible outcome: no issue.
-  Both status captures now use the `if` form, whose condition is
-  exempt from `-e`. Verified by executing the shipped `run:`
-  bodies under `bash -e` against a stub where `docker build`
-  succeeds and the scan exits 1 — the fixed step reaches its
-  handler and writes `has_findings=1`, the unpatched one exits 1
-  having written nothing. The first attempt at that harness
-  proved nothing, because a stub that failed `docker build` too
-  took the build-failure path and never reached the scan.
-
-
-- **A `run:` step that captures `$?` after a bare command is dead
-  code, and nothing anywhere said so (#1036).** GitHub Actions runs
-  every `run:` block under `bash -e`, and the `set -uo pipefail`
-  several steps open with does **not** clear it — so
-  `cmd; rc=$?` is never reached on the failure it was written to
-  handle. #975 fixed the two live sites; this adds the guard, which
-  that issue deliberately left out of scope.
-  The instance that matters: `trivy-scheduled.yml` captured Trivy's
-  status this way, and Trivy exits 1 **on findings**. The step died
-  at the first image with a CVE, `has_findings` was never written,
-  and the reporting step's fail-safe correctly declined to act on an
-  indeterminate result. **A clean week and a week full of criticals
-  produced the same visible outcome: no issue.**
-  `scripts/lint_workflow_shell.py` refuses the shape in CI's
-  unconditional Backend Lint job and in `make ci`. It is a linter of
-  our own because **neither `actionlint` nor `shellcheck -S style`
-  reports it** (both run against the exact snippet): SC2181 fires on
-  a direct `if [ $? -ne 0 ]` and not on `rc=$?` followed by a test
-  of `$rc`. It is pinned against the REAL pre-fix
-  `trivy-scheduled.yml` body, which it reports at the right line.
-  **The false positive it had to stop making is the interesting
-  half.** Turning the check on for a standalone script requires an
-  UNINDENTED `set -e`, because file order is not execution order and
-  this reads the file: `spatium-install` is `set -uo pipefail` at the
-  top and enables `-e` deep inside `do_install()`, which runs *after*
-  the wizard loop and preseed parser that appear below it. Counting
-  that produced four confident findings about code where `-e` is off
-  — and a linter that cries wolf on the installer is one that gets
-  deleted. Suppressing accepts weaker evidence than asserting, on
-  purpose.
-  **The sweep found a second live instance, in the DHCP agent's own
-  entrypoint** — and only after review caught that the guard was not
-  scanning the files its rationale was built on: it globbed `*.sh`,
-  and all 45 appliance host runners (`spatium-install` among them)
-  are extension-less. It now matches on a shell shebang too, and
-  refuses to print a pass when the script half scanned nothing.
-  What that turned up: `agent/dhcp/images/kea/entrypoint.sh` runs
-  under `set -eu` and ends with
-  `wait -n … || wait …` / `EXIT_CODE=$?` / `_term`. Reproduced
-  against busybox ash — when a supervised child exits non-zero the
-  list returns non-zero, `-e` kills the script on that line, and
-  `EXIT_CODE`, `_term` and `exit` are ALL skipped. So a kea or agent
-  **crash** — the case the supervision block exists for — tore the
-  container down without terminating its siblings, while a clean
-  SIGTERM (which returns 0) ran the cleanup perfectly. The failure
-  path was the only one that skipped it.
-
-
-### Added
-
-- **The appliance builds for arm64 — ISO and upgrade image, in
-  the release and the nightly (#1026, parts 2 + 3).** Apple
-  Silicon VMs, Graviton / Ampere instances and Raspberry Pi
-  5-class boards. `mkosi.conf` no longer pins `Architecture`;
-  the kernel, GRUB packages and `BiosBootloader` moved to
-  `mkosi.conf.d/` drop-ins matched on architecture, and the
-  Makefile always passes `--architecture` explicitly so an
-  Apple Silicon dev box does not silently start building arm64
-  by default. `release.yml` and `nightly.yml` matrix over
-  `[amd64, arm64]` with `fail-fast: false` — a break in one leg
-  must not withhold the other's ISO from a release — and the
-  arm64 leg runs on `ubuntu-24.04-arm`, a NATIVE runner,
-  because mkosi's builder cannot be emulated: under qemu-user
-  it dies on `mount_setattr(2)` (#991).
-  **arm64 is UEFI-only, and that is the platform rather than a
-  simplification.** There is no i386-pc GRUB target for AArch64
-  and no BIOS to chain-load from, so the installer lays down no
-  BIOS-boot partition, installs only `--target=arm64-efi`, and
-  **refuses before touching the disk** on a machine that did
-  not boot via EFI — a successful install that can never boot
-  is worse than an honest refusal. The partition NUMBERING is
-  identical on both architectures: p1 is simply absent on
-  arm64 rather than the rest shifting down, so `partition_node`,
-  `_MD_NAMES`, the #999 mirror path and the verification pass
-  all work unchanged. Root partitions are typed `8305` (Linux
-  root ARM-64) instead of `8304`, which `build-slot-image.sh`
-  and `wrap-iso.sh` now look up per architecture; the ISO is
-  built with `grub-mkrescue -d` forced to a single platform, so
-  an arm64 ISO cannot silently carry x86 boot paths just
-  because the builder image has the modules for both.
-  **The versioned ISO name gains its architecture.** It never
-  had one while the stable name always did — invisible with a
-  single build leg, a filename COLLISION with two, where
-  whichever leg uploaded second would win silently. The pruner
-  now treats the two architectures as a pair: its `*)`
-  fallthrough leaves unrecognised assets alone, which is right
-  for a genuinely new artifact and exactly wrong for an
-  architecture somebody added to the build matrix — ~3 GB per
-  release that nothing ever reclaims. A test pins the pruner's
-  architecture list against both workflow matrices.
-  Verified end to end on real hardware: the ISO boots in UTM on
-  an M4 (Apple Virtualization, UEFI), the installer runs, and
-  the installed system comes up with `root-arm64` partition
-  types, `BOOTAA64.EFI` on the ESP, no BIOS-boot partition, an
-  `ELF ARM aarch64` k3s binary, a Ready node on kernel
-  `6.12.107+deb13-arm64`, and A/B slot detection working
-  unchanged.
-
-### Fixed
-
 - **A DNS agent whose first config had not arrived yet exited 2 one
   second after logging `named_conf_missing_startup_deferred`, so every
   freshly joined cluster member's bind pod crash-looped until its
@@ -4386,7 +3748,6 @@ the formatter handles the rest.
   umbrella chart's DNS agents gain the liveness probe the appliance
   chart already had (tcp :53, 30 s / 30 s), so a bundle that never
   comes is still a bounded restart on both charts.
-
 
 - **A replaced control-plane member's Postgres instance now comes
   back (#1058).** After a dead-node replace — the dead member evicted,
@@ -4933,14 +4294,824 @@ the formatter handles the rest.
   accumulates now, which for a loss counter is the difference
   between reporting the bad minute and losing it.
 
+- **The appliance's role chart never installed on a fresh install
+  (#992).** The appliance chart is installed twice per appliance, and
+  both releases rendered #988's PriorityClasses, so Helm refused the
+  second install whole: no DNS or DHCP DaemonSet ever reached the
+  cluster, silently. `spatium-bootstrap` now owns the classes alone.
+
+- **A healthy first boot no longer leaves a failed console unit or a
+  Warning event (#994).** `spatium-console@ttyS0` treats "no serial
+  device" as success, and the TLS Secret is placed only once its
+  namespace exists.
+
+- **The DNS zone detail header no longer clips `+ Add Record` (#996).**
+  Eleven header buttons collapse into `Data ▾` and `Zone ▾` menus on a
+  new shared `HeaderMenu` with keyboard support, and the header wraps
+  rather than clipping on a narrow window. `+ Add Record` gains a
+  keyboard shortcut, listed in the `?` overlay.
+
+- **A subnet's DDNS opt-in takes effect, and creating a subnet keeps
+  its DNS binding (#1065, #1066).** `ddns_enabled` was read only when
+  the subnet did not inherit DDNS settings, and the form never cleared
+  the inheritance, so the per-subnet switch did nothing. Turning it on
+  now makes the subnet's own DDNS settings the effective ones. A lease
+  DDNS cannot publish now logs `ddns_not_published` with the reason,
+  instead of `ddns_applied` with nothing applied. And
+  `POST /ipam/subnets` dropped the DNS group and zone it was given
+  (the field was declared twice), while a PUT stored them.
+
+- **An appliance keeps its address through a carrier loss (#1084).**
+  NetworkManager withdrew the address and default route the moment the
+  link dropped, so a cable flap or switch reboot turned into a k3s
+  crash loop on a cluster member until the link returned. The
+  interface now stays configured through the flap.
+
+- **A k3s restart no longer re-imports every baked image before the
+  kubelet starts (#1082).** k3s only skips an unchanged image tarball
+  when a `.cache.json` exists in its images directory, and nothing
+  created one, so every restart spent minutes importing ~20 tarballs
+  first. A member rejoining after a partition waited on it.
+
+- **The supervisor's storage-health thread no longer crashes at
+  startup (#1072).** It read a `verify_tls` field `SupervisorConfig`
+  does not have, so storage health was never reported on any
+  appliance.
+
+- **A fresh install no longer crash-loops the agent pods once (#1062).**
+  The supervisor's first apply created every agent DaemonSet before
+  any agent key had arrived, so each scheduled a keyless pod that
+  exited 2 before the keyed one replaced it. A DaemonSet is now
+  rendered only once its key exists; a role assigned without a key is
+  held back and reported instead of crash-looping.
+
+- **Refreshing RPKI ROAs no longer gets the worker OOM-killed
+  (#1054).** The global ROA dump (~100 MB, a million ROAs) was parsed
+  whole into ~460 MB of Python objects that a process never hands
+  back. It is now streamed, keeping only the ASNs asked for.
+
+- **The docs flag the control-plane VIP as broken where they tell you
+  to set it (#1105).** Setting a VIP currently leaves MetalLB never
+  converging (#1103, still open). `TOPOLOGIES.md` and `APPLIANCE.md`
+  say so, and `TROUBLESHOOTING.md` has a recipe for it.
+
+### Security
+
+- **A second provider of the same type can no longer sign in as another
+  provider's user (#1235).** External accounts were matched on
+  `(auth_source, external_id)`, and `auth_source` is the provider's
+  type, not the provider. On a miss, an account of the same type with
+  the same username was adopted. So with two LDAP domains or two OIDC
+  IdPs configured, whoever held `jsmith` in the second one signed in as
+  the first one's `jsmith`, superadmin flag and all; an identical OIDC
+  `sub` from two IdPs did the same without any username at all. Now an
+  external account belongs to one provider (`user.auth_provider_id`,
+  migration `f4a8c2e71d09`), a login matches on the provider and its
+  external id, and **an account is never adopted by username alone**:
+  a taken username is refused as `username_collision`.
+  - **Upgrade note.** The migration attributes existing accounts only
+    where it can prove the provider: RADIUS / TACACS+ external ids name
+    it, and an LDAP / OIDC / SAML account is attributed when its type has
+    exactly one provider **and** the account cannot have come from another
+    one: it was created after that provider, and after the last deletion of
+    any other provider of its type (read from the audit log, which must
+    also hold the surviving provider's own `create` row; an audit log
+    restored without its section attributes nothing). A disabled
+    provider counts: one enabled and one disabled provider of a type is two,
+    and links nothing. Anything else is left unlinked and is refused
+    (`account_link_required`) until an administrator links it from
+    **Users → Edit → Sign-in provider** (`POST /users/{id}/link-provider`,
+    audited as `user.provider_linked`). The Users page marks those accounts
+    **unlinked**, and `list_users` reports their provider as null.
+  - **A deleted provider's accounts are not handed to its successor
+    (found by QA on #1289).** Released builds kept a deleted provider's accounts with
+    their identifier intact, so "one provider of the type exists now" did
+    not mean "only one ever did". An earlier draft of this fix linked such
+    an account to the surviving provider, both at upgrade and at sign-in,
+    so the survivor's subject with the same `sub` or DN signed in as it.
+    The backfill now checks the audit log as above, and the sign-in path
+    never links an unlinked account itself: it always refuses with
+    `account_link_required`, and the refusal's audit row names the account.
+  - **Behaviour change.** A user whose identifier at the provider changes,
+    such as an LDAP DN after an OU move, was re-attached by username and
+    is now refused until an administrator links the account again. The
+    link clears the stored identifier, and the next sign-in as that
+    username through that provider claims it; it also revokes the
+    account's sessions. Deleting a provider clears its accounts'
+    identifiers too, so a replacement provider of the same type that
+    issues the same `sub` or DN cannot adopt them. It also revokes their
+    sessions, and an administrator cannot delete the provider their own
+    account signs in through (409), which would lock them out.
+  - **SAML needs a stable NameID.** The NameID is the account's key at its
+    provider, and a transient one is new on every sign-in: it used to be
+    re-attached by username, which is the adoption this fix removes. A
+    transient NameID is now refused at the ACS with a message naming the
+    fix: configure the IdP to release a persistent or emailAddress NameID.
+  - On the password grant, a provider that accepts the password but whose
+    subject does not own the account no longer ends the login: the next
+    provider by priority still gets its turn, so a higher-priority
+    directory that also knows the user cannot lock out the account's
+    own provider.
+
+- **A started MFA enrolment is budgeted and expires (#1354).** The first
+  code at `POST /auth/mfa/enroll/verify` had no attempt limit, and a
+  started enrolment never expired and survived sign-out and a password
+  change. So an abandoned enrolment stayed open to unlimited 6-digit
+  guesses from any of the user's sessions, and a hit turned MFA on with a
+  secret the user never saw, locking a local user out until an admin
+  reset it. Verify now spends the same fail-closed step-up budget as
+  begin, disable and regenerate (`429` when spent, `503` while it cannot
+  be read), claimed atomically before the code is checked so concurrent
+  guesses cannot all slip under it. A wrong code answers `403`, not `401`,
+  so the UI does not resubmit and count it twice. A started enrolment
+  expires after 15 minutes (verify answers `400` and discards it), and
+  sign-out, a password change or an admin password reset discards it too. No migration: the start time is the
+  candidate secret's own Fernet timestamp.
+
+- **The api image no longer ships pip (#1392).** The runtime image
+  carried the Python base image's own pip 25.0.1, which has six fixed
+  CVEs (five MEDIUM, one LOW). Our release gate scans HIGH and CRITICAL
+  only, so it never blocked on them, and `apt-get upgrade` cannot patch
+  pip because it is not a Debian package. So every scan at default
+  severity, such as Harbor's, reported them on every build. Nothing at
+  runtime runs pip, and a production image has no business carrying a
+  package installer, so the runtime stage now uninstalls it, and the
+  `dev` stage (pytest, `make ci-backend-lint`) restores it with
+  `ensurepip`. A Trivy scan of the runtime image now reports no
+  fixable Python-package finding at any severity.
+
+- **Setting up two-factor authentication needs a step-up (#1241).**
+  `POST /auth/mfa/enroll/begin` needed only a session, and it is the step
+  that decides whose authenticator the account trusts. A hijacked session
+  could enrol the attacker's: for an SSO superadmin that authenticator then
+  passes every TOTP step-up on the secret reveals (agent bootstrap keys,
+  SNMP communities, provider secrets); for a local user it locks the real
+  owner out, since disabling MFA needs a code only the attacker has. A
+  local user now re-enters their password to start enrolling; an SSO user
+  must have signed in with their identity provider in the last 10 minutes,
+  and is told to sign out and back in otherwise. A token refresh now keeps
+  the session's original sign-in time rather than restamping it, so a
+  stolen session cannot refresh its way into looking recent; the session
+  viewer's "created" column now means when that person signed in. Refused
+  attempts are audited (`mfa.enrol_begin` / `denied`). Wrong answers to any
+  MFA step-up (enrol, disable, regenerate recovery codes) now count toward
+  a per-account budget of 5 per 15 minutes, then `429`: each of those runs
+  for a caller who already holds a session, so unthrottled each was a
+  password oracle for exactly the hijacked session the step-up exists to
+  stop. That budget fails closed: while Redis is unreachable the three
+  step-ups answer `503` with `Retry-After: 60`, because the account
+  lockout counts sign-in answers only and nothing else would bound the
+  guessing. Sign-in is unaffected.
+
+- **External accounts honour their state (#1242).** A **disabled** LDAP,
+  OIDC, SAML, RADIUS or TACACS+ user completed login: tokens, a session row
+  and a `login` / `success` audit row, before every later request was
+  refused. The check now runs before anything is issued or updated, answers
+  `403` (or `?error=account_disabled` on the SSO redirects) and is audited
+  as `denied`. And **"must change password"** on an external account, which
+  has no password here to change, locked it out until an admin cleared the
+  flag: setting it, or resetting the password, on an external account is
+  now refused, and an account that already carries the flag is no longer
+  held to it.
+
+- **Remote agents verify the control plane's certificate by default
+  (#1220).** All five `docker-compose.agent-*.yml` files defaulted
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY` to `1`, so an operator who followed
+  the docs ran agents that trusted any certificate, and anyone on the
+  network path could read the platform-wide agent key (then enrol rogue
+  agents and pull TSIG keys) or serve the agent its DNS / DHCP
+  configuration. Worse, the skip was checked before `TLS_CA_PATH` in the
+  DNS, DHCP and looking-glass agents, so mounting the control plane's CA
+  as `DOCKER.md` said verified nothing either, silently. Now the files
+  default to `0` and pass `TLS_CA_PATH` through from `.env` (with a
+  commented CA volume to uncomment); `TLS_CA_PATH` wins over the skip;
+  and an agent logs `control_plane_tls` on every start while
+  verification is off, or while a skip is being ignored. The DNS agent's
+  seven hand-copied verify decisions are now one `httpx_verify()`, with a
+  test that fails if a copy reappears. `DNS_AGENT.md` named a
+  `CA_BUNDLE_PATH` variable no code reads; it is `TLS_CA_PATH`. The
+  in-stack `docker-compose.yml` agents talk plain `http://api:8000`, so
+  the flag was a no-op there and is removed. The looking-glass agent got
+  its first tests and now runs in CI's agent matrix.
+  **Upgrade note:** a remote agent relying on the old default against a
+  private-CA or self-signed control plane stops connecting after the
+  upgrade. Mount that CA and set `TLS_CA_PATH` (`docs/deployment/DOCKER.md`,
+  distributed agent prerequisites), or set
+  `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` explicitly in `.env` to keep the old
+  behaviour in a lab. Appliance role pods and the supervisor are not
+  changed here; they are #1219.
+
+- **A backup archive named `..` can no longer delete the folder above
+  the archives (#1243).** The shared `safe_filename()` was
+  `os.path.basename`, and `basename("..")` is `..`. On a WebDAV target
+  `urljoin` turned that into the parent collection's URL, so
+  `DELETE /backup/targets/{id}/archives/%2E%2E` sent a recursive WebDAV
+  `DELETE` one level above the archives. Superadmin-only, but it
+  deletes data. `safe_filename()` now refuses an empty name, `.`, `..`,
+  anything with a `/` or `\`, and control characters, instead of
+  stripping (stripping also turned `a/b.zip` into `b.zip`, an archive
+  the caller never named). The seven drivers that carried their own
+  inline `basename` (S3, SCP, Azure Blob, SMB, FTP, GCS, WebDAV) now
+  all call it. The WebDAV URL percent-encodes the name as well, so a
+  name that arrives as `%2E%2E` is sent as a literal and never becomes
+  a dot-segment on a server that decodes before normalising.
+  The download, delete and restore-from-archive routes answer **422**
+  for such a name without reaching the destination, and also for any
+  name outside `spatiumddi-backup-*.zip` / `pre-restore-*.zip`: those
+  are the only names the listing ever shows, so any other name was
+  never offered by this API; the shared name pattern also stops
+  matching a name with a separator in it, so an object-store key under
+  a nested prefix is no longer listed as an archive nothing can then
+  download or delete, and the seven drivers that carried their own copy
+  of it now use the shared one. Thirteen download routes that built
+  `Content-Disposition` by hand now use `content_disposition()`, and an
+  uploaded upgrade image's filename, the one download name an uploader
+  controls, is stored as its last path component with control
+  characters removed, instead of verbatim.
+
+- **A client can no longer choose the source IP the API records
+  and rate-limits (#1221).** Compose published the API on every
+  interface, and the API believed `X-Real-IP` from any caller. nginx
+  overwrites that header, but a client talking to `:8000` directly set
+  its own. That bypassed the per-IP login throttle and the ACME
+  `allowfrom` gate, and wrote any address it liked into audit rows,
+  reopening #626 by another path. Now uvicorn runs with
+  `--no-proxy-headers`, and a middleware applies `X-Real-IP` and
+  `X-Forwarded-Proto` only when the real TCP peer is in the new
+  `TRUSTED_PROXY_CIDRS` (default: private, loopback, CGNAT and ULA
+  ranges, where the shipped proxies sit). `X-Forwarded-For` is no
+  longer read at all. Compose also publishes the API on `127.0.0.1`
+  only (`API_BIND`). Browsers and remote agents already go through
+  the frontend, and the looking-glass collector's host networking
+  uses localhost. **Upgrade note:** if you reach `:8000` from another
+  machine, set `API_BIND=0.0.0.0`, and preferably narrow
+  `TRUSTED_PROXY_CIDRS` to the frontend's address. On an appliance
+  whose nodes have public addresses, add them to
+  `TRUSTED_PROXY_CIDRS`. Otherwise the API sees the node, not the
+  browser, as the client.
+
+- **The api refuses to boot on a placeholder `SECRET_KEY` (#1222).**
+  `SECRET_KEY` signs every session token and, unless
+  `CREDENTIAL_ENCRYPTION_KEY` is set, derives the key every stored
+  credential is encrypted with. Compose (`.env.example`) and `k8s/base`
+  both shipped a committed placeholder, and the boot check only warned (and
+  did not recognise the k8s one at all). On such an install any signed-in
+  user could mint a superadmin token, since user ids are visible in the
+  audit log, and a database dump decrypted every stored LDAP, integration
+  and AI provider secret. Now the api refuses to start on either
+  placeholder, on a key under 32 characters, or on one that reads like a
+  placeholder, and says how to generate a key and how to move an existing
+  install onto it. `ALLOW_INSECURE_SECRET_KEY=true` boots with a warning
+  instead; `docker-compose.dev.yml` sets it and nothing else should.
+  `STRICT_SECRET_KEY` is now the default and still parses. A malformed
+  `CREDENTIAL_ENCRYPTION_KEY` also stops the boot rather than silently
+  falling back to a different key. Helm and the appliance already generate
+  their own keys and are unaffected.
+  **Upgrade note:** an install that has been running on the placeholder
+  stops at boot. Follow "Rotating `SECRET_KEY`" in
+  `docs/deployment/DOCKER.md` (compose) or `k8s/README.md` (`k8s/base`,
+  with a one-off Job in `k8s/ops/`): set a new key, then run
+  `python -m app.core.rotate_secret_key` with `OLD_SECRET_KEY` set, before
+  starting the api. It re-encrypts every stored credential for the new key
+  (the same walk a cross-install restore uses), is idempotent, and records
+  an audit row; everyone signs in again. Deliberately not "generate a key
+  on first start": compose could only persist it in Postgres, next to the
+  credentials it protects, so a dump would decrypt them anyway. Because
+  anyone could have signed requests on a placeholder key, the doc also
+  says to review API tokens, users and the audit log afterwards.
+  Also: an access token that names no session (`jti`) is refused. Every
+  login has minted one since `2026.05.07-1`, so such a token can only be
+  forged, and it also escaped force-logout. The session a token names must
+  also belong to the token's user, or a forger could pair their own live
+  session with a superadmin's id. And force-logout now reaches
+  the nmap scan stream, which checked its own token without looking at
+  the session. `k8s/base/secrets.yaml` is renamed `secrets.yaml.example`,
+  so `kubectl apply -f k8s/base/` no longer overwrites a real secret with
+  the placeholder.
+
+- **Appliance supervisors verify the control plane's TLS certificate
+  (#1219).** The appliance chart set `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` on
+  the supervisor unconditionally, calling it trust-on-first-use, and nothing
+  was pinned: every register, heartbeat and proxy poll ran with no
+  verification at all. The heartbeat response carries the platform-wide DNS
+  and DHCP agent keys and the slot image URL plus the sha256 that is its only
+  integrity check, so anyone on the path could read the keys and serve a node
+  a root filesystem of their choosing. Now the supervisor pins the
+  certificate the control plane presents at first contact and verifies every
+  connection against it in the TLS handshake (a self-signed control plane
+  works, and the hostname need not match an operator-typed IP). A rotated
+  certificate (re-minted on member join or VIP change, uploaded, or renewed
+  by ACME) is adopted only if the appliance CA, which every approved
+  supervisor already holds, vouches for it through a new unauthenticated
+  `GET /api/v1/appliance/supervisor/tls-pins`: the list of served
+  certificates, signed by the CA. That list names the TLS Secret's
+  certificate as well as the active one, so #1215's revert to the first-boot
+  certificate does not strand supervisors. Once approved, a supervisor also
+  checks that its first-contact pin is on the list, which catches an
+  interception present at pairing (unless it also replaced the CA). The
+  k8s, nettool, pcap and storage proxy loops go through the same pinned
+  trust; before, they verified against system CAs, so against a self-signed
+  control plane they could not connect at all. An `http://` URL is probed
+  once for the `https://` it redirects to, that certificate is pinned, and
+  every request goes straight to the `https://` target, so the pairing code
+  and session token no longer cross the wire in cleartext before the
+  redirect (they used to). Re-pairing with `spatium-pair` forgets the pin and
+  the CA, so an appliance moved to a rebuilt control plane pins the new one
+  rather than refusing it forever. The DNS, DHCP and looking-glass role
+  pods were left skipping verification here; #1281 below closes that.
+  **Upgrade note:** an already-paired appliance takes its pin at its first
+  contact after the upgrade, then checks it against the CA's list; a
+  mismatch is logged as `supervisor.tls.pin_not_vouched`.
+  **Also fixed, because pinning depends on it:** after a control-plane
+  reboot, the frontend kept serving the first-boot certificate. A k3s start
+  puts it back into the TLS Secret (#1215), the frontend pod that starts
+  then loads it, and when the api wrote the active certificate back, the
+  frontend did not roll. The rollout annotation was a checksum of the
+  certificate's content, and restoring the same content left it unchanged.
+  Found on a two-appliance test: after one reboot the control plane served
+  a certificate its own signed list did not name, and the remote appliance
+  refused it on every heartbeat until the frontend was restarted by hand.
+  The annotation now also covers the Secret's `resourceVersion`, which
+  every real write moves, so the write-back rolls the frontend. Browsers
+  stop being shown the first-boot certificate after a reboot as well. The
+  revert itself remains #1215.
+
+- **Appliance role pods verify the control plane's TLS certificate
+  (#1281).** On an off-cluster appliance the DNS, DHCP and looking-glass
+  pods reach the control plane at its external URL, and the chart gave
+  them `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` there. That connection carries
+  the platform-wide agent key out and the DNS / DHCP configuration back,
+  so anyone on the path could read the key and serve a node its zones and
+  scopes. They now use the certificate their supervisor pinned (#1219): the
+  chart mounts the supervisor's `tls/` directory read-only (public material
+  only) and sets a new agent variable, `TLS_PINNED_CERTS_PATH`. The agent
+  trusts exactly the certificates in that file, with a pinned leaf as its
+  own anchor and no hostname check, as the supervisor does. `TLS_CA_PATH`
+  could not do this: it checks the hostname and needs a real CA, so a
+  CA-issued leaf or an IP URL fails there. The file is read on every
+  connection, so a certificate the supervisor re-pins reaches the agents
+  without a restart. Until the supervisor has pinned, every request fails
+  and the agent logs `control_plane_pin_unavailable`; it never falls back to
+  skipping. `TLS_PINNED_CERTS_PATH` wins over `TLS_CA_PATH` and the skip,
+  and is used only for an `https://` URL. The one exception is a supervisor
+  started by hand with `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins
+  nothing, so its agents take the skip too (chart value
+  `controlPlaneTls.insecureSkipVerify`, set only by the supervisor) and warn
+  about it on every start.
+  An appliance promoted into the control plane no longer gives its agents
+  the external URL at all: they use the in-cluster api Service, as its
+  supervisor does. That closes the #409 known limitation and is also
+  required here, because a member's supervisor heartbeats in-cluster and
+  never re-pins, while a member joining re-mints the Web UI certificate.
+  The role apply key now includes the agents' URL, so a promotion re-applies
+  the role chart. Not covered: an `http://` control-plane URL, which the
+  role agents still use as typed (the supervisor upgrades its own traffic
+  to the `https://` target).
+
+- **nmap `extra_args` are an allowlist, and a Network Editor can no longer
+  read files through a scan (#1223).** The scan endpoint is gated on
+  `manage_nmap_scans`, which the builtin Network Editor role holds, and
+  `extra_args` was checked only for shell metacharacters and for `/` in
+  `--script` values. So a delegated user could pass `-iL <file>`: nmap
+  reads it as a target list and prints every line it cannot resolve
+  (`Failed to resolve "SECRET_KEY=…"`) into the output the API streams
+  back, which was verified in the api container as the api user. Also
+  open were `-oN` / `-oA` / `-oX <path>` (write a file as the api user),
+  `--datadir`, `--resume`, `--script-args` file paths, a bare extra
+  target or `-iR` (past target validation and the #722 do-not-probe
+  policy), spoofing (`-S`, `-D`, `-e`), and every exploit, dos, brute and
+  intrusive script. Now every token must be an allowed option with a
+  value of the right shape: scan type, host discovery, port selection,
+  timing, service / OS detection, `--reason` / `--open`, and `--script`
+  with script **names** that nmap's own `script.db` puts in none of the
+  `intrusive`, `exploit`, `dos`, `brute`, `external`, `malware` or
+  `fuzzer` categories. Category names, wildcards and expressions are
+  refused, because no category is clean: nmap's `safe` category holds 33
+  scripts that are also `external` or `intrusive` (`whois-ip` queries
+  third-party WHOIS servers, against non-negotiable #17), and `default`
+  holds two open-proxy probes. `-sC` and `-A` are refused in `extra_args`
+  in favour of the presets that already offer them. The copilot's scan
+  proposal goes through the same check, and so does a scan already queued
+  with old arguments, since the worker re-validates before it runs.
+
+- **A release publishes nothing until CI, Trivy and main have all said yes
+  (#1226).** `release.yml` ran on any matching tag, scanned nothing, and
+  pushed `:latest` alongside each version tag before the ISO, the
+  OpenAPI export or the GitHub release had finished. So #1218's BIND
+  image shipped with 7 HIGH CVEs that nothing on the release path looked
+  for; a release that failed part-way had already moved every compose
+  install (`${SPATIUMDDI_VERSION:-latest}`) onto it; and, since no ruleset
+  covers tags, anyone with write access could release any commit. Now a
+  `meta` job refuses a tag that is not on `main` and waits for `ci.yml`
+  to pass on the tagged commit. Each image is built once, pushed by
+  digest with no tag, and both architectures are pulled from that digest
+  and gated with Trivy + `trivy-gate.sh` (the nightly's gate, which only
+  ever scanned amd64); only when every image passes is that same digest
+  tagged `:<version>`, so what ships is byte-for-byte what was scanned.
+  The chart, ISO and OpenAPI export wait for the tags. `:latest` moves in
+  a final job after the GitHub release exists, all images or none: it
+  records where each `:latest` pointed, retries each move, and puts back
+  the ones already moved if one still fails. Release runs are no longer
+  serialised, because GitHub cancels a queued run when another queues
+  behind it and `meta` can now wait an hour; "is this the newest
+  release" is re-checked right before GitHub's latest release and
+  `:latest` are set instead. The workflow also stops assuming CalVer
+  (#1182 step 3): it accepts SemVer tags and publishes a SemVer
+  pre-release (`1.0.0-rc.1`) as a GitHub pre-release that never becomes
+  `:latest`, and the previous release, the CHANGELOG section and whether
+  a tag becomes latest are decided in `scripts/release_version.py` on the
+  product's own version ordering, ranking only tags on `main` that have
+  a published release (`.github/scripts/release-tags.sh`), so a stray tag
+  cannot freeze `:latest`. The shell it replaces got all three wrong
+  across the switch: `sort -V` ranks every `2026.*` tag above every `1.*`
+  one, and the CHANGELOG lookup was a prefix match that returns
+  `## 1.0.10` when asked for `1.0.1`. A final release cut below a newer
+  one no longer takes over `:latest` or the stable download URLs, or
+  uploads the un-versioned copies behind them. Release candidates no
+  longer take slots in the asset pruner's keep window (eight candidates
+  would have pushed eight final releases' ISOs out early); a candidate
+  keeps its ISO until a final release supersedes it. The image list is
+  one file, `.github/images.json`, read by both workflows and the
+  image-upgrade linter. And `docs-publish.yml` no longer runs on release
+  tags: a tag on an older commit rolled the docs site back behind
+  `main`, and a tag off `main` published unreviewed docs.
+
+- **Pinned images brought current; the CloudNativePG operator and
+  Patroni's etcd carried fixable HIGH CVEs (#1114).** Scanned with
+  the CI gate (HIGH/CRITICAL, fixes available): the CloudNativePG
+  operator image 1.30.0, which the appliance bakes for an air-gapped
+  install, had 13, and 1.30.1 has none; `quay.io/coreos/etcd` v3.5.33
+  in the compose HA overlay had 10, and v3.5.34 has none. Also moved:
+  the CloudNativePG chart 0.29.0 -> 0.29.1 (it carries that operator),
+  nginx 1.31.5 -> 1.31.6 (frontend and the appliance landing page),
+  and redis 8.10.1 -> 8.10.2. Two pins are held for the 1.0 freeze,
+  each with its reason in `versions.json`: k3s v1.37 is a Kubernetes
+  minor that a slot revert cannot undo, and Technitium 15.5 is a minor
+  release.
+
+- **BIND is raised to 9.20.29-r0 in the DNS images (#1218).** The
+  released 2026.09.04-1 `dns-bind9` image carries BIND 9.20.26, which
+  has seven HIGH remote denial-of-service CVEs, all fixed in 9.20.29-r0:
+  CVE-2026-19666, -19667, -76163, -77692, -80274, -81563 and -81736.
+  They are triggered by malformed DNS64 responses, a crafted
+  DNS-over-HTTPS request, a crafted DNSSEC reply, a TKEY query and
+  SVCB/HTTPS records. The `dns-powerdns` image carries the same
+  `bind-tools` / `bind-libs` for `dig`. Both Dockerfiles now require
+  9.20.29-r0, which also forces a rebuild of any cached package layer
+  that still has the old version. Upgrade: pull the new DNS images.
+
+- **`/metrics` needs a bearer token (#1159).** It was anonymous, and
+  reachable from outside: the web port proxies it and Docker Compose
+  publishes the API port. So anyone who could load the login page could
+  read per-route request counts. It now answers only
+  `Authorization: Bearer <token>`, where the token is the new scrape
+  token (`PROMETHEUS_METRICS_TOKEN`) or any valid API token, which gets
+  the same revoked / expired / scope / disabled-owner checks as on any
+  other route. The Helm chart generates the scrape token into its app
+  Secret as `metrics-token` and keeps it across upgrades like
+  `SECRET_KEY`; Compose reads it from `.env`; `k8s/base` takes it as an
+  optional Secret key. The appliance console reads it from the chart's
+  Secret, so its API panel keeps working.
+  **Upgrade note:** a Prometheus job that scrapes `/metrics` without a
+  token gets 401 after this release. Give it the scrape token or an API
+  token (`docs/OBSERVABILITY.md` §6 has a scrape config), or set
+  `PROMETHEUS_METRICS_REQUIRE_AUTH=false` to serve it anonymously again.
+
+- **The interactive API docs load through the web port again, and
+  the appliance's HTTPS web tier sends the #400 security headers
+  (#1157).** `/api/docs` and `/api/redoc` loaded Swagger UI and ReDoc
+  from cdn.jsdelivr.net (ReDoc also from Google Fonts), and Swagger
+  started from an inline `<script>`. The web tier's CSP (#400) allows
+  scripts from the page's own origin only. So on Docker Compose, and
+  on Helm without `frontend.tls.enabled`, the console's API docs
+  links opened blank pages, and an air-gapped install could not load
+  them on any port. The api now serves both bundles itself from
+  `backend/app/static/api-docs/`: byte-for-byte copies of
+  swagger-ui-dist 5.33.0 and redoc 2.5.4, pinned in `versions.json`.
+  Swagger's initializer is a static file. Scripts stay `'self'`
+  everywhere; `/api/redoc` alone may also start a `blob:` worker (its
+  search index) and load its footer logo from cdn.redoc.ly, which it
+  hides when offline. **The appliance's TLS config sent none of the
+  #400 headers.** #400 put them in the pre-k3s appliance nginx
+  config, which #194 had already orphaned, so
+  `frontend-tls-config.yaml` never had them. It now sends the same
+  Content-Security-Policy, X-Frame-Options, X-Content-Type-Options
+  and Referrer-Policy as the image's template, re-emitted on every
+  location with headers of its own. It also sends
+  `Strict-Transport-Security: max-age=31536000` without
+  `includeSubDomains`, as #400 intended. Browsers ignore HSTS for a
+  bare IP and over a certificate warning, so it only takes hold on a
+  hostname with a trusted certificate.
+
+- **An API token used only for reads now records that it was used
+  (#1158).** `last_used_at` was set on the request's database session
+  and left for the handler to commit. Read handlers never commit, so a
+  monitoring, inventory or export token showed "Last Used: —" forever,
+  while its first write set it. Operators hunting for stale tokens
+  could revoke live ones. The use is now written in a short-lived
+  transaction of its own, at most once a minute per token, the cadence
+  the session path keeps for `last_seen_at`. A handler that rolls back
+  cannot undo it, and a failed write never fails the request.
+
+- **Every shipped image now patches its base image's own packages
+  (#1088).** The nightly of 2026-09-14 refused to publish the api
+  image on 34 HIGH/CRITICAL findings — 7 CVEs across `perl` /
+  `perl-base` / `perl-modules-5.40` / `libperl5.40`, 2 in
+  `libpcre2-8-0`, 2 in `libsqlite3-0`, 1 in `gzip`, 1 in
+  `libssh2-1t64` — every one of which had a fix sitting on
+  deb.debian.org the whole time. `backend/Dockerfile` installed a
+  package list and upgraded nothing, so those packages could only
+  ever be fixed by upstream rebuilding `python:3.12-slim`, which is
+  not a schedule we control. It now runs `apt-get upgrade` before
+  the installs, the way every Alpine image in the repo has run
+  `apk upgrade`. The same omission applied to the Technitium
+  image, whose Ubuntu base is pinned by digest — so nothing in that
+  file could ever have patched it either — and is fixed alongside.
+  **This changes published release images, not just the nightly:**
+  `release.yml` builds without a layer cache, so its api image was
+  freshly built and still shipped every one of those base-image
+  CVEs.
+- **The nightly's cache no longer freezes the api image's package
+  layer (#1088).** BuildKit keys a layer on its RUN text, so the
+  `type=gha` cache served `backend/Dockerfile`'s whole `apt-get`
+  layer — package set included — from whenever it was first built.
+  That is why the same run reported `perl` at `5.40.1-6` when the
+  index had offered `5.40.1-6+deb13u1` for days: the layer had not
+  executed in weeks. The Alpine images solve this with an
+  `ARG APK_SNAPSHOT` the nightly passes its date tag to; the two
+  Debian-family images declared no such ARG, so they **silently
+  ignored the build arg the workflow was already passing them**.
+  Both now declare `ARG APT_SNAPSHOT` and the nightly passes it.
+  An upgrade line that never runs is indistinguishable, in the
+  built image, from no upgrade line at all — which is why the two
+  halves above are one fix and not two.
+
+- **The two source restrictions composed into a console-only
+  lockout, and neither guard could see the other (#1013).** The
+  appliance has two independent ways in and a source allowlist for
+  each — the Web UI (#285 Phase 6) and SSH (#1009). Each shipped
+  with an anti-lockout guard that checked only whether the
+  caller's address was inside *its own* list, so an operator could
+  pass both, one at a time, and end up reachable through neither.
+  That is not an exotic sequence: "lock this box down" means
+  scoping the Web UI to the management network and then scoping
+  SSH to the same one, and if that CIDR is stale both guards fire,
+  both offer an override, and each override is individually
+  reasonable. Nothing at any point said the other door was also
+  closing.
+  Before #1009 it could not happen — the port-22 floor was
+  un-removable, so SSH was the guaranteed recovery path the Web UI
+  guard leaned on. Making that floor retireable is what the SSH
+  allowlist needed in order to mean anything, and it removed the
+  guarantee.
+
+  Both write paths now resolve one shared question through
+  `backend/app/services/appliance/access.py`: **after this change,
+  does any remote door still admit the address I am talking to?**
+  When the answer is no they raise the *same* 422 — one state of
+  the appliance, so one sentence about it — requiring
+  `acknowledge_console_only=true`. Deliberately **not** satisfied
+  by the per-door `override_lockout` / `ssh_lockdown_force`: those
+  accept losing one door while another remains, which is a
+  materially smaller thing, and an operator may have ticked one
+  for an unrelated reason. The implication runs one way only —
+  accepting console-only already contains "this door closes on
+  me", so it is not asked for twice, which would be the
+  reflex-training pattern both guards' own comments warn about.
+  Both screens also read a new `GET /appliance/remote-access` and
+  show the *other* door's state at the point of decision; it sits
+  on the always-mounted `/appliance` hub rather than under
+  `/appliance/firewall`, because the SSH screen must be able to
+  ask with that module off.
+
+  **The per-door refusals say more on the way**, because reaching
+  one now *proves* the other door did not exclude the caller's
+  address: had it, the escalation would have raised first. So each
+  names the other list and its scope instead of hedging about it.
+  Only as far as the fact goes, though — every verdict here is
+  about ONE address, the source of the HTTP request, and that is
+  the right address for the Web UI door (the operator is using it,
+  over that door, right now) but only a proxy for the SSH one,
+  since browsing from one network and SSHing from another is
+  legitimate. So the copy is asymmetric on purpose: "you can still
+  reach this UI" is asserted, "you can still SSH" is not — the SSH
+  list is reported as *including the address you are connecting
+  from*, which is what is actually known.
+
+  **An address we cannot read is not covered — everywhere.** The
+  two guards had been scoring that case in opposite directions:
+  the Web UI one counted it as excluded and warned, the SSH one as
+  covered and proceeded. Both had a written rationale and the pair
+  was not defensible. The conservative reading wins because the
+  costs are asymmetric — an unneeded warning costs a checkbox, a
+  missing one costs a trip to the console — and because #1009's
+  argument for the other direction ("a gate that blocks on *I
+  could not tell* gets forced past by reflex") was a claim about
+  frequency, and the frequency is near zero: the trusted
+  client-IP helper falls back to the ASGI peer address, which
+  every real HTTP request has.
+
+  **Found on the way:** the Web UI guard was reading `client_ip`,
+  which `core/request_meta` documents as spoofable and explicitly
+  unsuitable for a source-IP allowlist gate. It is also simply the
+  wrong address on a real topology — behind a reverse proxy,
+  uvicorn's `--forwarded-allow-ips *` resolves the browser's own
+  IP out of `X-Forwarded-For` while nftables judges the packet
+  source, which is the proxy — so the guard would clear an
+  operator who was about to be locked out, with no attacker
+  involved. It now reads the same trusted value the SSH guard
+  does.
+
+  **And the console is not universal.** `spatium-console` runs on
+  `tty1` and `ttyS0`; a remote VM with no virtual serial port and
+  no hypervisor console has no floor at all, so an acknowledged
+  console-only lockout there is a rebuild. The escalation says
+  that in as many words rather than describing the console as a
+  recovery path, and `docs/deployment/APPLIANCE.md` now states it.
+
+  Both 422s are routed in the UI by the **acknowledgement field**
+  each one names, not by its prose: a field name is the API
+  contract and the sentence around it is not, and a test pins that
+  the three markers stay mutually exclusive. `WebUIAccessCard` was
+  lifted out of `FirewallTab.tsx` into its own component so it can
+  be rendered in a test — the failure mode on both sides is a
+  modal or a checkbox that never appears, which neither review nor
+  `tsc` can see. 1 MCP tool (`find_remote_access_doors`,
+  read-only, default on): the composition was the one thing
+  neither existing tool could show, since `find_web_ui_access` is
+  tagged `module="appliance.firewall"` and `find_ssh_settings` is
+  not — so with that module off the copilot could see one door and
+  not the other. No migration, no new column.
+
+- **The SSH source-CIDR allowlist was discarded and the port
+  opened to the world (#1001).** `spatiumddi-ssh-reload` renders
+  the nftables drop-in that scopes the SSH port to the operator's
+  configured networks — sshd has no native source filter, so that
+  fragment *is* the enforcement. It piped the CIDR list into a
+  `python3 -` whose program came from a heredoc, and `python3 -`
+  means *read the program from stdin*: the heredoc, being the
+  later redirection, won and the JSON was discarded. The
+  `except Exception: cidrs = []` then took the documented
+  empty-list branch, which opens the port unconditionally.
+  Nothing reported a problem — the rendered rule is valid
+  nftables, so the pre-reload `nft -c` dry-run passes, the reload
+  succeeds, the applied sidecar reports success, and the Fleet UI
+  shows the CIDR list exactly as typed. The data is now passed as
+  argv, and an unparseable list is **refused** rather than treated
+  as "open to everyone"; an absent list stays the legitimate "any
+  source" answer, and the port-22 accept floor in the firewall
+  renderer keeps a default install reachable.
+
+  **The allowlist only takes effect once SSH is moved off port
+  22**, and that is not what this change fixed. The appliance's
+  base `/etc/nftables.conf` emits an unconditional
+  `tcp dport 22 accept` in its management floor, above the
+  include glob that pulls this drop-in in, and nftables is
+  first-match-wins — verified against a real kernel. That floor
+  is the deliberate un-removable recovery channel that keeps a
+  bad Web-UI source restriction from bricking the box, so it was
+  left alone: retiring it when a scope is configured (what the
+  Web UI does) would turn a wrong CIDR into a console-only
+  recovery, which is a decision rather than a bug fix — tracked
+  as #1009. Said plainly here because the allowlist previously
+  did nothing for two independent reasons and only one of them
+  is now gone.
+
+  The apply order changed with it: the fragment is now staged
+  and validated *before* the sshd drop-in is installed. Both
+  paths that can refuse used to run after it, and `fail` exits
+  before the sshd reload — so the running daemon kept the old
+  port while the installed config had already moved it, and the
+  lockout arrived at the next sshd start rather than at the
+  failure.
+
+- **Blanking the installer's Time source did not disable NTP
+  (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
+  `pool` directive and `sourcedir` is additive, so removing the
+  installer's sources file left the appliance synchronising
+  against the public Debian pool. Four surfaces said "none",
+  including `docs/PRIVACY.md`, which is normative for
+  non-negotiable #17 — a false claim about an outbound connection
+  on the page an operator reads to decide what the box talks to.
+  Blank now means none: the installer comments out the `pool`
+  line and the `/run/chrony-dhcp` sourcedir (marked and exactly
+  reversible), and the answer reaches
+  `platform_settings.ntp_pool_servers` as an empty list, so the
+  control plane's first config push does not put the pool back.
+  `sources.d` and `conf.d` are left in place as the way back.
+
+- **The weekly CVE scan could report "clean" and could never
+  report a CVE (#975).** Found while adding a second job to the
+  same workflow. GitHub Actions runs a `run:` block under
+  `bash -e`, and the `set -uo pipefail` at the top of the scan
+  step does **not** clear that flag — so the bare
+  `docker run ... trivy --exit-code 1` followed by `rc=$?` killed
+  the whole step the moment Trivy found something. That is the
+  first image with findings, which is the only case the job
+  exists for: every branch after it was dead code,
+  `has_findings` was never written, and the reporting step's own
+  fail-safe then correctly refused to touch the tracking issue on
+  an indeterminate result — logging a warning nobody reads on a
+  scheduled run. A clean week and a week full of criticals
+  produced the same visible outcome: no issue.
+  Both status captures now use the `if` form, whose condition is
+  exempt from `-e`. Verified by executing the shipped `run:`
+  bodies under `bash -e` against a stub where `docker build`
+  succeeds and the scan exits 1 — the fixed step reaches its
+  handler and writes `has_findings=1`, the unpatched one exits 1
+  having written nothing. The first attempt at that harness
+  proved nothing, because a stub that failed `docker build` too
+  took the build-failure path and never reached the scan.
+
+- **A `run:` step that captures `$?` after a bare command is dead
+  code, and nothing anywhere said so (#1036).** GitHub Actions runs
+  every `run:` block under `bash -e`, and the `set -uo pipefail`
+  several steps open with does **not** clear it — so
+  `cmd; rc=$?` is never reached on the failure it was written to
+  handle. #975 fixed the two live sites; this adds the guard, which
+  that issue deliberately left out of scope.
+  The instance that matters: `trivy-scheduled.yml` captured Trivy's
+  status this way, and Trivy exits 1 **on findings**. The step died
+  at the first image with a CVE, `has_findings` was never written,
+  and the reporting step's fail-safe correctly declined to act on an
+  indeterminate result. **A clean week and a week full of criticals
+  produced the same visible outcome: no issue.**
+  `scripts/lint_workflow_shell.py` refuses the shape in CI's
+  unconditional Backend Lint job and in `make ci`. It is a linter of
+  our own because **neither `actionlint` nor `shellcheck -S style`
+  reports it** (both run against the exact snippet): SC2181 fires on
+  a direct `if [ $? -ne 0 ]` and not on `rc=$?` followed by a test
+  of `$rc`. It is pinned against the REAL pre-fix
+  `trivy-scheduled.yml` body, which it reports at the right line.
+  **The false positive it had to stop making is the interesting
+  half.** Turning the check on for a standalone script requires an
+  UNINDENTED `set -e`, because file order is not execution order and
+  this reads the file: `spatium-install` is `set -uo pipefail` at the
+  top and enables `-e` deep inside `do_install()`, which runs *after*
+  the wizard loop and preseed parser that appear below it. Counting
+  that produced four confident findings about code where `-e` is off
+  — and a linter that cries wolf on the installer is one that gets
+  deleted. Suppressing accepts weaker evidence than asserting, on
+  purpose.
+  **The sweep found a second live instance, in the DHCP agent's own
+  entrypoint** — and only after review caught that the guard was not
+  scanning the files its rationale was built on: it globbed `*.sh`,
+  and all 45 appliance host runners (`spatium-install` among them)
+  are extension-less. It now matches on a shell shebang too, and
+  refuses to print a pass when the script half scanned nothing.
+  What that turned up: `agent/dhcp/images/kea/entrypoint.sh` runs
+  under `set -eu` and ends with
+  `wait -n … || wait …` / `EXIT_CODE=$?` / `_term`. Reproduced
+  against busybox ash — when a supervised child exits non-zero the
+  list returns non-zero, `-e` kills the script on that line, and
+  `EXIT_CODE`, `_term` and `exit` are ALL skipped. So a kea or agent
+  **crash** — the case the supervision block exists for — tore the
+  container down without terminating its siblings, while a clean
+  SIGTERM (which returns 0) ran the cleanup perfectly. The failure
+  path was the only one that skipped it.
+
 ### Migrations
 
+- `f4a8c2e71d09` — #1235: nullable `user.auth_provider_id` (FK to
+  `auth_provider`), the provider an external account belongs to.
+  Backfilled only where the provider can be known for certain:
+  RADIUS / TACACS+ from the provider id in the external id, LDAP /
+  OIDC / SAML only when exactly one provider of that type could have
+  created the account. Anything else stays NULL rather than guessed.
 - `99e91dcae1e2` — #1227: `release_schema_head` (`version` PK,
   `alembic_head`, `recorded_at` defaulting to `now()`), the schema head
   each release ran at. No seed: each release writes its own row at
   startup. In the `platform_internal` backup section beside
   `alembic_version`.
-
+- `d8e1b5a26c47` — #1232: nullable `dns_record_op.next_attempt_at`
+  (retry backoff) and `dns_record_op.superseded_by` (the newer op for
+  the same RRset), plus `ix_dns_record_op_server_created` on
+  `(server_id, created_at)`. No backfill.
+- `e6b2d94f1a37` — #1185: nullable `dns_agent_bundle.renderer_revision`
+  and `dns_server.bundle_renderer_revision`. NULL reads as stale, so
+  each server re-renders its bundle once after the upgrade.
+- `b8e2d5c07a14` — #1166, data-only: the builtin `looking-glass`
+  firewall policy, `tcp/179` from anywhere. Idempotent.
+- `f3a9d61c07e4` — #1111: nullable `dns_record_op.xact_id` and
+  `dns_agent_bundle.visible_xacts` — which ops a stored bundle covers,
+  decided by commit rather than by start time. No backfill.
+- `d9a4c27e18f3` — #1111: `dns_agent_bundle.app_version`,
+  `dns_server.bundle_app_version` and `dns_server.bundle_dirty_at`.
+  Existing bundles carry the empty string, so each server re-renders
+  once after the upgrade.
+- `c4d1e7f90a2b` — #1111: `dns_agent_bundle` (one stored, rendered
+  config bundle per DNS server) and the `dns_server.bundle_*` render
+  state columns. All additive, no backfill: until the worker's first
+  render lands, the long-poll builds inline or waits.
+- `f4c8a2d61b37` — #1141: `dhcp_lease.mac_address` (and the lease
+  history table's) becomes nullable; `duid` and `iaid` are added; a
+  CHECK requires a MAC or a DUID; `(server_id, duid)` is indexed. No
+  backfill. Downgrade deletes the leases that have no MAC.
+- `e6b2f07a3c91` — #1139, data-only: adds `udp/547` (DHCPv6) to the
+  builtin `dhcp` firewall policy. Idempotent.
+- `b7d21c9e4f06` — #1067: `daemon_status`, `daemon_reason` and
+  `daemon_status_since` on `dns_server` and `dhcp_server` — the daemon
+  state agents report on every heartbeat. NULL means not reported.
 - `c5e8a1f3d027` — #1077: `agent_ingest_receipt` (PK
   `(server_id, batch_id)`, `received_at` defaulting to `now()`, indexed
   for the 35-day prune) — replay dedupe for spooled agent pushes; and
@@ -4968,9 +5139,27 @@ the formatter handles the rest.
   pristine `feature_module` seed rows so the catalog's
   `default_enabled` governs. No schema change; existing installs are
   not touched.
+- `c1f4a90e7d63` — #972: `emergency_response_location` (the 31
+  RFC 5139 civic-address elements as separate columns),
+  `erl_binding` and `e911_resolution_log`. No backfill.
+- `f7c3a91e50b4` — #1026: nullable `appliance.architecture` and
+  `appliance_upgrade_image.architecture`. No backfill on purpose: NULL
+  is unknown, and unknown never blocks an upgrade.
+- `b8f4c02e7a19` — #989: `backup_target.write_only` (boolean, default
+  FALSE) for write-only / immutable backup destinations. Existing
+  targets are unchanged.
+- `e5b1d47a9c62` — #1009: `platform_settings.ssh_lockdown` (boolean,
+  default FALSE). A no-op for every existing install until an operator
+  turns it on.
 - `c93f1a72e408` — `dhcp_metric_sample.receive_drop` /
   `.socket_drop` (both nullable: NULL means unmeasured) and
   `dhcp_server_group.kea_thread_pool_size` / `.kea_packet_logging`.
+- `d4a9e37b2c15` — #993, data-only: adds `tcp/10250` from the pod and
+  service CIDRs to the builtin `control-plane` firewall policy.
+  Idempotent.
+- `b6f2c04a71d8` — #986: `tld_registry_snapshot`, a one-row table
+  holding an operator-refreshed copy of IANA's TLD list, used only
+  when it is newer than the list bundled with the release.
 
 ---
 
