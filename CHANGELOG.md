@@ -27,6 +27,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A record change no longer re-renders and reloads its zone on a DNS
+  group without views (#1373).** The BIND9 agent re-renders and reloads
+  named only when the bundle's structural fingerprint moves; a record
+  change is meant to stay out of it and reach named as an RFC 2136
+  update. Since #430 each zone's payload also carries its serial (for
+  the agent's zone-state report), and every record change bumps it, so
+  every record change on a group without views was followed by a full
+  render and a freeze, reload and thaw of its zone beside the update:
+  the reload the RFC 2136 path exists to avoid, a served value that no
+  longer followed the record op's state, and a manual `rndc freeze` that
+  lasted only until the next record change. The serial is now left out
+  of the fingerprint, with the records. It stays in the payload, and the
+  agent now also reports the serial a record change brings once the op
+  that carries it has applied, beside the report it sends after a
+  reload. Groups with views are unchanged: there every record change
+  re-renders, by design.
+
 - **A change to a BIND9 zone is served even while named holds RFC 2136
   updates for it (#1407).** named writes an RFC 2136 update into the
   zone's file up to 15 minutes after taking it. A change to the zone

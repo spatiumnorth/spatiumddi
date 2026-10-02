@@ -63,7 +63,9 @@ _MAX_ERROR = 2000
 # renderer alone re-renders nothing.
 #
 # 2 (#1171): every zone copy carries its SOA timers.
-RENDERER_REVISION = 2
+# 3 (#1373): a zone's serial left the structural fingerprint of a group
+#   without views.
+RENDERER_REVISION = 3
 
 
 def _serves(revision: int | None) -> bool:

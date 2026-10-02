@@ -49,6 +49,11 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "fa252ef954d18d68ea32af59c4fad3c179a8b61fc130f2658f50a10fd79a8ee5",
         "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
     },
+    # #1373: the serial left the plain group's structural etag (views keep it).
+    3: {
+        "plain": "2ff144dc196f8f186e9a3ba3dcfc6b9f988839d9bf2e2ad6f5ee0596e32138d9",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
 }
 
 
