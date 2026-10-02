@@ -4558,6 +4558,12 @@ export interface AIModelInfo {
 export const aiApi = {
   listProviders: () =>
     api.get<AIProvider[]>("/ai/providers").then((r) => r.data),
+  // Whether a new chat would find an enabled provider. Any signed-in user
+  // may ask; the provider list above is superadmin-only (#1345).
+  available: () =>
+    api
+      .get<{ available: boolean }>("/ai/available")
+      .then((r) => r.data.available),
   getProvider: (id: string) =>
     api.get<AIProvider>(`/ai/providers/${id}`).then((r) => r.data),
   createProvider: (body: AIProviderCreate) =>

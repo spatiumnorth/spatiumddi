@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Copilot availability probe asks a route every user may read
+  (#1345).** With the Operator Copilot module on, its default, the app
+  shell asked `GET /api/v1/ai/providers` on every page to decide whether
+  to offer "Ask AI". That route is superadmin-only, so every page a
+  non-superadmin opened logged a 403, and the console read the refusal
+  as "available": a read-only Viewer was offered Ask AI, down to the
+  per-row "Ask AI about this…" buttons on Alerts and Audit, on an
+  install with no provider, where the admin was offered none. A new
+  `GET /api/v1/ai/available` tells any signed-in user whether a new chat
+  would find an enabled provider, as a bare yes or no that names no
+  provider, and the console asks it instead; the provider list stays
+  superadmin-only. Ask AI now appears only on a yes, not while the
+  answer is loading or when the probe failed. No copilot tool: a chat
+  that is running already has its answer.
+
 - **A refused action says it was refused (#1344).** The zones tab's
   bulk Delete sent one request per zone and then closed as if every one
   had worked: a refused delete cleared the selection and left the zone
