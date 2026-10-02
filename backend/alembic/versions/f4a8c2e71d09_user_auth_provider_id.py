@@ -35,7 +35,7 @@ A plain index rather than a unique one: an install that already holds two
 rows with one provider and one external id must still be able to upgrade.
 
 Revision ID: f4a8c2e71d09
-Revises: d8e1b5a26c47
+Revises: 99e91dcae1e2
 Create Date: 2026-09-29
 """
 
@@ -47,7 +47,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "f4a8c2e71d09"
-down_revision = "d8e1b5a26c47"
+down_revision = "99e91dcae1e2"
 branch_labels = None
 depends_on = None
 
