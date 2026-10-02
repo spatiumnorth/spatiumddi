@@ -12,6 +12,7 @@ import base64
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -174,11 +175,19 @@ def consume_assertion(cfg: SAMLConfig, base_url: str, post_data: dict) -> SAMLCo
     """Validate a signed SAML Response and extract claims.
 
     ``post_data`` is the form body from the ACS POST (``SAMLResponse`` +
-    optional ``RelayState``).
+    optional ``RelayState``). ``base_url`` is the one ``cfg`` was built from,
+    so ``cfg.sp_acs_url`` already carries it.
     """
     settings = OneLogin_Saml2_Settings(_settings_dict(cfg), sp_validation_only=False)
+    # Validate the Response as received at ``cfg.sp_acs_url`` (#1335): the ACS
+    # the metadata and every AuthnRequest advertise, and the route the IdP
+    # posts to. Strict mode checks the Response's ``Destination`` and its
+    # bearer ``Recipient`` against this URL, and a conforming IdP sets both to
+    # the advertised ACS, so any other URL here refuses every sign-in. The ACS
+    # is split as a whole, so a base URL's path prefix stays in the path.
+    acs = urlsplit(cfg.sp_acs_url)
     saml_auth = OneLogin_Saml2_Auth(
-        _request_data(base_url, "/api/v1/auth/acs", post=post_data),
+        _request_data(f"{acs.scheme}://{acs.netloc}", acs.path, post=post_data),
         old_settings=settings,
     )
     saml_auth.process_response()

@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **SAML sign-in accepts the Response an IdP addresses to the ACS
+  SpatiumDDI advertises (#1335).** The metadata and every
+  AuthnRequest name `/api/v1/auth/{provider_id}/callback` as the
+  Assertion Consumer Service, so a conforming IdP sets the Response's
+  `Destination` and the bearer `Recipient` to that URL. But the
+  Response was validated as received at `/api/v1/auth/acs`, a URL
+  that is neither advertised nor routed, so python3-saml's strict
+  checks refused every such Response ("The response was received at
+  …/api/v1/auth/acs instead of …/callback") and no SAML provider
+  could sign anyone in. That has been the case since SAML support
+  landed (2026.04.16-3). It failed closed: nobody got in. Responses
+  are now validated as received at the advertised ACS. Strict
+  validation is unchanged, so a Response addressed to any other URL,
+  `/api/v1/auth/acs` included, is refused.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
