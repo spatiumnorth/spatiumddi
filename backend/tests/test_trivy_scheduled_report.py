@@ -85,3 +85,45 @@ def test_the_reproduction_hint_covers_the_image_that_has_findings(workflow: str)
     assert (
         "are not agent images" in workflow
     ), "the footer must not send a reader to `make trivy` for backend/frontend"
+
+
+# ── #1392: MEDIUM/LOW findings with a fix, as an advisory ─────────────────────
+
+
+def _advisory_block(workflow: str) -> str:
+    start = workflow.index("--severity MEDIUM,LOW")
+    end = workflow.index('echo "::endgroup::"', start)
+    return workflow[start:end]
+
+
+def test_the_advisory_pass_scans_medium_and_low_with_a_fix(workflow: str) -> None:
+    """The pip CVEs that started #1392 were MEDIUM and LOW, and nothing we ran
+    reported below HIGH, so they sat in the api image until a registry
+    scanner at default severity showed them to a user."""
+    assert "--severity MEDIUM,LOW --ignore-unfixed" in workflow
+
+
+def test_the_advisory_never_feeds_the_gate(workflow: str) -> None:
+    """An advisory finding must not set ``any``, the flag ``has_findings``
+    comes from; it has its own ``adv`` and ``has_advisory``."""
+    block = _advisory_block(workflow)
+    assert "any=1" not in block, "an advisory finding must not mark the gate as failed"
+    assert "adv=1" in block
+    assert 'echo "has_advisory=$adv" >> "$GITHUB_OUTPUT"' in workflow
+
+
+def test_the_gate_still_scans_only_high_and_critical(workflow: str) -> None:
+    assert "--severity HIGH,CRITICAL --ignore-unfixed" in workflow
+
+
+def test_the_tracking_issue_opens_on_either_and_closes_only_when_both_are_clean(
+    workflow: str,
+) -> None:
+    assert "HAS_ADVISORY: ${{ steps.scan.outputs.has_advisory }}" in workflow
+    assert "if (hasFindings || hasAdvisory) {" in workflow, (
+        "an advisory alone must keep the tracking issue open, or MEDIUM/LOW "
+        "findings would be reported nowhere but the run summary"
+    )
+    # Fail safe, as for has_findings: no definitive advisory result means the
+    # issue is left alone, not closed.
+    assert "[raw, rawAdv].every(v => v === '0' || v === '1')" in workflow
