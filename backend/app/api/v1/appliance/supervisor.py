@@ -72,6 +72,13 @@ from app.core.agent_wake import (
     publish_wake,
     wake_subscription,
 )
+from app.core.auth_throttle import (
+    PAIRING_FAIL_MAX_GLOBAL,
+    PAIRING_FAIL_MAX_PER_IP,
+    PairingThrottleUnavailable,
+    claim_pairing_attempt,
+    refund_pairing_attempt,
+)
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import upgrade_direction
@@ -867,6 +874,60 @@ async def supervisor_register(
             session_token=cleartext,
         )
 
+    # #1356 — spend one attempt from the per-IP and install-wide budgets
+    # before the code is looked up, so concurrent guesses cannot all read an
+    # under-budget count. A right code refunds it below; only wrong ones
+    # accumulate. The fixed delay alone allowed ~2 guesses a second per
+    # connection, without limit, against codes that may never expire.
+    try:
+        allowed, ip_failures, global_failures = await claim_pairing_attempt(client_ip)
+    except PairingThrottleUnavailable:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Registration is paused: the attempt limiter is unavailable. Retrying shortly.",
+            headers={"Retry-After": "60"},
+        ) from None
+    if not allowed:
+        # Audited once per window when a limit trips, not once per refused
+        # request: per address, and once install-wide, since spreading the
+        # guesses over many addresses is the attack the global budget is for.
+        trip: dict[str, object] | None = None
+        if ip_failures == PAIRING_FAIL_MAX_PER_IP + 1:
+            trip = {"scope": "address", "failures_in_window": ip_failures - 1}
+        elif global_failures == PAIRING_FAIL_MAX_GLOBAL + 1:
+            trip = {"scope": "install", "failures_in_window": global_failures - 1}
+        if trip is not None:
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_throttled",
+                    resource_type="pairing_code",
+                    resource_id="unknown",
+                    resource_display="supervisor registration",
+                    result="forbidden",
+                    new_value=trip,
+                )
+            )
+            await db.commit()
+        logger.warning(
+            "supervisor_register_throttled",
+            ip=client_ip,
+            failures=ip_failures,
+            # -1 is claim_pairing_attempt's "not charged" sentinel, not a
+            # count; log it as null so the line doesn't read as a bad tally.
+            global_failures=global_failures if global_failures >= 0 else None,
+        )
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many failed registration attempts. Try again in 15 minutes.",
+            headers={"Retry-After": "900"},
+        )
+
     # Look up pairing code by hash. Single-row index hit.
     stmt = select(PairingCode).where(PairingCode.code_hash == submitted_hash)
     code_row = (await db.execute(stmt)).scalar_one_or_none()
@@ -907,27 +968,36 @@ async def supervisor_register(
         failure_reason = "exhausted"
 
     if failure_reason is not None:
-        db.add(
-            AuditLog(
-                user_id=None,
-                user_display_name="anonymous supervisor",
-                auth_source="anonymous",
-                source_ip=client_ip,
-                action="appliance.supervisor_register_denied",
-                resource_type="pairing_code",
-                resource_id=str(code_row.id) if code_row is not None else "unknown",
-                resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
-                ),
-                result="forbidden",
-                new_value={
-                    "reason": failure_reason,
-                    "hostname": body.hostname,
-                    "fingerprint": pubkey_fingerprint,
-                },
+        # #1356 — every wrong guess used to commit its own audit row, so a
+        # brute-force run also flooded the append-only audit table. A code
+        # that exists (revoked, expired, exhausted…) is a real event and is
+        # always audited; an unknown one is a guess, audited for the first
+        # failure from an address in each window (and the throttle trip
+        # above). Later guesses are logged, and the throttle row counts them.
+        if code_row is not None or ip_failures == 1:
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_denied",
+                    resource_type="pairing_code",
+                    resource_id=str(code_row.id) if code_row is not None else "unknown",
+                    resource_display=(
+                        "supervisor pairing code"
+                        if code_row is not None
+                        else "unknown pairing code"
+                    ),
+                    result="forbidden",
+                    new_value={
+                        "reason": failure_reason,
+                        "hostname": body.hostname,
+                        "fingerprint": pubkey_fingerprint,
+                    },
+                )
             )
-        )
-        await db.commit()
+            await db.commit()
         logger.warning(
             "supervisor_register_denied",
             reason=failure_reason,
@@ -1059,6 +1129,8 @@ async def supervisor_register(
         )
     )
     await db.commit()
+    # #1356 — a right code gives its attempt back, so only wrong ones count.
+    await refund_pairing_attempt(client_ip)
     logger.info(
         "supervisor_registration_pending",
         appliance_id=str(appliance_id),
