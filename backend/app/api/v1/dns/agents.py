@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
@@ -909,52 +909,79 @@ async def agent_zone_state(
     ``zone_serial_drift`` alert-rule type.
 
     Upsert by ``(server_id, zone_id)`` — no history, one row per
-    pair. Unknown zone names are silently skipped (zone deleted from
-    control plane but agent still serves it; the next config bundle
-    will drop it).
+    pair. The names are the bundle's own, and each is looked up among the
+    live zones of the reporting server's group (#1408). A name the group
+    does not hold (the zone was deleted from the control plane but the agent
+    still serves it; the next config bundle drops it) or holds more than once
+    (one zone per view, and the report names no view) is skipped, counted in
+    the answer, and logged once per report.
     """
     server, _ = auth
     now = datetime.now(UTC)
-    updated = 0
+    if not body.zones:
+        return {"updated": 0, "skipped": 0}
 
-    # Index known zones by name for one DB round-trip on the lookup.
-    names = [e.zone_name.rstrip(".") for e in body.zones]
-    if not names:
-        return {"updated": 0}
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
-    zones_by_name: dict[str, DNSZone] = {}
+    # #1408 — zone names are stored with the trailing dot, and the lookup
+    # stripped it from the reported names only, so it matched nothing: every
+    # report was dropped behind a 200 and every server read "never reported".
+    # Both sides are compared without it now, and only within this server's
+    # group: another group's zone of the same name is another zone.
+    def _key(name: str) -> str:
+        return name.rstrip(".").lower()
+
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == server.group_id,
+            DNSZone.deleted_at.is_(None),
+            func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
+        )
+    )
+    zones_by_key: dict[str, list[DNSZone]] = {}
     for z in res.scalars().all():
-        zones_by_name[z.name.rstrip(".")] = z
+        zones_by_key.setdefault(_key(z.name), []).append(z)
 
+    # A zone the bundle renders into several views is reported once per view:
+    # one zone, its last report wins.
+    serial_by_zone: dict[uuid.UUID, int] = {}
+    unknown: list[str] = []
+    ambiguous: list[str] = []
     for entry in body.zones:
-        key = entry.zone_name.rstrip(".")
-        zone = zones_by_name.get(key)
-        if zone is None:
-            continue
+        matches = zones_by_key.get(_key(entry.zone_name), [])
+        if len(matches) == 1:
+            serial_by_zone[matches[0].id] = entry.serial
+        else:
+            (ambiguous if matches else unknown).append(entry.zone_name)
 
+    for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.
         existing_res = await db.execute(
             select(DNSServerZoneState).where(
                 DNSServerZoneState.server_id == server.id,
-                DNSServerZoneState.zone_id == zone.id,
+                DNSServerZoneState.zone_id == zone_id,
             )
         )
         row = existing_res.scalar_one_or_none()
         if row is None:
             row = DNSServerZoneState(
                 server_id=server.id,
-                zone_id=zone.id,
-                current_serial=entry.serial,
+                zone_id=zone_id,
+                current_serial=serial,
                 reported_at=now,
             )
             db.add(row)
         else:
-            row.current_serial = entry.serial
+            row.current_serial = serial
             row.reported_at = now
-        updated += 1
 
+    if unknown or ambiguous:
+        logger.info(
+            "dns_agent_zone_state_skipped",
+            server=str(server.id),
+            unknown=sorted(set(unknown))[:20],
+            ambiguous=sorted(set(ambiguous))[:20],
+        )
     await db.commit()
-    return {"updated": updated}
+    return {"updated": len(serial_by_zone), "skipped": len(unknown) + len(ambiguous)}
 
 
 class DNSKeyReport(BaseModel):
