@@ -41,6 +41,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS VIP keeps the client's address (#1487).** With
+  `dns.useMetalLBVIP` on, the `dns-bind9` / `dns-powerdns` /
+  `dns-technitium` Services ran with the default
+  `externalTrafficPolicy: Cluster`, so kube-proxy SNATed every query and
+  the DNS server saw the CNI gateway and the other nodes instead of the
+  client. Technitium's default per-client rate limit (600 queries a
+  minute per address) then applied to the whole network at once, and
+  query logs, RPZ hit attribution and client ACLs all keyed on the node.
+  The three Services now set `externalTrafficPolicy: Local`, like the
+  control-plane VIP: the DNS pods run on every DNS node, so MetalLB still
+  announces the VIP from a node with a ready pod and fails over as
+  before. A new render check, `chart-vip-client-ip.py`, fails any MetalLB
+  VIP Service that does not keep the client address; the DHCP relay VIP
+  is exempt because Kea answers the relay at `giaddr`.
+
 - **Setting a control-plane VIP installs MetalLB (#1103).** It never
   did on a k3s with Helm 4 inside (klipper-helm): the
   `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no

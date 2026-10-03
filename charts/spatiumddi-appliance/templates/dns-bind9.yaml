@@ -221,6 +221,15 @@ metadata:
 spec:
   {{- if .Values.dns.useMetalLBVIP }}
   type: LoadBalancer
+  # Keep the client's source address. With the default ``Cluster`` policy
+  # kube-proxy SNATs every query that lands on the VIP to the node (or the
+  # CNI gateway), so the daemon sees two or three addresses for the whole
+  # network: per-client rate limits throttle everyone at once, and query
+  # logs, RPZ hits and ACLs all key on the wrong address. ``Local`` makes
+  # MetalLB announce the VIP from a node that runs a DNS pod and keeps the
+  # query there — the DaemonSet has one on every DNS node, so failover is
+  # unchanged. Same reasoning as the control-plane VIP in frontend.yaml.
+  externalTrafficPolicy: Local
   {{- else }}
   type: ClusterIP
   {{- end }}
