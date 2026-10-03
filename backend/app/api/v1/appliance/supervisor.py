@@ -5159,6 +5159,40 @@ def _vip_in_pool(vip: str, pool: list[str]) -> bool:
 _ASN_MIN, _ASN_MAX = 1, 4_294_967_295
 
 
+_GO_DURATION_PART = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|h|m|s)")
+_GO_DURATION_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _go_duration_seconds(value: str) -> float | None:
+    """Seconds in a Go duration (``90s``, ``1m30s``, ``2h``), or None.
+
+    MetalLB parses ``holdTime`` as a ``metav1.Duration``; anything else is a
+    config it refuses."""
+    pos = 0
+    total = 0.0
+    for match in _GO_DURATION_PART.finditer(value):
+        if match.start() != pos:
+            return None
+        total += float(match.group(1)) * _GO_DURATION_SECONDS[match.group(2)]
+        pos = match.end()
+    return total if pos and pos == len(value) else None
+
+
+def _is_uint(text: str, maximum: int) -> bool:
+    # ``isascii`` too: ``str.isdigit`` accepts "²" and other non-ASCII digits.
+    return text.isascii() and text.isdigit() and int(text) <= maximum
+
+
+def _valid_bgp_community(value: str) -> bool:
+    """A standard (``65000:100``) or large (``large:1:2:3``) community."""
+    parts = value.split(":")
+    if len(parts) == 2:
+        return all(_is_uint(p, 0xFFFF) for p in parts)
+    if len(parts) == 4 and parts[0] == "large":
+        return all(_is_uint(p, 0xFFFFFFFF) for p in parts[1:])
+    return False
+
+
 class MetalLBBgpPeer(BaseModel):
     """One BGPPeer CR — a router SpatiumDDI advertises the VIP to."""
 
@@ -5166,7 +5200,24 @@ class MetalLBBgpPeer(BaseModel):
     peer_asn: int
     peer_address: str
     peer_port: int | None = None
-    hold_time: str | None = None  # e.g. "90s" — passed through verbatim to the CR
+    hold_time: str | None = None  # e.g. "90s"; validated, then written to the CR
+
+    @field_validator("hold_time")
+    @classmethod
+    def _v_hold_time(cls, v: str | None) -> str | None:
+        """MetalLB's rule, checked here (#1103): its validating webhooks now
+        fail open while the controller starts, so a value it would refuse
+        installs anyway and leaves the VIP unadvertised behind a stale
+        config. A Go duration, at least 3 s (RFC 4271's floor for a
+        non-zero hold time) and at most the 16-bit 65535 s."""
+        if v is None or not v.strip():
+            return None
+        seconds = _go_duration_seconds(v.strip())
+        if seconds is None:
+            raise ValueError(f"hold_time {v!r} is not a duration such as 90s or 1m30s")
+        if not (3 <= seconds <= 65535):
+            raise ValueError("hold_time must be between 3s and 65535s")
+        return v.strip()
 
     @field_validator("my_asn", "peer_asn")
     @classmethod
@@ -5188,6 +5239,31 @@ class MetalLBBgpAdvertisement(BaseModel):
     ip_address_pools: list[str] = Field(default_factory=lambda: ["spatium-control-plane"])
     communities: list[str] = Field(default_factory=list)
     aggregation_length: int | None = None
+
+    # Checked here for the same reason as ``hold_time`` (#1103): MetalLB's
+    # webhooks fail open while the controller starts, and a value they would
+    # refuse then leaves the advertisement stale and the VIP unadvertised.
+    @field_validator("communities")
+    @classmethod
+    def _v_communities(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            value = raw.strip()
+            if not _valid_bgp_community(value):
+                raise ValueError(
+                    f"community {raw!r} must be ASN:NN (each 0-65535) or "
+                    "large:A:B:C (each 0-4294967295); named communities are not "
+                    "supported here"
+                )
+            out.append(value)
+        return out
+
+    @field_validator("aggregation_length")
+    @classmethod
+    def _v_aggregation_length(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 32):
+            raise ValueError("aggregation_length must be between 0 and 32 (IPv4)")
+        return v
 
 
 class MetalLBConfigResponse(BaseModel):
