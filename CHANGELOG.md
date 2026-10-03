@@ -53,6 +53,19 @@ the formatter handles the rest.
   TCP/53 — check the address and firewall"); a real DNS REFUSED still
   names the TSIG settings.
 
+- **IPAM and DHCP DDNS no longer write an A record beside a CNAME
+  (#1441).** #1381 made the record API refuse a CNAME next to other
+  data, but IPAM's auto-generated forward records (an address's
+  hostname, and DDNS for a lease) went through `_sync_dns_record`, which
+  did not ask. An address or lease named like an operator's CNAME wrote
+  an A beside it, and BIND then refused the whole zone, stopping every
+  record change on that server (#1378). The A / AAAA is now skipped,
+  logged as `ipam_dns_record_skipped_cname`, and the address keeps its
+  allocation: a DNS naming clash never fails an IP or a lease. Renaming
+  an address onto a CNAME's name retracts its old record and writes
+  nothing at the new one. The IPAM ↔ DNS drift view shows such an
+  address as missing its forward record.
+
 - **A DHCPv6 scope is refused on a group with a Windows DHCP server
   (#1480).** SpatiumDDI writes Windows DHCP through the DHCPv4 cmdlets
   only, so a v6 scope on such a group was handed to them anyway: the save
