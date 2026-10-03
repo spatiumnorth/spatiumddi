@@ -41,6 +41,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **More than one RADIUS / TACACS+ user can be auto-provisioned
+  (#1290).** An external account with no email (RADIUS and TACACS+
+  never report one, and neither does an LDAP entry without `mail` or an
+  OIDC token without the claim) was created with an empty email under a
+  plain unique index, so exactly one such account could exist: every
+  later first-time login hit the index and failed with a 409. The index
+  is now unique only among non-empty emails. An external login whose
+  reported email already belongs to another account is provisioned
+  without it, and an update to such an email is skipped, each with an
+  `external_user_email_in_use` warning, instead of failing the login.
+  Neither ever adopts the other account (#1235).
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
@@ -442,6 +454,13 @@ the formatter handles the rest.
   The agent waits that restart out rather than reading the old daemon's
   exit as a crash, and a `pdns_server` that will not stop fails the
   apply, which is retried, instead of keeping the old settings.
+
+### Migrations
+
+- `61566a119901` — #1290: `ix_user_email` becomes a partial unique
+  index, `WHERE email <> ''`. No data change. Downgrade restores the
+  plain unique index and refuses, with a message, while more than one
+  account has an empty email.
 
 ## 2026.10.02-1 — 2026-10-02
 
