@@ -562,6 +562,91 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
   );
 }
 
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live zones (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop and its reason shows in the dialog. What a delete still takes
+ *  is the group's zones already in Trash, for good. */
+function DeleteDNSGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DNSServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const zonesQ = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || zonesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const zones = zonesQ.data?.length ?? 0;
+  if (servers || zones) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      zones ? `${zones} zone${zones === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First move or delete {servers + zones === 1 ? "it" : "them"}.
+            {zones > 0 &&
+              " A deleted zone goes to Trash; deleting the group then deletes its zones in Trash for good, with their records."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <ConfirmDestroyModal
+      title={title}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
+      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
+  );
+}
+
 // ── Double-confirm destroy modal (matches IPAM pattern) ──────────────────────
 
 function ConfirmDestroyModal({
@@ -11240,10 +11325,8 @@ export function DNSPage() {
         <GroupModal group={editGroup} onClose={() => setEditGroup(null)} />
       )}
       {confirmDeleteGroup && (
-        <ConfirmDestroyModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${confirmDeleteGroup.name}"? The group must be empty — move or delete its servers and zones first.`}
-          checkLabel={`I understand the group "${confirmDeleteGroup.name}" will be deleted.`}
+        <DeleteDNSGroupModal
+          group={confirmDeleteGroup}
           onConfirm={() => deleteGroup.mutate(confirmDeleteGroup.id)}
           onClose={() => {
             setConfirmDeleteGroup(null);

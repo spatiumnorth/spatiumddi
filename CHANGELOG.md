@@ -118,6 +118,22 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **Delete Server Group no longer takes a group's live DHCP scopes with
+  it, and says what it does take (#1399).** The DHCP page's Delete
+  Server Group said "The group must be empty — move or delete its
+  servers first", but the server refused a group only while it held
+  servers: a group holding scopes was deleted, and every scope with its
+  pools and reservations went with it, none of them into Trash. A group
+  that still holds a scope is now refused (409) until its scopes are
+  deleted, by the API, the two-person approval queue and the Copilot
+  alike. The DHCP and DNS dialogs read what the group holds first:
+  while it holds servers or live scopes (zones), they say so and offer
+  no delete, so the console never sends one the server will refuse.
+  Scopes already in Trash still go with their group, for good: the
+  dialog and the approval preview say so, and the DNS dialog now says
+  the same of a group's zones in Trash, where it promised an empty
+  group too.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
