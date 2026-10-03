@@ -41,6 +41,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The alert evaluator no longer warns about the seeded
+  `schema-behind-head` and `cluster-upgrade-failed` rules (#1469).** Both
+  rules are raised and resolved by their own task (the schema check and
+  the rolling-upgrade orchestrator), not by the evaluator, but only
+  `audit_chain_broken` had a pass-through branch. The other two fell
+  through to `alert_unknown_rule_type`, so every worker logged two
+  warnings per 60 s tick, the bulk of its warnings on an appliance. The
+  three types now share one set the evaluator skips silently, and a rule
+  type the evaluator really does not know still warns.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
