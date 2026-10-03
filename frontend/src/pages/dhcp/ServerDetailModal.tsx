@@ -35,6 +35,7 @@ import { SpoolChip } from "@/components/SpoolChip";
 import { haPillTitle } from "@/lib/dhcpHa";
 import {
   dhcpApi,
+  formatApiError,
   logsApi,
   type DHCPActivityLogRow,
   type DHCPPendingOpEntry,
@@ -151,8 +152,12 @@ export function ServerDetailModal({
             serverName={server.name}
             serverKind="DHCP"
             isPending={pauseMut.isPending}
+            error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
             onConfirm={(reason) => pauseMut.mutate(reason)}
-            onCancel={() => setShowPauseModal(false)}
+            onCancel={() => {
+              setShowPauseModal(false);
+              pauseMut.reset();
+            }}
           />
         )}
         <div className="flex flex-wrap gap-1 border-b">

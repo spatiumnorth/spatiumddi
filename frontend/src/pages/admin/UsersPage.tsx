@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Plus,
   Pencil,
@@ -549,7 +550,12 @@ export function UsersPage() {
   const [resetUser, setResetUser] = useState<AppUser | null>(null);
   const [deleteUser, setDeleteUser] = useState<AppUser | null>(null);
 
-  const { data: users, isLoading } = useQuery({
+  const {
+    data: users,
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["users"],
     queryFn: usersApi.list,
   });
@@ -594,6 +600,14 @@ export function UsersPage() {
                     className="px-4 py-6 text-center text-muted-foreground"
                   >
                     Loading…
+                  </td>
+                </tr>
+              )}
+              {/* A refused or failed read says so, not a blank table (#1343). */}
+              {!isLoading && !users?.length && isError && (
+                <tr>
+                  <td colSpan={8} className="px-4 py-6 text-center">
+                    <ListReadError error={error} what="users" />
                   </td>
                 </tr>
               )}

@@ -1285,6 +1285,7 @@ def apply_control_plane_overrides(
     web_ui_allowed_cidrs: list[str] | None = None,
     *,
     mem_total_mib: int | None = None,
+    cnpg_instances: int | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
@@ -1292,6 +1293,14 @@ def apply_control_plane_overrides(
     memory limits, Postgres' shared_buffers and the worker concurrency,
     sized from ``mem_total_mib`` (see ``control_plane_resources``). Written to the spatium-control
     HelmChartConfig so it survives a k3s restart (#272).
+
+    #1313 — CNPG instances are ``cnpg_instances`` when given: the count
+    ``patch_cnpg_instances`` left on the Cluster this tick
+    (``CnpgScale.spec_after``), which differs from ``cp_size`` while a
+    scale-down is deferred (#1059's hold during a dead-node replace). Helm
+    re-applies the Cluster on every upgrade and may not force the field the
+    supervisor's patch wrote, so rendering ``cp_size`` there failed the
+    upgrade, and the helm-controller's recovery uninstalled the release.
 
     #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
     frontend as ``loadBalancerSourceRanges``, so the MetalLB VIP path is
@@ -1352,9 +1361,11 @@ def apply_control_plane_overrides(
         },
         # #1115 — the CNPG instance memory limit and shared_buffers ride along
         # with the instance count (both live under ``postgresql``; the merge
-        # keeps ``cnpg.instances`` beside ``cnpg.parameters``).
+        # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
+        # count is the Cluster's own, as the supervisor's patch left it.
         "postgresql": _deep_merge(
-            {"cnpg": {"instances": cp_size}}, sized.get("postgresql", {})
+            {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
+            sized.get("postgresql", {}),
         ),
         # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
         # read by the chart under ``kind: sentinel``, and firstboot is the
@@ -1886,6 +1897,22 @@ class CnpgScale:
         yield self.changed
         yield self.error
 
+    def spec_after(self, requested: int) -> int | None:
+        """``spec.instances`` as this call leaves the Cluster — the count the
+        chart must render (#1313, see ``apply_control_plane_overrides``).
+        ``requested`` when it was written or was already there, and when there
+        is no Cluster yet (a 404: the chart creates it with that count); the
+        count read when the change was deferred or its write failed. None when
+        the Cluster could not be read at all (a transport error or another
+        status): the count it holds is unknown, so the caller must not
+        re-render the chart this tick — ``requested`` could be the very
+        scale-down a hold is deferring."""
+        if self.scaled:
+            return requested
+        if self.current is not None:
+            return self.current
+        return None if self.error else requested
+
 
 def patch_cnpg_instances(
     instances: int,
@@ -1901,20 +1928,26 @@ def patch_cnpg_instances(
 
     #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep`` so
     a failed-release recovery (uninstall+reinstall) can't delete it and
-    wipe the database. But ``keep`` also makes the k3s helm-controller
-    leave the resource's *spec* untouched on upgrade: when the seed
-    scales the control plane via the spatium-control HelmChartConfig,
-    Helm patches api/worker/frontend/redis to the new size but silently
-    skips the kept Cluster, so CNPG stays at its initial instance count
-    (observed live: a 1->3 promote left Postgres single-node while
-    everything else scaled). Patch the Cluster CR directly here instead —
-    a merge-patch isn't a Helm operation, so ``keep`` doesn't apply, and
+    wipe the database. The supervisor sizes the Cluster here, directly,
+    rather than leaving it to the chart (observed live early on: a 1->3
+    promote left Postgres single-node while everything else scaled), and
     the CNPG operator reconciles the new replica set normally.
 
-    #590 — ``spec.affinity.podAntiAffinityType`` rides the same patch, and
-    for the same reason: the chart can set it on a FRESH install, but an
-    appliance that A/B-upgrades into the fix would keep CNPG's ``preferred``
-    default forever, since Helm won't touch the kept Cluster. Observed live
+    #1313 — ``keep`` does NOT stop Helm patching the Cluster on upgrade.
+    The helm-controller re-applies it on every upgrade, as a server-side
+    apply that may not force a conflict (``helm upgrade --server-side=auto
+    --force-conflicts=false``; the Cluster's managedFields list ``helm``,
+    operation Apply, beside this merge-patch on ``.spec.instances``). So
+    once this patch has written the field, an upgrade that renders a
+    different ``cnpg.instances`` fails on the conflict, and the
+    helm-controller's recovery uninstalls the whole release — api, worker,
+    beat, frontend — and reinstalls it into the same conflict, over and
+    over. The chart therefore renders the count this patch leaves on the
+    Cluster (``CnpgScale.spec_after``), never one it has not written.
+
+    #590 — ``spec.affinity.podAntiAffinityType`` rides the same patch: the
+    chart sets it on a FRESH install, and the patch brings an appliance that
+    A/B-upgrades into the fix to ``required`` too. Observed live
     on a 1→3 promote: instances 1 and 2 both landed on the seed, so one node
     loss would have taken the primary and a replica together.
 

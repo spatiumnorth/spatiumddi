@@ -27,6 +27,231 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Replacing a dead control-plane node no longer uninstalls the control
+  plane (#1313).** A Replace drops the node from the committed
+  control-plane count, and the seed re-sized the `spatium-control` release
+  to the new count, CloudNativePG's instance count included, while #1059's
+  hold keeps the database Cluster at its old size until the replacement is
+  promoted. Helm re-applies that Cluster on every upgrade, as a server-side
+  apply that may not force a conflict, and the seed's own patch already
+  owned the field, so the upgrade failed on `.spec.instances`. The
+  helm-controller's recovery for a failed release then uninstalled it (api,
+  worker, beat and frontend) and every reinstall failed the same way until
+  the promote, so the control plane went unanswered for 13 to 18 minutes
+  after each Replace. The seed now sizes the Cluster first and renders the
+  instance count the Cluster actually has (a heartbeat that cannot read the
+  Cluster leaves the release alone), so an upgrade never asks to change a
+  field the seed wrote. The chart and supervisor comments that said Helm
+  leaves the kept Cluster alone on upgrade are corrected. Nor does a
+  Replace re-size the rest of the release any more: the committed count is
+  one short only until the replacement is promoted, and re-sizing to it
+  rolled the api, worker and beat (their Redis URL lists one sentinel per
+  replica) and cut the api from three replicas to two while the dead
+  node's replica still read Ready, so the rollout could retire both live
+  replicas and leave the api unanswered for about a minute. Until the
+  promote the release now keeps the size the database Cluster is held at,
+  and the dead node's replicas wait for the replacement.
+
+- **A provider name longer than 20 characters no longer breaks every
+  sign-in through it (#1337).** An external sign-in writes the provider's
+  name into the session (`user_session.auth_source`, `VARCHAR(64)`) and into
+  the audit log (`audit_log.auth_source`, `VARCHAR(20)`), but a provider name
+  may be 255 characters. A sign-in through a provider named over 20
+  characters failed the audit insert and answered `422` "A supplied value
+  cannot be stored as sent.", leaving no audit row, no session and no
+  `last_login_at`. A name over 64 characters failed at the session first. An
+  unreachable provider with such a name also stopped the sign-in from
+  reaching the providers after it, and a refused sign-in through it left no
+  audit row. Migration `cd10b699d988` widens both columns to 255, the width
+  of the name. In PostgreSQL that is a catalogue-only change. Its downgrade
+  refuses, rather than truncates, while a longer value is stored, because
+  audit rows are covered by the hash chain.
+
+- **SAML sign-in accepts the Response an IdP addresses to the ACS
+  SpatiumDDI advertises (#1335).** The metadata and every
+  AuthnRequest name `/api/v1/auth/{provider_id}/callback` as the
+  Assertion Consumer Service, so a conforming IdP sets the Response's
+  `Destination` and the bearer `Recipient` to that URL. But the
+  Response was validated as received at `/api/v1/auth/acs`, a URL
+  that is neither advertised nor routed, so python3-saml's strict
+  checks refused every such Response ("The response was received at
+  …/api/v1/auth/acs instead of …/callback") and no SAML provider
+  could sign anyone in. That has been the case since SAML support
+  landed (2026.04.16-3). It failed closed: nobody got in. Responses
+  are now validated as received at the advertised ACS. Strict
+  validation is unchanged, so a Response addressed to any other URL,
+  `/api/v1/auth/acs` included, is refused.
+
+- **A slot rollback to a release older than #1044 no longer lets the
+  next upgrade regenerate `SECRET_KEY` (#1299).** #1044 carried the app
+  Secret through a reinstall with `helm.sh/resource-policy: keep`, but
+  `helm uninstall` reads that annotation from the release's last stored
+  revision, not from the live Secret, and after a rollback to
+  2026.09.04-1 that revision is the old chart's, which has none. On the
+  next forward boot helm-controller re-ran the HelmChart the old release
+  had left, before firstboot placed the new one; that upgrade failed,
+  the `reinstall` failure policy uninstalled the release, the Secret
+  went with it, and the install minted a new key, so everything
+  encrypted before it (the appliance certificate first) could no longer
+  be read. The control release now uses `failurePolicy: retry`, which
+  upgrades a failed release again and never uninstalls it. firstboot
+  sets it on every boot on the `spatium-control` HelmChartConfig, the
+  policy helm-controller actually applies (it overrides the HelmChart's
+  and defaults to `reinstall`) and the one a rollback leaves in place.
+  On a rolled-back release whose k3s predates `retry` (2026.09.04-1), a
+  failed control release now waits for an operator instead of being
+  reinstalled.
+
+- **The Copilot availability probe asks a route every user may read
+  (#1345).** With the Operator Copilot module on, its default, the app
+  shell asked `GET /api/v1/ai/providers` on every page to decide whether
+  to offer "Ask AI". That route is superadmin-only, so every page a
+  non-superadmin opened logged a 403, and the console read the refusal
+  as "available": a read-only Viewer was offered Ask AI, down to the
+  per-row "Ask AI about this…" buttons on Alerts and Audit, on an
+  install with no provider, where the admin was offered none. A new
+  `GET /api/v1/ai/available` tells any signed-in user whether a new chat
+  would find an enabled provider, as a bare yes or no that names no
+  provider, and the console asks it instead; the provider list stays
+  superadmin-only. Ask AI now appears only on a yes, not while the
+  answer is loading or when the probe failed. No copilot tool: a chat
+  that is running already has its answer.
+
+- **A refused action says it was refused (#1344).** The zones tab's
+  bulk Delete sent one request per zone and then closed as if every one
+  had worked: a refused delete cleared the selection and left the zone
+  with no word, and a delete the two-person approval queue took was
+  reported as done too. Delete Zone, a server's Pause (DNS and DHCP),
+  Delete server (DHCP) and Delete role left their dialog open with no
+  word when refused, and the DNS propagation check painted Cloudflare,
+  Google, Quad9 and OpenDNS "OK" when its own request had failed. Each
+  now says why in the dialog it was taken from, in the server's words:
+  the bulk delete says how many zones it could not delete and keeps
+  only those selected, and says above the zones when deletes went to
+  the approval queue; a propagation check that failed shows no resolver
+  status, only the reason. This holds for any failure, not only a
+  Viewer's 403: a scoped role, a revoked grant, a 409, a 500.
+
+- **A list the reader may not see is no longer shown as empty
+  (#1343).** When a page's own list read was refused (403), the page
+  rendered its empty state, so a read-only Viewer was told "Trash is
+  empty.", "No subscriptions yet." and "no appliances online" over
+  lists that held rows, and the Users page showed a blank table with
+  no word. Trash, Webhooks, Users, Security › Block Sync, Tools ›
+  Network Tools, AI › Tools, Cutover and Settings' audit-forward and
+  InfluxDB target lists now say the reader may not see the list, with
+  the server's reason; any other failed read says the list could not
+  be loaded, never that it is empty. Cutover no longer invites a first
+  plan beside its "Superadmin required". The polled reads among them
+  (Block Sync's two lists, the Network Tools appliance list, the
+  InfluxDB targets) stop polling once refused: a refusal does not
+  change by asking again, and Block Sync's and the appliance list's
+  refusals each write a `denied` audit row, which made a Viewer with
+  Block Sync open add 240 an hour.
+
+- **Allocate IP on an IPv6 subnet no longer names an address it will not
+  allocate (#1307).** "Next available" previews the address with
+  `strategy=sequential`, but for IPv6 the pick follows the subnet's
+  `ipv6_allocation_policy`, `random` by default, and draws a fresh
+  random suffix on every call, so the address shown was never the one
+  allocated. The preview endpoint now reports the strategy that picked
+  its candidate instead of echoing the one asked for, and the dialog
+  names the address only when the pick repeats (sequential, or EUI-64
+  from a MAC). For a random pick it says the address is picked when you
+  allocate. IPv4, and IPv6 subnets that allocate sequentially, are
+  unchanged.
+
+- **Allocate IP no longer offers a DHCP scope for status "dhcp", where
+  nothing uses it (#1306).** Choosing status "dhcp" showed a DHCP Scope
+  picker with a scope already selected, but only a `static_dhcp`
+  allocation makes a reservation on a scope: the `dhcp` request never
+  carried it. The picker now appears for `static_dhcp` only, as it does
+  in Edit address.
+
+- **Edit address shows the role and status an address is stored with
+  (#1305).** Its Role menu lacked `web`, `api` and `lb`, which the API
+  accepts, and its Status menu lacked the statuses integrations set
+  (`docker-container`, `proxmox-vm`, …). A select whose value is not
+  among its options shows its first one, so such an address read as Role
+  "— None —" or Status "available" while the table beside it said
+  otherwise, and "— None —" could not be picked to clear a role because
+  it already looked selected. Allocate IP and Edit address now offer the
+  three TLS-serving roles, and Edit address keeps the address's own
+  status or role as an option whenever its menu lacks it.
+
+- **A template picked in New Subnet or New IP Block applies (#1304).**
+  The dialogs sent their own defaults for every field a template fills
+  (`custom_fields: {}`, DDNS off, DNS and DHCP inherited), and the API's
+  template pre-fill fills only the fields a request leaves out, so the
+  template's custom fields, DDNS settings and DHCP group were dropped:
+  only its tags landed. Its DDNS lock still turned the new subnet's DDNS
+  inheritance off, so DDNS ended up pinned off, and its DHCP group sat
+  behind "inherit" with no effect. Picking a template now fills its
+  custom fields and its DNS, DHCP and DDNS settings into the dialog's own
+  fields, where they can be seen and changed, and the request carries
+  them. The API applies a template's DDNS lock only together with a DDNS
+  value it took from the template: a request that sets every DDNS value
+  the template sets gets the DDNS inheritance it would get with no
+  template.
+
+- **A custom field's Default Value is what the IPAM dialogs send, not
+  only what they show (#1303).** Allocate IP, New Subnet and New IP Block
+  showed a field's Default Value (Settings → Custom Fields) as its value,
+  but sent `custom_fields: {}`, and the API applies no default on create,
+  so the object was stored without it. Edit subnet, Edit IP Block and
+  Edit address showed the default too, on objects that never had the
+  field. The create dialogs now start the field at its default and send
+  it; the edit dialogs show only what is stored. A boolean default of
+  "false" rendered checked: boolean values are now read as true / false
+  words, and a select default its options do not offer, or a number
+  default that is not a number, is left out. The default stays a console
+  pre-fill: a create through the API or an import gets what it sends.
+
+- **Add Zone stores a reverse-lookup name as a reverse zone, so IPAM
+  publishes its PTRs (#1310).** Kind was pre-filled "Forward lookup"
+  whatever the name, and the zone API stored the kind it was given and
+  defaulted to forward too, as create-from-template and the copilot's
+  `create_dns_zone` did. A primary zone named under in-addr.arpa or
+  ip6.arpa created with Kind left alone was stored as forward, while the
+  API's own name classification called it reverse. IPAM publishes PTRs
+  only into reverse zones and creates no reverse zone beside one that
+  holds the name, so a subnet under such a zone got no PTR at all, for
+  its gateway or any host, and its DNS sync summary showed nothing
+  missing. For a primary zone, Kind now follows the name in the dialog
+  until the operator picks one; an omitted kind is taken from the name
+  on every create path; and the API refuses a forward kind for a name
+  under in-addr.arpa or ip6.arpa, on create and on an edit that sets the
+  kind, the name or the type. Secondary, stub and forward zones keep
+  their old default. A primary zone stored forward before this keeps
+  its kind until it is next saved from the Edit dialog, which then asks
+  for Reverse lookup.
+
+- **The DHCP scope dialog offers the DDNS hostname policies the API
+  accepts, and an edit checks the policy as create does (#1308).** The
+  dialog offered Client-supplied, From IPAM and Generate (`client`,
+  `ipam`, `generate`), while the scope API accepts `client`,
+  `server_name`, `derived` and `none`. Creating a scope with From IPAM
+  or Generate failed with the validator's raw `422`. Editing a scope to
+  either answered `200` and stored it unchecked, and a stored
+  `server_name`, `derived` or `none` showed as Client-supplied. The
+  dialog now offers the API's four policies and shows a stored one as
+  itself, and an edit that changes the policy is checked against the
+  same list as create. A value stored before the check is kept, and
+  shown as itself, until it is changed, so an unrelated edit still
+  saves.
+
+- **Apply template… in the DHCP scope dialog shows each option in its
+  own field (#1309).** The dialog merged a template's options by name
+  and gave an option the form did not hold yet the code `0`, while the
+  options editor draws its standard fields by code. So a template's
+  TFTP Server Name, Bootfile Name and TFTP Server Address landed in the
+  collapsed Custom options with a blank code. Their fields stayed empty
+  while the values were sent and stored. The editor also kept showing a
+  pre-filled value the template had replaced. Each template option now
+  takes the code its key stands for (`code:NN` included) and lands in
+  its own field. The editor is redrawn when a template is applied, so
+  the dialog shows what it will send.
+
 - **A DNS server's zone serials reach the per-server zone state
   (#1408).** The agent reports the serial of each zone it renders
   (`POST /api/v1/dns/agents/zone-state`), but the control plane
@@ -136,6 +361,50 @@ the formatter handles the rest.
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
   SSO account must enrol TOTP before it can mint an API token. The Users
   and API Tokens dialogs ask for it.
+
+- **Each DNS server group's internal TSIG key is encrypted at rest, and
+  can be rotated (#1364).** It was the one credential SpatiumDDI stored
+  in clear (`dns_server_group.tsig_key_secret`), and not a minor one:
+  the BIND9 agent grants that key zone transfers and dynamic updates on
+  every primary zone the group serves, from any address. So anyone who
+  read the database or an unencrypted backup could transfer and rewrite
+  those zones. The secret is now Fernet-encrypted like every other
+  credential (`tsig_key_secret_encrypted`, migration `b3c71e9a4d25`,
+  covered by the cross-install backup rewrap). The value itself is
+  unchanged, so agents keep working with no re-render. **Rotate group
+  TSIG key** (server group → Edit, or
+  `POST /dns/groups/{id}/group-tsig-key/rotate`) replaces it under the
+  same name, and the agents pick it up on their next sync; the secret
+  is never returned. No copilot tool, deliberately (non-negotiable #13):
+  the rotation re-renders every agent in the group, the broad-blast-radius
+  write that guidance keeps off the copilot. An "exclude secrets"
+  diagnostic archive now also blanks the leftover plaintext column below,
+  which it had been carrying in clear. **Upgrade notes:** the old plaintext column is kept,
+  unread, for one release so a rolling upgrade's old api pods keep
+  working, and the next release drops it. Until then it still holds the
+  pre-upgrade secret, so rotate each group's key once the upgrade has
+  finished. The migration now needs the api's `SECRET_KEY` (and
+  `CREDENTIAL_ENCRYPTION_KEY`, if set), which `k8s/base/migrate-job.yaml`
+  did not pass and now does; the Helm chart and Docker Compose already
+  did.
+
+- **A SAML Response signs in once, and only through the sign-in that
+  asked for it (#1335).** With the ACS fixed (#1335 under Fixed), SAML
+  sign-in still lacked two checks the Web Browser SSO profile requires
+  of a service provider. The Response was never compared with the
+  AuthnRequest the sign-in sent, so a Response lifted from one browser's
+  sign-in (a proxy or WAF that logs request bodies, an extension, a
+  shared machine) signed in through any other browser's flow. And
+  nothing remembered a consumed Assertion, so the same Response signed
+  in again until it expired. The flow cookie now carries the
+  AuthnRequest's ID, and the Response's `InResponseTo` must match it; a
+  Response without one is refused too. Each Assertion's ID is claimed in
+  Redis until its `NotOnOrAfter`, plus the clock drift python3-saml
+  allows, so it signs in once (SAML profiles 4.1.4.5). Like the MFA
+  challenge's claim, it fails open when Redis is unreachable; the binding
+  to the sign-in's own request holds regardless. A sign-in that was
+  started before the upgrade is asked to start again
+  (`saml_state_invalid`).
 
 - **The MFA enrolment QR code is drawn in the browser, not fetched from
   a third party (#1353).** The screen built it as an image from

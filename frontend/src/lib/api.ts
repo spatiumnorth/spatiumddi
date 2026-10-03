@@ -744,7 +744,10 @@ export type IPRole =
   | "vrrp"
   | "secondary"
   | "gateway"
-  | "bmc";
+  | "bmc"
+  | "web"
+  | "api"
+  | "lb";
 
 export const IP_ROLE_OPTIONS: IPRole[] = [
   "host",
@@ -760,6 +763,13 @@ export const IP_ROLE_OPTIONS: IPRole[] = [
   // lets an operator find them all and decide whether their subnet
   // belongs behind the do-not-probe flag.
   "bmc",
+  // TLS-serving roles (#118 Phase 2): discovery probes an IP in one of
+  // these for its certificate. The API took them from the start (IP_ROLES
+  // in models/ipam.py); the console never offered them, so an address
+  // with one showed "— None —" in Edit address (#1305).
+  "web",
+  "api",
+  "lb",
 ];
 
 export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
@@ -4578,6 +4588,12 @@ export interface AIModelInfo {
 export const aiApi = {
   listProviders: () =>
     api.get<AIProvider[]>("/ai/providers").then((r) => r.data),
+  // Whether a new chat would find an enabled provider. Any signed-in user
+  // may ask; the provider list above is superadmin-only (#1345).
+  available: () =>
+    api
+      .get<{ available: boolean }>("/ai/available")
+      .then((r) => r.data.available),
   getProvider: (id: string) =>
     api.get<AIProvider>(`/ai/providers/${id}`).then((r) => r.data),
   createProvider: (body: AIProviderCreate) =>
@@ -5935,6 +5951,12 @@ export const dnsApi = {
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
     api.put<DNSServerGroup>(`/dns/groups/${id}`, data).then((r) => r.data),
+  // #1364 — replace the group's own TSIG key secret. The secret is never
+  // returned; agents get it in their next config bundle.
+  rotateGroupTsigKey: (id: string) =>
+    api
+      .post<DNSServerGroup>(`/dns/groups/${id}/group-tsig-key/rotate`)
+      .then((r) => r.data),
   // #62: returns the full axios response (may be 202 queued-for-approval —
   // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
   // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.

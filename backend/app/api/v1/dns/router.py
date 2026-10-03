@@ -100,7 +100,7 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
-from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.named_conf_validation import (
     AclCycleError,
     ViewValidationError,
@@ -145,7 +145,7 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
-from app.services.dns.tsig import group_key_names
+from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -995,6 +995,42 @@ VALID_ZONE_COLORS = {
 }
 
 
+def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
+    """The kind to store for a ``zone_type`` zone named ``name`` that a request
+    asked to be ``kind`` (#1310).
+
+    A primary zone named under in-addr.arpa / ip6.arpa is a reverse-lookup
+    zone: the API's own classifier scopes the name ``reverse`` and the zone's
+    Add Record pre-fills PTR. IPAM publishes PTR records only into kind
+    "reverse" zones (``_resolve_reverse_zone``), and the reverse-zone
+    auto-create finds a zone of the computed name and creates nothing beside it
+    (``ensure_reverse_zone_for_subnet``). Stored as anything else, such a zone
+    silently gets no PTR, for a gateway or a host, while the DNS-sync summary
+    reads in sync. So for a primary zone ``None`` (the request did not say)
+    takes the kind from the name, and a kind the name contradicts raises
+    ``ValueError``.
+
+    Secondary, stub and forward zones keep the kind they are given
+    (``forward`` when omitted, as before). IPAM's PTR lookup does not look at
+    the zone type, and those zones are not SpatiumDDI's to write into, so a
+    derived ``reverse`` would newly send PTR updates to a zone that refuses
+    them. Only one direction is enforced: kind "reverse" on a name outside
+    those trees is left to the operator, since IPAM never matches such a zone.
+    """
+    if zone_type != "primary":
+        return kind if kind is not None else "forward"
+    derived = zone_kind_for_name(name)
+    if kind is None:
+        return derived
+    if derived == "reverse" and kind != "reverse":
+        raise ValueError(
+            f"{name.rstrip('.')} is a reverse-lookup zone name (under in-addr.arpa "
+            "or ip6.arpa), so a primary zone by that name must be kind 'reverse', "
+            f"not {kind!r}: IPAM publishes PTR records only into reverse zones"
+        )
+    return kind
+
+
 def _validate_masters_format(v: list[str] | None) -> list[str]:
     """Validate each ``masters`` entry is a bare IP or ``ip@port`` — the only
     shapes the BIND9 ``masters { ... };`` renderer accepts. Rejects anything
@@ -1023,7 +1059,9 @@ class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
     zone_type: str = "primary"
-    kind: str = "forward"
+    # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
+    # from its name.
+    kind: str | None = None
     ttl: int = 3600
     refresh: int = 86400
     retry: int = 7200
@@ -1082,6 +1120,11 @@ class ZoneCreate(BaseModel):
                     "(primary server IP) to transfer from"
                 )
             self.masters = cleaned
+        return self
+
+    @model_validator(mode="after")
+    def kind_follows_name(self) -> ZoneCreate:
+        self.kind = resolved_zone_kind(self.name, self.kind, self.zone_type)
         return self
 
     @field_validator("color")
@@ -1655,6 +1698,42 @@ async def update_group(
             resource_id=str(group.id),
             resource_display=group.name,
             changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
+    collect_wake(dns_group_channel(group.id))
+    await db.commit()
+    await db.refresh(group)
+    drivers = await _drivers_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+
+
+@router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
+async def rotate_group_key(
+    group_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> ServerGroupResponse:
+    """Replace the group's own TSIG key secret (#1364).
+
+    That key is granted ``allow-update`` and ``allow-transfer`` on every
+    primary zone the group serves, so anyone holding it can transfer and
+    rewrite them. Rotating it is the answer to "it may have leaked" (a
+    database or backup read). The name is kept, so the next bundle carries
+    one changed secret and every agent re-renders its ``key {}`` stanza; an
+    RFC 2136 update signed with the old secret in that window is refused and
+    retried (#1232). The secret is never returned.
+    """
+    group = await _require_group(group_id, db)
+    rotate_group_tsig_key(group)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="rotate",
+            resource_type="dns_server_group",
+            resource_id=str(group.id),
+            resource_display=group.name,
+            new_value={"tsig_key_name": group.tsig_key_name},
             result="success",
         )
     )
@@ -4964,6 +5043,21 @@ async def update_zone(
                     "(primary server IP) to transfer from"
                 ),
             )
+    # #1310 — a request that sets the kind, the name or the type must leave a
+    # primary zone with a reverse-lookup name kind "reverse"
+    # (``resolved_zone_kind``). A zone stored forward before that check stays
+    # editable by a request that touches none of them; the Edit dialog sends
+    # the kind it shows, so a save there asks for Reverse lookup, which
+    # repairs the zone.
+    if {"kind", "name", "zone_type"} & changes.keys():
+        try:
+            resolved_zone_kind(
+                changes.get("name", zone.name),
+                changes.get("kind", zone.kind),
+                effective_zone_type,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     # DNSSEC flag flips through the generic update path (#811). Same
     # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
@@ -6207,12 +6301,19 @@ class FromTemplateRequest(BaseModel):
     params: dict[str, str] = {}
     view_id: uuid.UUID | None = None
     zone_type: str = "primary"
-    kind: str = "forward"
+    # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
+    # from its name.
+    kind: str | None = None
 
     @field_validator("zone_name")
     @classmethod
     def ensure_trailing_dot(cls, v: str) -> str:
         return v if v.endswith(".") else v + "."
+
+    @model_validator(mode="after")
+    def kind_follows_name(self) -> FromTemplateRequest:
+        self.kind = resolved_zone_kind(self.zone_name, self.kind, self.zone_type)
+        return self
 
 
 @router.get("/zone-templates", response_model=ZoneTemplateCatalog)

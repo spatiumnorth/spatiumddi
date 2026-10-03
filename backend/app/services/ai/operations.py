@@ -2341,9 +2341,14 @@ class CreateDNSZoneArgs(BaseModel):
         default="primary",
         description="Zone type — ``primary``, ``secondary``, ``forward``, or ``stub``.",
     )
-    kind: str = Field(
-        default="forward",
-        description="``forward`` (a normal name → record zone) or ``reverse`` (PTR zone).",
+    kind: str | None = Field(
+        default=None,
+        description=(
+            "``forward`` (a normal name → record zone) or ``reverse`` (PTR zone). "
+            "Omit it to take it from the name: a primary zone under in-addr.arpa / "
+            "ip6.arpa is ``reverse`` (and cannot be ``forward``); any other zone "
+            "defaults to ``forward``."
+        ),
     )
     primary_ns: str = Field(
         default="",
@@ -2458,7 +2463,7 @@ async def _resolve_group_for_zone(
 async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
-    from app.api.v1.dns.router import VALID_ZONE_TYPES  # noqa: PLC0415
+    from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
@@ -2469,6 +2474,12 @@ async def _preview_create_dns_zone(
         return PreviewResult(
             ok=False, detail=f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}."
         )
+
+    # #1310 — the kind follows the name, as on the REST create.
+    try:
+        kind = resolved_zone_kind(name, args.kind, args.zone_type)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
 
     if args.driver_hint is not None and args.driver_hint not in _DNS_DRIVER_HINTS:
         return PreviewResult(
@@ -2506,7 +2517,7 @@ async def _preview_create_dns_zone(
 
     parts = [f"Create zone `{name}` in group `{grp.name}`"]
     parts.append(f"drivers={sorted(drivers) or ['(none)']}")
-    parts.append(f"type={args.zone_type}/{args.kind}")
+    parts.append(f"type={args.zone_type}/{kind}")
     if args.dnssec_enabled:
         # #811: create now enqueues the ``dnssec_sign`` op itself, so the
         # preview no longer has to warn about a flag-only zone. BIND9
@@ -2529,6 +2540,7 @@ async def _preview_create_dns_zone(
 async def _apply_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> dict[str, Any]:
+    from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
 
@@ -2537,6 +2549,8 @@ async def _apply_create_dns_zone(
     enforce_operation_permission(user, _OPERATIONS["create_dns_zone"])
 
     name = _normalize_zone_name(args.name)
+    # #1310 — re-checked at apply, like the driver gate below.
+    kind = resolved_zone_kind(name, args.kind, args.zone_type)
     grp, drivers, err = await _resolve_group_for_zone(
         db, group_id=args.group_id, driver_hint=args.driver_hint
     )
@@ -2554,7 +2568,7 @@ async def _apply_create_dns_zone(
         group_id=grp.id,
         name=name,
         zone_type=args.zone_type,
-        kind=args.kind,
+        kind=kind,
         ttl=args.ttl,
         primary_ns=args.primary_ns,
         admin_email=args.admin_email,
@@ -2586,7 +2600,7 @@ async def _apply_create_dns_zone(
                 "group_id": str(grp.id),
                 "group": grp.name,
                 "zone_type": args.zone_type,
-                "kind": args.kind,
+                "kind": kind,
                 "dnssec_enabled": args.dnssec_enabled,
                 "driver_hint": args.driver_hint,
                 "via": "ai_proposal",
@@ -2607,7 +2621,7 @@ async def _apply_create_dns_zone(
         "group_id": str(grp.id),
         "name": name,
         "zone_type": args.zone_type,
-        "kind": args.kind,
+        "kind": kind,
         "dnssec_enabled": args.dnssec_enabled,
     }
 

@@ -135,6 +135,16 @@ def _normalize_sync_mode(v: str | None) -> str:
     return legacy.get(v, v)
 
 
+def _check_hostname_policy(v: str | None) -> str:
+    """The one vocabulary for a scope's DDNS hostname policy, on create and on
+    update (#1308). Blank means the model default, ``client``."""
+    if v in (None, ""):
+        return "client"
+    if v not in VALID_HOSTNAME_POLICIES:
+        raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
+    return v
+
+
 # Fields the scope write models accept under two names, as
 # ``(name ScopeResponse emits, alias also accepted, comparison normaliser)``.
 # Both aliases are the underlying column name, which is why they are accepted
@@ -344,13 +354,7 @@ class ScopeCreate(BaseModel):
     @field_validator("ddns_hostname_policy")
     @classmethod
     def _h(cls, v: str | None) -> str | None:
-        if v in (None, ""):
-            return "client"
-        if v not in VALID_HOSTNAME_POLICIES:
-            raise ValueError(
-                f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}"
-            )
-        return v
+        return _check_hostname_policy(v)
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -843,6 +847,21 @@ async def update_scope(
             status_code=422,
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
+    # #1308 — the same vocabulary as create: the scope dialog offered
+    # ``ipam`` / ``generate``, which create refused with a 422 and this path
+    # stored. Only a CHANGED policy is checked, the way options are (#597,
+    # #1228): the dialog sends the stored policy back with every save, so one
+    # written before this check must not block an unrelated edit.
+    if (
+        "ddns_hostname_policy" in changes
+        and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
+    ):
+        try:
+            changes["ddns_hostname_policy"] = _check_hostname_policy(
+                changes["ddns_hostname_policy"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
         normalized = normalize_options(changes["options"])
         # Validate only options that CHANGED from the stored value (#597

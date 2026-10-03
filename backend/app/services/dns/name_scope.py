@@ -56,6 +56,7 @@ from typing import Literal
 from app.services.dns.tld_registry import load_bundled, load_special_use
 
 NameScope = Literal["public", "reserved", "undelegated", "reverse"]
+ZoneKind = Literal["forward", "reverse"]
 
 # Suffixes that make a zone a reverse zone. Both are under ``.arpa``.
 _REVERSE_SUFFIXES: tuple[tuple[str, ...], ...] = (
@@ -95,6 +96,20 @@ def _suffix_matches(labels: tuple[str, ...], suffix_labels: tuple[str, ...]) -> 
     ``example.com`` is reserved, not just its children.
     """
     return len(labels) >= len(suffix_labels) and labels[-len(suffix_labels) :] == suffix_labels
+
+
+def zone_kind_for_name(name: str) -> ZoneKind:
+    """The lookup kind of a zone named ``name`` (#1310).
+
+    ``reverse`` for a name under ``in-addr.arpa`` / ``ip6.arpa`` (the names
+    :func:`classify_zone_name` scopes ``reverse``, by the same label-wise
+    test) and ``forward`` for every other name. A zone's ``kind`` is what
+    IPAM keys on: it publishes PTR records only into kind ``reverse`` zones.
+    """
+    labels = _labels(name)
+    if any(_suffix_matches(labels, suffix) for suffix in _REVERSE_SUFFIXES):
+        return "reverse"
+    return "forward"
 
 
 def classify_zone_name(name: str, *, tlds: frozenset[str] | None = None) -> ZoneNameScope:
