@@ -39,7 +39,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crypto import decrypt_str
+from app.core.crypto import decrypt_str, encrypt_str
 from app.drivers.dns import AXFR_TSIG_DRIVERS
 from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSTSIGKey, DNSView, DNSZone
@@ -122,18 +122,40 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
     return None
 
 
+def group_tsig_secret(group: DNSServerGroup | None) -> str | None:
+    """The group key's secret in clear, or None when there is none to use.
+
+    Stored Fernet-encrypted (#1364). A value that does not decrypt (the
+    install's key changed without a rewrap) is reported and treated as
+    absent, so ``ensure_group_tsig_key`` mints a replacement rather than the
+    group shipping a key nobody can read.
+    """
+    if group is None or not group.tsig_key_secret_encrypted:
+        return None
+    try:
+        return decrypt_str(group.tsig_key_secret_encrypted)
+    except ValueError:
+        logger.warning("dns.tsig.group_key_undecryptable", group=str(group.id))
+        return None
+
+
+def set_group_tsig_secret(group: DNSServerGroup, secret: str) -> None:
+    group.tsig_key_secret_encrypted = encrypt_str(secret)
+
+
 def legacy_group_key(group: DNSServerGroup | None) -> TsigKey | None:
     """The group's own auto-minted key (``ensure_group_tsig_key``), or None.
 
     Never an operator key: this is the product's own identity toward its
     agents, and its secret is returned by no API.
     """
-    if group is None or not group.tsig_key_name or not group.tsig_key_secret:
+    secret = group_tsig_secret(group)
+    if group is None or not group.tsig_key_name or not secret:
         return None
     return TsigKey(
         name=group.tsig_key_name,
         algorithm=group.tsig_key_algorithm or "hmac-sha256",
-        secret=group.tsig_key_secret,
+        secret=secret,
     )
 
 
@@ -321,11 +343,14 @@ async def pull_zone_records_signed(
 __all__ = [
     "VIEW_TRANSFER_KEY_PREFIX",
     "group_key_names",
+    "group_tsig_secret",
     "is_view_transfer_key",
     "legacy_group_key",
     "pull_zone_records_signed",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
+    "rotate_group_tsig_key",
+    "set_group_tsig_secret",
     "transfer_needs_tsig",
     "transfer_view_name",
     "view_transfer_key",
@@ -371,12 +396,33 @@ def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
     UI — or one a server is MOVED into (#934) — could reach an agent with
     no key at all.
 
-    Returns True when a key was generated, False when one already existed.
-    Mutates the row; the caller commits.
+    Returns True when a key was generated, False when a usable one already
+    existed. A stored key that no longer decrypts counts as none, and is
+    replaced under its EXISTING name: an operator may cite that name in a
+    view's ``match-clients`` or an ACL, and re-deriving it from a group
+    renamed since would leave those an undefined symbol that makes BIND
+    refuse the whole file. Mutates the row; the caller commits.
     """
-    if group.tsig_key_secret:
+    if group_tsig_secret(group):
         return False
-    group.tsig_key_name = _safe_key_label(group)
-    group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
-    group.tsig_key_algorithm = "hmac-sha256"
+    rotate_group_tsig_key(group)
     return True
+
+
+def rotate_group_tsig_key(group: DNSServerGroup) -> None:
+    """Replace the group key's secret, keeping its name (#1364).
+
+    The name is what every zone's ``allow-update`` / ``allow-transfer`` grant
+    and every agent's ``key {}`` stanza refer to, so keeping it means the
+    rotation is one changed secret in the next bundle rather than a rename
+    the agents and the zone grants have to follow. Mutates the row; the
+    caller commits and wakes the group.
+    """
+    if not group.tsig_key_name:
+        group.tsig_key_name = _safe_key_label(group)
+    set_group_tsig_secret(group, _new_group_secret())
+    group.tsig_key_algorithm = "hmac-sha256"
+
+
+def _new_group_secret() -> str:
+    return base64.b64encode(secrets.token_bytes(32)).decode()

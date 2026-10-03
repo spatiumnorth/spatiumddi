@@ -16,8 +16,21 @@ import {
   isAdoptionRequired,
 } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
+import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
+
+// #1308 — the scope API's own vocabulary (``VALID_HOSTNAME_POLICIES`` in
+// backend/app/api/v1/dhcp/scopes.py). The dialog used to offer client / ipam /
+// generate: create refused the last two with a 422, update stored them
+// unchecked, and a stored server_name / derived / none showed as
+// "Client-supplied".
+const DDNS_HOSTNAME_POLICIES: { value: string; label: string }[] = [
+  { value: "client", label: "Client-supplied" },
+  { value: "server_name", label: "Server name" },
+  { value: "derived", label: "Derived" },
+  { value: "none", label: "None" },
+];
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
@@ -269,13 +282,14 @@ export function CreateScopeModal({
   // reload lost the other half instead — the platform defaults.
   //
   // Neither half overwrites a value already there (typed, or applied from a
-  // template). Rows are named like DHCPOptionsEditor's own, so a template's
-  // by-name merge replaces them instead of adding a second row per code.
+  // template). Rows carry DHCPOptionsEditor's own codes, so a template's
+  // by-code merge replaces them instead of adding a second row per code.
   //
   // DHCPOptionsEditor's inputs are uncontrolled (defaultValue + onBlur), so
   // a pre-fill landing after the operator touched a field would change what
   // is sent without changing what is shown. It is remounted on each
-  // pre-fill, so the dialog always shows what it will send.
+  // pre-fill and each applied template, so the dialog always shows what it
+  // will send.
   const [prefillGeneration, setPrefillGeneration] = useState(0);
   const [settingsPrefilled, setSettingsPrefilled] = useState(false);
   useEffect(() => {
@@ -973,9 +987,21 @@ export function CreateScopeModal({
                   value={ddnsPolicy}
                   onChange={(e) => setDdnsPolicy(e.target.value)}
                 >
-                  <option value="client">Client-supplied</option>
-                  <option value="ipam">From IPAM</option>
-                  <option value="generate">Generate</option>
+                  {DDNS_HOSTNAME_POLICIES.map((p) => (
+                    <option key={p.value} value={p.value}>
+                      {p.label}
+                    </option>
+                  ))}
+                  {/* A value stored before edits were checked (#1308) shows
+                      as itself, and is sent back unchanged until another
+                      policy is picked. */}
+                  {!DDNS_HOSTNAME_POLICIES.some(
+                    (p) => p.value === ddnsPolicy,
+                  ) && (
+                    <option value={ddnsPolicy}>
+                      {ddnsPolicy} (not a supported policy)
+                    </option>
+                  )}
                 </select>
               </Field>
               {/* #784 — a "Domain Override" input used to sit here. Nothing
@@ -1030,7 +1056,12 @@ export function CreateScopeModal({
             <ApplyTemplateControl
               groupId={groupId}
               currentOptions={options}
-              onApply={setOptions}
+              onApply={(next) => {
+                setOptions(next);
+                // #1309 — redraw the editor's uncontrolled fields, so each
+                // shows what the template put in the form.
+                setPrefillGeneration((g) => g + 1);
+              }}
             />
           </div>
           <DHCPOptionsEditor
@@ -1206,26 +1237,29 @@ function ApplyTemplateControl({
     const tpl = templates.find((t) => t.id === templateId);
     if (!tpl) return;
     const tplOptions = tpl.options ?? {};
-    // Build a name->existing-DHCPOption map for the current value so we can
-    // diff and report which keys we're about to clobber.
-    const byName = new Map<string, DHCPOption>();
-    for (const o of currentOptions) {
-      const n = o.name || `option-${o.code}`;
-      byName.set(n, o);
-    }
+    // #1309 — a template stores its options by key (`tftp-server-name`,
+    // `code:43`), and DHCPOptionsEditor draws each standard field by CODE.
+    // Each key takes the code it stands for, as the backend reads it
+    // (dhcpOptionKeys), and merges by that code. A key the form did not
+    // hold yet used to land as `code: 0`: out of its own field, in the
+    // collapsed custom bucket with a blank code, while its value was still
+    // sent and stored. A key that names no code still merges by name.
+    const next = [...currentOptions];
     const conflicts: string[] = [];
-    for (const [n, v] of Object.entries(tplOptions)) {
-      const existing = byName.get(n);
-      if (existing) {
-        const a = JSON.stringify(existing.value);
-        const b = JSON.stringify(v);
-        if (a !== b) conflicts.push(n);
-        byName.set(n, { ...existing, name: n, value: v });
-      } else {
-        byName.set(n, { code: 0, name: n, value: v });
+    for (const [key, value] of Object.entries(tplOptions)) {
+      const code = optionKeyCode(key);
+      const at = next.findIndex((o) =>
+        code > 0 ? o.code === code : (o.name || `option-${o.code}`) === key,
+      );
+      if (at < 0) {
+        next.push({ code, name: key, value });
+        continue;
       }
+      if (JSON.stringify(next[at].value) !== JSON.stringify(value))
+        conflicts.push(key);
+      next[at] = { ...next[at], name: key, value };
     }
-    onApply(Array.from(byName.values()));
+    onApply(next);
     setOverwritten(conflicts);
     // Reset the select so picking the same template again still fires.
     setPickerKey((k) => k + 1);

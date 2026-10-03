@@ -23,6 +23,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { DHCPScope } from "@/lib/api";
 
 type SubnetFixture = {
   id: string;
@@ -35,15 +36,20 @@ const getSubnet = vi.fn<(id: string) => Promise<SubnetFixture>>();
 const getSettings = vi.fn<() => Promise<unknown>>();
 const createScope = vi.fn();
 const createPool = vi.fn();
+const updateScope = vi.fn();
+const listOptionTemplates = vi.fn<(groupId: string) => Promise<unknown[]>>(() =>
+  Promise.resolve([]),
+);
 
 vi.mock("@/lib/api", () => ({
   dhcpApi: {
     listGroups: () => Promise.resolve([]),
     listOptionCodes: () => Promise.resolve([]),
-    listOptionTemplates: () => Promise.resolve([]),
+    listOptionTemplates: (groupId: string) => listOptionTemplates(groupId),
     listPxeProfiles: () => Promise.resolve([]),
     createScope: (...args: unknown[]) => createScope(...args),
     createPool: (...args: unknown[]) => createPool(...args),
+    updateScope: (...args: unknown[]) => updateScope(...args),
   },
   ipamApi: {
     getSubnet: (id: string) => getSubnet(id),
@@ -124,6 +130,7 @@ async function save() {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  listOptionTemplates.mockReset();
 });
 
 describe("CreateScopeModal pre-fill (#1154)", () => {
@@ -301,5 +308,223 @@ describe("CreateScopeModal pre-fill (#1154)", () => {
     );
     await act(async () => {});
     expect(control("Routers (option 3)").value).toBe("");
+  });
+});
+
+/** A stored scope, as `GET /dhcp/scopes/{id}` returns it, for the edit dialog. */
+function storedScope(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "scope-1",
+    subnet_id: SUBNET_A.id,
+    group_id: "grp-1",
+    name: "staff-scope",
+    description: "",
+    enabled: true,
+    lease_time: 86400,
+    min_lease_time: null,
+    max_lease_time: null,
+    lease_cache_threshold: null,
+    lease_cache_max_age: null,
+    ddns_enabled: true,
+    ddns_hostname_policy: "client",
+    hostname_sync_mode: "on_static_only",
+    dns_track_dynamic_leases: true,
+    address_family: "ipv4",
+    relay_addresses: [],
+    options: [],
+    pxe_profile_id: null,
+    ...overrides,
+  };
+}
+
+function openEdit(qc: QueryClient, scope: ReturnType<typeof storedScope>) {
+  render(
+    <QueryClientProvider client={qc}>
+      <CreateScopeModal
+        scope={scope as unknown as DHCPScope}
+        onClose={() => {}}
+      />
+    </QueryClientProvider>,
+  );
+}
+
+function policySelect(): HTMLSelectElement {
+  return control("Hostname Policy") as unknown as HTMLSelectElement;
+}
+
+describe("CreateScopeModal DDNS Hostname Policy (#1308)", () => {
+  // The scope API's vocabulary (VALID_HOSTNAME_POLICIES in
+  // backend/app/api/v1/dhcp/scopes.py). The dialog offered client / ipam /
+  // generate: create refused the last two with a 422, and a stored
+  // server_name / derived / none showed as "Client-supplied".
+  const API_POLICIES = ["client", "server_name", "derived", "none"];
+
+  it("offers exactly the policies the scope API accepts, and sends the one picked", async () => {
+    const qc = client();
+    qc.setQueryData(["settings"], SETTINGS);
+    getSettings.mockResolvedValue(SETTINGS);
+    getSubnet.mockResolvedValue(SUBNET_A);
+    createScope.mockResolvedValue({ id: "scope-1" });
+    createPool.mockResolvedValue({});
+
+    open(qc, SUBNET_A.id);
+    fireEvent.click(screen.getByLabelText(/^DDNS — push lease updates/));
+    const offered = Array.from(policySelect().options).map((o) => o.value);
+    expect(offered).toEqual(API_POLICIES);
+
+    fireEvent.change(policySelect(), { target: { value: "derived" } });
+    expect(policySelect().value).toBe("derived");
+    await save();
+    expect(createScope.mock.calls[0][1]).toMatchObject({
+      ddns_enabled: true,
+      ddns_hostname_policy: "derived",
+    });
+  });
+
+  it("shows a scope's stored policy as itself", async () => {
+    for (const stored of ["server_name", "derived", "none"]) {
+      openEdit(client(), storedScope({ ddns_hostname_policy: stored }));
+      expect(policySelect().value).toBe(stored);
+      expect(policySelect().selectedOptions[0].value).toBe(stored);
+      cleanup();
+    }
+  });
+
+  it("shows a stored value outside the vocabulary as itself, and sends it back unchanged", async () => {
+    // Stored through the edit path before it was checked (here the subnet's
+    // vocabulary, which docs/features/DHCP.md listed for the scope). The
+    // update handler grandfathers an unchanged value, so an unrelated edit
+    // saves; the dialog must not show it as "Client-supplied" meanwhile.
+    updateScope.mockResolvedValue({ id: "scope-1" });
+    openEdit(
+      client(),
+      storedScope({ ddns_hostname_policy: "client_or_generated" }),
+    );
+    expect(policySelect().value).toBe("client_or_generated");
+    expect(policySelect().selectedOptions[0].textContent).toContain(
+      "client_or_generated",
+    );
+
+    fireEvent.submit(control("Name").form!);
+    await waitFor(() => expect(updateScope).toHaveBeenCalledTimes(1));
+    expect(updateScope.mock.calls[0][1]).toMatchObject({
+      ddns_hostname_policy: "client_or_generated",
+    });
+  });
+});
+
+describe("CreateScopeModal Apply template… (#1309)", () => {
+  type TemplateFixture = {
+    id: string;
+    group_id: string;
+    name: string;
+    description: string;
+    address_family: string;
+    options: Record<string, string | string[]>;
+  };
+  const PXE_TEMPLATE: TemplateFixture = {
+    id: "tpl-1",
+    group_id: "grp-1",
+    name: "pxe",
+    description: "",
+    address_family: "ipv4",
+    options: {
+      "tftp-server-name": "tftp.example.test",
+      "bootfile-name": "pxelinux.0",
+      "tftp-server-address": ["192.0.2.69"],
+    },
+  };
+
+  function openInGroup(qc: QueryClient) {
+    render(
+      <QueryClientProvider client={qc}>
+        <CreateScopeModal
+          subnetId={SUBNET_A.id}
+          defaultGroupId="grp-1"
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  /** Open the dialog in the template's group, let both pre-fills land, apply. */
+  async function openAndApply(template: TemplateFixture) {
+    listOptionTemplates.mockResolvedValue([template]);
+    const qc = client();
+    qc.setQueryData(["settings"], SETTINGS);
+    getSettings.mockResolvedValue(SETTINGS);
+    getSubnet.mockResolvedValue(SUBNET_A);
+    createScope.mockResolvedValue({ id: "scope-1" });
+    createPool.mockResolvedValue({});
+
+    openInGroup(qc);
+    await waitFor(() =>
+      expect(control("Routers (option 3)").value).toBe("10.78.21.1"),
+    );
+    expect(control("DNS Servers (option 6)").value).toBe("10.0.0.53");
+    const picker = await screen.findByDisplayValue("Apply template…");
+    fireEvent.change(picker, { target: { value: template.id } });
+  }
+
+  it("shows each option it adds in that option's own field, and sends what it shows", async () => {
+    await openAndApply(PXE_TEMPLATE);
+
+    expect(control("TFTP Server Name (option 66)").value).toBe(
+      "tftp.example.test",
+    );
+    expect(control("Bootfile Name (option 67)").value).toBe("pxelinux.0");
+    expect(control("TFTP Server Address (option 150)").value).toBe(
+      "192.0.2.69",
+    );
+    expect(control("Routers (option 3)").value).toBe("10.78.21.1");
+
+    const body = await save();
+    expect(body.options).toContainEqual({
+      code: 66,
+      name: "tftp-server-name",
+      value: "tftp.example.test",
+    });
+    expect(body.options).toContainEqual({
+      code: 67,
+      name: "bootfile-name",
+      value: "pxelinux.0",
+    });
+    expect(body.options).toContainEqual({
+      code: 150,
+      name: "tftp-server-address",
+      value: ["192.0.2.69"],
+    });
+    expect(
+      (body.options as { code: number }[]).filter((o) => o.code === 0),
+    ).toEqual([]);
+  });
+
+  it("shows a template's value over a pre-filled field", async () => {
+    // The pre-fill put the platform DNS server in option 6; the template
+    // replaces it in the form, so the field must show the template's.
+    await openAndApply({
+      ...PXE_TEMPLATE,
+      options: { "dns-servers": ["192.0.2.53"] },
+    });
+
+    expect(control("DNS Servers (option 6)").value).toBe("192.0.2.53");
+    const body = await save();
+    expect(
+      (body.options as { code: number }[]).filter((o) => o.code === 6),
+    ).toEqual([{ code: 6, name: "dns-servers", value: ["192.0.2.53"] }]);
+  });
+
+  it("keeps a template's raw-code option under its code", async () => {
+    await openAndApply({
+      ...PXE_TEMPLATE,
+      options: { "code:43": "0104c0000201" },
+    });
+
+    const body = await save();
+    expect(body.options).toContainEqual({
+      code: 43,
+      name: "code:43",
+      value: "0104c0000201",
+    });
   });
 });

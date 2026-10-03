@@ -125,6 +125,21 @@ def _stamp_dhcp_group(target: Any, dhcp_group_id: uuid.UUID | None, *, force: bo
     return False
 
 
+def _ddns_fields_set_by(template: IPAMTemplate) -> list[str]:
+    """The DDNS columns ``template`` sets away from the create schema's
+    defaults: the values its DDNS lock exists to make take effect."""
+    fields: list[str] = []
+    if template.ddns_enabled:
+        fields.append("ddns_enabled")
+    if template.ddns_hostname_policy != "client_or_generated":
+        fields.append("ddns_hostname_policy")
+    if template.ddns_domain_override is not None:
+        fields.append("ddns_domain_override")
+    if template.ddns_ttl is not None:
+        fields.append("ddns_ttl")
+    return fields
+
+
 def _apply_ddns_lock(target: Any, template: IPAMTemplate, *, force: bool) -> None:
     """When the template stamps any DDNS column, also flip the target's
     ``ddns_inherit_settings=False`` so the stamped values actually
@@ -133,12 +148,7 @@ def _apply_ddns_lock(target: Any, template: IPAMTemplate, *, force: bool) -> Non
     """
     if not hasattr(target, "ddns_inherit_settings"):
         return
-    template_writes_ddns = (
-        template.ddns_enabled
-        or template.ddns_hostname_policy != "client_or_generated"
-        or template.ddns_domain_override is not None
-        or template.ddns_ttl is not None
-    )
+    template_writes_ddns = bool(_ddns_fields_set_by(template))
     if template_writes_ddns and (force or target.ddns_inherit_settings):
         target.ddns_inherit_settings = False
 
@@ -231,6 +241,27 @@ def _prefill_unset(body: Any, name: str, value: Any) -> None:
     setattr(body, name, value)
 
 
+def _supplied_fields(body: Any) -> set[str]:
+    """The fields the request itself set. Read it before pre-filling:
+    Pydantic counts an assignment as set, so ``_prefill`` adds every field
+    it fills to ``model_fields_set``."""
+    return set(getattr(body, "model_fields_set", None) or ())
+
+
+def _lock_ddns_on_create(template: IPAMTemplate, body: Any, supplied: set[str]) -> None:
+    """Turn the new carrier's DDNS inheritance off when a DDNS value the
+    template sets was pre-filled, so that value takes effect. The lock goes
+    with the template's values (#1304): when the request supplied every one
+    of them itself, none is the template's, and the carrier's DDNS
+    inheritance is what the same request gets without a template. A request
+    that sets ``ddns_inherit_settings`` itself always keeps it.
+    """
+    if not hasattr(body, "ddns_inherit_settings"):
+        return
+    if any(name not in supplied for name in _ddns_fields_set_by(template)):
+        _prefill_unset(body, "ddns_inherit_settings", False)
+
+
 def apply_template_on_create_block(template: IPAMTemplate, body: Any) -> None:
     """Pre-fill an IPBlockCreate body in-place. ``template`` is the
     fully-loaded ORM row.
@@ -239,20 +270,14 @@ def apply_template_on_create_block(template: IPAMTemplate, body: Any) -> None:
         raise TemplateError(
             f"Template {template.name!r} applies to {template.applies_to!r}, not 'block'."
         )
+    supplied = _supplied_fields(body)
     for field in _TEMPLATE_FIELDS_COMMON:
         _prefill(body, field, getattr(template, field))
     if template.dns_group_id is not None:
         _prefill_unset(body, "dns_group_ids", [str(template.dns_group_id)])
     if template.dhcp_group_id is not None:
         _prefill_unset(body, "dhcp_server_group_id", template.dhcp_group_id)
-    if hasattr(body, "ddns_inherit_settings"):
-        if (
-            template.ddns_enabled
-            or template.ddns_hostname_policy != "client_or_generated"
-            or template.ddns_domain_override is not None
-            or template.ddns_ttl is not None
-        ):
-            _prefill_unset(body, "ddns_inherit_settings", False)
+    _lock_ddns_on_create(template, body, supplied)
 
 
 def apply_template_on_create_subnet(template: IPAMTemplate, body: Any) -> None:
@@ -260,20 +285,14 @@ def apply_template_on_create_subnet(template: IPAMTemplate, body: Any) -> None:
         raise TemplateError(
             f"Template {template.name!r} applies to {template.applies_to!r}, not 'subnet'."
         )
+    supplied = _supplied_fields(body)
     for field in _TEMPLATE_FIELDS_COMMON:
         _prefill(body, field, getattr(template, field))
     if template.dns_group_id is not None:
         _prefill_unset(body, "dns_group_ids", [str(template.dns_group_id)])
     if template.dhcp_group_id is not None:
         _prefill_unset(body, "dhcp_server_group_id", template.dhcp_group_id)
-    if hasattr(body, "ddns_inherit_settings"):
-        if (
-            template.ddns_enabled
-            or template.ddns_hostname_policy != "client_or_generated"
-            or template.ddns_domain_override is not None
-            or template.ddns_ttl is not None
-        ):
-            _prefill_unset(body, "ddns_inherit_settings", False)
+    _lock_ddns_on_create(template, body, supplied)
 
 
 # ── Child layout carving (block templates only) ───────────────────────
