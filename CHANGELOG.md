@@ -181,7 +181,12 @@ the formatter handles the rest.
   `api.resources` (on an appliance, the memory limit the supervisor sizes
   from the node's RAM), with any `slotImageMirror.resources` key laid over
   it, and the Charts job refuses a render whose mirror memory or CPU limit
-  is below the api's.
+  is below the api's. Its liveness and readiness probes are the api's too
+  (`api.probes`, with `slotImageMirror.probes` laid over them): its own
+  probes killed a start that had not bound its port about 40 seconds in,
+  and gave each check the kubelet's default 1 second, so a slow cold start
+  on a busy node was killed before it served (the pod in #1174 logged 12
+  liveness kills before its OOMKills).
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to

@@ -376,6 +376,11 @@ slotImageMirror:
   # (e.g. ``limits: { memory: 2Gi }``); keep its limits at or above the
   # api's, which the Charts job's ``chart-slot-image-mirror.py`` enforces.
   resources: {}
+  # #1174 — empty: the mirror's liveness and readiness probes take
+  # ``api.probes`` (#1051), because they probe the same process. Keys set
+  # here are laid over the api's, e.g. ``liveness: { periodSeconds: 60 }``;
+  # the Charts job refuses a timeout or a failure budget below the api's.
+  probes: {}
   nodeSelector: {}
   tolerations: []
   auth:

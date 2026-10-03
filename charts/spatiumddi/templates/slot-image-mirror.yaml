@@ -179,20 +179,36 @@ spec:
                 secretKeyRef:
                   name: {{ $mirrorName }}-auth
                   key: secret
+          # #1174 — the api's probe budgets (``api.probes``, #1051), with any
+          # key of ``slotImageMirror.probes`` laid over them. The mirror is
+          # the api's process: one uvicorn worker that imports the whole
+          # application and runs its startup before it binds the port, and
+          # whose event loop answers late when busy. Its own budgets (a
+          # liveness that killed it ~40 s after a start that had not bound
+          # yet, and the kubelet's 1 s timeout on both probes) killed a cold
+          # boot on a busy node: #1174's pod logged 12 liveness kills before
+          # its OOMKills.
+          {{- $probes := mergeOverwrite (deepCopy (.Values.api.probes | default dict)) (deepCopy (.Values.slotImageMirror.probes | default dict)) }}
+          {{- with $probes.liveness }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            failureThreshold: 3
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          {{- with $probes.readiness }}
           readinessProbe:
             httpGet:
               path: /health/ready
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 3
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
           # #1174 — sized as the api, because it runs the api: the same
           # image, the whole application imported before the first byte
           # is served. ``api.resources`` (on an appliance, the limit the

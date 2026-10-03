@@ -159,3 +159,87 @@ def test_quantities_compare_across_units() -> None:
     assert mod.cpu_millicores("1") == mod.cpu_millicores("1000m") == 1000
     assert mod.cpu_millicores("0.5") == mod.cpu_millicores("500m") == 500
     assert mod.cpu_millicores("1Gi") is None
+
+
+# ---- probes: the mirror is the api's process, so it gets at least the api's budgets ----
+# The renders read on 2026-10-03: the api's api.probes (#1051) and the
+# mirror's own hard-coded probes, which leave timeoutSeconds to the kubelet's 1 s.
+API_PROBES = {
+    "livenessProbe": {"httpGet": {"path": "/health/live", "port": "http"},
+                      "initialDelaySeconds": 10, "periodSeconds": 30,
+                      "timeoutSeconds": 30, "failureThreshold": 4},
+    "readinessProbe": {"httpGet": {"path": "/health/ready", "port": "http"},
+                       "initialDelaySeconds": 5, "periodSeconds": 10,
+                       "timeoutSeconds": 15, "failureThreshold": 3},
+}
+OLD_MIRROR_PROBES = {
+    "livenessProbe": {"httpGet": {"path": "/health/live", "port": "http"},
+                      "initialDelaySeconds": 10, "periodSeconds": 15, "failureThreshold": 3},
+    "readinessProbe": {"httpGet": {"path": "/health/ready", "port": "http"},
+                       "initialDelaySeconds": 5, "periodSeconds": 10, "failureThreshold": 3},
+}
+
+
+def _probed(component: str, container: str, probes: dict) -> str:
+    import yaml
+
+    doc = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": f"rel-spatiumddi-{component}",
+                     "labels": {"app.kubernetes.io/component": component}},
+        "spec": {"template": {"spec": {"containers": [{
+            "name": container,
+            "image": "ghcr.io/spatiumnorth/spatiumddi-api:test",
+            "resources": {"limits": {"cpu": "1000m", "memory": "512Mi"}},
+            **probes,
+        }]}}},
+    }
+    return "---\n" + yaml.safe_dump(doc)
+
+
+def _with_probes(mirror_probes: dict) -> str:
+    return _probed("api", "api", API_PROBES) + _probed(
+        "slot-image-mirror", "slot-image-mirror", mirror_probes
+    )
+
+
+def test_a_mirror_with_the_apis_probes_passes(tmp_path: Path) -> None:
+    r = _run(_with_probes(API_PROBES), tmp_path)
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_mirrors_old_probes_fail_on_timeout_and_budget(tmp_path: Path) -> None:
+    """Before #1174's second fix: a liveness that gives up 55 s after the
+    start (the third failure lands near 40 s) with the kubelet's 1 s timeout,
+    against the api's 130 s and 30 s; a readiness with 1 s against 15 s."""
+    r = _run(_with_probes(OLD_MIRROR_PROBES), tmp_path)
+    assert r.returncode == 1
+    assert ("livenessProbe timeoutSeconds 1 is below the api's 30 "
+            "(Deployment/rel-spatiumddi-api)") in r.stderr
+    assert "livenessProbe gives up after 55 s, below the api's 130 s" in r.stderr
+    assert "readinessProbe timeoutSeconds 1 is below the api's 15" in r.stderr
+    assert "readinessProbe gives up after" not in r.stderr  # 35 s against 35 s holds
+    assert "3 slot-image mirror shortfall(s)" in r.stderr
+
+
+def test_a_mirror_that_lost_a_probe_the_api_carries_fails(tmp_path: Path) -> None:
+    r = _run(_with_probes({"readinessProbe": API_PROBES["readinessProbe"]}), tmp_path)
+    assert r.returncode == 1
+    assert "livenessProbe is missing; the api carries one" in r.stderr
+
+
+def test_longer_budgets_than_the_api_and_an_unprobed_api_both_pass(tmp_path: Path) -> None:
+    longer = {k: dict(v, periodSeconds=60, timeoutSeconds=60) for k, v in API_PROBES.items()}
+    r = _run(_with_probes(longer), tmp_path)
+    assert r.returncode == 0, r.stderr
+    r = _run(_probed("api", "api", {}) + _probed("slot-image-mirror", "slot-image-mirror", {}),
+             tmp_path)
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_probe_budget_counts_from_the_initial_delay() -> None:
+    mod = _module()
+    assert mod.probe_budget_s(API_PROBES["livenessProbe"]) == 130
+    assert mod.probe_budget_s(OLD_MIRROR_PROBES["livenessProbe"]) == 55
+    assert mod.probe_budget_s({}) == 30  # the kubelet's 0 + 10 * 3

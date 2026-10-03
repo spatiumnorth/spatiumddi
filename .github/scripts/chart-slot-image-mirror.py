@@ -18,6 +18,16 @@ the chart derives the mirror's resources from ``api.resources``, so a render
 that fails here has a ``slotImageMirror.resources`` override, or a template,
 that sized the mirror back down.
 
+The probes follow the same rule, because the process they probe is the same
+one: one uvicorn worker that imports the application and runs its startup
+before it binds the port, and whose event loop answers late when busy
+(#1051). For each probe the api carries, the mirror must carry it too, with a
+``timeoutSeconds`` at least the api's and a failure budget
+(``initialDelaySeconds + periodSeconds * failureThreshold``, the kubelet's
+defaults filling any field left out) at least the api's. The mirror's old
+probes killed it about 40 s after a start that had not bound yet, and
+#1174's pod logged 12 liveness kills before its OOMKills.
+
 It fails closed. A render that carries the mirror but no api to compare it
 with is refused, because a guard that cannot find its reference must not read
 as a pass.
@@ -118,6 +128,56 @@ def shortfalls(docs: list[Any]) -> list[str]:
                 f"{mirror[0]} container {_MIRROR[1]}: limits.{key} {m_val} is below "
                 f"the api's {a_val} ({api[0]}); the mirror runs the api's image and "
                 "imports the whole application (#1174)"
+            )
+    out.extend(_probe_shortfalls(mirror, api))
+    return out
+
+
+# The kubelet's defaults for a field a probe leaves out.
+_PROBE_DEFAULTS = {
+    "initialDelaySeconds": 0,
+    "periodSeconds": 10,
+    "timeoutSeconds": 1,
+    "failureThreshold": 3,
+}
+
+
+def _probe_field(probe: dict, key: str) -> float:
+    value = probe.get(key)
+    return float(_PROBE_DEFAULTS[key] if value is None else value)
+
+
+def probe_budget_s(probe: dict) -> float:
+    """Seconds from the container's start until a probe that never succeeds
+    has failed ``failureThreshold`` times: its first period begins after
+    ``initialDelaySeconds``."""
+    return _probe_field(probe, "initialDelaySeconds") + _probe_field(
+        probe, "periodSeconds"
+    ) * _probe_field(probe, "failureThreshold")
+
+
+def _probe_shortfalls(mirror: tuple[str, dict], api: tuple[str, dict]) -> list[str]:
+    out: list[str] = []
+    for key in ("livenessProbe", "readinessProbe"):
+        a_probe = api[1].get(key)
+        if not isinstance(a_probe, dict):
+            continue
+        m_probe = mirror[1].get(key)
+        where = f"{mirror[0]} container {_MIRROR[1]}: {key}"
+        if not isinstance(m_probe, dict):
+            out.append(f"{where} is missing; the api carries one ({api[0]}) (#1174)")
+            continue
+        m_to, a_to = _probe_field(m_probe, "timeoutSeconds"), _probe_field(a_probe, "timeoutSeconds")
+        if m_to < a_to:
+            out.append(
+                f"{where} timeoutSeconds {m_to:g} is below the api's {a_to:g} ({api[0]}); "
+                "the mirror's event loop is the api's (#1174)"
+            )
+        m_b, a_b = probe_budget_s(m_probe), probe_budget_s(a_probe)
+        if m_b < a_b:
+            out.append(
+                f"{where} gives up after {m_b:g} s, below the api's {a_b:g} s ({api[0]}); "
+                "the mirror's cold start is the api's (#1174)"
             )
     return out
 
