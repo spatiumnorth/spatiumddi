@@ -41,6 +41,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cloud DNS servers no longer show unreachable while they work
+  (#1455).** The DNS health task asks a driver for `health_check()` and
+  otherwise sends a SOA query to the server's host and port. No driver
+  had one, so a Cloudflare server was probed as the host `cloudflare` on
+  port 443, which can never answer, and every cloud server (Cloudflare,
+  Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode,
+  Vultr) sat at `unreachable` while its zone list, imports and record
+  pulls succeeded. `CloudDNSDriverBase` now implements `health_check()`
+  on top of the existing credential `probe()`, so health is measured
+  against the provider API the control plane actually drives, and a
+  failure carries the provider's message into the `dns_health_checked`
+  log line. `technitium_api` inherits the same hook and is checked
+  through its HTTP API instead of a SOA query. A test pins the hook on
+  every credentialed agentless driver, so a new provider cannot fall
+  back to the SOA probe.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
