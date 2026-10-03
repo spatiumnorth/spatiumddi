@@ -11,6 +11,10 @@ import { Modal } from "./modal";
  * The reason is optional but strongly encouraged. We surface a faint
  * hint about that in the placeholder but don't enforce — operator
  * judgment wins.
+ *
+ * ``error`` is the caller's failed pause, shown in the dialog (#1344): a
+ * refused or failed pause leaves the dialog open, and without it the
+ * operator was told nothing at all.
  */
 export function PauseServerModal({
   serverName,
@@ -18,12 +22,14 @@ export function PauseServerModal({
   onConfirm,
   onCancel,
   isPending = false,
+  error,
 }: {
   serverName: string;
   serverKind: "DNS" | "DHCP";
   onConfirm: (reason: string) => void;
   onCancel: () => void;
   isPending?: boolean;
+  error?: string | null;
 }) {
   const [reason, setReason] = useState("");
 
@@ -59,6 +65,11 @@ export function PauseServerModal({
             disabled={isPending}
           />
         </div>
+        {error && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

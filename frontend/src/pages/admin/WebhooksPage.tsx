@@ -34,6 +34,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
 
 const inputCls =
@@ -535,7 +536,12 @@ export function WebhooksPage() {
     onConfirm: () => void;
   } | null>(null);
 
-  const { data: subs = [], isLoading } = useQuery({
+  const {
+    data: subs = [],
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["webhooks"],
     queryFn: webhooksApi.list,
   });
@@ -590,6 +596,11 @@ export function WebhooksPage() {
 
         {isLoading ? (
           <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : subs.length === 0 && isError ? (
+          // A refused or failed read is not an empty list (#1343).
+          <div className="rounded-md border bg-muted/20 p-6 text-center text-sm">
+            <ListReadError error={error} what="webhook subscriptions" />
+          </div>
         ) : subs.length === 0 ? (
           <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
             No subscriptions yet. The platform is publishing typed events into

@@ -21,6 +21,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   settingsApi,
   type InfluxDBTarget,
@@ -108,12 +110,18 @@ function relativeTime(iso: string | null): string {
 
 export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
   const qc = useQueryClient();
-  const { data: targets = [], isLoading } = useQuery({
+  const {
+    data: targets = [],
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["influxdb-targets"],
     queryFn: settingsApi.listInfluxTargets,
     // The row carries last-push state written by a beat task, so it goes
-    // stale on its own; refresh while the page is open.
-    refetchInterval: 30000,
+    // stale on its own; refresh while the page is open, unless the read
+    // was refused (#1343).
+    refetchInterval: pollUnlessRefused(30000),
   });
 
   const [editing, setEditing] = useState<
@@ -217,7 +225,12 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
                   colSpan={7}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  No InfluxDB targets configured.
+                  {/* A refused or failed read is not an empty list (#1343). */}
+                  {isError ? (
+                    <ListReadError error={error} what="the InfluxDB targets" />
+                  ) : (
+                    "No InfluxDB targets configured."
+                  )}
                 </td>
               </tr>
             ) : (
