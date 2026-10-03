@@ -12,6 +12,7 @@ import base64
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -20,11 +21,22 @@ from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.idp_metadata_parser import OneLogin_Saml2_IdPMetadataParser
 from onelogin.saml2.settings import OneLogin_Saml2_Settings
 
+from app.config import settings as app_settings
 from app.core.auth.user_sync import ExternalAuthResult
 from app.core.crypto import decrypt_dict
+from app.core.redis_client import make_async_redis
 from app.models.auth_provider import AuthProvider
 
 logger = structlog.get_logger(__name__)
+
+# How long a consumed Assertion's ID is remembered (#1335): until the
+# NotOnOrAfter of its bearer SubjectConfirmationData, which ends the window
+# in which it can be delivered (SAML profiles 4.1.4.5), plus python3-saml's
+# allowed clock drift, so a replica whose clock runs behind cannot take it a
+# second time. The profile requires that NotOnOrAfter; an Assertion without
+# one is remembered for a day.
+_REPLAY_DRIFT_SECONDS = 300
+_REPLAY_FALLBACK_SECONDS = 24 * 3600
 
 
 class SAMLServiceError(Exception):
@@ -153,14 +165,16 @@ def _request_data(host: str, path: str, query: str = "", post: dict | None = Non
     }
 
 
-def build_authorize_url(cfg: SAMLConfig, base_url: str, relay_state: str) -> str:
+def build_authorize_url(cfg: SAMLConfig, base_url: str, relay_state: str) -> tuple[str, str]:
     """Returns the IdP's SSO URL (HTTP-Redirect binding) with a SAMLRequest
-    parameter. ``relay_state`` is the CSRF-like token we round-trip."""
+    parameter, and that AuthnRequest's ID. ``relay_state`` is the CSRF-like
+    token we round-trip; the ID is what the Response must answer (#1335)."""
     settings = OneLogin_Saml2_Settings(_settings_dict(cfg), sp_validation_only=False)
     saml_auth = OneLogin_Saml2_Auth(
         _request_data(base_url, "/api/v1/auth/authorize"), old_settings=settings
     )
-    return saml_auth.login(return_to=relay_state)
+    url = saml_auth.login(return_to=relay_state)
+    return url, saml_auth.get_last_request_id()
 
 
 @dataclass
@@ -168,25 +182,58 @@ class SAMLConsumeResult:
     result: ExternalAuthResult
     relay_state: str | None
     attributes: dict[str, Any]
+    # The Assertion's ID and its bearer SubjectConfirmationData's NotOnOrAfter
+    # (epoch seconds), for ``claim_assertion``.
+    assertion_id: str = ""
+    not_on_or_after: int | None = None
+
+    def replay_window_seconds(self, now: float | None = None) -> int:
+        """How long this Assertion's ID must be remembered (see
+        ``_REPLAY_DRIFT_SECONDS``)."""
+        if self.not_on_or_after is None:
+            return _REPLAY_FALLBACK_SECONDS
+        remaining = self.not_on_or_after - int(time.time() if now is None else now)
+        return max(remaining, 0) + _REPLAY_DRIFT_SECONDS
 
 
-def consume_assertion(cfg: SAMLConfig, base_url: str, post_data: dict) -> SAMLConsumeResult:
+def consume_assertion(
+    cfg: SAMLConfig, base_url: str, post_data: dict, *, request_id: str | None = None
+) -> SAMLConsumeResult:
     """Validate a signed SAML Response and extract claims.
 
     ``post_data`` is the form body from the ACS POST (``SAMLResponse`` +
-    optional ``RelayState``).
+    optional ``RelayState``). ``base_url`` is the one ``cfg`` was built from,
+    so ``cfg.sp_acs_url`` already carries it. ``request_id`` is the ID of the
+    AuthnRequest this sign-in sent: when given, the Response must answer it
+    (#1335).
     """
     settings = OneLogin_Saml2_Settings(_settings_dict(cfg), sp_validation_only=False)
+    # Validate the Response as received at ``cfg.sp_acs_url`` (#1335): the ACS
+    # the metadata and every AuthnRequest advertise, and the route the IdP
+    # posts to. Strict mode checks the Response's ``Destination`` and its
+    # bearer ``Recipient`` against this URL, and a conforming IdP sets both to
+    # the advertised ACS, so any other URL here refuses every sign-in. The ACS
+    # is split as a whole, so a base URL's path prefix stays in the path.
+    acs = urlsplit(cfg.sp_acs_url)
     saml_auth = OneLogin_Saml2_Auth(
-        _request_data(base_url, "/api/v1/auth/acs", post=post_data),
+        _request_data(f"{acs.scheme}://{acs.netloc}", acs.path, post=post_data),
         old_settings=settings,
     )
-    saml_auth.process_response()
+    saml_auth.process_response(request_id=request_id)
 
     errors = saml_auth.get_errors()
     if errors:
         reason = saml_auth.get_last_error_reason() or ", ".join(errors)
         raise SAMLServiceError(f"SAML response rejected: {reason}")
+    # python3-saml refuses an InResponseTo that names another request, but
+    # lets a Response without one through. A Response to this sign-in's
+    # AuthnRequest MUST carry it (SAML core 3.2.2), so one without it answers
+    # nothing this sign-in asked (#1335).
+    if request_id is not None and saml_auth.get_last_response_in_response_to() != request_id:
+        raise SAMLServiceError(
+            "SAML response rejected: it has no InResponseTo, so it does not answer "
+            f"this sign-in's AuthnRequest {request_id}"
+        )
     if not saml_auth.is_authenticated():
         raise SAMLServiceError("SAML response did not authenticate the user")
 
@@ -243,7 +290,37 @@ def consume_assertion(cfg: SAMLConfig, base_url: str, post_data: dict) -> SAMLCo
             "session_index": session_index,
             "raw": attrs,
         },
+        assertion_id=saml_auth.get_last_assertion_id() or "",
+        not_on_or_after=saml_auth.get_last_assertion_not_on_or_after(),
     )
+
+
+async def claim_assertion(consumed: SAMLConsumeResult) -> bool:
+    """Spend a validated Assertion (#1335). True on its first use, so the
+    sign-in may proceed; False when it has signed someone in before, which
+    is a replay the caller must refuse. A bearer Assertion is single-use
+    (SAML profiles 4.1.4.5).
+
+    The same Redis claim as ``auth_throttle.mfa_challenge_consume``, which
+    makes an MFA challenge single-use: ``SET key 1 EX ttl NX`` is atomic, so
+    of two concurrent deliveries exactly one wins, and the key expires by
+    itself once the Assertion could not be delivered anyway. Like that guard
+    it fails open when Redis is unreachable. The Response is still bound to
+    this sign-in's own AuthnRequest by ``consume_assertion``, so replaying it
+    then also takes the browser's own HttpOnly flow cookie, and a holder of
+    that already holds the sign-in."""
+    if not consumed.assertion_id:
+        return False  # the schema requires an ID; a strict parse never gets here
+    key = f"saml_assertion:{consumed.assertion_id}:used"
+    try:
+        r = make_async_redis(app_settings.redis_url, socket_connect_timeout=2)
+        try:
+            return bool(await r.set(key, "1", ex=consumed.replay_window_seconds(), nx=True))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — never block sign-in on a Redis blip
+        logger.warning("saml_replay_guard_redis_unavailable", error=str(exc))
+        return True
 
 
 def sp_metadata_xml(cfg: SAMLConfig) -> str:
