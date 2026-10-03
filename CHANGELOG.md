@@ -41,6 +41,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS record ops reach every server in the order they were queued
+  (#1489).** Reported by @stefanriegel on a three-server Technitium
+  group: after a UniFi sync, records were missing on single servers
+  while SpatiumDDI showed them and every op read `applied`. The sync
+  queued a delete and a create of the same record in one transaction,
+  and ops shipped ordered by `(created_at, id)`: `created_at` is the
+  transaction's start, so the pair tied, and `id` is a random UUID, so
+  each server got the pair in its own random order. Where the delete
+  landed last, the record was gone until the next full zone reconcile.
+  Each op now gets a queue position from a sequence (`seq`), and ops
+  ship in `(created_at, seq)` order. The #1232 supersede rule uses the
+  same order, so a delete that fails is superseded by the create queued
+  after it instead of retrying and removing the record again. Ops from
+  different transactions compare exactly as before.
+
 - **Setting a control-plane VIP installs MetalLB (#1103).** It never
   did on a k3s with Helm 4 inside (klipper-helm): the
   `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
@@ -520,6 +535,10 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
+- `6293ba5af00e` — #1489: `dns_record_op.seq`, nullable, filled from
+  the new sequence `dns_record_op_seq_seq` on insert. No backfill and no
+  table rewrite: ops queued before the upgrade keep NULL and their old
+  order. Downgrade drops the column and the sequence.
 
 ## 2026.10.02-1 — 2026-10-02
 
