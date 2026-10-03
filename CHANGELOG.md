@@ -27,6 +27,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **TACACS+ sign-in works against a server whose profile is keyed on
+  the service (#1336).** After the password was accepted, the product
+  asked the TACACS+ server to authorize the user with no arguments at
+  all, though RFC 8907 says the `service` argument "MUST always be
+  included". Servers key their authorization profiles on it (tac_plus-ng's
+  sample guards its profile with `if (service == shell)`), so the request
+  was denied, the reply carried no `priv-lvl`, no group mapped, and every
+  user was refused "Invalid credentials" (`no_group_mapping_match`).
+  Sign-in worked only against a server that ignores the service. The
+  request now asks to authorize a login shell, `service=shell` with an
+  empty `cmd` (a session rather than one command), as a network device
+  does at login. A server that refuses the shell still leaves the user
+  without a group, and that refusal is now logged
+  (`tacacs_authorization_refused`).
+
 - **A record name the group's BIND would refuse is refused when it
   is saved, not after it has stopped the server (#1378).** The record
   API checked every owner with the RFC 2181 rule, which allows `_`, so
