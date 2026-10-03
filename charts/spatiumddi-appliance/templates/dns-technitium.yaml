@@ -188,6 +188,8 @@ metadata:
 spec:
   {{- if .Values.dns.useMetalLBVIP }}
   type: LoadBalancer
+  # Keep the client's source address — see dns-bind9.yaml.
+  externalTrafficPolicy: Local
   {{- else }}
   type: ClusterIP
   {{- end }}

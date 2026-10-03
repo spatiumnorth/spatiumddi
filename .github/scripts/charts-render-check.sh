@@ -101,6 +101,12 @@ render() { # name chart [helm --set args...]
     # shellcheck disable=SC2086  # POSTURE_ARGS is a deliberate flag list
     python3 "$ROOT/.github/scripts/chart-pod-posture.py" $POSTURE_ARGS "$file" \
         || failures=$((failures + 1))
+    # A MetalLB VIP must keep the client's source address (the DNS VIP's
+    # rate limits, query logs and RPZ hits are all per client). The DHCP
+    # relay VIP is exempt: Kea answers the relay at giaddr, so the packet's
+    # source address is never used.
+    python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
