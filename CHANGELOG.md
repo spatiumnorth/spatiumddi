@@ -41,6 +41,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A server group an appliance cannot carry is refused instead of
+  silently dropped (#1468).** The supervisor writes the assigned DNS or
+  DHCP group's name into the role env and accepts only letters, digits,
+  `.`, `_` and `-`. Anything else, such as a group created in the UI as
+  `UniFi DHCP migration`, was dropped with a warning on every heartbeat,
+  so the agent registered without its group and a fresh server landed in
+  the default group. Assigning such a group to an appliance role (REST
+  and Copilot), or renaming an assigned group to such a name, is now a
+  422 that suggests a valid name. Groups no appliance uses keep free-text
+  names, and re-saving an existing name is still accepted.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
