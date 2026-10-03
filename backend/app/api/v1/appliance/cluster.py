@@ -276,6 +276,10 @@ class WorkloadHealth(BaseModel):
     ready: int
     total: int
     restarts: int
+    # Job pods still running for this component (#1213) — e.g. a CNPG
+    # replica join. Not counted in ready / total; while non-zero the
+    # component reads "degraded" even at ready == total.
+    jobs_running: int = 0
     status: str
 
 

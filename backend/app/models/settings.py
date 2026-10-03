@@ -690,7 +690,9 @@ class PlatformSettings(Base):
             "'" + json.dumps(DEFAULT_UNATTENDED_ORIGINS).replace("'", "''") + "'::jsonb"
         ),
     )
-    # Glob patterns never auto-upgraded (Unattended-Upgrade::Package-Blacklist).
+    # Packages never auto-upgraded (Unattended-Upgrade::Package-Blacklist).
+    # Each entry is a Python regular expression matched from the start of
+    # the package name, NOT a glob (#1384): ``linux-image-``, ``^openssl$``.
     apt_unattended_blocklist: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )

@@ -36,6 +36,7 @@ import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import {
   dnsApi,
+  formatApiError,
   logsApi,
   metricsApi,
   type DNSPendingOpEntry,
@@ -157,8 +158,12 @@ export function ServerDetailModal({
             serverName={server.name}
             serverKind="DNS"
             isPending={pauseMut.isPending}
+            error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
             onConfirm={(reason) => pauseMut.mutate(reason)}
-            onCancel={() => setShowPauseModal(false)}
+            onCancel={() => {
+              setShowPauseModal(false);
+              pauseMut.reset();
+            }}
           />
         )}
         <div className="flex flex-wrap gap-1 border-b">
@@ -586,7 +591,10 @@ function OpRow({ op }: { op: DNSPendingOpEntry }) {
     in_flight: "bg-blue-500/15 text-blue-600",
     applied: "bg-emerald-500/15 text-emerald-600",
     failed: "bg-red-500/15 text-red-600",
+    // #1232 — a newer op for the same RRset delivered this one's change.
+    superseded: "bg-muted text-muted-foreground",
   };
+  const retryIn = fmtUntil(op.next_attempt_at);
   const r = op.record as { name?: string; type?: string; value?: string };
   const recordSummary = r.name
     ? `${r.name} ${r.type ?? ""} ${r.value ?? ""}`.trim()
@@ -609,6 +617,11 @@ function OpRow({ op }: { op: DNSPendingOpEntry }) {
         >
           {op.state.replace("_", " ")}
         </span>
+        {op.state === "pending" && retryIn && (
+          <span className="ml-1.5 text-[10px] text-muted-foreground">
+            retry {retryIn}
+          </span>
+        )}
       </td>
       <td className="px-3 py-1.5 text-right text-xs tabular-nums">
         {op.attempts}
@@ -1200,6 +1213,17 @@ function ErrorBlock() {
       Failed to load — try again
     </div>
   );
+}
+
+/** "in 3m" for a time still ahead, or null once it has passed. */
+function fmtUntil(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return null;
+  const sec = Math.ceil((t - Date.now()) / 1000);
+  if (sec <= 0) return null;
+  if (sec < 60) return `in ${sec}s`;
+  return `in ${Math.ceil(sec / 60)}m`;
 }
 
 function fmtRelative(iso: string | null | undefined): string {

@@ -74,11 +74,29 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # Auth source: local | ldap | oidc
+    # Auth source: local | ldap | oidc | saml | radius | tacacs
     auth_source: Mapped[str] = mapped_column(String(20), nullable=False, default="local")
     external_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True
-    )  # LDAP DN or OIDC sub
+    )  # LDAP DN, OIDC sub, SAML NameID; unique only within its provider
+    # The provider an external account belongs to (#1235). External
+    # identities are keyed on (auth_provider_id, external_id): two providers
+    # of the same type are two authorities, and keying on ``auth_source``
+    # (the TYPE) let one of them log in as the other's users. NULL for a
+    # local account, for an external account that predates this column and
+    # could not be attributed, and for one whose provider was deleted. Such
+    # an account is refused at sign-in (``account_link_required`` or
+    # ``username_collision``) and is attributed only by an administrator's
+    # link (``POST /users/{id}/link-provider``), never by a sign-in: another
+    # provider's identical ``sub`` / DN is not the same person. A deleted
+    # provider's accounts also lose their ``external_id`` (see the provider
+    # delete handler). See ``app.core.auth.user_sync``.
+    auth_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("auth_provider.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -218,9 +236,9 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     # name) so the viewer can show "Logged in via Okta" without a
     # join. ``last_seen_at`` is bumped on each authenticated request
     # (throttled to ~60 s in the auth dep) so the viewer can render
-    # a relative-age hint.
+    # a relative-age hint. As wide as ``auth_provider.name`` (#1337).
     auth_source: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="local", server_default=sa_text("'local'")
+        String(255), nullable=False, default="local", server_default=sa_text("'local'")
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -4,6 +4,7 @@ Re-exports a single ``router`` that combines:
     /api/v1/ai/providers/...  — provider config CRUD (Wave 1)
     /api/v1/ai/tools          — tool catalog introspection (Wave 2)
     /api/v1/ai/mcp            — MCP JSON-RPC endpoint (Wave 2)
+    /api/v1/ai/available      — is a chat possible? any signed-in user (#1345)
     /api/v1/ai/sessions       — chat session CRUD (Wave 3)
     /api/v1/ai/chat           — chat streaming endpoint (Wave 3)
     /api/v1/ai/usage          — usage stats (per-user + admin) (Wave 4)

@@ -295,6 +295,7 @@ def _scrub_dump_text(dump_text: str) -> str:
 
     from app.services.backup.rewrap import (  # noqa: PLC0415
         JSONB_ENCRYPTED_FIELDS,
+        LEGACY_PLAINTEXT_SECRET_COLUMNS,
         _jsonb_secret_sites,
         redactable_columns,
     )
@@ -315,6 +316,11 @@ def _scrub_dump_text(dump_text: str) -> str:
     for table, _pk, enc_col in redactable_columns():
         bare = table.strip('"')
         by_table.setdefault(bare, set()).add(enc_col)
+    # Plaintext leftovers of an expand/contract move (#1364): text, not
+    # bytea, so they are written as NULL rather than an empty bytea.
+    null_by_table: dict[str, set[str]] = {}
+    for table, column in LEGACY_PLAINTEXT_SECRET_COLUMNS:
+        null_by_table.setdefault(table, set()).add(column)
 
     # ``COPY "public"."foo" ("a", "b", ...) FROM stdin;`` — we use
     # ``--quote-all-identifiers`` on the dump, so every name is
@@ -323,6 +329,7 @@ def _scrub_dump_text(dump_text: str) -> str:
     out: list[str] = []
     in_copy_table: str | None = None
     cols_to_scrub: list[int] = []
+    cols_to_null: list[int] = []
     jsonb_cols: list[tuple[int, Any]] = []
 
     for line in dump_text.splitlines(keepends=False):
@@ -333,17 +340,20 @@ def _scrub_dump_text(dump_text: str) -> str:
                 cols_list = [c.strip().strip('"') for c in m.group(2).split(",")]
                 scrub_set = by_table.get(table, set())
                 cols_to_scrub = [i for i, c in enumerate(cols_list) if c in scrub_set]
+                null_set = null_by_table.get(table, set())
+                cols_to_null = [i for i, c in enumerate(cols_list) if c in null_set]
                 jsonb_cols = [
                     (i, spec)
                     for i, c in enumerate(cols_list)
                     if (spec := jsonb_by_table.get(table, {}).get(c)) is not None
                 ]
-                if cols_to_scrub or jsonb_cols:
+                if cols_to_scrub or cols_to_null or jsonb_cols:
                     in_copy_table = table
             out.append(line)
         elif line == r"\.":
             in_copy_table = None
             cols_to_scrub = []
+            cols_to_null = []
             jsonb_cols = []
             out.append(line)
         else:
@@ -351,6 +361,9 @@ def _scrub_dump_text(dump_text: str) -> str:
             for i in cols_to_scrub:
                 if i < len(parts) and parts[i] != r"\N":
                     parts[i] = r"\\x"
+            for i in cols_to_null:
+                if i < len(parts):
+                    parts[i] = r"\N"
             for idx, spec in jsonb_cols:
                 if not (0 <= idx < len(parts)):
                     continue

@@ -42,7 +42,7 @@ from pathlib import Path
 
 import structlog
 
-from . import appliance_state, k8s_api
+from . import appliance_state, cp_tls, k8s_api
 
 
 @dataclass(frozen=True)
@@ -209,7 +209,7 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     here we only override what changes per-appliance (per-role
     enabled flags + agent keys + group names + control-plane URL).
     """
-    control_plane_url = env_vars.get("CONTROL_PLANE_URL") or os.environ.get("CONTROL_PLANE_URL", "")
+    control_plane_url = role_control_plane_url(env_vars)
     image_tag = role_image_tag(env_vars)
 
     # Phase 10 wave 2 — ``enabled`` flags here are RELEASE-ownership
@@ -271,6 +271,12 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
         "priorityClasses": {
             "create": False,
             "external": True,
+        },
+        # #1281 — the role agents on the external URL verify against this
+        # supervisor's pin, unless this supervisor was started with the skip:
+        # then it pins nothing, and the agents would wait for ever.
+        "controlPlaneTls": {
+            "insecureSkipVerify": cp_tls.skip_verify(),
         },
         "agentLanding": {
             "enabled": False,
@@ -378,6 +384,22 @@ def _chart_digest() -> str:
     return digest
 
 
+def role_control_plane_url(env_vars: dict[str, str]) -> str:
+    """The control-plane URL the role agents are given (#1281).
+
+    Off-cluster, the operator's URL, which the chart verifies against this
+    supervisor's pinned certificate. On a control-plane member, empty, so the
+    chart falls through to the in-cluster api Service over plain HTTP, the
+    path a full-stack node's agents already take. It has to: a member's
+    supervisor heartbeats in-cluster and so never re-pins, while a member
+    joining re-mints the Web UI certificate, so agents verifying the external
+    URL against that pin would fail on the first join after a promotion.
+    """
+    if appliance_state.is_control_plane_member():
+        return ""
+    return env_vars.get("CONTROL_PLANE_URL") or os.environ.get("CONTROL_PLANE_URL", "")
+
+
 def role_release_fingerprint(env_file: Path) -> str:
     """What the role apply renders beyond the role env itself (#1203).
 
@@ -387,9 +409,21 @@ def role_release_fingerprint(env_file: Path) -> str:
     upgrade, and the agent DaemonSets kept the previous release's chart and
     images. Both change only with a slot upgrade, so steady-state heartbeats
     still skip, and the first heartbeat on a new slot re-applies once.
+
+    The agents' control-plane URL is in it too (#1281): it changes when the
+    node is promoted into the control plane, with nothing in the role env
+    moving, and without it the agents would keep verifying the external URL
+    against a pin their supervisor no longer maintains. So is whether this
+    supervisor skips verification, which decides between the pin and the
+    skip in the agents' pods.
     """
-    tag = role_image_tag(_parse_env_file(env_file))
-    return f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
+    env_vars = _parse_env_file(env_file)
+    tag = role_image_tag(env_vars)
+    return (
+        f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
+        f"control_plane_url={role_control_plane_url(env_vars)}\n"
+        f"skip_tls_verify={cp_tls.skip_verify()}\n"
+    )
 
 
 def role_label_diff(profiles: list[str]) -> dict[str, str | None]:

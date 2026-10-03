@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import encrypt_str
 from app.drivers.dns.base import RecordData
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.services.dns import drift as drift_mod
@@ -34,7 +35,7 @@ async def _group_server_zone(
     group = DNSServerGroup(
         name=f"g-{uuid.uuid4().hex[:6]}",
         tsig_key_name="spatium-test",
-        tsig_key_secret="c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE=",
+        tsig_key_secret_encrypted=encrypt_str("c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE="),
     )
     db.add(group)
     await db.flush()

@@ -5,9 +5,10 @@ underlying ``tacacs_plus`` library does blocking TCP I/O. See
 ``backend/app/api/v1/auth/router.py`` for the async wrapper used at login.
 
 TACACS+ authorization is a separate round-trip: after ``authenticate()``
-returns valid, we call ``authorize()`` with an empty arg list and extract
-AV-pairs from the response. The ``priv-lvl`` AV pair is conventional; admins
-can also populate a custom ``group`` pair on the TACACS+ server.
+returns valid, we ask ``authorize()`` to authorize a login shell
+(``service=shell``, ``cmd=``; RFC 8907 section 8.2) and extract AV-pairs from
+the response. The ``priv-lvl`` AV pair is conventional; admins can also
+populate a custom ``group`` pair on the TACACS+ server.
 
 Manual test recipe (requires a reachable TACACS+ server):
     $ python -c "from app.core.auth.tacacs import authenticate_tacacs; \\
@@ -30,6 +31,17 @@ from app.core.crypto import decrypt_dict
 from app.models.auth_provider import AuthProvider
 
 logger = structlog.get_logger(__name__)
+
+
+# What a sign-in asks the server to authorize: a login shell, the session a
+# network device asks for when a user logs in. RFC 8907 section 8.2: the
+# ``service`` argument "MUST always be included", and ``cmd`` "MUST be
+# specified if service equals "shell"", with an empty value for session-based
+# (rather than per-command) authorization. Servers key their authorization
+# profiles on ``service`` (tac_plus-ng's sample: ``if (service == shell)``),
+# so a request without it is refused, the reply carries no ``priv-lvl``, and
+# no group maps (#1336). Both are mandatory (``=``), as the RFC words them.
+LOGIN_AUTHORIZATION_ARGS: tuple[bytes, ...] = (b"service=shell", b"cmd=")
 
 
 class TACACSServiceError(Exception):
@@ -216,10 +228,24 @@ def authenticate_tacacs(
     groups: list[str] = []
     try:
         assert client is not None
-        author_reply = client.authorize(username, arguments=[])
+        author_reply = client.authorize(username, arguments=list(LOGIN_AUTHORIZATION_ARGS))
         if getattr(author_reply, "valid", False):
             args = getattr(author_reply, "arguments", None) or []
             groups = _extract_groups(args, cfg.attr_groups)
+        else:
+            # The server refused to authorize a login shell for this user, so
+            # no AV-pair maps and the sign-in ends in no_group_mapping_match.
+            # Say so here: the server's log is otherwise the only place it shows.
+            server_msg = getattr(author_reply, "server_msg", b"") or b""
+            if isinstance(server_msg, bytes):
+                server_msg = server_msg.decode(errors="replace")
+            logger.warning(
+                "tacacs_authorization_refused",
+                provider=provider.name,
+                username=username,
+                status=getattr(author_reply, "status", None),
+                server_msg=str(server_msg)[:200],
+            )
     except Exception as exc:  # noqa: BLE001 — no-authorize TACACS+ servers exist
         logger.warning(
             "tacacs_authorize_failed",

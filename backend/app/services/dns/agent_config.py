@@ -22,7 +22,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
@@ -67,7 +67,14 @@ from app.services.dns.pool_geo import (
     records_for_view,
     view_renders_zone,
 )
-from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.powerdns_alias import alias_resolver
+from app.services.dns.record_ops import (
+    QUEUED_OP_STATES,
+    RRSET_KEY_CHUNK,
+    op_rrset_key,
+    rrset_match_where,
+    supersede,
+)
 from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
@@ -543,12 +550,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
     tsig_keys: list[dict[str, Any]] = []
-    if grp and grp.tsig_key_name and grp.tsig_key_secret:
+    if (group_key := legacy_group_key(grp)) is not None:
         tsig_keys.append(
             {
-                "name": grp.tsig_key_name,
-                "secret": grp.tsig_key_secret,
-                "algorithm": grp.tsig_key_algorithm,
+                "name": group_key.name,
+                "secret": group_key.secret,
+                "algorithm": group_key.algorithm,
             }
         )
 
@@ -654,6 +661,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if server.driver == "powerdns":
+        # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
+        # forwarders, or "" for ALIAS off. Never a built-in public resolver.
+        # PowerDNS-only, so no other driver's structural etag moves with it.
+        options_block["alias_resolver"] = alias_resolver(
+            getattr(opts, "forwarders", []) if opts else [],
+            getattr(opts, "forward_transport", "do53") if opts else "do53",
+        )
     # Built from the unified descriptor list so operator split-horizon
     # views (issue #24), synthesized geo views + the geo catch-all
     # (issue #530) all render. Already ordered low→high so the rendered
@@ -682,7 +697,8 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # no legacy key ships none, and its views render as before. The secret rides
     # the bundle body under the same trust model as ``tsig_keys``, and
     # ``views`` is structural, so a group-key rotation re-renders the views.
-    group_key = legacy_group_key(grp)
+    # ``group_key`` is the legacy key resolved for ``tsig_keys`` above; it is
+    # not re-read here, so the secret is decrypted once per render.
     if group_key is not None:
         for view_entry in views_block:
             vkey = view_transfer_key(group_key, view_entry["name"])
@@ -1091,8 +1107,11 @@ async def page_pending_ops(
     with the gate in place a secondary's ops sat in ``state=pending``
     forever. Marked ``in_flight`` on dispatch so the same op doesn't re-ship
     on every long-poll cycle until the agent's next heartbeat acks it; a
-    failure ack resets it to pending (attempt++), and after 5 failures it
-    becomes ``failed`` and stays out.
+    failure ack returns it to pending with a backoff, and after
+    ``MAX_OP_ATTEMPTS`` it becomes ``failed`` (#1232). One never acknowledged
+    is returned to the retry path by the heartbeat
+    (``record_ops.reset_unacknowledged_ops``), and an op backing off is
+    retired (``superseded``) once a newer op for its RRset ships.
 
     One PAGE of the queue, never the whole backlog: the agent applies a page
     and acks it on its next heartbeat; the page it was shipped is
@@ -1119,8 +1138,14 @@ async def page_pending_ops(
     """
     if server.maintenance_mode:
         return [], 0
+    now = datetime.now(UTC)
     batch = max(1, int(settings.dns_agent_ops_batch))
-    conds: list[Any] = [DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending"]
+    conds: list[Any] = [
+        DNSRecordOp.server_id == server.id,
+        DNSRecordOp.state == "pending",
+        # #1232 — an op backing off after a failed attempt waits its turn.
+        or_(DNSRecordOp.next_attempt_at.is_(None), DNSRecordOp.next_attempt_at <= now),
+    ]
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
@@ -1136,6 +1161,7 @@ async def page_pending_ops(
         remaining = int((await db.execute(select(func.count()).where(*conds))).scalar_one()) - len(
             ops_to_dispatch
         )
+    await _supersede_backed_off_ops(db, server, ops_to_dispatch, now)
     page: list[dict[str, Any]] = []
     for op in ops_to_dispatch:
         page.append(
@@ -1145,12 +1171,62 @@ async def page_pending_ops(
                 "op": op.op,
                 "record": op.record,
                 "target_serial": op.target_serial,
+                # #1232 — which dispatch this is; the agent echoes it in its
+                # ack, so a late ack for an earlier dispatch is not charged
+                # to this one.
+                "dispatch": op.attempts,
             }
         )
         op.state = "in_flight"
+        # The dispatch time: the stale-``in_flight`` reset measures from it.
+        op.updated_at = now
     if ops_to_dispatch:
         await db.flush()
     return page, remaining
+
+
+async def _supersede_backed_off_ops(
+    db: AsyncSession, server: DNSServer, shipping: list[DNSRecordOp], now: datetime
+) -> None:
+    """Retire an op waiting out a backoff once a newer op for its RRset ships.
+
+    Every op carries the whole desired RRset (#773), so the newer op delivers
+    the older one's change; left alone, the older op would retry after it and
+    put the RRset back the way it was. Only ops still backing off are
+    candidates — anything older and ready ships ahead in the same page — and
+    only those for an RRset in this page, matched in SQL: a bulk backlog that
+    failed can leave hundreds of thousands of ops backing off, and loading
+    them on every page is what paging exists to avoid. Strictly older only;
+    ops queued by one transaction share ``created_at``.
+    """
+    newest: dict[tuple[str, str, str], DNSRecordOp] = {}
+    for op in shipping:
+        key = op_rrset_key(op)
+        if key is not None:
+            newest[key] = op  # the page is oldest-first; the last one wins
+    if not newest:
+        return
+    keys = sorted(newest)
+    for i in range(0, len(keys), RRSET_KEY_CHUNK):
+        waiting = (
+            (
+                await db.execute(
+                    select(DNSRecordOp).where(
+                        DNSRecordOp.server_id == server.id,
+                        DNSRecordOp.state == "pending",
+                        DNSRecordOp.next_attempt_at > now,
+                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for op in waiting:
+            key = op_rrset_key(op)
+            successor = newest.get(key) if key is not None else None
+            if successor is not None and successor.created_at > op.created_at:
+                supersede(op, successor.id, now)
 
 
 def compose_bundle(

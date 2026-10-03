@@ -8,7 +8,7 @@ via ``execution_options(include_deleted=True)``.
 Cascading: when soft-deleting a parent (IPSpace / IPBlock / Subnet / DNSZone /
 DHCPScope) we walk every descendant in scope and stamp them with the same
 ``deleted_at`` + ``deletion_batch_id``. ``DNSRecord`` cascades from a parent
-DNSZone; ``DHCPPool`` + ``DHCPStaticAssignment`` cascade from a parent
+DNSZone, stamped set-based rather than walked (``BulkChild``, #1231); ``DHCPPool`` + ``DHCPStaticAssignment`` cascade from a parent
 DHCPScope (#617 — a scope used to be treated as a leaf, which left its pools
 and reservations as live, un-stamped rows pointing at a hidden parent: still
 enforcing group-wide MAC uniqueness and still answering ``GET
@@ -35,8 +35,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
@@ -93,9 +94,53 @@ class SoftDeleteRow:
 
 
 @dataclass
+class BulkChild:
+    """Children stamped by one set-based UPDATE instead of being loaded (#1231).
+
+    A zone's records. Loading each one, stamping it through the ORM and
+    writing one audit row per record made the default zone delete a single
+    transaction proportional to the zone, holding the global audit lock for
+    every hash: on a 250k-record zone, minutes. The records are stamped with
+    one statement instead, and counted on the parent's own audit row.
+    """
+
+    parent: Any
+    model: type
+    fk_column: str
+    resource_type: str
+    count: int
+
+
+@dataclass
 class SoftDeleteBatch:
     batch_id: uuid.UUID
     rows: list[SoftDeleteRow] = field(default_factory=list)
+    bulk: list[BulkChild] = field(default_factory=list)
+
+    def counts(self) -> dict[str, int]:
+        """Rows per resource type, set-based children included."""
+        out: dict[str, int] = {}
+        for row in self.rows:
+            out[row.resource_type] = out.get(row.resource_type, 0) + 1
+        for child in self.bulk:
+            out[child.resource_type] = out.get(child.resource_type, 0) + child.count
+        return out
+
+    def audit_old_value(self, row: SoftDeleteRow) -> dict[str, Any]:
+        """The ``old_value`` for ``row``'s soft-delete audit entry.
+
+        A parent whose children were stamped set-based carries their count,
+        since they get no audit row of their own (#1231).
+        """
+        value: dict[str, Any] = {"deletion_batch_id": str(self.batch_id)}
+        cascaded = {
+            child.resource_type: child.count
+            for child in self.bulk
+            if child.parent is row.obj and child.count
+        }
+        if cascaded:
+            value["cascaded"] = cascaded
+        return value
 
 
 def _row_display(obj: Any) -> str:
@@ -108,7 +153,7 @@ def _row_display(obj: Any) -> str:
     if isinstance(obj, DNSZone):
         return obj.name
     if isinstance(obj, DNSRecord):
-        return f"{obj.fqdn} {obj.record_type}"
+        return _record_label(obj.fqdn, obj.record_type)
     if isinstance(obj, DHCPScope):
         return obj.name or str(obj.id)
     if isinstance(obj, DHCPPool):
@@ -187,25 +232,38 @@ async def _collect_descendants(db: AsyncSession, root: Any) -> list[Any]:
             select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == root.id)
         )
         out.extend(static_res.scalars().all())
-    elif isinstance(root, DNSZone):
-        rec_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == root.id))
-        for record in rec_res.scalars().all():
-            out.append(record)
+    # A DNSZone's records are not loaded here: they are stamped set-based by
+    # ``apply_soft_delete`` (see ``BulkChild`` and ``_attach_bulk``).
     return out
+
+
+async def _attach_bulk(db: AsyncSession, batch: SoftDeleteBatch, objs: list[Any]) -> None:
+    """Register the set-based children of every zone among ``objs`` (#1231)."""
+    for obj in objs:
+        if isinstance(obj, DNSZone):
+            count = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(DNSRecord)
+                    .where(DNSRecord.zone_id == obj.id, DNSRecord.deleted_at.is_(None))
+                )
+            ).scalar_one()
+            batch.bulk.append(
+                BulkChild(
+                    parent=obj,
+                    model=DNSRecord,
+                    fk_column="zone_id",
+                    resource_type="dns_record",
+                    count=int(count or 0),
+                )
+            )
 
 
 async def collect_soft_delete_batch(db: AsyncSession, root: Any) -> SoftDeleteBatch:
     """Build a fresh batch covering ``root`` + every cascade descendant."""
 
     batch = SoftDeleteBatch(batch_id=uuid.uuid4())
-    descendants = await _collect_descendants(db, root)
-    for obj in descendants:
-        batch.rows.append(
-            SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
-        )
-    batch.rows.append(
-        SoftDeleteRow(obj=root, resource_type=_resource_type(root), display=_row_display(root))
-    )
+    await add_to_batch(db, batch, root)
     return batch
 
 
@@ -217,23 +275,49 @@ async def add_to_batch(db: AsyncSession, batch: SoftDeleteBatch, root: Any) -> N
     shows one deletion and one restore brings both back, records included.
     """
 
-    for obj in await _collect_descendants(db, root):
+    objs = [*await _collect_descendants(db, root), root]
+    for obj in objs:
         batch.rows.append(
             SoftDeleteRow(obj=obj, resource_type=_resource_type(obj), display=_row_display(obj))
         )
-    batch.rows.append(
-        SoftDeleteRow(obj=root, resource_type=_resource_type(root), display=_row_display(root))
-    )
+    await _attach_bulk(db, batch, objs)
 
 
-def apply_soft_delete(batch: SoftDeleteBatch, user_id: uuid.UUID | None) -> datetime:
-    """Stamp every row in the batch. Caller is responsible for the audit log + commit."""
+async def apply_soft_delete(
+    db: AsyncSession, batch: SoftDeleteBatch, user_id: uuid.UUID | None
+) -> datetime:
+    """Stamp every row in the batch. Caller is responsible for the audit log + commit.
+
+    Set-based children are stamped with one UPDATE per parent. Only rows
+    still live are touched, so a record trashed earlier keeps its own batch
+    and comes back with that one, not this.
+    """
 
     now = datetime.now(UTC)
     for row in batch.rows:
         row.obj.deleted_at = now
         row.obj.deleted_by_user_id = user_id
         row.obj.deletion_batch_id = batch.batch_id
+    for child in batch.bulk:
+        fk = getattr(child.model, child.fk_column)
+        # "evaluate", not False: it walks only the identity map, never the
+        # matched rows, and keeps any record already loaded in this session
+        # from reading as live after the stamp.
+        result = await db.execute(
+            update(child.model)
+            .where(fk == child.parent.id, child.model.deleted_at.is_(None))
+            .values(
+                deleted_at=now,
+                deleted_by_user_id=user_id,
+                deletion_batch_id=batch.batch_id,
+            )
+            .execution_options(synchronize_session="evaluate")
+        )
+        # The rows actually stamped, not the count taken at collect time: a
+        # record committed in between rides this batch and must be counted
+        # on the parent's audit row.
+        if result.rowcount is not None and result.rowcount >= 0:
+            child.count = int(result.rowcount)
     return now
 
 
@@ -258,31 +342,142 @@ async def batch_resource_types(db: AsyncSession, batch_id: uuid.UUID) -> set[str
     return types
 
 
+@dataclass
+class RestoreResult:
+    """What :func:`restore_batch` did.
+
+    ``restored`` are the rows un-stamped through the ORM. A restored zone's
+    records are not among them: they are un-stamped by one UPDATE per zone
+    and counted in ``bulk`` under the zone's id (#1389), mirroring how the
+    delete stamped them (#1231).
+    """
+
+    restored: list[Any] = field(default_factory=list)
+    conflicts: list[dict[str, str]] = field(default_factory=list)
+    bulk: dict[uuid.UUID, dict[str, int]] = field(default_factory=dict)
+
+    @property
+    def total(self) -> int:
+        """Every row restored, set-based children included."""
+        return len(self.restored) + sum(n for c in self.bulk.values() for n in c.values())
+
+    def audit_new_value(self, obj: Any, batch_id: uuid.UUID) -> dict[str, Any]:
+        """The ``new_value`` for ``obj``'s restore audit entry.
+
+        A parent whose children were restored set-based carries their count,
+        since they get no audit row of their own.
+        """
+        value: dict[str, Any] = {"deletion_batch_id": str(batch_id)}
+        children = self.bulk.get(getattr(obj, "id", None))  # type: ignore[arg-type]
+        if children:
+            value["restored"] = dict(children)
+        return value
+
+
+def _record_label(fqdn: str, record_type: str) -> str:
+    return f"{fqdn} {record_type}"
+
+
+def _live_duplicate_exists(batch_id: uuid.UUID) -> Any:
+    """``EXISTS`` a live record with the same identity as the ``DNSRecord`` row.
+
+    The set-based form of the record conflict rule (#1389): a per-record
+    ``SELECT`` made restoring a 250k-record zone 250k queries. Identity is the
+    one ``find_identical_record`` refuses a duplicate on (#1230), so a restore
+    cannot bring back the twins a create would have refused: the view, the
+    owner name compared case-insensitively, the type, the value after
+    trimming, and the structured fields. Under split-horizon the same record
+    in two views is two records, and an MX or SRV with the same target at
+    another priority, weight or port is another record, not a clash.
+
+    Postgres turns this into a semi-join; the ``=`` clauses on zone, name,
+    type and value are what it can hash on. The inner side is limited to the
+    batch's zones so that hash covers them, not every live record installed.
+    """
+    live = aliased(DNSRecord)
+    batch = aliased(DNSRecord)
+    batch_zones = select(batch.zone_id).where(batch.deletion_batch_id == batch_id)
+    return (
+        select(live.id)
+        .where(
+            live.deleted_at.is_(None),
+            live.zone_id.in_(batch_zones),
+            live.zone_id == DNSRecord.zone_id,
+            func.lower(live.name) == func.lower(DNSRecord.name),
+            func.upper(live.record_type) == func.upper(DNSRecord.record_type),
+            func.btrim(live.value) == func.btrim(DNSRecord.value),
+            live.view_id.is_not_distinct_from(DNSRecord.view_id),
+            live.priority.is_not_distinct_from(DNSRecord.priority),
+            live.weight.is_not_distinct_from(DNSRecord.weight),
+            live.port.is_not_distinct_from(DNSRecord.port),
+            live.id != DNSRecord.id,
+        )
+        .exists()
+    )
+
+
+async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.UUID, str]:
+    """The batch's records a live record already duplicates, in one query.
+
+    Returns ``{record id: label}``.
+    """
+    stmt: Any = (
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type)
+        .where(DNSRecord.deletion_batch_id == batch_id, _live_duplicate_exists(batch_id))
+        .execution_options(include_deleted=True)
+    )
+    return {
+        row_id: _record_label(fqdn, record_type)
+        for row_id, fqdn, record_type in (await db.execute(stmt)).tuples()
+    }
+
+
 async def restore_batch(
     db: AsyncSession,
     batch_id: uuid.UUID,
     *,
     conflict_check: Callable[[Any], Awaitable[str | None]] | None = None,
     skip_conflicts: bool = False,
-) -> tuple[list[Any], list[dict[str, str]]]:
+) -> RestoreResult:
     """Restore every row sharing ``batch_id``.
 
-    Returns ``(restored_objs, conflicts)``. By default a non-empty
-    ``conflicts`` means NOTHING was restored and the caller should 409 with
-    the list — right for a cascade batch (a zone with a hole is worse than a
-    refusal). With ``skip_conflicts`` the conflicting rows are left in the
-    trash and every other row is restored — the shape a bulk record delete
-    (#963) needs, where the rows are independent siblings and one hand-made
-    duplicate must not pin the other N in the trash forever.
+    By default a non-empty ``conflicts`` means NOTHING was restored and the
+    caller should 409 with the list — right for a cascade batch (a zone with a
+    hole is worse than a refusal). With ``skip_conflicts`` the conflicting rows
+    are left in the trash and every other row is restored — the shape a bulk
+    record delete (#963) needs, where the rows are independent siblings and one
+    hand-made duplicate must not pin the other N in the trash forever.
+
+    Records are checked set-based by ``_record_conflicts`` whenever
+    ``conflict_check`` is given, not by ``conflict_check`` itself, and the
+    records of a zone restored in the same batch are un-stamped by one UPDATE
+    per zone rather than loaded (#1389). Records whose zone is not in the batch
+    (a #963 bulk record delete) are still loaded: the caller re-pushes them to
+    agentless providers. Every other type keeps the per-row path, where the
+    conflict rules are richer and the batches small.
     """
 
-    restored: list[Any] = []
-    conflicts: list[dict[str, str]] = []
+    result = RestoreResult()
+    record_conflicts: dict[uuid.UUID, str] = {}
+    if conflict_check is not None:
+        record_conflicts = await _record_conflicts(db, batch_id)
+        result.conflicts.extend(
+            {
+                "type": "dns_record",
+                "id": str(rid),
+                "display": label,
+                "reason": "An identical record already exists in zone",
+            }
+            for rid, label in record_conflicts.items()
+        )
 
     # Look up every row across all in-scope models. Each query opts into
     # include_deleted so it can see soft-deleted rows; without that the
     # global filter hides them.
+    zone_ids: list[uuid.UUID] = []
     for resource_type, model in TYPE_TO_MODEL.items():
+        if model is DNSRecord:
+            continue  # below, once every zone in the batch is known
         stmt: Any = (
             select(model)
             .where(model.deletion_batch_id == batch_id)
@@ -293,7 +488,7 @@ async def restore_batch(
             if conflict_check is not None:
                 reason = await conflict_check(obj)
                 if reason:
-                    conflicts.append(
+                    result.conflicts.append(
                         {
                             "type": resource_type,
                             "id": str(obj.id),
@@ -302,17 +497,50 @@ async def restore_batch(
                         }
                     )
                     continue
-            restored.append(obj)
+            result.restored.append(obj)
+            if isinstance(obj, DNSZone):
+                zone_ids.append(obj.id)
 
-    if conflicts and not skip_conflicts:
-        return [], conflicts
+    # Records whose zone is restored with them are left to the UPDATE below;
+    # the rest are loaded.
+    rec_stmt: Any = select(DNSRecord).where(DNSRecord.deletion_batch_id == batch_id)
+    if zone_ids:
+        rec_stmt = rec_stmt.where(DNSRecord.zone_id.not_in(zone_ids))
+    records = await db.execute(rec_stmt.execution_options(include_deleted=True))
+    result.restored.extend(r for r in records.scalars().all() if r.id not in record_conflicts)
 
-    for obj in restored:
+    if result.conflicts and not skip_conflicts:
+        return RestoreResult(conflicts=result.conflicts)
+
+    for zone_id in zone_ids:
+        where = [DNSRecord.zone_id == zone_id, DNSRecord.deletion_batch_id == batch_id]
+        # "evaluate" walks only the identity map, so a record already loaded
+        # in this session does not keep reading as trashed after the UPDATE.
+        sync = "evaluate"
+        if record_conflicts:
+            # Only with skip_conflicts. The duplicates are excluded by the same
+            # predicate that found them, not by a list of ids, which on a large
+            # zone would exceed the driver's bind-parameter limit. Python cannot
+            # evaluate a correlated EXISTS, hence "fetch".
+            where.append(~_live_duplicate_exists(batch_id))
+            sync = "fetch"
+        updated = await db.execute(
+            update(DNSRecord)
+            .where(*where)
+            .values(deleted_at=None, deleted_by_user_id=None, deletion_batch_id=None)
+            .execution_options(synchronize_session=sync)
+        )
+        # Same guard as the delete side: a driver that cannot report a count
+        # answers -1, which must not be added to the total.
+        if updated.rowcount is not None and updated.rowcount > 0:
+            result.bulk[zone_id] = {"dns_record": int(updated.rowcount)}
+
+    for obj in result.restored:
         obj.deleted_at = None
         obj.deleted_by_user_id = None
         obj.deletion_batch_id = None
 
-    return restored, conflicts
+    return result
 
 
 async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
@@ -371,20 +599,8 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
 
-    elif isinstance(obj, DNSRecord):
-        existing = (
-            await db.execute(
-                select(DNSRecord).where(
-                    DNSRecord.zone_id == obj.zone_id,
-                    DNSRecord.name == obj.name,
-                    DNSRecord.record_type == obj.record_type,
-                    DNSRecord.value == obj.value,
-                    DNSRecord.id != obj.id,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            return "An identical record already exists in zone"
+    # DNSRecord is checked set-based for the whole batch by
+    # ``_record_conflicts`` (#1389), which ``restore_batch`` runs itself.
 
     elif isinstance(obj, DHCPScope):
         existing = (

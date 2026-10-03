@@ -1551,7 +1551,7 @@ tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
 - nftables base-config strip — `/etc/nftables.conf` currently has hardcoded DNS / DHCP / HTTP "belt-and-braces" rules from the pre-#170 5-role world; on Application appliances the supervisor's drop-in should be the sole source of truth so the operator can verify role-driven rules are actually being enforced.
 - Per-appliance scoped agent keys — current implementation passes the platform-wide global `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`; a per-appliance scoped key would limit blast radius if a supervisor cert ever leaked.
 - Host-OS config plane (#155–#166) — **APT sources / proxy / GPG keys + private-mirror auth landed in 2026.06.19-1 (#155)** via `platform_settings.apt_*` → `apt_bundle` heartbeat → the `spatiumddi-apt-reload` host runner (staged `apt-get update` validate-before-swap), joining the already-shipped SNMP / NTP / SSH / resolver / syslog planes. Still pending on the same `ConfigBundle long-poll → trigger-file → host runner` pattern: static routes and the remaining #156–#166 surfaces.
-- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist globs), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
+- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist entries: Python regular expressions matched from the start of the package name, not globs, and refused at save when they do not compile, #1384), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
 
 ---
 
@@ -2580,8 +2580,10 @@ introduced by an upgrade don't clobber operator-created ones.
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken): no commit happens. Next reboot reverts to the
-   previous `saved_entry` automatically. Worst case is one
-   wasted reboot.
+   previous `saved_entry` automatically. If the new slot's
+   migrate step had already run, the reverted release cannot
+   start on the migrated database: see
+   [Rolling back](#rolling-back-the-database-stays-on-var-1227).
 
 **CLI access (for emergency / scripted upgrades):**
 
@@ -2639,6 +2641,82 @@ amd64.raw.xz` with the kernel + initrd baked in + the image-
 baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
+
+### Rolling back: the database stays on `/var` (#1227)
+
+A slot swap replaces the root filesystem. PostgreSQL lives on the
+persistent `/var`, so it does not go back with the slot. An upgrade's
+migrate step moves the schema forward, and the release you left cannot
+run on that schema afterwards. Alembic cannot migrate backwards from a
+revision it has never heard of. Its migrate Job fails with
+`Can't locate revision`, its api / worker / beat wait for migrate
+forever, and on a single node the newer release's api keeps serving
+behind the older UI. Nothing retries.
+
+**What is checked before you go back.** Every path that moves a
+control-plane node to an older release first compares the database's
+schema revision with the one that release was built with:
+
+- `POST /api/v1/appliance/slot-upgrade/rollback`;
+- **Fleet → set next boot / set default** onto the other slot
+  (`/appliances/{id}/set-next-boot`, `/set-default-slot`);
+- **Fleet → Schedule OS upgrade** with an image older than the one
+  running (`/appliances/{id}/upgrade`).
+
+When the older release cannot run on the database, the request is
+refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
+naming both revisions. The Fleet UI shows that as a confirmation. To go
+ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
+that if you will restore a copy of the database from before the
+upgrade. Data-plane appliances are never checked, because their release
+does not touch the database. Pointing a node at the slot it already
+runs, which commits a trial boot, is not checked either.
+
+The revision each release was built with comes from two places.
+`backend/app/data/release_schema_heads.json` is generated from the
+release tags by `scripts/release_schema_heads.py`, and for a release it
+lists it is the answer. Every release also records its own when it
+starts, once the schema is at its head, in the `release_schema_head`
+table, which is what covers nightly and dev builds no tag names. An api
+records the booted slot's version only when that slot is its own
+release: after a rollback to a slot whose release cannot migrate, the
+newer release's api keeps running there, and recording the older
+version against its own head would let the next rollback to it through.
+A release in neither, such as an older nightly, is reported as `unknown`, and the
+switch goes ahead: refusing on "don't know" would block every rollback
+on an install that never recorded anything.
+
+**What is not covered.** The trial-boot auto-revert (step 8 above)
+happens on the host with no operator involved, so nothing can refuse
+it. No database snapshot is taken before an upgrade yet, so there is
+nothing to restore automatically. The rolling-upgrade preflight's
+`pre_upgrade_backup` row warns when no backup target has succeeded in
+the last 24 hours. Run one before starting.
+
+**Coming from 2026.09.04-1 or earlier: do not go back to it.** Take a
+backup before the upgrade. 2026.10.02-1 adds 22 migrations that
+2026.09.04-1 cannot run on, and 2026.09.04-1 predates both the check
+above and the clearer migrate error, so a trial-boot revert or a
+Compose / Helm redeploy of it leaves the control plane down with only
+`Can't locate revision` to go on. Its chart also lacks the #1042 fix,
+so a reinstall during the rollback can mint a new `SECRET_KEY` and
+leave every credential encrypted at rest unreadable. If you must go
+back, restore the pre-upgrade backup together with the older release.
+
+**If an appliance is already stuck.** The older release's
+`wait-for-migrate` init container prints the cause once, including
+`The database was migrated by a NEWER SpatiumDDI release`, then keeps
+logging `current=<written by a newer release, see above>`:
+
+```bash
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
+```
+
+Re-applying the newer release recovers it. Its migrate step finds
+nothing to do, and every workload rolls out:
+`POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
+**Schedule OS upgrade** in the Fleet UI. The only other way out is to
+restore a pre-upgrade copy of the database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
@@ -3187,10 +3265,31 @@ unconditionally, and nothing was pinned in its place).
 **Limit, stated plainly.** Trust on first use is as good as the first
 contact. An attacker on the path at pairing time who also substitutes the CA
 certificate the supervisor receives at approval is not caught automatically;
-comparing the logged fingerprint with **Appliance → TLS** is the check. The
-DNS, DHCP and looking-glass role pods on an appliance still skip verification
-toward the control plane; they need the pinned certificate passed through to
-them, which is tracked separately.
+comparing the logged fingerprint with **Appliance → TLS** is the check.
+
+**The role pods use the same pin (#1281).** On an off-cluster appliance the
+DNS, DHCP and looking-glass pods reach the control plane at the same external
+URL, sending the agent key and receiving their DNS / DHCP configuration over
+it. They used to skip verification there. The chart now mounts the
+supervisor's `tls/` directory read-only (`/var/persist/spatium-supervisor/tls`,
+which holds only public material; the private key is in `identity/`) and sets
+`TLS_PINNED_CERTS_PATH` to the pin in it. The agent trusts exactly the
+certificates in that file, with no hostname check, the same way the
+supervisor does, and reads it on every connection, so a certificate the
+supervisor re-pins reaches the agents without a restart. Until the supervisor
+has pinned, every request fails and the agent logs
+`control_plane_pin_unavailable`; it does not fall back to skipping. The one
+exception is a supervisor started by hand with
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins nothing, so it renders its
+agents with the skip too (`controlPlaneTls.insecureSkipVerify`), and they warn
+about it on every start. On a
+control-plane member, including an appliance promoted into the control plane,
+the agents are not given the external URL at all: they use the in-cluster api
+Service, as the member's supervisor does. The pin cannot serve there, because
+a member's supervisor heartbeats in-cluster and so never re-pins, while a
+member joining re-mints the Web UI certificate. An `http://` URL carries no
+certificate to verify; the supervisor upgrades its own traffic to the
+`https://` target, but the role agents do not yet.
 
 ### Pairing code (recommended) — issue #169
 

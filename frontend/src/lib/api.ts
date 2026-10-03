@@ -744,7 +744,10 @@ export type IPRole =
   | "vrrp"
   | "secondary"
   | "gateway"
-  | "bmc";
+  | "bmc"
+  | "web"
+  | "api"
+  | "lb";
 
 export const IP_ROLE_OPTIONS: IPRole[] = [
   "host",
@@ -760,6 +763,13 @@ export const IP_ROLE_OPTIONS: IPRole[] = [
   // lets an operator find them all and decide whether their subnet
   // belongs behind the do-not-probe flag.
   "bmc",
+  // TLS-serving roles (#118 Phase 2): discovery probes an IP in one of
+  // these for its certificate. The API took them from the start (IP_ROLES
+  // in models/ipam.py); the console never offered them, so an address
+  // with one showed "— None —" in Edit address (#1305).
+  "web",
+  "api",
+  "lb",
 ];
 
 export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
@@ -2421,6 +2431,10 @@ export interface AppUser {
   is_superadmin: boolean;
   force_password_change: boolean;
   auth_source: string;
+  /** The provider an external account belongs to (#1235). Null for a local
+   *  account, and for an external one not attributed to a provider, which
+   *  cannot sign in until it is linked (``usersApi.linkProvider``). */
+  auth_provider_id?: string | null;
   last_login_at: string | null;
   /** Lockout state (issue #71). ``locked`` is the live time check;
    *  ``failed_login_locked_until`` is the wall-clock target so the UI
@@ -2459,6 +2473,15 @@ export const usersApi = {
     api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
+  /** Link an external account to its provider (#1235). Clears the stored
+   *  external id; the next sign-in through that provider with the
+   *  account's username claims it. */
+  linkProvider: (id: string, authProviderId: string) =>
+    api
+      .post<AppUser>(`/users/${id}/link-provider`, {
+        auth_provider_id: authProviderId,
+      })
+      .then((r) => r.data),
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 
@@ -4545,6 +4568,12 @@ export interface AIModelInfo {
 export const aiApi = {
   listProviders: () =>
     api.get<AIProvider[]>("/ai/providers").then((r) => r.data),
+  // Whether a new chat would find an enabled provider. Any signed-in user
+  // may ask; the provider list above is superadmin-only (#1345).
+  available: () =>
+    api
+      .get<{ available: boolean }>("/ai/available")
+      .then((r) => r.data.available),
   getProvider: (id: string) =>
     api.get<AIProvider>(`/ai/providers/${id}`).then((r) => r.data),
   createProvider: (body: AIProviderCreate) =>
@@ -5034,6 +5063,10 @@ export interface DNSPendingOpEntry {
   last_error: string | null;
   created_at: string;
   applied_at: string | null;
+  // #1232 — when a backing-off op may ship again (null = now), and the newer
+  // op a `superseded` one was retired in favour of.
+  next_attempt_at?: string | null;
+  superseded_by?: string | null;
 }
 
 export interface DNSPendingOpsResponse {
@@ -5898,6 +5931,12 @@ export const dnsApi = {
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
     api.put<DNSServerGroup>(`/dns/groups/${id}`, data).then((r) => r.data),
+  // #1364 — replace the group's own TSIG key secret. The secret is never
+  // returned; agents get it in their next config bundle.
+  rotateGroupTsigKey: (id: string) =>
+    api
+      .post<DNSServerGroup>(`/dns/groups/${id}/group-tsig-key/rotate`)
+      .then((r) => r.data),
   // #62: returns the full axios response (may be 202 queued-for-approval —
   // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)`` or the
   // 202 envelope is lost; callers pass it to ``handleApprovalQueued``.
@@ -11908,14 +11947,33 @@ export const applianceSlotApi = {
         checksum_url: checksum_url || null,
       })
       .then((r) => r.data),
-  rollback: (target_slot: ApplianceSlot | null) =>
+  rollback: (
+    target_slot: ApplianceSlot | null,
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<{
         scheduled: string;
         target_slot: ApplianceSlot | null;
-      }>("/appliance/slot-upgrade/rollback", { target_slot })
+        schema_check: SchemaRollbackCheck | null;
+      }>("/appliance/slot-upgrade/rollback", {
+        target_slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
 };
+
+// #1227 — whether a release can start on the database as it is now. The
+// database survives an A/B slot swap, so going back to an older release
+// puts its code on a schema a newer release migrated, which it cannot run.
+export interface SchemaRollbackCheck {
+  verdict: "compatible" | "incompatible" | "unknown";
+  target_version: string | null;
+  target_head: string | null;
+  head_source: "recorded" | "bundled" | null;
+  database_revision: string | null;
+  message: string;
+}
 
 // ── Appliance: fleet upgrade orchestration (Phase 8f, issue #138) ──
 export type FleetAgentKind = "dns" | "dhcp";
@@ -12820,6 +12878,7 @@ export const applianceApprovalApi = {
     source:
       | { kind: "url"; url: string }
       | { kind: "uploaded"; slot_image_id: string },
+    acknowledge_schema_rollback = false,
   ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
@@ -12827,6 +12886,7 @@ export const applianceApprovalApi = {
         ...(source.kind === "url"
           ? { desired_slot_image_url: source.url }
           : { slot_image_id: source.slot_image_id }),
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   clearUpgrade: (id: string) =>
@@ -12838,14 +12898,26 @@ export const applianceApprovalApi = {
   // pickup pipeline as ``scheduleUpgrade`` — the backend stamps a
   // desired-state column on the appliance row, the supervisor's next
   // heartbeat reads it + writes the host-side trigger file.
-  setNextBootSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setNextBootSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
-      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, { slot })
+      .post<ApplianceRow>(`/appliance/appliances/${id}/set-next-boot`, {
+        slot,
+        acknowledge_schema_rollback,
+      })
       .then((r) => r.data),
-  setDefaultSlot: (id: string, slot: "slot_a" | "slot_b") =>
+  setDefaultSlot: (
+    id: string,
+    slot: "slot_a" | "slot_b",
+    acknowledge_schema_rollback = false,
+  ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/set-default-slot`, {
         slot,
+        acknowledge_schema_rollback,
       })
       .then((r) => r.data),
   scheduleReboot: (id: string) =>
@@ -13369,6 +13441,9 @@ export interface ClusterWorkloadHealth {
   ready: number;
   total: number;
   restarts: number;
+  /** Job pods still running for this component (#1213), e.g. a CNPG
+   *  replica join. Not in ready / total; keeps the status off healthy. */
+  jobs_running: number;
   status: string;
 }
 

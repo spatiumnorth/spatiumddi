@@ -152,6 +152,17 @@ RUN useradd --no-create-home --shell /bin/false app \
     && chown -R app:app /var/lib/spatiumddi
 
 COPY --from=builder /install /usr/local
+
+# The base image's pip is removed (#1392): nothing at runtime runs it, and
+# it is not a Debian package, so ``apt-get upgrade`` can never patch it and
+# every scan at default severity reports its CVEs. A production image also
+# has no business carrying a package installer. The ``dev`` stage below puts
+# it back with ``ensurepip``. This runs AFTER the builder COPY, and asserts,
+# so a dependency that ever pulls pip in transitively cannot quietly put it
+# back into /usr/local.
+RUN python -m pip uninstall -y --root-user-action=ignore pip \
+    && ! python -c "import pip" 2>/dev/null
+
 COPY --chown=app:app . .
 
 USER app
@@ -191,7 +202,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 # writes), then switch back to ``app`` so the runtime CMD stays unchanged.
 FROM runtime AS dev
 USER root
-RUN pip install --no-cache-dir --root-user-action=ignore \
+# The runtime stage removed pip (#1392); ``--default-pip`` restores the plain
+# ``pip`` command too, which ``make ci-backend-lint`` execs into this image.
+RUN python -m ensurepip --default-pip \
+    && python -m pip install --no-cache-dir --root-user-action=ignore \
         "pytest>=8.3.0" \
         "pytest-asyncio>=0.24.0" \
         "pytest-cov>=6.0.0" \

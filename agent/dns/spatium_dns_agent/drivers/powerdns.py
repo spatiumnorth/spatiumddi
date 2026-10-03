@@ -26,6 +26,7 @@ the first ship.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -55,6 +56,53 @@ log = structlog.get_logger(__name__)
 _PDNS_API_BASE = "http://127.0.0.1:8081/api/v1/servers/localhost"
 _PDNS_API_TIMEOUT = 10.0
 _API_KEY_FILE = "pdns-api.key"
+
+# ``resolver=`` takes ``ip``, ``ip:port`` or ``[v6]:port``, comma-separated.
+_ALIAS_RESOLVER_PORTED_RE = re.compile(
+    r"^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$"
+)
+
+
+def _alias_resolver_entry_ok(entry: str) -> bool:
+    """One ``resolver=`` element: an address, optionally with a port."""
+    ported = _ALIAS_RESOLVER_PORTED_RE.fullmatch(entry)
+    host = (ported.group(1) or ported.group(2)) if ported else entry
+    if ported and not 1 <= int(ported.group(3)) <= 65535:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # A bracketed host must be v6 and an unbracketed ``ip:port`` must be v4;
+    # a zone index (``%eth0``) is not something ``resolver=`` can parse.
+    if ported and (addr.version == 6) != bool(ported.group(1)):
+        return False
+    return "%" not in entry
+
+
+def _read_text_or_none(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def _safe_alias_resolver(value: Any) -> str:
+    """The ALIAS resolver list to write into pdns.conf, or "" for ALIAS off.
+
+    The control plane builds the list from validated forwarders (#1353), but
+    it lands in pdns.conf, where a newline would start a new directive and a
+    value pdns cannot parse stops it starting, so every element is checked
+    again here. Anything that is not an address list turns ALIAS off rather
+    than reaching the file.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    entries = value.strip().split(",")
+    if not all(_alias_resolver_entry_ok(e) for e in entries):
+        log.warning("powerdns_alias_resolver_refused", value=value[:200])
+        return ""
+    return ",".join(entries)
 
 
 def _quote_txt(value: str) -> str:
@@ -287,6 +335,14 @@ def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
+    #: Set for the length of ``_restart_daemon``; read by the supervisor's
+    #: liveness check on another thread (see ``daemon_restarting``).
+    _restarting: bool = False
+    #: A changed ``pdns.conf`` that the running daemon has not loaded yet.
+    #: Cleared only by a restart that succeeded: once the render is swapped
+    #: in, a retry compares the new file with itself and would otherwise
+    #: never restart, leaving pdns on the old settings for good.
+    _conf_restart_owed: bool = False
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -297,8 +353,10 @@ class PowerDNSDriver(DriverBase):
         ``pdns.conf`` is largely static after first boot — listen
         addresses, the API key, and the LMDB filename don't change at
         runtime. We still rewrite it on every render so operators
-        editing options through the UI (loglevel, listen address) see
-        the change without restarting the container.
+        editing options through the UI (loglevel, query logging, the
+        ALIAS resolver) see the change: ``swap_and_reload`` restarts
+        pdns when the rendered file differs, since pdns reads it only
+        at startup.
         """
         # Re-mode anything a pre-#869 build left world-readable before we
         # render over it — the old trees outlive the upgrade (see the helper).
@@ -328,14 +386,13 @@ class PowerDNSDriver(DriverBase):
         if query_log_enabled and log_level < 6:
             log_level = 6
 
-        # Issue #250 — operator-overridable ALIAS resolver. Defaults
-        # to 1.1.1.1 + 8.8.8.8 for labs (matches pre-#250 behaviour),
-        # but air-gapped or split-horizon deployments can set
-        # ``options.alias_resolver`` to a private resolver list (or
-        # to an empty string to suppress the ALIAS feature entirely).
-        alias_resolver = opts.get("alias_resolver")
-        if alias_resolver is None:
-            alias_resolver = "1.1.1.1,8.8.8.8"
+        # The ALIAS resolver is the group's own plain-DNS forwarders,
+        # computed by the control plane (#1353); "" turns ALIAS expansion
+        # off. There is no built-in fallback: the old ``1.1.1.1,8.8.8.8``
+        # default sent every ALIAS target to Cloudflare and Google, an
+        # outbound connection nobody configured. The value is written into
+        # pdns.conf, so anything but an address list is refused here too.
+        alias_resolver = _safe_alias_resolver(opts.get("alias_resolver"))
         conf_path = new_dir / "pdns.conf"
         # 0600, not write_text: this file embeds ``api-key=`` in cleartext,
         # and that key grants zone CRUD + DNSSEC over the pdns REST API
@@ -603,6 +660,7 @@ class PowerDNSDriver(DriverBase):
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / "rendered"
         backup = self.state_dir / "rendered.prev"
+        old_conf = _read_text_or_none(current / "pdns.conf")
         if current.exists():
             if backup.exists():
                 shutil.rmtree(backup)
@@ -616,10 +674,27 @@ class PowerDNSDriver(DriverBase):
         # Before that check existed this comment was simply wrong —
         # start_daemon only verified the config file and the binary,
         # and would happily spawn a second daemon.
+        if old_conf is not None and old_conf != _read_text_or_none(current / "pdns.conf"):
+            self._conf_restart_owed = True
         if not self.daemon_running():
             log.info("powerdns_daemon_starting_after_first_render")
             self.start_daemon()
             self._wait_for_api_up()
+            # A fresh daemon reads the current render, so nothing is owed.
+            self._conf_restart_owed = False
+        elif self._conf_restart_owed:
+            # pdns reads pdns.conf only when it starts, so a changed one
+            # (the ALIAS resolver from the group's forwarders, #1353; the log
+            # level; query logging) is otherwise ignored until the container
+            # restarts. Zones live in LMDB and survive; the reconcile below
+            # runs against the new daemon. Costs a sub-second gap in answers,
+            # and only when an operator changes a server option. A restart
+            # that raises leaves the debt in place, so the sync loop's retry
+            # of this apply restarts again rather than comparing the swapped-in
+            # file with itself.
+            log.info("powerdns_conf_changed_restarting", pid=self.daemon_pid)
+            self._restart_daemon()
+            self._conf_restart_owed = False
 
         api_key = self._load_or_generate_api_key()
         zones_path = current / "zones.json"
@@ -639,6 +714,58 @@ class PowerDNSDriver(DriverBase):
         # failure here used to lose every record on cold-boot when
         # the timing race fired.
         self._reconcile_zones(api_key, payload)
+
+    def daemon_restarting(self) -> bool:
+        return self._restarting
+
+    def _restart_daemon(self, *, stop_timeout_s: float = 15.0) -> None:
+        """Stop ``pdns_server`` and start it from the current render.
+
+        Runs on the sync thread while the supervisor checks liveness every
+        second on its own, so ``_restarting`` covers the whole stop/start:
+        without it a tick between the SIGTERM and the new spawn read the old
+        pid as a dead daemon and the agent exited 2 (#1402's gate walk: 2 of 3
+        forwarder changes, DNS down ~13 s through kubelet's back-off).
+
+        A daemon that outlives the stop timeout is NOT adopted: the start
+        below would find it running and keep it, the reconcile would succeed
+        against the old process, and the apply would be recorded although
+        pdns never loaded the new file. Raising fails the apply instead, and
+        ``_conf_restart_owed`` makes the retry restart again.
+        """
+        self._restarting = True
+        try:
+            pid = self.daemon_pid or find_running_daemon("pdns_server")
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pid = None
+            deadline = time.monotonic() + stop_timeout_s
+            while pid is not None and time.monotonic() < deadline:
+                # We spawned it, so once it exits it is our zombie until reaped.
+                try:
+                    if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                        break
+                except ChildProcessError:
+                    # Not our child (adopted after an agent restart): poll instead.
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                time.sleep(0.1)
+            else:
+                if pid is not None:
+                    log.warning("pdns_server_stop_timed_out", pid=pid)
+                    raise RuntimeError(
+                        f"pdns_server (pid {pid}) did not stop within {stop_timeout_s:g}s "
+                        "of SIGTERM, so it is still serving the previous pdns.conf"
+                    )
+            self.daemon_pid = None
+            self.start_daemon()
+            self._wait_for_api_up()
+        finally:
+            self._restarting = False
 
     def _wait_for_api_up(self, *, timeout_s: float = 10.0) -> None:
         """Poll the local PowerDNS REST API until it answers (or
@@ -1205,7 +1332,7 @@ class PowerDNSDriver(DriverBase):
         api_key: str,
         log_level: int,
         query_log_enabled: bool = False,
-        alias_resolver: str = "1.1.1.1,8.8.8.8",
+        alias_resolver: str = "",
     ) -> str:
         # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
         # Agent and control plane render the same shape; the agent
@@ -1245,15 +1372,21 @@ class PowerDNSDriver(DriverBase):
                 f"log-dns-details={log_queries_value}",
                 f"log-dns-queries={log_queries_value}",
                 "",
+                # PowerDNS polls a TXT record under secpoll.powerdns.com at
+                # startup and periodically to learn whether its version has
+                # a security advisory. That query leaves through ``resolver=``
+                # (once hardcoded public resolvers, see below) or the system
+                # resolver, naming the version; it is an outbound connection
+                # nobody configured (non-negotiable #17). An empty suffix
+                # turns it off (#1353). PowerDNS fixes arrive with
+                # SpatiumDDI releases instead. A startup setting: takes effect on
+                # pdns's next start, like ``dnsupdate`` below.
+                "security-poll-suffix=",
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
                 # synthesises A/AAAA at query time by recursing through
-                # the configured resolver. The resolver list is
-                # operator-controlled via ``options.alias_resolver``
-                # (#250) so air-gapped + split-horizon deployments can
-                # point at a private resolver instead of leaking
-                # internal-zone lookups to public DNS. Empty string
-                # disables ALIAS entirely.
+                # the configured resolver: the group's forwarders, or none
+                # and ALIAS off (#1353).
                 *(
                     ["expand-alias=yes", f"resolver={alias_resolver}"]
                     if alias_resolver.strip()
@@ -1274,9 +1407,9 @@ class PowerDNSDriver(DriverBase):
                 # the feature is available; per-zone acceptance is gated by the
                 # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata
                 # the reconciler sets — a zone with neither rejects every
-                # update, so this is a no-op for zones without an ACL. Note:
-                # ``dnsupdate`` is a startup setting, so a pdns already running
-                # with it off only picks this up on the next container restart.
+                # update, so this is a no-op for zones without an ACL.
+                # ``dnsupdate`` is a startup setting, like every line here;
+                # ``swap_and_reload`` restarts pdns when this file changes.
                 "dnsupdate=yes",
                 "",
             ]

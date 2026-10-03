@@ -104,7 +104,7 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError } from "@/lib/dnsNames";
+import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -1018,6 +1018,23 @@ function GroupModal({
     group?.is_public_facing ?? false,
   );
   const [error, setError] = useState("");
+  const [confirmRotate, setConfirmRotate] = useState(false);
+  const [rotated, setRotated] = useState(false);
+
+  const rotateMut = useMutation({
+    mutationFn: (id: string) => dnsApi.rotateGroupTsigKey(id),
+    onSuccess: () => {
+      setConfirmRotate(false);
+      setRotated(true);
+      // A failed earlier attempt left its message under the form.
+      setError("");
+      qc.invalidateQueries({ queryKey: ["dns-groups"] });
+    },
+    onError: (e: ApiError) => {
+      setConfirmRotate(false);
+      setError(formatApiError(e));
+    },
+  });
 
   const mut = useMutation({
     mutationFn: (d: Partial<DNSServerGroup>) =>
@@ -1150,6 +1167,33 @@ function GroupModal({
           )}
         </div>
 
+        {group && (
+          <div className="rounded border bg-muted/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="min-w-0 text-sm font-medium">
+                Group TSIG key
+              </span>
+              <button
+                type="button"
+                onClick={() => setConfirmRotate(true)}
+                className="shrink-0 rounded-md border px-2.5 py-1 text-xs hover:bg-muted"
+              >
+                Rotate…
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              The key this group&apos;s agents sign dynamic updates with, and
+              that its BIND9 servers allow zone transfers to. Rotate it if a
+              database or backup copy may have been read.
+            </p>
+            {rotated && (
+              <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                Rotated. Agents pick up the new key on their next config sync.
+              </p>
+            )}
+          </div>
+        )}
+
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
@@ -1157,6 +1201,29 @@ function GroupModal({
           label={group ? "Save" : "Create"}
         />
       </form>
+      {group && confirmRotate && (
+        <ConfirmModal
+          open
+          title="Rotate the group TSIG key?"
+          confirmLabel="Rotate key"
+          loading={rotateMut.isPending}
+          onClose={() => setConfirmRotate(false)}
+          onConfirm={() => rotateMut.mutate(group.id)}
+          message={
+            <div className="space-y-2 text-sm">
+              <p>
+                A new secret replaces the current one, under the same key name.
+                Every agent in the group re-renders its config with it on the
+                next sync.
+              </p>
+              <p>
+                A dynamic update signed with the old secret in that window is
+                refused and retried. Nothing outside SpatiumDDI uses this key.
+              </p>
+            </div>
+          }
+        />
+      )}
     </Modal>
   );
 }
@@ -2341,7 +2408,7 @@ function DnssecCard({
 
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
-function ZoneModal({
+export function ZoneModal({
   groupId,
   views,
   zone,
@@ -2359,7 +2426,18 @@ function ZoneModal({
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
-  const [kind, setKind] = useState(zone?.kind ?? "forward");
+  // #1310 — on create, a primary zone's Kind follows its name until the
+  // operator picks one. A name under in-addr.arpa / ip6.arpa is a
+  // reverse-lookup zone, and IPAM publishes PTR records only into kind
+  // "reverse" zones, so the old fixed "forward" default left such a zone
+  // without a single PTR. Secondary, stub and forward zones keep that
+  // default, as the API does: IPAM cannot write into them. An existing
+  // zone shows the kind it is stored with.
+  const [pickedKind, setPickedKind] = useState<string | null>(
+    zone?.kind ?? null,
+  );
+  const kind =
+    pickedKind ?? (zoneType === "primary" ? zoneKindForName(name) : "forward");
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
@@ -2514,7 +2592,7 @@ function ZoneModal({
             <select
               className={inputCls}
               value={kind}
-              onChange={(e) => setKind(e.target.value)}
+              onChange={(e) => setPickedKind(e.target.value)}
             >
               <option value="forward">Forward lookup</option>
               <option value="reverse">Reverse lookup</option>
@@ -4684,6 +4762,7 @@ function ZoneDetailView({
             deleteZone.reset();
           }}
           isPending={deleteZone.isPending}
+          error={deleteZone.isError ? formatApiError(deleteZone.error) : null}
           notice={deleteNotice}
         />
       )}
@@ -5233,6 +5312,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           serverName={pausePrompt.name}
           serverKind="DNS"
           isPending={pauseMut.isPending}
+          error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
           onConfirm={(reason) => {
             pauseInFlightFor.current = pausePrompt.id;
             pauseMut.mutate(
@@ -5240,7 +5320,10 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               { onSuccess: () => setPausePrompt(null) },
             );
           }}
-          onCancel={() => setPausePrompt(null)}
+          onCancel={() => {
+            setPausePrompt(null);
+            pauseMut.reset();
+          }}
         />
       )}
       {confirmDeleteServer && (
@@ -8307,16 +8390,49 @@ function ZonesTab({
     });
   }
 
+  // #1344 — every zone is its own DELETE, so every result is read. A
+  // refused or failed delete leaves its zone in place: the dialog stays
+  // open and says why, with only those zones still selected. A delete the
+  // two-person approval queue took (#62) has not happened yet either; that
+  // is said above the zones once the dialog closes.
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
+  const [bulkDeleteNotice, setBulkDeleteNotice] = useState<string | null>(null);
   const bulkDeleteZones = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.allSettled(
-        ids.map((id) => dnsApi.deleteZone(group.id, id)),
-      );
-    },
-    onSuccess: () => {
+    mutationFn: (ids: string[]) =>
+      Promise.allSettled(ids.map((id) => dnsApi.deleteZone(group.id, id))),
+    onSuccess: (results, ids) => {
       qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
-      setSelected(new Set());
-      setConfirmBulkDelete(false);
+      const failed = ids.filter((_, i) => results[i].status === "rejected");
+      const queued = results.filter(
+        (r) => r.status === "fulfilled" && handleApprovalQueued(r.value),
+      ).length;
+      if (queued > 0) {
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        setBulkDeleteNotice(
+          queued === ids.length
+            ? APPROVAL_QUEUED_MESSAGE
+            : `${queued} of ${ids.length} zones: ${APPROVAL_QUEUED_MESSAGE}`,
+        );
+      }
+      setSelected(new Set(failed));
+      if (failed.length === 0) {
+        setConfirmBulkDelete(false);
+        return;
+      }
+      const reasons = [
+        ...new Set(
+          results.flatMap((r) =>
+            r.status === "rejected" ? [formatApiError(r.reason)] : [],
+          ),
+        ),
+      ];
+      const what =
+        failed.length < ids.length
+          ? `${failed.length} of ${ids.length} zones were not deleted`
+          : ids.length === 1
+            ? "The zone was not deleted"
+            : `None of the ${ids.length} zones were deleted`;
+      setBulkDeleteError(`${what}: ${reasons.join("; ")}`);
     },
   });
 
@@ -8593,6 +8709,17 @@ function ZonesTab({
         </div>
       )}
 
+      {bulkDeleteNotice && (
+        <div className="mb-2 flex items-center justify-between rounded-md border bg-amber-50 px-3 py-1.5 text-xs dark:bg-amber-900/10">
+          <span>{bulkDeleteNotice}</span>
+          <button
+            onClick={() => setBulkDeleteNotice(null)}
+            className="rounded-md border px-2 py-1 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {isFetching && zones.length === 0 && (
         <p className="text-sm text-muted-foreground">Loading…</p>
       )}
@@ -8671,8 +8798,16 @@ function ZonesTab({
           }
           checkLabel={`I understand ${selected.size} zone${selected.size === 1 ? "" : "s"} and all their records will be permanently deleted.`}
           isPending={bulkDeleteZones.isPending}
-          onClose={() => setConfirmBulkDelete(false)}
-          onConfirm={() => bulkDeleteZones.mutate(Array.from(selected))}
+          error={bulkDeleteError}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkDeleteError(null);
+          }}
+          onConfirm={() => {
+            setBulkDeleteError(null);
+            setBulkDeleteNotice(null);
+            bulkDeleteZones.mutate(Array.from(selected));
+          }}
         />
       )}
     </div>

@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
@@ -74,7 +74,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
-from app.services.dns.record_ops import ack_op
+from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
@@ -146,6 +146,10 @@ class AgentHeartbeatRequest(BaseModel):
     spool: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+    # Cumulative failed APPLY ATTEMPTS since the agent started, retries
+    # included. Accepted and deliberately not stored (#1232): it cannot say
+    # which op failed or whether a retry then succeeded. The op rows are the
+    # record — ``failed`` ops raise ``dns_record_op_failed``.
     failed_ops_count: int = 0
     disk_free_bytes: int | None = None
     # #430 (D6) — deprecated: serial convergence is reported via the
@@ -814,13 +818,13 @@ async def agent_heartbeat(
     # indistinguishable from a healthy one.
     apply_reported_daemon_state(server, body.daemon, agent_kind="dns", server_id=str(server.id))
 
-    # Process op ACKs
-    for ack in body.ops_ack:
-        op_id = ack.get("op_id")
-        result = ack.get("result", "error")
-        message = ack.get("message")
-        if op_id:
-            await ack_op(db, op_id, result, message)
+    # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
+    await apply_acks(db, server.id, body.ops_ack)
+    # #1232 — then return any op this agent was sent and never acknowledged
+    # (it restarted, or the long-poll response was lost) to the retry path.
+    # After the acks, so an ack arriving now is not reset under it; here and
+    # not in the long-poll, because this transaction always commits.
+    await reset_unacknowledged_ops(db, server.id)
 
     rotated_token = None
     rotated_exp = None
@@ -847,31 +851,18 @@ async def agent_record_ops(
     db: DB,
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> dict[str, Any]:
-    """Return the queue of pending record ops targeting this server.
+    """One page of this server's queued record ops, out of band.
 
-    Agents typically pick ops up from the long-poll bundle, but this endpoint
-    lets an agent drain ops out-of-band (e.g. after a restart).
+    Agents pick ops up from the long-poll bundle; this is the same page — the
+    same backoff, the same ``in_flight`` marking and ``dispatch`` stamp
+    (#1232) — for a caller that wants the ops without the bundle. It used to
+    return every ``pending`` op unmarked, which bypassed the backoff, and an
+    error ack for an op fetched that way was not counted.
     """
     server, _ = auth
-    res = await db.execute(
-        select(DNSRecordOp)
-        .where(DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending")
-        .order_by(DNSRecordOp.created_at)
-    )
-    ops = res.scalars().all()
-    return {
-        "server_id": str(server.id),
-        "ops": [
-            {
-                "op_id": str(o.id),
-                "zone_name": o.zone_name,
-                "op": o.op,
-                "record": o.record,
-                "target_serial": o.target_serial,
-            }
-            for o in ops
-        ],
-    }
+    ops, remaining = await page_pending_ops(db, server)
+    await db.commit()
+    return {"server_id": str(server.id), "ops": ops, "remaining": remaining}
 
 
 @router.post("/ops/{op_id}/ack")
@@ -886,7 +877,9 @@ async def agent_ops_ack(
     op = await db.get(DNSRecordOp, op_id)
     if op is None or op.server_id != server.id:
         raise HTTPException(status_code=404, detail="Op not found")
-    await ack_op(db, str(op_id), body.get("result", "error"), body.get("message"))
+    await ack_op(
+        db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
+    )
     await db.commit()
     return {"status": "ok"}
 
@@ -916,52 +909,79 @@ async def agent_zone_state(
     ``zone_serial_drift`` alert-rule type.
 
     Upsert by ``(server_id, zone_id)`` — no history, one row per
-    pair. Unknown zone names are silently skipped (zone deleted from
-    control plane but agent still serves it; the next config bundle
-    will drop it).
+    pair. The names are the bundle's own, and each is looked up among the
+    live zones of the reporting server's group (#1408). A name the group
+    does not hold (the zone was deleted from the control plane but the agent
+    still serves it; the next config bundle drops it) or holds more than once
+    (one zone per view, and the report names no view) is skipped, counted in
+    the answer, and logged once per report.
     """
     server, _ = auth
     now = datetime.now(UTC)
-    updated = 0
+    if not body.zones:
+        return {"updated": 0, "skipped": 0}
 
-    # Index known zones by name for one DB round-trip on the lookup.
-    names = [e.zone_name.rstrip(".") for e in body.zones]
-    if not names:
-        return {"updated": 0}
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
-    zones_by_name: dict[str, DNSZone] = {}
+    # #1408 — zone names are stored with the trailing dot, and the lookup
+    # stripped it from the reported names only, so it matched nothing: every
+    # report was dropped behind a 200 and every server read "never reported".
+    # Both sides are compared without it now, and only within this server's
+    # group: another group's zone of the same name is another zone.
+    def _key(name: str) -> str:
+        return name.rstrip(".").lower()
+
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == server.group_id,
+            DNSZone.deleted_at.is_(None),
+            func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
+        )
+    )
+    zones_by_key: dict[str, list[DNSZone]] = {}
     for z in res.scalars().all():
-        zones_by_name[z.name.rstrip(".")] = z
+        zones_by_key.setdefault(_key(z.name), []).append(z)
 
+    # A zone the bundle renders into several views is reported once per view:
+    # one zone, its last report wins.
+    serial_by_zone: dict[uuid.UUID, int] = {}
+    unknown: list[str] = []
+    ambiguous: list[str] = []
     for entry in body.zones:
-        key = entry.zone_name.rstrip(".")
-        zone = zones_by_name.get(key)
-        if zone is None:
-            continue
+        matches = zones_by_key.get(_key(entry.zone_name), [])
+        if len(matches) == 1:
+            serial_by_zone[matches[0].id] = entry.serial
+        else:
+            (ambiguous if matches else unknown).append(entry.zone_name)
 
+    for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.
         existing_res = await db.execute(
             select(DNSServerZoneState).where(
                 DNSServerZoneState.server_id == server.id,
-                DNSServerZoneState.zone_id == zone.id,
+                DNSServerZoneState.zone_id == zone_id,
             )
         )
         row = existing_res.scalar_one_or_none()
         if row is None:
             row = DNSServerZoneState(
                 server_id=server.id,
-                zone_id=zone.id,
-                current_serial=entry.serial,
+                zone_id=zone_id,
+                current_serial=serial,
                 reported_at=now,
             )
             db.add(row)
         else:
-            row.current_serial = entry.serial
+            row.current_serial = serial
             row.reported_at = now
-        updated += 1
 
+    if unknown or ambiguous:
+        logger.info(
+            "dns_agent_zone_state_skipped",
+            server=str(server.id),
+            unknown=sorted(set(unknown))[:20],
+            ambiguous=sorted(set(ambiguous))[:20],
+        )
     await db.commit()
-    return {"updated": updated}
+    return {"updated": len(serial_by_zone), "skipped": len(unknown) + len(ambiguous)}
 
 
 class DNSKeyReport(BaseModel):

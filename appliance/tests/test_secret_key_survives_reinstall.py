@@ -17,8 +17,11 @@ same event purely because they carry `helm.sh/resource-policy: keep`.
 
 Two independent guards, because each closes the hole for a different
 deployment shape: the annotation protects anyone whose chart owns the Secret
-(plain Kubernetes / Helm), and `failurePolicy: abort` stops the appliance
-taking the destructive path at all.
+(plain Kubernetes / Helm), and on the appliance `failurePolicy: retry` stops
+helm-controller taking the destructive path at all (#1299): `helm uninstall`
+keeps only what the release's LAST stored revision annotates, and after a slot
+rollback to a release older than #1044 that revision is the old chart's, which
+has no `keep` (test_firstboot_failure_policy.py pins the HelmChartConfig half).
 
     python3 -m pytest appliance/tests/test_secret_key_survives_reinstall.py -v
 """
@@ -130,25 +133,34 @@ def _render_control_helmchart() -> dict:
 
 
 def test_the_control_helmchart_does_not_set_abort() -> None:
-    """`abort` was considered and REJECTED — this pins the decision (#1042).
+    """`abort` was considered and REJECTED (#1042) — this pins that decision.
 
-    It looks like the safer setting and is not. spatiumddi-helm-stuck-recover
-    only acts on a HelmChart carrying a `Failed` condition, and only after a
-    600 s latch on a 5 min tick — so a release left `pending-upgrade` by the
-    slot reboot, which is the scenario #1042 was found in, may never qualify.
-    `abort` there risks an indefinite outage with no API and no UI, where the
-    default `reinstall` recovers in seconds.
-
-    What made `reinstall` dangerous was the missing
-    `helm.sh/resource-policy: keep`, not the reinstall: with it the Secret
-    survives the uninstall and the reinstall's `lookup` finds the same key.
-    Disruptive and self-healing is fine; lossy was not.
+    spatiumddi-helm-stuck-recover only acts on a HelmChart carrying a `Failed`
+    condition, and only after a 600 s latch on a 5 min tick, so a release left
+    `pending-upgrade` by the slot reboot may never qualify: `abort` there risks an
+    indefinite outage with no API and no UI.
     """
     manifest = _render_control_helmchart()
     assert manifest["spec"].get("failurePolicy") != "abort", (
         "failurePolicy: abort defers recovery to a timer that may never fire "
         "for a pending-upgrade release — see this test's docstring"
     )
+
+
+def test_the_control_helmchart_retries_instead_of_reinstalling() -> None:
+    """`retry`, not the CRD default `reinstall` (#1299).
+
+    #1042 kept `reinstall` and relied on `keep` to carry the Secret through its
+    uninstall half. `helm uninstall` decides what to keep from the LAST stored
+    revision's manifest, never from the live object, so after a slot rollback to a
+    release older than #1044 (2026.09.04-1) the next reinstall deleted the Secret
+    and minted a new SECRET_KEY. `retry` (helm-controller v0.17.7, k3s v1.36.4+k3s1)
+    upgrades a failed release again and never deletes any of it, and unlike `abort`
+    it does not wait for an operator. A HelmChartConfig's policy overrides this
+    one; test_firstboot_failure_policy.py pins that half.
+    """
+    manifest = _render_control_helmchart()
+    assert manifest["spec"].get("failurePolicy") == "retry"
 
 
 def test_values_content_still_parses() -> None:
