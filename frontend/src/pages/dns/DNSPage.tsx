@@ -104,7 +104,7 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError } from "@/lib/dnsNames";
+import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -2337,7 +2337,7 @@ function DnssecCard({
 
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
-function ZoneModal({
+export function ZoneModal({
   groupId,
   views,
   zone,
@@ -2355,7 +2355,18 @@ function ZoneModal({
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
-  const [kind, setKind] = useState(zone?.kind ?? "forward");
+  // #1310 — on create, a primary zone's Kind follows its name until the
+  // operator picks one. A name under in-addr.arpa / ip6.arpa is a
+  // reverse-lookup zone, and IPAM publishes PTR records only into kind
+  // "reverse" zones, so the old fixed "forward" default left such a zone
+  // without a single PTR. Secondary, stub and forward zones keep that
+  // default, as the API does: IPAM cannot write into them. An existing
+  // zone shows the kind it is stored with.
+  const [pickedKind, setPickedKind] = useState<string | null>(
+    zone?.kind ?? null,
+  );
+  const kind =
+    pickedKind ?? (zoneType === "primary" ? zoneKindForName(name) : "forward");
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
@@ -2510,7 +2521,7 @@ function ZoneModal({
             <select
               className={inputCls}
               value={kind}
-              onChange={(e) => setKind(e.target.value)}
+              onChange={(e) => setPickedKind(e.target.value)}
             >
               <option value="forward">Forward lookup</option>
               <option value="reverse">Reverse lookup</option>

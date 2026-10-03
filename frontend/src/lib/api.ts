@@ -744,7 +744,10 @@ export type IPRole =
   | "vrrp"
   | "secondary"
   | "gateway"
-  | "bmc";
+  | "bmc"
+  | "web"
+  | "api"
+  | "lb";
 
 export const IP_ROLE_OPTIONS: IPRole[] = [
   "host",
@@ -760,6 +763,13 @@ export const IP_ROLE_OPTIONS: IPRole[] = [
   // lets an operator find them all and decide whether their subnet
   // belongs behind the do-not-probe flag.
   "bmc",
+  // TLS-serving roles (#118 Phase 2): discovery probes an IP in one of
+  // these for its certificate. The API took them from the start (IP_ROLES
+  // in models/ipam.py); the console never offered them, so an address
+  // with one showed "— None —" in Edit address (#1305).
+  "web",
+  "api",
+  "lb",
 ];
 
 export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
