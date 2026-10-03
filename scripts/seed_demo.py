@@ -1683,10 +1683,11 @@ def seed_rbac_sample(a: Api):
         )
 
 
-def seed_api_token(a: Api):
+def seed_api_token(a: Api, pw: str):
     """A read-only scoped API token. NOT idempotent (no unique name) — guard
     via list-then-skip. The raw token is returned once; we discard it (a
-    seeded demo token is never used for real automation).
+    seeded demo token is never used for real automation). Minting one needs
+    the caller's step-up (#1355), so the seeding user's password rides along.
     """
     print("Creating scoped API token…")
     existing = a.call("GET", "/api/v1/api-tokens") or []
@@ -1702,6 +1703,7 @@ def seed_api_token(a: Api):
             "expires_in_days": 365,
             "scopes": ["read"],
             "resource_grants": [],
+            "stepup_password": pw,
         },
     )
 
@@ -1865,7 +1867,7 @@ def main(base: str, user: str, pw: str):
 
     # Governance + admin data.
     seed_rbac_sample(a)
-    seed_api_token(a)
+    seed_api_token(a, pw)
     seed_conformity_policy(a)
     seed_webhook(a)
 
