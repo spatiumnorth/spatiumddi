@@ -27,6 +27,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DHCP scope dialog offers the DDNS hostname policies the API
+  accepts, and an edit checks the policy as create does (#1308).** The
+  dialog offered Client-supplied, From IPAM and Generate (`client`,
+  `ipam`, `generate`), while the scope API accepts `client`,
+  `server_name`, `derived` and `none`. Creating a scope with From IPAM
+  or Generate failed with the validator's raw `422`. Editing a scope to
+  either answered `200` and stored it unchecked, and a stored
+  `server_name`, `derived` or `none` showed as Client-supplied. The
+  dialog now offers the API's four policies and shows a stored one as
+  itself, and an edit that changes the policy is checked against the
+  same list as create. A value stored before the check is kept, and
+  shown as itself, until it is changed, so an unrelated edit still
+  saves.
+
+- **Apply template… in the DHCP scope dialog shows each option in its
+  own field (#1309).** The dialog merged a template's options by name
+  and gave an option the form did not hold yet the code `0`, while the
+  options editor draws its standard fields by code. So a template's
+  TFTP Server Name, Bootfile Name and TFTP Server Address landed in the
+  collapsed Custom options with a blank code. Their fields stayed empty
+  while the values were sent and stored. The editor also kept showing a
+  pre-filled value the template had replaced. Each template option now
+  takes the code its key stands for (`code:NN` included) and lands in
+  its own field. The editor is redrawn when a template is applied, so
+  the dialog shows what it will send.
+
 - **A DNS server's zone serials reach the per-server zone state
   (#1408).** The agent reports the serial of each zone it renders
   (`POST /api/v1/dns/agents/zone-state`), but the control plane
