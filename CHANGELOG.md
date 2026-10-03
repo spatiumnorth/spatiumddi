@@ -304,6 +304,32 @@ the formatter handles the rest.
 
 ### Security
 
+- **Each DNS server group's internal TSIG key is encrypted at rest, and
+  can be rotated (#1364).** It was the one credential SpatiumDDI stored
+  in clear (`dns_server_group.tsig_key_secret`), and not a minor one:
+  the BIND9 agent grants that key zone transfers and dynamic updates on
+  every primary zone the group serves, from any address. So anyone who
+  read the database or an unencrypted backup could transfer and rewrite
+  those zones. The secret is now Fernet-encrypted like every other
+  credential (`tsig_key_secret_encrypted`, migration `b3c71e9a4d25`,
+  covered by the cross-install backup rewrap). The value itself is
+  unchanged, so agents keep working with no re-render. **Rotate group
+  TSIG key** (server group → Edit, or
+  `POST /dns/groups/{id}/group-tsig-key/rotate`) replaces it under the
+  same name, and the agents pick it up on their next sync; the secret
+  is never returned. No copilot tool, deliberately (non-negotiable #13):
+  the rotation re-renders every agent in the group, the broad-blast-radius
+  write that guidance keeps off the copilot. An "exclude secrets"
+  diagnostic archive now also blanks the leftover plaintext column below,
+  which it had been carrying in clear. **Upgrade notes:** the old plaintext column is kept,
+  unread, for one release so a rolling upgrade's old api pods keep
+  working, and the next release drops it. Until then it still holds the
+  pre-upgrade secret, so rotate each group's key once the upgrade has
+  finished. The migration now needs the api's `SECRET_KEY` (and
+  `CREDENTIAL_ENCRYPTION_KEY`, if set), which `k8s/base/migrate-job.yaml`
+  did not pass and now does; the Helm chart and Docker Compose already
+  did.
+
 - **A SAML Response signs in once, and only through the sign-in that
   asked for it (#1335).** With the ACS fixed (#1335 under Fixed), SAML
   sign-in still lacked two checks the Web Browser SSO profile requires

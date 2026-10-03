@@ -84,6 +84,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("dhcp_server", "id", "credentials_encrypted"),
     ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
+    ("dns_server_group", "id", "tsig_key_secret_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
@@ -301,6 +302,20 @@ NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
         ("appliance", "kubeconfig_encrypted"),
         ("pairing_code", "code_encrypted"),
         ("acme_client_account", "account_key_encrypted"),
+    }
+)
+
+
+# Plaintext copies of a secret that an expand/contract migration has moved
+# into an ``*_encrypted`` column but not yet dropped (#296): unmapped, unread
+# by the application, and still holding the pre-upgrade value. They are not
+# Fernet tokens, so nothing above covers them, and an "exclude secrets"
+# diagnostic archive must still not carry them. The scrubber writes NULL.
+# Remove an entry in the release whose contract migration drops the column.
+LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # #1364 — moved to ``tsig_key_secret_encrypted``.
+        ("dns_server_group", "tsig_key_secret"),
     }
 )
 
