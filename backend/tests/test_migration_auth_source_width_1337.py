@@ -108,7 +108,7 @@ async def _insert(engine: AsyncEngine, schema: str, table: str, value: str) -> N
 
 def test_the_revision_follows_the_head_it_was_written_on() -> None:
     m = _migration()
-    assert (m.revision, m.down_revision) == (_REVISION, "f4a8c2e71d09")
+    assert (m.revision, m.down_revision) == (_REVISION, "b3c71e9a4d25")
 
 
 @pytest.mark.asyncio
