@@ -3302,8 +3302,15 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    per-role ``deployment_kind`` coupling was dropped under #170
    Wave A3 — roles are assigned post-approval from the Fleet tab,
    not baked into the code). Pick ephemeral (single-use, default
-   15 min expiry) or persistent (multi-claim, optional ``max_claims``),
-   then click **Generate code**.
+   15 min expiry) or persistent (multi-claim, optional ``max_claims``,
+   30-day expiry by default; ``0`` means never, and the dialog warns),
+   then click **Generate code**. A persistent code minted before this
+   default existed never expired; the upgrade gives it an expiry 30 days
+   after the upgrade, so re-mint it if it must outlive that. Registration is throttled (#1356): ten
+   wrong codes from one address, or a hundred across the install, in 15
+   minutes refuse further attempts with ``429`` until the window passes.
+   A right code doesn't count, so a fleet rollout behind one NAT address
+   is never throttled.
 3. The 8 digits appear in a large monospace box with a live
    countdown + copy button. Write them down or copy them to a
    second device.
