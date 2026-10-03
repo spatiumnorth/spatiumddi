@@ -1508,3 +1508,97 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── Zones the bundle dropped are retired, only if this agent made them ───
+
+
+def _retire(
+    tmp_path: Path,
+    *,
+    desired: list[str],
+    ledger: list[str] | None = None,
+    previous: list[str] | None = None,
+    ledger_raw: str | None = None,
+    errors: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Run ``_retire_dropped_zones``; return (zones deleted, ledger after)."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    if ledger is not None:
+        d._managed_zones_path().write_text(_json.dumps(ledger))
+    if ledger_raw is not None:
+        d._managed_zones_path().write_text(ledger_raw)
+    prev = tmp_path / "rendered.prev" / "zones.json"
+    if previous is not None:
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        prev.write_text(_json.dumps([{"zone": z} for z in previous]))
+
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        msg = (errors or {}).get(params.get("zone", ""))
+        return {"status": "error", "errorMessage": msg} if msg else {"status": "ok"}
+
+    calls = _install_fake_request(d, _responder)
+    d._retire_dropped_zones("tok-1", [{"zone": z} for z in desired], prev)
+    deleted = [c[3]["zone"] for c in calls if c[2] == "zones/delete"]
+    return deleted, _json.loads(d._managed_zones_path().read_text())
+
+
+def test_zone_dropped_from_the_bundle_is_deleted(tmp_path: Path) -> None:
+    deleted, ledger = _retire(
+        tmp_path, desired=["a.test"], ledger=["a.test", "gone.test"]
+    )
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_only_zones_in_the_ledger_are_candidates(tmp_path: Path) -> None:
+    """A zone an operator made on the daemon is never in the ledger, and the
+    retire pass does not even list the daemon's zones to find one."""
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test"])
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_first_run_seeds_the_ledger_from_the_previous_render(tmp_path: Path) -> None:
+    """An agent upgraded mid-change: the zone the new bundle dropped was in
+    the previous render, so it is still retired."""
+    deleted, ledger = _retire(
+        tmp_path, desired=["a.test"], previous=["a.test", "gone.test"]
+    )
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_first_run_without_history_deletes_nothing(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test", "b.test"])
+    assert deleted == []
+    assert ledger == ["a.test", "b.test"]
+
+
+def test_failed_delete_is_retried_and_missing_zone_is_forgotten(tmp_path: Path) -> None:
+    deleted, ledger = _retire(
+        tmp_path,
+        desired=["a.test"],
+        ledger=["a.test", "busy.test", "manual.test"],
+        errors={
+            "busy.test": "Some transient failure",
+            "manual.test": "No such zone was found: manual.test",
+        },
+    )
+    assert sorted(deleted) == ["busy.test", "manual.test"]
+    # The failure stays a candidate for the next pass; the already-gone one
+    # does not.
+    assert ledger == ["a.test", "busy.test"]
+
+
+def test_unreadable_ledger_deletes_nothing_and_is_rebuilt(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger_raw="{not json")
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_zone_names_compare_case_insensitively(tmp_path: Path) -> None:
+    deleted, _ = _retire(tmp_path, desired=["Example.TEST"], ledger=["example.test"])
+    assert deleted == []
