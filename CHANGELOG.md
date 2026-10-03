@@ -51,6 +51,14 @@ the formatter handles the rest.
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
 
+- **A DHCPv6 scope is refused on a group with a Windows DHCP server
+  (#1480).** SpatiumDDI writes Windows DHCP through the DHCPv4 cmdlets
+  only, so a v6 scope on such a group was handed to them anyway: the save
+  failed with a 502, or the scope existed in SpatiumDDI and on no server.
+  Creating a v6 scope in a group with a Windows member is now a 422 that
+  says why, and so is adding or moving a Windows server into a group that
+  has v6 scopes.
+
 - **Setting a control-plane VIP installs MetalLB (#1103).** It never
   did on a k3s with Helm 4 inside (klipper-helm): the
   `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
