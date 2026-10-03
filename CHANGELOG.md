@@ -42,6 +42,41 @@ the formatter handles the rest.
   without a group, and that refusal is now logged
   (`tacacs_authorization_refused`).
 
+- **A record name the group's BIND would refuse is refused when it
+  is saved, not after it has stopped the server (#1378).** The record
+  API checked every owner with the RFC 2181 rule, which allows `_`, so
+  `bad_name A 192.0.2.33` was saved. BIND loads a primary zone under
+  `check-names primary fail`, so the agent's zone check refused the
+  file and quarantined the server's whole config bundle: the record
+  was never served, and no later record change on that server applied
+  while it stayed. Create, update, bulk create and the Copilot now
+  answer 422 when the owner of an A, AAAA or MX record, or the target
+  of an MX, NS, SRV or ServiceMode SVCB/HTTPS record (or of a PTR in a
+  reverse zone), is not a host name — BIND's own check-names rule,
+  zone labels included, with BIND's exceptions for Active Directory's
+  `gc._msdcs` and SPF's `_spf` labels. Underscore TXT, SRV, CNAME and
+  TLSA owners stay legal, as #597 intended. An edit is checked only
+  for the name or value it changes.
+  Rows saved before this still fail BIND's check; the name-conformance
+  report (`GET /diagnostics/name-conformance`) now lists them, and
+  deleting or renaming one lets the server apply again.
+
+- **A CNAME can no longer be saved beside other data at its name
+  (#1381).** `www A` then `www CNAME` were both saved. A name that holds
+  a CNAME holds nothing else (RFC 1034 §3.6.2, RFC 2181 §10.1), so
+  PowerDNS refused the agent's zone patch ("Conflicts with
+  pre-existing RRset") and BIND's zone check refuses "CNAME and other
+  data", which quarantines the server's whole config bundle (#1378).
+  Create, update, bulk create and the Copilot now refuse a CNAME at a
+  name that holds any record, a second CNAME, and any record at a name
+  that holds a CNAME, with a 409 naming the record in the way; a CNAME
+  at the zone apex, which always holds the SOA and NS, is a 422. Views
+  count: a record with no view meets every view, so a split-horizon
+  CNAME in one view beside an address in another stays legal. Bulk
+  create skips a clashing record and says why, as it does for a
+  duplicate. Records IPAM generates count as data at their name, so a
+  CNAME is refused where one exists.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
@@ -57,6 +92,19 @@ the formatter handles the rest.
   DDNS-enabled subnet the old address's A / PTR records are published
   under the lease's hostname. The old address is still freed when no
   active lease holds it.
+
+- **Reserving an address a DHCP lease holds no longer leaves the
+  reservation's row to the lease (#1404).** Pinning a device to the
+  address it already leases, or moving a reservation back onto an
+  address its lease still holds, takes over that lease's IPAM row. The
+  row became the reservation's (`static_dhcp`, its name, its MAC) but
+  kept the lease's `auto_from_lease` flag and lease link, which the
+  lease ingest reads as "this row is mine". The client's next DHCP
+  exchange turned the reserved address back into a plain lease row,
+  and the lease's release or expiry deleted it, so the address read
+  as free while the reservation still handed it to the device. A row
+  a reservation takes over now drops both, and the lease mirror
+  leaves it alone, as it does every reservation's row.
 
 ### Security
 
