@@ -513,6 +513,9 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
+- `199eb1562927` — #1446: `appliance.reboot_requested_boot_id`, a
+  nullable string. No backfill: NULL means the boot is not recorded yet.
+  Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
