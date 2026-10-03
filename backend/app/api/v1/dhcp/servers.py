@@ -612,6 +612,14 @@ async def update_server(
     changes = body.model_dump(
         exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    # #1458 — ``exclude_none`` treats an explicit ``null`` like an absent
+    # key, so a server could be moved to another group but never taken out
+    # of one. An ungrouped server is a valid state (the column is nullable
+    # and create accepts it), so an explicitly sent ``server_group_id:
+    # null`` clears the group. Every other field keeps "null = leave".
+    clear_group = "server_group_id" in body.model_fields_set and body.server_group_id is None
+    if clear_group:
+        changes["server_group_id"] = None
     target_group = changes.get("server_group_id", s.server_group_id)
     target_driver = changes.get("driver", s.driver)
     if target_group != s.server_group_id or target_driver != s.driver:
@@ -698,6 +706,8 @@ async def update_server(
     audit_payload = body.model_dump(
         mode="json", exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    if clear_group:
+        audit_payload["server_group_id"] = None
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
