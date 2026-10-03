@@ -43,14 +43,15 @@ the formatter handles the rest.
   resolvers cached negative answers for five minutes, whatever the zone
   said. They now ship in the agent bundle and are written into the SOA,
   and an edit of any of them, or of the zone's TTL, bumps the zone's
-  serial so its secondaries transfer the change. **Nothing changes on the
-  wire at upgrade for a zone left at the defaults:** zones whose timers
-  are exactly the old stored defaults (86400 / 7200 / 3600000 / 3600,
-  never served) are set to the `3600 / 600 / 86400 / 300` they serve
-  today (migration `ff32b91acad8`), and new zones default to those
-  values too, keeping the 5-minute negative TTL a DDNS-driven estate
-  relies on. A zone whose timers were edited starts serving them, and
-  each such zone reloads once. The zone API refuses a timer outside 0 to
+  serial so its secondaries transfer the change. **At upgrade a timer
+  changes on the wire only where someone set it:** each timer still at
+  its old stored default (refresh 86400, retry 7200, expire 3600000,
+  minimum 3600, none of them ever served) is set to the value it serves
+  today (3600, 600, 86400, 300) by migration `ff32b91acad8`, and new
+  zones default to those values too, keeping the 5-minute negative TTL
+  a DDNS-driven estate relies on. A zone with an edited timer starts
+  serving it, under a new serial so its secondaries transfer it, and
+  reloads once. The zone API refuses a timer outside 0 to
   2147483647, and a stored one BIND would refuse is served as before and
   logged rather than taking the zone down. PowerDNS and Technitium
   manage their own SOA and are unchanged.
@@ -116,12 +117,13 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `ff32b91acad8` — #1171, data-only: every `dns_zone` whose SOA timers
-  are exactly the old defaults (refresh 86400, retry 7200, expire
-  3600000, minimum 3600) gets the values the BIND9 agent has always
-  served (3600, 600, 86400, 300), so rendering the stored timers changes
-  nothing on the wire for those zones. No serial bump. Downgrade is a
-  no-op.
+- `ff32b91acad8` — #1171, data-only: each `dns_zone` SOA timer still at
+  its old default (refresh 86400, retry 7200, expire 3600000, minimum
+  3600) gets the value the BIND9 agent has always served (3600, 600,
+  86400, 300), timer by timer, so rendering the stored timers changes
+  nothing on the wire for a timer nobody set. Every zone left with any
+  other timer moves its serial (`bump_zone_serial`'s rule), since its
+  served SOA changes at this upgrade. Downgrade is a no-op.
 
 ## 2026.10.02-1 — 2026-10-02
 
