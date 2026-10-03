@@ -41,6 +41,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing a zone's type now reaches Technitium (#1457).** The agent
+  creates zones with `zones/create` and treats "already exists" as
+  success, re-applying only the upstream, so the type of an existing
+  zone was never compared. A zone switched from forward to primary in
+  SpatiumDDI stayed a Forwarder on every Technitium server: names that
+  were not a local record were still forwarded to the old upstream and
+  answered with that server's stale data, while SpatiumDDI showed the
+  zone as primary and the agents reported every record op as applied.
+  The agent now reads the live type (`zones/options/get`) when the zone
+  already exists and converts it in place with `zones/convert`, before
+  the upstream is re-applied. Verified against Technitium 15.4.0:
+  Forwarder to Primary keeps the zone's records, and Primary to
+  Forwarder works too. Technitium refuses a conversion to Secondary or
+  Stub ("not supported"); that is logged at error as
+  `technitium_zone_type_mismatch` rather than worked around with a
+  delete, since the agent never deletes zones on its own.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release

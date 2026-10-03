@@ -1697,6 +1697,13 @@ class TechnitiumDriver(DriverBase):
                 # permanent silent no-op: the operator edits it, the
                 # bundle changes, and the daemon keeps transferring from
                 # the old address forever.
+                #
+                # The same holds for the zone TYPE (#1457): a zone switched
+                # from forward to primary in SpatiumDDI stayed a Forwarder
+                # here, so every name that was not a local record went to
+                # the old upstream. Convert first, so the upstream below is
+                # applied to the type the zone now has.
+                self._reconcile_zone_type(token, zone, ztype)
                 self._reapply_zone_upstream(token, zone, ztype, params)
                 return
             log.error(
@@ -1705,6 +1712,45 @@ class TechnitiumDriver(DriverBase):
                 zone_type=ztype,
                 error=body.get("errorMessage"),
             )
+
+    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
+        """Bring an existing zone's type in line with the bundle (#1457).
+
+        ``zones/create`` never changes the type of a zone that already
+        exists, so a type change in SpatiumDDI used to stop at the daemon.
+        ``zones/convert`` changes it in place and keeps the zone's records
+        (verified live against 15.4.0: Forwarder → Primary keeps every
+        record, Primary → Forwarder works too). Converting to Secondary or
+        Stub is refused by Technitium ("not supported") from both Primary
+        and Forwarder; that is logged at error rather than worked around
+        with a delete + recreate, because deleting a zone is not something
+        the agent does on its own (see ``_reconcile_zones``).
+
+        An unreadable live type is skipped, not guessed: converting on a
+        wrong guess is worse than leaving the zone as it is.
+        """
+        body = self._call(token, "GET", "zones/options/get", {"zone": zone}).json()
+        live = (body.get("response") or {}).get("type") if body.get("status") == "ok" else None
+        if not live:
+            log.warning(
+                "technitium_zone_type_unreadable",
+                zone=zone,
+                error=body.get("errorMessage"),
+            )
+            return
+        if live == ztype:
+            return
+        resp = self._call(token, "POST", "zones/convert", {"zone": zone, "type": ztype}).json()
+        if resp.get("status") == "ok":
+            log.info("technitium_zone_type_converted", zone=zone, from_type=live, to_type=ztype)
+            return
+        log.error(
+            "technitium_zone_type_mismatch",
+            zone=zone,
+            live_type=live,
+            desired_type=ztype,
+            error=resp.get("errorMessage"),
+        )
 
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
