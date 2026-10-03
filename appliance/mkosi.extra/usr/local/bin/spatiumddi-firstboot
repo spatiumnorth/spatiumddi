@@ -904,26 +904,24 @@ spec:
   chartContent: ${chart_b64}
   targetNamespace: spatium
   createNamespace: false
-  # #1042 — failurePolicy is deliberately LEFT AT THE CRD DEFAULT ('reinstall').
+  # #1299 — a failed release is UPGRADED again ('retry'), never uninstalled.
   #
-  # The first cut of this fix set 'abort', on the reasoning that a clean
-  # uninstall of a release owning SECRET_KEY is too destructive to self-heal
-  # into. Review measured the cost and it is worse than the disease:
-  # spatiumddi-helm-stuck-recover only acts on a HelmChart carrying a
-  # 'Failed' condition, and only after a 600 s latch, on a 5 min tick. A
-  # release left 'pending-upgrade' by the slot reboot — i.e. exactly the
-  # scenario #1042 was found in — may never set 'Failed' at all, so 'abort'
-  # risks an INDEFINITE outage with no API and no UI, where 'reinstall'
-  # recovers in seconds.
+  # #1042/#1044 kept the CRD default ('reinstall') and relied on the app
+  # Secret's 'helm.sh/resource-policy: keep' to carry SECRET_KEY through the
+  # uninstall half. But 'helm uninstall' keeps only what the release's LAST
+  # stored revision annotates, and after a slot rollback to a release older
+  # than #1044 that revision is the old chart's, which has no 'keep': the
+  # reinstall deleted the Secret, the install's 'lookup' found nothing, and
+  # 'randAlphaNum 64' minted a new SECRET_KEY, orphaning everything
+  # encrypted at rest (#1042's consequences, again). 'abort' was rejected in
+  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.7
+  # and klipper-helm v0.13.3, from k3s v1.36.4+k3s1) does not wait: it runs
+  # 'helm upgrade' on a failed release, and deletes nothing.
   #
-  # What made 'reinstall' dangerous was never the reinstall: it was that the
-  # app Secret lacked 'helm.sh/resource-policy: keep', so the uninstall half
-  # DELETED it and the install half minted a new SECRET_KEY. With the
-  # annotation (charts/spatiumddi/templates/secret.yaml) the Secret survives
-  # the uninstall and the reinstall's 'lookup' finds the same key — the same
-  # mechanism that carried the Postgres and Redis secrets through the very
-  # same event. A reinstall is disruptive and self-healing; it is no longer
-  # lossy, which is the property that actually mattered.
+  # A HelmChartConfig's failurePolicy overrides this one, and its CRD
+  # default is 'reinstall', so pin_control_failure_policy sets 'retry' there
+  # too. That is the half that governs the appliance; see it for the path.
+  failurePolicy: retry
   valuesContent: |
     image:
       tag: "${SPATIUMDDI_VERSION}"
@@ -1410,6 +1408,67 @@ _strip_control_priority_class() {
     sed -i -E 's/^([[:space:]]*)priorityClassName: "spatium-control-plane"$/\1priorityClassName: ""/' "$1"
 }
 
+# #1299 — pin 'failurePolicy: retry' on the control release's HelmChartConfig.
+#
+# This is the policy helm-controller applies: a HelmChartConfig's failurePolicy
+# overrides its HelmChart's, and the CRD defaults it to 'reinstall', so the
+# HelmChartConfig the supervisor creates (valuesContent only) has meant
+# 'reinstall' whatever _render_control_helmchart says.
+#
+# It is also the half that survives a slot switch. The HelmChart is rewritten
+# by whichever slot boots, and its job runs before this script places its own
+# (place_deferred_control_manifest waits for the CNPG webhook). On the forward
+# boot after a rollback to 2026.09.04-1, helm-controller re-ran the HelmChart
+# the old release had left (its chart, whose app Secret has no 'keep') with
+# this release's klipper-helm; that upgrade failed, the job helm-controller
+# then re-created found the release 'failed' and, under 'reinstall',
+# uninstalled it. Helm keeps only what the last stored revision annotates, so
+# the app Secret was deleted and the install minted a new SECRET_KEY.
+#
+# Nothing an older release runs rewrites a HelmChartConfig's failurePolicy:
+# its supervisor and api only merge-patch valuesContent. So once this release
+# has booted, the job for a stale HelmChart runs under 'retry' as well, on
+# either slot. An older helm-controller hands 'retry' to a klipper-helm that
+# knows only 'reinstall', which treats it as 'abort': a failed control release
+# on such a rolled-back slot waits for an operator instead of being
+# reinstalled, which is what keeps SECRET_KEY.
+#
+# Idempotent, quick, never fatal: an apiserver that does not answer leaves it
+# for the next boot. Inert on a node that does not carry the control chart.
+pin_control_failure_policy() {
+    [ -f "${CONTROL_MANIFEST}.deferred" ] || [ -f "$CONTROL_MANIFEST" ] || return 0
+    local cur
+    if ! cur=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get helmchartconfig spatium-control --ignore-not-found \
+            -o 'jsonpath={.metadata.name}/{.spec.failurePolicy}' 2>/dev/null); then
+        echo "WARN: could not read HelmChartConfig kube-system/spatium-control; failurePolicy not pinned this boot." >&2
+        return 0
+    fi
+    case "$cur" in
+        spatium-control/retry)
+            return 0
+            ;;
+        "")
+            if printf '%s\n' "apiVersion: helm.cattle.io/v1" "kind: HelmChartConfig" \
+                    "metadata:" "  name: spatium-control" "  namespace: kube-system" \
+                    "spec:" "  failurePolicy: retry" \
+                    | /usr/local/bin/k3s kubectl --request-timeout=10s create -f - >/dev/null 2>&1; then
+                echo "Pinned failurePolicy retry on HelmChartConfig kube-system/spatium-control (created)."
+                return 0
+            fi
+            # Raced the supervisor's create: fall through to the patch.
+            ;;
+    esac
+    if /usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            patch helmchartconfig spatium-control \
+            --type merge -p '{"spec":{"failurePolicy":"retry"}}' >/dev/null 2>&1; then
+        echo "Pinned failurePolicy retry on HelmChartConfig kube-system/spatium-control (was '${cur#*/}')."
+    else
+        echo "WARN: could not pin failurePolicy on HelmChartConfig kube-system/spatium-control; retried next boot." >&2
+    fi
+    return 0
+}
+
 release_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
@@ -1690,6 +1749,8 @@ if [ "$ready" = 1 ]; then
     date -Iseconds > "$STAMP"
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
+    # #1299 — first, while this boot's control chart is still held back.
+    pin_control_failure_policy
     place_deferred_tls_manifest
     reassert_control_plane_class || true
     place_deferred_control_manifest
