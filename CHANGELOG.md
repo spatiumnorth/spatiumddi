@@ -169,6 +169,26 @@ the formatter handles the rest.
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
 
+- **A member whose join fails for a transient reason keeps retrying for
+  the whole retry window (#1212).** After a transient join failure the
+  backend keeps the member's desired role for 15 minutes (#961), so that
+  its supervisor re-fires the join once the path to the seed is back. But
+  the supervisor re-fired on every heartbeat, three attempts at most and
+  none spaced, and an attempt against an unreachable seed fails in about
+  20 seconds. All three landed in the first two and a half minutes of an
+  outage. A member whose path to the seed's control-plane ports came back
+  after that stayed a standalone node with its row `failed`, and the
+  cluster kept an even control-plane count until an operator re-promoted
+  or replaced it. Re-fires against the same seed are now spaced from the
+  last attempt's time in the supervisor's own attempt ledger: one minute,
+  two, then every four. The first retry still comes a minute after the
+  first attempt, and the attempts now reach past the 15-minute window.
+  So the backend's window ends a transient failure's retries, and a
+  member whose path returns inside it joins with no operator action. The
+  ceiling stays as the backstop for a control plane that never processes
+  the failure: eight attempts over about 23 minutes, where it used to be
+  three in two and a half. A demote's leave is unchanged.
+
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
   2026.10.02-1, where Plan → Start never got past the upgrade lease:
