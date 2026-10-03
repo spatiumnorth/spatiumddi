@@ -35,6 +35,10 @@ from app.config import settings
 from app.core.crypto import decrypt_str
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
+    ZONE_DEFAULT_EXPIRE,
+    ZONE_DEFAULT_MINIMUM,
+    ZONE_DEFAULT_REFRESH,
+    ZONE_DEFAULT_RETRY,
     DNSAcl,
     DNSRecord,
     DNSRecordOp,
@@ -501,6 +505,15 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
             "primary_ns": getattr(z, "primary_ns", "") or "",
             "admin_email": getattr(z, "admin_email", "") or "",
+            # #1171 — the zone's SOA timers. Stored, editable, exported and in
+            # the control plane's own zone template, never shipped, so the
+            # BIND9 agent wrote 3600/600/86400/300 into every zone's SOA. Like
+            # the apex above they are structural (zones_structural keeps them),
+            # so an edit re-renders the zone.
+            "refresh": getattr(z, "refresh", ZONE_DEFAULT_REFRESH),
+            "retry": getattr(z, "retry", ZONE_DEFAULT_RETRY),
+            "expire": getattr(z, "expire", ZONE_DEFAULT_EXPIRE),
+            "minimum": getattr(z, "minimum", ZONE_DEFAULT_MINIMUM),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
