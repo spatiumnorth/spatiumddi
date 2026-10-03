@@ -27,6 +27,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS server's zone serials reach the per-server zone state
+  (#1408).** The agent reports the serial of each zone it renders
+  (`POST /api/v1/dns/agents/zone-state`), but the control plane
+  stripped the trailing dot from the reported names and looked them
+  up against names stored with one. Nothing matched, every report was
+  dropped behind a 200, and the zone's server-state view showed every
+  server as never reported and out of sync. The names now match, only
+  among the reporting server's own group (another group's zone of the
+  same name is another zone). A name the group does not hold, or
+  holds once per view, is skipped and counted in the answer.
+
 - **TACACS+ sign-in works against a server whose profile is keyed on
   the service (#1336).** After the password was accepted, the product
   asked the TACACS+ server to authorize the user with no arguments at
