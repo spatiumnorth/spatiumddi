@@ -78,6 +78,19 @@ the formatter handles the rest.
   under the lease's hostname. The old address is still freed when no
   active lease holds it.
 
+- **Reserving an address a DHCP lease holds no longer leaves the
+  reservation's row to the lease (#1404).** Pinning a device to the
+  address it already leases, or moving a reservation back onto an
+  address its lease still holds, takes over that lease's IPAM row. The
+  row became the reservation's (`static_dhcp`, its name, its MAC) but
+  kept the lease's `auto_from_lease` flag and lease link, which the
+  lease ingest reads as "this row is mine". The client's next DHCP
+  exchange turned the reserved address back into a plain lease row,
+  and the lease's release or expiry deleted it, so the address read
+  as free while the reservation still handed it to the device. A row
+  a reservation takes over now drops both, and the lease mirror
+  leaves it alone, as it does every reservation's row.
+
 ### Security
 
 - **The MFA enrolment QR code is drawn in the browser, not fetched from
