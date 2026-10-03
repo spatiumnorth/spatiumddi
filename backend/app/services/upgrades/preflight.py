@@ -108,15 +108,29 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 # ── Individual checks ─────────────────────────────────────────────────
 
 
-def check_inflight_conflict(*, namespace: str | None = None) -> PreflightResult:
+def check_inflight_conflict(
+    *, namespace: str | None = None, own_holder: str | None = None
+) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
     Reads the ``spatium-upgrade-lock`` Lease; if it's held + not
     expired we ``fail`` with the holder's identity. An expired lease
     is fine (the previous holder crashed before releasing — we'll
     take over on acquire).
+
+    ``own_holder`` is the identity of the run asking. The orchestrator
+    takes the lease at Start and then runs this preflight again for every
+    node, so without it each run failed its own first node on the lease
+    it had just taken (#1445).
     """
     state = mutex.get_state(namespace=namespace)
+    if state.held and not state.expired and own_holder and state.holder == own_holder:
+        return PreflightResult(
+            name="inflight_conflict",
+            level="ok",
+            message="the upgrade lease is held by this run",
+            detail={"holder": state.holder, "transitions": state.transitions},
+        )
     if state.held and not state.expired:
         return PreflightResult(
             name="inflight_conflict",
@@ -625,8 +639,12 @@ async def run_all(
     *,
     target_version: str,
     namespace: str | None = None,
+    own_holder: str | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
+
+    ``own_holder`` is passed by a run that already holds the upgrade
+    lease (see :func:`check_inflight_conflict`); Plan passes nothing.
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
@@ -634,7 +652,7 @@ async def run_all(
     ``asyncio.gather``.
     """
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace),
+        check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
         check_disk_headroom(),
         await check_mirror_disk_headroom(),

@@ -141,9 +141,11 @@ def _now_iso() -> str:
 # ── Step 1: preflight ────────────────────────────────────────────────
 
 
-async def _step_preflight(target_version: str) -> StepResult:
+async def _step_preflight(target_version: str, lease_holder: str | None = None) -> StepResult:
     step = StepResult(name="preflight", started_at=_now_iso())
-    report = await preflight.run_all(target_version=target_version)
+    # The orchestrator holds the upgrade lease while it drives this chain;
+    # without its identity, the in-flight check fails on that very lease.
+    report = await preflight.run_all(target_version=target_version, own_holder=lease_holder)
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
         return step.finish(
@@ -636,6 +638,7 @@ async def single_node_upgrade(
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     start_step: StepName | None = None,
+    lease_holder: str | None = None,
 ) -> SingleNodeResult:
     """Drive one node through the 11-step rolling-upgrade primitive.
 
@@ -657,6 +660,9 @@ async def single_node_upgrade(
         cnpg_namespace: namespace of the Cluster CR; defaults to the
             SA-mounted namespace.
         start_step: skip-ahead-to. Useful for resume + tests.
+        lease_holder: identity holding the upgrade lease for this run, so
+            the per-node preflight does not count that lease as another
+            upgrade in flight.
     """
     steps_in_order: list[StepName] = [
         "preflight",
@@ -705,7 +711,7 @@ async def single_node_upgrade(
         results.append(r)
         return r.ok
 
-    if not await _run("preflight", _step_preflight(target_version)):
+    if not await _run("preflight", _step_preflight(target_version, lease_holder)):
         return _failed(node_name, target_version, "preflight", results)
     if not await _run("etcd_snapshot", _step_etcd_snapshot()):
         return _failed(node_name, target_version, "etcd_snapshot", results)

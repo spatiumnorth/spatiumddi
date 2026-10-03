@@ -26,7 +26,7 @@ import pytest
 
 from app.services.appliance import k8s
 from app.services.appliance.slot_image_target import SlotImageTarget
-from app.services.upgrades import per_node, preflight
+from app.services.upgrades import mutex, orchestrator, per_node, preflight
 
 _MICRO_TIME = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$")
 
@@ -212,3 +212,156 @@ async def test_a_replica_that_is_visibly_not_streaming_still_fails(
     result = await preflight.check_replication_lag()
 
     assert result.level == "fail"
+
+
+# ── The run's own lease is not "another upgrade in flight" ─────────────────────
+
+
+def _held_by(holder: str) -> mutex.LeaseState:
+    return mutex.LeaseState(held=True, holder=holder, renew_time="t", transitions=1, expired=False)
+
+
+def test_the_lease_held_by_this_run_is_not_a_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(preflight.mutex, "get_state", lambda **_k: _held_by("worker-0"))
+
+    assert preflight.check_inflight_conflict(own_holder="worker-0").level == "ok"
+    # Anyone else, including a caller that does not say who it is, still conflicts.
+    assert preflight.check_inflight_conflict(own_holder="api-1").level == "fail"
+    assert preflight.check_inflight_conflict().level == "fail"
+
+
+def _all_other_checks_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _ok(name: str) -> preflight.PreflightResult:
+        return preflight.PreflightResult(name=name, level="ok", message="fine", detail={})
+
+    for name in ("check_disk_headroom", "check_version_path", "check_quorum"):
+        monkeypatch.setattr(preflight, name, lambda *_a, _n=name, **_k: _ok(_n))
+    for name in (
+        "check_replication_lag",
+        "check_mirror_disk_headroom",
+        "check_kea_ha_version_skew",
+        "check_powerdns_lmdb_migration",
+        "check_etcd_snapshot_freshness",
+        "check_pre_upgrade_backup",
+    ):
+
+        async def _async_ok(*_a: Any, _n: str = name, **_k: Any) -> preflight.PreflightResult:
+            return _ok(_n)
+
+        monkeypatch.setattr(preflight, name, _async_ok)
+
+
+@pytest.mark.asyncio
+async def test_a_node_preflight_passes_on_its_own_runs_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Start takes the lease, then every node's chain opens with the full
+    # preflight. Before the fix the in-flight check failed on that very
+    # lease, so every run failed its first node (found by ddi-pg on #1449).
+    _all_other_checks_ok(monkeypatch)
+    monkeypatch.setattr(preflight.mutex, "get_state", lambda **_k: _held_by("worker-0"))
+
+    own = await per_node._step_preflight("2026.10.03-1", "worker-0")
+    anonymous = await per_node._step_preflight("2026.10.03-1")
+
+    assert own.ok is True
+    assert anonymous.ok is False
+    assert anonymous.detail["failed_checks"] == ["inflight_conflict"]
+
+
+@pytest.mark.asyncio
+async def test_the_node_chain_forwards_the_lease_holder_to_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[Any] = []
+
+    async def _preflight(target_version: str, lease_holder: str | None = None) -> Any:
+        seen.append(lease_holder)
+        return per_node.StepResult(name="preflight", started_at="t").finish(True)
+
+    async def _ok(*_a: Any, **_k: Any) -> per_node.StepResult:
+        return per_node.StepResult(name="x", started_at="t").finish(True)
+
+    monkeypatch.setattr(per_node, "_step_preflight", _preflight)
+    for name in (
+        "etcd_snapshot",
+        "cordon",
+        "drain",
+        "trigger_slot_apply",
+        "health_gate",
+        "convergence",
+        "uncordon",
+        "cluster_verify",
+    ):
+        monkeypatch.setattr(per_node, f"_step_{name}", _ok)
+
+    db = MagicMock(commit=AsyncMock())
+    await per_node.single_node_upgrade(
+        db,
+        node_name="node-1",
+        target_version="2026.10.03-1",
+        slot_image=SlotImageTarget(url="https://example.test/slot.raw.xz"),
+        lease_holder="worker-0",
+    )
+
+    assert seen == ["worker-0"]
+
+
+# ── Plan detects the CNPG cluster when the field is left empty ────────────────
+
+
+@pytest.mark.parametrize(
+    ("url", "status", "expected"),
+    [
+        (
+            "postgresql+asyncpg://u:p@spatium-control-spatiumddi-postgresql-rw:5432/db",
+            200,
+            "spatium-control-spatiumddi-postgresql",
+        ),
+        (
+            "postgresql+asyncpg://u:p@pg-rw.spatium.svc.cluster.local:5432/db",
+            200,
+            "pg",
+        ),
+        # Ends in -rw, but no such Cluster: not a CNPG database.
+        ("postgresql+asyncpg://u:p@db-rw:5432/db", 404, ""),
+    ],
+)
+def test_the_cnpg_cluster_is_detected_from_the_database_host(
+    monkeypatch: pytest.MonkeyPatch, url: str, status: int, expected: str
+) -> None:
+    asked: list[str] = []
+
+    def _get(name: str, namespace: str | None = None) -> tuple[int, Any]:
+        asked.append(name)
+        return status, {}
+
+    monkeypatch.setattr(orchestrator.settings, "database_url", url)
+    monkeypatch.setattr(orchestrator.k8s, "get_cnpg_cluster", _get)
+
+    assert orchestrator.detect_cnpg_cluster_name() == expected
+    assert asked == [expected or "db"]
+
+
+def test_a_database_host_without_rw_asks_kubernetes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _get(*_a: Any, **_k: Any) -> tuple[int, Any]:
+        raise AssertionError("should not be called")
+
+    monkeypatch.setattr(
+        orchestrator.settings, "database_url", "postgresql+asyncpg://u:p@postgres:5432/db"
+    )
+    monkeypatch.setattr(orchestrator.k8s, "get_cnpg_cluster", _get)
+
+    assert orchestrator.detect_cnpg_cluster_name() == ""
+
+
+def test_an_unreachable_kubeapi_detects_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _get(*_a: Any, **_k: Any) -> tuple[int, Any]:
+        raise k8s.KubeapiUnavailableError("no service account")
+
+    monkeypatch.setattr(orchestrator.settings, "database_url", "postgresql+asyncpg://u:p@pg-rw/db")
+    monkeypatch.setattr(orchestrator.k8s, "get_cnpg_cluster", _get)
+
+    assert orchestrator.detect_cnpg_cluster_name() == ""

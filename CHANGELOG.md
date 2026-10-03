@@ -54,6 +54,15 @@ the formatter handles the rest.
     streaming. A state the role cannot see is now a warning
     ("unverified"), not a failure; a replica visibly not streaming
     still fails.
+  - Once the lease could be taken, every run would have failed its own
+    first node: each node's chain re-runs the full preflight, and its
+    in-flight check failed on any held lease, including the one the run
+    had just taken. The check now passes a lease held by the run asking.
+  - Plan took the CNPG cluster name only from its form field, which is
+    empty by default, so a default run skipped the CNPG maintenance
+    window and the primary-moved check above. Left empty, the name is
+    now detected from the database connection (the chart's
+    `<cluster>-rw` Service, confirmed by reading the Cluster).
   The other points in that report are #1446, #1447 and #1448.
 
 - **Replacing a dead control-plane node no longer uninstalls the control
