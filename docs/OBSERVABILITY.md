@@ -381,7 +381,7 @@ AuditLog
   timestamp (timestamptz, indexed)
   user_id (FK → User)
   user_display_name: str    -- denormalized for historical record
-  auth_source: str          -- local / ldap / oidc
+  auth_source: str          -- local, a service source (system, acme, ...), or the name of the provider an external sign-in went through (up to 255, #1337)
   source_ip: inet
   user_agent: str
   action: enum(create, update, delete, login, logout, sync, permission_change, ...)

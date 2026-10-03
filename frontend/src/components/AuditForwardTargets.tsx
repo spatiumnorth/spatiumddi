@@ -17,6 +17,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   settingsApi,
   type AuditForwardFormat,
@@ -126,7 +127,12 @@ export function AuditForwardTargets({
   isSuperadmin: boolean;
 }) {
   const qc = useQueryClient();
-  const { data: targets = [], isLoading } = useQuery({
+  const {
+    data: targets = [],
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["audit-forward-targets"],
     queryFn: settingsApi.listAuditTargets,
   });
@@ -231,7 +237,15 @@ export function AuditForwardTargets({
                   colSpan={7}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
-                  No audit-forward targets configured.
+                  {/* A refused or failed read is not an empty list (#1343). */}
+                  {isError ? (
+                    <ListReadError
+                      error={error}
+                      what="the audit-forward targets"
+                    />
+                  ) : (
+                    "No audit-forward targets configured."
+                  )}
                 </td>
               </tr>
             ) : (

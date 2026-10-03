@@ -128,7 +128,7 @@ The software makes no outbound connection you did not configure, with one except
 | 🔐 | **DNSSEC** | BIND9 inline-signing (BIND owns + auto-rotates keys) + **PowerDNS and Technitium online sign / unsign** from the zone page · reusable `dnssec-policy` library — KSK + ZSK algorithm / size / lifetime, **NSEC or NSEC3** (iterations · salt length · opt-out) · per-zone public key state + **DS export** to hand to the parent-zone registrar · manual + automatic rollover · SpatiumDDI never holds private key material — the signer owns and rotates it |
 | 🔀 | **DNS Views (split-horizon)** | per-view zone + record rendering on BIND9 — `view_id IS NULL` records shared across views, scoped records render only in their view, RPZ / blocklists replicate into each view block |
 | ⚖️ | **GSLB-lite + GeoDNS steering** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member · **topology-aware steering** — a per-member serving scope (client CIDRs and/or Site) renders as BIND9 geo views composed over split-horizon, evaluated before operator views with a union fallback so a scoped-only pool never blackholes |
-| 🔄 | **DHCP** | Kea container · agentless FortiGate cloud DHCP driver (FortiOS REST, no agent) · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library · **PXE / iPXE provisioning profiles** — per-architecture boot-file selection (BIOS · UEFI x64 / ia32 / arm64 · iPXE chainload) rendered as Kea client classes, one reusable profile assigned per scope · DHCPv6 stateful / stateless / SLAAC modes · DHCPv6 prefix delegation (IA_PD / pd-pools + RFC 6603 excluded-prefix) · DUID host reservations · per-subnet relay-agent addresses · **IPv6 Router Advertisements** (radvd rendered per RA-enabled scope + rogue-RA passive sniffer) · fingerbank device-class on the lease list (filterable) · rogue-DHCP detection (opt-in active probe → unexpected-responder alert + allowlist) · **fingerprint-driven device policies** — compile chosen fingerbank device classes into a real Kea client class with its own option set and lease time, bindable from a pool's class restriction (NAC-lite, no 802.1X, no switch config); ambiguous signatures are excluded by default, counted and listed, because a request list of `1,3,6,15` comes from a doorbell and a rack server alike |
+| 🔄 | **DHCP** | Kea container · agentless FortiGate cloud DHCP driver (FortiOS REST, no agent) · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library · **PXE / iPXE provisioning profiles** — per-architecture boot-file selection (BIOS · UEFI x64 / ia32 / arm64 · iPXE chainload) rendered as Kea client classes, one reusable profile assigned per scope · DHCPv6 stateful / stateless / SLAAC modes · DHCPv6 prefix delegation (IA_PD / pd-pools + RFC 6603 excluded-prefix) · DUID host reservations · DHCPv6 leases mirrored into IPAM and DDNS, keyed on DUID + IAID · **Windows DHCP failover** — relationships observed per server, uncoordinated serving of one scope by two Windows servers refused, and relationships created / edited / replicated from SpatiumDDI · per-subnet relay-agent addresses · **IPv6 Router Advertisements** (radvd rendered per RA-enabled scope + rogue-RA passive sniffer) · fingerbank device-class on the lease list (filterable) · rogue-DHCP detection (opt-in active probe → unexpected-responder alert + allowlist) · **fingerprint-driven device policies** — compile chosen fingerbank device classes into a real Kea client class with its own option set and lease time, bindable from a pool's class restriction (NAC-lite, no 802.1X, no switch config); ambiguous signatures are excluded by default, counted and listed, because a request list of `1,3,6,15` comes from a doorbell and a rack server alike |
 | 🪟 | **Windows DNS + DHCP** | agentless — RFC 2136 + WinRM, no software on the DC |
 | 🧩 | **Agentless Technitium** | already run Technitium? Point SpatiumDDI at it — paste an API URL + permanent bearer token and the control plane drives its HTTP API directly, nothing deployed. Zone + record CRUD and topology pull; DNSSEC / forwarders / blocklists stay in Technitium's own console. Coexists with the agent-managed container driver — a group is single-driver, so a mixed estate is one group each |
 | ☁️ | **Cloud DNS** | agentless first-class drivers — Cloudflare · Route 53 · Azure DNS · Google Cloud DNS · DigitalOcean · Hetzner · Linode · Vultr · import-existing-zones · client-side multi-value RRset disambiguation |
@@ -157,6 +157,7 @@ The software makes no outbound connection you did not configure, with one except
 | 🛤 | **WAN circuits** | carrier-supplied logical pipe (provider + transport class + bandwidth + endpoints + term + cost) · 9 transport classes including AWS DX / Azure ER / GCP Interconnect cross-connects · soft-deletable (`status='decom'` is operator-visible end-of-life) · alerts for term-expiring + status-changed |
 | 📦 | **Service catalog** | bundles VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / Overlay into a customer-deliverable · `mpls_l3vpn` + `sdwan` + `custom` kinds in v1 · kind-aware `/summary` endpoint with L3VPN canonical shape · alerts for term-expiring + resource-orphaned |
 | 🌐 | **SD-WAN overlays** | vendor-neutral overlay topology + routing-policy intent · 6 kinds (sdwan / ipsec / wireguard / dmvpn / vxlan-evpn / gre) · ordered preferred-circuit chain per site · 33 well-known SaaS apps in the catalog · pure read-only `/simulate` what-if when circuits go down · SVG circular-layout topology view |
+| 🚑 | **E911 dispatchable location** (`network.e911`) | SpatiumDDI as a Location Information Server: given a phone's IP, MAC or LLDP chassis + port, answer *which room is this device in, right now?* from the leases, switch FDB and LLDP data IPAM already collects · Emergency Response Locations as the 31 separate RFC 5139 civic elements, bound to a switch port / subnet / VLAN / device at a fixed precedence · a stale precise answer is refused in favour of a fresh coarse one, and every answer carries its confidence · HELD (RFC 5985) + PIDF-LO for phones and PBXs that already speak it · DHCP options 99 / 123 · civic CSV + LLDP-MED snippets · a location *source* only — no call routing, no ALI upload ([docs](docs/features/E911.md)) |
 
 ### 🏭 Vertical network awareness
 
@@ -165,7 +166,8 @@ Four IP-native domains a generic IPAM doesn't speak. Each is a
 the DDI primitives already here — not a protocol implementation. All
 four are read-only by construction: SpatiumDDI records what the estate
 *is*, and never reads or writes a device object, a control tag, or a
-study. Default-on, individually togglable.
+study. Off on a fresh install, individually togglable under Settings →
+Features.
 
 | | Domain | What it models |
 |---|---|---|
@@ -268,7 +270,7 @@ doesn't own.
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended)) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO for amd64 and arm64, installable onto a RAID1 mirror (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended)) |
 
 ---
 
@@ -937,7 +939,7 @@ Operators get a real Kubernetes node without managing one.
 
 1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox /
    VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
-   bare metal. **amd64** (arm64 ISO is planned).
+   bare metal. **amd64** or **arm64** (UEFI only).
 
    **Hard floor (installer refuses below this): 32 GiB disk** —
    the A/B atomic-upgrade layout needs two 8 GiB OS slots that

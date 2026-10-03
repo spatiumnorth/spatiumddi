@@ -14,7 +14,13 @@ and the seed never served again.
 The /v3 etcd gRPC gateway answers 415 on this build and the appliance ships no
 etcdctl, so the fix reads membership from the joiner's own k3s journal (the same
 log classify_join_failure already scans) plus the supervisor's persisted
-etcd-member marker — never a live etcd query. These tests drive the detection
+etcd-member marker — never a live etcd query.
+
+#1285 — only lines logged AFTER the seed's etcd accepted the member add count.
+k3s logs "Adding member ... to etcd cluster" just BEFORE MemberAddAsLearner and
+again on every refused retry, so that line alone once kept a node etcd never
+admitted (nightly-2026.09.28: 1,616 refused adds in 27 minutes, row `joining`
+for good). These tests drive the detection
 helper against canned journals (SPATIUM_K3S_LOG_CMD) and a temp marker file
 (SPATIUM_ETCD_MEMBER_SIDECAR), and pin the structure of do_join so a rollback
 can never precede the membership decision.
@@ -56,6 +62,34 @@ ADDING_MEMBER = (
     "ddipg-member-2-f439c46f=https://192.168.122.170:2380 to etcd cluster "
     '[ddipg-member-1-33157b2d=https://192.168.122.24:2380]"'
 )
+# The success line k3s logs once the add went through (k3s v1.36.4+k3s1
+# pkg/etcd/etcd.go, join()): the member list now carries this node.
+STARTING_JOIN = (
+    'time="2026-09-29T07:04:37Z" level=info msg="Starting etcd to join cluster with '
+    "members [ddipg-seed-c337b117=https://192.168.122.183:2380 "
+    "ddipg-member-1-7f072fd9=https://192.168.122.160:2380 "
+    'ddipg-member-3-7d1c4ad1=https://192.168.122.86:2380]"'
+)
+# A refused add, verbatim from member-4 on nightly-2026.09.28 (spatiumddi#1285):
+# the seed kept a dead voter, so its etcd refused every add; k3s retried it once
+# a second and gave up 15 minutes later.
+REFUSED_ADD_ATTEMPT = (
+    'time="2026-09-29T11:57:34Z" level=info msg="Adding member '
+    "ddipg-member-4-4ee86735=https://192.168.122.195:2380 to etcd cluster "
+    "[ddipg-member-3-7d1c4ad1=https://192.168.122.86:2380 "
+    "ddipg-seed-c337b117=https://192.168.122.183:2380 "
+    'ddipg-member-1-7f072fd9=https://192.168.122.160:2380]"'
+)
+REFUSED_ADD_WAIT = (
+    'time="2026-09-29T11:57:34Z" level=info msg="Waiting for other members to finish '
+    'joining etcd cluster: etcdserver: unhealthy cluster"'
+)
+REFUSED_ADD_GIVE_UP = (
+    'time="2026-09-29T12:02:28Z" level=error msg="Shutdown request received: \\"failed '
+    "to wait for API server to become ready: context deadline exceeded\\nthe server is "
+    'currently unable to handle the request\\""'
+)
+REFUSED_ADD = "\n".join([REFUSED_ADD_ATTEMPT, REFUSED_ADD_WAIT] * 3 + [REFUSED_ADD_GIVE_UP])
 PUBLISHED = (
     '{"level":"info","ts":"2026-09-10T11:49:34.801802Z",'
     '"caller":"etcdserver/server.go:1836","msg":"published local member to cluster through raft"}'
@@ -83,8 +117,23 @@ def test_a_started_etcd_marker_means_registered() -> None:
     assert _registered(STARTING_ETCD, None) is True
 
 
-def test_an_adding_member_marker_means_registered() -> None:
-    assert _registered(ADDING_MEMBER, None) is True
+def test_an_adding_member_line_alone_is_not_registered() -> None:
+    """#1285 — k3s logs this line BEFORE it asks etcd to add the member, and on
+    every refused retry. On its own it proves nothing about membership."""
+    assert _registered(ADDING_MEMBER, None) is False
+
+
+def test_a_refused_add_is_not_registered() -> None:
+    """#1285 — the verbatim refused-add journal: 'Adding member' then etcd's
+    'unhealthy cluster' refusal, over and over, then k3s giving up. Never a
+    member, so the rollback is safe and must run."""
+    assert _registered(REFUSED_ADD, None) is False
+
+
+def test_a_starting_etcd_to_join_marker_means_registered() -> None:
+    """k3s logs this only after MemberAddAsLearner succeeded (or the member list
+    already has this node): the add went through."""
+    assert _registered(STARTING_JOIN, None) is True
 
 
 def test_a_published_member_marker_means_registered() -> None:
@@ -166,6 +215,15 @@ def test_the_fix_uses_no_etcd_gateway_or_etcdctl() -> None:
     for forbidden in ("/v3/cluster", "127.0.0.1:2382", "etcdctl", "member/remove"):
         offenders = [ln for ln in code if forbidden in ln]
         assert not offenders, f"{forbidden}: {offenders}"
+
+
+def test_the_journal_anchor_carries_its_zone() -> None:
+    """#1285 — journalctl reads a bare --since timestamp as LOCAL time, and an
+    operator can set the appliance's zone: the anchor must name UTC, or the scan
+    window is hours off and a standalone boot's etcd lines count as this
+    attempt's."""
+    dj = _do_join()
+    assert "k3s_started_at=\"$(date -u '+%Y-%m-%d %H:%M:%S UTC')\"" in dj
 
 
 def test_wait_ready_takes_an_optional_budget() -> None:

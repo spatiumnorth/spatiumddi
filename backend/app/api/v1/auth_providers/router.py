@@ -17,10 +17,11 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, SuperAdmin
+from app.api.stepup import require_operator_stepup
 from app.core.auth.ldap import test_connection as ldap_test_connection
 from app.core.auth.oidc import invalidate_caches as oidc_invalidate_caches
 from app.core.auth.oidc import probe_discovery as oidc_probe_discovery
@@ -29,7 +30,7 @@ from app.core.auth.saml import probe_metadata as saml_probe_metadata
 from app.core.auth.tacacs import test_connection as tacacs_test_connection
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.models.audit import AuditLog
-from app.models.auth import Group
+from app.models.auth import Group, User, UserSession
 from app.models.auth_provider import (
     PROVIDER_TYPES,
     AuthGroupMapping,
@@ -293,6 +294,47 @@ async def update_provider(
 @router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_provider(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     provider = await _get_provider_or_404(db, provider_id)
+    if user.auth_provider_id == provider.id:
+        # The caller's own account would be unlinked, and refused at its next
+        # sign-in until another administrator links it.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Your own account signs in through this provider. Deleting it "
+                "would lock you out; have another administrator delete it."
+            ),
+        )
+    # Its accounts lose their provider (the FK is SET NULL) and, with it,
+    # their identifier (#1235). An external id means something only at the
+    # provider that issued it, and a stale one would make the next provider
+    # of this type issuing the same ``sub`` / DN / NameID look like the
+    # account's owner to anything matching on ``(auth_source, external_id)``.
+    # The accounts are refused at sign-in until an administrator links them
+    # to a provider.
+    orphaned = (
+        await db.execute(
+            update(User)
+            .where(User.auth_provider_id == provider.id)
+            .values(external_id=None)
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+    # And their sessions, as a link does: deleting the provider withdraws the
+    # authority those sessions were issued on, so none outlives it until its
+    # refresh token happens to expire.
+    sessions_revoked = (
+        await db.execute(
+            update(UserSession)
+            .where(
+                UserSession.user_id.in_(
+                    select(User.id).where(User.auth_provider_id == provider.id)
+                ),
+                UserSession.revoked.is_(False),
+            )
+            .values(revoked=True)
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
     db.add(
         AuditLog(
             user_id=user.id,
@@ -303,6 +345,7 @@ async def delete_provider(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
             resource_id=str(provider.id),
             resource_display=provider.name,
             result="success",
+            new_value={"accounts_unlinked": orphaned, "sessions_revoked": sessions_revoked},
         )
     )
     await db.delete(provider)
@@ -464,11 +507,33 @@ async def test_provider(
     )
 
 
-# Debug-only: decrypt + return secrets. Kept out of GET to avoid accidental exposure.
-# Used by the admin UI's "Reveal" button (explicit action).
-@router.get("/{provider_id}/secrets", response_model=dict[str, Any])
-async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[str, Any]:
+class RevealSecretsRequest(BaseModel):
+    """The operator step-up (#408): a local user's password, or an external
+    user's authenticator code."""
+
+    password: str | None = None
+    totp_code: str | None = None
+
+
+# Decrypt + return a provider's secrets (the LDAP bind password, the OIDC /
+# SAML / RADIUS / TACACS+ secrets). A POST carrying the operator step-up,
+# like every other secret reveal (#1355): it was a GET with none, the one
+# reveal a stolen session could read outright.
+@router.post("/{provider_id}/secrets", response_model=dict[str, Any])
+async def reveal_secrets(
+    provider_id: uuid.UUID, body: RevealSecretsRequest, db: DB, user: SuperAdmin
+) -> dict[str, Any]:
     provider = await _get_provider_or_404(db, provider_id)
+    method = await require_operator_stepup(
+        db,
+        user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="read",
+        resource_type="auth_provider_secret",
+        resource_id=str(provider.id),
+        resource_display=provider.name,
+    )
     if provider.secrets_encrypted is None:
         return {}
     db.add(
@@ -481,6 +546,7 @@ async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> di
             resource_id=str(provider.id),
             resource_display=provider.name,
             result="success",
+            new_value={"stepup_method": method},
         )
     )
     await db.commit()
