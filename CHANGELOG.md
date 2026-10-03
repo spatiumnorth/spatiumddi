@@ -53,6 +53,17 @@ the formatter handles the rest.
   `external_user_email_in_use` warning, instead of failing the login.
   Neither ever adopts the other account (#1235).
 
+- **A DHCP server can be taken out of its server group (#1458).**
+  `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
+  an explicit `"server_group_id": null` was dropped like an absent key:
+  the call answered 200 and the server stayed in its group. A server
+  could be moved to another group but never made ungrouped, although
+  the column is nullable and create accepts it. An explicitly sent
+  `null` now clears the group, wakes the old group's channel so its
+  remaining members re-render, and is recorded in the audit row. Every
+  other field keeps "null = leave it as it is", since several of them
+  are NOT NULL.
+
 - **IPAM and DHCP DDNS no longer write an A record beside a CNAME
   (#1441).** #1381 made the record API refuse a CNAME next to other
   data, but IPAM's auto-generated forward records (an address's
