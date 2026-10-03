@@ -72,7 +72,7 @@ logger = structlog.get_logger(__name__)
 # The audit actor for the orchestrator's own transitions (started, node_failed,
 # succeeded, chart_bump_failed, post_upgrade_verify_failed), which no operator
 # drives. ``audit_log.user_display_name`` is NOT NULL.
-SYSTEM_ACTOR = "system:upgrade-orchestrator"
+SYSTEM_ACTOR = per_node.SYSTEM_ACTOR
 
 
 def detect_cnpg_cluster_name(namespace: str | None = None) -> str:

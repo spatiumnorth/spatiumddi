@@ -86,6 +86,20 @@ the formatter handles the rest.
     record `system:upgrade-orchestrator`, a crashed drive rolls back
     before marking the run failed, and a failed start or crashed drive
     releases the lease if it still holds it.
+  - Nothing rebooted the node into the slot it staged. The host runner
+    writes the new slot, arms the next boot and stops there, so the
+    health gate timed out on every node with the old version still
+    running. A new `reboot` step waits until the host reports this run's
+    slot staged, then requests the reboot through the same flag as the
+    Fleet reboot action (audited as `system:upgrade-orchestrator`). A
+    `done` left by an earlier upgrade does not count, so the node is not
+    restarted in the middle of the apply, and a request already
+    outstanding is not stamped twice. On a control-plane member the
+    request depends on #1446's fix.
+  - The run's database session did not survive the CNPG switchover it
+    waits for: the next query failed with "connection is closed". Task
+    sessions now ping their connection on checkout, and the reboot and
+    health-gate waits end their transaction on every poll.
   The other points in that report are #1446, #1447 and #1448.
 
 - **Replacing a dead control-plane node no longer uninstalls the control
