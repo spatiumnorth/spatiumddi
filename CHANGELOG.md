@@ -27,6 +27,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Add Zone stores a reverse-lookup name as a reverse zone, so IPAM
+  publishes its PTRs (#1310).** Kind was pre-filled "Forward lookup"
+  whatever the name, and the zone API stored the kind it was given and
+  defaulted to forward too, as create-from-template and the copilot's
+  `create_dns_zone` did. A primary zone named under in-addr.arpa or
+  ip6.arpa created with Kind left alone was stored as forward, while the
+  API's own name classification called it reverse. IPAM publishes PTRs
+  only into reverse zones and creates no reverse zone beside one that
+  holds the name, so a subnet under such a zone got no PTR at all, for
+  its gateway or any host, and its DNS sync summary showed nothing
+  missing. For a primary zone, Kind now follows the name in the dialog
+  until the operator picks one; an omitted kind is taken from the name
+  on every create path; and the API refuses a forward kind for a name
+  under in-addr.arpa or ip6.arpa, on create and on an edit that sets the
+  kind, the name or the type. Secondary, stub and forward zones keep
+  their old default. A primary zone stored forward before this keeps
+  its kind until it is next saved from the Edit dialog, which then asks
+  for Reverse lookup.
+
 - **The DHCP scope dialog offers the DDNS hostname policies the API
   accepts, and an edit checks the policy as create does (#1308).** The
   dialog offered Client-supplied, From IPAM and Generate (`client`,
