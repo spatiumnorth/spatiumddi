@@ -174,8 +174,9 @@ In order, a login through provider P as subject S with username U:
 
 1. signs in as the account linked to P with external id S;
 2. else claims the account an administrator linked to P
-   (`POST /users/{id}/link-provider`) whose username is U and which has not
-   signed in since the link;
+   (`POST /users/{id}/link-provider`), or created for P
+   (`POST /users` with `auth_provider_id`, #1291), whose username is U and
+   which has not signed in since;
 3. else, for an account from before `auth_provider_id` existed (NULL, same
    type, external id S), refuses with `account_link_required` until an
    administrator links it. The login never links such an account itself:
@@ -663,7 +664,14 @@ rather than swallowing the failure. Permission-related rejections
 - **Auto-create disabled.** First external login for a new subject is
   refused with `401` if `provider.auto_create_users=False`: the provider
   then signs in only accounts already linked to it.
-  `backend/app/core/auth/user_sync.py`.
+  `backend/app/core/auth/user_sync.py`. To admit a new user, pre-create the
+  account (#1291): Users → New User → *Signs in through* the provider, or
+  `POST /users` with `auth_provider_id` and no password. That makes an
+  account bound to the provider with no password and no external id yet;
+  the user's first sign-in through that provider as that username claims
+  it, exactly as after a `link-provider`. A sign-in with the same username
+  through any other provider is still refused as a collision, and creating
+  such an account as a superadmin needs the operator step-up.
 - **Username collision.** An external subject not linked to an account,
   whose username already belongs to any account — local, or linked to
   another provider — is rejected (`username_collision`) rather than
