@@ -51,6 +51,29 @@ the formatter handles the rest.
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
 
+- **Setting a control-plane VIP installs MetalLB (#1103).** It never
+  did on a k3s with Helm 4 inside (klipper-helm): the
+  `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
+  `IPAddressPool` was created, and the frontend Service's external IP
+  stayed `<pending>`. Helm 4 applies MetalLB's validating webhooks before the
+  pool and `L2Advertisement`, so those were refused while the controller
+  serving the webhook was still starting, and each retry uninstalled
+  first, deleting the controller again. The webhooks now fail open
+  (`crds.validationFailurePolicy: Ignore`) while unreachable; once the
+  controller is up they validate as before. A new chart gate checks the
+  rendered policy, since `helm lint` and `helm template` pass either
+  way. BGP mode had the same loop through a door `Ignore` cannot close:
+  the `BGPPeer` was written as `v1beta1` while its CRD stores `v1beta2`,
+  so creating it needs MetalLB's conversion webhook, and a conversion
+  webhook has no failure policy. Enabling MetalLB and BGP in one save
+  therefore still wedged the install. It is now written at `v1beta2`,
+  which needs no conversion. Because a value the webhooks would refuse now
+  installs and leaves the VIP silently unadvertised, the API checks those
+  BGP fields itself: a peer's hold time must be a duration from 3s to
+  65535s, communities must be `ASN:NN` or `large:A:B:C`, and the
+  aggregation length 0–32. The "known issue" notes in `TOPOLOGIES.md`,
+  `APPLIANCE.md` and `TROUBLESHOOTING.md` are removed.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release

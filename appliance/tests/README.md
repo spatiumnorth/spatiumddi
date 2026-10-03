@@ -11,6 +11,7 @@ helm or a cluster.
 | File | What it tests |
 |---|---|
 | `test_chart_pod_posture.py` | `.github/scripts/chart-pod-posture.py` — the seccomp + PriorityClass gate on both charts (#983) |
+| `test_chart_webhooks_fail_open.py` | `.github/scripts/chart-webhooks-fail-open.py` — MetalLB's validating webhooks failing open, and the BGPPeer written at its CRD's storage version so no conversion webhook is needed mid-install (#1103) |
 | `test_cluster_join_failure_reason.py` | `spatium-cluster-join`'s failure-reason classifier (#590) |
 | `test_cluster_join_identity.py` | `spatium-cluster-join`'s cluster-identity wipe (#590) |
 | `test_firewall_webui_sentinel.py` | Web UI reachability before the supervisor exists (#769) |
