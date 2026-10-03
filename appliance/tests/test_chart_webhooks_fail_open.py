@@ -88,7 +88,10 @@ def test_ignore_passes(tmp_path: Path) -> None:
 def test_fail_is_refused(tmp_path: Path) -> None:
     r = _run(_webhook("Fail"), tmp_path, "--require")
     assert r.returncode == 1
-    assert "ipaddresspoolvalidationwebhook.metallb.io" in r.stdout
+    # The refusal names the offending webhook. Token membership, not a
+    # substring test: CodeQL reads ``"<host>" in text`` as URL sanitisation.
+    named = r.stdout.replace("/", " ").replace(":", " ").split()
+    assert "ipaddresspoolvalidationwebhook.metallb.io" in named
 
 
 def test_absent_policy_is_refused(tmp_path: Path) -> None:

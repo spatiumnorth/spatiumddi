@@ -57,7 +57,11 @@ the formatter handles the rest.
   so creating it needs MetalLB's conversion webhook, and a conversion
   webhook has no failure policy. Enabling MetalLB and BGP in one save
   therefore still wedged the install. It is now written at `v1beta2`,
-  which needs no conversion. The "known issue" notes in `TOPOLOGIES.md`,
+  which needs no conversion. Because a value the webhooks would refuse now
+  installs and leaves the VIP silently unadvertised, the API checks those
+  BGP fields itself: a peer's hold time must be a duration from 3s to
+  65535s, communities must be `ASN:NN` or `large:A:B:C`, and the
+  aggregation length 0–32. The "known issue" notes in `TOPOLOGIES.md`,
   `APPLIANCE.md` and `TROUBLESHOOTING.md` are removed.
 
 - **Replacing a dead control-plane node no longer uninstalls the control
