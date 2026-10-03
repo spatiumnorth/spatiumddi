@@ -37,7 +37,7 @@ release reads a non-NULL ``expires_at`` the same way this one does, so
 leaving the values in place is correct for it.
 
 Revision ID: 5e6d56b39ab7
-Revises: f4a8c2e71d09
+Revises: cd10b699d988
 Create Date: 2026-10-02
 """
 
@@ -50,7 +50,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "5e6d56b39ab7"
-down_revision = "f4a8c2e71d09"
+down_revision = "cd10b699d988"
 branch_labels = None
 depends_on = None
 
