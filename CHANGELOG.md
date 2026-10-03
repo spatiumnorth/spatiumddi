@@ -118,6 +118,17 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **A role's dialog shows the grants the role holds (#1394).** Roles →
+  View is the only place the console shows what a built-in role grants,
+  and it showed each grant through two selects offering fixed lists: a
+  stored action or resource type the lists did not name fell back to
+  their first option. Appliance Operator's one grant, admin on
+  appliance, read "admin · *", Change Approver showed no approve at
+  all, and nine of the twelve built-in roles read broader or different
+  grants than they hold. A custom role's Edit dialog showed the same
+  wrong values. Each select now also offers the value its row holds, so
+  every grant shows as stored.
+
 - **Delete Server Group no longer takes a group's live DHCP scopes with
   it, and says what it does take (#1399).** The DHCP page's Delete
   Server Group said "The group must be empty — move or delete its
