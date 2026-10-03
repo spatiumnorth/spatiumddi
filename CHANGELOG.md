@@ -358,6 +358,26 @@ the formatter handles the rest.
 
 ### Security
 
+- **Actions that mint a credential need the operator step-up (#1355).**
+  #408 made secret reveals ask for a password or authenticator code so a
+  stolen session cannot read them, but a stolen session could still mint
+  itself a fresh credential and reveal anything after that. Four
+  superadmin actions now re-confirm the caller the same way: reading an
+  auth provider's secrets (the LDAP bind password and the OIDC / SAML /
+  RADIUS / TACACS+ secrets; now `POST /auth-providers/{id}/secrets`, was
+  a GET with no step-up), creating or promoting a superadmin, resetting a
+  superadmin's password, and minting an API token, for every owner.
+  Wrong answers spend the per-account step-up budget (an omitted answer
+  is refused without spending it), and each answered attempt is audited
+  with the method used. Once the budget is spent the action answers 429
+  for 15 minutes; that refusal is not yet audited and carries no
+  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
+  create tokens, superadmins or a superadmin's password must send
+  `stepup_password` (or `stepup_totp_code` for an SSO account), and an
+  SSO account must enrol TOTP before it can mint an API token. The Users
+  and API Tokens dialogs ask for it.
+
 - **Each DNS server group's internal TSIG key is encrypted at rest, and
   can be rotated (#1364).** It was the one credential SpatiumDDI stored
   in clear (`dns_server_group.tsig_key_secret`), and not a minor one:
