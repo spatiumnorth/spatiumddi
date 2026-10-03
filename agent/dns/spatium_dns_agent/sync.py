@@ -19,6 +19,7 @@ from .admin_pusher import push_rendered_config
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
+    PHASE_VALIDATE,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -28,7 +29,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
-from .drivers.base import DriverBase
+from .drivers.base import DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
@@ -64,6 +65,22 @@ def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[st
     if "dispatch" in op:
         ack["dispatch"] = op["dispatch"]
     return ack
+
+
+def _held_back_error(held: tuple[HeldZone, ...]) -> str:
+    """The operator-facing account of the zones an apply held back (#1403)."""
+    zones = "; ".join(
+        f"{h.zone}{f' (view {h.view})' if h.view else ''}: {h.reason} ("
+        + ("still served from its last good copy" if h.served else "not served")
+        + ")"
+        for h in held
+    )
+    count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+    return truncate_error(
+        f"named-checkzone refused {count}, held back until the data loads; "
+        f"every other change in this config is live: {zones}"
+    )
+
 
 class SyncLoop:
     def __init__(
@@ -117,7 +134,9 @@ class SyncLoop:
             self._current_etag = etag
             try:
                 self.driver.apply_config(bundle)
-                self._current_structural_etag = bundle.get("structural_etag")
+                self._current_structural_etag = self._applied_fingerprint(bundle)
+                if self.driver.held_back and not booting_from_previous:
+                    self._report_applied(etag)
                 if not booting_from_previous:
                     # #882 — ``current`` demonstrably works, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
@@ -207,7 +226,7 @@ class SyncLoop:
             log.exception("bootstrap_last_known_good_apply_failed")
             return
         self._current_etag = prev_etag
-        self._current_structural_etag = prev_bundle.get("structural_etag")
+        self._current_structural_etag = self._applied_fingerprint(prev_bundle)
         self.apply_status = ApplyStatus(
             status=STATUS_REVERTED,
             etag=prev_etag,
@@ -326,13 +345,17 @@ class SyncLoop:
             if not self._apply_with_revert(bundle, etag):
                 self._current_etag = etag
                 return
-            self._current_structural_etag = new_structural
+            self._current_structural_etag = self._applied_fingerprint(bundle)
             log.info("structural_reload_applied", structural_etag=new_structural)
 
             # Post the serials we just rendered so the control plane can
             # show per-server drift. Best-effort — a failed POST doesn't
-            # roll back the apply (we already serve the new config).
-            self._report_zone_state(bundle)
+            # roll back the apply (we already serve the new config). A zone
+            # held back (#1403) is not serving the serial it was rendered
+            # with, so it is left out and keeps the serial it last reported.
+            self._report_zone_state(
+                bundle, skip={h.zone.lower() for h in self.driver.held_back}
+            )
 
             # DNSSEC (issue #49): BIND9 signs inline from the rendered
             # config, so after a structural reload we read each signed
@@ -388,8 +411,13 @@ class SyncLoop:
         # re-render, so whatever the control plane is serving is what we are
         # running. Clear a stale ``reverted`` verdict: the operator's fix has
         # landed and leaving the chip up would report a divergence that no
-        # longer exists.
-        if self._quarantine.etag is None and not self.apply_status.healthy:
+        # longer exists. Not while zones are held back (#1403): that verdict
+        # was set by this very apply, and is true until they load.
+        if (
+            self._quarantine.etag is None
+            and not self.apply_status.healthy
+            and not self.driver.held_back
+        ):
             self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
             self.heartbeat.config_apply = self.apply_status
             log.info("config_apply_recovered", etag=etag)
@@ -443,13 +471,60 @@ class SyncLoop:
 
         self._quarantine.clear()
         commit_config(self.cfg.state_dir, etag)
+        self._report_applied(etag)
+        return True
+
+    def _report_applied(self, etag: str | None) -> None:
+        """The verdict on a bundle the daemon took: whole, or with zones held back.
+
+        #1403 — a zone named-checkzone refuses no longer fails the apply; the
+        driver holds it back and applies the rest. The server is then not
+        serving everything the operator saved, so it says so the way #882
+        reports any divergence (``reverted``, echoed into the daemon state),
+        naming each zone and the checker's reason, rather than reading ``ok``.
+        """
+        held = self.driver.held_back
+        if held:
+            error = _held_back_error(held)
+            self.apply_status = ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=etag,
+                failed_etag=etag,
+                phase=PHASE_VALIDATE,
+                error=error,
+            )
+            self.heartbeat.config_apply = self.apply_status
+            self.heartbeat.daemon_status = {
+                **self.heartbeat.daemon_status,
+                "status": "degraded",
+                "reason": f"config_apply_{STATUS_REVERTED}: {error}",
+            }
+            log.warning(
+                "sync_applied_with_zones_held_back",
+                etag=etag,
+                zones=[f"{h.zone} ({h.view})" if h.view else h.zone for h in held],
+            )
+            return
         self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
         self.heartbeat.config_apply = self.apply_status
         if self.heartbeat.daemon_status.get("status") == "degraded":
             # Clear a degraded verdict this loop set on a previous cycle;
             # leaving it would make a recovered server look broken forever.
             self.heartbeat.daemon_status = {"status": "ok"}
-        return True
+
+    def _applied_fingerprint(self, bundle: dict[str, Any]) -> str | None:
+        """The structural etag to record for a bundle the driver just applied.
+
+        ``None`` while the apply held zones back (#1403): the daemon is not
+        running that bundle whole, so the next bundle must re-render even
+        when its structural etag is the same one. On a group without views,
+        deleting the record that made a zone unloadable is a record-only
+        change that moves no structural etag, and would otherwise leave the
+        zone held, and reported held, until some unrelated structural edit.
+        """
+        if self.driver.held_back:
+            return None
+        return bundle.get("structural_etag")
 
     def _handle_apply_failure(
         self,
@@ -521,7 +596,7 @@ class SyncLoop:
                 )
                 log.exception("sync_revert_failed", failed_etag=etag)
             else:
-                self._current_structural_etag = prev_bundle.get("structural_etag")
+                self._current_structural_etag = self._applied_fingerprint(prev_bundle)
                 status = ApplyStatus(
                     status=STATUS_REVERTED,
                     etag=prev_etag,
@@ -543,17 +618,22 @@ class SyncLoop:
             "reason": f"config_apply_{status.status}: {status.error}",
         }
 
-    def _report_zone_state(self, bundle: dict[str, Any]) -> None:
+    def _report_zone_state(
+        self, bundle: dict[str, Any], skip: set[str] | None = None
+    ) -> None:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
 
         Best-effort. A dead control plane or transient 5xx never blocks
-        the daemon — the next structural reload will try again.
+        the daemon — the next structural reload will try again. ``skip``:
+        zone names (lowercase, no trailing dot) the apply held back (#1403).
         """
         entries: list[dict[str, Any]] = []
         for z in bundle.get("zones") or []:
             name = z.get("name")
             serial = z.get("serial")
             if not name or serial is None:
+                continue
+            if skip and str(name).rstrip(".").lower() in skip:
                 continue
             entries.append({"zone_name": str(name), "serial": int(serial)})
         if not entries:
