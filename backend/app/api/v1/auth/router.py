@@ -33,6 +33,9 @@ from app.core.auth.saml import (
     build_authorize_url as saml_authorize_url,
 )
 from app.core.auth.saml import (
+    claim_assertion as saml_claim_assertion,
+)
+from app.core.auth.saml import (
     consume_assertion as saml_consume_assertion,
 )
 from app.core.auth.tacacs import TACACSServiceError, authenticate_tacacs
@@ -1636,7 +1639,7 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
 
     relay_state = py_secrets.token_urlsafe(32)
     try:
-        authorize_url = saml_authorize_url(cfg, base, relay_state)
+        authorize_url, request_id = saml_authorize_url(cfg, base, relay_state)
     except Exception as exc:  # noqa: BLE001 — python3-saml surfaces plain Exception
         logger.warning("saml_authorize_build_error", provider=provider.name, error=str(exc))
         return _login_error_redirect("saml_build_failed")
@@ -1645,6 +1648,8 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
         {
             "provider_id": str(provider.id),
             "relay_state": relay_state,
+            # The AuthnRequest this flow sent: the Response must answer it (#1335).
+            "request_id": request_id,
             "exp": int(datetime.now(UTC).timestamp()) + _SAML_FLOW_TTL,
         }
     )
@@ -1782,12 +1787,29 @@ async def saml_callback(
         return _login_error_redirect("saml_state_mismatch")
     if RelayState != flow.get("relay_state"):
         return _login_error_redirect("saml_state_mismatch")
+    # A flow that kept no AuthnRequest ID (started before #1335's fix) cannot
+    # tell its own Response from another flow's, so it starts again.
+    request_id = flow.get("request_id")
+    if not request_id:
+        return _login_error_redirect("saml_state_invalid")
 
     try:
         cfg = SAMLConfig.from_provider(provider, base)
+        # The Response must answer this flow's AuthnRequest, and its Assertion
+        # signs in once (#1335). Bound to its request, a Response lifted from
+        # one browser's sign-in does not sign in through another's; spent on
+        # first use, it does not sign in twice through its own.
         consumed = saml_consume_assertion(
-            cfg, base, {"SAMLResponse": SAMLResponse, "RelayState": RelayState}
+            cfg,
+            base,
+            {"SAMLResponse": SAMLResponse, "RelayState": RelayState},
+            request_id=request_id,
         )
+        if not await saml_claim_assertion(consumed):
+            raise SAMLServiceError(
+                f"SAML response rejected: assertion {consumed.assertion_id} has "
+                "already been used to sign in"
+            )
     except SAMLServiceError as exc:
         logger.warning("saml_assertion_rejected", provider=provider.name, error=str(exc))
         db.add(

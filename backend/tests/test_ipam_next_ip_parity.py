@@ -139,3 +139,86 @@ async def test_preview_and_commit_agree_on_candidate(
     )
     assert commit.status_code == 201, commit.text
     assert commit.json()["address"] == predicted
+
+
+# ── #1307 — IPv6: the preview says which strategy drew its candidate ─────────
+#
+# For IPv6 the pick upgrades "sequential" to the subnet's
+# ``ipv6_allocation_policy`` ("random" by default). A random draw does not
+# repeat, so the preview's candidate is not the address a commit draws, and
+# the preview has to say so by reporting the strategy it used. Where the pick
+# does repeat (sequential, or EUI-64 from a MAC), preview and commit agree.
+
+
+async def _seed_v6_subnet(db: AsyncSession, network: str, policy: str) -> Subnet:
+    subnet = await _seed_subnet(db, network)
+    subnet.ipv6_allocation_policy = policy
+    await db.flush()
+    return subnet
+
+
+@pytest.mark.asyncio
+async def test_ipv6_random_preview_reports_a_random_draw(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    subnet = await _seed_v6_subnet(db_session, "fd00:1307::/64", "random")
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    preview = await client.get(f"/api/v1/ipam/subnets/{subnet.id}/next-ip-preview", headers=hdr)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    # A free candidate, labelled as what it is. Asked for "sequential", the
+    # pick used the subnet's policy, and the commit will draw again.
+    assert body["address"] is not None
+    assert body["strategy"] == "random"
+
+
+@pytest.mark.asyncio
+async def test_ipv6_sequential_preview_and_commit_agree(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    subnet = await _seed_v6_subnet(db_session, "fd00:1307:1::/120", "sequential")
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+
+    preview = await client.get(f"/api/v1/ipam/subnets/{subnet.id}/next-ip-preview", headers=hdr)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["strategy"] == "sequential"
+    predicted = preview.json()["address"]
+    assert predicted is not None
+
+    commit = await client.post(
+        f"/api/v1/ipam/subnets/{subnet.id}/next", headers=hdr, json={"hostname": "host1"}
+    )
+    assert commit.status_code == 201, commit.text
+    assert commit.json()["address"] == predicted
+
+
+@pytest.mark.asyncio
+async def test_ipv6_eui64_preview_and_commit_agree_on_the_mac(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    subnet = await _seed_v6_subnet(db_session, "fd00:1307:2::/64", "eui64")
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {token}"}
+    mac = "00:aa:00:3f:2a:1c"
+
+    preview = await client.get(
+        f"/api/v1/ipam/subnets/{subnet.id}/next-ip-preview",
+        headers=hdr,
+        params={"mac_address": mac},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json() == {"address": "fd00:1307:2:0:2aa:ff:fe3f:2a1c", "strategy": "eui64"}
+
+    commit = await client.post(
+        f"/api/v1/ipam/subnets/{subnet.id}/next",
+        headers=hdr,
+        json={"hostname": "host1", "mac_address": mac},
+    )
+    assert commit.status_code == 201, commit.text
+    assert commit.json()["address"] == "fd00:1307:2:0:2aa:ff:fe3f:2a1c"
