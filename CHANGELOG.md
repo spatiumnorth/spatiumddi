@@ -370,6 +370,26 @@ the formatter handles the rest.
 
 ### Security
 
+- **Actions that mint a credential need the operator step-up (#1355).**
+  #408 made secret reveals ask for a password or authenticator code so a
+  stolen session cannot read them, but a stolen session could still mint
+  itself a fresh credential and reveal anything after that. Four
+  superadmin actions now re-confirm the caller the same way: reading an
+  auth provider's secrets (the LDAP bind password and the OIDC / SAML /
+  RADIUS / TACACS+ secrets; now `POST /auth-providers/{id}/secrets`, was
+  a GET with no step-up), creating or promoting a superadmin, resetting a
+  superadmin's password, and minting an API token, for every owner.
+  Wrong answers spend the per-account step-up budget (an omitted answer
+  is refused without spending it), and each answered attempt is audited
+  with the method used. Once the budget is spent the action answers 429
+  for 15 minutes; that refusal is not yet audited and carries no
+  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
+  create tokens, superadmins or a superadmin's password must send
+  `stepup_password` (or `stepup_totp_code` for an SSO account), and an
+  SSO account must enrol TOTP before it can mint an API token. The Users
+  and API Tokens dialogs ask for it.
+
 - **Each DNS server group's internal TSIG key is encrypted at rest, and
   can be rotated (#1364).** It was the one credential SpatiumDDI stored
   in clear (`dns_server_group.tsig_key_secret`), and not a minor one:
@@ -455,8 +475,40 @@ the formatter handles the rest.
   exit as a crash, and a `pdns_server` that will not stop fails the
   apply, which is retried, instead of keeping the old settings.
 
+- **Supervisor registration has an attempt budget, and persistent pairing
+  codes expire by default (#1356).** `POST /appliance/supervisor/register`
+  is unauthenticated: an 8-digit pairing code is the credential. Nothing
+  limited the guesses beyond a fixed half-second delay, persistent codes
+  defaulted to never expiring, and every wrong guess committed its own
+  audit row, so a brute-force run also flooded the append-only audit
+  table. Now ten wrong codes from one address, or a hundred across the
+  install, in 15 minutes get `429` until the window passes. The attempt is
+  spent before the code is checked, so concurrent guesses can't all slip
+  under the limit, and a right code refunds it, so a fleet rollout behind
+  one NAT address is never throttled. A request already refused checks no
+  code and is not charged to the install-wide budget, so one address
+  cannot use it up and lock out every registration. The throttle fails
+  closed (`503`) while Redis is unreachable. The supervisor stops retrying
+  on `429` until its next loop tick, honours a capped `Retry-After` on
+  `503`, and drops a pairing code the control plane rejects rather than
+  re-sending it every 30 seconds, which kept its address throttled for
+  every appliance pairing from behind it (a control-plane node mints a
+  fresh self-bootstrap code instead). An unknown code is audited only for the
+  first failure from an address in each window, plus once when either
+  limit trips; a code that exists but is revoked, expired or exhausted is always
+  audited. **Behaviour change:** a persistent code now expires after 30
+  days unless created with `expires_in_minutes: 0`, and the dialog warns
+  when you choose never. Persistent codes minted before the upgrade,
+  which never expired, now expire 30 days after the upgrade (migration
+  `5e6d56b39ab7`); re-mint one with `expires_in_minutes: 0` if a code
+  that never expires is what you want.
+
 ### Migrations
 
+- `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
+  that is not revoked and has no expiry gets `expires_at` 30 days after
+  the upgrade. Downgrade is a no-op: which codes were NULL is not
+  recorded, and restoring NULL would make them never expire again.
 - `61566a119901` — #1290: `ix_user_email` becomes a partial unique
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one

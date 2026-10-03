@@ -119,6 +119,19 @@ session alone doesn't prove and an SSO account has no local password.
   strong as the enrolment gate, rather than the password it exists to
   demand. Disable / regenerate-recovery-codes
   follow the same shape (password for local, TOTP-only for SSO).
+- **Actions that mint a credential need the same step-up (#1355)**: reading
+  an auth provider's secrets (`POST /auth-providers/{id}/secrets`, which was
+  a GET with no step-up), creating a superadmin or promoting an account to
+  one, resetting a superadmin's password, and minting an API token. Each
+  hands out something that outlives the session or passes every later
+  step-up, so without it the reveal step-up protected nothing from a stolen
+  session: it could mint itself a credential and reveal anything. The body
+  carries `stepup_password` / `stepup_totp_code` (`password` / `totp_code` on
+  the secrets reveal). Wrong answers spend the per-account step-up budget
+  (fails closed; an omitted answer is refused without spending it), a refusal is `403`, and every attempt is audited with the
+  method used (`stepup_method`). An SSO account must enrol TOTP before it can
+  mint an API token. Granting superadmin through a group's role is not yet
+  covered (#1412).
 
 ## External identity providers
 
@@ -586,7 +599,8 @@ invalid JWT to avoid confirming token existence to an attacker.
 
 **Lifecycle.**
 - Create via the Admin → API Tokens UI or `POST /api/v1/api-tokens`
-  (JSON: `{name, description?, expires_in_days?}`). The create
+  (JSON: `{name, description?, expires_in_days?, stepup_password?,
+  stepup_totp_code?}` — the owner's step-up is required, #1355). The create
   response contains the raw `token` field **once** — the UI forces a
   "copy now" dialog before it disappears.
 - List via `GET /api/v1/api-tokens` (your tokens only; superadmins

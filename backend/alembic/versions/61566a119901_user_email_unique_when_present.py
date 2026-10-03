@@ -22,7 +22,7 @@ and refuses with a clear message rather than a bare unique violation. Give
 those accounts distinct emails (or remove them) before downgrading.
 
 Revision ID: 61566a119901
-Revises: cd10b699d988
+Revises: 5e6d56b39ab7
 Create Date: 2026-10-03
 """
 
@@ -33,7 +33,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "61566a119901"
-down_revision = "cd10b699d988"
+down_revision = "5e6d56b39ab7"
 branch_labels = None
 depends_on = None
 

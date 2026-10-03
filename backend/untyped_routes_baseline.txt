@@ -14,7 +14,6 @@ GET /api/v1/appliance/diagnostics/logs
 GET /api/v1/appliance/diagnostics/logs/{name}
 GET /api/v1/appliance/system/info
 GET /api/v1/appliance/system/setup
-GET /api/v1/auth-providers/{provider_id}/secrets
 GET /api/v1/bgp/prefix/origin
 GET /api/v1/bgp/prefix/routing-history
 GET /api/v1/dhcp/agents/config
@@ -42,6 +41,7 @@ POST /api/v1/appliance/supervisor/pcap/progress/{capture_id}
 POST /api/v1/appliance/supervisor/pcap/upload/{capture_id}
 POST /api/v1/appliance/system/maintenance
 POST /api/v1/appliance/system/setup/complete
+POST /api/v1/auth-providers/{provider_id}/secrets
 POST /api/v1/backup/manifest-preview
 POST /api/v1/backup/targets/{target_id}/archives/restore
 POST /api/v1/backup/targets/{target_id}/test

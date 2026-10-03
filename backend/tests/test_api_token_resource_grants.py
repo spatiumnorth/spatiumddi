@@ -174,6 +174,7 @@ async def test_create_token_grant_exceeds_owner_rejected(
         headers={"Authorization": f"Bearer {token}"},
         json={
             "name": "scoped",
+            "stepup_password": "x",  # the owner's step-up (#1355)
             "resource_grants": [
                 {"action": "write", "resource_type": "subnet", "resource_id": str(sub.id)}
             ],
@@ -196,6 +197,7 @@ async def test_create_token_unknown_resource_422(
         headers={"Authorization": f"Bearer {token}"},
         json={
             "name": "scoped",
+            "stepup_password": "x",  # the owner's step-up (#1355)
             "resource_grants": [
                 {
                     "action": "write",
@@ -219,6 +221,7 @@ async def test_create_token_bad_resource_type_422(
         headers={"Authorization": f"Bearer {token}"},
         json={
             "name": "scoped",
+            "stepup_password": "x",  # the owner's step-up (#1355)
             "resource_grants": [
                 {"action": "write", "resource_type": "ip_block", "resource_id": str(uuid.uuid4())}
             ],
