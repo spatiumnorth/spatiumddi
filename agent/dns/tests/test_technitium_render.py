@@ -1508,3 +1508,221 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── Zone apex: SOA + NS from the zone's own settings ───────────────────
+#
+# Technitium writes its own apex at zone create: one NS and an SOA MNAME
+# naming the server's host name (the pod name, under the DNS VIP) and a
+# placeholder RNAME. The SOA-update semantics below were checked against a
+# live technitium/dns-server:15.4.0: ``zones/records/update`` for type SOA
+# refuses a call without ``serial`` and stores current + 1, takes the RNAME
+# in either SOA or address form and reads it back as an address, and
+# ``zones/records/get`` without ``listZone`` returns the apex records only.
+
+
+def _render_zone(tmp_path: Path, zone: dict[str, Any]) -> dict[str, Any]:
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(_zone_bundle(zones=[zone]))
+    return _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())[0]
+
+
+def test_render_apex_from_primary_ns_and_admin_email(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "home.example.test.",
+            "type": "primary",
+            "ttl": 300,
+            "primary_ns": "ns.home.example.test.",
+            "admin_email": "hostmaster.example.test.",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+            "records": [{"name": "ns", "type": "A", "value": "192.0.2.53"}],
+        },
+    )
+    assert out["apex"] == {
+        "ns": ["ns.home.example.test"],
+        "soa": {
+            "primaryNameServer": "ns.home.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+        },
+        "ttl": 300,
+    }
+
+
+def test_render_apex_declared_ns_records_win(tmp_path: Path) -> None:
+    """The zone's own apex NS records are the NS set (#1153's precedence);
+    a relative target is relative to the zone, as in a zone file."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "example.test.",
+            "type": "primary",
+            "primary_ns": "ns0.elsewhere.test",
+            "records": [
+                {"name": "@", "type": "NS", "value": "ns1.example.test."},
+                {"name": "@", "type": "NS", "value": "ns2"},
+                {"name": "sub", "type": "NS", "value": "ns.sub.example.test."},
+            ],
+        },
+    )
+    assert out["apex"]["ns"] == ["ns1.example.test", "ns2.example.test"]
+    # MNAME is still the Primary NS when one is set.
+    assert out["apex"]["soa"]["primaryNameServer"] == "ns0.elsewhere.test"
+    # The delegation stays an ordinary record.
+    assert [r["domain"] for r in out["records"] if r["type"] == "NS"] == ["sub.example.test"]
+
+
+def test_render_apex_absent_when_zone_sets_nothing(tmp_path: Path) -> None:
+    """A zone with no Primary NS, Admin Email or timers keeps the daemon's
+    apex untouched — the behaviour before the apex was managed."""
+    out = _render_zone(
+        tmp_path, {"name": "plain.test.", "type": "primary", "ttl": 3600, "records": []}
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_only_for_primary_zones(tmp_path: Path) -> None:
+    """A secondary's apex comes from the transfer, so it is not ours."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "s.test.",
+            "type": "secondary",
+            "masters": ["192.0.2.1"],
+            "primary_ns": "ns.s.test.",
+        },
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_ignores_unusable_values(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "x.test.",
+            "type": "primary",
+            "primary_ns": "  ",
+            "admin_email": "nodots",
+            "minimum": True,  # a bool is not a timer
+            "refresh": -1,
+        },
+    )
+    assert "apex" not in out
+
+
+def test_responsible_person_forms() -> None:
+    from spatium_dns_agent.drivers.technitium import _responsible_person
+
+    assert _responsible_person("hostmaster.example.test.") == "hostmaster@example.test"
+    assert _responsible_person("first\\.last.example.test.") == "first.last@example.test"
+    assert _responsible_person("Admin@Example.test") == "admin@example.test"
+    assert _responsible_person("nodots") is None
+    assert _responsible_person("") is None
+    assert _responsible_person(None) is None
+
+
+def _apex_reconcile(
+    driver: TechnitiumDriver,
+    apex_records: list[dict[str, Any]],
+    apex: dict[str, Any],
+    fail_paths: set[str] = frozenset(),  # type: ignore[assignment]
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        if path == "zones/records/get":
+            if params.get("listZone") == "true":
+                return {"status": "ok", "response": {"records": []}}
+            return {"status": "ok", "response": {"records": apex_records}}
+        if path in fail_paths:
+            return {"status": "error", "errorMessage": "boom"}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(driver, _responder)
+    driver._reconcile_zones(
+        "tok-1", [{"zone": "example.test", "type": "Primary", "records": [], "apex": apex}]
+    )
+    return calls
+
+
+_DAEMON_APEX = [
+    {"name": "example.test", "type": "NS", "ttl": 14400,
+     "rData": {"nameServer": "dns-technitium-snw7c"}},
+    {"name": "example.test", "type": "SOA", "ttl": 900,
+     "rData": {"primaryNameServer": "dns-technitium-snw7c",
+               "responsiblePerson": "hostadmin@example.test", "serial": 41,
+               "refresh": 900, "retry": 300, "expire": 604800, "minimum": 900}},
+]
+
+_WANTED_APEX = {
+    "ns": ["ns.example.test"],
+    "soa": {"primaryNameServer": "ns.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300},
+    "ttl": 300,
+}
+
+
+def test_reconcile_apex_rewrites_daemon_soa_and_ns(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX)
+    writes = [(c[2], c[3]) for c in calls if c[2] != "zones/create" and c[2] != "zones/records/get"]
+
+    soa = [p for path, p in writes if path == "zones/records/update"]
+    assert len(soa) == 1
+    assert soa[0]["type"] == "SOA"
+    assert soa[0]["serial"] == 41  # the current serial, which the daemon requires
+    assert soa[0]["primaryNameServer"] == "ns.example.test"
+    assert soa[0]["responsiblePerson"] == "hostmaster@example.test"
+    assert (soa[0]["refresh"], soa[0]["retry"], soa[0]["minimum"], soa[0]["ttl"]) == (
+        3600, 600, 300, 300)
+
+    ns_ops = [(path, p["nameServer"]) for path, p in writes if p.get("type") == "NS"]
+    # The new name server goes in before the daemon's own comes out.
+    assert ns_ops == [
+        ("zones/records/add", "ns.example.test"),
+        ("zones/records/delete", "dns-technitium-snw7c"),
+    ]
+
+
+def test_reconcile_apex_is_a_noop_when_converged(tmp_path: Path) -> None:
+    """Every SOA write bumps the serial, so a converged apex must cost one
+    read and nothing else."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    converged = [
+        {"name": "example.test", "type": "NS", "ttl": 300,
+         "rData": {"nameServer": "ns.example.test"}},
+        {"name": "example.test", "type": "SOA", "ttl": 300,
+         "rData": {"primaryNameServer": "ns.example.test",
+                   "responsiblePerson": "hostmaster@example.test", "serial": 42,
+                   "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300}},
+    ]
+    calls = _apex_reconcile(d, converged, _WANTED_APEX)
+    assert [c[2] for c in calls if c[2] != "zones/create"] == [
+        "zones/records/get",  # the zone's records
+        "zones/records/get",  # its apex
+    ]
+
+
+def test_reconcile_apex_keeps_old_ns_when_the_add_fails(tmp_path: Path) -> None:
+    """Never leave the zone without a name server."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX, fail_paths={"zones/records/add"})
+    assert "zones/records/delete" not in [c[2] for c in calls]
+
+
+def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
+    """No ``apex`` in the payload (an older render, or a zone that sets
+    nothing): the daemon's own SOA and NS are not even read."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
