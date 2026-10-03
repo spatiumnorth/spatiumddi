@@ -456,11 +456,11 @@ async def test_a_flow_that_kept_no_request_id_starts_again(
 
 
 async def test_an_assertion_is_remembered_until_it_could_no_longer_be_delivered() -> None:
-    from app.core.auth.saml import SAMLConsumeResult
+    import app.core.auth.saml as saml_mod
     from app.core.auth.user_sync import ExternalAuthResult
 
-    def consumed(not_on_or_after: int | None) -> SAMLConsumeResult:
-        return SAMLConsumeResult(
+    def consumed(not_on_or_after: int | None) -> saml_mod.SAMLConsumeResult:
+        return saml_mod.SAMLConsumeResult(
             result=ExternalAuthResult(external_id="x", username="x"),
             relay_state=None,
             attributes={},
