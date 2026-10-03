@@ -168,6 +168,20 @@ the formatter handles the rest.
   takeover, and Abort's release is no longer renewed away (the aborted
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
+- **On a multi-node control plane the slot-image mirror starts and stays
+  up, so an uploaded upgrade image has somewhere to live (#1174).** Once the
+  control plane has more than one node, the supervisor turns on the
+  slot-image mirror: the one place an uploaded or imported upgrade image is
+  kept, and where every node fetches it during a rolling upgrade. The mirror
+  runs the api's image and imports the whole application before it serves a
+  byte (about 280 MiB once started), but it kept resources written for a
+  small idle process, 256Mi of memory and 500m of CPU. It was OOMKilled
+  during that import and crash-looped, so an air-gapped rolling upgrade had
+  no image source. The mirror is now sized as the api: it takes
+  `api.resources` (on an appliance, the memory limit the supervisor sizes
+  from the node's RAM), with any `slotImageMirror.resources` key laid over
+  it, and the Charts job refuses a render whose mirror memory or CPU limit
+  is below the api's.
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
