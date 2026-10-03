@@ -361,7 +361,7 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 #### What an archive exposes
 
-**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. Most credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **The exception is each DNS server group's internal TSIG key** (`dns_server_group.tsig_key_secret`), which is stored in clear: the group's BIND9 servers grant zone transfers and dynamic updates to that key from any address, so anyone holding an archive can read and rewrite every zone the group serves for as long as that key is in use.
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, and each DNS server group's internal TSIG key) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **One leftover until the next release:** the group TSIG key was stored in clear before #1364, and the old column (`dns_server_group.tsig_key_secret`) is kept, unread, for one release so a rolling upgrade's old pods keep working; it still holds each group's pre-upgrade secret. That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
 
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
@@ -610,8 +610,8 @@ Three things make this a least-privilege pull rather than a full API key:
   the destination is not read at all — without this, a nightly poller
   re-downloads a multi-GB archive every run.
 * **The puller never needs the target passphrase**, and should not have it:
-  without it most stored credentials in the archive stay encrypted. The rest of
-  the database dump is readable, the DNS group TSIG keys included (see
+  without it the stored credentials in the archive stay encrypted. The rest of
+  the database dump is readable (see
   [What an archive exposes](#what-an-archive-exposes)), so protect the token and
   wherever the puller writes the archive as you would the install itself.
 

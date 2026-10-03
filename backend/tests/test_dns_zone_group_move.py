@@ -36,6 +36,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns.tsig import group_tsig_secret
 
 
 async def _superadmin(db: AsyncSession, username: str = "root935") -> str:
@@ -697,7 +698,7 @@ async def test_target_group_gets_a_tsig_key(client: AsyncClient, db_session: Asy
     token = await _superadmin(db_session)
     src = await _group(db_session, "src")
     dst = await _group(db_session, "dst")
-    assert dst.tsig_key_secret is None
+    assert group_tsig_secret(dst) is None
     zone = await _zone(db_session, src)
 
     resp = await _commit(client, token, zone, dst)
@@ -705,7 +706,7 @@ async def test_target_group_gets_a_tsig_key(client: AsyncClient, db_session: Asy
     assert resp.json()["target_tsig_key_generated"] is True
 
     await db_session.refresh(dst)
-    assert dst.tsig_key_secret
+    assert group_tsig_secret(dst)
 
 
 @pytest.mark.asyncio

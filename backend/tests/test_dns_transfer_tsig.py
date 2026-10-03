@@ -36,6 +36,7 @@ from app.services.dns.tsig import (
     VIEW_TRANSFER_KEY_PREFIX,
     resolve_group_transfer_key,
     resolve_view_transfer_key,
+    set_group_tsig_secret,
     transfer_needs_tsig,
     view_transfer_key,
 )
@@ -44,7 +45,11 @@ _B64 = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE="
 
 
 async def _group(db: AsyncSession, **kw: Any) -> DNSServerGroup:
+    # The group key is stored encrypted (#1364); tests name it in clear.
+    secret = kw.pop("tsig_key_secret", None)
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:8]}", **kw)
+    if secret:
+        set_group_tsig_secret(grp, secret)
     db.add(grp)
     await db.flush()
     return grp

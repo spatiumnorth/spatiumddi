@@ -1149,6 +1149,7 @@ function GroupServersList({
           serverName={pausePrompt.name}
           serverKind="DHCP"
           isPending={pauseMut.isPending}
+          error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
           onConfirm={(reason) => {
             pauseMutId.current = pausePrompt.id;
             pauseMut.mutate(
@@ -1156,7 +1157,10 @@ function GroupServersList({
               { onSuccess: () => setPausePrompt(null) },
             );
           }}
-          onCancel={() => setPausePrompt(null)}
+          onCancel={() => {
+            setPausePrompt(null);
+            pauseMut.reset();
+          }}
         />
       )}
     </div>
@@ -3319,8 +3323,16 @@ export function DHCPPage() {
           title="Delete DHCP Server"
           description={`Remove server "${delServer.name}"? Its scopes remain but will be unassigned.`}
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
-          onClose={() => setDelServer(null)}
+          onClose={() => {
+            setDelServer(null);
+            deleteServerMut.reset();
+          }}
           isPending={deleteServerMut.isPending}
+          error={
+            deleteServerMut.isError
+              ? formatApiError(deleteServerMut.error)
+              : null
+          }
         />
       )}
       {modalServer && (

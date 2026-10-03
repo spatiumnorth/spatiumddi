@@ -55,7 +55,7 @@ async def test_saml_flow_cookie_is_samesite_none_and_secure(
     monkeypatch.setattr(
         auth_router,
         "saml_authorize_url",
-        lambda cfg, base, relay: "https://idp.example.com/sso?x=1",
+        lambda cfg, base, relay: ("https://idp.example.com/sso?x=1", "ONELOGIN_stub"),
     )
 
     resp = await client.get(f"/api/v1/auth/{provider.id}/authorize")
@@ -84,7 +84,7 @@ async def test_saml_flow_cookie_stays_lax_over_plain_http(
     monkeypatch.setattr(
         auth_router,
         "saml_authorize_url",
-        lambda cfg, base, relay: "https://idp.example.com/sso?x=1",
+        lambda cfg, base, relay: ("https://idp.example.com/sso?x=1", "ONELOGIN_stub"),
     )
 
     resp = await client.get(f"/api/v1/auth/{provider.id}/authorize")

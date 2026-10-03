@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { cn } from "@/lib/utils";
 
 // Tools whose name starts with this prefix stage write proposals
@@ -64,7 +65,7 @@ export function AIToolCatalogPage() {
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
 
-  const { data, isLoading, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: CATALOG_QUERY_KEY,
     queryFn: () => aiToolCatalogApi.list(),
   });
@@ -396,7 +397,14 @@ export function AIToolCatalogPage() {
         })()}
         {!isLoading && grouped.length === 0 && (
           <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-            {search ? "No tools match this search." : "No tools registered."}
+            {/* A refused or failed read is not an empty registry (#1343). */}
+            {isError && !data ? (
+              <ListReadError error={error} what="the AI tool catalog" />
+            ) : search ? (
+              "No tools match this search."
+            ) : (
+              "No tools registered."
+            )}
           </div>
         )}
       </div>

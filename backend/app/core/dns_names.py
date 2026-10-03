@@ -5,8 +5,9 @@ one place. The rule is deliberately **per-context** — there is no single
 "valid DNS name" regex, because the correct answer depends on the field's
 role:
 
-* **Host names** (``IPAddress.hostname``, a DHCP reservation hostname, an
-  A/AAAA/PTR owner) follow RFC 952 + RFC 1123 §2.1 — the classic
+* **Host names** (``IPAddress.hostname``, a DHCP reservation hostname, the
+  owner of an A/AAAA/MX record and the names BIND's check-names covers —
+  ``bind_check_names_error``) follow RFC 952 + RFC 1123 §2.1 — the classic
   letters-digits-hyphen (LDH) rule: each label 1–63 chars, no leading or
   trailing hyphen, total ≤ 253. Internationalized input is normalized to
   its IDNA A-label (``xn--``) form rather than rejected.
@@ -247,6 +248,165 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     if len(normalized) > MAX_NAME_LEN:
         raise ValueError(f"{field} '{normalized}' exceeds {MAX_NAME_LEN} characters")
     return normalized
+
+
+# ── What BIND's check-names refuses (issue #1378) ────────────────────────
+# BIND loads a primary zone under ``check-names primary fail`` unless told
+# otherwise, and the agent renders no check-names option, so named-checkzone
+# (the agent's pre-swap zone check, run with ``-k fail``) refuses a zone file
+# that breaks the rule below, and the agent then quarantines the server's
+# whole config bundle. The RFC 2181 owner rule above allows ``_`` in any
+# owner, so the record API used to store records the group's own BIND would
+# not load. The rule, as BIND applies it (``dns_rdata_checkowner`` /
+# ``dns_rdata_checknames``):
+#
+# * the OWNER of an A, AAAA or MX record must be a host name. The whole owner
+#   name counts, the zone's own labels included; a leftmost ``*`` is allowed.
+#   BIND's two exceptions: Active Directory's ``gc._msdcs.<host>`` (A and
+#   AAAA), and an A owner with an SPF "exists" label — ``_spf``,
+#   ``_spf_verify`` or ``_spf_rate`` — anywhere but its last label.
+# * the TARGET of an MX, NS or SRV record must be a host name, and so must an
+#   SVCB or HTTPS TargetName in ServiceMode (an AliasMode target is not
+#   checked).
+# * the TARGET of a PTR must be a host name when the owner is a reverse
+#   mapping name (under in-addr.arpa, ip6.arpa or ip6.int), except DNS-SD's
+#   browsing-domain records (``b._dns-sd._udp.<domain>`` and its kin).
+#
+# "Host name" is RFC 952 as relaxed by RFC 1123: every label is letters,
+# digits and hyphens with no leading or trailing hyphen (``_HOST_LABEL_RE``).
+# The root name (a null MX, an SRV "no service here" target) qualifies.
+# Every case here was checked against named-checkzone 9.20.29 with the
+# agent's own flags (``-i none -k fail``) on the appliance's dns-bind9 image.
+
+BIND_HOST_OWNER_TYPES = frozenset({"A", "AAAA", "MX"})
+BIND_HOST_TARGET_TYPES = frozenset({"MX", "NS", "SRV"})
+BIND_SERVICE_BINDING_TYPES = frozenset({"SVCB", "HTTPS"})
+_REVERSE_MAPPING_SUFFIXES = ("in-addr.arpa", "ip6.arpa", "ip6.int")
+_DNSSD_BROWSE_PREFIXES = frozenset(
+    (first, "_dns-sd", "_udp") for first in ("b", "db", "lb", "r", "dr")
+)
+_AD_GC_PREFIX = ("gc", "_msdcs")
+_SPF_EXISTS_LABELS = frozenset({"_spf", "_spf_verify", "_spf_rate"})
+
+
+def _first_non_host_label(name: str, *, wildcard: bool) -> str | None:
+    """The first label of *name* that is not a host-name label, or None.
+
+    *name* is a dotted presentation name; a trailing root dot is ignored and
+    the root itself is a host name. With *wildcard*, a leftmost ``*`` label
+    passes, as it does for an owner in BIND.
+    """
+    body = name.strip().rstrip(".")
+    if not body:
+        return None
+    for i, label in enumerate(body.split(".")):
+        if wildcard and i == 0 and label == "*":
+            continue
+        if not label.isascii() or not _HOST_LABEL_RE.match(label):
+            return label
+    return None
+
+
+def _zone_absolute(name: str, origin: str) -> str:
+    """*name* the way a zone file whose ``$ORIGIN`` is *origin* reads it.
+
+    The agent writes record values into the zone file as they are stored, so a
+    name without a trailing dot is relative to the zone, and ``@`` is the zone.
+    """
+    name = name.strip()
+    origin = origin.strip().rstrip(".") + "."
+    if name in ("", "@"):
+        return origin
+    if name.endswith("."):
+        return name
+    return f"{name}.{origin}" if origin != "." else f"{name}."
+
+
+def _bind_owner_exempt(record_type: str, owner: str) -> bool:
+    """BIND's own exceptions to the owner rule (``checkowner_in_a`` /
+    ``checkowner_in_aaaa``): Active Directory's global-catalog name
+    ``gc._msdcs.<host>`` for an A or AAAA, and for an A an owner carrying an
+    SPF "exists" label (RFC 7208 section 5.7 and appendix D.1) in any label
+    but the last.
+    """
+    labels = owner.strip().rstrip(".").split(".")
+    lowered = [label.lower() for label in labels]
+    if (
+        record_type in ("A", "AAAA")
+        and len(labels) >= 2
+        and tuple(lowered[:2]) == _AD_GC_PREFIX
+        and _first_non_host_label(".".join(labels[2:]), wildcard=False) is None
+    ):
+        return True
+    return record_type == "A" and any(label in _SPF_EXISTS_LABELS for label in lowered[:-1])
+
+
+def _is_reverse_mapping(owner: str) -> bool:
+    labels = owner.strip().rstrip(".").lower().split(".")
+    if tuple(labels[:3]) in _DNSSD_BROWSE_PREFIXES:
+        return False
+    body = ".".join(labels)
+    return any(body == s or body.endswith("." + s) for s in _REVERSE_MAPPING_SUFFIXES)
+
+
+def bind_check_names_error(
+    record_type: str,
+    owner: str,
+    value: str | None,
+    *,
+    origin: str,
+    check_owner: bool = True,
+    check_target: bool = True,
+) -> str | None:
+    """Why BIND's default ``check-names`` would refuse this record, or None.
+
+    *owner* is the record's full owner name (relative owner + zone), *value*
+    its stored value and *origin* the zone's name. MX and SRV values may carry
+    the priority (and weight and port) inline on some paths, so their target
+    is the value's last token; an SVCB or HTTPS value is ``priority target
+    params…``. *check_owner* / *check_target* let an edit check only what it
+    changes, so a TTL edit on a row that predates the rule still goes
+    through. The message is operator-facing.
+    """
+    rtype = record_type.strip().upper()
+    if check_owner and rtype in BIND_HOST_OWNER_TYPES:
+        owner_abs = _zone_absolute(owner, origin)
+        bad = _first_non_host_label(owner_abs, wildcard=True)
+        if bad is not None and not _bind_owner_exempt(rtype, owner_abs):
+            return (
+                f"{rtype} record name '{owner_abs.rstrip('.')}' is not a host name: "
+                f"its label '{bad}' may only hold letters, digits and hyphens, "
+                "with no leading or trailing hyphen (RFC 1123). BIND refuses a "
+                "zone that holds it (check-names), which stops the server applying "
+                "its configuration. An underscore name suits TXT, SRV and similar "
+                "records, not an address or mail exchanger."
+            )
+    if not check_target or value is None:
+        return None
+    tokens = value.split()
+    if not tokens:
+        return None
+    if rtype in BIND_HOST_TARGET_TYPES:
+        target = tokens[-1]
+    elif rtype in BIND_SERVICE_BINDING_TYPES:
+        # ServiceMode only: an AliasMode (priority 0) target is not checked.
+        if len(tokens) < 2 or not tokens[0].isdigit() or int(tokens[0]) == 0:
+            return None
+        target = tokens[1]
+    elif rtype == "PTR" and _is_reverse_mapping(_zone_absolute(owner, origin)):
+        target = tokens[-1]
+    else:
+        return None
+    target_abs = _zone_absolute(target, origin)
+    bad = _first_non_host_label(target_abs, wildcard=False)
+    if bad is None:
+        return None
+    return (
+        f"{rtype} record target '{target_abs.rstrip('.')}' is not a host name: its "
+        f"label '{bad}' may only hold letters, digits and hyphens, with no leading "
+        "or trailing hyphen (RFC 1123). BIND refuses a zone that holds it "
+        "(check-names), which stops the server applying its configuration."
+    )
 
 
 # ── Non-raising sanitizer (DHCP lease path) ──────────────────────────────
