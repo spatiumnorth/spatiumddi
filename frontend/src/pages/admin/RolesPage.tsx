@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
   rolesApi,
   type AppRole,
   type PermissionEntry,
@@ -318,6 +319,12 @@ function DeleteModal({
           Any groups referencing it will lose those permissions. This cannot be
           undone.
         </p>
+        {/* A refused or failed delete says so; the dialog stays (#1344). */}
+        {mutation.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

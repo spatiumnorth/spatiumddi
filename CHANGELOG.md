@@ -27,6 +27,53 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Copilot availability probe asks a route every user may read
+  (#1345).** With the Operator Copilot module on, its default, the app
+  shell asked `GET /api/v1/ai/providers` on every page to decide whether
+  to offer "Ask AI". That route is superadmin-only, so every page a
+  non-superadmin opened logged a 403, and the console read the refusal
+  as "available": a read-only Viewer was offered Ask AI, down to the
+  per-row "Ask AI about this…" buttons on Alerts and Audit, on an
+  install with no provider, where the admin was offered none. A new
+  `GET /api/v1/ai/available` tells any signed-in user whether a new chat
+  would find an enabled provider, as a bare yes or no that names no
+  provider, and the console asks it instead; the provider list stays
+  superadmin-only. Ask AI now appears only on a yes, not while the
+  answer is loading or when the probe failed. No copilot tool: a chat
+  that is running already has its answer.
+
+- **A refused action says it was refused (#1344).** The zones tab's
+  bulk Delete sent one request per zone and then closed as if every one
+  had worked: a refused delete cleared the selection and left the zone
+  with no word, and a delete the two-person approval queue took was
+  reported as done too. Delete Zone, a server's Pause (DNS and DHCP),
+  Delete server (DHCP) and Delete role left their dialog open with no
+  word when refused, and the DNS propagation check painted Cloudflare,
+  Google, Quad9 and OpenDNS "OK" when its own request had failed. Each
+  now says why in the dialog it was taken from, in the server's words:
+  the bulk delete says how many zones it could not delete and keeps
+  only those selected, and says above the zones when deletes went to
+  the approval queue; a propagation check that failed shows no resolver
+  status, only the reason. This holds for any failure, not only a
+  Viewer's 403: a scoped role, a revoked grant, a 409, a 500.
+
+- **A list the reader may not see is no longer shown as empty
+  (#1343).** When a page's own list read was refused (403), the page
+  rendered its empty state, so a read-only Viewer was told "Trash is
+  empty.", "No subscriptions yet." and "no appliances online" over
+  lists that held rows, and the Users page showed a blank table with
+  no word. Trash, Webhooks, Users, Security › Block Sync, Tools ›
+  Network Tools, AI › Tools, Cutover and Settings' audit-forward and
+  InfluxDB target lists now say the reader may not see the list, with
+  the server's reason; any other failed read says the list could not
+  be loaded, never that it is empty. Cutover no longer invites a first
+  plan beside its "Superadmin required". The polled reads among them
+  (Block Sync's two lists, the Network Tools appliance list, the
+  InfluxDB targets) stop polling once refused: a refusal does not
+  change by asking again, and Block Sync's and the appliance list's
+  refusals each write a `denied` audit row, which made a Viewer with
+  Block Sync open add 240 an hour.
+
 - **Allocate IP on an IPv6 subnet no longer names an address it will not
   allocate (#1307).** "Next available" previews the address with
   `strategy=sequential`, but for IPv6 the pick follows the subnet's
