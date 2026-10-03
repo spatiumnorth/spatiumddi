@@ -41,6 +41,67 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The rolling upgrade can run on a multi-node cluster (#1445).**
+  Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
+  2026.10.02-1, where Plan → Start never got past the upgrade lease:
+  - Every Lease write sent whole-second `acquireTime` / `renewTime`,
+    and the apiserver requires a MicroTime (six fractional digits), so
+    it answered 400 and the orchestrator never took its lease. All
+    three writes now send a MicroTime.
+  - The orchestrator runs in the Celery worker, and only the api's
+    ServiceAccount held its RBAC. With `api.upgradeOrchestratorRBAC`
+    on, the worker now gets the same grants: its own namespaced Role
+    carrying only the orchestrator's rules (not the api's Secret or
+    Deployment patch), plus the orchestrator ClusterRole and the
+    kube-system HelmChartConfig Role.
+  - `verify_primary_moved` passed whenever CNPG named any primary,
+    including one still on the cordoned node, so the drain could evict
+    the primary. It now waits until the primary pod runs on another
+    node, and treats a pod it cannot read as unproven.
+  - The slot-apply stamp was only flushed before the health gate
+    waited on the supervisor, which reads it from another session, so
+    the gate could only time out. `single_node_upgrade` now commits it
+    first.
+  - The `replication_lag` preflight and post-node check read
+    `pg_stat_replication` as the app's database role, which sees a
+    replica's state as NULL, and reported every replica as not
+    streaming. A state the role cannot see is now a warning
+    ("unverified"), not a failure; a replica visibly not streaming
+    still fails.
+  - Once the lease could be taken, every run would have failed its own
+    first node: each node's chain re-runs the full preflight, and its
+    in-flight check failed on any held lease, including the one the run
+    had just taken. The check now passes a lease held by the run asking.
+  - Plan took the CNPG cluster name only from its form field, which is
+    empty by default, so a default run skipped the CNPG maintenance
+    window and the primary-moved check above. Left empty, the name is
+    now detected from the database connection (the chart's
+    `<cluster>-rw` Service, confirmed by reading the Cluster).
+  - With the lease working, a run still could not leave `planned`: the
+    orchestrator's own transitions wrote an audit row with no actor
+    into a NOT NULL column, so the `started` transition failed. The
+    catch-all then reused the failed session, so the run was never
+    marked failed, and the lease stayed held for its full 10 minutes,
+    refusing Celery's retry and the next Start. Those transitions now
+    record `system:upgrade-orchestrator`, a crashed drive rolls back
+    before marking the run failed, and a failed start or crashed drive
+    releases the lease if it still holds it.
+  - Nothing rebooted the node into the slot it staged. The host runner
+    writes the new slot, arms the next boot and stops there, so the
+    health gate timed out on every node with the old version still
+    running. A new `reboot` step waits until the host reports this run's
+    slot staged, then requests the reboot through the same flag as the
+    Fleet reboot action (audited as `system:upgrade-orchestrator`). A
+    `done` left by an earlier upgrade does not count, so the node is not
+    restarted in the middle of the apply, and a request already
+    outstanding is not stamped twice. On a control-plane member the
+    request depends on #1446's fix.
+  - The run's database session did not survive the CNPG switchover it
+    waits for: the next query failed with "connection is closed". Task
+    sessions now ping their connection on checkout, and the reboot and
+    health-gate waits end their transaction on every poll.
+  The other points in that report are #1446, #1447 and #1448.
+
 - **Setting a control-plane VIP installs MetalLB (#1103).** It never
   did on a k3s with Helm 4 inside (klipper-helm): the
   `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
@@ -539,6 +600,26 @@ the formatter handles the rest.
 > rollback can mint a new `SECRET_KEY` and leave every credential
 > encrypted at rest unreadable. If you must go back, restore the
 > backup you took before the upgrade alongside the older release.
+
+# ⚠️ Upgrading an appliance from 2026.09.04-1: back up the app Secret first
+
+> **Before you upgrade an appliance from 2026.09.04-1, back up the
+> Secret that holds `SECRET_KEY`:**
+> `kubectl -n spatium get secret spatium-control-spatiumddi-app -o yaml > spatium-control-app-secret.yaml`,
+> and keep the file off the appliance. 2026.09.04-1's chart does not
+> mark that Secret to be kept (#1042 fixed that in this release), so if
+> the first `spatium-control` helm install on the new slot fails and
+> helm reinstalls the release, a new key is generated and every
+> credential encrypted at rest (TLS certificates, integration and
+> provider secrets) becomes unreadable. Restoring the saved Secret
+> recovers them. This was reported on a real upgrade (#1445, #1448).
+
+> **The built-in rolling upgrade (Rolling Upgrade tab, Plan → Start)
+> does not complete on a multi-node cluster in this release (#1445).**
+> The orchestrator cannot take its upgrade lease. A fix is in progress;
+> until it ships, follow #1445 before upgrading a multi-node control
+> plane. On a multi-node cluster, Kea HA pairs may also fail to come up
+> after the upgrade (#1447).
 
 **This is not 1.0.0.** 1.0.0 is still being worked on, and this
 release is a waypoint on the way there: a month of QA on the ddi-pg

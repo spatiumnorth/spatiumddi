@@ -60,7 +60,14 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # halt-on-failure handles step-level failures; this catches
             # the rarer "the loop itself crashed" case.
             from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
+            from app.services.upgrades import mutex  # noqa: PLC0415
 
+            # The failure may have left the session in a failed transaction
+            # (a flush that raised); without this every statement below
+            # raises PendingRollbackError, the row is never marked failed,
+            # and the run sits in ``planned`` / ``running`` with no error
+            # (#1449).
+            await db.rollback()
             row = await db.get(SystemUpgradeRun, rid)
             if row is not None and row.state in ("planned", "running"):
                 row.state = "failed"
@@ -69,6 +76,10 @@ async def _async_drive(run_id: str) -> dict[str, str]:
 
                 row.finished_at = datetime.now(UTC)
                 await db.commit()
+            # A failed run holds the lease for nothing; left held, the next
+            # Start is refused until it expires. Only ours, never another
+            # worker's that took it over.
+            mutex.release_if_held()
             logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 

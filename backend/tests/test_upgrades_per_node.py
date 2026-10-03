@@ -379,6 +379,7 @@ async def test_step_health_gate_succeeds_on_version_match(
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=5.0)
@@ -399,6 +400,7 @@ async def test_step_health_gate_fails_on_supervisor_failed(
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=5.0)
@@ -416,6 +418,7 @@ async def test_step_health_gate_times_out(monkeypatch: pytest.MonkeyPatch) -> No
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=0.05)
@@ -526,7 +529,7 @@ async def test_step_uncordon_partial_failure_reports_state() -> None:
 @pytest.mark.asyncio
 async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every step returns ok → single_node_upgrade returns ok=True with
-    11 step results (etcd_snapshot is the no-op placeholder)."""
+    12 step results (etcd_snapshot is the no-op placeholder)."""
 
     # Mock every step to return an ok StepResult so we exercise the
     # chained-call shape without re-doing each step's tests.
@@ -546,13 +549,14 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         per_node, "_step_trigger_slot_apply", lambda *a, **k: _ok("trigger_slot_apply")
     )
+    monkeypatch.setattr(per_node, "_step_reboot", lambda *a, **k: _ok("reboot"))
     monkeypatch.setattr(per_node, "_step_health_gate", lambda *a, **k: _ok("health_gate"))
     monkeypatch.setattr(per_node, "_step_convergence", lambda *a, **k: _ok("convergence"))
     monkeypatch.setattr(per_node, "_step_uncordon", lambda *a, **k: _ok("uncordon"))
     monkeypatch.setattr(per_node, "_step_cluster_verify", lambda *a, **k: _ok("cluster_verify"))
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -569,6 +573,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
         "verify_primary_moved",
         "drain",
         "trigger_slot_apply",
+        "reboot",
         "health_gate",
         "convergence",
         "uncordon",
@@ -607,7 +612,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     monkeypatch.setattr(per_node, "_step_drain", _track_drain)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -635,13 +640,13 @@ async def test_single_node_upgrade_step_crash_caught(
     Otherwise an orchestrator-pod crash mid-step would leave the
     SystemUpgradeRun row stuck in ``running`` forever."""
 
-    async def _crash(_target_version: str) -> per_node.StepResult:
+    async def _crash(_target_version: str, *_a: object) -> per_node.StepResult:
         raise RuntimeError("kubeapi unreachable")
 
     monkeypatch.setattr(per_node, "_step_preflight", _crash)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),

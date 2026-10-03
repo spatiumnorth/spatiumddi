@@ -336,6 +336,29 @@ async def test_drive_loop_happy_path_two_nodes(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_drive_loop_passes_its_lease_holder_to_each_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node chain's preflight must know the lease is this run's (#1445)."""
+    run = _FakeRun(state="running")
+    run.lease_holder = "worker-0"
+    run.plan = {"node_order": ["node-a"], "slot_image_url": "http://mirror/x"}
+    db = _db_for_state_test(run)
+    holders: list[Any] = []
+
+    async def _fake_per_node(*args: Any, **kwargs: Any) -> per_node.SingleNodeResult:
+        holders.append(kwargs.get("lease_holder"))
+        return _good_result(kwargs["node_name"])
+
+    monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
+    monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+    monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
+
+    await orchestrator._drive_loop(db, run, asyncio.Event())  # type: ignore[arg-type]
+    assert holders == ["worker-0"]
+
+
+@pytest.mark.asyncio
 async def test_drive_loop_halts_on_first_node_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

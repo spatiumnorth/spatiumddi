@@ -121,6 +121,7 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
     archive_path,
@@ -6034,8 +6035,7 @@ async def schedule_appliance_reboot(
                 "appliance OS."
             ),
         )
-    row.reboot_requested = True
-    row.reboot_requested_at = datetime.now(UTC)
+    request_reboot(row)
     db.add(
         AuditLog(
             user_id=current_user.id,

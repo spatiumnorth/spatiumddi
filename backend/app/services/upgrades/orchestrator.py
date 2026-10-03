@@ -46,8 +46,11 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.audit import AuditLog
 from app.models.system_upgrade import LIFECYCLE_STATES, SystemUpgradeRun
 from app.services.appliance import k8s
@@ -65,6 +68,38 @@ from app.services.upgrades import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# The audit actor for the orchestrator's own transitions (started, node_failed,
+# succeeded, chart_bump_failed, post_upgrade_verify_failed), which no operator
+# drives. ``audit_log.user_display_name`` is NOT NULL.
+SYSTEM_ACTOR = per_node.SYSTEM_ACTOR
+
+
+def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
+    """The CNPG Cluster this control plane's database runs on, or ``""``.
+
+    The chart points ``DATABASE_URL`` at the ``<cluster>-rw`` Service CNPG
+    creates for the primary, so the cluster name is the host's first label
+    without ``-rw``. It is confirmed by reading the Cluster CR, so a
+    non-CNPG database whose host happens to end in ``-rw`` detects nothing.
+
+    Plan used to take the name only from the operator, and the field is
+    empty by default, so a default Plan skipped the CNPG maintenance window
+    and the check that the primary has left a node before it is drained.
+    """
+    try:
+        host = make_url(settings.database_url).host or ""
+    except ArgumentError:
+        return ""
+    label = host.split(".", 1)[0]
+    if not label.endswith("-rw") or len(label) <= 3:
+        return ""
+    candidate = label[: -len("-rw")]
+    try:
+        status, _ = k8s.get_cnpg_cluster(candidate, namespace=namespace)
+    except k8s.KubeapiUnavailableError:
+        return ""
+    return candidate if status == 200 else ""
 
 
 # Lease duration for orchestrator runs — much longer than the 60 s
@@ -145,6 +180,11 @@ async def plan_upgrade(
         partial unique index would 500 us anyway; we surface the
         409 cleanly first).
     """
+    if not cnpg_cluster_name:
+        cnpg_cluster_name = detect_cnpg_cluster_name(cnpg_namespace)
+        if cnpg_cluster_name:
+            logger.info("upgrade_plan_cnpg_cluster_detected", cluster=cnpg_cluster_name)
+
     # Preflight gate.
     report = await preflight.run_all(target_version=target_version)
     if report.overall == "fail":
@@ -320,8 +360,13 @@ async def _transition(
     db.add(
         AuditLog(
             user_id=actor_user_id,
-            user_display_name=actor_display,
-            auth_source=actor_source,
+            # ``user_display_name`` and ``auth_source`` are NOT NULL, and the
+            # orchestrator's own transitions have no operator. Writing None
+            # failed the very first transition (``started``) of every run, so
+            # no rolling upgrade could leave ``planned`` (found by ddi-pg on
+            # #1449).
+            user_display_name=actor_display or SYSTEM_ACTOR,
+            auth_source=actor_source or "system",
             action=f"upgrade.{event}",
             resource_type="system_upgrade_run",
             resource_id=str(run.id),
@@ -466,10 +511,18 @@ async def drive_upgrade(
         ok, err = mutex.acquire(lease_duration_seconds=LEASE_DURATION_S)
         if not ok:
             raise OrchestratorError(f"could not acquire upgrade lease: {err}")
-        run.lease_holder = mutex._identity()  # noqa: SLF001 — same module family
-        run.lease_acquired_at = _now()
-        await _transition(db, run, "running", allowed_from=("planned",), event="started")
-        await db.commit()
+        try:
+            run.lease_holder = mutex._identity()  # noqa: SLF001 — same module family
+            run.lease_acquired_at = _now()
+            await _transition(db, run, "running", allowed_from=("planned",), event="started")
+            await db.commit()
+        except BaseException:
+            # The run never started, so nothing holds the lease for a reason:
+            # left held, Celery's retry is refused it until it expires
+            # (10 min), and an operator's next Start too (#1449).
+            await db.rollback()
+            mutex.release_if_held()
+            raise
         await db.refresh(run)
     elif run.state == "running":
         # Resume / re-enqueue path — confirm we still hold the lease,
@@ -705,6 +758,7 @@ async def _drive_loop(
             slot_image=slot_image,
             cnpg_cluster_name=cnpg_name,
             cnpg_namespace=cnpg_namespace,
+            lease_holder=run.lease_holder,
         )
 
         per_node_progress[next_node] = {
