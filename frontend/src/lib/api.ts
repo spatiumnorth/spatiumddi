@@ -4317,7 +4317,7 @@ export interface InternalGroup {
   user_ids?: string[];
 }
 
-export interface InternalGroupCreate {
+export interface InternalGroupCreate extends StepUp {
   name: string;
   description?: string;
   auth_source?: string;
@@ -4326,7 +4326,7 @@ export interface InternalGroupCreate {
   user_ids?: string[];
 }
 
-export interface InternalGroupUpdate {
+export interface InternalGroupUpdate extends StepUp {
   name?: string;
   description?: string;
   external_dn?: string | null;
@@ -4361,7 +4361,7 @@ export interface TimeBoundGrant {
   created_at: string;
 }
 
-export interface TimeBoundGrantCreate {
+export interface TimeBoundGrantCreate extends StepUp {
   group_id: string;
   action: string;
   resource_type: string;
@@ -4412,7 +4412,7 @@ export interface RoleCreate {
   permissions?: PermissionEntry[];
 }
 
-export interface RoleUpdate {
+export interface RoleUpdate extends StepUp {
   name?: string;
   description?: string;
   permissions?: PermissionEntry[];
