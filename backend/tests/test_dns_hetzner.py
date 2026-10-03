@@ -25,9 +25,12 @@ from app.drivers.dns.hetzner import HetznerDNSDriver
 class _FakeResponse:
     """Minimal stand-in for an ``httpx.Response`` (status + json())."""
 
-    def __init__(self, status_code: int, payload: Any = None) -> None:
+    def __init__(
+        self, status_code: int, payload: Any = None, headers: dict[str, str] | None = None
+    ) -> None:
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
+        self.headers = headers or {}
 
     def json(self) -> Any:
         return self._payload
@@ -232,6 +235,16 @@ def test_long_txt_is_split_into_255_byte_strings() -> None:
     parts = wire.split(" ")
     assert [len(p) - 2 for p in parts] == [255, 255, 90]
     # And it round-trips.
+    assert HetznerDNSDriver._txt_from_wire(wire) == value
+
+
+def test_txt_split_counts_bytes_not_characters() -> None:
+    # "é" is two bytes in UTF-8: 200 of them are 400 bytes, so a character
+    # count would emit one 200-character string BIND reads as 400 bytes.
+    value = "é" * 200
+    wire = HetznerDNSDriver._wire_value(RecordData("@", "TXT", value))
+    parts = [p[1:-1] for p in wire.split(" ")]
+    assert [len(p.encode("utf-8")) for p in parts] == [254, 146]
     assert HetznerDNSDriver._txt_from_wire(wire) == value
 
 
@@ -447,7 +460,7 @@ async def test_wildcard_name_is_kept_in_path(monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Actions ─────────────────────────────────────────────────────────────
 async def test_running_action_is_polled_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hetzner_mod, "_ACTION_POLL_S", 0)
+    monkeypatch.setattr(hetzner_mod, "_ACTION_POLL_FIRST_S", 0)
     fake = _FakeClient(
         {
             "get": [
@@ -481,7 +494,7 @@ async def test_failed_action_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_stuck_action_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hetzner_mod, "_ACTION_POLL_S", 0)
+    monkeypatch.setattr(hetzner_mod, "_ACTION_POLL_FIRST_S", 0)
     monkeypatch.setattr(hetzner_mod, "_ACTION_TIMEOUT_S", 0)
     fake = _FakeClient(
         {"get": [_NOT_FOUND], "post": [_FakeResponse(201, _action("create_rrset", "running"))]}
@@ -489,6 +502,81 @@ async def test_stuck_action_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = _patch_client(monkeypatch, fake)
 
     with pytest.raises(CloudDNSError, match="still 'running'"):
+        await driver._apply_record(
+            _Server(), _CREDS, _change("create", RecordData("x", "A", "192.0.2.1"))
+        )
+
+
+async def test_action_polling_backs_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(hetzner_mod.asyncio, "sleep", fake_sleep)
+    running = _action("create_rrset", "running")
+    fake = _FakeClient(
+        {
+            "get": [_NOT_FOUND]
+            + [_FakeResponse(200, running) for _ in range(4)]
+            + [_FakeResponse(200, _action("create_rrset"))],
+            "post": [_FakeResponse(201, running)],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _change("create", RecordData("x", "A", "192.0.2.1"))
+    )
+
+    # 1 s doubling to a 5 s cap: five polls cost five requests, not twenty.
+    assert sleeps == [1.0, 2.0, 4.0, 5.0, 5.0]
+
+
+_LOCKED = _FakeResponse(423, {"error": {"code": "locked", "message": "action running"}})
+
+
+async def test_locked_zone_write_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hetzner_mod, "_ACTION_POLL_FIRST_S", 0)
+    fake = _FakeClient(
+        {
+            "get": [_NOT_FOUND],
+            "post": [_LOCKED, _LOCKED, _FakeResponse(201, _action("create_rrset"))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _change("create", RecordData("x", "A", "192.0.2.1"))
+    )
+
+    assert [c["path"] for c in fake.writes()] == ["/zones/example.com/rrsets"] * 3
+
+
+async def test_lock_that_outlasts_the_retry_window_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hetzner_mod, "_LOCKED_RETRY_S", 0)
+    fake = _FakeClient({"get": [_NOT_FOUND], "post": [_LOCKED]})
+    driver = _patch_client(monkeypatch, fake)
+
+    with pytest.raises(CloudDNSError, match="action running"):
+        await driver._apply_record(
+            _Server(), _CREDS, _change("create", RecordData("x", "A", "192.0.2.1"))
+        )
+
+
+async def test_rate_limit_names_the_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hetzner_mod.time, "time", lambda: 1000)
+    limited = _FakeResponse(
+        429,
+        {"error": {"code": "rate_limit_exceeded", "message": "limit"}},
+        headers={"RateLimit-Reset": "1042"},
+    )
+    fake = _FakeClient({"get": [_NOT_FOUND], "post": [limited]})
+    driver = _patch_client(monkeypatch, fake)
+
+    with pytest.raises(CloudDNSError, match="rate limit reached .*resets in 42 s"):
         await driver._apply_record(
             _Server(), _CREDS, _change("create", RecordData("x", "A", "192.0.2.1"))
         )

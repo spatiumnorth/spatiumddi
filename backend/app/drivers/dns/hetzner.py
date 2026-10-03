@@ -74,7 +74,17 @@ _RRSETS_PER_PAGE = 100
 # Writes return an ``action`` that may still be running. Bounded so a
 # stuck action surfaces as an error instead of hanging the request.
 _ACTION_TIMEOUT_S = 60.0
-_ACTION_POLL_S = 0.5
+# Polling backs off from 1 s to 5 s. The Cloud API allows 3600 requests per
+# hour per project (refilled at one a second) and asks clients not to poll
+# actions too often; a fixed 0.5 s poll cost ~20 requests per write, which a
+# bulk sync of a few hundred records would exhaust.
+_ACTION_POLL_FIRST_S = 1.0
+_ACTION_POLL_MAX_S = 5.0
+
+# ``423 locked``: another action is still running on the zone. Writes are
+# retried with backoff for up to this long rather than failed outright, since
+# consecutive writes to one zone routinely overlap.
+_LOCKED_RETRY_S = 60.0
 
 # Types whose value ends in a hostname that must be absolute on the wire.
 _HOSTNAME_TARGET_TYPES = {"CNAME", "NS", "PTR", "MX", "SRV"}
@@ -149,6 +159,47 @@ class HetznerDNSDriver(CloudDNSDriverBase):
             detail = f"HTTP {status}"
         raise CloudDNSError(f"Hetzner API error: {detail}")
 
+    @staticmethod
+    def _error_code(response: Any) -> str:
+        try:
+            body = response.json()
+        except (ValueError, TypeError):
+            return ""
+        err = body.get("error") if isinstance(body, dict) else None
+        return str(err.get("code") or "") if isinstance(err, dict) else ""
+
+    async def _send(self, client: httpx.AsyncClient, method: str, path: str, **kwargs: Any) -> Any:
+        """Issue a write, retrying while the zone is locked by another action.
+
+        A ``429`` is reported with the time the limit resets rather than as
+        a bare error, so an operator can tell a throttled sync from a broken
+        one.
+        """
+        deadline = time.monotonic() + _LOCKED_RETRY_S
+        delay = _ACTION_POLL_FIRST_S
+        while True:
+            resp = await getattr(client, method)(path, **kwargs)
+            status = self._status(resp)
+            if status == 423 and self._error_code(resp) == "locked":
+                if time.monotonic() + delay > deadline:
+                    return resp  # _unwrap reports the lock
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _ACTION_POLL_MAX_S)
+                continue
+            if status == 429:
+                headers = getattr(resp, "headers", None) or {}
+                reset = headers.get("RateLimit-Reset") if hasattr(headers, "get") else None
+                when = ""
+                if reset:
+                    try:
+                        when = f"; it resets in {max(0, int(reset) - int(time.time()))} s"
+                    except (TypeError, ValueError):
+                        when = ""
+                raise CloudDNSError(
+                    "Hetzner API rate limit reached (3600 requests per hour per " f"project){when}."
+                )
+            return resp
+
     def _token(self, creds: dict[str, Any]) -> str:
         token = (creds or {}).get("api_token")
         if not token:
@@ -166,6 +217,7 @@ class HetznerDNSDriver(CloudDNSDriverBase):
         if not isinstance(action, dict):
             return
         deadline = time.monotonic() + _ACTION_TIMEOUT_S
+        delay = _ACTION_POLL_FIRST_S
         while True:
             status = action.get("status")
             if status == "success":
@@ -179,7 +231,8 @@ class HetznerDNSDriver(CloudDNSDriverBase):
                     f"Hetzner action {action.get('id')} still {status!r} after "
                     f"{int(_ACTION_TIMEOUT_S)} s"
                 )
-            await asyncio.sleep(_ACTION_POLL_S)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _ACTION_POLL_MAX_S)
             resp = await client.get(f"/zones/actions/{action['id']}")
             action = self._unwrap(resp).get("action") or {}
 
@@ -220,14 +273,37 @@ class HetznerDNSDriver(CloudDNSDriverBase):
         return f"{host}." if "." in host else host
 
     @staticmethod
-    def _txt_to_wire(value: str) -> str:
+    def _txt_chunks(raw: str) -> list[str]:
+        """Split ``raw`` into strings of at most 255 UTF-8 bytes.
+
+        The limit is in bytes (RFC 1035 §3.3), so a character count is only
+        right for ASCII. Splitting on character boundaries keeps every chunk
+        valid UTF-8.
+        """
+        chunks: list[str] = []
+        cur: list[str] = []
+        size = 0
+        for ch in raw:
+            n = len(ch.encode("utf-8"))
+            if size + n > _TXT_CHUNK:
+                chunks.append("".join(cur))
+                cur, size = [], 0
+            cur.append(ch)
+            size += n
+        if cur or not chunks:
+            chunks.append("".join(cur))
+        return chunks
+
+    @classmethod
+    def _txt_to_wire(cls, value: str) -> str:
         """Quote a TXT value, splitting it into ≤255-byte strings."""
         raw = value
         # Already in presentation form (``"a" "b"``) — leave it alone.
         if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
             return raw
-        chunks = [raw[i : i + _TXT_CHUNK] for i in range(0, len(raw), _TXT_CHUNK)] or [""]
-        return " ".join('"' + c.replace("\\", "\\\\").replace('"', '\\"') + '"' for c in chunks)
+        return " ".join(
+            '"' + c.replace("\\", "\\\\").replace('"', '\\"') + '"' for c in cls._txt_chunks(raw)
+        )
 
     @staticmethod
     def _txt_from_wire(value: str) -> str:
@@ -341,7 +417,7 @@ class HetznerDNSDriver(CloudDNSDriverBase):
     async def _post_action(
         self, client: httpx.AsyncClient, path: str, body: dict[str, Any]
     ) -> None:
-        resp = await client.post(path, json=body)
+        resp = await self._send(client, "post", path, json=body)
         await self._wait_action(client, self._unwrap(resp))
 
     async def _create_rrset(
@@ -365,7 +441,7 @@ class HetznerDNSDriver(CloudDNSDriverBase):
     async def _delete_rrset(
         self, client: httpx.AsyncClient, zone_fqdn: str, name: str, rtype: str
     ) -> None:
-        resp = await client.delete(self._rrset_path(zone_fqdn, name, rtype))
+        resp = await self._send(client, "delete", self._rrset_path(zone_fqdn, name, rtype))
         if self._status(resp) == 404:
             return  # idempotent delete
         await self._wait_action(client, self._unwrap(resp))
@@ -457,14 +533,17 @@ class HetznerDNSDriver(CloudDNSDriverBase):
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         async with self._client(token) as client:
             if op == "create":
-                resp = await client.post(
-                    "/zones", json={"name": zone_fqdn.rstrip("."), "mode": "primary"}
+                resp = await self._send(
+                    client,
+                    "post",
+                    "/zones",
+                    json={"name": zone_fqdn.rstrip("."), "mode": "primary"},
                 )
                 await self._wait_action(client, self._unwrap(resp))
                 return
 
             if op == "delete":
-                resp = await client.delete(f"/zones/{self._zone_ref(zone_fqdn)}")
+                resp = await self._send(client, "delete", f"/zones/{self._zone_ref(zone_fqdn)}")
                 if self._status(resp) == 404:
                     return
                 await self._wait_action(client, self._unwrap(resp))

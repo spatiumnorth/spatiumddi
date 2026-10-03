@@ -54,8 +54,12 @@ the formatter handles the rest.
   converges; the per-value fallback uses `add_records` /
   `remove_records` against the live set. Writes are asynchronous actions
   and are now awaited, so a change the API rejects after accepting it is
-  reported as failed rather than applied. TXT values are quoted on write
-  and joined on read, hostname targets are absolutised, and
+  reported as failed rather than applied. Action polling backs off from
+  1 s to 5 s to stay inside the API's 3600 requests per hour per project,
+  a write refused because another action is running on the zone is
+  retried, and hitting the rate limit says when it resets. TXT values are
+  quoted on write (split into strings of at most 255 bytes) and joined on
+  read, hostname targets are absolutised, and
   secondary-mode zones (transferred from your own primaries) are no longer
   offered for import, since they have no RRsets to manage. A redirect is
   reported as such instead of as "HTTP 301". Contributed by
