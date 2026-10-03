@@ -41,6 +41,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCPv6 scope is refused on a group with a Windows DHCP server
+  (#1480).** SpatiumDDI writes Windows DHCP through the DHCPv4 cmdlets
+  only, so a v6 scope on such a group was handed to them anyway: the save
+  failed with a 502, or the scope existed in SpatiumDDI and on no server.
+  Creating a v6 scope in a group with a Windows member is now a 422 that
+  says why, and so is adding or moving a Windows server into a group that
+  has v6 scopes.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
