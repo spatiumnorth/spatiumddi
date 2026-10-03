@@ -160,6 +160,11 @@ Each DHCP driver declares the spelling it reads
 (`DHCPDriver.raw_option_spelling`), so a new driver states its own rather
 than inheriting Kea's.
 
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
+
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
 equivalent and all raw codes, `opt-NN` on a Windows group included: the

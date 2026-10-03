@@ -24,7 +24,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
@@ -62,6 +62,19 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 }
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
+
+
+async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
+    """Whether ``group_id`` has a Windows DHCP member (#1480)."""
+    if group_id is None:
+        return False
+    return bool(
+        await db.scalar(
+            select(DHCPServer.id)
+            .where(DHCPServer.server_group_id == group_id, DHCPServer.driver == "windows_dhcp")
+            .limit(1)
+        )
+    )
 
 
 async def validate_dhcp_options(
@@ -680,6 +693,19 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
+    if address_family == "ipv6" and await _group_has_windows(db, group_id):
+        # #1480 — the Windows write path speaks DHCPv4 only (Add-/Set-
+        # DhcpServerv4Scope, Set-DhcpServerv4OptionValue), so a v6 scope on a
+        # group with a Windows member would be handed to v4 cmdlets: a 502,
+        # or a scope that exists here and on no Windows server.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This group has a Windows DHCP server, and SpatiumDDI manages Windows "
+                "DHCP over DHCPv4 only. Put DHCPv6 scopes in a group without Windows "
+                "members."
+            ),
+        )
     _create_options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family

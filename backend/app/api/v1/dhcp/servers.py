@@ -482,6 +482,39 @@ async def _assert_group_options_servable(
     )
 
 
+async def _assert_no_v6_scopes_for_windows(db: DB, group_id: uuid.UUID | None, driver: str) -> None:
+    """422 when a Windows server would join a group with DHCPv6 scopes (#1480).
+
+    The Windows write path speaks DHCPv4 only, so it cannot serve them."""
+    if group_id is None or driver != "windows_dhcp":
+        return
+    names = (
+        (
+            await db.execute(
+                select(DHCPScope.name)
+                .where(
+                    DHCPScope.group_id == group_id,
+                    DHCPScope.address_family == "ipv6",
+                    DHCPScope.deleted_at.is_(None),
+                )
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This group has DHCPv6 scopes, and SpatiumDDI manages Windows DHCP over "
+                f"DHCPv4 only, so a Windows server could not serve them "
+                f"({', '.join(n or '(unnamed)' for n in names)}). Use a group without "
+                "DHCPv6 scopes."
+            ),
+        )
+
+
 async def _assert_driver_mix_allowed(
     db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
 ) -> None:
@@ -523,6 +556,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
 
     await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
     await _assert_group_options_servable(db, body.server_group_id, body.driver)
+    await _assert_no_v6_scopes_for_windows(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
     # drivers (FortiGate) speak HTTPS on 443; agent/agentless DHCP daemons use 67.
@@ -610,6 +644,14 @@ async def update_server(
     changes = body.model_dump(
         exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    # #1458 — ``exclude_none`` treats an explicit ``null`` like an absent
+    # key, so a server could be moved to another group but never taken out
+    # of one. An ungrouped server is a valid state (the column is nullable
+    # and create accepts it), so an explicitly sent ``server_group_id:
+    # null`` clears the group. Every other field keeps "null = leave".
+    clear_group = "server_group_id" in body.model_fields_set and body.server_group_id is None
+    if clear_group:
+        changes["server_group_id"] = None
     target_group = changes.get("server_group_id", s.server_group_id)
     target_driver = changes.get("driver", s.driver)
     if target_group != s.server_group_id or target_driver != s.driver:
@@ -617,6 +659,7 @@ async def update_server(
         await _assert_group_options_servable(
             db, target_group, target_driver, exclude_server_id=s.id
         )
+        await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -698,6 +741,8 @@ async def update_server(
     audit_payload = body.model_dump(
         mode="json", exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
     )
+    if clear_group:
+        audit_payload["server_group_id"] = None
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
