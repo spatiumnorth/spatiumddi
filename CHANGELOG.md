@@ -41,6 +41,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Raw DHCP option codes are checked on every way into a group, not
+  only on write (#1347).** #1296 made a scope or option-template write
+  refuse the raw spelling its group's servers drop (Windows reads `opt-NN`,
+  Kea and FortiGate `code:NN`). Three other paths still produced options
+  saved and never served, with no error:
+  - **A server joining a group.** A scope saved with `code:43` on a Kea,
+    FortiGate or empty group kept it when a Windows server was added or
+    moved in, and Windows then served the scope without it. Creating or
+    moving a server into such a group is now refused, naming the scopes and
+    keys.
+  - **The Windows importer** wrote `opt-NN` into whatever group it was
+    given, and a Kea group dropped every one at render. Options are now
+    re-keyed to the target group's spelling on commit, and the ones no
+    server there can serve are dropped and named in the warnings.
+  - **The option editor** keyed a catalogue pick as `code:NN` even on a
+    Windows group, where the write then refused it. It now uses the group's
+    spelling, for scopes and option templates alike.
+  Each DHCP driver now declares the spelling it reads, rather than the
+  router special-casing Windows, and `opt-NN` on a DHCPv6 scope is refused
+  on a Windows group too: the Windows write path is DHCPv4-only, so it
+  reached no server.
+
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
   an explicit `"server_group_id": null` was dropped like an absent key:
