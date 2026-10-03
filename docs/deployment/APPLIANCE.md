@@ -532,15 +532,6 @@ state on its heartbeat:
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
-  **Known issue — setting a VIP does not work today
-  ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).** The
-  plumbing above is correct and the override reaches the cluster, but the
-  MetalLB install itself then fails permanently: Helm 4 orders the
-  validating webhooks ahead of the pool CRs, and each klipper-helm retry
-  runs `helm uninstall` first — deleting the controller that backs the
-  webhook — so no `IPAddressPool` is ever created and the frontend Service
-  stays `<pending>`. Leave the VIP unset until this is fixed; see
-  [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets

@@ -310,6 +310,14 @@ lint "$METALLB" "${METALLB_ALL_ON[@]}"
 render metallb-defaults "$METALLB"
 POSTURE_ARGS="--require-priority"
 render metallb-all-on "$METALLB" "${METALLB_ALL_ON[@]}"
+# #1103 — the webhooks must fail open, or the CRs in the same install are
+# refused while the controller that serves the webhook is still starting.
+# Only a live apiserver shows it; lint and template pass either way. MetalLB's
+# one webhook configuration covers the BGP kinds too, so this render is the
+# whole check; the BGP render's extra frr-k8s webhook is left at Fail on
+# purpose (see the script's docstring).
+python3 "$ROOT/.github/scripts/chart-webhooks-fail-open.py" "$OUT/metallb-all-on.yaml" --require \
+    || failures=$((failures + 1))
 # BGP mode (#566 D1) — the supervisor flips ``frrk8s.enabled`` on together
 # with ``bgp.enabled`` the moment a peer is configured, so this shape reaches
 # real appliances and has to be rendered. The two frr-k8s workloads are
@@ -318,9 +326,18 @@ render metallb-all-on "$METALLB" "${METALLB_ALL_ON[@]}"
 # Exempting them by name is strictly better than not rendering the chart,
 # which is how their missing priority class and BestEffort QoS survived #965.
 POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner"
-render metallb-bgp "$METALLB" "${METALLB_ALL_ON[@]}" --set metallb.frrk8s.enabled=true
+# One peer, because the API refuses BGP mode without one: without it this
+# render held no BGPPeer at all, so the CR every BGP appliance carries was
+# never schema-checked.
+METALLB_BGP=(
+    --set metallb.frrk8s.enabled=true
+    --set metallb.bgp.peers[0].myASN=64512
+    --set metallb.bgp.peers[0].peerASN=64513
+    --set metallb.bgp.peers[0].peerAddress=10.0.0.1
+)
+render metallb-bgp "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 POSTURE_ARGS=""
-coverage "$METALLB" "${METALLB_ALL_ON[@]}" --set metallb.frrk8s.enabled=true
+coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2
