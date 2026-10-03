@@ -49,6 +49,10 @@ import { cn } from "@/lib/utils";
  * non-digits before validating, so an operator can type the dash
  * or leave it out and either resolves to the same hash.
  */
+
+// #1356 — the server's default for a persistent code: 30 days.
+const PERSISTENT_DEFAULT_MINUTES = 30 * 24 * 60;
+
 function formatPairingCode(code: string): string {
   const digits = code.replace(/\D/g, "");
   if (digits.length !== 8) return code;
@@ -465,9 +469,9 @@ function GenerateCodeModal({
   const [generated, setGenerated] = useState<PairingCodeCreated | null>(null);
 
   // Reset expiry default when toggling persistent: ephemeral defaults
-  // to 15 min, persistent defaults to "no expiry" (null).
+  // to 15 min, persistent to 30 days (#1356). 0 = never, persistent only.
   useEffect(() => {
-    setExpiresInMinutes(persistent ? null : 15);
+    setExpiresInMinutes(persistent ? PERSISTENT_DEFAULT_MINUTES : 15);
     if (!persistent) setMaxClaims("");
   }, [persistent]);
 
@@ -542,7 +546,7 @@ function GenerateCodeModal({
               Expiry{" "}
               <span className="text-muted-foreground">
                 {persistent
-                  ? "(optional — leave 0 for no expiry)"
+                  ? "(minutes — default 30 days, 0 for no expiry)"
                   : "(minutes)"}
               </span>
             </span>
@@ -552,12 +556,16 @@ function GenerateCodeModal({
               min={persistent ? 0 : 5}
               max={persistent ? undefined : 60}
               value={expiresInMinutes ?? 0}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setExpiresInMinutes(persistent && v === 0 ? null : v);
-              }}
+              onChange={(e) => setExpiresInMinutes(Number(e.target.value))}
             />
           </label>
+          {persistent && expiresInMinutes === 0 && (
+            <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+              A code that never expires lets any appliance that learns its 8
+              digits ask to join, for as long as the code exists. Prefer an
+              expiry, and revoke the code when the rollout is done.
+            </p>
+          )}
 
           {persistent && (
             <label className="flex flex-col gap-1 text-sm">
