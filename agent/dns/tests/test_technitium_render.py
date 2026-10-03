@@ -1455,6 +1455,96 @@ def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
     assert opts and opts[0][3]["primaryNameServerAddresses"] == "192.0.2.9:5353"
 
 
+# ── Zone type change on an existing zone (#1457) ────────────────────────
+
+
+def _existing_zone_responder(live_type: str | None, convert: dict[str, Any] | None = None):
+    """zones/create says "already exists"; options/get reports ``live_type``."""
+
+    def responder(path, params, n):
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": f"Zone already exists: {params['zone']}"}
+        if path == "zones/options/get":
+            if live_type is None:
+                return {"status": "error", "errorMessage": "No such zone was found"}
+            return {"status": "ok", "response": {"name": params["zone"], "type": live_type}}
+        if path == "zones/convert":
+            return convert or {"status": "ok", "response": {}}
+        return {"status": "ok"}
+
+    return responder
+
+
+def test_forwarder_zone_switched_to_primary_is_converted(tmp_path: Path) -> None:
+    """The reported case: forward → primary in SpatiumDDI left a Forwarder on
+    the daemon, so names without a local record went to the old upstream."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder("Forwarder"))
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    converts = [c for c in calls if c[2] == "zones/convert"]
+    assert len(converts) == 1
+    assert converts[0][1] == "POST"
+    assert converts[0][3] == {"zone": "home.test", "type": "Primary"}
+
+
+def test_primary_zone_switched_to_forwarder_is_converted_before_the_upstream(
+    tmp_path: Path,
+) -> None:
+    """The forwarder target is set with zones/options/set, which only means
+    something once the zone IS a Forwarder — so convert first."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder("Primary"))
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.53"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert paths.index("zones/convert") < paths.index("zones/options/set")
+    assert calls[paths.index("zones/convert")][3]["type"] == "Forwarder"
+    assert calls[paths.index("zones/options/set")][3]["forwarder"] == "192.0.2.53"
+
+
+def test_zone_of_the_right_type_is_not_converted(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder("Primary"))
+
+    d._ensure_zone_exists("t", {"zone": "p.test", "type": "Primary"})
+
+    assert "zones/convert" not in [c[2] for c in calls]
+
+
+def test_unsupported_conversion_is_logged_and_nothing_is_deleted(tmp_path: Path) -> None:
+    """Technitium refuses Primary/Forwarder → Secondary ("not supported").
+    The agent must not fall back to deleting the zone on its own."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    refused = {
+        "status": "error",
+        "errorMessage": "Cannot convert the zone 's.test' from Primary to Secondary zone: "
+        "not supported.",
+    }
+    calls = _install_fake_request(d, _existing_zone_responder("Primary", convert=refused))
+
+    d._ensure_zone_exists(
+        "t", {"zone": "s.test", "type": "Secondary", "masters": ["192.0.2.1"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/convert" in paths
+    assert not any(p.startswith("zones/delete") for p in paths)
+
+
+def test_unreadable_live_type_is_not_guessed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder(None))
+
+    d._ensure_zone_exists("t", {"zone": "x.test", "type": "Primary"})
+
+    assert "zones/convert" not in [c[2] for c in calls]
+
+
 def test_empty_tsig_key_set_is_pushed(tmp_path: Path) -> None:
     """A revoked key that is never cleared stays installed and signed
     transfers keep working — same bug class as the forwarders path."""
