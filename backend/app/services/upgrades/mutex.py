@@ -247,6 +247,19 @@ def renew(
     )
 
 
+def release_if_held(*, namespace: str | None = None) -> bool:
+    """Release the lease only if THIS pod holds it; True if released.
+
+    For failure paths: :func:`release` clears whoever holds the lease, and a
+    crashed drive must never drop a lease another worker has since taken
+    over (#1445)."""
+    state = get_state(namespace=namespace)
+    if not state.held or state.holder != _identity():
+        return False
+    ok, _err = release(namespace=namespace)
+    return ok
+
+
 def release(*, namespace: str | None = None) -> tuple[bool, str | None]:
     """Release the lease we hold by setting an empty holder.
 

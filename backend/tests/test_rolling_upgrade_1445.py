@@ -365,3 +365,130 @@ def test_an_unreachable_kubeapi_detects_nothing(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(orchestrator.k8s, "get_cnpg_cluster", _get)
 
     assert orchestrator.detect_cnpg_cluster_name() == ""
+
+
+# ── The run's own transitions commit, and a failed start lets go ──────────────
+
+
+async def _planned_run(db: Any) -> Any:
+    from app.models.system_upgrade import SystemUpgradeRun
+
+    run = SystemUpgradeRun(
+        kind="cluster_rolling",
+        state="planned",
+        target_version="2026.10.03-1",
+        source_versions={},
+        plan={"node_order": ["node-a"], "slot_image_url": "https://example.test/x.raw.xz"},
+        progress={"per_node": {}, "events": []},
+    )
+    db.add(run)
+    await db.commit()
+    return run
+
+
+@pytest.mark.asyncio
+async def test_the_started_transition_commits_against_postgres(
+    db_session: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every run's first transition wrote an audit row with no actor into a
+    NOT NULL column, so no rolling upgrade could leave ``planned`` (found by
+    ddi-pg on #1449). Committed for real here, which the mocked-session
+    orchestrator tests could not see."""
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _planned_run(db_session)
+    monkeypatch.setattr(orch.mutex, "acquire", lambda **_k: (True, None))
+    monkeypatch.setattr(orch.mutex, "_identity", lambda: "worker-0")
+
+    async def _no_loop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _no_renewal(stop: Any) -> None:
+        await stop.wait()
+
+    monkeypatch.setattr(orch, "_drive_loop", _no_loop)
+    monkeypatch.setattr(orch, "_lease_renewal_loop", _no_renewal)
+
+    result = await orch.drive_upgrade(db_session, run.id)
+
+    assert result.state == "running"
+    row = (
+        await db_session.execute(select(AuditLog).where(AuditLog.action == "upgrade.started"))
+    ).scalar_one()
+    assert row.user_display_name == orch.SYSTEM_ACTOR
+    assert row.auth_source == "system"
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_fails_releases_the_lease(
+    db_session: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _planned_run(db_session)
+    released: list[bool] = []
+    monkeypatch.setattr(orch.mutex, "acquire", lambda **_k: (True, None))
+    monkeypatch.setattr(orch.mutex, "_identity", lambda: "worker-0")
+    monkeypatch.setattr(orch.mutex, "release_if_held", lambda **_k: released.append(True) or True)
+
+    async def _boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("transition failed")
+
+    monkeypatch.setattr(orch, "_transition", _boom)
+
+    with pytest.raises(RuntimeError):
+        await orch.drive_upgrade(db_session, run.id)
+    assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_drive_marks_the_run_failed_after_a_failed_flush(
+    db_session: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-all reused a session left in a failed transaction, so it
+    raised PendingRollbackError and the run sat in ``planned`` with no
+    error. It now rolls back first, marks the run failed, and lets go of
+    the lease."""
+    from contextlib import asynccontextmanager
+
+    from app.models.audit import AuditLog
+    from app.models.system_upgrade import SystemUpgradeRun
+    from app.services.upgrades import mutex
+    from app.tasks import upgrade_orchestrator as task
+
+    run = await _planned_run(db_session)
+    run_id = run.id
+    released: list[bool] = []
+    monkeypatch.setattr(mutex, "release_if_held", lambda **_k: released.append(True) or True)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield db_session
+
+    async def _drive(db: Any, _rid: Any) -> Any:
+        # What the original bug did: a NOT NULL violation at flush time.
+        db.add(
+            AuditLog(
+                user_display_name=None,
+                action="upgrade.started",
+                resource_type="system_upgrade_run",
+                resource_id=str(_rid),
+                result="success",
+            )
+        )
+        await db.flush()
+
+    monkeypatch.setattr(task, "task_session", _session)
+    monkeypatch.setattr(task, "drive_upgrade", _drive)
+
+    out = await task._async_drive(str(run_id))
+
+    assert out["state"] == "failed"
+    db_session.expire_all()
+    row = await db_session.get(SystemUpgradeRun, run_id)
+    assert row is not None and row.state == "failed"
+    assert row.last_error and "orchestrator crashed" in row.last_error
+    assert released == [True]

@@ -63,6 +63,15 @@ the formatter handles the rest.
     window and the primary-moved check above. Left empty, the name is
     now detected from the database connection (the chart's
     `<cluster>-rw` Service, confirmed by reading the Cluster).
+  - With the lease working, a run still could not leave `planned`: the
+    orchestrator's own transitions wrote an audit row with no actor
+    into a NOT NULL column, so the `started` transition failed. The
+    catch-all then reused the failed session, so the run was never
+    marked failed, and the lease stayed held for its full 10 minutes,
+    refusing Celery's retry and the next Start. Those transitions now
+    record `system:upgrade-orchestrator`, a crashed drive rolls back
+    before marking the run failed, and a failed start or crashed drive
+    releases the lease if it still holds it.
   The other points in that report are #1446, #1447 and #1448.
 
 - **Replacing a dead control-plane node no longer uninstalls the control

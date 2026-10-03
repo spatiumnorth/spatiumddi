@@ -69,6 +69,11 @@ from app.services.upgrades import (
 
 logger = structlog.get_logger(__name__)
 
+# The audit actor for the orchestrator's own transitions (started, node_failed,
+# succeeded, chart_bump_failed, post_upgrade_verify_failed), which no operator
+# drives. ``audit_log.user_display_name`` is NOT NULL.
+SYSTEM_ACTOR = "system:upgrade-orchestrator"
+
 
 def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
     """The CNPG Cluster this control plane's database runs on, or ``""``.
@@ -355,8 +360,13 @@ async def _transition(
     db.add(
         AuditLog(
             user_id=actor_user_id,
-            user_display_name=actor_display,
-            auth_source=actor_source,
+            # ``user_display_name`` and ``auth_source`` are NOT NULL, and the
+            # orchestrator's own transitions have no operator. Writing None
+            # failed the very first transition (``started``) of every run, so
+            # no rolling upgrade could leave ``planned`` (found by ddi-pg on
+            # #1449).
+            user_display_name=actor_display or SYSTEM_ACTOR,
+            auth_source=actor_source or "system",
             action=f"upgrade.{event}",
             resource_type="system_upgrade_run",
             resource_id=str(run.id),
@@ -501,10 +511,18 @@ async def drive_upgrade(
         ok, err = mutex.acquire(lease_duration_seconds=LEASE_DURATION_S)
         if not ok:
             raise OrchestratorError(f"could not acquire upgrade lease: {err}")
-        run.lease_holder = mutex._identity()  # noqa: SLF001 — same module family
-        run.lease_acquired_at = _now()
-        await _transition(db, run, "running", allowed_from=("planned",), event="started")
-        await db.commit()
+        try:
+            run.lease_holder = mutex._identity()  # noqa: SLF001 — same module family
+            run.lease_acquired_at = _now()
+            await _transition(db, run, "running", allowed_from=("planned",), event="started")
+            await db.commit()
+        except BaseException:
+            # The run never started, so nothing holds the lease for a reason:
+            # left held, Celery's retry is refused it until it expires
+            # (10 min), and an operator's next Start too (#1449).
+            await db.rollback()
+            mutex.release_if_held()
+            raise
         await db.refresh(run)
     elif run.state == "running":
         # Resume / re-enqueue path — confirm we still hold the lease,
