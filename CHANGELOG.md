@@ -41,6 +41,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP server can be taken out of its server group (#1458).**
+  `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
+  an explicit `"server_group_id": null` was dropped like an absent key:
+  the call answered 200 and the server stayed in its group. A server
+  could be moved to another group but never made ungrouped, although
+  the column is nullable and create accepts it. An explicitly sent
+  `null` now clears the group, wakes the old group's channel so its
+  remaining members re-render, and is recorded in the audit row. Every
+  other field keeps "null = leave it as it is", since several of them
+  are NOT NULL.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
