@@ -293,19 +293,20 @@ async def test_run_all_overall_ok() -> None:
             report = await preflight.run_all(target_version="2026.06.01-1")
     assert report.overall == "ok"
     assert report.can_start is True
-    # 9 results: Phase A's 5 (inflight, replication_lag, disk_headroom,
+    # 10 results: Phase A's 5 (inflight, replication_lag, disk_headroom,
     # version_path, quorum), plus Phase B's mirror_disk_headroom which
     # short-circuits to ok when ``slot_image_mirror_url`` is unset, plus
     # #637's kea_ha_version_skew (ok here — no appliance Kea HA pairs),
     # #638's powerdns_lmdb_migration (ok here — no appliance PowerDNS
     # nodes) and #974's etcd_snapshot_freshness (ok here — no appliance
-    # rows at all, so there is no k3s datastore to protect).
+    # rows at all, so there is no k3s datastore to protect), plus #1227's
+    # pre_upgrade_backup (ok here for the same reason: no A/B slots).
     #
     # This count is deliberately exact rather than ``>=``: adding a check
     # to ``run_all`` should be a decision someone confirms, since every
     # one of them runs on the operator's click and a slow or noisy check
     # is felt there.
-    assert len(report.results) == 9
+    assert len(report.results) == 10
 
 
 @pytest.mark.asyncio

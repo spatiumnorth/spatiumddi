@@ -109,6 +109,11 @@ _NEEDS_OPERATOR = {
     "must re-join as a NEW member": True,
     "the seed rejected the join token": False,
     "could not reach the seed": False,
+    # #1285 — a refused etcd member add. An unreachable voter holding a seat needs
+    # the operator (remove it first): every retry would wipe the node again and be
+    # refused again. A learner backlog clears once the other joiner is in.
+    "a voting member it cannot reach": True,
+    "another member is still joining": False,
 }
 
 
@@ -145,6 +150,15 @@ def test_the_classifier_names_the_permanent_failures() -> None:
     assert sup._join_failure_is_permanent(
         "this node's etcd member was removed from the cluster — it must "
         "re-join as a NEW member (leave first)"
+    )
+    assert sup._join_failure_is_permanent(
+        "the seed's etcd refused this member (etcdserver: unhealthy cluster): a voting "
+        "member it cannot reach still holds a seat — remove that member (Fleet → Replace), "
+        "then retry"
+    )
+    assert not sup._join_failure_is_permanent(
+        "the seed's etcd refused this member (etcdserver: too many learner members): "
+        "another member is still joining — retry once it is ready"
     )
     assert not sup._join_failure_is_permanent(_TRANSIENT)
     # Names the token, but the campaign drill produced it from a NETWORK block

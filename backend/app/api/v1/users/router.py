@@ -17,6 +17,7 @@ from app.core.permissions import is_effective_superadmin
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
+from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
     is_locked as is_user_locked,
@@ -24,6 +25,7 @@ from app.services.account_lockout import (
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
     push_history,
@@ -48,6 +50,10 @@ class UserResponse(BaseModel):
     is_superadmin: bool
     force_password_change: bool
     auth_source: str
+    # The provider an external account belongs to (#1235); null for a local
+    # account, and for an external one not attributed to a provider, which
+    # cannot sign in until it is linked (POST /users/{id}/link-provider).
+    auth_provider_id: str | None = None
     # Real ``datetime``s (#907); see the audit router for why.
     last_login_at: datetime | None = None
     # Lockout state (issue #71). ``locked`` mirrors the live time
@@ -68,6 +74,11 @@ class UserResponse(BaseModel):
     @classmethod
     def coerce_id(cls, v: object) -> str:
         return str(v)
+
+    @field_validator("auth_provider_id", mode="before")
+    @classmethod
+    def coerce_provider_id(cls, v: object) -> str | None:
+        return None if v is None else str(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -172,6 +183,10 @@ class UpdateUserRequest(BaseModel):
     @classmethod
     def email_valid(cls, v: str | None) -> str | None:
         return None if v is None else _validate_email(v)
+
+
+class LinkProviderRequest(BaseModel):
+    auth_provider_id: uuid.UUID
 
 
 class ResetPasswordRequest(BaseModel):
@@ -415,6 +430,10 @@ async def reset_password(
     user.password_history_encrypted = push_history(
         hashed, user.password_history_encrypted, policy.history_count
     )
+    # #1354 — like a self-service change, an admin reset discards a started
+    # MFA enrolment: a reset usually means the account was compromised, and
+    # the enrolment may have been started by whoever compromised it.
+    clear_pending_enrolment(user)
     # SECURITY (#400 / M3): an admin password reset must revoke every
     # outstanding session + refresh token for the target user — the whole
     # reason an admin resets a password is usually that the account is
@@ -466,6 +485,93 @@ async def unlock_account(
         )
     await db.commit()
     logger.info("account_unlocked", target=user.username, by=current_user.username)
+
+
+@router.post("/{user_id}/link-provider", response_model=UserResponse)
+async def link_provider(
+    user_id: uuid.UUID,
+    body: LinkProviderRequest,
+    current_user: SuperAdmin,
+    db: DB,
+) -> User:
+    """Link an external account to the provider it signs in through (#1235).
+
+    External accounts are keyed on their provider. An account that predates
+    that, and that cannot be attributed because several providers of its
+    type exist, is refused at login until it is linked here; so is a user
+    whose identifier at the provider changed (an LDAP DN after an OU move),
+    since the account is never adopted by username alone.
+
+    The link clears the stored external id: the next login through this
+    provider with the account's username claims it and records the
+    provider's id for the subject. Only this administrator action
+    authorises that username match. Every session the account holds is
+    revoked, so nothing opened under the previous identity survives it.
+
+    A local account cannot be linked. It has a password, and linking it
+    would hand it to whoever holds that username at the provider, which is
+    the takeover #1235 closes.
+    """
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    provider = await db.get(AuthProvider, body.auth_provider_id)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Auth provider not found"
+        )
+    if user.auth_source == "local":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "A local account cannot be linked to an external provider: whoever holds "
+                "the same username there would sign in as it."
+            ),
+        )
+    old = {
+        "auth_source": user.auth_source,
+        "auth_provider_id": str(user.auth_provider_id) if user.auth_provider_id else None,
+        "external_id": user.external_id,
+    }
+    user.auth_source = provider.type
+    user.auth_provider_id = provider.id
+    user.external_id = None
+    # The link changes who the account belongs to, and it is how an
+    # administrator repairs one a second provider signed in as before #1235.
+    # Sessions opened under the old identity must not outlive that, the
+    # same reasoning as the admin password reset above (#400).
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+        .values(revoked=True)
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="user.provider_linked",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=user.username,
+            result="success",
+            old_value=old,
+            new_value={
+                "auth_source": provider.type,
+                "auth_provider_id": str(provider.id),
+                "auth_provider": provider.name,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(user)
+    logger.info(
+        "user_provider_linked",
+        target=user.username,
+        provider=provider.name,
+        by=current_user.username,
+    )
+    return user
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

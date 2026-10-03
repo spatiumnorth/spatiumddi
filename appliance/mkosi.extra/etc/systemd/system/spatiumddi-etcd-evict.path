@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch for SpatiumDDI etcd member evictions (#1284)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/1284
+# Installed appliances only — the request is written by the seed's supervisor
+# via its release-state bind mount; never present on the live ISO.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The supervisor atomically renames a
+# .new sibling onto the request, so this fires once per request. The runner
+# then moves the request aside while it runs (.processing, then .done), so a
+# request is never run twice; systemd folds that change into the run already
+# active.
+PathChanged=/var/lib/spatiumddi/release-state/etcd-evict-pending
+
+[Install]
+WantedBy=multi-user.target

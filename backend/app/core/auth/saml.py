@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import structlog
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
+from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.idp_metadata_parser import OneLogin_Saml2_IdPMetadataParser
 from onelogin.saml2.settings import OneLogin_Saml2_Settings
 
@@ -191,6 +192,17 @@ def consume_assertion(cfg: SAMLConfig, base_url: str, post_data: dict) -> SAMLCo
 
     attrs = saml_auth.get_attributes() or {}
     name_id = saml_auth.get_nameid() or ""
+    # The NameID is the account's key at this provider (#1235), and a
+    # transient one is new on every sign-in: the first would create an
+    # account that every later sign-in is refused, as its username is taken
+    # and an account is never adopted by username. Refuse it up front, with
+    # the setting that fixes it.
+    if saml_auth.get_nameid_format() == OneLogin_Saml2_Constants.NAMEID_TRANSIENT:
+        raise SAMLServiceError(
+            "the IdP sent a transient NameID, which changes on every sign-in and "
+            "cannot identify an account; configure it to release a persistent or "
+            "emailAddress NameID"
+        )
     session_index = saml_auth.get_session_index() or ""
 
     def _first(name: str) -> str | None:

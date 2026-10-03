@@ -96,7 +96,18 @@ JOINED_READY_TIMEOUT="${SPATIUM_JOINED_READY_TIMEOUT:-600}"
 # a rollback to a standalone etcd would strand a voter on the seed). A join
 # that died at token-validation / CA-fetch never starts etcd and logs none of
 # them, so the classic rollback stays safe for it.
-ETCD_REGISTERED_MARKERS='Starting etcd for existing cluster member|Adding member .* to etcd cluster|published local member to cluster through raft'
+#
+# #1285 — only lines k3s/etcd log AFTER the member add succeeded count. k3s
+# logs "Adding member <name>=<peer> to etcd cluster [...]" immediately BEFORE
+# MemberAddAsLearner (k3s v1.36.4+k3s1 pkg/etcd/etcd.go), and again on every
+# retry, about once a second, while the seed's etcd refuses the add
+# ("Waiting for other members to finish joining etcd cluster: etcdserver:
+# unhealthy cluster"). Counting that line kept a node etcd never admitted:
+# no rollback, k3s cycling every ~15 min, and a `failed` no supervisor could
+# report, so the row sat `joining` for good. "Starting etcd to join cluster
+# with members" is logged only once the add went through (or the member list
+# already has this node).
+ETCD_REGISTERED_MARKERS='Starting etcd for existing cluster member|Starting etcd to join cluster with members|published local member to cluster through raft'
 # Entries under $K3S_SERVER_DIR that carry cluster identity — moved aside
 # on a join, moved back on a rollback. Kept as one list so the wipe and
 # the restore can never drift apart.
@@ -333,6 +344,25 @@ classify_join_failure() {
         *"TLS handshake timeout"*|*"connection reset"*|*"unexpected EOF"*) transport=1 ;;
         *) transport=0 ;;
     esac
+    # #1285 — the seed's etcd refused this node's member add. k3s retries the
+    # add once a second and logs each refusal at info level; the line that ends
+    # the attempt ~15 min later ("failed to wait for API server to become
+    # ready: context deadline exceeded") would read as a transport error. It is
+    # not one: the seed answered, and its etcd said no.
+    # The refusal decides only when the attempt ended on it: k3s gave up
+    # waiting for its API server, and the last "Waiting for other members"
+    # line it logged is that refusal. A refusal earlier in an attempt that then
+    # died of something else (a connection-refused fatal, say) is not the cause,
+    # and the unhealthy-cluster refusal is permanent upstream (no auto-retry).
+    local refused="" last_wait=""
+    case "$subject" in
+        *"failed to wait for API server to become ready"*)
+            last_wait="$(printf '%s\n' "$log" | grep -F 'Waiting for other members to finish joining etcd cluster:' | tail -n 1)"
+            case "$last_wait" in
+                *"etcdserver: unhealthy cluster"*) refused=unhealthy ;;
+                *"etcdserver: too many learner members"*) refused=learners ;;
+            esac ;;
+    esac
     # Two stages, on purpose: first decide WHAT happened, then name it — so
     # every reason string is written exactly once below, and the backend's
     # contract test (tests/test_appliance_join_auto_retry.py), which reads
@@ -351,7 +381,8 @@ classify_join_failure() {
             if [ "$transport" = 1 ]; then kind=unreachable; else kind=rejected; fi ;;
         *"token CA hash does not match"*) kind=rejected ;;
         *)
-            if [ "$transport" = 1 ]; then kind=unreachable; else kind=""; fi ;;
+            if [ -n "$refused" ]; then kind="refused_$refused"
+            elif [ "$transport" = 1 ]; then kind=unreachable; else kind=""; fi ;;
     esac
     case "$kind" in
         stale_member)
@@ -368,6 +399,12 @@ classify_join_failure() {
             ;;
         unreachable)
             printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
+            ;;
+        refused_unhealthy)
+            printf '%s' "the seed's etcd refused this member (etcdserver: unhealthy cluster): a voting member it cannot reach still holds a seat — remove that member (Fleet → Replace), then retry"
+            ;;
+        refused_learners)
+            printf '%s' "the seed's etcd refused this member (etcdserver: too many learner members): another member is still joining — retry once it is ready"
             ;;
         *)
             printf '%s' ""
@@ -419,8 +456,10 @@ wait_ready() {
 # #1052 — did THIS join attempt get this node into the seed's etcd?
 #
 # READY_TIMEOUT is the budget for the NODE to report Ready; the etcd side of a
-# join finishes long before it — k3s adds the joiner as a learner within
-# seconds and promotes it to voter as soon as it has caught up. Rolling such a
+# join finishes long before it — once the seed's etcd accepts the add, k3s has
+# the joiner as a learner within seconds and promotes it to voter as soon as it
+# has caught up. (An add etcd refuses never gets that far, and must not read as
+# membership: see ETCD_REGISTERED_MARKERS, #1285.) Rolling such a
 # node back re-creates a standalone etcd, with its original first-boot CA, on
 # the very peer URL the seed still lists as a voter: a foreign certificate the
 # seed's raft can never verify, so the seed loses quorum for good and its k3s
@@ -569,7 +608,12 @@ EOF
     # Anchor for the journal scan below — anything k3s logs from here on
     # belongs to THIS join attempt, not a previous one.
     local k3s_started_at reason
-    k3s_started_at="$(date -u '+%Y-%m-%d %H:%M:%S')"
+    # #1285 — the zone is part of the anchor: journalctl reads a bare
+    # timestamp as LOCAL time, and an operator can set the appliance's zone
+    # (spatiumddi-tz-reload). East of UTC the window would open hours early and
+    # take the standalone boot's "published local member" line for this
+    # attempt's etcd; west of it, the window would open in the future.
+    k3s_started_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     if systemctl start k3s && wait_ready; then
         log "JOIN ok — node is Ready as a control-plane member"
         write_state ready "$server_url"

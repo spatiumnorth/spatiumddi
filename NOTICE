@@ -172,7 +172,8 @@ Where the two disagree about a license, THIS file is authoritative.
 This list covers the major bundled / shipped components; it is not an
 exhaustive enumeration of every transitive dependency. The complete
 transitive sets are backend/pyproject.toml (with the resolved versions
-visible via `pip list` inside the API image) and frontend/package-lock.json.
+listed by `importlib.metadata` inside the API image, which ships no pip —
+see docs/THIRD_PARTY.md) and frontend/package-lock.json.
 
 Full license texts are not vendored into this repository. Each component's
 license ships with the component itself and can be read from a running
@@ -181,7 +182,8 @@ system — for example:
   /usr/share/doc/<package>/copyright        (Debian appliance packages)
   /usr/share/licenses/<package>/            (Alpine agent images)
   /usr/share/doc/k3s/LICENSE                (k3s, fetched at image build)
-  python3 -m pip show <name>                (Python packages)
+  /usr/local/lib/python3.12/site-packages/<name>-*.dist-info/
+                                            (Python packages, API image)
 
 docs/THIRD_PARTY.md documents this in more detail, including the copyleft
 components and what their terms mean for redistribution.

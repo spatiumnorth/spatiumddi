@@ -33,6 +33,8 @@ is heavier and false-positive-prone; tracked separately.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -200,3 +202,35 @@ async def schema_at_head(session_factory=None) -> SchemaCheck:
     if actual != expected:
         return SchemaCheck(False, expected, actual, f"schema at {actual}, image expects {expected}")
     return SchemaCheck(True, expected, actual, f"schema at head {expected}")
+
+
+# Alembic's own wording when a revision id is not in the script directory.
+# Matched rather than typed: alembic raises it as a plain ``CommandError``.
+_UNKNOWN_REVISION = re.compile(r"Can't locate revision identified by '([^']+)'")
+
+UNKNOWN_REVISION_HINT = (
+    "The database was migrated by a NEWER SpatiumDDI release than this one "
+    "(#1227). This release's migrations stop before that revision, so it "
+    "cannot run on this database and its api, worker and beat will wait for "
+    "migrate forever. Re-apply the newer release, or restore a copy of the "
+    "database taken before the upgrade. See 'Rolling back' in "
+    "docs/deployment/APPLIANCE.md."
+)
+
+
+def explain_unknown_revision(message: str, database_revisions: Iterable[str]) -> str | None:
+    """The migrate-step error for a database a newer release migrated, or None.
+
+    Alembic's ``Can't locate revision identified by 'x'`` is accurate and
+    useless: it reads like a corrupt install, while the real cause is almost
+    always a rollback, an auto-revert or a downgrade onto a database the
+    newer release had already migrated. Only when ``x`` is the revision the
+    DATABASE is at: the same error for a mistyped command-line target is the
+    operator's typo, and saying "a newer release migrated this" there would
+    send them the wrong way. None for every other error, which is left exactly
+    as alembic raised it.
+    """
+    match = _UNKNOWN_REVISION.search(message)
+    if match is None or match.group(1) not in set(database_revisions):
+        return None
+    return f"{message}\n\n{UNKNOWN_REVISION_HINT}"
