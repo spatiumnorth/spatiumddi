@@ -27,7 +27,7 @@ audit row's content is covered by its ``row_hash`` (#73), so it must never be
 rewritten, and audit rows are never deleted.
 
 Revision ID: cd10b699d988
-Revises: f4a8c2e71d09
+Revises: b3c71e9a4d25
 Create Date: 2026-10-02
 """
 
@@ -38,7 +38,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "cd10b699d988"
-down_revision = "f4a8c2e71d09"
+down_revision = "b3c71e9a4d25"
 branch_labels = None
 depends_on = None
 
