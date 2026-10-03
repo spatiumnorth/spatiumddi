@@ -84,6 +84,10 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.appliance.group_names import (
+    group_assigned_to_appliance,
+    group_name_problem,
+)
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -1685,6 +1689,18 @@ async def update_group(
         raise HTTPException(status_code=404, detail="Server group not found")
 
     changes = body.model_dump(exclude_none=True)
+    # #1468 — an appliance's supervisor gets this group by NAME and drops a
+    # name it won't put in its role env, so don't rename an assigned group
+    # into one. Only on an actual change: re-saving a legacy name is fine.
+    new_name = changes.get("name")
+    if (
+        new_name is not None
+        and new_name != group.name
+        and await group_assigned_to_appliance(db, "dns", group.id)
+    ):
+        problem = group_name_problem("dns", new_name)
+        if problem is not None:
+            raise HTTPException(status_code=422, detail=problem)
     for k, v in changes.items():
         setattr(group, k, v)
 
