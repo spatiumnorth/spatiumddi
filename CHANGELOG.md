@@ -25,6 +25,20 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Changed
+
+- **The weekly image scan also reports fixable MEDIUM and LOW findings,
+  as an advisory (#1392).** The scheduled Trivy scan, like every gate,
+  looked only at HIGH and CRITICAL, so the pip CVEs in the api image
+  (five MEDIUM, one LOW) went unreported until a user's registry scanner
+  showed them at its default severity. `trivy-scheduled.yml` now runs a
+  second pass per image, MEDIUM and LOW with a fix available, and puts
+  the findings in their own section of the scan's tracking issue, which
+  they can open on their own; the issue closes only when both are
+  clean. It is not a gate: the release, nightly and PR scans still block
+  on HIGH and CRITICAL only. The tracking issue's title becomes
+  "Scheduled Trivy scan: fixable CVEs in shipped images".
+
 ### Fixed
 
 - **Replacing a dead control-plane node no longer uninstalls the control

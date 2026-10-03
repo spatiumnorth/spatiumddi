@@ -15,6 +15,13 @@ name: Scheduled Dependency Health
 # next contributor. It uses CI's exact gate — HIGH,CRITICAL + --ignore-unfixed
 # (matching ``make trivy`` and the ``build-*-images.yml`` Trivy steps).
 #
+# #1392 added an ADVISORY pass on top: MEDIUM,LOW + --ignore-unfixed, reported
+# in its own section of the same tracking issue. It never gates anything (the
+# release, nightly and PR gates stay HIGH/CRITICAL), but it can open the issue
+# on its own, so a fixable MEDIUM/LOW finding is seen here first rather than by
+# a user whose registry scanner runs at default severity, which is how the pip
+# CVEs in #1392 were found.
+#
 # Unlike ``make trivy`` (six agent images — the contributor pre-push gate),
 # this superset also covers ``backend/Dockerfile`` + ``frontend/Dockerfile``,
 # which had no Trivy coverage anywhere.
@@ -86,6 +93,15 @@ jobs:
           report="$RUNNER_TEMP/findings.md"
           : > "$report"
           any=0
+          # #1392 — MEDIUM/LOW findings with a fix, reported as an ADVISORY:
+          # its own section of the tracking issue, never a gate and never
+          # part of ``has_findings``. The pip CVEs that started #1392 sat in
+          # the api image unreported because nothing here looked below HIGH,
+          # while a registry scanner at default severity (Harbor's) showed
+          # them on every pull.
+          advisory="$RUNNER_TEMP/advisory.md"
+          : > "$advisory"
+          adv=0
 
           for spec in "${specs[@]}"; do
             IFS='|' read -r name df ctx target <<< "$spec"
@@ -203,10 +219,61 @@ jobs:
                 echo ""
               } >> "$report"
             fi
+
+            # #1392 — the advisory pass: the same image, MEDIUM/LOW with a fix.
+            # ``--exit-code 0`` because the verdict is the JSON, not the exit:
+            # a document that does not parse is a scan error (same reasoning
+            # as the rc=1 check above), reported in the advisory section so
+            # it can never read as "clean". The ``if`` form is #975's: this
+            # step runs under ``bash -e``.
+            if docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$cache":/root/.cache/ \
+              aquasec/trivy:latest image \
+              --severity MEDIUM,LOW --ignore-unfixed --scanners vuln \
+              --format json --exit-code 0 -q \
+              "trivy-scan-$name:scan" > "$RUNNER_TEMP/advisory-$name.json" 2>"$RUNNER_TEMP/advisory-$name.log" \
+              && jq -e 'has("Results")' "$RUNNER_TEMP/advisory-$name.json" >/dev/null 2>&1; then
+              arows=$(jq -r '
+                .Results[]? as $r
+                | ($r.Vulnerabilities // [])[]
+                | "| \(.Severity) | `\(.PkgName)` | \(.VulnerabilityID) | `\(.InstalledVersion)` | `\((.FixedVersion // "-") | split(",")[0] | gsub("^\\s+|\\s+$"; ""))` |"
+                ' "$RUNNER_TEMP/advisory-$name.json" | sort -u)
+              atotal=$(printf '%s\n' "$arows" | grep -c '^|' || true)
+              if [ "$atotal" -gt 0 ]; then
+                echo "ℹ️ advisory: $atotal MEDIUM/LOW finding(s) with a fix"
+                printf '%s\n' "$arows"
+                adv=1
+                {
+                  echo "### \`$name\` — $atotal advisory finding(s)"
+                  echo ""
+                  echo "| Severity | Package | CVE | Installed | Fixed |"
+                  echo "|---|---|---|---|---|"
+                  printf '%s\n' "$arows" | head -n 100 | grep '^|' || true
+                  if [ "$atotal" -gt 100 ]; then
+                    echo ""
+                    echo "_Truncated: showing 100 of $atotal. Full list in the run log._"
+                  fi
+                  echo ""
+                } >> "$advisory"
+              fi
+            else
+              echo "⚠️ advisory scan error"
+              adv=1
+              {
+                echo "### \`$name\` — ⚠️ advisory scan error"
+                echo ""
+                echo '```'
+                tail -c 2000 "$RUNNER_TEMP/advisory-$name.log"
+                echo '```'
+                echo ""
+              } >> "$advisory"
+            fi
             echo "::endgroup::"
           done
 
           echo "has_findings=$any" >> "$GITHUB_OUTPUT"
+          echo "has_advisory=$adv" >> "$GITHUB_OUTPUT"
 
           # Human-readable rollup on the run's summary page regardless of outcome.
           {
@@ -216,6 +283,14 @@ jobs:
               echo "✅ All shipped images clean (HIGH/CRITICAL, fix-available)."
             else
               cat "$report"
+            fi
+            echo ""
+            echo "### Advisory: MEDIUM/LOW, fix-available (not a gate)"
+            echo ""
+            if [ "$adv" -eq 0 ]; then
+              echo "✅ None."
+            else
+              cat "$advisory"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -229,6 +304,7 @@ jobs:
         uses: actions/github-script@v9
         env:
           HAS_FINDINGS: ${{ steps.scan.outputs.has_findings }}
+          HAS_ADVISORY: ${{ steps.scan.outputs.has_advisory }}
         with:
           script: |
             const fs = require('fs');
@@ -242,16 +318,21 @@ jobs:
             // as it is — closing it on an indeterminate result would mask real,
             // still-unfixed CVEs.
             const raw = process.env.HAS_FINDINGS;
-            if (raw !== '0' && raw !== '1') {
+            const rawAdv = process.env.HAS_ADVISORY;
+            if (![raw, rawAdv].every(v => v === '0' || v === '1')) {
               core.warning(
-                `Scan produced no definitive result (has_findings=${JSON.stringify(raw)}); ` +
-                `leaving any tracking issue untouched.`);
+                `Scan produced no definitive result (has_findings=${JSON.stringify(raw)}, ` +
+                `has_advisory=${JSON.stringify(rawAdv)}); leaving any tracking issue untouched.`);
               return;
             }
             const hasFindings = raw === '1';
+            // #1392 — MEDIUM/LOW findings with a fix: their own section, and
+            // reason enough on their own to keep the issue open. Never a gate.
+            const hasAdvisory = rawAdv === '1';
 
             const label = 'security:trivy';
-            const title = 'Scheduled Trivy scan: HIGH/CRITICAL CVEs in shipped images';
+            // Generic, since an advisory-only issue is not HIGH/CRITICAL.
+            const title = 'Scheduled Trivy scan: fixable CVEs in shipped images';
             const marker = '<!-- trivy-scheduled-scan -->';
 
             // Ensure the label exists (idempotent).
@@ -272,16 +353,28 @@ jobs:
               owner, repo, state: 'open', labels: label, per_page: 100,
             })).data.filter(i => !i.pull_request).find(i => (i.body || '').includes(marker));
 
-            if (hasFindings) {
-              let report = '(report file missing — see the run log)';
-              const path = `${process.env.RUNNER_TEMP}/findings.md`;
-              if (fs.existsSync(path)) report = fs.readFileSync(path, 'utf8');
+            if (hasFindings || hasAdvisory) {
+              const read = (name) => {
+                const path = `${process.env.RUNNER_TEMP}/${name}`;
+                return fs.existsSync(path)
+                  ? fs.readFileSync(path, 'utf8')
+                  : '(report file missing — see the run log)';
+              };
+              const gate = hasFindings
+                ? `## HIGH/CRITICAL, fix-available (the release gate)\n\n${read('findings.md')}`
+                : `## HIGH/CRITICAL, fix-available (the release gate)\n\n✅ None.\n`;
+              const advisory = hasAdvisory
+                ? `## Advisory: MEDIUM/LOW, fix-available\n\n` +
+                  `Not a gate: a release still publishes with these. They are here so ` +
+                  `they get fixed before a registry scanner at default severity reports ` +
+                  `them for us (#1392).\n\n${read('advisory.md')}`
+                : `## Advisory: MEDIUM/LOW, fix-available\n\n✅ None.\n`;
               let body =
                 `${marker}\n\n` +
-                `The weekly image vulnerability scan found **HIGH/CRITICAL, ` +
-                `fix-available** CVEs (or a scan/build error).\n\n` +
+                `The weekly image vulnerability scan found **fix-available** CVEs ` +
+                `(or a scan/build error).\n\n` +
                 `- Scan run: ${runUrl}\n- Last updated: ${today}\n\n` +
-                `${report}\n\n---\n` +
+                `${gate}\n${advisory}\n\n---\n` +
                 `Reproduce an agent image locally with \`make trivy IMAGE=<name>\`; ` +
                 `\`backend\` and \`frontend\` are not agent images — build the Dockerfile ` +
                 `above (\`--target runtime\` for backend) and scan it with the same flags. ` +
@@ -290,7 +383,7 @@ jobs:
               if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_…truncated._';
 
               if (open) {
-                await github.rest.issues.update({ owner, repo, issue_number: open.number, body });
+                await github.rest.issues.update({ owner, repo, issue_number: open.number, title, body });
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: open.number,
                   body: `🔁 Still failing as of ${today} — ${runUrl}`,
