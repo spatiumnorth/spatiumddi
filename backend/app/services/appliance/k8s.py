@@ -739,9 +739,8 @@ def _micro_time(at: float | None = None) -> str:
     take its lease on a real cluster (#1445).
     """
     stamp = time.time() if at is None else at
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(stamp)) + (
-        ".%06dZ" % int((stamp % 1) * 1_000_000)
-    )
+    micros = int((stamp % 1) * 1_000_000)
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(stamp))}.{micros:06d}Z"
 
 
 def create_lease(

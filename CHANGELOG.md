@@ -27,6 +27,35 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The rolling upgrade can run on a multi-node cluster (#1445).**
+  Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
+  2026.10.02-1, where Plan → Start never got past the upgrade lease:
+  - Every Lease write sent whole-second `acquireTime` / `renewTime`,
+    and the apiserver requires a MicroTime (six fractional digits), so
+    it answered 400 and the orchestrator never took its lease. All
+    three writes now send a MicroTime.
+  - The orchestrator runs in the Celery worker, and only the api's
+    ServiceAccount held its RBAC. With `api.upgradeOrchestratorRBAC`
+    on, the worker now gets the same grants: its own namespaced Role
+    carrying only the orchestrator's rules (not the api's Secret or
+    Deployment patch), plus the orchestrator ClusterRole and the
+    kube-system HelmChartConfig Role.
+  - `verify_primary_moved` passed whenever CNPG named any primary,
+    including one still on the cordoned node, so the drain could evict
+    the primary. It now waits until the primary pod runs on another
+    node, and treats a pod it cannot read as unproven.
+  - The slot-apply stamp was only flushed before the health gate
+    waited on the supervisor, which reads it from another session, so
+    the gate could only time out. `single_node_upgrade` now commits it
+    first.
+  - The `replication_lag` preflight and post-node check read
+    `pg_stat_replication` as the app's database role, which sees a
+    replica's state as NULL, and reported every replica as not
+    streaming. A state the role cannot see is now a warning
+    ("unverified"), not a failure; a replica visibly not streaming
+    still fails.
+  The other points in that report are #1446, #1447 and #1448.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
@@ -447,6 +476,26 @@ the formatter handles the rest.
 > rollback can mint a new `SECRET_KEY` and leave every credential
 > encrypted at rest unreadable. If you must go back, restore the
 > backup you took before the upgrade alongside the older release.
+
+# ⚠️ Upgrading an appliance from 2026.09.04-1: back up the app Secret first
+
+> **Before you upgrade an appliance from 2026.09.04-1, back up the
+> Secret that holds `SECRET_KEY`:**
+> `kubectl -n spatium get secret spatium-control-spatiumddi-app -o yaml > spatium-control-app-secret.yaml`,
+> and keep the file off the appliance. 2026.09.04-1's chart does not
+> mark that Secret to be kept (#1042 fixed that in this release), so if
+> the first `spatium-control` helm install on the new slot fails and
+> helm reinstalls the release, a new key is generated and every
+> credential encrypted at rest (TLS certificates, integration and
+> provider secrets) becomes unreadable. Restoring the saved Secret
+> recovers them. This was reported on a real upgrade (#1445, #1448).
+
+> **The built-in rolling upgrade (Rolling Upgrade tab, Plan → Start)
+> does not complete on a multi-node cluster in this release (#1445).**
+> The orchestrator cannot take its upgrade lease. A fix is in progress;
+> until it ships, follow #1445 before upgrading a multi-node control
+> plane. On a multi-node cluster, Kea HA pairs may also fail to come up
+> after the upgrade (#1447).
 
 **This is not 1.0.0.** 1.0.0 is still being worked on, and this
 release is a waypoint on the way there: a month of QA on the ddi-pg

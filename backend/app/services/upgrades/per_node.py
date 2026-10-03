@@ -287,7 +287,9 @@ async def _step_verify_primary_moved(
         # is another poll, never a pass.
         if current_primary:
             pod_status, pod = k8s.get_pod(current_primary, namespace=namespace)
-            primary_node = ((pod or {}).get("spec") or {}).get("nodeName") if pod_status == 200 else None
+            primary_node = (
+                ((pod or {}).get("spec") or {}).get("nodeName") if pod_status == 200 else None
+            )
             if primary_node and primary_node != node_name:
                 return step.finish(
                     True,

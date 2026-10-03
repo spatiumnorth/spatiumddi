@@ -50,18 +50,17 @@ def captured_requests(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         sent.append({"method": method, "path": path, "body": json.loads(kwargs["body"])})
         return (201 if method == "POST" else 200), b"{}"
 
-    monkeypatch.setattr(
-        k8s, "get_config", lambda: k8s._Config("h", 443, "t", "/ca", "spatium")
-    )
+    monkeypatch.setattr(k8s, "get_config", lambda: k8s._Config("h", 443, "t", "/ca", "spatium"))
     monkeypatch.setattr(k8s, "_request", _request)
     return sent
 
 
 def test_every_lease_write_sends_micro_time(captured_requests: list[dict[str, Any]]) -> None:
     assert k8s.create_lease("upgrade", "api-0") == (True, None)
-    assert k8s.update_lease(
-        "upgrade", "api-0", bump_transitions=True, expected_transitions=1
-    ) == (True, None)
+    assert k8s.update_lease("upgrade", "api-0", bump_transitions=True, expected_transitions=1) == (
+        True,
+        None,
+    )
     assert k8s.clear_lease_holder("upgrade") == (True, None)
 
     stamps = []
@@ -192,7 +191,9 @@ def _row(state: str | None, lag: int | None = None) -> Any:
 async def test_replicas_whose_state_is_hidden_are_unverified_not_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(preflight, "AsyncSessionLocal", _session_returning([_row(None), _row(None)]))
+    monkeypatch.setattr(
+        preflight, "AsyncSessionLocal", _session_returning([_row(None), _row(None)])
+    )
 
     result = await preflight.check_replication_lag()
 
