@@ -613,6 +613,12 @@ class Appliance(Base):
     reboot_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #1446 — the boot (``/proc/sys/kernel/random/boot_id``) the reboot
+    # request applies to, recorded from the first heartbeat after the stamp.
+    # The request is retired when a heartbeat arrives from a DIFFERENT boot,
+    # which is the proof it landed. NULL until that first heartbeat, and
+    # always NULL for a supervisor too old to report a boot id.
+    reboot_requested_boot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # #786 — operator asked to clear a failed upgrade. The visible failure
     # state (the ``last_upgrade_*`` columns above) is re-published from
     # host sidecar files on every heartbeat, so clearing the DB alone does
