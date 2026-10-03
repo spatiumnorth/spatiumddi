@@ -41,6 +41,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A large blocklist feed no longer OOM-kills the worker, once an hour,
+  forever (#1466).** The feed refresh loaded every existing entry as an
+  ORM object and added one tracked object per new domain. On the
+  catalog's Hagezi Gambling feed (~578k domains) that peaked at about
+  2 GiB above baseline, over the worker's 1.4 GiB limit, so the list
+  never synced and every attempt killed a worker. Because the task was
+  acked late and requeued on worker loss, the killed refresh went back
+  to the broker and took down the next worker after the visibility
+  timeout, along with whatever that worker was running. The refresh now
+  diffs on domain columns and writes in batches of plain INSERT / DELETE
+  statements (about 135 MiB for the same feed), and the task is acked on
+  receipt, so a refresh that does take its worker down is lost rather
+  than redelivered. Also fixed on the way: a feed listing a domain the
+  operator had already added by hand failed the whole refresh on the
+  list's unique constraint; the manual entry is now kept and the feed's
+  copy skipped.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
