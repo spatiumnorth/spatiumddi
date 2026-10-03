@@ -141,9 +141,29 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+The spelling is checked on the other ways in as well (#1347):
+
+- **A server joining a group.** Creating a server in a group, or moving
+  one into it, is refused (422) when the group's servers would then drop
+  a raw option already stored on one of its scopes: a Windows server
+  joining a group whose scopes hold `code:43`, say. The refusal names the
+  scopes and keys, so they can be re-keyed or removed first.
+- **The importer.** Options arrive in the source server's spelling (the
+  Windows importer keeps an unmapped option as `opt-NN`). They are re-keyed
+  to the target group's spelling on commit, and any no server in the group
+  can serve (a code Kea has no definition for, or any raw code in a mixed
+  group) are dropped, each named in the import's warnings.
+- **The option editor.** A pick from the option-code catalogue is keyed in
+  the group's spelling: `opt-43` on a Windows group, `code:43` elsewhere.
+
+Each DHCP driver declares the spelling it reads
+(`DHCPDriver.raw_option_spelling`), so a new driver states its own rather
+than inheriting Kea's.
+
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
-equivalent and all raw codes. A client class renders into the DHCPv4
+equivalent and all raw codes, `opt-NN` on a Windows group included: the
+Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A client class renders into the DHCPv4
 config always, and into the DHCPv6 config when the group has v6 scopes, so
 its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
 refused, because Dhcp4 would reject it.
