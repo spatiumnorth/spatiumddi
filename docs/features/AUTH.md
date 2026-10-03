@@ -110,8 +110,13 @@ session alone doesn't prove and an SSO account has no local password.
   user can re-enrol from scratch.
 - **Re-confirming sensitive reveals (#408)**: the secret-reveal
   endpoints (agent keys / SNMP community / appliance kubeconfig / pairing
-  codes) re-verify the operator right before handing back the cleartext,
-  via the shared `app.services.reauth.reverify_operator` helper. A **local
+  codes / block-sync and firewall-feed secrets) re-verify the operator right
+  before handing back the cleartext, through the shared operator step-up
+  (`app.api.stepup.require_operator_stepup`, #1413), so a wrong answer
+  spends the same per-account budget as every other step-up and each
+  refusal is audited under the endpoint's own `*_reveal_denied` action.
+  The approvals break-glass keeps its own audit row and account-lockout
+  count but passes the same budget gate. A **local
   user proves their password**; a **password-less external-auth user
   proves a current TOTP code** (so they must enrol MFA first, hence the
   open enrolment above). TOTP is deliberately **not** accepted in lieu of
@@ -129,7 +134,9 @@ session alone doesn't prove and an SSO account has no local password.
   carries `stepup_password` / `stepup_totp_code` (`password` / `totp_code` on
   the secrets reveal). Wrong answers spend the per-account step-up budget
   (fails closed; an omitted answer is refused without spending it), a refusal is `403`, and every attempt is audited with the
-  method used (`stepup_method`). An SSO account must enrol TOTP before it can
+  method used (`stepup_method`). Once the budget is spent the step-up
+  answers `429` with `Retry-After` set to the time left on the block, and
+  that refusal is audited too (`error_detail: stepup_blocked`, #1413). An SSO account must enrol TOTP before it can
   mint an API token. Granting superadmin through a group's role is not yet
   covered (#1412).
 
