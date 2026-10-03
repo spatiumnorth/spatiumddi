@@ -358,6 +358,29 @@ the formatter handles the rest.
 
 ### Security
 
+- **Making someone a superadmin through a group needs the operator
+  step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
+  user is also a superadmin when one of their groups holds a role
+  carrying `*` / `*`, or a live `*` / `*` time-bound grant. A stolen
+  session could therefore still make an account it controls a superadmin
+  by adding it to such a group, giving such a role to its group, adding
+  `*` / `*` to a role its group already holds, or granting `*` / `*`
+  temporarily. Each of those now needs the step-up when, and only when,
+  it would make someone a superadmin who is not one; the check is on the
+  effect and runs before anything is written, and the audit row records
+  how many users it reached. Superadmin status here ignores whether the
+  account is enabled: before, a disabled role-only superadmin's password
+  could be reset with no step-up and the account re-enabled. The Groups,
+  Roles and time-bound grant dialogs ask for the step-up when the server
+  says it is needed (a 403 with `X-Stepup-Required`). The Users page's
+  Role column now shows a superadmin through a group's role, marked
+  "(role)", where it said "user". The Copilot's temporary-access proposal
+  refuses a `*` / `*` grant that would make superadmins, since a chat
+  Apply cannot ask for a password. Not covered yet: an auth-provider group
+  mapping that targets a superadmin group (#1476). **Behaviour change:**
+  an API client that makes such a group, role or grant change must send
+  `stepup_password` (or `stepup_totp_code`).
+
 - **The older secret reveals count wrong answers like every other
   step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing
   codes, appliance kubeconfig, SNMP community, block-sync and

@@ -155,7 +155,7 @@ session alone doesn't prove and an SSO account has no local password.
   temporary-access proposal refuses such a grant, since a chat Apply cannot
   ask for a password. Not covered: an auth-provider group mapping that
   targets a superadmin group, which grants nothing until a matching IdP
-  account signs in.
+  account signs in (#1476).
 
 ## External identity providers
 
