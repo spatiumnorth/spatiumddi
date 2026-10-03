@@ -53,6 +53,16 @@ the formatter handles the rest.
   `external_user_email_in_use` warning, instead of failing the login.
   Neither ever adopts the other account (#1235).
 
+- **The alert evaluator no longer warns about the seeded
+  `schema-behind-head` and `cluster-upgrade-failed` rules (#1469).** Both
+  rules are raised and resolved by their own task (the schema check and
+  the rolling-upgrade orchestrator), not by the evaluator, but only
+  `audit_chain_broken` had a pass-through branch. The other two fell
+  through to `alert_unknown_rule_type`, so every worker logged two
+  warnings per 60 s tick, the bulk of its warnings on an appliance. The
+  three types now share one set the evaluator skips silently, and a rule
+  type the evaluator really does not know still warns.
+
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
   an explicit `"server_group_id": null` was dropped like an absent key:

@@ -77,6 +77,13 @@ from app.services.bgp.hijack_monitor import (
     expected_origin_set,
     severity_for_rpki,
 )
+
+# Aliased so it does not land in this module as a ``RULE_TYPE_*`` name:
+# ``cluster_upgrade_failed`` is owned by the upgrade orchestrator and is
+# deliberately not in ``RULE_TYPES`` (operators cannot create one).
+from app.services.upgrades.alerts import (
+    RULE_TYPE_CLUSTER_UPGRADE_FAILED as _CLUSTER_UPGRADE_FAILED,
+)
 from app.services.wol_scheduler.verify import seen_since
 
 logger = structlog.get_logger(__name__)
@@ -628,6 +635,21 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DNS_TUNNELING,
         RULE_TYPE_DNS_BEACONING,
         RULE_TYPE_DNS_DGA,
+    }
+)
+
+# Rule types whose AlertEvents are opened and resolved by their own task,
+# not by ``evaluate_all`` — the evaluator skips them silently. Each one is a
+# seeded singleton rule; without an entry here it falls through to the
+# ``alert_unknown_rule_type`` warning on every 60 s tick (#1469).
+_EXTERNALLY_DRIVEN_RULE_TYPES: frozenset[str] = frozenset(
+    {
+        # ``app.tasks.audit_chain_verify.verify_audit_chain`` (nightly + on demand).
+        RULE_TYPE_AUDIT_CHAIN_BROKEN,
+        # ``app.tasks.schema_check`` (#565).
+        RULE_TYPE_SCHEMA_BEHIND_HEAD,
+        # The rolling-upgrade orchestrator (``services/upgrades/alerts.py``).
+        _CLUSTER_UPGRADE_FAILED,
     }
 )
 
@@ -6520,14 +6542,11 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 delivered_webhook += dwh
                 delivered_smtp += dsm
                 continue
-            elif rule.rule_type == RULE_TYPE_AUDIT_CHAIN_BROKEN:
-                # Externally driven — the dedicated
-                # ``app.tasks.audit_chain_verify.verify_audit_chain``
-                # Celery task creates / resolves AlertEvent rows for
-                # this rule on its own schedule (nightly + on-demand).
-                # The general evaluator just silently passes; without
-                # this branch the warning loop spammed once per
-                # 60s tick.
+            elif rule.rule_type in _EXTERNALLY_DRIVEN_RULE_TYPES:
+                # Externally driven — a dedicated task creates / resolves
+                # AlertEvent rows for these rules on its own schedule. The
+                # general evaluator silently passes; falling through to the
+                # warning below would log it once per 60 s tick.
                 continue
             else:
                 logger.warning("alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type)
