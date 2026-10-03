@@ -1,7 +1,9 @@
 """Operator Copilot chat surface (issue #90 Wave 3).
 
-Two routers:
+Three surfaces:
 
+* ``/available`` — whether a new chat would find an enabled provider,
+  for any signed-in user (#1345).
 * ``/sessions`` — session CRUD (list user's sessions, get one with
   history, rename, archive).
 * ``/chat`` — POST a user message, receive an SSE stream with
@@ -104,6 +106,12 @@ class SessionUpdate(BaseModel):
     archived: bool | None = None
 
 
+class CopilotAvailability(BaseModel):
+    """Whether a new chat would find a provider to talk to (#1345)."""
+
+    available: bool
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -128,6 +136,23 @@ async def _session_message_count(db: Any, session_id: uuid.UUID) -> int:
         )
         or 0
     )
+
+
+# ── Availability ─────────────────────────────────────────────────────────
+
+
+@router.get("/available", response_model=CopilotAvailability)
+async def copilot_available(current_user: CurrentUser, db: DB) -> CopilotAvailability:
+    """Whether the Operator Copilot has an enabled provider to chat with.
+
+    The console asks this on every page to decide whether to offer "Ask AI"
+    (#1345). It used to read ``GET /providers`` for it, which is
+    superadmin-only, so every other user's page raised a 403 and the console
+    read the refusal as "available". Any signed-in user may chat, so any
+    signed-in user may ask. The answer is the lookup a new chat makes
+    (``_get_default_provider``) as a bare yes or no, naming no provider.
+    """
+    return CopilotAvailability(available=await _get_default_provider(db) is not None)
 
 
 # ── Sessions CRUD ────────────────────────────────────────────────────────

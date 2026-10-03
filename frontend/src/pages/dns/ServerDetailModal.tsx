@@ -36,6 +36,7 @@ import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import {
   dnsApi,
+  formatApiError,
   logsApi,
   metricsApi,
   type DNSPendingOpEntry,
@@ -157,8 +158,12 @@ export function ServerDetailModal({
             serverName={server.name}
             serverKind="DNS"
             isPending={pauseMut.isPending}
+            error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
             onConfirm={(reason) => pauseMut.mutate(reason)}
-            onCancel={() => setShowPauseModal(false)}
+            onCancel={() => {
+              setShowPauseModal(false);
+              pauseMut.reset();
+            }}
           />
         )}
         <div className="flex flex-wrap gap-1 border-b">

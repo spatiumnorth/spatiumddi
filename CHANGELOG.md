@@ -42,6 +42,237 @@ the formatter handles the rest.
   validation is unchanged, so a Response addressed to any other URL,
   `/api/v1/auth/acs` included, is refused.
 
+- **A slot rollback to a release older than #1044 no longer lets the
+  next upgrade regenerate `SECRET_KEY` (#1299).** #1044 carried the app
+  Secret through a reinstall with `helm.sh/resource-policy: keep`, but
+  `helm uninstall` reads that annotation from the release's last stored
+  revision, not from the live Secret, and after a rollback to
+  2026.09.04-1 that revision is the old chart's, which has none. On the
+  next forward boot helm-controller re-ran the HelmChart the old release
+  had left, before firstboot placed the new one; that upgrade failed,
+  the `reinstall` failure policy uninstalled the release, the Secret
+  went with it, and the install minted a new key, so everything
+  encrypted before it (the appliance certificate first) could no longer
+  be read. The control release now uses `failurePolicy: retry`, which
+  upgrades a failed release again and never uninstalls it. firstboot
+  sets it on every boot on the `spatium-control` HelmChartConfig, the
+  policy helm-controller actually applies (it overrides the HelmChart's
+  and defaults to `reinstall`) and the one a rollback leaves in place.
+  On a rolled-back release whose k3s predates `retry` (2026.09.04-1), a
+  failed control release now waits for an operator instead of being
+  reinstalled.
+
+- **The Copilot availability probe asks a route every user may read
+  (#1345).** With the Operator Copilot module on, its default, the app
+  shell asked `GET /api/v1/ai/providers` on every page to decide whether
+  to offer "Ask AI". That route is superadmin-only, so every page a
+  non-superadmin opened logged a 403, and the console read the refusal
+  as "available": a read-only Viewer was offered Ask AI, down to the
+  per-row "Ask AI about this…" buttons on Alerts and Audit, on an
+  install with no provider, where the admin was offered none. A new
+  `GET /api/v1/ai/available` tells any signed-in user whether a new chat
+  would find an enabled provider, as a bare yes or no that names no
+  provider, and the console asks it instead; the provider list stays
+  superadmin-only. Ask AI now appears only on a yes, not while the
+  answer is loading or when the probe failed. No copilot tool: a chat
+  that is running already has its answer.
+
+- **A refused action says it was refused (#1344).** The zones tab's
+  bulk Delete sent one request per zone and then closed as if every one
+  had worked: a refused delete cleared the selection and left the zone
+  with no word, and a delete the two-person approval queue took was
+  reported as done too. Delete Zone, a server's Pause (DNS and DHCP),
+  Delete server (DHCP) and Delete role left their dialog open with no
+  word when refused, and the DNS propagation check painted Cloudflare,
+  Google, Quad9 and OpenDNS "OK" when its own request had failed. Each
+  now says why in the dialog it was taken from, in the server's words:
+  the bulk delete says how many zones it could not delete and keeps
+  only those selected, and says above the zones when deletes went to
+  the approval queue; a propagation check that failed shows no resolver
+  status, only the reason. This holds for any failure, not only a
+  Viewer's 403: a scoped role, a revoked grant, a 409, a 500.
+
+- **A list the reader may not see is no longer shown as empty
+  (#1343).** When a page's own list read was refused (403), the page
+  rendered its empty state, so a read-only Viewer was told "Trash is
+  empty.", "No subscriptions yet." and "no appliances online" over
+  lists that held rows, and the Users page showed a blank table with
+  no word. Trash, Webhooks, Users, Security › Block Sync, Tools ›
+  Network Tools, AI › Tools, Cutover and Settings' audit-forward and
+  InfluxDB target lists now say the reader may not see the list, with
+  the server's reason; any other failed read says the list could not
+  be loaded, never that it is empty. Cutover no longer invites a first
+  plan beside its "Superadmin required". The polled reads among them
+  (Block Sync's two lists, the Network Tools appliance list, the
+  InfluxDB targets) stop polling once refused: a refusal does not
+  change by asking again, and Block Sync's and the appliance list's
+  refusals each write a `denied` audit row, which made a Viewer with
+  Block Sync open add 240 an hour.
+
+- **Allocate IP on an IPv6 subnet no longer names an address it will not
+  allocate (#1307).** "Next available" previews the address with
+  `strategy=sequential`, but for IPv6 the pick follows the subnet's
+  `ipv6_allocation_policy`, `random` by default, and draws a fresh
+  random suffix on every call, so the address shown was never the one
+  allocated. The preview endpoint now reports the strategy that picked
+  its candidate instead of echoing the one asked for, and the dialog
+  names the address only when the pick repeats (sequential, or EUI-64
+  from a MAC). For a random pick it says the address is picked when you
+  allocate. IPv4, and IPv6 subnets that allocate sequentially, are
+  unchanged.
+
+- **Allocate IP no longer offers a DHCP scope for status "dhcp", where
+  nothing uses it (#1306).** Choosing status "dhcp" showed a DHCP Scope
+  picker with a scope already selected, but only a `static_dhcp`
+  allocation makes a reservation on a scope: the `dhcp` request never
+  carried it. The picker now appears for `static_dhcp` only, as it does
+  in Edit address.
+
+- **Edit address shows the role and status an address is stored with
+  (#1305).** Its Role menu lacked `web`, `api` and `lb`, which the API
+  accepts, and its Status menu lacked the statuses integrations set
+  (`docker-container`, `proxmox-vm`, …). A select whose value is not
+  among its options shows its first one, so such an address read as Role
+  "— None —" or Status "available" while the table beside it said
+  otherwise, and "— None —" could not be picked to clear a role because
+  it already looked selected. Allocate IP and Edit address now offer the
+  three TLS-serving roles, and Edit address keeps the address's own
+  status or role as an option whenever its menu lacks it.
+
+- **A template picked in New Subnet or New IP Block applies (#1304).**
+  The dialogs sent their own defaults for every field a template fills
+  (`custom_fields: {}`, DDNS off, DNS and DHCP inherited), and the API's
+  template pre-fill fills only the fields a request leaves out, so the
+  template's custom fields, DDNS settings and DHCP group were dropped:
+  only its tags landed. Its DDNS lock still turned the new subnet's DDNS
+  inheritance off, so DDNS ended up pinned off, and its DHCP group sat
+  behind "inherit" with no effect. Picking a template now fills its
+  custom fields and its DNS, DHCP and DDNS settings into the dialog's own
+  fields, where they can be seen and changed, and the request carries
+  them. The API applies a template's DDNS lock only together with a DDNS
+  value it took from the template: a request that sets every DDNS value
+  the template sets gets the DDNS inheritance it would get with no
+  template.
+
+- **A custom field's Default Value is what the IPAM dialogs send, not
+  only what they show (#1303).** Allocate IP, New Subnet and New IP Block
+  showed a field's Default Value (Settings → Custom Fields) as its value,
+  but sent `custom_fields: {}`, and the API applies no default on create,
+  so the object was stored without it. Edit subnet, Edit IP Block and
+  Edit address showed the default too, on objects that never had the
+  field. The create dialogs now start the field at its default and send
+  it; the edit dialogs show only what is stored. A boolean default of
+  "false" rendered checked: boolean values are now read as true / false
+  words, and a select default its options do not offer, or a number
+  default that is not a number, is left out. The default stays a console
+  pre-fill: a create through the API or an import gets what it sends.
+
+- **Add Zone stores a reverse-lookup name as a reverse zone, so IPAM
+  publishes its PTRs (#1310).** Kind was pre-filled "Forward lookup"
+  whatever the name, and the zone API stored the kind it was given and
+  defaulted to forward too, as create-from-template and the copilot's
+  `create_dns_zone` did. A primary zone named under in-addr.arpa or
+  ip6.arpa created with Kind left alone was stored as forward, while the
+  API's own name classification called it reverse. IPAM publishes PTRs
+  only into reverse zones and creates no reverse zone beside one that
+  holds the name, so a subnet under such a zone got no PTR at all, for
+  its gateway or any host, and its DNS sync summary showed nothing
+  missing. For a primary zone, Kind now follows the name in the dialog
+  until the operator picks one; an omitted kind is taken from the name
+  on every create path; and the API refuses a forward kind for a name
+  under in-addr.arpa or ip6.arpa, on create and on an edit that sets the
+  kind, the name or the type. Secondary, stub and forward zones keep
+  their old default. A primary zone stored forward before this keeps
+  its kind until it is next saved from the Edit dialog, which then asks
+  for Reverse lookup.
+
+- **The DHCP scope dialog offers the DDNS hostname policies the API
+  accepts, and an edit checks the policy as create does (#1308).** The
+  dialog offered Client-supplied, From IPAM and Generate (`client`,
+  `ipam`, `generate`), while the scope API accepts `client`,
+  `server_name`, `derived` and `none`. Creating a scope with From IPAM
+  or Generate failed with the validator's raw `422`. Editing a scope to
+  either answered `200` and stored it unchecked, and a stored
+  `server_name`, `derived` or `none` showed as Client-supplied. The
+  dialog now offers the API's four policies and shows a stored one as
+  itself, and an edit that changes the policy is checked against the
+  same list as create. A value stored before the check is kept, and
+  shown as itself, until it is changed, so an unrelated edit still
+  saves.
+
+- **Apply template… in the DHCP scope dialog shows each option in its
+  own field (#1309).** The dialog merged a template's options by name
+  and gave an option the form did not hold yet the code `0`, while the
+  options editor draws its standard fields by code. So a template's
+  TFTP Server Name, Bootfile Name and TFTP Server Address landed in the
+  collapsed Custom options with a blank code. Their fields stayed empty
+  while the values were sent and stored. The editor also kept showing a
+  pre-filled value the template had replaced. Each template option now
+  takes the code its key stands for (`code:NN` included) and lands in
+  its own field. The editor is redrawn when a template is applied, so
+  the dialog shows what it will send.
+
+- **A DNS server's zone serials reach the per-server zone state
+  (#1408).** The agent reports the serial of each zone it renders
+  (`POST /api/v1/dns/agents/zone-state`), but the control plane
+  stripped the trailing dot from the reported names and looked them
+  up against names stored with one. Nothing matched, every report was
+  dropped behind a 200, and the zone's server-state view showed every
+  server as never reported and out of sync. The names now match, only
+  among the reporting server's own group (another group's zone of the
+  same name is another zone). A name the group does not hold, or
+  holds once per view, is skipped and counted in the answer.
+
+- **TACACS+ sign-in works against a server whose profile is keyed on
+  the service (#1336).** After the password was accepted, the product
+  asked the TACACS+ server to authorize the user with no arguments at
+  all, though RFC 8907 says the `service` argument "MUST always be
+  included". Servers key their authorization profiles on it (tac_plus-ng's
+  sample guards its profile with `if (service == shell)`), so the request
+  was denied, the reply carried no `priv-lvl`, no group mapped, and every
+  user was refused "Invalid credentials" (`no_group_mapping_match`).
+  Sign-in worked only against a server that ignores the service. The
+  request now asks to authorize a login shell, `service=shell` with an
+  empty `cmd` (a session rather than one command), as a network device
+  does at login. A server that refuses the shell still leaves the user
+  without a group, and that refusal is now logged
+  (`tacacs_authorization_refused`).
+
+- **A record name the group's BIND would refuse is refused when it
+  is saved, not after it has stopped the server (#1378).** The record
+  API checked every owner with the RFC 2181 rule, which allows `_`, so
+  `bad_name A 192.0.2.33` was saved. BIND loads a primary zone under
+  `check-names primary fail`, so the agent's zone check refused the
+  file and quarantined the server's whole config bundle: the record
+  was never served, and no later record change on that server applied
+  while it stayed. Create, update, bulk create and the Copilot now
+  answer 422 when the owner of an A, AAAA or MX record, or the target
+  of an MX, NS, SRV or ServiceMode SVCB/HTTPS record (or of a PTR in a
+  reverse zone), is not a host name — BIND's own check-names rule,
+  zone labels included, with BIND's exceptions for Active Directory's
+  `gc._msdcs` and SPF's `_spf` labels. Underscore TXT, SRV, CNAME and
+  TLSA owners stay legal, as #597 intended. An edit is checked only
+  for the name or value it changes.
+  Rows saved before this still fail BIND's check; the name-conformance
+  report (`GET /diagnostics/name-conformance`) now lists them, and
+  deleting or renaming one lets the server apply again.
+
+- **A CNAME can no longer be saved beside other data at its name
+  (#1381).** `www A` then `www CNAME` were both saved. A name that holds
+  a CNAME holds nothing else (RFC 1034 §3.6.2, RFC 2181 §10.1), so
+  PowerDNS refused the agent's zone patch ("Conflicts with
+  pre-existing RRset") and BIND's zone check refuses "CNAME and other
+  data", which quarantines the server's whole config bundle (#1378).
+  Create, update, bulk create and the Copilot now refuse a CNAME at a
+  name that holds any record, a second CNAME, and any record at a name
+  that holds a CNAME, with a 409 naming the record in the way; a CNAME
+  at the zone apex, which always holds the SOA and NS, is a 422. Views
+  count: a record with no view meets every view, so a split-horizon
+  CNAME in one view beside an address in another stays legal. Bulk
+  create skips a clashing record and says why, as it does for a
+  duplicate. Records IPAM generates count as data at their name, so a
+  CNAME is refused where one exists.
+
 - **Moving a DHCP reservation to another address while its client
   still holds its lease no longer shows the old address as free
   (#1302).** The move deleted the reservation's row at the old
@@ -57,6 +288,19 @@ the formatter handles the rest.
   DDNS-enabled subnet the old address's A / PTR records are published
   under the lease's hostname. The old address is still freed when no
   active lease holds it.
+
+- **Reserving an address a DHCP lease holds no longer leaves the
+  reservation's row to the lease (#1404).** Pinning a device to the
+  address it already leases, or moving a reservation back onto an
+  address its lease still holds, takes over that lease's IPAM row. The
+  row became the reservation's (`static_dhcp`, its name, its MAC) but
+  kept the lease's `auto_from_lease` flag and lease link, which the
+  lease ingest reads as "this row is mine". The client's next DHCP
+  exchange turned the reserved address back into a plain lease row,
+  and the lease's release or expiry deleted it, so the address read
+  as free while the reservation still handed it to the device. A row
+  a reservation takes over now drops both, and the lease mirror
+  leaves it alone, as it does every reservation's row.
 
 ### Security
 

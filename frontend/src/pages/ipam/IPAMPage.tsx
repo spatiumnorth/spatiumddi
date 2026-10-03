@@ -74,6 +74,7 @@ import {
   type IPAddress,
   type IPRole,
   type CustomField,
+  type IPAMTemplate,
   type DNSZone,
   type FreeCidrRange,
   type Router as NetworkRouter,
@@ -95,6 +96,10 @@ import {
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
+import {
+  customFieldChecked,
+  withCustomFieldDefaults,
+} from "@/lib/customFieldValues";
 import { hostnameError } from "@/lib/dnsNames";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
@@ -787,8 +792,11 @@ function CustomFieldsSection({
             // Displayed value: local if set, else empty (so the inherited
             // value shows through the HTML placeholder). We never pre-fill
             // the input with the inherited value — that would flip it from
-            // "inherited" to "locally set" the moment the user saves.
-            const val = rawLocal ?? def.default_value ?? "";
+            // "inherited" to "locally set" the moment the user saves. Nor
+            // with the definition's Default Value: a create dialog puts it
+            // in ``values``, which is what it sends (#1303), and an edit
+            // dialog shows only what is stored.
+            const val = rawLocal ?? "";
             const inheritedBadge =
               localUnset && hasInherited ? (
                 <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
@@ -816,7 +824,7 @@ function CustomFieldsSection({
                   <input
                     type="checkbox"
                     className="rounded"
-                    checked={!!val}
+                    checked={customFieldChecked(val)}
                     onChange={(e) => onChange(def.name, e.target.checked)}
                   />
                 ) : def.field_type === "select" && def.options ? (
@@ -2431,7 +2439,47 @@ function isIPv6Cidr(cidr: string): boolean {
   return cidr.includes(":");
 }
 
-function CreateSubnetModal({
+/**
+ * What a template picked in New Subnet / New IP Block puts in the dialog's
+ * own fields (#1304). The API fills only the fields a request leaves out,
+ * and these dialogs send every one of them, so a template's value reaches
+ * the new row only by being shown in the form, and so sent. Each part is
+ * null when the template does not set it, and that part of the form is left
+ * as it is. DDNS counts as set by the same test the API's template lock
+ * uses (services/ipam/templates.py).
+ */
+function templateFormValues(tpl: IPAMTemplate) {
+  const additionalZoneIds = tpl.dns_additional_zone_ids ?? [];
+  return {
+    customFields:
+      Object.keys(tpl.custom_fields ?? {}).length > 0
+        ? tpl.custom_fields
+        : null,
+    ddns:
+      tpl.ddns_enabled ||
+      tpl.ddns_hostname_policy !== "client_or_generated" ||
+      tpl.ddns_domain_override !== null ||
+      tpl.ddns_ttl !== null
+        ? {
+            enabled: tpl.ddns_enabled,
+            policy: tpl.ddns_hostname_policy,
+            domainOverride: tpl.ddns_domain_override,
+            ttl: tpl.ddns_ttl,
+          }
+        : null,
+    dns:
+      tpl.dns_group_id || tpl.dns_zone_id || additionalZoneIds.length > 0
+        ? {
+            groupIds: tpl.dns_group_id ? [tpl.dns_group_id] : [],
+            zoneId: tpl.dns_zone_id,
+            additionalZoneIds,
+          }
+        : null,
+    dhcpGroupId: tpl.dhcp_group_id,
+  };
+}
+
+export function CreateSubnetModal({
   spaceId,
   defaultBlockId,
   defaultNetwork,
@@ -2520,6 +2568,34 @@ function CreateSubnetModal({
     queryFn: () => ipamApi.listTemplates({ applies_to: "subnet" }),
   });
 
+  // #1304 — a picked template fills the fields it sets, where the operator
+  // sees them; this dialog sends every field, so that is how they apply.
+  function applyTemplate(id: string) {
+    setTemplateId(id);
+    const tpl = subnetTemplates?.find((t) => t.id === id);
+    if (!tpl) return;
+    const v = templateFormValues(tpl);
+    if (v.customFields) {
+      setCustomFields((prev) => ({ ...prev, ...v.customFields }));
+    }
+    if (v.ddns) {
+      setDdnsEnabled(v.ddns.enabled);
+      setDdnsPolicy(v.ddns.policy);
+      setDdnsDomainOverride(v.ddns.domainOverride);
+      setDdnsTtl(v.ddns.ttl);
+    }
+    if (v.dns) {
+      setDnsInherit(false);
+      setDnsGroupIds(v.dns.groupIds);
+      setDnsZoneId(v.dns.zoneId);
+      setDnsAdditionalZoneIds(v.dns.additionalZoneIds);
+    }
+    if (v.dhcpGroupId) {
+      setDhcpInherit(false);
+      setDhcpServerGroupId(v.dhcpGroupId);
+    }
+  }
+
   // Narrow the prefix picker to values valid for the selected block's family
   // and larger than the block's own prefix. /24 stays the default for IPv4,
   // /64 for IPv6.
@@ -2548,6 +2624,9 @@ function CreateSubnetModal({
     queryKey: ["custom-fields", "subnet"],
     queryFn: () => customFieldsApi.list("subnet"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -2599,7 +2678,7 @@ function CreateSubnetModal({
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status: "active",
         skip_auto_addresses: skipAuto,
-        custom_fields: customFields,
+        custom_fields: shownCustomFields,
         dns_inherit_settings: dnsInherit,
         ...(dnsInherit
           ? {}
@@ -2822,7 +2901,7 @@ function CreateSubnetModal({
               <select
                 className={inputCls}
                 value={templateId}
-                onChange={(e) => setTemplateId(e.target.value)}
+                onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
                 {(subnetTemplates ?? []).map((t) => (
@@ -2834,8 +2913,9 @@ function CreateSubnetModal({
               </select>
               {templateId && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Operator-supplied fields here override the template's
-                  defaults.
+                  The template's custom fields and its DNS, DHCP and DDNS
+                  settings are filled in on these tabs; change any of them
+                  before you create. Its tags are added to the new subnet.
                 </p>
               )}
             </Field>
@@ -2887,7 +2967,7 @@ function CreateSubnetModal({
           </Field>
           <CustomFieldsSection
             definitions={cfDefs}
-            values={customFields}
+            values={shownCustomFields}
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
@@ -3175,7 +3255,7 @@ function CollisionWarningBanner({
   );
 }
 
-function AddAddressModal({
+export function AddAddressModal({
   subnetId,
   presetRange,
   onClose,
@@ -3222,7 +3302,11 @@ function AddAddressModal({
   // failed (partial success). The row already exists, so re-submitting would
   // collide; the footer switches from "Allocate" to "Close".
   const [addressCreated, setAddressCreated] = useState(false);
-  const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
+  // Only a reservation is made on a scope (the static_dhcp branch of the
+  // mutation below). A "dhcp" row records an address the DHCP server
+  // leases, and nothing takes a scope for it, so the picker is not shown
+  // for one (#1306). Edit address draws the same line (#867).
+  const needsDhcpScope = ipStatus === "static_dhcp";
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
   // check + pool warnings even before the user flips to ``static_dhcp``.
@@ -3276,9 +3360,11 @@ function AddAddressModal({
     return null;
   })();
 
-  // Preview the IP the backend would hand out on "next available". Only
-  // meaningful for IPv4; the endpoint returns ``address: null`` on v6
-  // or when the subnet is exhausted — the UI handles both.
+  // Preview the IP the backend would hand out on "next available";
+  // ``address: null`` when the subnet is exhausted. On IPv6 the subnet's
+  // allocation policy picks, and the response names the strategy that
+  // did: a ``random`` pick is drawn again on commit, so its address is
+  // not the one the dialog allocates and is not shown as such (#1307).
   const { data: nextPreview, isFetching: previewFetching } = useQuery({
     queryKey: ["next-ip-preview", subnetId],
     queryFn: () => ipamApi.previewNextIp(subnetId, "sequential"),
@@ -3291,6 +3377,9 @@ function AddAddressModal({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   // Fetch effective DNS for this subnet to know which zones are available
   const { data: effectiveDns } = useQuery({
@@ -3366,7 +3455,7 @@ function AddAddressModal({
               status: ipStatus,
               mac_address: mac || undefined,
               description: description || undefined,
-              custom_fields: customFields,
+              custom_fields: shownCustomFields,
               dns_zone_id: zoneParam,
               extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
@@ -3381,7 +3470,7 @@ function AddAddressModal({
               mac_address: mac || undefined,
               description: description || undefined,
               status: ipStatus,
-              custom_fields: customFields,
+              custom_fields: shownCustomFields,
               dns_zone_id: zoneParam,
               extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
@@ -3508,6 +3597,15 @@ function AddAddressModal({
               <span className="text-muted-foreground">
                 Finding next available IP…
               </span>
+            ) : nextPreview?.address && nextPreview.strategy === "random" ? (
+              <>
+                <span className="text-muted-foreground">Next available:</span>{" "}
+                <span className="font-medium">picked when you allocate</span>
+                <span className="ml-2 text-muted-foreground">
+                  (by this subnet's IPv6 allocation policy; skips dynamic DHCP
+                  pools)
+                </span>
+              </>
             ) : nextPreview?.address ? (
               <>
                 <span className="text-muted-foreground">Next available:</span>{" "}
@@ -3869,7 +3967,7 @@ function AddAddressModal({
         </Field>
         <CustomFieldsSection
           definitions={cfDefs}
-          values={customFields}
+          values={shownCustomFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -8624,6 +8722,21 @@ const ADDRESS_STATUSES = [
   "discovered",
 ] as const;
 
+/**
+ * ``options`` with the row's stored ``value`` first when they lack it
+ * (#1305). A controlled ``<select>`` whose value is none of its options
+ * shows its first one, so an address an integration marked
+ * ``docker-container`` read as "available". Kept as an option, the stored
+ * value is what the dialog shows and what an untouched Save sends.
+ * InlineStatusSelect guards its status the same way.
+ */
+function withStoredValue(
+  options: readonly string[],
+  value: string | null | undefined,
+): readonly string[] {
+  return value && !options.includes(value) ? [value, ...options] : options;
+}
+
 // Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
 // ``YYYY-MM-DDTHH:MM``, no TZ suffix). Naively slicing ``toISOString()``
 // yields the *UTC* wall-clock, which the local-time input then misreads — so
@@ -8637,7 +8750,7 @@ function toLocalDatetimeInput(iso: string): string {
     .slice(0, 16);
 }
 
-function EditAddressModal({
+export function EditAddressModal({
   address,
   onClose,
 }: {
@@ -9021,7 +9134,7 @@ function EditAddressModal({
             value={status}
             onChange={(e) => setStatus(e.target.value)}
           >
-            {ADDRESS_STATUSES.map((s) => (
+            {withStoredValue(ADDRESS_STATUSES, address.status).map((s) => (
               <option key={s} value={s}>
                 {s}
               </option>
@@ -9095,7 +9208,7 @@ function EditAddressModal({
               onChange={(e) => setRole(e.target.value)}
             >
               <option value="">— None —</option>
-              {IP_ROLE_OPTIONS.map((r) => (
+              {withStoredValue(IP_ROLE_OPTIONS, address.role).map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>
@@ -11558,7 +11671,7 @@ function flattenBlocks(
 
 // ─── Create Block Modal ───────────────────────────────────────────────────────
 
-function CreateBlockModal({
+export function CreateBlockModal({
   spaceId,
   defaultParentBlockId,
   onClose,
@@ -11608,11 +11721,36 @@ function CreateBlockModal({
     queryKey: ["custom-fields", "ip_block"],
     queryFn: () => customFieldsApi.list("ip_block"),
   });
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303).
+  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
 
   const { data: blockTemplates } = useQuery({
     queryKey: ["ipam-templates", "block"],
     queryFn: () => ipamApi.listTemplates({ applies_to: "block" }),
   });
+
+  // #1304 — as in New Subnet. This dialog has no DDNS fields and sends
+  // none, so the API applies a block template's DDNS itself.
+  function applyTemplate(id: string) {
+    setTemplateId(id);
+    const tpl = blockTemplates?.find((t) => t.id === id);
+    if (!tpl) return;
+    const v = templateFormValues(tpl);
+    if (v.customFields) {
+      setCustomFields((prev) => ({ ...prev, ...v.customFields }));
+    }
+    if (v.dns) {
+      setDnsInherit(false);
+      setDnsGroupIds(v.dns.groupIds);
+      setDnsZoneId(v.dns.zoneId);
+      setDnsAdditionalZoneIds(v.dns.additionalZoneIds);
+    }
+    if (v.dhcpGroupId) {
+      setDhcpInherit(false);
+      setDhcpServerGroupId(v.dhcpGroupId);
+    }
+  }
 
   const flatBlocks = existingBlocks
     ? flattenBlocks(buildBlockTree(existingBlocks, [], null))
@@ -11626,7 +11764,7 @@ function CreateBlockModal({
         name: name || undefined,
         description: description || undefined,
         parent_block_id: parentBlockId || undefined,
-        custom_fields: customFields,
+        custom_fields: shownCustomFields,
         dns_inherit_settings: dnsInherit,
         ...(dnsInherit
           ? {}
@@ -11710,7 +11848,7 @@ function CreateBlockModal({
               <select
                 className={inputCls}
                 value={templateId}
-                onChange={(e) => setTemplateId(e.target.value)}
+                onChange={(e) => applyTemplate(e.target.value)}
               >
                 <option value="">— none —</option>
                 {(blockTemplates ?? []).map((t) => (
@@ -11722,9 +11860,10 @@ function CreateBlockModal({
               </select>
               {templateId && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Operator-supplied fields here override the template's
-                  defaults. Children defined in the template are carved
-                  automatically.
+                  The template's custom fields and its DNS and DHCP settings are
+                  filled in on these tabs; change any of them before you create.
+                  Its tags and DDNS settings are added to the new block, and
+                  children defined in the template are carved automatically.
                 </p>
               )}
             </Field>
@@ -11747,7 +11886,7 @@ function CreateBlockModal({
           )}
           <CustomFieldsSection
             definitions={cfDefs}
-            values={customFields}
+            values={shownCustomFields}
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
