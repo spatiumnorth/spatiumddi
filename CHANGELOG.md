@@ -41,6 +41,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Editing a record's value on Cloudflare replaces it instead of adding
+  a second record (#1494).** The driver handled `update` by looking up
+  the Cloudflare row by the op's value, which is the NEW value and not
+  on Cloudflare yet, so the lookup missed and the "update is create on
+  miss" fallback added a second row next to the old one. For a DMARC
+  record that turned the domain's policy off, since two DMARC records
+  mean none. A create or update that carries its complete desired RRset
+  (every agentless op since #783) is now written as a set: rows that
+  match a member are kept, with the TTL corrected in place, missing
+  members are created, and the remaining rows are deleted last so the
+  name never goes empty. Values are compared in a normalised form (TXT
+  with or without quotes, host names with or without the trailing dot,
+  IPv6 notation), so an unchanged record is not posted again. If
+  Cloudflare still reports a value as a duplicate, nothing is deleted
+  and the op fails with that message. A delete stays a single-value
+  delete.
+
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
   an explicit `"server_group_id": null` was dropped like an absent key:
