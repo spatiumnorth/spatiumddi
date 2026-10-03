@@ -2443,19 +2443,31 @@ export interface AppUser {
   failed_login_count?: number;
   failed_login_locked_until?: string | null;
   locked?: boolean;
+  /** #1355 — the flag OR a wildcard role; resetting such an account's
+   *  password needs the caller's step-up. */
+  is_effective_superadmin?: boolean;
+}
+
+/** #1355 — the caller's own step-up on actions that mint a credential:
+ *  a local user's password, or an SSO user's authenticator code. */
+export interface StepUp {
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 export const usersApi = {
   list: () => api.get<AppUser[]>("/users").then((r) => r.data),
   get: (id: string) => api.get<AppUser>(`/users/${id}`).then((r) => r.data),
-  create: (data: {
-    username: string;
-    email: string;
-    display_name: string;
-    password: string;
-    is_superadmin: boolean;
-    force_password_change: boolean;
-  }) => api.post<AppUser>("/users", data).then((r) => r.data),
+  create: (
+    data: {
+      username: string;
+      email: string;
+      display_name: string;
+      password: string;
+      is_superadmin: boolean;
+      force_password_change: boolean;
+    } & StepUp,
+  ) => api.post<AppUser>("/users", data).then((r) => r.data),
   update: (
     id: string,
     data: Partial<
@@ -2467,10 +2479,14 @@ export const usersApi = {
         | "is_superadmin"
         | "force_password_change"
       >
-    >,
+    > &
+      StepUp,
   ) => api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
-  resetPassword: (id: string, newPassword: string) =>
-    api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
+  resetPassword: (id: string, newPassword: string, stepUp: StepUp = {}) =>
+    api.post(`/users/${id}/reset-password`, {
+      new_password: newPassword,
+      ...stepUp,
+    }),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
   /** Link an external account to its provider (#1235). Clears the stored
@@ -4439,9 +4455,13 @@ export const authProvidersApi = {
   update: (id: string, body: AuthProviderUpdate) =>
     api.put<AuthProvider>(`/auth-providers/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/auth-providers/${id}`),
-  revealSecrets: (id: string) =>
+  // #1355 — a POST carrying the step-up, like every other secret reveal.
+  revealSecrets: (id: string, password: string, totpCode: string) =>
     api
-      .get<Record<string, unknown>>(`/auth-providers/${id}/secrets`)
+      .post<Record<string, unknown>>(`/auth-providers/${id}/secrets`, {
+        password: password || null,
+        totp_code: totpCode || null,
+      })
       .then((r) => r.data),
   listMappings: (id: string) =>
     api
@@ -10216,6 +10236,9 @@ export interface ApiTokenCreate {
   expires_in_days?: number | null;
   scopes?: ApiTokenScope[];
   resource_grants?: ApiTokenResourceGrant[];
+  /** #1355 — the owner's step-up; a token outlives the session. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /** Response from POST — contains the raw token ONCE. */

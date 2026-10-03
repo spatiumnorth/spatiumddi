@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_operator_stepup
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
@@ -67,6 +68,11 @@ class ApiTokenCreate(BaseModel):
     # dns_zone}. Empty = no resource restriction. Validated against the
     # issuing user's RBAC + resource existence in the create handler.
     resource_grants: list[dict] = Field(default_factory=list)
+    # #1355 — the owner's step-up (password, or authenticator code for an
+    # account without one). A token outlives the session that minted it, so a
+    # stolen session must not be able to mint itself one.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("resource_grants")
     @classmethod
@@ -232,6 +238,16 @@ async def create_token(
     db: DB,
     current_user: CurrentUser,
 ) -> dict:
+    method = await require_operator_stepup(
+        db,
+        current_user,
+        password=body.stepup_password,
+        totp_code=body.stepup_totp_code,
+        action="create",
+        resource_type="api_token",
+        resource_id="?",
+        resource_display=body.name,
+    )
     raw, prefix_, token_hash = generate_api_token()
     # ``prefix`` on the model is 10 chars — ``sddi_`` is 5, so we record
     # ``sddi_`` + the first 5 chars of the random body, giving operators a
@@ -271,6 +287,7 @@ async def create_token(
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "scopes": body.scopes,
                 "resource_grants": body.resource_grants,
+                "stepup_method": method,
             },
         )
     )
