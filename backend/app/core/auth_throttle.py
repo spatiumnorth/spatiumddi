@@ -236,6 +236,24 @@ async def refund_stepup_attempt(user_id: object) -> None:
         logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
 
 
+async def stepup_block_seconds_left(user_id: object) -> int:
+    """Seconds until a spent step-up budget resets, for ``Retry-After``.
+
+    Falls back to the full window when Redis cannot say, or the key has no
+    TTL: a ``Retry-After`` that is too long only delays a retry, while one
+    that is too short sends the client back while it is still blocked."""
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            ttl = int(await r.ttl(_stepup_key(user_id)))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — only the header depends on it
+        logger.warning("stepup_throttle_redis_unavailable", error=str(exc))
+        return _STEPUP_FAIL_WINDOW_SECONDS
+    return ttl if ttl > 0 else _STEPUP_FAIL_WINDOW_SECONDS
+
+
 async def record_stepup_password_failure(user_id: object) -> None:
     """Count one wrong step-up answer. Only failures count, so a user who
     gets it right is never slowed by their own successes.
