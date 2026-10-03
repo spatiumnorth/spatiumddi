@@ -13,7 +13,12 @@ Failure modes:
   cached pairing code from env so we don't crash-loop on a dead
   code. Wave A2's behaviour is "log loud + idle"; Wave B+'s console
   dashboard will surface a recover-from-failed-pair affordance.
-* Network unreachable / 5xx → backoff + retry forever. The supervisor
+* Attempt budget spent (429, #1356) → stop this round and let the main
+  loop try again on its next tick. Retrying every couple of seconds
+  cannot succeed before the window passes, and each retry is another
+  request against an endpoint that is refusing them.
+* Network unreachable / 5xx → backoff + retry forever (a 503 with a
+  ``Retry-After`` is honoured, capped). The supervisor
   is the only path to bring the appliance into the fleet; if the
   control plane is briefly down the supervisor should keep trying
   rather than fall over.
@@ -51,9 +56,37 @@ class RegisterFatal(Exception):
     config + stop trying until an operator pastes a new one."""
 
 
+class RegisterCodeRejected(RegisterFatal):
+    """Control plane returned 403 — this pairing code will never work
+    (invalid / expired / revoked / used up). The caller drops it rather
+    than re-presenting it every loop tick: each retry spends one of the
+    address's registration attempts (#1356), so a box stuck on a dead code
+    would keep its address throttled and lock out every other appliance
+    pairing from behind the same NAT."""
+
+
 class RegisterDisabled(Exception):
     """Control plane returned 404 — feature flag is off. Retry on
     next boot; in the meantime the supervisor falls back to idle."""
+
+
+class RegisterThrottled(Exception):
+    """Control plane returned 429 — too many failed registration attempts
+    from this address (or install-wide) in the current window (#1356). The
+    caller retries on its next loop tick instead of in a tight loop."""
+
+
+# Longest a 503's Retry-After may pause one attempt. The control plane asks
+# for 60 s while its attempt limiter is unreachable; the cap keeps a large or
+# hostile value from parking the supervisor's startup.
+_MAX_RETRY_AFTER_S = 30.0
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float:
+    try:
+        return max(0.0, float(resp.headers.get("Retry-After", "")))
+    except ValueError:
+        return 0.0
 
 
 def register(
@@ -130,10 +163,15 @@ def register(
                 f"control plane rejected our register payload as malformed: {resp.text}"
             )
         if resp.status_code == 403:
-            raise RegisterFatal(
+            raise RegisterCodeRejected(
                 "Pairing code rejected by control plane "
                 "(invalid / expired / already used). "
                 "Generate a fresh pairing code in the Pairing tab."
+            )
+        if resp.status_code == 429:
+            raise RegisterThrottled(
+                "Control plane is refusing registration attempts from this "
+                f"address for now (Retry-After: {resp.headers.get('Retry-After', '?')} s)."
             )
 
         # 5xx — retry.
@@ -144,7 +182,9 @@ def register(
             status=resp.status_code,
             body=resp.text[:200],
         )
-        time.sleep(backoff_seconds)
+        time.sleep(
+            max(backoff_seconds, min(_retry_after_seconds(resp), _MAX_RETRY_AFTER_S))
+        )
 
     raise RegisterFatal(
         f"register failed after {max_attempts} attempts; last error: {last_error}"
