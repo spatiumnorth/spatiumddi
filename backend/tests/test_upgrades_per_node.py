@@ -552,7 +552,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(per_node, "_step_cluster_verify", lambda *a, **k: _ok("cluster_verify"))
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -607,7 +607,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     monkeypatch.setattr(per_node, "_step_drain", _track_drain)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -641,7 +641,7 @@ async def test_single_node_upgrade_step_crash_caught(
     monkeypatch.setattr(per_node, "_step_preflight", _crash)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),

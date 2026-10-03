@@ -279,37 +279,20 @@ async def _step_verify_primary_moved(
         status_block = body.get("status") or {}
         current_primary = status_block.get("currentPrimary")
         last_primary = current_primary
-        # CNPG primary pod names are ``<cluster>-<ordinal>``; the pod
-        # carries a ``spec.nodeName`` that tells us where it lives.
-        # We could resolve that pod here, but the simpler signal is
-        # comparing ``currentPrimary`` against the *previous* value —
-        # any change means switchover landed, and CNPG won't pick a
-        # pod on a cordoned node. We just need it to be NON-None +
-        # NON-empty + verified.
-        # Note: ``instances > 1`` was already enforced by the early-
-        # return on line 250-251, so the gate here is just on
-        # ``current_primary`` being non-empty.
+        # #1445 — the primary has moved only when its pod runs on another
+        # node. This used to return ok for any non-empty currentPrimary,
+        # the one on the cordoned node included, so the drain that follows
+        # evicted the primary itself instead of waiting for CNPG's
+        # switchover. A pod we cannot read proves nothing either way, so it
+        # is another poll, never a pass.
         if current_primary:
-            # Check the primary pod's nodeName != our cordoned node.
-            pods_status = status_block.get("instancesStatus") or {}
-            on_target = False
-            for pod_list in pods_status.values():
-                if not isinstance(pod_list, list):
-                    continue
-                for pod_name in pod_list:
-                    if pod_name == current_primary:
-                        # CNPG records which node the pod lives on via
-                        # the per-pod status (we'd need a second GET on
-                        # the pod itself for full certainty). Pragmatic
-                        # cheap check: if instances > 1 and the primary
-                        # changed since we started, the cordon-triggered
-                        # switchover did its job. We log the primary
-                        # name for forensics.
-                        on_target = False
-            if not on_target:
+            pod_status, pod = k8s.get_pod(current_primary, namespace=namespace)
+            primary_node = ((pod or {}).get("spec") or {}).get("nodeName") if pod_status == 200 else None
+            if primary_node and primary_node != node_name:
                 return step.finish(
                     True,
                     current_primary=current_primary,
+                    primary_node=primary_node,
                     instances=instances,
                 )
         await asyncio.sleep(_POLL_INTERVAL_S)
@@ -454,9 +437,8 @@ async def _step_trigger_slot_apply(
         # happened to be scheduled first.
         return step.finish(False, error=str(exc))
     await db.flush()
-    # NB: db.commit is the orchestrator's responsibility — Phase D will
-    # commit at every step transition. For testing in Phase C the
-    # caller drives the commits.
+    # Flushed, not committed: ``single_node_upgrade`` commits straight after
+    # this step, before the health gate waits on the supervisor (#1445).
     return step.finish(True, appliance_id=str(appliance.id))
 
 
@@ -746,6 +728,13 @@ async def single_node_upgrade(
         _step_trigger_slot_apply(db, node_name, target_version, slot_image),
     ):
         return _failed(node_name, target_version, "trigger_slot_apply", results)
+    # #1445 — the supervisor reads the desired slot image from its heartbeat,
+    # in another session, so it sees the stamp only once it is committed. The
+    # orchestrator commits before and after this whole chain, never between
+    # steps, so without this the health gate waited out its timeout for a
+    # node that had never been told to upgrade.
+    if start_index <= steps_in_order.index("trigger_slot_apply"):
+        await db.commit()
     if not await _run("health_gate", _step_health_gate(db, node_name, target_version)):
         return _failed(node_name, target_version, "health_gate", results)
     if not await _run("convergence", _step_convergence(node_name)):

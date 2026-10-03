@@ -184,9 +184,27 @@ async def check_replication_lag(*, threshold_bytes: int = 16 * 1024) -> Prefligh
             message="no streaming replicas (single-node shape)",
             detail={"replicas": []},
         )
+    # #1445 — ``pg_stat_replication`` shows a replica's ``state`` and LSNs
+    # only to a superuser or a member of ``pg_monitor``; to anyone else the
+    # row is there but those columns are NULL. The app's role is neither on
+    # the appliance (CNPG manages it and reverts a manual GRANT), so every
+    # replica read as "not streaming" and the preflight refused to start a
+    # healthy cluster's upgrade. A NULL state is unverified, not broken.
+    unverified = [r for r in replicas if r["state"] is None]
+    if len(unverified) == len(replicas):
+        return PreflightResult(
+            name="replication_lag",
+            level="warn",
+            message=(
+                f"{len(replicas)} replica(s) connected; their streaming state "
+                "is not visible to the app's database role (needs pg_monitor), "
+                "so it was not verified"
+            ),
+            detail={"replicas": replicas, "unverified": True},
+        )
     streaming = [r for r in replicas if r["state"] == "streaming"]
     lagging = [r for r in streaming if r["lag_bytes"] > threshold_bytes]
-    not_streaming = [r for r in replicas if r["state"] != "streaming"]
+    not_streaming = [r for r in replicas if r["state"] is not None and r["state"] != "streaming"]
     if not_streaming:
         return PreflightResult(
             name="replication_lag",
