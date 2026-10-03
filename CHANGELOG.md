@@ -27,6 +27,58 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DHCP scope dialog offers the DDNS hostname policies the API
+  accepts, and an edit checks the policy as create does (#1308).** The
+  dialog offered Client-supplied, From IPAM and Generate (`client`,
+  `ipam`, `generate`), while the scope API accepts `client`,
+  `server_name`, `derived` and `none`. Creating a scope with From IPAM
+  or Generate failed with the validator's raw `422`. Editing a scope to
+  either answered `200` and stored it unchecked, and a stored
+  `server_name`, `derived` or `none` showed as Client-supplied. The
+  dialog now offers the API's four policies and shows a stored one as
+  itself, and an edit that changes the policy is checked against the
+  same list as create. A value stored before the check is kept, and
+  shown as itself, until it is changed, so an unrelated edit still
+  saves.
+
+- **Apply template… in the DHCP scope dialog shows each option in its
+  own field (#1309).** The dialog merged a template's options by name
+  and gave an option the form did not hold yet the code `0`, while the
+  options editor draws its standard fields by code. So a template's
+  TFTP Server Name, Bootfile Name and TFTP Server Address landed in the
+  collapsed Custom options with a blank code. Their fields stayed empty
+  while the values were sent and stored. The editor also kept showing a
+  pre-filled value the template had replaced. Each template option now
+  takes the code its key stands for (`code:NN` included) and lands in
+  its own field. The editor is redrawn when a template is applied, so
+  the dialog shows what it will send.
+
+- **A DNS server's zone serials reach the per-server zone state
+  (#1408).** The agent reports the serial of each zone it renders
+  (`POST /api/v1/dns/agents/zone-state`), but the control plane
+  stripped the trailing dot from the reported names and looked them
+  up against names stored with one. Nothing matched, every report was
+  dropped behind a 200, and the zone's server-state view showed every
+  server as never reported and out of sync. The names now match, only
+  among the reporting server's own group (another group's zone of the
+  same name is another zone). A name the group does not hold, or
+  holds once per view, is skipped and counted in the answer.
+
+- **TACACS+ sign-in works against a server whose profile is keyed on
+  the service (#1336).** After the password was accepted, the product
+  asked the TACACS+ server to authorize the user with no arguments at
+  all, though RFC 8907 says the `service` argument "MUST always be
+  included". Servers key their authorization profiles on it (tac_plus-ng's
+  sample guards its profile with `if (service == shell)`), so the request
+  was denied, the reply carried no `priv-lvl`, no group mapped, and every
+  user was refused "Invalid credentials" (`no_group_mapping_match`).
+  Sign-in worked only against a server that ignores the service. The
+  request now asks to authorize a login shell, `service=shell` with an
+  empty `cmd` (a session rather than one command), as a network device
+  does at login. A server that refuses the shell still leaves the user
+  without a group, and that refusal is now logged
+  (`tacacs_authorization_refused`).
+
 - **A record name the group's BIND would refuse is refused when it
   is saved, not after it has stopped the server (#1378).** The record
   API checked every owner with the RFC 2181 rule, which allows `_`, so
@@ -77,6 +129,19 @@ the formatter handles the rest.
   DDNS-enabled subnet the old address's A / PTR records are published
   under the lease's hostname. The old address is still freed when no
   active lease holds it.
+
+- **Reserving an address a DHCP lease holds no longer leaves the
+  reservation's row to the lease (#1404).** Pinning a device to the
+  address it already leases, or moving a reservation back onto an
+  address its lease still holds, takes over that lease's IPAM row. The
+  row became the reservation's (`static_dhcp`, its name, its MAC) but
+  kept the lease's `auto_from_lease` flag and lease link, which the
+  lease ingest reads as "this row is mine". The client's next DHCP
+  exchange turned the reserved address back into a plain lease row,
+  and the lease's release or expiry deleted it, so the address read
+  as free while the reservation still handed it to the device. A row
+  a reservation takes over now drops both, and the lease mirror
+  leaves it alone, as it does every reservation's row.
 
 ### Security
 
