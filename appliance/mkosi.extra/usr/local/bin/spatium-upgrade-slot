@@ -757,6 +757,32 @@ def cmd_apply(args) -> int:
         _write_progress("failed", None, msg)
         return 5
 
+    # Flavour gate — the twin of the #1026 arch gate above, and here for the
+    # same reason. The arch check alone is not enough: a generic arm64 image
+    # and a Raspberry Pi (`rpi5`) image both report arch=arm64, so the arch
+    # gate would wave a generic image onto a Pi. That swaps the Raspberry Pi
+    # downstream kernel for Debian's generic one, which has no RP1 Ethernet
+    # driver — the node reboots with no onboard NIC and, on remote hardware,
+    # does not come back. Refuse a flavour change in the same post-dd,
+    # pre-bootloader window. An absent/empty APPLIANCE_PROFILE is the generic
+    # build (and what pre-profile images report), so normalise both sides:
+    # generic<->generic and rpi5<->rpi5 pass, any cross is refused.
+    host_profile = _read_active_appliance_profile()
+    image_profile = ((written or {}).get("APPLIANCE_PROFILE") or "").strip()
+    if host_profile != image_profile:
+        hp = host_profile or "generic"
+        ip = image_profile or "generic"
+        msg = (
+            f"appliance-flavour mismatch: image is '{ip}', this node is "
+            f"'{hp}'. Refusing to make {inactive['partlabel']} bootable — a "
+            f"flavour change (e.g. a generic image onto a Raspberry Pi) would "
+            f"bring the node back without its onboard NIC. The active slot is "
+            f"untouched. Use the matching '{hp}' image."
+        )
+        print(f"ERROR: {msg}", file=sys.stderr)
+        _write_progress("failed", None, msg)
+        return 5
+
     # Sync the sidecar FIRST so the renderer reads correct per-slot labels
     # when it re-renders grub.cfg below. (Previously sync_slot_versions was
     # called last; it must now precede the render — #395.)
@@ -1147,6 +1173,25 @@ def _read_active_appliance_version() -> str:
     except OSError:
         return "unreadable"
     return "unstamped"
+
+
+def _read_active_appliance_profile() -> str:
+    """Parse APPLIANCE_PROFILE= from /etc/spatiumddi/appliance-release.
+
+    The booted slot's build profile (e.g. ``rpi5``). Empty string means the
+    default/generic build — which is also what an image built before the
+    profile stamp existed reports — so callers normalise both sides before
+    comparing. Feeds the flavour gate in ``cmd_apply``.
+    """
+    if not _ACTIVE_RELEASE_FILE.exists():
+        return ""
+    try:
+        for line in _ACTIVE_RELEASE_FILE.read_text().splitlines():
+            if line.startswith("APPLIANCE_PROFILE="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
 
 
 def sync_slot_versions() -> dict[str, str]:

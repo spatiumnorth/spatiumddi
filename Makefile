@@ -49,6 +49,12 @@ APPLIANCE_ARCH ?= linux/amd64
 # rather than three call sites each getting it right.
 MKOSI_ARCH := $(if $(filter arm64,$(notdir $(APPLIANCE_ARCH))),arm64,x86-64)
 
+# Optional mkosi profile (#1026) — e.g. APPLIANCE_PROFILE=rpi5 for the
+# Raspberry Pi 5 image (RPi downstream kernel, so the RP1 onboard NIC works).
+# Empty by default, so ordinary amd64 / arm64 builds are byte-for-byte unchanged.
+APPLIANCE_PROFILE ?=
+MKOSI_PROFILE_FLAG := $(if $(APPLIANCE_PROFILE),--profile $(APPLIANCE_PROFILE),)
+
 # Per-build identifier used as the image tag (compose substitutes via
 # ``${SPATIUMDDI_VERSION}``). Computed once per ``make`` invocation —
 # git short sha + 4 random hex chars — so each ISO cut produces a
@@ -538,7 +544,7 @@ appliance:
 	docker run --rm --privileged \
 	    -v $(PWD)/$(APPLIANCE_DIR):/work \
 	    $(APPLIANCE_BUILDER) \
-	    --architecture=$(MKOSI_ARCH) \
+	    --architecture=$(MKOSI_ARCH) $(MKOSI_PROFILE_FLAG) \
 	    --output-directory=build --force build
 	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
 	if [ -n "$$raw" ]; then \
@@ -845,6 +851,7 @@ appliance-stamp-dev:
 	  echo "APPLIANCE_VERSION=\"$(SPATIUMDDI_VERSION)\""; \
 	  echo "BUILD_TIME=\"$$(date -u +%Y-%m-%dT%H:%M:%SZ)\""; \
 	  echo "APPLIANCE_ARCH=\"$(notdir $(APPLIANCE_ARCH))\""; \
+	  echo "APPLIANCE_PROFILE=\"$(APPLIANCE_PROFILE)\""; \
 	} > $$f; \
 	echo "→ Stamped appliance-release: $$(cat $$f | grep APPLIANCE_VERSION)"
 
