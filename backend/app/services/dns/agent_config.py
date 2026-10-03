@@ -550,12 +550,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
     tsig_keys: list[dict[str, Any]] = []
-    if grp and grp.tsig_key_name and grp.tsig_key_secret:
+    if (group_key := legacy_group_key(grp)) is not None:
         tsig_keys.append(
             {
-                "name": grp.tsig_key_name,
-                "secret": grp.tsig_key_secret,
-                "algorithm": grp.tsig_key_algorithm,
+                "name": group_key.name,
+                "secret": group_key.secret,
+                "algorithm": group_key.algorithm,
             }
         )
 
@@ -697,7 +697,8 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # no legacy key ships none, and its views render as before. The secret rides
     # the bundle body under the same trust model as ``tsig_keys``, and
     # ``views`` is structural, so a group-key rotation re-renders the views.
-    group_key = legacy_group_key(grp)
+    # ``group_key`` is the legacy key resolved for ``tsig_keys`` above; it is
+    # not re-read here, so the secret is decrypted once per render.
     if group_key is not None:
         for view_entry in views_block:
             vkey = view_transfer_key(group_key, view_entry["name"])

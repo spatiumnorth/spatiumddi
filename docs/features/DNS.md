@@ -607,7 +607,8 @@ DNSZone
   id, server_group_id, view_id (nullable)
   name (FQDN with trailing dot, e.g., "example.com.")
   type: enum(primary, secondary, stub, forward)
-  kind: enum(forward, reverse)    -- forward or reverse lookup zone
+  kind: enum(forward, reverse)    -- forward or reverse lookup zone; a primary
+                                  --   zone under in-addr.arpa / ip6.arpa is reverse (#1310)
   ttl (default SOA TTL)
   refresh, retry, expire, minimum (SOA fields)
   primary_ns, admin_email         (SOA fields)

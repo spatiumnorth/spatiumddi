@@ -218,6 +218,7 @@ backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_colum
 backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_column:54
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:43
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:44
+backend/alembic/versions/b3c71e9a4d25_dns_group_tsig_secret_encrypted.py:drop_column:95
 backend/alembic/versions/b3e7d1f9a204_appliance_host_migration_health.py:drop_column:47
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:148
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:149

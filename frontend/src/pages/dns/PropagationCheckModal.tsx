@@ -11,6 +11,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import {
   dnsApi,
+  formatApiError,
   type PropagationCheckResult,
   type PropagationResolverResult,
 } from "@/lib/api";
@@ -98,8 +99,9 @@ export function PropagationCheckModal({
         <ResultsTable
           result={checkMut.data}
           isLoading={checkMut.isPending}
-          isError={checkMut.isError}
-          errorMessage={(checkMut.error as Error | undefined)?.message}
+          errorMessage={
+            checkMut.isError ? formatApiError(checkMut.error) : undefined
+          }
           resolvers={resolvers.map((r) => ({
             address: r.address,
             name: r.name,
@@ -113,18 +115,18 @@ export function PropagationCheckModal({
 function ResultsTable({
   result,
   isLoading,
-  isError,
   errorMessage,
   resolvers,
 }: {
   result: PropagationCheckResult | undefined;
   isLoading: boolean;
-  isError: boolean;
   errorMessage: string | undefined;
   resolvers: { address: string; name: string }[];
 }) {
   // While the first request is in flight we render placeholder rows so
-  // the operator sees what's about to be queried.
+  // the operator sees what's about to be queried. A placeholder is not a
+  // result: its status is never shown, so a check that failed (#1344)
+  // leaves every resolver unanswered rather than "OK".
   const rows: PropagationResolverResult[] = result
     ? result.results
     : resolvers.map((r) => ({
@@ -157,7 +159,7 @@ function ResultsTable({
                 </div>
               </td>
               <td className="px-2 py-1.5">
-                {result || isError ? (
+                {result ? (
                   <StatusBadge status={r.status} />
                 ) : isLoading ? (
                   <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
@@ -187,9 +189,9 @@ function ResultsTable({
           ))}
         </tbody>
       </table>
-      {isError && errorMessage && (
+      {errorMessage && (
         <div className="border-t bg-destructive/5 px-2 py-1.5 text-xs text-destructive">
-          {errorMessage}
+          The check failed: {errorMessage}
         </div>
       )}
       {result && (
