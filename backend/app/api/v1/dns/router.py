@@ -38,6 +38,7 @@ from app.core.agent_wake import (
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
+    bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
     validate_fqdn,
@@ -85,6 +86,15 @@ from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns.bundle_dirty import mark_bundles_dirty
+from app.services.dns.cname_conflict import (
+    APEX_CNAME_DETAIL,
+    CNAME_CONFLICT_REASON,
+    describe_cname_conflict,
+    find_cname_conflict,
+    is_apex,
+    types_conflict,
+    views_overlap,
+)
 from app.services.dns.delegation import (
     compute_delegation,
     find_parent_zone,
@@ -1537,6 +1547,36 @@ def _validate_address_record_value(record_type: str, value: str) -> None:
             "list in one record."
         ),
     )
+
+
+def _enforce_bind_check_names(
+    record_type: str,
+    owner_fqdn: str,
+    value: str,
+    zone_name: str,
+    *,
+    check_owner: bool = True,
+    check_target: bool = True,
+) -> None:
+    """422 a record BIND's default ``check-names`` would refuse (#1378).
+
+    The RFC 2181 owner rule lets ``_`` into any owner, but BIND refuses a zone
+    whose A / AAAA / MX owner, or MX / NS / SRV target, is not a host name —
+    and one such record made the agent quarantine the server's whole config
+    bundle, so no later change on that server applied. Refusing it here keeps
+    the API from storing what the group's BIND will not load. The rule lives in
+    ``app.core.dns_names.bind_check_names_error``.
+    """
+    err = bind_check_names_error(
+        record_type,
+        owner_fqdn,
+        value,
+        origin=zone_name,
+        check_owner=check_owner,
+        check_target=check_target,
+    )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 # ── Server Group endpoints ──────────────────────────────────────────────────
@@ -6660,6 +6700,30 @@ def _identical_record_conflict(existing: DNSRecord) -> HTTPException:
     return HTTPException(status.HTTP_409_CONFLICT, describe_identical(existing))
 
 
+async def _refuse_cname_conflict(
+    db: DB,
+    zone_id: uuid.UUID,
+    *,
+    view_id: uuid.UUID | None,
+    name: str,
+    record_type: str,
+    fqdn: str,
+    exclude_id: uuid.UUID | None = None,
+) -> None:
+    """#1381 — a CNAME stands alone at its name; see
+    ``app.services.dns.cname_conflict``. 422 for a CNAME at the apex (never
+    valid), 409 for a clash with a row the zone holds."""
+    if record_type.upper() == "CNAME" and is_apex(name):
+        raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+    other = await find_cname_conflict(
+        db, zone_id, view_id=view_id, name=name, record_type=record_type, exclude_id=exclude_id
+    )
+    if other is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, describe_cname_conflict(record_type, fqdn, other)
+        )
+
+
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/records",
     response_model=RecordResponse,
@@ -6683,6 +6747,7 @@ async def create_record(
     )
     _validate_address_record_value(body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+    _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
     # not store the same RR twice.
     existing = await find_identical_record(
@@ -6698,6 +6763,14 @@ async def create_record(
     )
     if existing is not None:
         raise _identical_record_conflict(existing)
+    await _refuse_cname_conflict(
+        db,
+        zone_id,
+        view_id=body.view_id,
+        name=body.name,
+        record_type=body.record_type,
+        fqdn=fqdn,
+    )
 
     record = DNSRecord(
         zone_id=zone_id,
@@ -6757,6 +6830,8 @@ async def update_record(
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
     changes = body.model_dump(exclude_none=True)
+    before_name, before_value = record.name, record.value
+    before_view = record.view_id
     for k, v in changes.items():
         setattr(record, k, v)
     # #424 — validate the merged per-type fields (record_type is immutable on
@@ -6773,6 +6848,20 @@ async def update_record(
         _validate_address_record_value(record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
+    # #1378 — what the edit actually changes is checked against BIND's
+    # check-names (validate-on-write, as above), so resubmitting a row's own
+    # name or value with a TTL edit does not re-judge a row that predates it.
+    name_changed = (record.name or "").lower() != (before_name or "").lower()
+    value_changed = (record.value or "").strip() != (before_value or "").strip()
+    if zone is not None and (name_changed or value_changed):
+        _enforce_bind_check_names(
+            record.record_type,
+            record.fqdn,
+            record.value,
+            zone.name,
+            check_owner=name_changed,
+            check_target=value_changed,
+        )
     # #1230 — an edit must not turn this row into a twin of another. Only
     # checked when a field that makes up the record's identity changed, so a
     # TTL edit on a twin that predates the rule still goes through.
@@ -6791,6 +6880,18 @@ async def update_record(
         )
         if existing is not None:
             raise _identical_record_conflict(existing)
+    # #1381 — a rename or a move to another view must not land on a CNAME's
+    # name (or put a CNAME beside a name's data).
+    if name_changed or record.view_id != before_view:
+        await _refuse_cname_conflict(
+            db,
+            record.zone_id,
+            view_id=record.view_id,
+            name=record.name,
+            record_type=record.record_type,
+            fqdn=record.fqdn,
+            exclude_id=record.id,
+        )
     target_serial = bump_zone_serial(zone) if zone is not None else None
     if zone is not None:
         await enqueue_record_op(
@@ -7150,6 +7251,11 @@ class BulkCreateRecordsRequest(BaseModel):
     other still lists it. Identical means the same view, owner name (compared
     case-insensitively), type, value and structured fields. Re-submitting a
     batch is therefore idempotent.
+
+    A record that would share its name with a CNAME, or a CNAME at a name that
+    already holds a record — in the zone or earlier in the batch, in an
+    overlapping view — is skipped the same way (#1381); a CNAME at the zone
+    apex fails the whole batch with a 422.
     """
 
     records: list[RecordCreate]
@@ -7211,8 +7317,14 @@ async def bulk_create_records(
 
     # #1230 — the zone's live records at the submitted names, so a record the
     # zone already holds is skipped rather than stored a second time.
+    if any(r.record_type == "CNAME" and is_apex(r.name) for r in body.records):
+        raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+
     names = sorted({r.name.lower() for r in body.records})
     existing_keys: set[tuple[Any, ...]] = set()
+    # #1381 — what each submitted name already holds (view, type), for the
+    # CNAME rule below: against the zone, and within the batch as it is kept.
+    occupants: dict[str, list[tuple[uuid.UUID | None, str]]] = {}
     for start in range(0, len(names), 5000):
         rows = (
             await db.execute(
@@ -7231,6 +7343,10 @@ async def bulk_create_records(
             )
         ).all()
         existing_keys.update(_identity(*row) for row in rows)
+        for row in rows:
+            occupants.setdefault(row.name.lower(), []).append(
+                (row.view_id, row.record_type.upper())
+            )
 
     seen: set[tuple[Any, ...]] = set()
     skipped: list[dict[str, str]] = []
@@ -7242,12 +7358,18 @@ async def bulk_create_records(
             if key in existing_keys
             else "duplicate within batch" if key in seen else None
         )
+        here = occupants.setdefault(r.name.lower(), [])
+        if reason is None and any(
+            views_overlap(v, r.view_id) and types_conflict(r.record_type, t) for v, t in here
+        ):
+            reason = CNAME_CONFLICT_REASON
         if reason is not None:
             skipped.append(
                 {"name": r.name, "record_type": r.record_type, "value": r.value, "reason": reason}
             )
             continue
         seen.add(key)
+        here.append((r.view_id, r.record_type.upper()))
         accepted.append(r)
 
     if not accepted:
@@ -7257,6 +7379,7 @@ async def bulk_create_records(
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
+        _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(
             DNSRecord(
                 zone_id=zone_id,
