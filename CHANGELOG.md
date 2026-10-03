@@ -27,6 +27,64 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP on an IPv6 subnet no longer names an address it will not
+  allocate (#1307).** "Next available" previews the address with
+  `strategy=sequential`, but for IPv6 the pick follows the subnet's
+  `ipv6_allocation_policy`, `random` by default, and draws a fresh
+  random suffix on every call, so the address shown was never the one
+  allocated. The preview endpoint now reports the strategy that picked
+  its candidate instead of echoing the one asked for, and the dialog
+  names the address only when the pick repeats (sequential, or EUI-64
+  from a MAC). For a random pick it says the address is picked when you
+  allocate. IPv4, and IPv6 subnets that allocate sequentially, are
+  unchanged.
+
+- **Allocate IP no longer offers a DHCP scope for status "dhcp", where
+  nothing uses it (#1306).** Choosing status "dhcp" showed a DHCP Scope
+  picker with a scope already selected, but only a `static_dhcp`
+  allocation makes a reservation on a scope: the `dhcp` request never
+  carried it. The picker now appears for `static_dhcp` only, as it does
+  in Edit address.
+
+- **Edit address shows the role and status an address is stored with
+  (#1305).** Its Role menu lacked `web`, `api` and `lb`, which the API
+  accepts, and its Status menu lacked the statuses integrations set
+  (`docker-container`, `proxmox-vm`, …). A select whose value is not
+  among its options shows its first one, so such an address read as Role
+  "— None —" or Status "available" while the table beside it said
+  otherwise, and "— None —" could not be picked to clear a role because
+  it already looked selected. Allocate IP and Edit address now offer the
+  three TLS-serving roles, and Edit address keeps the address's own
+  status or role as an option whenever its menu lacks it.
+
+- **A template picked in New Subnet or New IP Block applies (#1304).**
+  The dialogs sent their own defaults for every field a template fills
+  (`custom_fields: {}`, DDNS off, DNS and DHCP inherited), and the API's
+  template pre-fill fills only the fields a request leaves out, so the
+  template's custom fields, DDNS settings and DHCP group were dropped:
+  only its tags landed. Its DDNS lock still turned the new subnet's DDNS
+  inheritance off, so DDNS ended up pinned off, and its DHCP group sat
+  behind "inherit" with no effect. Picking a template now fills its
+  custom fields and its DNS, DHCP and DDNS settings into the dialog's own
+  fields, where they can be seen and changed, and the request carries
+  them. The API applies a template's DDNS lock only together with a DDNS
+  value it took from the template: a request that sets every DDNS value
+  the template sets gets the DDNS inheritance it would get with no
+  template.
+
+- **A custom field's Default Value is what the IPAM dialogs send, not
+  only what they show (#1303).** Allocate IP, New Subnet and New IP Block
+  showed a field's Default Value (Settings → Custom Fields) as its value,
+  but sent `custom_fields: {}`, and the API applies no default on create,
+  so the object was stored without it. Edit subnet, Edit IP Block and
+  Edit address showed the default too, on objects that never had the
+  field. The create dialogs now start the field at its default and send
+  it; the edit dialogs show only what is stored. A boolean default of
+  "false" rendered checked: boolean values are now read as true / false
+  words, and a select default its options do not offer, or a number
+  default that is not a number, is left out. The default stays a console
+  pre-fill: a create through the API or an import gets what it sends.
+
 - **Add Zone stores a reverse-lookup name as a reverse zone, so IPAM
   publishes its PTRs (#1310).** Kind was pre-filled "Forward lookup"
   whatever the name, and the zone API stored the kind it was given and
