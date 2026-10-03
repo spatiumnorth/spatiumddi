@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.services.superadmin_grant import (
     SuperadminModel,
     holds_superadmin,
@@ -376,3 +377,159 @@ async def test_the_copilot_grant_refuses_one_that_makes_superadmins(
     # An ordinary grant still goes through.
     read = GrantTemporaryAccessArgs(group_id=str(group.id), action="read", resource_type="subnet")
     assert (await _preview_grant_temporary_access(db_session, admin, read)).ok is True
+
+
+# ── Auth-provider group mappings (#1476) ─────────────────────────────────────
+
+
+async def _provider(db: AsyncSession) -> AuthProvider:
+    prov = AuthProvider(
+        name=_name("ldap"),
+        type="ldap",
+        is_enabled=True,
+        priority=100,
+        config={},
+        auto_create_users=True,
+        auto_update_users=True,
+    )
+    db.add(prov)
+    await db.commit()
+    return prov
+
+
+async def _mappings(db: AsyncSession, provider_id: uuid.UUID) -> list[AuthGroupMapping]:
+    rows = await db.execute(
+        select(AuthGroupMapping).where(AuthGroupMapping.provider_id == provider_id)
+    )
+    return list(rows.scalars())
+
+
+@pytest.mark.asyncio
+async def test_mapping_an_idp_group_into_a_superadmin_group_needs_the_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Nobody is a superadmin yet, and nobody needs to be: the next sign-in
+    from the external group would be one."""
+    _, headers = await _admin(db_session)
+    prov = await _provider(db_session)
+    group = await _group(db_session, roles=[await _role(db_session, _STAR)], users=[])
+    url = f"/api/v1/auth-providers/{prov.id}/mappings"
+    body = {"external_group": "CN=Admins,DC=example,DC=com", "internal_group_id": str(group.id)}
+
+    r = await client.post(url, headers=headers, json=body)
+    assert r.status_code == 403, r.text
+    assert r.headers.get("X-Stepup-Required") == "true"
+    assert await _mappings(db_session, prov.id) == []
+
+    r = await client.post(url, headers=headers, json={**body, "stepup_password": _PW})
+    assert r.status_code == 201, r.text
+    row = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.resource_type == "auth_group_mapping",
+                    AuditLog.result == "success",
+                )
+                .order_by(AuditLog.timestamp.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert row is not None
+    assert row.new_value["grants_superadmin"] is True
+    assert row.new_value["stepup_method"] == "password"
+
+
+@pytest.mark.asyncio
+async def test_mapping_into_an_ordinary_group_needs_no_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _admin(db_session)
+    prov = await _provider(db_session)
+    viewers = await _group(
+        db_session,
+        roles=[await _role(db_session, [{"action": "read", "resource_type": "*"}])],
+        users=[],
+    )
+    r = await client.post(
+        f"/api/v1/auth-providers/{prov.id}/mappings",
+        headers=headers,
+        json={"external_group": "CN=Viewers", "internal_group_id": str(viewers.id)},
+    )
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.asyncio
+async def test_repointing_a_mapping_at_a_superadmin_group_needs_the_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _admin(db_session)
+    prov = await _provider(db_session)
+    plain = await _group(db_session, roles=[], users=[])
+    star = await _group(db_session, roles=[await _role(db_session, _STAR)], users=[])
+    mapping = AuthGroupMapping(
+        provider_id=prov.id, external_group="CN=Ops", internal_group_id=plain.id
+    )
+    db_session.add(mapping)
+    await db_session.commit()
+    url = f"/api/v1/auth-providers/{prov.id}/mappings/{mapping.id}"
+
+    r = await client.put(url, headers=headers, json={"internal_group_id": str(star.id)})
+    assert r.status_code == 403, r.text
+    assert r.headers.get("X-Stepup-Required") == "true"
+    await db_session.refresh(mapping)
+    assert mapping.internal_group_id == plain.id
+
+    r = await client.put(
+        url, headers=headers, json={"internal_group_id": str(star.id), "stepup_password": _PW}
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_renaming_the_external_group_of_a_superadmin_mapping_needs_the_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A new external group is a new set of IdP accounts becoming superadmins."""
+    _, headers = await _admin(db_session)
+    prov = await _provider(db_session)
+    star = await _group(db_session, roles=[await _role(db_session, _STAR)], users=[])
+    mapping = AuthGroupMapping(
+        provider_id=prov.id, external_group="CN=Admins", internal_group_id=star.id
+    )
+    db_session.add(mapping)
+    await db_session.commit()
+    url = f"/api/v1/auth-providers/{prov.id}/mappings/{mapping.id}"
+
+    r = await client.put(url, headers=headers, json={"external_group": "CN=Everyone"})
+    assert r.status_code == 403, r.text
+    await db_session.refresh(mapping)
+    assert mapping.external_group == "CN=Admins"
+
+
+@pytest.mark.asyncio
+async def test_a_priority_or_unchanged_edit_of_a_superadmin_mapping_needs_no_step_up(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Every matching mapping applies on sign-in, so the priority changes who
+    is a superadmin not at all; nor does resubmitting the same values."""
+    _, headers = await _admin(db_session)
+    prov = await _provider(db_session)
+    star = await _group(db_session, roles=[await _role(db_session, _STAR)], users=[])
+    mapping = AuthGroupMapping(
+        provider_id=prov.id, external_group="CN=Admins", internal_group_id=star.id
+    )
+    db_session.add(mapping)
+    await db_session.commit()
+    url = f"/api/v1/auth-providers/{prov.id}/mappings/{mapping.id}"
+
+    r = await client.put(url, headers=headers, json={"priority": 5})
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        url,
+        headers=headers,
+        json={"external_group": "CN=Admins", "internal_group_id": str(star.id)},
+    )
+    assert r.status_code == 200, r.text

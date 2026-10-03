@@ -376,10 +376,15 @@ the formatter handles the rest.
   Role column now shows a superadmin through a group's role, marked
   "(role)", where it said "user". The Copilot's temporary-access proposal
   refuses a `*` / `*` grant that would make superadmins, since a chat
-  Apply cannot ask for a password. Not covered yet: an auth-provider group
-  mapping that targets a superadmin group (#1476). **Behaviour change:**
-  an API client that makes such a group, role or grant change must send
-  `stepup_password` (or `stepup_totp_code`).
+  Apply cannot ask for a password. An auth-provider group mapping into a
+  superadmin group needs it as well (#1476): it grants nothing until an
+  account from the external group signs in, so the check is on the target
+  group, and covers creating such a mapping, re-pointing one at such a
+  group and renaming its external group. The mapping editor now asks for
+  the step-up, and shows a failed save instead of saying nothing.
+  **Behaviour change:** an API client that makes such a group, role,
+  grant or mapping change must send `stepup_password` (or
+  `stepup_totp_code`).
 
 - **The older secret reveals count wrong answers like every other
   step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing

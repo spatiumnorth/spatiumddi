@@ -153,9 +153,13 @@ session alone doesn't prove and an SSO account has no local password.
   that a step-up is needed from the server — a `403` carrying
   `X-Stepup-Required: true` — then ask for it and resubmit. The Copilot's
   temporary-access proposal refuses such a grant, since a chat Apply cannot
-  ask for a password. Not covered: an auth-provider group mapping that
-  targets a superadmin group, which grants nothing until a matching IdP
-  account signs in (#1476).
+  ask for a password. An auth-provider group mapping that targets a
+  superadmin group needs it too (#1476): it grants nothing at once, but the
+  next sign-in from any account in the external group becomes a superadmin,
+  and who that is cannot be known when the mapping is saved. So the check
+  there is on the target group: creating such a mapping, re-pointing one at
+  such a group, or renaming the external group of one that targets it. A
+  priority change needs none, since every matching mapping applies.
 
 ## External identity providers
 

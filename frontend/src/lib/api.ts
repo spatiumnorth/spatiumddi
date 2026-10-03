@@ -4289,13 +4289,14 @@ export interface AuthGroupMapping {
   modified_at: string;
 }
 
-export interface AuthGroupMappingCreate {
+// #1476 — a mapping into a group that grants superadmin needs the step-up.
+export interface AuthGroupMappingCreate extends StepUp {
   external_group: string;
   internal_group_id: string;
   priority?: number;
 }
 
-export interface AuthGroupMappingUpdate {
+export interface AuthGroupMappingUpdate extends StepUp {
   external_group?: string;
   internal_group_id?: string;
   priority?: number;
