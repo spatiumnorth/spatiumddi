@@ -9,7 +9,8 @@ For ``kind="webhook"``, ``webhook_flavor`` further selects how the JSON
 body is shaped: ``generic`` posts the raw audit/alert payload,
 ``slack``/``teams``/``discord`` wraps it in the platform's
 incoming-webhook block format so chat-channel delivery works without a
-separate transformer.
+separate transformer, and ``apprise`` hands the event to Apprise for any
+of the services it supports.
 """
 
 from __future__ import annotations
@@ -56,11 +57,14 @@ class AuditForwardTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # upgrade's old pods keep working (#296). The next release drops them.
     url_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     auth_header_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    # webhook_flavor: generic | slack | teams | discord
+    # webhook_flavor: generic | slack | teams | discord | apprise
     # Picks the platform-specific JSON shape at send time. ``generic`` is
     # the original behaviour (raw audit/alert payload); the others wrap
     # in Slack mrkdwn / Teams MessageCard / Discord embed format so a
     # standard incoming-webhook URL works without a transformer.
+    # ``apprise`` (#1503) is different: ``url_encrypted`` then holds one
+    # Apprise service URL (``tgram://…``, ``ntfys://…``) and Apprise does
+    # the transport and formatting (``app.services.apprise_delivery``).
     webhook_flavor: Mapped[str] = mapped_column(
         String(16),
         nullable=False,

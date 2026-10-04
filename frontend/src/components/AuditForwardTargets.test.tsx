@@ -114,3 +114,49 @@ describe("webhook secrets in the target form", () => {
     expect("url" in body).toBe(false);
   });
 });
+
+describe("the Apprise flavor (#1503)", () => {
+  it("asks for the URL again when a target switches to Apprise", async () => {
+    await openEdit();
+    fireEvent.change(screen.getByDisplayValue("Generic JSON"), {
+      target: { value: "apprise" },
+    });
+    expect(
+      screen.getByText(
+        "Enter the URL again: the stored one belongs to the previous flavor.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText("tgram://<bot_token>/<chat_id>"),
+    ).toBeTruthy();
+    expect(screen.getByText("Apprise documentation")).toBeTruthy();
+  });
+
+  it("keeps a stored Apprise URL when the field is left blank", async () => {
+    const stored: AuditForwardTarget = {
+      ...TARGET,
+      webhook_flavor: "apprise",
+      url_display: "tgram://…",
+      auth_header_set: false,
+    };
+    api.list.mockResolvedValue([stored]);
+    api.update.mockResolvedValue(stored);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("tgram://…");
+    fireEvent.click(screen.getByTitle("Edit"));
+    await screen.findByText(/Stored: tgram:\/\/…/);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Save"));
+    });
+    const body = api.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.webhook_flavor).toBe("apprise");
+    expect("url" in body).toBe(false);
+  });
+});

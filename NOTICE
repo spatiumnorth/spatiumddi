@@ -140,6 +140,11 @@ Where the two disagree about a license, THIS file is authoritative.
 - python-dateutil (recurrence RRULE/RDATE expansion) — Apache 2.0 / BSD 3-Clause — https://github.com/dateutil/dateutil
 - idna (IDNA2008 host/record name normalization — issue #597) — BSD 3-Clause — https://github.com/kjd/idna
 - PyYAML — MIT — https://pyyaml.org
+- Apprise (alert / audit delivery to Telegram, ntfy, Pushover, Matrix and other
+  notification services) — BSD 2-Clause — https://github.com/caronc/apprise
+- Python-Markdown (Apprise dependency) — BSD 3-Clause — https://github.com/Python-Markdown/markdown
+- requests-oauthlib / OAuthLib (Apprise dependencies) — ISC / BSD 3-Clause —
+  https://github.com/requests/requests-oauthlib , https://github.com/oauthlib/oauthlib
 - docker SDK for Python (appliance cert reload) — Apache 2.0 — https://github.com/docker/docker-py
 - boto3 / botocore (AWS — infra mirror + Route 53 DNS + S3 backups) — Apache 2.0 — https://github.com/boto/boto3
 - azure-identity / azure-mgmt-network / azure-mgmt-compute / azure-mgmt-dns / azure-mgmt-resource / azure-storage-blob (Azure — infra mirror + Azure DNS + Blob backups) — MIT — https://github.com/Azure/azure-sdk-for-python

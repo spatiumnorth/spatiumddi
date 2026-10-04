@@ -450,6 +450,28 @@ don't serialize the queue.
   `HTTP Request: POST …` log line for a delivery shows only that
   host, and delivery errors are redacted before they are logged or
   returned by **Test**.
+- **Apprise** (#1503) — `webhook_flavor="apprise"`. The URL is one
+  [Apprise](https://github.com/caronc/apprise) service URL
+  (`tgram://<bot_token>/<chat_id>`, `ntfys://…`, `pover://…`,
+  `workflows://…` for Teams Workflows, …), stored like any webhook URL
+  but displayed as its scheme only (`tgram://…`), because there the
+  host can be the token. Each event becomes a title and a plain-text
+  body with an Apprise notify type (`info`, `warning`; `failure` for
+  error / denied / critical), and Apprise formats it for the service.
+  Apprise is synchronous, so each call runs on a four-thread pool off
+  the event loop, with Apprise's own connect / read timeouts (4 s each
+  by default, `cto=` / `rto=` in the URL) and a 20 s deadline for the
+  whole message. Create / update returns 422 when Apprise cannot load
+  the URL (parsing only, nothing is sent, the URL is not echoed), and a
+  target switched to or from `apprise` needs its URL re-entered.
+  **Test** reports the service's reason (e.g. `Telegram: Failed to send
+  Telegram notification to [redacted]: Bad Request: chat not found,
+  error=400.`), taken from that call's `AppriseResult` and redacted.
+  The `apprise` logger does not propagate to the application's
+  handlers, and any library's log record written during a send
+  (urllib3's DEBUG request line carries Telegram's bot token in its
+  path) has the URL's parts replaced. Rule gating is unchanged: these
+  are webhook targets, so an alert rule's webhook channel covers them.
 - **SMTP email** — stdlib `smtplib` driven through
   `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
   plaintext, optional auth (Fernet-encrypted password at rest).

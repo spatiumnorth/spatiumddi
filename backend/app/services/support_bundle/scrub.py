@@ -142,6 +142,47 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # A Shared Access Signature in a query string: a Teams Workflows
     # (Power Automate / Logic Apps) webhook, or any Azure SAS URL.
     ("sas-signature", re.compile(r"(?<=[?&]sig=)[A-Za-z0-9%_+/=-]+"), _REDACTED),
+    # Apprise service URLs (#1503) carry their credential in whichever URL
+    # part the service chose. The audit-forward sender keeps them out of
+    # its own logs; these catch whatever else prints one. ``user:pass@``
+    # (ntfy, Matrix, Mattermost, …) is already covered by url-credentials
+    # above. As there, brackets are excluded from every class so a
+    # replacement cannot match the pattern that produced it.
+    #
+    # Telegram: the bot token is the host, ``tgram://<id>:<secret>/<chat>``.
+    ("apprise-url", re.compile(r"(?<=tgram://)[^\s/\"'<>\[\]]+"), _REDACTED),
+    # Pushover: ``pover://<user key>@<app token>``.
+    ("apprise-url", re.compile(r"(?<=pover://)[^\s/\"'<>\[\]]+"), _REDACTED),
+    # A token used as the whole userinfo: ``ntfys://<token>@host``,
+    # ``matrixs://<token>@host``.
+    (
+        "apprise-url",
+        re.compile(r"\b((?:ntfys?|matrixs?)://)[^\s/@:\"'<>\[\]]+(?=@)"),
+        rf"\1{_REDACTED}",
+    ),
+    # Gotify: the application token is the path, ``gotify(s)://host/<token>``.
+    (
+        "apprise-url",
+        re.compile(r"\b(gotifys?://[^\s/\"'<>\[\]]+/)[^\s?#\"'<>\[\]]+"),
+        rf"\1{_REDACTED}",
+    ),
+    # A Telegram Bot API token wherever it appears, e.g. in a request line
+    # ``/bot<id>:<secret>/sendMessage``.
+    (
+        "telegram-bot-token",
+        re.compile(r"(?<!\d)\d{3,15}:[A-Za-z0-9_-]{30,}"),
+        _REDACTED,
+    ),
+    # A secret-named query parameter on any URL (``?token=…``, ``&apikey=…``).
+    (
+        "url-query-secret",
+        re.compile(
+            r"(?<=[?&])((?:access_token|token|apikey|api_key|key|secret|password|pass|pwd)=)"
+            r"[^&\s\"'<>#\[\]]+",
+            re.IGNORECASE,
+        ),
+        rf"\1{_REDACTED}",
+    ),
 )
 
 # Matched on KEY name, for structured data (env dumps, settings rows,

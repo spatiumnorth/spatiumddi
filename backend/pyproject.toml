@@ -94,6 +94,13 @@ dependencies = [
     # post-rolling-upgrade. Pinned explicitly so the chart-bump path
     # doesn't break if a transitive consumer drops the dep.
     "PyYAML>=6.0",
+    # Apprise delivery for webhook forward targets (#1503): one service URL
+    # covers Telegram, ntfy, Pushover, Matrix, Teams Workflows and the rest.
+    # 2.x for ``AppriseResult``: notify() returns the call's own status and
+    # log lines, which is how the Test button reports the service's reason.
+    # Pulls in requests-oauthlib (+ oauthlib) and Markdown; requests,
+    # urllib3, certifi, click and PyYAML are already here.
+    "apprise>=2.0.1,<3",
 ]
 
 [project.optional-dependencies]

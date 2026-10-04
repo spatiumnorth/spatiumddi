@@ -26,6 +26,7 @@ import {
   type AuditForwardSeverity,
   type AuditForwardTarget,
   type AuditForwardTargetWrite,
+  type AuditForwardWebhookFlavor,
 } from "@/lib/api";
 
 const inputCls =
@@ -473,6 +474,13 @@ function TargetModal({
 
   const isSyslog = form.kind === "syslog";
   const isWebhook = form.kind === "webhook";
+  // The stored URL is an Apprise URL or a plain webhook URL; switching
+  // between the two needs a new one (the server refuses a blank field).
+  const flavorSwitch =
+    !!existingId &&
+    urlSet &&
+    (initial.webhook_flavor === "apprise") !==
+      (form.webhook_flavor === "apprise");
 
   return (
     <Modal
@@ -670,11 +678,7 @@ function TargetModal({
                 onChange={(e) =>
                   setForm({
                     ...form,
-                    webhook_flavor: e.target.value as
-                      | "generic"
-                      | "slack"
-                      | "teams"
-                      | "discord",
+                    webhook_flavor: e.target.value as AuditForwardWebhookFlavor,
                   })
                 }
               >
@@ -682,11 +686,16 @@ function TargetModal({
                 <option value="slack">Slack (mrkdwn blocks)</option>
                 <option value="teams">Microsoft Teams (MessageCard)</option>
                 <option value="discord">Discord (embed)</option>
+                <option value="apprise">
+                  Apprise (Telegram, ntfy, Pushover, Matrix, Teams Workflows, …)
+                </option>
               </select>
               <div className="mt-1 text-[11px] text-muted-foreground">
                 {form.webhook_flavor === "generic"
                   ? "Posts the raw audit/alert JSON. For collectors that parse it themselves."
-                  : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+                  : form.webhook_flavor === "apprise"
+                    ? "Sends a title and a short text through Apprise, which formats it for the service. One Apprise URL per target."
+                    : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
               </div>
             </label>
             <label className="block">
@@ -701,22 +710,53 @@ function TargetModal({
                 value={form.url ?? ""}
                 onChange={(e) => setForm({ ...form, url: e.target.value })}
                 placeholder={
-                  urlSet
+                  urlSet && !flavorSwitch
                     ? "(stored — leave blank to keep unchanged)"
-                    : form.webhook_flavor === "slack"
-                      ? "https://hooks.slack.com/services/T…/B…/…"
-                      : form.webhook_flavor === "teams"
-                        ? "https://…webhook.office.com/webhookb2/…"
-                        : form.webhook_flavor === "discord"
-                          ? "https://discord.com/api/webhooks/…/…"
-                          : "https://collector.example.com/ingest"
+                    : form.webhook_flavor === "apprise"
+                      ? "tgram://<bot_token>/<chat_id>"
+                      : form.webhook_flavor === "slack"
+                        ? "https://hooks.slack.com/services/T…/B…/…"
+                        : form.webhook_flavor === "teams"
+                          ? "https://…webhook.office.com/webhookb2/…"
+                          : form.webhook_flavor === "discord"
+                            ? "https://discord.com/api/webhooks/…/…"
+                            : "https://collector.example.com/ingest"
                 }
               />
               <div className="mt-1 text-[11px] text-muted-foreground">
-                {urlSet
-                  ? `Stored: ${urlDisplay || "(set)"}. Encrypted at rest and never shown again — paste a new URL to replace it.`
-                  : "Encrypted at rest and never shown again after saving."}
+                {flavorSwitch
+                  ? "Enter the URL again: the stored one belongs to the previous flavor."
+                  : urlSet
+                    ? `Stored: ${urlDisplay || "(set)"}. Encrypted at rest and never shown again — paste a new URL to replace it.`
+                    : "Encrypted at rest and never shown again after saving."}
               </div>
+              {form.webhook_flavor === "apprise" && (
+                <div className="mt-1 space-y-0.5 text-[11px] text-muted-foreground">
+                  <div>
+                    Telegram:{" "}
+                    <code>tgram://&lt;bot_token&gt;/&lt;chat_id&gt;</code>
+                  </div>
+                  <div>
+                    ntfy:{" "}
+                    <code>
+                      ntfys://&lt;user&gt;:&lt;password&gt;@&lt;host&gt;/&lt;topic&gt;
+                    </code>
+                  </div>
+                  <div>
+                    Every service and its URL format:{" "}
+                    <a
+                      href="https://appriseit.com/services/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline"
+                    >
+                      Apprise documentation
+                    </a>
+                    . Saving checks that Apprise can read the URL; use Test to
+                    send a message.
+                  </div>
+                </div>
+              )}
             </label>
             {form.webhook_flavor === "generic" && (
               <div>
