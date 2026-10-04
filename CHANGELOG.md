@@ -518,6 +518,17 @@ the formatter handles the rest.
   No operator action is needed; an account that may have been exposed
   can disable and re-enrol MFA to rotate its secret.
 
+- **The pre-restore safety dump is no longer readable by other local users (GHSA-g996-3ph6-q3x8).**
+  `_write_pre_restore_safety_dump` created its directory and zip with
+  default modes, and the archive's secrets envelope uses a documented
+  constant passphrase, so anyone able to read the file could recover
+  `SECRET_KEY`. The directory is now created 0700 (and tightened if it
+  already existed looser) and the zip is created 0600 at open time, with
+  no window where it is group- or world-readable. Existing dumps keep
+  their old modes; the next restore tightens the directory.
+  Not yet changed: the constant passphrase itself, and pruning of old
+  dumps; both are follow-ups.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
