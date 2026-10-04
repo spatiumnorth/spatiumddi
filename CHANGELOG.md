@@ -481,6 +481,20 @@ the formatter handles the rest.
 
 ### Security
 
+- **The DHCP agent's external Service no longer publishes Kea's HA listener
+  (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
+  NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
+  hook's peer listener: plain HTTP, no authentication, and it accepts the
+  commands HA peers send each other. It was latent while the listener never
+  bound (#1447); once it does, every node IP answered it. The external
+  Service now carries UDP 67 only. HA peers keep reaching each other
+  pod-to-pod, and the headless Service still lists 8000 for in-cluster DNS
+  names, so HA needs no change. Appliances were never affected: there the
+  DHCP pod uses host networking behind the appliance firewall. A new chart
+  gate (`chart-no-external-kea-ha.py`) fails CI if a NodePort or
+  LoadBalancer Service in front of a DHCP agent publishes 8000 again, on
+  every render and on the raw `k8s/dhcp` manifests.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
