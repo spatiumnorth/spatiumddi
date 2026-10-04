@@ -1477,6 +1477,8 @@ Thanks to everyone who has opened a pull request against SpatiumDDI.
 | <img src="https://github.com/tristanbob.png" width="48" alt=""> | [@tristanbob](https://github.com/tristanbob) | `authlib.jose` → `joserfc` migration, pairing-code prune fix |
 | <img src="https://github.com/Cmonnich.png" width="48" alt=""> | [@Cmonnich](https://github.com/Cmonnich) | Technitium DNS driver |
 | <img src="https://github.com/waza-ari.png" width="48" alt=""> | [@waza-ari](https://github.com/waza-ari) | Agentless FortiGate cloud DHCP driver |
+| <img src="https://github.com/stefanriegel.png" width="48" alt=""> | [@stefanriegel](https://github.com/stefanriegel) | Multi-node appliance field testing and fixes: Technitium zone types and blocklists, cloud DNS health, DHCP server groups, blocklist feed memory, alert evaluator |
+| <img src="https://github.com/containerguy.png" width="48" alt=""> | [@containerguy](https://github.com/containerguy) | Hetzner DNS driver on the Hetzner Cloud API |
 
 Opened a PR and not listed? That is an oversight, not a judgement — please
 say so on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)

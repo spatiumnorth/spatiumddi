@@ -44,7 +44,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.services.backup.crypto import encrypt_secrets
+from app.services.backup.crypto import encrypt_secrets, hint_reveals_passphrase
 
 logger = structlog.get_logger(__name__)
 
@@ -440,6 +440,13 @@ async def build_backup_archive(
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
+    if hint_reveals_passphrase(passphrase, passphrase_hint):
+        # The write paths refuse this; a target saved before they did
+        # can still hold it. Dropped rather than raised so the schedule
+        # keeps producing backups — the hint is a convenience, the
+        # backup is not. Never log the hint itself.
+        logger.warning("backup_hint_contains_passphrase_dropped")
+        passphrase_hint = None
     schema_head = await _read_alembic_head(db)
     hostname = socket.gethostname()
     created_at = datetime.now(UTC)
