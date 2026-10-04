@@ -506,6 +506,18 @@ the formatter handles the rest.
   who may have run a failing restore should rotate those credentials and
   purge older logs.
 
+- **Regenerating MFA recovery codes no longer returns the account's TOTP
+  secret (GHSA-244w-8h9w-g58j).** `POST /api/v1/auth/mfa/recovery-codes/regenerate`
+  answered with the enrolment response model, so every regeneration
+  carried the existing `secret` and `otpauth_uri` alongside the new codes.
+  The UI reads only the codes, so nothing needed the seed, but anyone
+  holding a session and one live code could take it and keep minting
+  valid codes after the session was revoked. The endpoint now answers
+  with `{"recovery_codes": [...]}` only. Enrolment (`/mfa/enroll/begin`)
+  is unchanged, since that is where the secret is legitimately shown.
+  No operator action is needed; an account that may have been exposed
+  can disable and re-enrol MFA to rotate its secret.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
