@@ -140,17 +140,20 @@ router = APIRouter(
 )
 
 
-def _require_type_write(current_user: User, resource_type: str) -> None:
+def _require_type_write(current_user: User, resource_type: str, action: str = "write") -> None:
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
-    create + update). The router-level gate admits an any-of grant over the
-    whole IPAM surface — including peripheral types like ``nat_mapping`` and
-    ``custom_field`` — so without this a ``write:nat_mapping`` grant could
-    create or mutate core structure it holds no write on (#508). Superadmin and
-    wildcard grants pass via ``user_has_permission``."""
-    if not user_has_permission(current_user, "write", resource_type):
+    create, update, resize, split, merge, move, purge, DNS sync, delete). The
+    router-level gate admits an any-of grant over the whole IPAM surface —
+    including peripheral types like ``nat_mapping`` and ``custom_field`` — and,
+    for mutating methods, ANY ``address_set`` grant with its ``resource_id``
+    ignored, so without this a ``write:nat_mapping`` grant or a set-scoped
+    delegate could mutate core structure it holds no permission on (#508).
+    ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
+    Superadmin and wildcard grants pass via ``user_has_permission``."""
+    if not user_has_permission(current_user, action, resource_type):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'write' on '{resource_type}'",
+            detail=f"Permission denied: need '{action}' on '{resource_type}'",
         )
 
 
@@ -3168,6 +3171,7 @@ async def delete_space(
     with a pending change-request instead of executing. Module-off / no
     policy → executes inline via ``operation.apply`` exactly as before.
     """
+    _require_type_write(current_user, "ip_space", "delete")
     op = get_operation("delete_space")
     assert op is not None  # registered at import
     args = DeleteSpaceArgs(space_id=space_id, permanent=permanent)
@@ -3622,6 +3626,7 @@ async def delete_block(
     and a ``delete:ip_block`` policy matches, returns ``202`` with a pending
     change-request; otherwise executes inline via ``operation.apply``.
     """
+    _require_type_write(current_user, "ip_block", "delete")
     op = get_operation("delete_block")
     assert op is not None  # registered at import
     args = DeleteBlockArgs(block_id=block_id, permanent=permanent)
@@ -4521,6 +4526,7 @@ async def allocate_subnet(
     invalid ``prefix_len`` (≤ the block's own prefix, or > the family max) or a
     ``network`` that isn't an in-block, correctly-sized child.
     """
+    _require_type_write(current_user, "subnet")
     # Lock the parent block row so concurrent allocate-subnet calls on the
     # same block serialize: the second waits until the first commits, then
     # recomputes free space and picks the next free CIDR.
@@ -4829,6 +4835,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     toggle — an operator can sweep on demand even with the scheduled
     sweep off.
     """
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -5569,6 +5576,7 @@ async def delete_subnet(
     approved replay takes the identical branch). Otherwise executes inline via
     ``operation.apply`` — same logic, side effects, audit, and 204 as before.
     """
+    _require_type_write(current_user, "subnet", "delete")
     op = get_operation("delete_subnet")
     assert op is not None  # registered at import
     args = DeleteSubnetArgs(subnet_id=subnet_id, force=force, permanent=permanent)
@@ -5691,6 +5699,7 @@ async def resize_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetResizePreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.resize import preview_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
@@ -5739,6 +5748,7 @@ async def resize_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetResizeCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.resize import ResizeError, commit_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
@@ -5807,6 +5817,7 @@ async def resize_block_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockResizePreviewResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.resize import preview_block_resize
 
     block = await db.get(IPBlock, block_id)
@@ -5838,6 +5849,7 @@ async def resize_block_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockResizeCommitResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.resize import ResizeError, commit_block_resize
 
     block = await db.get(IPBlock, block_id)
@@ -5940,6 +5952,7 @@ async def move_block_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockMovePreviewResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.block_move import BlockMoveError, preview_move
 
     block = await db.get(IPBlock, block_id)
@@ -5979,6 +5992,7 @@ async def move_block_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockMoveCommitResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.block_move import BlockMoveError, commit_move
 
     block = await db.get(IPBlock, block_id)
@@ -6197,6 +6211,7 @@ async def split_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> SplitSubnetPreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_split import preview_subnet_split
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6235,6 +6250,7 @@ async def split_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> SplitSubnetCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_split import SplitError, commit_subnet_split
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6323,6 +6339,7 @@ async def merge_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> MergeSubnetPreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_merge import preview_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6349,6 +6366,7 @@ async def merge_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> MergeSubnetCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_merge import MergeError, commit_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6723,6 +6741,7 @@ async def dns_sync_commit(
 ) -> DnsSyncCommitResponse:
     """Apply the user-selected drift actions for one subnet. Anything not
     listed is skipped."""
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -6787,6 +6806,7 @@ async def dns_sync_commit_block(
     current_user: CurrentUser,
     db: DB,
 ) -> DnsSyncCommitResponse:
+    _require_type_write(current_user, "ip_block")
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="Block not found")
@@ -6845,6 +6865,7 @@ async def dns_sync_commit_space(
     current_user: CurrentUser,
     db: DB,
 ) -> DnsSyncCommitResponse:
+    _require_type_write(current_user, "ip_space")
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
@@ -6925,6 +6946,7 @@ async def _backfill_reverse_zones(
 async def backfill_reverse_zones_subnet(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "subnet")
     s = await db.get(Subnet, subnet_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -6940,6 +6962,7 @@ async def backfill_reverse_zones_subnet(
 async def backfill_reverse_zones_block(
     block_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "ip_block")
     # Walk the block subtree (block + descendant blocks' subnets)
     block_ids: set[uuid.UUID] = {block_id}
     pending = [block_id]
@@ -6963,6 +6986,7 @@ async def backfill_reverse_zones_block(
 async def backfill_reverse_zones_space(
     space_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "ip_space")
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
@@ -8193,6 +8217,7 @@ async def purge_orphans(
     side filter) and passes the chosen ids here. We scope by subnet so a stale UI
     can't purge rows from a different subnet.
     """
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -9050,6 +9075,7 @@ async def add_subnet_domain(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetDomainResponse:
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -9125,6 +9151,7 @@ async def remove_subnet_domain(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
+    _require_type_write(current_user, "subnet")
     sd = await db.get(SubnetDomain, domain_id)
     if sd is None or sd.subnet_id != subnet_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet domain not found")
@@ -9193,6 +9220,7 @@ async def bulk_edit_subnets(
     All mutations happen in a single transaction; one audit row per
     successfully-updated subnet shares a `batch_id` in `new_value`.
     """
+    _require_type_write(current_user, "subnet")
     changes = body.changes.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(
