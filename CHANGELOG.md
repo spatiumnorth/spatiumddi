@@ -100,8 +100,13 @@ the formatter handles the rest.
   never created, such as one made on the daemon directly, are never
   touched. The first run after the upgrade picks up the zones of the
   previous bundle; zones orphaned before that have to be removed by
-  hand (`zones/delete` on each server). PowerDNS has the same gap and
-  is not changed here.
+  hand (`zones/delete` on each server). An empty zone list, which the
+  control plane sends only for a group with no zones, retires every
+  zone like BIND9 does. A bundle with no zone list at all, and a zone
+  the bundle still has that the driver skipped (a secondary with no
+  primaries, say), retire nothing and log
+  `technitium_zone_retire_held_back`. PowerDNS has the same gap and is
+  not changed here.
 
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so

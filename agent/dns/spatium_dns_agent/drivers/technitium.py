@@ -635,8 +635,28 @@ class TechnitiumDriver(DriverBase):
             shutil.rmtree(new_dir)
         new_dir.mkdir(parents=True)
 
+        raw_zones = bundle.get("zones")
+        if not isinstance(raw_zones, list):
+            raw_zones = None
+        # Every zone name the bundle carries, including the ones skipped
+        # below: ``_retire_dropped_zones`` must not delete a zone SpatiumDDI
+        # still has just because this driver could not render it. ``None``
+        # when the bundle has no zone list at all, which is not the same
+        # claim as an empty one and retires nothing.
+        bundle_zone_names = (
+            None
+            if raw_zones is None
+            else sorted(
+                {
+                    str(z.get("name") or "").rstrip(".").lower()
+                    for z in raw_zones
+                    if isinstance(z, dict) and str(z.get("name") or "").rstrip(".")
+                }
+            )
+        )
+
         zones_payload = []
-        for zone in bundle.get("zones", []) or []:
+        for zone in raw_zones or []:
             zname = (zone.get("name") or "").rstrip(".")
             if not zname:
                 continue
@@ -729,6 +749,7 @@ class TechnitiumDriver(DriverBase):
                 if (k.get("name") or "").rstrip(".")
             ],
             "catalog": catalog,
+            "bundle_zone_names": bundle_zone_names,
         }
         self._write_secret(
             new_dir / "server.json", json.dumps(server_payload, indent=2)
@@ -810,13 +831,23 @@ class TechnitiumDriver(DriverBase):
 
         self._reconcile_zones(token, payload)
         self._apply_catalog(token, server_state.get("catalog"), payload)
-        self._retire_dropped_zones(token, payload, backup / "zones.json")
+        self._retire_dropped_zones(
+            token,
+            payload,
+            backup / "zones.json",
+            bundle_zone_names=server_state.get("bundle_zone_names"),
+        )
 
     def _managed_zones_path(self) -> Path:
         return self.state_dir / _MANAGED_ZONES_FILE
 
     def _retire_dropped_zones(
-        self, token: str, payload: list[dict[str, Any]], previous_render: Path
+        self,
+        token: str,
+        payload: list[dict[str, Any]],
+        previous_render: Path,
+        *,
+        bundle_zone_names: list[str] | None,
     ) -> None:
         """Delete the zones this agent put on the daemon that the bundle dropped.
 
@@ -834,6 +865,19 @@ class TechnitiumDriver(DriverBase):
         bundle that brought the upgrade is still retired; anything orphaned
         before that is left for the operator. A delete that fails keeps its
         name in the ledger so the next pass retries it.
+
+        Retirement follows the zone list the control plane sent, not what
+        this driver managed to render, so two cases hold it back:
+
+        * ``bundle_zone_names`` is ``None``: the bundle had no zone list
+          (key absent, ``null``, not a list) or ``server.json`` could not be
+          read. Nothing is deleted and the ledger is kept. An explicit empty
+          list is different: it is what a group with no zones sends, and
+          every zone in the ledger is retired, as BIND9 empties
+          ``named.conf``.
+        * A zone the bundle still names but the render skipped (a type
+          Technitium cannot serve, a secondary with no primaries, a
+          forwarder with no upstream) stays, and stays in the ledger.
         """
         desired = {str(z.get("zone") or "").lower() for z in payload if z.get("zone")}
         path = self._managed_zones_path()
@@ -853,8 +897,27 @@ class TechnitiumDriver(DriverBase):
             log.warning("technitium_managed_zones_unreadable", error=str(exc))
             managed = set()
 
+        if not isinstance(bundle_zone_names, list):
+            if managed - desired:
+                log.warning(
+                    "technitium_zone_retire_held_back",
+                    reason="bundle_has_no_zone_list",
+                    zones=sorted(managed - desired),
+                )
+            self._write_secret(path, json.dumps(sorted(managed | desired)))
+            return
+
+        named = {str(n).lower() for n in bundle_zone_names}
+        held = (managed - desired) & named
+        if held:
+            log.warning(
+                "technitium_zone_retire_held_back",
+                reason="zone_still_in_bundle",
+                zones=sorted(held),
+            )
+
         kept: set[str] = set()
-        for zone in sorted(managed - desired):
+        for zone in sorted(managed - desired - named):
             body = self._call(token, "POST", "zones/delete", {"zone": zone}).json()
             error = body.get("errorMessage") or ""
             if body.get("status") == "ok":
@@ -865,7 +928,7 @@ class TechnitiumDriver(DriverBase):
                 kept.add(zone)
                 log.warning("technitium_zone_retire_failed", zone=zone, error=error)
 
-        self._write_secret(path, json.dumps(sorted(desired | kept)))
+        self._write_secret(path, json.dumps(sorted(desired | held | kept)))
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
