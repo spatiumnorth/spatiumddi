@@ -41,6 +41,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Technitium server that cannot be connected to is no longer reported
+  as refusing the zone transfer (#1470).** Drift and Sync with Servers
+  read a Technitium zone over AXFR, and the driver turned any error
+  containing "REFUSED" into "refused the zone transfer despite signing it
+  with the group key", including a TCP "Connection refused". On an
+  appliance whose Technitium answers only on the DNS VIP, nothing listens
+  on the node address, so every pull failed with a message that pointed
+  at the TSIG key on all servers. A connection failure now keeps the
+  message the AXFR helper already gives it ("could not be reached on
+  TCP/53 — check the address and firewall"); a real DNS REFUSED still
+  names the TSIG settings.
+
 - **More than one RADIUS / TACACS+ user can be auto-provisioned
   (#1290).** An external account with no email (RADIUS and TACACS+
   never report one, and neither does an LDAP entry without `mail` or an
