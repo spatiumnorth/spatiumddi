@@ -27,6 +27,22 @@ the formatter handles the rest.
 
 ### Changed
 
+- **DHCP clients renew at half the lease time instead of every 15
+  minutes (#1259).** The agent rendered a fixed `renew-timer: 900` /
+  `rebind-timer: 1800` into both Kea daemons, whatever the lease time, so
+  a client on a 1-day lease renewed 48 times a day. Kea now derives T1/T2
+  from each lease (`calculate-tee-times`): DHCPv4 clients renew at 50 %
+  and rebind at 87.5 % of the lease (RFC 2131); DHCPv6 uses 50 % / 80 %
+  of the preferred lifetime (RFC 8415, Kea's default), e.g. a renew after
+  7.5 h on a 1-day lease. This is a behaviour change: far fewer renewals,
+  so less DHCP and lease-event load, and a lease change or an outage of
+  the server is noticed later by clients. Short leases get usable timers
+  for the first time: a v4 lease of 15 minutes or less used to carry no
+  T1/T2 at all, and a short v6 lease a T1 past its own expiry. If you
+  relied on the 15-minute cadence, shorten the scope's lease time. Takes
+  effect when the DHCP agent restarts on the new image; no control-plane
+  change.
+
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
   looked only at HIGH and CRITICAL, so the pip CVEs in the api image
