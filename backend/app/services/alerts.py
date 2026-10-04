@@ -527,6 +527,25 @@ RULE_TYPE_IP_BLOCKLISTED = "ip_blocklisted"
 # passes.
 RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
 
+# Scheduled backups (issue #1262). Before these, a failed nightly backup
+# wrote an audit row and nothing else, so on a default install it could
+# fail for weeks unnoticed. Subject is the **backup target**, and only
+# enabled targets with a schedule are watched. Both decided by
+# ``services/backup/health.evaluate_backup_health``, shared with the
+# ``get_backup_health`` copilot tool.
+#   * ``backup_failed`` — the last finished run failed. Resolves on the
+#     next success.
+#   * ``backup_stale`` — no successful run within N scheduled runs plus a
+#     grace (N = ``threshold_percent``, reused as a count, default 2). Also
+#     catches the cases where nothing runs at all: beat or worker down, or
+#     a run left ``in_progress`` by a dead process, which the sweep then
+#     skips forever.
+# A run that is genuinely in progress neither opens nor resolves either
+# event, so a target that keeps failing holds one event instead of
+# resolving and re-firing around every attempt.
+RULE_TYPE_BACKUP_FAILED = "backup_failed"
+RULE_TYPE_BACKUP_STALE = "backup_stale"
+
 # ``dns_tunneling_suspected`` (issue #699) — a client's DNS behaviour
 # scored above the tunneling threshold in a recent hourly window.
 # Subject is the **client IP**, so a host tunnelling for six hours holds
@@ -632,6 +651,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
         RULE_TYPE_IP_BLOCKLISTED,
         RULE_TYPE_RESTORE_DRILL_FAILED,
+        RULE_TYPE_BACKUP_FAILED,
+        RULE_TYPE_BACKUP_STALE,
         RULE_TYPE_DNS_TUNNELING,
         RULE_TYPE_DNS_BEACONING,
         RULE_TYPE_DNS_DGA,
@@ -1295,6 +1316,125 @@ async def _matching_restore_drill_failed_subjects(
                 f"recovery path — investigate before you need it."
             )
         matches.append((str(target_id), target_name, message))
+    return matches
+
+
+def _fmt_utc(dt: datetime | None) -> str:
+    if dt is None:
+        return "unknown time"
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+async def _open_event_severities(db: AsyncSession, rule: AlertRule) -> dict[str, str]:
+    """Open events of ``rule`` keyed by subject_id, for matchers that
+    hold an event standing while their subject is in an undecided state."""
+    rows = (
+        (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {ev.subject_id: ev.severity for ev in rows}
+
+
+async def _matching_backup_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str | None]]:
+    """Watched backup targets whose last finished run failed (#1262).
+
+    A run in progress says nothing new, so it holds an open event at its
+    current severity (a no-op for the shared loop) instead of resolving
+    it. Without that, a target failing every night would resolve and
+    re-fire, and notify again, around every attempt.
+
+    The message deliberately leaves out ``last_run_error``: driver errors
+    can carry hosts, paths or bucket names, and alert payloads leave the
+    install by syslog / webhook / SMTP.
+    """
+    from app.services.backup.health import evaluate_backup_health  # noqa: PLC0415
+
+    held = await _open_event_severities(db, rule)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await evaluate_backup_health(db, now=now):
+        if not h.watched:
+            continue
+        subject_id = str(h.target_id)
+        if h.failed:
+            since = (
+                f"Last successful run: {_fmt_utc(h.last_success_at)}."
+                if h.last_success_at is not None
+                else "It has never completed a successful run."
+            )
+            message = (
+                f"Scheduled backup FAILED for target '{h.name}' ({h.kind}): the "
+                f"run started {_fmt_utc(h.last_run_at)} did not complete. {since} "
+                "The error is on the Backup page and in the audit log."
+            )
+            matches.append((subject_id, h.name, message, None))
+        elif h.last_run_status == "in_progress" and subject_id in held:
+            matches.append((subject_id, h.name, "", held[subject_id]))
+    return matches
+
+
+async def _matching_backup_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str | None]]:
+    """Watched backup targets with no successful run within N scheduled
+    runs plus the grace (#1262). N is ``threshold_percent``, reused as a
+    count.
+
+    A run that is genuinely in progress holds an open event rather than
+    resolving it, same as ``backup_failed``. A run presumed dead does
+    not: it counts as no run, which is the case this rule exists for.
+    """
+    from app.services.backup.health import (  # noqa: PLC0415
+        STALE_AFTER_RUNS_DEFAULT,
+        evaluate_backup_health,
+    )
+
+    runs = rule.threshold_percent or STALE_AFTER_RUNS_DEFAULT
+    held = await _open_event_severities(db, rule)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await evaluate_backup_health(db, now=now, stale_after_runs=runs):
+        if not h.watched:
+            continue
+        subject_id = str(h.target_id)
+        if h.run_in_progress:
+            if subject_id in held:
+                matches.append((subject_id, h.name, "", held[subject_id]))
+            continue
+        if not h.stale:
+            continue
+        since = f"since {_fmt_utc(h.last_success_at)}" if h.last_success_at is not None else "ever"
+        if h.run_presumed_dead:
+            why = (
+                f"A run has been marked in progress since {_fmt_utc(h.last_run_at)}; "
+                "the process running it has most likely died, and the scheduler skips "
+                "the target until it clears. Run it now from the Backup page."
+            )
+        elif h.failed:
+            why = "The last run failed."
+        else:
+            due = f" (due {_fmt_utc(h.next_run_at)})" if h.next_run_at is not None else ""
+            why = (
+                f"The scheduled run{due} has not started. "
+                "Check that the Celery worker and beat are running."
+            )
+        message = (
+            f"Backup target '{h.name}' ({h.kind}) has had no successful run {since}, "
+            f"across {runs} scheduled run(s) ({h.schedule_cron}). {why}"
+        )
+        matches.append((subject_id, h.name, message, None))
     return matches
 
 
@@ -6008,6 +6148,73 @@ async def seed_restore_drill_failed_alert_rule() -> None:
         await session.commit()
 
 
+_BACKUP_RULE_SEEDS: tuple[dict[str, Any], ...] = (
+    {
+        "rule_type": RULE_TYPE_BACKUP_FAILED,
+        "name": "Scheduled backup failed",
+        "description": (
+            "Fires when the last run of an enabled, scheduled backup target "
+            "failed. Subject is the target. Auto-resolves when its next run "
+            "succeeds. Manual-only and disabled targets are not watched."
+        ),
+        "severity": "warning",
+        "threshold_percent": None,
+    },
+    {
+        "rule_type": RULE_TYPE_BACKUP_STALE,
+        "name": "Scheduled backup stale",
+        "description": (
+            "Fires when an enabled, scheduled backup target has had no "
+            "successful run within N scheduled runs plus one hour (N = "
+            "threshold_percent, used as a count). Catches backups that "
+            "stopped running at all: worker or beat down, or a run left "
+            "in progress by a dead process. Auto-resolves on the next "
+            "successful run."
+        ),
+        "severity": "critical",
+        "threshold_percent": 2,
+    },
+)
+
+
+async def seed_backup_alert_rules() -> None:
+    """Seed ``backup_failed`` + ``backup_stale`` (#1262), ENABLED.
+
+    Enabled for the same reason as ``restore_drill_failed``: both rules
+    only watch enabled targets with a schedule, so they are silent on an
+    install that has none, and an operator who scheduled a backup wants
+    to know when it stops working. Keyed on ``rule_type``; an operator who
+    disables, renames or re-thresholds one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        added = False
+        for seed in _BACKUP_RULE_SEEDS:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    severity=seed["severity"],
+                    threshold_percent=seed["threshold_percent"],
+                    enabled=True,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+            added = True
+        if added:
+            await session.commit()
+
+
 async def seed_dns_tunneling_alert_rule() -> None:
     """Seed the ``dns_tunneling_suspected`` rule (#699), ENABLED.
 
@@ -6299,6 +6506,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_RESTORE_DRILL_FAILED:
                 base = await _matching_restore_drill_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "backup_target"
+            elif rule.rule_type == RULE_TYPE_BACKUP_FAILED:
+                matches = await _matching_backup_failed_subjects(db, rule, now)
+                subject_type = "backup_target"
+            elif rule.rule_type == RULE_TYPE_BACKUP_STALE:
+                matches = await _matching_backup_stale_subjects(db, rule, now)
                 subject_type = "backup_target"
             elif rule.rule_type == RULE_TYPE_DNS_TUNNELING:
                 base = await _matching_dns_tunneling_subjects(db, rule)

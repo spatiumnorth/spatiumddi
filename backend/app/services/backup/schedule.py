@@ -50,6 +50,18 @@ def compute_next_run(expression: str, *, after: datetime | None = None) -> datet
     return it.get_next(datetime).astimezone(UTC)
 
 
+def compute_prev_run(expression: str, *, before: datetime) -> datetime:
+    """Return the last firing of ``expression`` strictly before
+    ``before``. UTC-aware. The mirror of :func:`compute_next_run`.
+    """
+    base = before.astimezone(UTC)
+    try:
+        it = croniter(expression, base)
+    except (CroniterBadCronError, ValueError, TypeError) as exc:
+        raise InvalidCronExpression(f"invalid cron expression: {exc}") from exc
+    return it.get_prev(datetime).astimezone(UTC)
+
+
 def is_due(next_run_at: datetime | None, *, now: datetime | None = None) -> bool:
     """Cheap predicate for the beat sweep — "should this target
     run right now?". A NULL ``next_run_at`` means "manual only";
