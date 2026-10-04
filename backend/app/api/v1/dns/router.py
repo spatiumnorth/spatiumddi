@@ -4826,7 +4826,7 @@ async def get_server_pending_ops(
     ops_res = await db.execute(
         select(DNSRecordOp)
         .where(DNSRecordOp.server_id == server_id)
-        .order_by(DNSRecordOp.created_at.desc())
+        .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.seq.desc().nulls_last())
         .limit(limit)
     )
     items = [
