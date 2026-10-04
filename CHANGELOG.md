@@ -554,6 +554,22 @@ the formatter handles the rest.
   `audit_log` row. Operators who relied on non-superadmin accounts resolving
   alerts need to use a superadmin account.
 
+- **The IPv6 Router Advertisement config now loads, and nothing an IPAM
+  writer types can reach it as syntax (GHSA-6235-5gh6-4hr2).** The rendered
+  `radvd.conf` used `AdvMaxInterval`, which is not a radvd keyword
+  (`MaxRtrAdvInterval` is), so radvd rejected every config. Fixing the
+  keyword alone would have exposed a second problem: DNSSL search domains
+  (including the subnet `domain_name`, writable by any IPAM editor) and the
+  RA interface name were interpolated into the file unvalidated, so a crafted
+  value could inject a whole extra `interface` block. DNSSL entries and the
+  subnet `domain_name` must now be valid domain names (RFC 2181 labels, so
+  an underscore is still fine) and the interface a Linux interface name,
+  rejected with a 422 at the API and dropped again at render time (RDNSS and prefixes are
+  re-checked too). The DHCP agent now writes the new config to a staged file,
+  runs `radvd -c` on it and only then swaps it in, so a rejected config no
+  longer replaces the working one on disk. No operator action; existing
+  invalid values are skipped at render with a log line.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
