@@ -26,6 +26,7 @@ import {
   type AuditForwardSeverity,
   type AuditForwardTarget,
   type AuditForwardTargetWrite,
+  type AuditForwardWebhookFlavor,
 } from "@/lib/api";
 
 const inputCls =
@@ -100,13 +101,12 @@ function targetToBody(t: AuditForwardTarget): AuditForwardTargetWrite {
     protocol: t.protocol,
     facility: t.facility,
     ca_cert_pem: t.ca_cert_pem ?? null,
-    url: t.url,
-    // auth_header + smtp_password are write-only — server returns
-    // booleans only. Leaving them blank on edit means "don't change";
-    // ``null`` on smtp_password mirrors that intent (the form sends
-    // null when not retyped, an explicit empty string only when the
-    // operator hits "clear stored password").
-    auth_header: "",
+    // url, auth_header and smtp_password are write-only: the server
+    // returns booleans (plus the URL's host) only (#1502). ``null`` means
+    // "keep what's stored"; the save drops a blank field for the same
+    // reason, and an explicit empty string is sent only to clear.
+    url: null,
+    auth_header: null,
     webhook_flavor: t.webhook_flavor,
     smtp_host: t.smtp_host,
     smtp_port: t.smtp_port,
@@ -253,7 +253,7 @@ export function AuditForwardTargets({
                 const dest =
                   t.kind === "syslog"
                     ? `${t.host || "?"}:${t.port} ${t.protocol.toUpperCase()}`
-                    : t.url || "—";
+                    : t.url_display || "—";
                 const filter =
                   t.min_severity ||
                   (t.resource_types && t.resource_types.length > 0)
@@ -367,6 +367,8 @@ export function AuditForwardTargets({
             editing.mode === "create" ? EMPTY : targetToBody(editing.row)
           }
           existingId={editing.mode === "edit" ? editing.row.id : undefined}
+          urlSet={editing.mode === "edit" ? editing.row.url_set : false}
+          urlDisplay={editing.mode === "edit" ? editing.row.url_display : ""}
           authHeaderSet={
             editing.mode === "edit" ? editing.row.auth_header_set : false
           }
@@ -409,26 +411,36 @@ export function AuditForwardTargets({
 function TargetModal({
   initial,
   existingId,
+  urlSet,
+  urlDisplay,
   authHeaderSet,
   smtpPasswordSet,
   onClose,
 }: {
   initial: AuditForwardTargetWrite;
   existingId?: string;
+  urlSet: boolean;
+  urlDisplay: string;
   authHeaderSet: boolean;
   smtpPasswordSet: boolean;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
   const [form, setForm] = useState<AuditForwardTargetWrite>(initial);
+  const [clearAuthHeader, setClearAuthHeader] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const saveMut = useMutation({
     mutationFn: async () => {
       const body: AuditForwardTargetWrite = { ...form };
-      // Don't clobber the stored auth_header when editing if the user
-      // left the field blank — that means "keep what's on file".
-      if (existingId && authHeaderSet && !body.auth_header) {
+      // A blank URL or header on edit means "keep what's on file" — the
+      // server never sends either back, so the field always starts empty.
+      if (existingId && !body.url) {
+        delete body.url;
+      }
+      if (clearAuthHeader) {
+        body.auth_header = "";
+      } else if (existingId && !body.auth_header) {
         delete body.auth_header;
       }
       // Same dance for SMTP password — ``null`` (default on edit) means
@@ -462,6 +474,13 @@ function TargetModal({
 
   const isSyslog = form.kind === "syslog";
   const isWebhook = form.kind === "webhook";
+  // The stored URL is an Apprise URL or a plain webhook URL; switching
+  // between the two needs a new one (the server refuses a blank field).
+  const flavorSwitch =
+    !!existingId &&
+    urlSet &&
+    (initial.webhook_flavor === "apprise") !==
+      (form.webhook_flavor === "apprise");
 
   return (
     <Modal
@@ -659,11 +678,7 @@ function TargetModal({
                 onChange={(e) =>
                   setForm({
                     ...form,
-                    webhook_flavor: e.target.value as
-                      | "generic"
-                      | "slack"
-                      | "teams"
-                      | "discord",
+                    webhook_flavor: e.target.value as AuditForwardWebhookFlavor,
                   })
                 }
               >
@@ -671,50 +686,111 @@ function TargetModal({
                 <option value="slack">Slack (mrkdwn blocks)</option>
                 <option value="teams">Microsoft Teams (MessageCard)</option>
                 <option value="discord">Discord (embed)</option>
+                <option value="apprise">
+                  Apprise (Telegram, ntfy, Pushover, Matrix, Teams Workflows, …)
+                </option>
               </select>
               <div className="mt-1 text-[11px] text-muted-foreground">
                 {form.webhook_flavor === "generic"
                   ? "Posts the raw audit/alert JSON. For collectors that parse it themselves."
-                  : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+                  : form.webhook_flavor === "apprise"
+                    ? "Sends a title and a short text through Apprise, which formats it for the service. One Apprise URL per target."
+                    : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
               </div>
             </label>
             <label className="block">
               <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                 URL
               </div>
+              {/* Write-only: a chat webhook URL is the credential (#1502). */}
               <input
+                type="password"
+                autoComplete="new-password"
                 className={inputCls}
                 value={form.url ?? ""}
                 onChange={(e) => setForm({ ...form, url: e.target.value })}
                 placeholder={
-                  form.webhook_flavor === "slack"
-                    ? "https://hooks.slack.com/services/T…/B…/…"
-                    : form.webhook_flavor === "teams"
-                      ? "https://…webhook.office.com/webhookb2/…"
-                      : form.webhook_flavor === "discord"
-                        ? "https://discord.com/api/webhooks/…/…"
-                        : "https://collector.example.com/ingest"
+                  urlSet && !flavorSwitch
+                    ? "(stored — leave blank to keep unchanged)"
+                    : form.webhook_flavor === "apprise"
+                      ? "tgram://<bot_token>/<chat_id>"
+                      : form.webhook_flavor === "slack"
+                        ? "https://hooks.slack.com/services/T…/B…/…"
+                        : form.webhook_flavor === "teams"
+                          ? "https://…webhook.office.com/webhookb2/…"
+                          : form.webhook_flavor === "discord"
+                            ? "https://discord.com/api/webhooks/…/…"
+                            : "https://collector.example.com/ingest"
                 }
               />
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {flavorSwitch
+                  ? "Enter the URL again: the stored one belongs to the previous flavor."
+                  : urlSet
+                    ? `Stored: ${urlDisplay || "(set)"}. Encrypted at rest and never shown again — paste a new URL to replace it.`
+                    : "Encrypted at rest and never shown again after saving."}
+              </div>
+              {form.webhook_flavor === "apprise" && (
+                <div className="mt-1 space-y-0.5 text-[11px] text-muted-foreground">
+                  <div>
+                    Telegram:{" "}
+                    <code>tgram://&lt;bot_token&gt;/&lt;chat_id&gt;</code>
+                  </div>
+                  <div>
+                    ntfy:{" "}
+                    <code>
+                      ntfys://&lt;user&gt;:&lt;password&gt;@&lt;host&gt;/&lt;topic&gt;
+                    </code>
+                  </div>
+                  <div>
+                    Every service and its URL format:{" "}
+                    <a
+                      href="https://appriseit.com/services/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline"
+                    >
+                      Apprise documentation
+                    </a>
+                    . Saving checks that Apprise can read the URL; use Test to
+                    send a message.
+                  </div>
+                </div>
+              )}
             </label>
             {form.webhook_flavor === "generic" && (
-              <label className="block">
-                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Authorization Header (optional)
-                </div>
-                <input
-                  className={inputCls}
-                  value={form.auth_header ?? ""}
-                  onChange={(e) =>
-                    setForm({ ...form, auth_header: e.target.value })
-                  }
-                  placeholder={
-                    authHeaderSet
-                      ? "(stored — leave blank to keep unchanged)"
-                      : "Bearer …"
-                  }
-                />
-              </label>
+              <div>
+                <label className="block">
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Authorization Header (optional)
+                  </div>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    className={inputCls}
+                    value={form.auth_header ?? ""}
+                    disabled={clearAuthHeader}
+                    onChange={(e) =>
+                      setForm({ ...form, auth_header: e.target.value })
+                    }
+                    placeholder={
+                      authHeaderSet
+                        ? "(stored — leave blank to keep unchanged)"
+                        : "Bearer …"
+                    }
+                  />
+                </label>
+                {existingId && authHeaderSet && (
+                  <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={clearAuthHeader}
+                      onChange={(e) => setClearAuthHeader(e.target.checked)}
+                    />
+                    Remove the stored header
+                  </label>
+                )}
+              </div>
             )}
           </>
         ) : (

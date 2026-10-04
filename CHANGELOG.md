@@ -25,6 +25,33 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Alerts and audit events through Apprise: Telegram, ntfy, Pushover,
+  Matrix and more (#1503).** Webhook forward targets get an `apprise`
+  flavor. Its URL is one [Apprise](https://github.com/caronc/apprise)
+  service URL, e.g. `tgram://<bot_token>/<chat_id>` or
+  `ntfys://<user>:<password>@<host>/<topic>`, and Apprise formats the
+  message for that service. It is a webhook target, so an alert rule's
+  existing webhook channel, `min_severity` and resource filters apply
+  unchanged. The URL is stored like every webhook URL since #1502:
+  Fernet-encrypted, write-only, shown only as its scheme (`tgram://…`).
+  Saving checks that Apprise can read the URL, without sending anything
+  and without echoing it in the 422. Delivery and the Test button run on a
+  small thread pool, off the event loop, with Apprise's per-request
+  timeouts and a 20-second deadline per message. The Test button now
+  reports the service's own reason ("Bad Request: chat not found"), with
+  the URL's token and credentials redacted. Apprise's log lines are kept
+  out of the api and worker logs, and the URL's parts are scrubbed from
+  any library's log line written during a send; the support-bundle
+  scrubber recognises the common Apprise URL shapes and Telegram bot
+  tokens. New dependency: `apprise` 2.x (BSD 2-Clause), which brings
+  `requests-oauthlib`, `oauthlib` and `Markdown`; see NOTICE and
+  `docs/THIRD_PARTY.md`. `docs/PRIVACY.md` lists Apprise destinations as
+  an operator-configured connection. Apprise also reaches Microsoft Teams
+  through Power Automate Workflows (`workflows://…`, or the workflow's
+  HTTPS URL as is), which is relevant to #1504.
+
 ### Changed
 
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
@@ -463,6 +490,44 @@ the formatter handles the rest.
 
 ### Security
 
+- **Webhook forward targets keep their URL and Authorization header
+  encrypted, and no longer show or log them (#1502).** For a Slack,
+  Discord or Teams target the incoming-webhook URL is the credential:
+  whoever has it can post into the channel. It sat in a plaintext
+  column (`audit_forward_target.url`), and so in every backup archive's
+  unencrypted database dump and in "exclude secrets" diagnostic
+  archives. The API returned it in full, and httpx logged it at INFO on
+  every delivery (`HTTP Request: POST <URL>`), which put it in the api
+  and worker logs and in an appliance support bundle. A generic
+  target's `Authorization` header was stored the same way. The legacy
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
+  (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
+  cross-install backup rewrap). The API takes them write-only and
+  returns `url_set`, `auth_header_set` and a `url_display` that shows
+  only the scheme and host (`https://hooks.slack.com/…`). The httpx
+  request line for a webhook delivery shows only that host, and
+  delivery and save errors are redacted. The support-bundle scrubber
+  also recognises Slack, Discord and Teams webhook URLs and a SAS
+  `sig=` parameter, wherever else one is printed. The form uses
+  password inputs, shows the stored host, and keeps a field left blank
+  on edit.
+  **Behaviour changes:** `GET /settings/audit-forward-targets` no
+  longer has `url`, and `GET /settings` no longer has
+  `audit_forward_webhook_url` / `audit_forward_webhook_auth_header`
+  (each is replaced by the `*_set` / `*_display` fields). On
+  `PUT /settings/audit-forward-targets/{id}`, an omitted or `null`
+  `url` / `auth_header` now keeps the stored value, and `""` clears it.
+  Before, an omitted header was wiped, so editing a generic target in
+  the UI silently removed its header. **Upgrade notes:** the old
+  plaintext columns are kept, unread, for one release so a rolling
+  upgrade's old api pods keep working, and the next release drops them.
+  Until then they hold the pre-upgrade values, so a full archive still
+  carries those in clear, as every earlier archive does. To make them
+  dead secrets, re-issue the webhook URL in Slack / Discord / Teams (and
+  any collector token) once the upgrade has finished, and paste the new
+  one in.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
@@ -623,6 +688,15 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `e51ab0dede3e` — #1502, expand only: adds `url_encrypted` /
+  `auth_header_encrypted` to `audit_forward_target` and
+  `audit_forward_webhook_url_encrypted` /
+  `audit_forward_webhook_auth_header_encrypted` to `platform_settings`,
+  fills them from the plaintext columns with `encrypt_str` (so it needs
+  `SECRET_KEY`, like `b3c71e9a4d25`), and makes the plaintext columns
+  nullable. It does not drop them; the next release does. Downgrade
+  copies the current values back into the plaintext columns and drops
+  the encrypted ones.
 
 ## 2026.10.02-1 — 2026-10-02
 

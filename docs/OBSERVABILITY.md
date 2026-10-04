@@ -439,7 +439,39 @@ don't serialize the queue.
   header sent verbatim. The `webhook_flavor` column picks between
   generic JSON, **Slack** (`mrkdwn` block), **Teams**
   (`MessageCard`), and **Discord** (`embed`) so chat-channel
-  delivery doesn't need a separate adapter.
+  delivery doesn't need a separate adapter. For the chat flavors the
+  URL is the credential (anyone holding it can post into the
+  channel), so the URL and the header are **write-only secrets**
+  (#1502): Fernet-encrypted at rest (`url_encrypted`,
+  `auth_header_encrypted`), never returned by the API, which shows
+  `url_set` / `auth_header_set` and a `url_display` of scheme and
+  host only (`https://hooks.slack.com/…`). On update, an omitted or
+  `null` field keeps the stored value and `""` clears it. httpx's own
+  `HTTP Request: POST …` log line for a delivery shows only that
+  host, and delivery errors are redacted before they are logged or
+  returned by **Test**.
+- **Apprise** (#1503) — `webhook_flavor="apprise"`. The URL is one
+  [Apprise](https://github.com/caronc/apprise) service URL
+  (`tgram://<bot_token>/<chat_id>`, `ntfys://…`, `pover://…`,
+  `workflows://…` for Teams Workflows, …), stored like any webhook URL
+  but displayed as its scheme only (`tgram://…`), because there the
+  host can be the token. Each event becomes a title and a plain-text
+  body with an Apprise notify type (`info`, `warning`; `failure` for
+  error / denied / critical), and Apprise formats it for the service.
+  Apprise is synchronous, so each call runs on a four-thread pool off
+  the event loop, with Apprise's own connect / read timeouts (4 s each
+  by default, `cto=` / `rto=` in the URL) and a 20 s deadline for the
+  whole message. Create / update returns 422 when Apprise cannot load
+  the URL (parsing only, nothing is sent, the URL is not echoed), and a
+  target switched to or from `apprise` needs its URL re-entered.
+  **Test** reports the service's reason (e.g. `Telegram: Failed to send
+  Telegram notification to [redacted]: Bad Request: chat not found,
+  error=400.`), taken from that call's `AppriseResult` and redacted.
+  The `apprise` logger does not propagate to the application's
+  handlers, and any library's log record written during a send
+  (urllib3's DEBUG request line carries Telegram's bot token in its
+  path) has the URL's parts replaced. Rule gating is unchanged: these
+  are webhook targets, so an alert rule's webhook channel covers them.
 - **SMTP email** — stdlib `smtplib` driven through
   `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
   plaintext, optional auth (Fernet-encrypted password at rest).
@@ -528,6 +560,11 @@ are preserved and migrated into one `audit_forward_target` row apiece
 on upgrade. When the targets table is empty the service falls back to
 those flat columns so existing installs keep forwarding without
 operator intervention. They are slated for removal in a future release.
+The legacy webhook's URL and header get the same write-only treatment
+as a target's (#1502): `audit_forward_webhook_url_encrypted` /
+`audit_forward_webhook_auth_header_encrypted`, and `GET /settings`
+returns `audit_forward_webhook_url_set` / `_url_display` /
+`audit_forward_webhook_auth_header_set` instead of the values.
 
 **Known gap.** Celery-scheduled audits (e.g. the lease-pull
 housekeeping row) may not forward — Celery wraps the task body in

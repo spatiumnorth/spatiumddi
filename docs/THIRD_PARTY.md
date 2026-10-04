@@ -198,6 +198,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 | [google-cloud-\* / google-auth](https://github.com/googleapis/google-cloud-python) | Apache 2.0 | GCP mirror + Cloud DNS + GCS backups |
 | [docker](https://github.com/docker/docker-py) | Apache 2.0 | Cert-reload signal on non-k3s appliances |
 | [PyYAML](https://pyyaml.org/) | MIT | HelmChartConfig rewriting |
+| [Apprise](https://github.com/caronc/apprise) | BSD 2-Clause | Delivery for webhook forward targets with the `apprise` flavor: one service URL for Telegram, ntfy, Pushover, Matrix, Teams Workflows and the rest. Brings [Python-Markdown](https://github.com/Python-Markdown/markdown) (BSD 3-Clause) and [requests-oauthlib](https://github.com/requests/requests-oauthlib) / [OAuthLib](https://github.com/oauthlib/oauthlib) (ISC / BSD 3-Clause); its other dependencies were already in the image |
 | [openai](https://github.com/openai/openai-python) / [anthropic](https://github.com/anthropics/anthropic-sdk-python) | Apache 2.0 / MIT | Operator Copilot model clients |
 
 **Cloudflare has no SDK entry on purpose.** The Cloudflare DNS driver speaks

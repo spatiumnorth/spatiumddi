@@ -18,7 +18,10 @@ Supported output formats (syslog kind):
   For raw TCP/UDP inputs on Logstash / Fluentd / Vector.
 
 Webhook targets always deliver compact JSON (the HTTP body); the
-``format`` column is ignored for ``kind="webhook"``.
+``format`` column is ignored for ``kind="webhook"``. The one exception is
+``webhook_flavor="apprise"`` (#1503): the URL is an Apprise service URL
+and ``app.services.apprise_delivery`` sends a title + text body through
+Apprise instead.
 
 Design notes:
 
@@ -58,7 +61,9 @@ from app.config import settings as _app_settings
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
+from app.services import apprise_delivery
 from app.services.after_commit_dispatch import dispatch
+from app.services.forward_secrets import redact, reveal, secret_url_in_flight
 
 logger = structlog.get_logger(__name__)
 
@@ -507,14 +512,17 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
     headers = {"Content-Type": "application/json"}
     if auth_header:
         headers["Authorization"] = auth_header
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code >= 300:
-            logger.warning(
-                "audit_forward_webhook_non2xx",
-                status=resp.status_code,
-                body_preview=resp.text[:200],
-            )
+    # The URL is the credential for a chat webhook (#1502). httpx logs every
+    # request with its full URL at INFO; this keeps that line to the host.
+    with secret_url_in_flight(url):
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code >= 300:
+        logger.warning(
+            "audit_forward_webhook_non2xx",
+            status=resp.status_code,
+            body_preview=redact(resp.text[:200], url, auth_header),
+        )
 
 
 # ── Chat-flavor webhook formatters (Slack / Teams / Discord) ───────────────
@@ -781,7 +789,18 @@ def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
     return True
 
 
-async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> None:
+async def _deliver_to_target(
+    target: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> None:
+    """Deliver one event to one target.
+
+    Failures are logged and swallowed so one dead target never affects the
+    others. ``raise_errors`` re-raises after logging, for the Test button,
+    which wants to show the operator why a probe failed.
+    """
     if not _target_accepts(target, payload):
         return
     kind = target.get("kind")
@@ -801,6 +820,17 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
             )
         elif kind == "webhook":
             flavor = (target.get("webhook_flavor") or "generic").lower()
+            if flavor == "apprise":
+                # One Apprise service URL (#1503). Apprise formats for the
+                # service, so it gets plain text and our severity.
+                title, text_body = _payload_summary_lines(payload)
+                await apprise_delivery.send(
+                    target["url"],
+                    title=title,
+                    body=text_body,
+                    severity=_payload_severity(payload),
+                )
+                return
             body = _shape_webhook_body(flavor, payload)
             # Slack / Teams / Discord incoming-webhook URLs accept
             # unauthenticated POSTs by design; forwarding the
@@ -835,8 +865,12 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
             "audit_forward_target_failed",
             target=target.get("name"),
             kind=kind,
-            error=str(exc),
+            # An httpx error can quote the URL, which for a chat webhook is
+            # the credential (#1502).
+            error=redact(str(exc), target.get("url") or "", target.get("auth_header") or ""),
         )
+        if raise_errors:
+            raise
 
 
 # ── Legacy deliver helper (alerts.py still calls _deliver_one indirectly) ──
@@ -918,11 +952,22 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
                 "protocol": t.protocol or "udp",
                 "facility": int(t.facility or 16),
             }
-        elif webhook_cfg is None and t.kind == "webhook" and t.url:
-            webhook_cfg = {
-                "url": t.url,
-                "auth_header": t.auth_header or "",
-            }
+        elif (
+            webhook_cfg is None
+            and t.kind == "webhook"
+            and t.webhook_flavor != "apprise"
+            and t.url_encrypted
+        ):
+            # The legacy shape is a plain JSON POST; an Apprise URL is not
+            # something httpx can post to.
+            url = reveal(t.url_encrypted, field="url", target=t.name)
+            if url:
+                webhook_cfg = {
+                    "url": url,
+                    "auth_header": reveal(
+                        t.auth_header_encrypted, field="auth_header", target=t.name
+                    ),
+                }
         if syslog_cfg is not None and webhook_cfg is not None:
             break
 
@@ -947,10 +992,14 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
             "protocol": ps.audit_forward_syslog_protocol or "udp",
             "facility": int(ps.audit_forward_syslog_facility),
         }
-    if ps.audit_forward_webhook_enabled and ps.audit_forward_webhook_url:
+    legacy_url = reveal(ps.audit_forward_webhook_url_encrypted, field="audit_forward_webhook_url")
+    if ps.audit_forward_webhook_enabled and legacy_url:
         webhook_cfg = {
-            "url": ps.audit_forward_webhook_url,
-            "auth_header": ps.audit_forward_webhook_auth_header or "",
+            "url": legacy_url,
+            "auth_header": reveal(
+                ps.audit_forward_webhook_auth_header_encrypted,
+                field="audit_forward_webhook_auth_header",
+            ),
         }
     return syslog_cfg, webhook_cfg
 
@@ -982,14 +1031,21 @@ async def _load_targets() -> list[dict[str, Any]]:
                     "resource_types": t.resource_types,
                 }
             )
-        elif t.kind == "webhook" and t.url:
+        elif t.kind == "webhook" and t.url_encrypted:
+            # Encrypted at rest (#1502). One that won't decrypt is skipped,
+            # like an SMTP password below.
+            url = reveal(t.url_encrypted, field="url", target=t.name)
+            if not url:
+                continue
             out.append(
                 {
                     "name": t.name,
                     "kind": "webhook",
                     "webhook_flavor": t.webhook_flavor or "generic",
-                    "url": t.url,
-                    "auth_header": t.auth_header or "",
+                    "url": url,
+                    "auth_header": reveal(
+                        t.auth_header_encrypted, field="auth_header", target=t.name
+                    ),
                     "min_severity": t.min_severity,
                     "resource_types": t.resource_types,
                 }
