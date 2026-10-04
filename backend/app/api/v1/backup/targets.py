@@ -25,13 +25,14 @@ from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
-from app.core.crypto import encrypt_str
+from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
 from app.services.backup.runner import run_backup_for_target
 from app.services.backup.schedule import (
     InvalidCronExpression,
@@ -103,6 +104,17 @@ def _assert_retention_is_reachable(driver, *, write_only: bool, keep_n, keep_day
             "Clear retention_keep_last_n / retention_keep_days, or turn write_only off."
         ),
     )
+
+
+def _assert_hint_keeps_passphrase_secret(passphrase: str | None, hint: str | None) -> None:
+    """Refuse a hint that gives the passphrase away.
+
+    Checked before anything is stored, because the update path writes
+    the payload (hint included) into the append-only audit log — a hint
+    accepted once cannot be taken back out of it.
+    """
+    if hint_reveals_passphrase(passphrase, hint):
+        raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
 
 
 def _require_superadmin(current_user: CurrentUser) -> None:
@@ -319,6 +331,7 @@ async def create_target(
                 "exclusive — set exactly one (or neither for no auto-prune)"
             ),
         )
+    _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
     try:
@@ -420,6 +433,22 @@ async def update_target(
                 "exclusive — set exactly one (or neither for no auto-prune)"
             ),
         )
+
+    # Either half of the pair can change on its own, so check the pair
+    # as it will be stored: a new hint against the stored passphrase is
+    # the common case (the form re-sends the hint on every save), and a
+    # rotated passphrase must not turn out to be the old hint.
+    if "passphrase_hint" in payload or payload.get("passphrase") is not None:
+        new_hint = payload.get("passphrase_hint", row.passphrase_hint)
+        new_passphrase = payload.get("passphrase")
+        if new_passphrase is None:
+            try:
+                new_passphrase = decrypt_str(row.passphrase_encrypted)
+            except ValueError:
+                # Unreadable stored passphrase — nothing to compare
+                # against, and the runner already reports it as such.
+                new_passphrase = None
+        _assert_hint_keeps_passphrase_secret(new_passphrase, new_hint)
 
     driver = get_destination(row.kind)
     # ``exclude_unset`` keeps a key the client explicitly set to null, and
