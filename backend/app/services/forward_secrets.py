@@ -68,7 +68,7 @@ def reveal(token: bytes | None, *, field: str, target: str | None = None) -> str
 
 
 def url_display(url: str) -> str:
-    """``https://hooks.example.com/…``: enough to tell targets apart.
+    """``https://hooks.slack.com/…``: enough to tell targets apart.
 
     Only the scheme, host and an explicit port survive. The path and query
     are where incoming-webhook credentials live, and userinfo is a password,
