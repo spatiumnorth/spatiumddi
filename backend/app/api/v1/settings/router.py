@@ -53,6 +53,7 @@ from app.services.appliance.access import console_only_detail, covers, effective
 from app.services.appliance.apt import render_sources_list
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
 # Debian build ships out of the box — DES/AES for priv, MD5/SHA for
@@ -145,8 +146,11 @@ class SettingsResponse(BaseModel):
     audit_forward_syslog_protocol: str
     audit_forward_syslog_facility: int
     audit_forward_webhook_enabled: bool
-    audit_forward_webhook_url: str
-    audit_forward_webhook_auth_header: str
+    # The legacy webhook's URL and header are write-only (#1502). This read
+    # is open to every signed-in user, and both are credentials.
+    audit_forward_webhook_url_set: bool = False
+    audit_forward_webhook_url_display: str = ""
+    audit_forward_webhook_auth_header_set: bool = False
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -309,6 +313,15 @@ class SettingsResponse(BaseModel):
             cols = {c.name: getattr(data, c.name) for c in data.__table__.columns}
             cols["fingerbank_api_key_set"] = bool(cols.pop("fingerbank_api_key_encrypted", None))
             cols["snmp_community_set"] = bool(cols.pop("snmp_community_encrypted", None))
+            # #1502 — the legacy webhook URL is shown as its host only.
+            webhook_url = cols.pop("audit_forward_webhook_url_encrypted", None)
+            cols["audit_forward_webhook_url_set"] = bool(webhook_url)
+            cols["audit_forward_webhook_url_display"] = url_display(
+                reveal(webhook_url, field="audit_forward_webhook_url")
+            )
+            cols["audit_forward_webhook_auth_header_set"] = bool(
+                cols.pop("audit_forward_webhook_auth_header_encrypted", None)
+            )
             raw_users = cols.get("snmp_v3_users") or []
             cols["snmp_v3_users"] = [_redact_v3_user(u) for u in raw_users]
             # Issue #156 — fold each syslog target's CA PEM ciphertext into
@@ -1922,6 +1935,15 @@ async def update_settings(
             # that a value was set.
             changes["fingerbank_api_key_set"] = True
 
+    # The legacy webhook's URL + Authorization header (#1502): same
+    # encrypt-and-redact shape, so neither reaches the column in clear or the
+    # ``platform_settings_updated`` log line below.
+    for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
+        if _field in changes:
+            raw = changes.pop(_field)
+            setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
+            changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
+
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
         from app.core.crypto import encrypt_str
@@ -2189,6 +2211,10 @@ async def update_settings(
             "fingerbank_api_key_set",
             "snmp_community_cleared",
             "snmp_community_set",
+            "audit_forward_webhook_url_cleared",
+            "audit_forward_webhook_url_set",
+            "audit_forward_webhook_auth_header_cleared",
+            "audit_forward_webhook_auth_header_set",
         ):
             continue
         setattr(settings, field, value)
@@ -2963,9 +2989,12 @@ class AuditTargetBody(BaseModel):
     protocol: str = "udp"
     facility: int = 16
     ca_cert_pem: str | None = None
-    # webhook
-    url: str = ""
-    auth_header: str = ""
+    # webhook. Both are write-only and Fernet-encrypted at rest (#1502):
+    # for a Slack / Discord / Teams target the URL IS the credential. Same
+    # three-way contract as ``smtp_password``: ``None`` (or omitted) keeps
+    # the stored value, ``""`` clears it, anything else replaces it.
+    url: str | None = None
+    auth_header: str | None = None
     webhook_flavor: str = "generic"
     # smtp
     smtp_host: str = ""
@@ -3040,8 +3069,11 @@ class AuditTargetResponse(BaseModel):
     protocol: str
     facility: int
     ca_cert_pem: str | None
-    url: str
-    # Redact auth_header — we return whether it's set, never the value.
+    # The URL and header are never returned (#1502). ``url_display`` is the
+    # scheme and host only (``https://hooks.slack.com/…``), so targets can
+    # still be told apart.
+    url_set: bool
+    url_display: str
     auth_header_set: bool
     webhook_flavor: str
     smtp_host: str
@@ -3071,8 +3103,9 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         protocol=t.protocol,
         facility=t.facility,
         ca_cert_pem=t.ca_cert_pem,
-        url=t.url,
-        auth_header_set=bool(t.auth_header),
+        url_set=bool(t.url_encrypted),
+        url_display=url_display(reveal(t.url_encrypted, field="url", target=t.name)),
+        auth_header_set=bool(t.auth_header_encrypted),
         webhook_flavor=t.webhook_flavor or "generic",
         smtp_host=t.smtp_host or "",
         smtp_port=int(t.smtp_port or 587),
@@ -3101,8 +3134,8 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.protocol = body.protocol
     t.facility = body.facility
     t.ca_cert_pem = body.ca_cert_pem
-    t.url = body.url
-    t.auth_header = body.auth_header
+    t.url_encrypted = apply_write_only(t.url_encrypted, body.url)
+    t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
     t.webhook_flavor = body.webhook_flavor
     t.smtp_host = body.smtp_host
     t.smtp_port = body.smtp_port
@@ -3118,6 +3151,18 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
     t.min_severity = body.min_severity
     t.resource_types = body.resource_types
+
+
+def _save_error(exc: Exception, body: AuditTargetBody) -> str:
+    """The reason a save failed, without the statement's bound parameters.
+
+    SQLAlchemy's message for a failed flush ends with ``[parameters: …]``,
+    every value the INSERT / UPDATE carried (#1502). The driver's own
+    message (``duplicate key value violates unique constraint …``) is all
+    the operator needs.
+    """
+    reason = str(getattr(exc, "orig", None) or exc)
+    return redact(reason, body.url or "", body.auth_header or "", body.smtp_password or "")
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
@@ -3146,7 +3191,9 @@ async def create_audit_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"create failed: {_save_error(exc, body)}"
+        ) from exc
     await db.refresh(row)
     return _target_to_response(row)
 
@@ -3171,7 +3218,9 @@ async def update_audit_target(
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"update failed: {_save_error(exc, body)}"
+        ) from exc
     await db.refresh(row)
     return _target_to_response(row)
 
@@ -3219,6 +3268,9 @@ async def test_audit_target(
         "old_value": None,
         "new_value": None,
     }
+    # The webhook secrets are encrypted at rest too (#1502).
+    url = reveal(row.url_encrypted, field="url", target=row.name)
+    auth_header = reveal(row.auth_header_encrypted, field="auth_header", target=row.name)
     # Decrypt the SMTP password lazily — only the test path needs the
     # cleartext, and only inside this request scope.
     smtp_password = ""
@@ -3241,8 +3293,8 @@ async def test_audit_target(
         "protocol": row.protocol,
         "facility": row.facility,
         "ca_cert_pem": row.ca_cert_pem,
-        "url": row.url,
-        "auth_header": row.auth_header or "",
+        "url": url,
+        "auth_header": auth_header,
         "webhook_flavor": row.webhook_flavor or "generic",
         "smtp_host": row.smtp_host or "",
         "smtp_port": int(row.smtp_port or 587),
@@ -3258,7 +3310,8 @@ async def test_audit_target(
     try:
         await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+        reason = redact(str(exc), url, auth_header, smtp_password)
+        raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
     return {"status": "ok", "target": row.name}
 
 
