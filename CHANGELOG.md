@@ -544,6 +544,16 @@ the formatter handles the rest.
   credential or presigned URL that was edited, or failed a run, on an
   earlier release, since the audit table is append-only.
 
+- **Resolving an alert event and running an evaluation now require a
+  superadmin (GHSA-9m9r-w366-jj3v).** `POST /alerts/events/{id}/resolve` and
+  `POST /alerts/evaluate` only checked that the caller was signed in, so the
+  read-only Viewer role could dismiss a transition-once alert (registrar
+  change, hijack latch) for good, or trigger an evaluator pass that delivers
+  to the configured syslog / webhook / SMTP targets. Both now use the same
+  superadmin gate as the alert-rule writes, and a resolve writes an
+  `audit_log` row. Operators who relied on non-superadmin accounts resolving
+  alerts need to use a superadmin account.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`

@@ -278,7 +278,7 @@ def _require_superadmin(current_user: CurrentUser) -> None:
     if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Superadmin required to manage alert rules",
+            detail="Superadmin required to manage alerts",
         )
 
 
@@ -421,12 +421,29 @@ async def list_events(
 @router.post("/events/{event_id}/resolve", response_model=AlertEventResponse)
 async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertEvent:
     """Manually mark an event resolved. Useful to silence a known-good
-    alert while the underlying metric is still above threshold."""
+    alert while the underlying metric is still above threshold.
+
+    Superadmin only, like the rule writes: for transition-once rules a
+    resolve dismisses the signal for good. Audited.
+    """
+    _require_superadmin(current_user)
     event = await db.get(AlertEvent, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
     if event.resolved_at is None:
         event.resolved_at = datetime.now(UTC)
+        db.add(
+            AuditLog(
+                action="resolve",
+                resource_type="alert_event",
+                resource_id=str(event.id),
+                resource_display=event.subject_display,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                new_value={"rule_id": str(event.rule_id), "subject_type": event.subject_type},
+            )
+        )
     await db.commit()
     await db.refresh(event)
     return event
@@ -441,7 +458,9 @@ async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
 
     Handy for "did that rule I just created fire?" workflows — skips
     waiting for the 60 s Celery tick. Same semantics as the scheduled
-    run, just synchronous.
+    run, just synchronous. Superadmin only: a pass delivers to the
+    configured syslog / webhook / SMTP targets.
     """
+    _require_superadmin(current_user)
     result = await alert_service.evaluate_all(db)
     return EvaluateResponse(**result)
