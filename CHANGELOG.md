@@ -529,6 +529,21 @@ the formatter handles the rest.
   Not yet changed: the constant passphrase itself, and pruning of old
   dumps; both are follow-ups.
 
+- **Backup-target credentials no longer reach the audit log or error
+  messages (GHSA-m63g-667p-6qgw).** `PATCH /backup/targets/{id}` wrote
+  the raw request body into `audit_log.new_value` minus only the
+  passphrase, so a rotated S3 key, SCP password or key, Azure, GCS,
+  WebDAV, FTP, SMB or https_put credential landed in the audit table in
+  clear, readable by the Viewer role, forwarded to SIEM targets and
+  copied into every backup archive. The audit row now records only the
+  names of the config keys that changed. Separately, the https_put and
+  webdav drivers put the full destination URL, including a presigned
+  query string or `user:pass@`, into errors that reach
+  `last_run_error`, the audit log and the logs; they now show scheme,
+  host and path only. Operator action: rotate any backup-target
+  credential or presigned URL that was edited, or failed a run, on an
+  earlier release, since the audit table is append-only.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`

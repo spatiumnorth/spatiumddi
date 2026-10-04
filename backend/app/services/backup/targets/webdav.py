@@ -57,6 +57,8 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     safe_filename,
+    safe_url,
+    scrub_url,
 )
 
 logger = structlog.get_logger(__name__)
@@ -180,7 +182,9 @@ class WebDAVDestination(BackupDestination):
                     headers={"Content-Type": "application/zip"},
                 )
             except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV PUT failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"WebDAV PUT failed: {scrub_url(str(exc), target)}"
+                ) from exc
         if resp.status_code not in (200, 201, 204):
             raise BackupDestinationError(
                 f"WebDAV PUT returned {resp.status_code}: {resp.text[:300]}"
@@ -202,10 +206,12 @@ class WebDAVDestination(BackupDestination):
                     },
                 )
             except httpx.HTTPError as exc:
-                raise BackupDestinationError(f"WebDAV PROPFIND failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"WebDAV PROPFIND failed: {scrub_url(str(exc), url)}"
+                ) from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
-                f"WebDAV collection {url!r} not found — verify the URL is correct"
+                f"WebDAV collection {safe_url(url)!r} not found — verify the URL is correct"
             )
         if resp.status_code != 207:
             raise BackupDestinationError(
@@ -270,7 +276,7 @@ class WebDAVDestination(BackupDestination):
                 raise BackupDestinationError(f"WebDAV GET failed: {exc}") from exc
         if resp.status_code == 404:
             raise BackupDestinationError(
-                f"archive {safe_filename(filename)!r} not found at {target}"
+                f"archive {safe_filename(filename)!r} not found at {safe_url(target)}"
             )
         if resp.status_code != 200:
             raise BackupDestinationError(
@@ -344,5 +350,5 @@ class WebDAVDestination(BackupDestination):
                 return {"ok": False, "error": f"webdav: {exc}"}
         return {
             "ok": True,
-            "detail": f"wrote + verified + deleted probe at {probe_target}",
+            "detail": f"wrote + verified + deleted probe at {safe_url(probe_target)}",
         }
