@@ -9,7 +9,10 @@ For ``kind="webhook"``, ``webhook_flavor`` further selects how the JSON
 body is shaped: ``generic`` posts the raw audit/alert payload,
 ``slack``/``teams``/``discord`` wraps it in the platform's
 incoming-webhook block format so chat-channel delivery works without a
-separate transformer.
+separate transformer. ``telegram`` posts to the Telegram Bot API's
+``sendMessage`` instead of ``url``: the bot token, chat id and optional
+forum topic live in the ``telegram_*`` columns, the token Fernet-encrypted
+at rest like the SMTP password.
 """
 
 from __future__ import annotations
@@ -51,16 +54,36 @@ class AuditForwardTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # platform_settings); migrating to Fernet-at-rest is a separate pass
     # tracked with the other secret-hardening work.
     auth_header: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
-    # webhook_flavor: generic | slack | teams | discord
+    # webhook_flavor: generic | slack | teams | discord | telegram
     # Picks the platform-specific JSON shape at send time. ``generic`` is
     # the original behaviour (raw audit/alert payload); the others wrap
     # in Slack mrkdwn / Teams MessageCard / Discord embed format so a
     # standard incoming-webhook URL works without a transformer.
+    # ``telegram`` ignores ``url`` and uses the ``telegram_*`` columns.
     webhook_flavor: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
         default="generic",
         server_default=sa_text("'generic'"),
+    )
+
+    # ── telegram fields (webhook_flavor="telegram") ────────────────
+    # The bot token is the whole credential (it goes in the Bot API URL
+    # path), so it is Fernet-encrypted at rest and write-only in the API,
+    # which exposes only ``telegram_bot_token_set`` — same shape as
+    # ``smtp_password_encrypted``.
+    telegram_bot_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # A numeric chat id (``-100…`` for a supergroup or channel) or a
+    # public ``@channelusername``. Text, because both forms are valid.
+    telegram_chat_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=sa_text("''")
+    )
+    # Forum topic to post into, for a supergroup with topics enabled.
+    telegram_message_thread_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Bot API base URL. Empty means Telegram's public API; set it for a
+    # self-hosted Bot API server.
+    telegram_api_base: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
     )
 
     # ── smtp fields ────────────────────────────────────────────────

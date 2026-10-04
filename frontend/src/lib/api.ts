@@ -4046,7 +4046,8 @@ export type AuditForwardWebhookFlavor =
   | "generic"
   | "slack"
   | "teams"
-  | "discord";
+  | "discord"
+  | "telegram";
 export type AuditForwardSmtpSecurity = "none" | "starttls" | "ssl";
 export type AuditForwardFormat =
   | "rfc5424_json"
@@ -4080,6 +4081,11 @@ export interface AuditForwardTarget {
   smtp_from_address: string;
   smtp_to_addresses: string[] | null;
   smtp_reply_to: string;
+  // The bot token is write-only (Fernet-encrypted at rest) — bool only.
+  telegram_bot_token_set: boolean;
+  telegram_chat_id: string;
+  telegram_message_thread_id: number | null;
+  telegram_api_base: string;
   min_severity: AuditForwardSeverity | null;
   resource_types: string[] | null;
   created_at: string;
@@ -4109,6 +4115,12 @@ export interface AuditForwardTargetWrite {
   smtp_from_address?: string;
   smtp_to_addresses?: string[] | null;
   smtp_reply_to?: string;
+  // ``null`` / ``""`` keep the stored token; any other string replaces it
+  // (encrypted server-side, never returned).
+  telegram_bot_token?: string | null;
+  telegram_chat_id?: string;
+  telegram_message_thread_id?: number | null;
+  telegram_api_base?: string;
   min_severity?: AuditForwardSeverity | null;
   resource_types?: string[] | null;
 }

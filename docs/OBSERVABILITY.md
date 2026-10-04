@@ -440,6 +440,25 @@ don't serialize the queue.
   generic JSON, **Slack** (`mrkdwn` block), **Teams**
   (`MessageCard`), and **Discord** (`embed`) so chat-channel
   delivery doesn't need a separate adapter.
+- **Telegram** — `webhook_flavor="telegram"`. Not an incoming
+  webhook: the target holds a **bot token** (Fernet-encrypted at
+  rest, write-only in the API — only `telegram_bot_token_set` comes
+  back), a **chat id** (`-100…` for a group or channel, or a public
+  `@channelusername`), an optional **topic id** for forum
+  supergroups, and an optional **API base** for a self-hosted Bot API
+  server (default `https://api.telegram.org`); `url` is unused. Each
+  event is one `sendMessage` call with `parse_mode=HTML`: a severity
+  emoji, the title in bold and the body, HTML-escaped and cut to
+  Telegram's 4096-character limit. Telegram's own error is reported
+  ("chat not found", "bot is not a member of the channel chat") — on
+  the target's **Test** button as well as in the log — and a 429 is
+  retried once when `retry_after` is at most 5 s. The token is kept
+  out of every log line, including httpx's request log.
+  To set one up: create a bot with @BotFather and copy its token, add
+  the bot to the chat (in a channel, as an admin allowed to post),
+  and read the chat id from the bot's `getUpdates` or a helper bot.
+  Telegram targets are alert *webhook* targets, so a rule's
+  "webhook" channel covers them, like Slack / Teams / Discord.
 - **SMTP email** — stdlib `smtplib` driven through
   `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
   plaintext, optional auth (Fernet-encrypted password at rest).

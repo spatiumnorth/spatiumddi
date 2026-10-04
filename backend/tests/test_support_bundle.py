@@ -57,6 +57,11 @@ async def _user(db: AsyncSession, username: str, *, superadmin: bool) -> tuple[U
         ("-----BEGIN RSA PRIVATE KEY-----", "pem"),
         ("-----BEGIN PRIVATE KEY-----", "pem"),
         ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27u", "jwt"),
+        ("123456789:ABCdefGHIjklMNOpqrSTUvwxYZ0123456_-x", "telegram-bot-token"),
+        (
+            "https://api.telegram.org/bot123456789:ABCdefGHIjklMNOpqrSTUvwxYZ0123456_-x/sendMessage",
+            "telegram-bot-token",
+        ),
     ],
 )
 def test_secret_shapes_are_removed(blob: str, kind: str) -> None:

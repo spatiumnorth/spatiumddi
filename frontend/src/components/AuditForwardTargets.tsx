@@ -26,6 +26,7 @@ import {
   type AuditForwardSeverity,
   type AuditForwardTarget,
   type AuditForwardTargetWrite,
+  type AuditForwardWebhookFlavor,
 } from "@/lib/api";
 
 const inputCls =
@@ -85,6 +86,10 @@ const EMPTY: AuditForwardTargetWrite = {
   smtp_from_address: "",
   smtp_to_addresses: null,
   smtp_reply_to: "",
+  telegram_bot_token: null,
+  telegram_chat_id: "",
+  telegram_message_thread_id: null,
+  telegram_api_base: "",
   min_severity: null,
   resource_types: null,
 };
@@ -116,6 +121,11 @@ function targetToBody(t: AuditForwardTarget): AuditForwardTargetWrite {
     smtp_from_address: t.smtp_from_address,
     smtp_to_addresses: t.smtp_to_addresses,
     smtp_reply_to: t.smtp_reply_to,
+    // Write-only like smtp_password: ``null`` = keep the stored token.
+    telegram_bot_token: null,
+    telegram_chat_id: t.telegram_chat_id,
+    telegram_message_thread_id: t.telegram_message_thread_id,
+    telegram_api_base: t.telegram_api_base,
     min_severity: t.min_severity,
     resource_types: t.resource_types,
   };
@@ -253,7 +263,12 @@ export function AuditForwardTargets({
                 const dest =
                   t.kind === "syslog"
                     ? `${t.host || "?"}:${t.port} ${t.protocol.toUpperCase()}`
-                    : t.url || "—";
+                    : t.kind === "webhook" && t.webhook_flavor === "telegram"
+                      ? `Telegram chat ${t.telegram_chat_id || "?"}` +
+                        (t.telegram_message_thread_id
+                          ? ` (topic ${t.telegram_message_thread_id})`
+                          : "")
+                      : t.url || "—";
                 const filter =
                   t.min_severity ||
                   (t.resource_types && t.resource_types.length > 0)
@@ -373,6 +388,9 @@ export function AuditForwardTargets({
           smtpPasswordSet={
             editing.mode === "edit" ? editing.row.smtp_password_set : false
           }
+          telegramTokenSet={
+            editing.mode === "edit" ? editing.row.telegram_bot_token_set : false
+          }
           onClose={() => setEditing(null)}
         />
       )}
@@ -411,12 +429,14 @@ function TargetModal({
   existingId,
   authHeaderSet,
   smtpPasswordSet,
+  telegramTokenSet,
   onClose,
 }: {
   initial: AuditForwardTargetWrite;
   existingId?: string;
   authHeaderSet: boolean;
   smtpPasswordSet: boolean;
+  telegramTokenSet: boolean;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -436,6 +456,11 @@ function TargetModal({
       // dialog to clear if they ever need to.
       if (existingId && smtpPasswordSet && body.smtp_password === null) {
         delete body.smtp_password;
+      }
+      // Telegram bot token: blank on edit = keep the stored one (the
+      // server treats null and "" alike — a target can't run without it).
+      if (!body.telegram_bot_token) {
+        delete body.telegram_bot_token;
       }
       if (body.resource_types && body.resource_types.length === 0) {
         body.resource_types = null;
@@ -659,11 +684,7 @@ function TargetModal({
                 onChange={(e) =>
                   setForm({
                     ...form,
-                    webhook_flavor: e.target.value as
-                      | "generic"
-                      | "slack"
-                      | "teams"
-                      | "discord",
+                    webhook_flavor: e.target.value as AuditForwardWebhookFlavor,
                   })
                 }
               >
@@ -671,32 +692,122 @@ function TargetModal({
                 <option value="slack">Slack (mrkdwn blocks)</option>
                 <option value="teams">Microsoft Teams (MessageCard)</option>
                 <option value="discord">Discord (embed)</option>
+                <option value="telegram">Telegram (Bot API)</option>
               </select>
               <div className="mt-1 text-[11px] text-muted-foreground">
                 {form.webhook_flavor === "generic"
                   ? "Posts the raw audit/alert JSON. For collectors that parse it themselves."
-                  : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+                  : form.webhook_flavor === "telegram"
+                    ? "Sends each event as a Telegram message from your bot. Create a bot with @BotFather, add it to the chat (in a channel, as an admin allowed to post), then enter the token and chat ID below."
+                    : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
               </div>
             </label>
-            <label className="block">
-              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                URL
-              </div>
-              <input
-                className={inputCls}
-                value={form.url ?? ""}
-                onChange={(e) => setForm({ ...form, url: e.target.value })}
-                placeholder={
-                  form.webhook_flavor === "slack"
-                    ? "https://hooks.slack.com/services/T…/B…/…"
-                    : form.webhook_flavor === "teams"
-                      ? "https://…webhook.office.com/webhookb2/…"
-                      : form.webhook_flavor === "discord"
-                        ? "https://discord.com/api/webhooks/…/…"
-                        : "https://collector.example.com/ingest"
-                }
-              />
-            </label>
+            {form.webhook_flavor === "telegram" && (
+              <>
+                <label className="block">
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Bot Token
+                  </div>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    className={inputCls}
+                    value={form.telegram_bot_token ?? ""}
+                    onChange={(e) =>
+                      setForm({ ...form, telegram_bot_token: e.target.value })
+                    }
+                    placeholder={
+                      telegramTokenSet
+                        ? "(stored — leave blank to keep unchanged)"
+                        : "123456789:AA…"
+                    }
+                  />
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    The token @BotFather issued. It is the bot&apos;s full
+                    credential: stored encrypted and never shown again.
+                  </div>
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Chat ID
+                    </div>
+                    <input
+                      className={inputCls}
+                      value={form.telegram_chat_id ?? ""}
+                      onChange={(e) =>
+                        setForm({ ...form, telegram_chat_id: e.target.value })
+                      }
+                      placeholder="-1001234567890 or @channelname"
+                    />
+                  </label>
+                  <label className="block">
+                    <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Topic ID (optional)
+                    </div>
+                    <input
+                      type="number"
+                      min={1}
+                      className={inputCls}
+                      value={form.telegram_message_thread_id ?? ""}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          telegram_message_thread_id: e.target.value
+                            ? Number(e.target.value)
+                            : null,
+                        })
+                      }
+                      placeholder="forum topics only"
+                    />
+                  </label>
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Group IDs are negative; supergroup and channel IDs start with
+                  -100. To find one, post in the chat and read{" "}
+                  <code>chat.id</code> from the bot&apos;s{" "}
+                  <code>getUpdates</code>.
+                </div>
+                <label className="block">
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Bot API Server (optional)
+                  </div>
+                  <input
+                    className={inputCls}
+                    value={form.telegram_api_base ?? ""}
+                    onChange={(e) =>
+                      setForm({ ...form, telegram_api_base: e.target.value })
+                    }
+                    placeholder="https://api.telegram.org"
+                  />
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    Only for a self-hosted Bot API server. Leave blank to use
+                    Telegram&apos;s.
+                  </div>
+                </label>
+              </>
+            )}
+            {form.webhook_flavor !== "telegram" && (
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  URL
+                </div>
+                <input
+                  className={inputCls}
+                  value={form.url ?? ""}
+                  onChange={(e) => setForm({ ...form, url: e.target.value })}
+                  placeholder={
+                    form.webhook_flavor === "slack"
+                      ? "https://hooks.slack.com/services/T…/B…/…"
+                      : form.webhook_flavor === "teams"
+                        ? "https://…webhook.office.com/webhookb2/…"
+                        : form.webhook_flavor === "discord"
+                          ? "https://discord.com/api/webhooks/…/…"
+                          : "https://collector.example.com/ingest"
+                  }
+                />
+              </label>
+            )}
             {form.webhook_flavor === "generic" && (
               <label className="block">
                 <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">

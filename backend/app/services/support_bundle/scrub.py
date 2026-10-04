@@ -113,6 +113,15 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         re.compile(r"(?<=://)[^:/@\s\[\]]+:[^@/\s\[\]]+(?=@)"),
         f"{_REDACTED}:{_REDACTED}",
     ),
+    # Telegram Bot API token (``<bot id>:<secret>``). It travels in the
+    # request PATH (``/bot<token>/sendMessage``), so any log line that
+    # prints the request URL carries it. The audit-forward sender filters
+    # it out of httpx's request log; this catches whatever else does.
+    (
+        "telegram-bot-token",
+        re.compile(r"(?<!\d)\d{3,15}:[A-Za-z0-9_-]{30,}"),
+        f"{_REDACTED}:telegram-bot-token",
+    ),
     # Base64 TSIG secrets are indistinguishable from any other base64, so
     # they are excluded by key name at the collector instead; see
     # ``SECRET_KEY_NAME_RE``.

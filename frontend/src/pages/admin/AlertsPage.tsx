@@ -517,8 +517,8 @@ function RuleEditorModal({
           </p>
           <p className="text-[11px] text-muted-foreground/80">
             Fans out to every enabled target of the matching kind in Settings →
-            Audit Event Forwarding (webhook covers Slack / Teams / Discord chat
-            flavors automatically).
+            Audit Event Forwarding (webhook covers the Slack / Teams / Discord /
+            Telegram chat flavors automatically).
           </p>
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -534,7 +534,7 @@ function RuleEditorModal({
               checked={notifyWebhook}
               onChange={(e) => setNotifyWebhook(e.target.checked)}
             />
-            Webhook (incl. Slack / Teams / Discord)
+            Webhook (incl. Slack / Teams / Discord / Telegram)
           </label>
           <label className="flex items-center gap-2 text-sm">
             <input

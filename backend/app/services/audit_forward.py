@@ -40,7 +40,10 @@ See ``docs/OBSERVABILITY.md`` for the operator-facing view.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import logging
+import re
 import socket
 import ssl
 from collections.abc import AsyncIterator
@@ -513,7 +516,7 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
             logger.warning(
                 "audit_forward_webhook_non2xx",
                 status=resp.status_code,
-                body_preview=resp.text[:200],
+                body_preview=redact_telegram_tokens(resp.text[:200]),
             )
 
 
@@ -636,7 +639,227 @@ def _shape_webhook_body(flavor: str, payload: dict[str, Any]) -> dict[str, Any]:
         return _teams_payload(payload)
     if flavor == "discord":
         return _discord_payload(payload)
+    if flavor == "telegram":
+        return _telegram_payload(payload)
     return payload
+
+
+# ── Telegram (webhook_flavor="telegram") ───────────────────────────────────
+#
+# Not an incoming webhook: the Bot API takes the bot token in the request
+# PATH (``/bot<token>/sendMessage``), so the target stores the token
+# (Fernet-encrypted), the chat id and an optional forum topic as separate
+# columns and the URL is assembled here at send time. The token is the
+# whole credential, so the rule for this section is that it never leaves
+# ``_send_telegram`` — not in a log line, an exception message, or the
+# test endpoint's response. httpx logs every request URL at INFO, which is
+# what ``_TelegramTokenLogFilter`` below is for.
+
+TELEGRAM_DEFAULT_API_BASE = "https://api.telegram.org"
+
+#: ``<bot id>:<secret>`` as @BotFather issues it. Validated strictly at
+#: create/update: the token is interpolated into the URL path, so a ``/``,
+#: ``?`` or ``#`` in it would change which endpoint we call.
+TELEGRAM_BOT_TOKEN_RE = re.compile(r"\d{3,15}:[A-Za-z0-9_-]{20,128}")
+
+#: A token anywhere in free text — a logged URL, an exception message.
+_TELEGRAM_TOKEN_IN_TEXT_RE = re.compile(r"(?<!\d)\d{3,15}:[A-Za-z0-9_-]{20,}")
+
+#: ``sendMessage`` rejects text longer than this. Telegram counts UTF-16
+#: code units (an emoji outside the BMP is two), and we count the HTML
+#: markup too, so a message that fits here always fits there.
+_TELEGRAM_TEXT_LIMIT = 4096
+_TELEGRAM_TITLE_LIMIT = 256
+
+#: A 429 carries ``parameters.retry_after``. One retry when the wait is at
+#: most this many seconds; longer and the message is reported as dropped,
+#: since an alert run or an audit fan-out should not stall on one target.
+_TELEGRAM_MAX_RETRY_AFTER = 5
+
+_TELEGRAM_ICONS = {
+    # Mirrors the Slack shortcodes, as the emoji Telegram actually renders.
+    "info": "ℹ️",
+    "warn": "⚠️",
+    "warning": "⚠️",
+    "error": "🚨",
+    "denied": "⛔",
+    "critical": "🚨",
+}
+
+
+def redact_telegram_tokens(text: str) -> str:
+    """Replace anything shaped like a Telegram bot token with a placeholder."""
+    return _TELEGRAM_TOKEN_IN_TEXT_RE.sub("[REDACTED]", text)
+
+
+class _TelegramTokenLogFilter(logging.Filter):
+    """Strip bot tokens from httpx's ``HTTP Request: POST <url>`` log line.
+
+    httpx logs the full request URL at INFO, and the root logger runs at
+    INFO, so without this every Telegram delivery would write the bot
+    token to the api / worker log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_telegram_tokens(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                redact_telegram_tokens(str(a)) if isinstance(a, (str, httpx.URL)) else a
+                for a in record.args
+            )
+        return True
+
+
+_TELEGRAM_LOG_FILTER = _TelegramTokenLogFilter()
+# ``addFilter`` is a no-op when the same filter object is already attached.
+logging.getLogger("httpx").addFilter(_TELEGRAM_LOG_FILTER)
+
+
+class TelegramDeliveryError(RuntimeError):
+    """A Telegram send failed. The message is operator-facing and never
+    contains the bot token, so it is safe to log and to return from the
+    test endpoint."""
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _telegram_escape(text: str, budget: int) -> str:
+    """HTML-escape ``text`` for ``parse_mode=HTML``, cut to ``budget``.
+
+    Truncation happens on the RAW text, one character at a time, before
+    escaping, so an entity like ``&amp;`` is never cut in half. The
+    result, ellipsis included, is at most ``budget`` UTF-16 units.
+    """
+    escaped = html.escape(text, quote=False)
+    if _utf16_len(escaped) <= budget:
+        return escaped
+    limit = budget - 1  # room for the ellipsis
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        piece = html.escape(ch, quote=False)
+        size = _utf16_len(piece)
+        if used + size > limit:
+            break
+        out.append(piece)
+        used += size
+    return "".join(out) + "…"
+
+
+def _telegram_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The message part of a ``sendMessage`` body (no chat fields).
+
+    Telegram's HTML mode, not Markdown: HTML needs only ``<``, ``>`` and
+    ``&`` escaped, while MarkdownV2 reserves eighteen characters, most of
+    which turn up in hostnames, zone names and alert messages.
+    """
+    title, body = _payload_summary_lines(payload)
+    icon = _TELEGRAM_ICONS.get(_payload_severity(payload), "ℹ️")
+    header = f"{icon} <b>{_telegram_escape(title, _TELEGRAM_TITLE_LIMIT)}</b>"
+    text = header
+    if body:
+        budget = _TELEGRAM_TEXT_LIMIT - _utf16_len(header) - 1  # the newline
+        text = f"{header}\n{_telegram_escape(body, budget)}"
+    return {
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+
+def _telegram_chat_id(chat_id: str) -> int | str:
+    """Numeric ids go out as integers; ``@channelusername`` as a string."""
+    return int(chat_id) if re.fullmatch(r"-?\d+", chat_id) else chat_id
+
+
+def _telegram_client() -> httpx.AsyncClient:
+    # Same 5 s budget as the other webhook flavors. A seam for tests.
+    return httpx.AsyncClient(timeout=5.0)
+
+
+def _telegram_error(status: int, data: dict[str, Any] | None) -> str:
+    """Turn a failed Bot API response into an operator-facing message."""
+    description = ""
+    if data is not None:
+        description = redact_telegram_tokens(str(data.get("description") or ""))[:200]
+    shown = description or f"HTTP {status}"
+    lowered = description.lower()
+    if status in (401, 404):
+        # 401 for a revoked or wrong token; 404 when the token is not a
+        # token at all (the path does not resolve to a bot).
+        return (
+            f"Telegram rejected the bot token ({shown}). "
+            "Check the token @BotFather issued for this bot."
+        )
+    if "chat not found" in lowered:
+        return (
+            f"Telegram could not find the chat ({shown}). Check the chat ID, "
+            "and that the bot has been added to that chat."
+        )
+    if status == 403:
+        return (
+            f"Telegram refused to deliver ({shown}). The bot must be a member "
+            "of the chat; in a channel it must be an admin allowed to post."
+        )
+    if status == 429:
+        retry_after = None
+        if data is not None and isinstance(data.get("parameters"), dict):
+            retry_after = data["parameters"].get("retry_after")
+        wait = f" for {retry_after} s" if retry_after is not None else ""
+        return f"Telegram rate-limited the bot{wait} ({shown}); this message was dropped."
+    return f"Telegram API error ({shown})."
+
+
+async def _send_telegram(target: dict[str, Any], message: dict[str, Any]) -> None:
+    """POST one ``sendMessage``. Raises ``TelegramDeliveryError``.
+
+    Unlike ``_send_webhook``, a non-2xx is raised rather than logged: the
+    Bot API always answers ``{"ok": false, "description": …}`` on failure,
+    and that description ("chat not found", "bot was blocked by the user")
+    is exactly what the operator needs from the "Test target" button.
+    """
+    token = (target.get("telegram_bot_token") or "").strip()
+    chat_id = (target.get("telegram_chat_id") or "").strip()
+    if not token or not chat_id:
+        raise TelegramDeliveryError("Telegram target is missing its bot token or chat ID.")
+    base = (target.get("telegram_api_base") or TELEGRAM_DEFAULT_API_BASE).rstrip("/")
+    body: dict[str, Any] = {"chat_id": _telegram_chat_id(chat_id)}
+    thread_id = target.get("telegram_message_thread_id")
+    if thread_id:
+        body["message_thread_id"] = int(thread_id)
+    body.update(message)
+    url = f"{base}/bot{token}/sendMessage"
+
+    for attempt in (1, 2):
+        try:
+            async with _telegram_client() as client:
+                resp = await client.post(url, json=body)
+        except httpx.HTTPError as exc:
+            # ``from None``: the httpx exception carries the request, and
+            # with it the URL. Its str() normally does not, but redact
+            # anyway — this text reaches logs and the test endpoint.
+            raise TelegramDeliveryError(
+                f"Could not reach the Telegram Bot API at {base}: "
+                f"{type(exc).__name__}: {redact_telegram_tokens(str(exc))[:200]}"
+            ) from None
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            data = None
+        if 200 <= resp.status_code < 300 and data is not None and data.get("ok") is True:
+            return
+        if resp.status_code == 429 and attempt == 1 and data is not None:
+            params = data.get("parameters")
+            retry_after = params.get("retry_after") if isinstance(params, dict) else None
+            if isinstance(retry_after, int) and 0 <= retry_after <= _TELEGRAM_MAX_RETRY_AFTER:
+                await asyncio.sleep(retry_after)
+                continue
+        raise TelegramDeliveryError(_telegram_error(resp.status_code, data))
 
 
 # ── SMTP transport ─────────────────────────────────────────────────────────
@@ -781,7 +1004,18 @@ def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
     return True
 
 
-async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> None:
+async def _deliver_to_target(
+    target: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> None:
+    """Deliver one event to one target.
+
+    Failures are logged and swallowed so one dead target never affects
+    the others. ``raise_errors`` re-raises after logging, for the test
+    endpoint, which wants to show the operator why a probe failed.
+    """
     if not _target_accepts(target, payload):
         return
     kind = target.get("kind")
@@ -802,6 +1036,9 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
         elif kind == "webhook":
             flavor = (target.get("webhook_flavor") or "generic").lower()
             body = _shape_webhook_body(flavor, payload)
+            if flavor == "telegram":
+                await _send_telegram(target, body)
+                return
             # Slack / Teams / Discord incoming-webhook URLs accept
             # unauthenticated POSTs by design; forwarding the
             # ``Authorization`` header would just confuse them. Keep
@@ -835,8 +1072,10 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
             "audit_forward_target_failed",
             target=target.get("name"),
             kind=kind,
-            error=str(exc),
+            error=redact_telegram_tokens(str(exc)),
         )
+        if raise_errors:
+            raise
 
 
 # ── Legacy deliver helper (alerts.py still calls _deliver_one indirectly) ──
@@ -978,6 +1217,37 @@ async def _load_targets() -> list[dict[str, Any]]:
                     "protocol": t.protocol,
                     "facility": int(t.facility),
                     "ca_cert_pem": t.ca_cert_pem,
+                    "min_severity": t.min_severity,
+                    "resource_types": t.resource_types,
+                }
+            )
+        elif t.kind == "webhook" and t.webhook_flavor == "telegram":
+            # No ``url`` — the Bot API URL is built from the token at send
+            # time. Decrypted here for the same reason as the SMTP password.
+            if not t.telegram_bot_token_encrypted or not t.telegram_chat_id:
+                continue
+            try:
+                from app.core.crypto import decrypt_str
+
+                bot_token = decrypt_str(t.telegram_bot_token_encrypted)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "audit_forward_telegram_decrypt_failed",
+                    target=t.name,
+                    error=type(exc).__name__,
+                )
+                continue
+            out.append(
+                {
+                    "name": t.name,
+                    "kind": "webhook",
+                    "webhook_flavor": "telegram",
+                    "url": "",
+                    "auth_header": "",
+                    "telegram_bot_token": bot_token,
+                    "telegram_chat_id": t.telegram_chat_id,
+                    "telegram_message_thread_id": t.telegram_message_thread_id,
+                    "telegram_api_base": t.telegram_api_base,
                     "min_severity": t.min_severity,
                     "resource_types": t.resource_types,
                 }

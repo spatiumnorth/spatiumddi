@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import (
@@ -2936,7 +2937,10 @@ async def get_oui_refresh_status(task_id: str, current_user: CurrentUser) -> OUI
 # ── Audit forward targets (multi-target + multi-format) ───────────────────
 
 _VALID_KINDS = {"syslog", "webhook", "smtp"}
-_VALID_WEBHOOK_FLAVORS = {"generic", "slack", "teams", "discord"}
+_VALID_WEBHOOK_FLAVORS = {"generic", "slack", "teams", "discord", "telegram"}
+# A numeric chat id (``-100…`` for supergroups / channels) or a public
+# ``@username`` (5-32 chars, starts with a letter).
+_TELEGRAM_CHAT_ID_RE = re.compile(r"-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31}")
 _VALID_SMTP_SECURITY = {"none", "starttls", "ssl"}
 _VALID_FORMATS = {
     "rfc5424_json",
@@ -2980,9 +2984,51 @@ class AuditTargetBody(BaseModel):
     smtp_from_address: str = ""
     smtp_to_addresses: list[str] | None = None
     smtp_reply_to: str = ""
+    # telegram (webhook_flavor="telegram")
+    # Write-only. ``None`` or ``""`` leaves the stored token alone — unlike
+    # ``smtp_password`` there is no "clear", since a Telegram target cannot
+    # work without one. Checked in ``_check_telegram_target`` rather than
+    # a field validator, because a pydantic 422 echoes the rejected input
+    # back in the response body.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str = ""
+    telegram_message_thread_id: int | None = Field(default=None, ge=1)
+    telegram_api_base: str = ""
     # filter
     min_severity: str | None = None
     resource_types: list[str] | None = None
+
+    @field_validator("telegram_chat_id")
+    @classmethod
+    def _valid_telegram_chat_id(cls, v: str) -> str:
+        v = v.strip()
+        if v and not _TELEGRAM_CHAT_ID_RE.fullmatch(v):
+            raise ValueError(
+                "telegram_chat_id must be a numeric chat id (e.g. -1001234567890) "
+                "or a public @channelusername"
+            )
+        return v
+
+    @field_validator("telegram_api_base")
+    @classmethod
+    def _valid_telegram_api_base(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if not v:
+            return ""
+        parts = urlsplit(v)
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError(
+                "telegram_api_base must be the https base URL of a Bot API server, "
+                "with no credentials, query or fragment"
+            )
+        return v
 
     @field_validator("kind")
     @classmethod
@@ -3053,6 +3099,11 @@ class AuditTargetResponse(BaseModel):
     smtp_from_address: str
     smtp_to_addresses: list[str] | None
     smtp_reply_to: str
+    # The bot token is write-only — bool only, like the SMTP password.
+    telegram_bot_token_set: bool
+    telegram_chat_id: str
+    telegram_message_thread_id: int | None
+    telegram_api_base: str
     min_severity: str | None
     resource_types: list[str] | None
     created_at: datetime
@@ -3082,11 +3133,45 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         smtp_from_address=t.smtp_from_address or "",
         smtp_to_addresses=list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
         smtp_reply_to=t.smtp_reply_to or "",
+        telegram_bot_token_set=bool(t.telegram_bot_token_encrypted),
+        telegram_chat_id=t.telegram_chat_id or "",
+        telegram_message_thread_id=t.telegram_message_thread_id,
+        telegram_api_base=t.telegram_api_base or "",
         min_severity=t.min_severity,
         resource_types=t.resource_types,
         created_at=t.created_at,
         modified_at=t.modified_at,
     )
+
+
+def _check_telegram_target(body: AuditTargetBody, existing: AuditForwardTarget | None) -> None:
+    """Cross-field checks for ``webhook_flavor="telegram"``, as a 422.
+
+    Done here rather than in a pydantic validator so the error never
+    echoes the token back: FastAPI's validation response includes the
+    rejected input.
+    """
+    if body.kind != "webhook" or body.webhook_flavor != "telegram":
+        return
+    token = (body.telegram_bot_token or "").strip()
+    if token and not audit_forward_svc.TELEGRAM_BOT_TOKEN_RE.fullmatch(token):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "telegram_bot_token does not look like a Bot API token "
+                "(<bot id>:<secret>, as @BotFather issues it)"
+            ),
+        )
+    if not token and not (existing is not None and existing.telegram_bot_token_encrypted):
+        raise HTTPException(
+            status_code=422,
+            detail="telegram_bot_token is required for the telegram flavor",
+        )
+    if not body.telegram_chat_id:
+        raise HTTPException(
+            status_code=422,
+            detail="telegram_chat_id is required for the telegram flavor",
+        )
 
 
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
@@ -3116,6 +3201,11 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     # anything else = encrypt + replace.
     if body.smtp_password is not None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
+    t.telegram_chat_id = body.telegram_chat_id
+    t.telegram_message_thread_id = body.telegram_message_thread_id
+    t.telegram_api_base = body.telegram_api_base
+    if body.telegram_bot_token and body.telegram_bot_token.strip():
+        t.telegram_bot_token_encrypted = encrypt_str(body.telegram_bot_token.strip())
     t.min_severity = body.min_severity
     t.resource_types = body.resource_types
 
@@ -3139,6 +3229,7 @@ async def create_audit_target(
     forbid_in_demo_mode("Audit-forward target creation is disabled")
     if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    _check_telegram_target(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
@@ -3166,6 +3257,7 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    _check_telegram_target(body, row)
     _apply_body(row, body)
     try:
         await db.commit()
@@ -3232,6 +3324,18 @@ async def test_audit_target(
                 status_code=500,
                 detail=f"failed to decrypt SMTP password: {exc}",
             ) from exc
+    is_telegram = row.kind == "webhook" and row.webhook_flavor == "telegram"
+    telegram_bot_token = ""
+    if is_telegram and row.telegram_bot_token_encrypted:
+        try:
+            from app.core.crypto import decrypt_str
+
+            telegram_bot_token = decrypt_str(row.telegram_bot_token_encrypted)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to decrypt the Telegram bot token: {type(exc).__name__}",
+            ) from None
     target_dict = {
         "name": row.name,
         "kind": row.kind,
@@ -3252,13 +3356,24 @@ async def test_audit_target(
         "smtp_from_address": row.smtp_from_address or "",
         "smtp_to_addresses": list(row.smtp_to_addresses or []),
         "smtp_reply_to": row.smtp_reply_to or "",
+        "telegram_bot_token": telegram_bot_token,
+        "telegram_chat_id": row.telegram_chat_id or "",
+        "telegram_message_thread_id": row.telegram_message_thread_id,
+        "telegram_api_base": row.telegram_api_base or "",
         "min_severity": None,  # ignore filter on a probe
         "resource_types": None,
     }
     try:
-        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        # Telegram failures are raised, not just logged, so the operator
+        # sees Telegram's own reason ("chat not found", "bot was blocked
+        # by the user"). The other kinds keep their log-and-continue
+        # behaviour here.
+        await audit_forward_svc._deliver_to_target(  # noqa: SLF001
+            target_dict, payload, raise_errors=is_telegram
+        )
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+        detail = audit_forward_svc.redact_telegram_tokens(str(exc))
+        raise HTTPException(status_code=502, detail=f"delivery failed: {detail}") from None
     return {"status": "ok", "target": row.name}
 
 

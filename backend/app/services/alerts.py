@@ -5787,7 +5787,7 @@ async def _deliver(
                 event=str(event.id),
                 target=target.get("name"),
                 kind=kind,
-                error=str(exc),
+                error=audit_forward.redact_telegram_tokens(str(exc)),
             )
 
     return delivered_syslog, delivered_webhook, delivered_smtp

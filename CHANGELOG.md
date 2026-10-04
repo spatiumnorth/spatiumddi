@@ -25,6 +25,27 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Telegram delivery for alert and audit-forward targets (#1503).**
+  Webhook targets gain a `telegram` flavor. It is configured with a bot
+  token, a chat ID (`-100…` or `@channelusername`), an optional forum
+  topic and an optional self-hosted Bot API base, not a URL. Each event
+  is one `sendMessage` in Telegram's HTML mode: a severity emoji, the
+  title in bold and the body, HTML-escaped and cut to the 4096-character
+  limit. The only way to reach Telegram before this was to point a
+  Slack-flavor target at the Bot API, which showed the Slack markup
+  literally and kept the bot token in a plaintext URL. The token is
+  Fernet-encrypted at rest and write-only in the API
+  (`telegram_bot_token_set`). It is kept out of every log line,
+  including httpx's request log, out of error messages, and out of
+  "exclude secrets" backups, and it is rewrapped on a cross-install
+  restore. The support-bundle scrubber also recognises the token's
+  shape. Telegram's own error ("chat not found", "bot is not a member of
+  the channel chat") is shown on the target's Test button. A 429 with a
+  `retry_after` of 5 s or less is retried once. Telegram targets are
+  webhook targets, so an alert rule's webhook channel covers them.
+
 ### Changed
 
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
@@ -623,6 +644,11 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `458665326e7b` — #1503, additive: `audit_forward_target` gains
+  `telegram_bot_token_encrypted`, `telegram_chat_id`,
+  `telegram_message_thread_id` and `telegram_api_base`. The NOT NULL
+  columns have server defaults. Downgrade drops the four columns, and
+  any Telegram targets stop working.
 
 ## 2026.10.02-1 — 2026-10-02
 

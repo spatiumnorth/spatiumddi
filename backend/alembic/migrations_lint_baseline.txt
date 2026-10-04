@@ -47,6 +47,10 @@ backend/alembic/versions/30cda233dce9_add_smtp_chat_flavor_to_audit_forward_.py:
 backend/alembic/versions/30cda233dce9_add_smtp_chat_flavor_to_audit_forward_.py:drop_column:148
 backend/alembic/versions/3124d540d74f_domain_registration.py:drop_table:110
 backend/alembic/versions/3b7f92c10d5e_add_platform_settings.py:drop_table:39
+backend/alembic/versions/458665326e7b_audit_forward_telegram.py:drop_column:68
+backend/alembic/versions/458665326e7b_audit_forward_telegram.py:drop_column:69
+backend/alembic/versions/458665326e7b_audit_forward_telegram.py:drop_column:70
+backend/alembic/versions/458665326e7b_audit_forward_telegram.py:drop_column:71
 backend/alembic/versions/4a7c8e3d51b9_asn_phase2.py:drop_column:113
 backend/alembic/versions/4a7c8e3d51b9_asn_phase2.py:drop_column:116
 backend/alembic/versions/4a7c8e3d51b9_asn_phase2.py:drop_column:96

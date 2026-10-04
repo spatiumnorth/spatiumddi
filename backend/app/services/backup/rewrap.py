@@ -77,6 +77,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("appliance_ca", "id", "key_encrypted"),
     ("appliance_certificate", "id", "key_encrypted"),
     ("audit_forward_target", "id", "smtp_password_encrypted"),
+    ("audit_forward_target", "id", "telegram_bot_token_encrypted"),
     ("auth_provider", "id", "secrets_encrypted"),
     ("backup_target", "id", "passphrase_encrypted"),
     ("bgp_lg_peer", "id", "md5_password_encrypted"),
