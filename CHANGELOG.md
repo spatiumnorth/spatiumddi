@@ -495,6 +495,17 @@ the formatter handles the rest.
   LoadBalancer Service in front of a DHCP agent publishes 8000 again, on
   every render and on the raw `k8s/dhcp` manifests.
 
+- **Logged tracebacks no longer include local variables
+  (GHSA-4mwf-qwqg-5fw7).** The api and worker rendered every unhandled
+  exception through structlog's `dict_tracebacks`, which attaches each
+  stack frame's local variables, so a failed restore wrote the backup
+  passphrase and the database password into the JSON log (and from there
+  to any forwarded log store). Exception rendering is now configured with
+  locals off, in both the JSON and console formats. The exception type,
+  message and frames (file, line, function) are still logged. Operators
+  who may have run a failing restore should rotate those credentials and
+  purge older logs.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`
