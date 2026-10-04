@@ -57,6 +57,83 @@ the formatter handles the rest.
   next request. A supervisor too old to report its boot gets the request
   exactly once. Migration `199eb1562927`.
 
+- **More than one RADIUS / TACACS+ user can be auto-provisioned
+  (#1290).** An external account with no email (RADIUS and TACACS+
+  never report one, and neither does an LDAP entry without `mail` or an
+  OIDC token without the claim) was created with an empty email under a
+  plain unique index, so exactly one such account could exist: every
+  later first-time login hit the index and failed with a 409. The index
+  is now unique only among non-empty emails. An external login whose
+  reported email already belongs to another account is provisioned
+  without it, and an update to such an email is skipped, each with an
+  `external_user_email_in_use` warning, instead of failing the login.
+  Neither ever adopts the other account (#1235).
+
+- **The alert evaluator no longer warns about the seeded
+  `schema-behind-head` and `cluster-upgrade-failed` rules (#1469).** Both
+  rules are raised and resolved by their own task (the schema check and
+  the rolling-upgrade orchestrator), not by the evaluator, but only
+  `audit_chain_broken` had a pass-through branch. The other two fell
+  through to `alert_unknown_rule_type`, so every worker logged two
+  warnings per 60 s tick, the bulk of its warnings on an appliance. The
+  three types now share one set the evaluator skips silently, and a rule
+  type the evaluator really does not know still warns.
+
+- **A DHCP server can be taken out of its server group (#1458).**
+  `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
+  an explicit `"server_group_id": null` was dropped like an absent key:
+  the call answered 200 and the server stayed in its group. A server
+  could be moved to another group but never made ungrouped, although
+  the column is nullable and create accepts it. An explicitly sent
+  `null` now clears the group, wakes the old group's channel so its
+  remaining members re-render, and is recorded in the audit row. Every
+  other field keeps "null = leave it as it is", since several of them
+  are NOT NULL.
+
+- **IPAM and DHCP DDNS no longer write an A record beside a CNAME
+  (#1441).** #1381 made the record API refuse a CNAME next to other
+  data, but IPAM's auto-generated forward records (an address's
+  hostname, and DDNS for a lease) went through `_sync_dns_record`, which
+  did not ask. An address or lease named like an operator's CNAME wrote
+  an A beside it, and BIND then refused the whole zone, stopping every
+  record change on that server (#1378). The A / AAAA is now skipped,
+  logged as `ipam_dns_record_skipped_cname`, and the address keeps its
+  allocation: a DNS naming clash never fails an IP or a lease. Renaming
+  an address onto a CNAME's name retracts its old record and writes
+  nothing at the new one. The IPAM ↔ DNS drift view shows such an
+  address as missing its forward record.
+
+- **A DHCPv6 scope is refused on a group with a Windows DHCP server
+  (#1480).** SpatiumDDI writes Windows DHCP through the DHCPv4 cmdlets
+  only, so a v6 scope on such a group was handed to them anyway: the save
+  failed with a 502, or the scope existed in SpatiumDDI and on no server.
+  Creating a v6 scope in a group with a Windows member is now a 422 that
+  says why, and so is adding or moving a Windows server into a group that
+  has v6 scopes.
+
+- **Setting a control-plane VIP installs MetalLB (#1103).** It never
+  did on a k3s with Helm 4 inside (klipper-helm): the
+  `helm-install-spatium-metallb` Job looped in `CrashLoopBackOff`, no
+  `IPAddressPool` was created, and the frontend Service's external IP
+  stayed `<pending>`. Helm 4 applies MetalLB's validating webhooks before the
+  pool and `L2Advertisement`, so those were refused while the controller
+  serving the webhook was still starting, and each retry uninstalled
+  first, deleting the controller again. The webhooks now fail open
+  (`crds.validationFailurePolicy: Ignore`) while unreachable; once the
+  controller is up they validate as before. A new chart gate checks the
+  rendered policy, since `helm lint` and `helm template` pass either
+  way. BGP mode had the same loop through a door `Ignore` cannot close:
+  the `BGPPeer` was written as `v1beta1` while its CRD stores `v1beta2`,
+  so creating it needs MetalLB's conversion webhook, and a conversion
+  webhook has no failure policy. Enabling MetalLB and BGP in one save
+  therefore still wedged the install. It is now written at `v1beta2`,
+  which needs no conversion. Because a value the webhooks would refuse now
+  installs and leaves the VIP silently unadvertised, the API checks those
+  BGP fields itself: a peer's hold time must be a duration from 3s to
+  65535s, communities must be `ASN:NN` or `large:A:B:C`, and the
+  aggregation length 0–32. The "known issue" notes in `TOPOLOGIES.md`,
+  `APPLIANCE.md` and `TROUBLESHOOTING.md` are removed.
+
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed
   control-plane count, and the seed re-sized the `spatium-control` release
@@ -516,6 +593,11 @@ the formatter handles the rest.
 - `199eb1562927` — #1446: `appliance.reboot_requested_boot_id`, a
   nullable string. No backfill: NULL means the boot is not recorded yet.
   Downgrade drops the column.
+
+- `61566a119901` — #1290: `ix_user_email` becomes a partial unique
+  index, `WHERE email <> ''`. No data change. Downgrade restores the
+  plain unique index and refuses, with a message, while more than one
+  account has an empty email.
 
 ## 2026.10.02-1 — 2026-10-02
 
