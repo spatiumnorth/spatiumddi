@@ -41,6 +41,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Kea HA peers bind their HTTP listener again after a config change
+  (#1447).** The DHCP agent validated every config with Kea's
+  `config-test` command before `config-reload`. On Kea 3.0.3 that command
+  leaves the running daemon in multi-threading test mode, and the HA hook's
+  dedicated listener on :8000 then silently never starts, so both peers sat
+  in `partner-down` and served the scope on their own (fixed upstream in
+  Kea 3.0.4, not yet in Alpine). The agent now checks the file it is about
+  to reload with `kea-dhcp4 -t` / `kea-dhcp6 -t` in a separate process
+  (30 s timeout) and sends the daemon only `config-reload`. A rejected
+  config is still reported and reverted as before; a check that cannot run
+  (missing binary, timeout, crash) blocks the reload and reports the apply
+  as failed in the `validate` phase instead of passing it.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
