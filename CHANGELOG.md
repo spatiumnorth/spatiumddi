@@ -41,6 +41,56 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
+  dropped NFS connection no longer crashes the api (#1500).** The `nfs`
+  destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
+  the server's limit on NFSv3, but libnfs 5.0.2 (the `libnfs14` the image
+  ships) never learns the limit on NFSv4 and sends one 1 MiB WRITE. A
+  Synology DSM 7 export (limit 128 KiB) drops the connection on that, so
+  every v4 backup failed with "nfs_service failed" and left its `.part`
+  file behind, while v3 worked. Writes are now capped at the limit
+  libnfs negotiated, or at 64 KiB when it has none. Separately, after a
+  connection died mid-call, tearing down the libnfs context ran a
+  callback against a stack frame that no longer existed (a 5.0.2 bug,
+  fixed upstream in 5.0.3). The api died with SIGSEGV, and the target
+  was left `in_progress`, so its schedule stopped firing. A context
+  that still has requests queued at teardown is now leaked with its
+  socket closed instead of destroyed.
+
+- **A Technitium server that cannot be connected to is no longer reported
+  as refusing the zone transfer (#1470).** Drift and Sync with Servers
+  read a Technitium zone over AXFR, and the driver turned any error
+  containing "REFUSED" into "refused the zone transfer despite signing it
+  with the group key", including a TCP "Connection refused". On an
+  appliance whose Technitium answers only on the DNS VIP, nothing listens
+  on the node address, so every pull failed with a message that pointed
+  at the TSIG key on all servers. A connection failure now keeps the
+  message the AXFR helper already gives it ("could not be reached on
+  TCP/53 — check the address and firewall"); a real DNS REFUSED still
+  names the TSIG settings.
+
+- **More than one RADIUS / TACACS+ user can be auto-provisioned
+  (#1290).** An external account with no email (RADIUS and TACACS+
+  never report one, and neither does an LDAP entry without `mail` or an
+  OIDC token without the claim) was created with an empty email under a
+  plain unique index, so exactly one such account could exist: every
+  later first-time login hit the index and failed with a 409. The index
+  is now unique only among non-empty emails. An external login whose
+  reported email already belongs to another account is provisioned
+  without it, and an update to such an email is skipped, each with an
+  `external_user_email_in_use` warning, instead of failing the login.
+  Neither ever adopts the other account (#1235).
+
+- **The alert evaluator no longer warns about the seeded
+  `schema-behind-head` and `cluster-upgrade-failed` rules (#1469).** Both
+  rules are raised and resolved by their own task (the schema check and
+  the rolling-upgrade orchestrator), not by the evaluator, but only
+  `audit_chain_broken` had a pass-through branch. The other two fell
+  through to `alert_unknown_rule_type`, so every worker logged two
+  warnings per 60 s tick, the bulk of its warnings on an appliance. The
+  three types now share one set the evaluator skips silently, and a rule
+  type the evaluator really does not know still warns.
+
 - **A zone deleted in SpatiumDDI is removed from its Technitium
   servers (#1496).** The agent created every zone in the bundle and
   never deleted one, so a deleted zone kept answering authoritatively on
@@ -425,6 +475,23 @@ the formatter handles the rest.
 
 ### Security
 
+- **A backup passphrase hint may no longer contain the passphrase (#1498).**
+  The hint is stored in clear on purpose, so archives can be told apart
+  without the passphrase: in `manifest.json`, in the `secrets.enc`
+  header, in the API response, and, on edit, in the audit log. The field
+  sits directly under the passphrase input, and nothing stopped the
+  passphrase landing in it. Every archive then carried its own key next
+  to the ciphertext, and the append-only audit log kept a copy that
+  cannot be removed. Target create / update and create-and-download now
+  answer 422 when the hint contains the passphrase (case-insensitive).
+  A PATCH that changes only one half is checked against the stored
+  other half. A target saved before this keeps backing up, but its
+  archives are written without the hint (`backup_hint_contains_passphrase_dropped`).
+  The target form gains the help text the download form already had.
+  **If you are affected:** set a new passphrase and a new hint, take a
+  backup, and delete the older archives. The old passphrase stays in the
+  audit log, so do not reuse it.
+
 - **Actions that mint a credential need the operator step-up (#1355).**
   #408 made secret reveals ask for a password or authenticator code so a
   stolen session cannot read them, but a stolen session could still mint
@@ -564,6 +631,10 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
+- `61566a119901` — #1290: `ix_user_email` becomes a partial unique
+  index, `WHERE email <> ''`. No data change. Downgrade restores the
+  plain unique index and refuses, with a message, while more than one
+  account has an empty email.
 
 ## 2026.10.02-1 — 2026-10-02
 
