@@ -65,6 +65,35 @@ class BackupCryptoError(Exception):
     """
 
 
+#: The 422 detail every write path returns for a hint that gives the
+#: passphrase away. One string so the three endpoints cannot drift.
+HINT_REVEALS_PASSPHRASE = (
+    "passphrase_hint must not contain the passphrase — the hint is stored "
+    "unencrypted in every archive (manifest.json and the secrets.enc header), "
+    "in the API response and in the audit log"
+)
+
+
+def hint_reveals_passphrase(passphrase: str | None, hint: str | None) -> bool:
+    """True when ``hint`` contains ``passphrase``.
+
+    The hint is written in clear next to the ciphertext it unlocks —
+    deliberately, so an operator can tell archives apart without the
+    passphrase. That makes a hint which *is* the passphrase (the field
+    sits directly under the passphrase input, and gets the paste meant
+    for it) a silent total loss: ``secrets.enc`` then protects nothing.
+
+    Case-insensitive substring match: a hint that only re-cases the
+    passphrase, or wraps it in other text, gives it away just as well.
+    The passphrase minimum of 8 characters keeps this from catching a
+    hint that merely shares a short word with it.
+    """
+    if not passphrase or not hint:
+        return False
+    secret = passphrase.strip().casefold()
+    return bool(secret) and secret in hint.casefold()
+
+
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -87,6 +116,12 @@ def encrypt_secrets(
     """
     if not passphrase:
         raise BackupCryptoError("passphrase is required to encrypt secrets")
+    if hint_reveals_passphrase(passphrase, hint):
+        # The API refuses this combination; a row saved before that
+        # check existed can still carry it. Dropping the hint keeps the
+        # scheduled backup running while not writing the key beside the
+        # lock. ``build_backup_archive`` logs it.
+        hint = None
     salt = os.urandom(_SALT_BYTES)
     nonce = os.urandom(_NONCE_BYTES)
     key = _derive_key(passphrase, salt)

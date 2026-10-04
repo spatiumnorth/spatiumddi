@@ -463,6 +463,23 @@ the formatter handles the rest.
 
 ### Security
 
+- **A backup passphrase hint may no longer contain the passphrase (#1498).**
+  The hint is stored in clear on purpose, so archives can be told apart
+  without the passphrase: in `manifest.json`, in the `secrets.enc`
+  header, in the API response, and, on edit, in the audit log. The field
+  sits directly under the passphrase input, and nothing stopped the
+  passphrase landing in it. Every archive then carried its own key next
+  to the ciphertext, and the append-only audit log kept a copy that
+  cannot be removed. Target create / update and create-and-download now
+  answer 422 when the hint contains the passphrase (case-insensitive).
+  A PATCH that changes only one half is checked against the stored
+  other half. A target saved before this keeps backing up, but its
+  archives are written without the hint (`backup_hint_contains_passphrase_dropped`).
+  The target form gains the help text the download form already had.
+  **If you are affected:** set a new passphrase and a new hint, take a
+  backup, and delete the older archives. The old passphrase stays in the
+  audit log, so do not reuse it.
+
 - **Actions that mint a credential need the operator step-up (#1355).**
   #408 made secret reveals ask for a password or authenticator code so a
   stolen session cannot read them, but a stolen session could still mint
