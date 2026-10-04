@@ -146,8 +146,8 @@ class SettingsResponse(BaseModel):
     audit_forward_syslog_protocol: str
     audit_forward_syslog_facility: int
     audit_forward_webhook_enabled: bool
-    # The legacy webhook's URL and header are write-only (#1502). This read
-    # is open to every signed-in user, and both are credentials.
+    # The legacy webhook's URL and header are credentials, so they are
+    # write-only here (#1502).
     audit_forward_webhook_url_set: bool = False
     audit_forward_webhook_url_display: str = ""
     audit_forward_webhook_auth_header_set: bool = False

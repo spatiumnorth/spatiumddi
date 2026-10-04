@@ -473,9 +473,8 @@ the formatter handles the rest.
   every delivery (`HTTP Request: POST <URL>`), which put it in the api
   and worker logs and in an appliance support bundle. A generic
   target's `Authorization` header was stored the same way. The legacy
-  single-webhook pair on `platform_settings` was worse:
-  `GET /settings` returned the URL and header in clear to every
-  signed-in user. All four values are now Fernet-encrypted
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
   (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
   cross-install backup rewrap). The API takes them write-only and
   returns `url_set`, `auth_header_set` and a `url_display` that shows

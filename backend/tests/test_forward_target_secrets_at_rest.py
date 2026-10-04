@@ -5,7 +5,7 @@ credential: whoever has it can post into the channel. Both it and a generic
 target's ``Authorization`` header used to sit in plaintext columns, came back
 from the API, and were written to the logs by httpx on every delivery. The
 same went for the legacy single-webhook pair on ``platform_settings``, which
-``GET /settings`` returned to every signed-in user.
+``GET /settings`` also returned in clear.
 """
 
 from __future__ import annotations
