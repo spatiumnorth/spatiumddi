@@ -278,7 +278,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         content: str | None = None,
         priority: int | None = None,
     ) -> str | None:
-        """Return the Cloudflare record id matching name+type+value, or ``None``.
+        """Return the Cloudflare record id matching name+type+value, or ``None``."""
+        rec = await self._find_record(client, zone_id, name, record_type, content, priority)
+        return None if rec is None else str(rec["id"])
+
+    async def _find_record(
+        self,
+        client: httpx.AsyncClient,
+        zone_id: str,
+        name: str,
+        record_type: str,
+        content: str | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the Cloudflare record matching name+type+value, or ``None``.
 
         SpatiumDDI keys DNS records per value and supports round-robin (multiple
         A/AAAA at one hostname) and multiple MX/NS/TXT. So when ``content`` is
@@ -301,7 +314,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
             return None
         # Name+type-only lookup (content unknown): keep legacy first-match.
         if content is None:
-            return str(results[0]["id"])
+            return dict(results[0])
         # Value-keyed lookup: pick the row whose content (and priority for
         # MX/SRV) actually matches — the server-side filter is a narrowing
         # hint, not a guarantee.
@@ -310,7 +323,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 continue
             if priority is not None and rec.get("priority") != priority:
                 continue
-            return str(rec["id"])
+            return dict(rec)
         return None
 
     async def _list_rrset(
@@ -350,6 +363,12 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         so the set is reconciled instead: rows that match a member are kept
         (TTL corrected in place), missing members are created, and only then
         are the rows no member matches removed, so the name never goes empty.
+
+        SpatiumDDI does not model Cloudflare's ``proxied`` flag, and a PUT or
+        POST without it lands DNS-only, publishing the origin address. So a
+        kept row's flag is carried into its PUT (a proxied row is never PUT:
+        its TTL always reads back as auto), and a created row joins the
+        proxy status the rows at the name already have.
         """
         rec = change.record
         rtype = rec.record_type
@@ -359,6 +378,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         keyed_priority = rtype in _PRIORITY_TYPES
 
         unmatched = await self._list_rrset(client, zone_id, name, rtype)
+        proxied = any(r.get("proxied") for r in unmatched)
         to_create: list[dict[str, Any]] = []
         for member in rrset.members:
             payload: dict[str, Any] = {
@@ -380,10 +400,16 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 None,
             )
             if match is None:
+                if proxied:
+                    payload["proxied"] = True
                 to_create.append(payload)
                 continue
             unmatched.remove(match)
-            if match.get("ttl") != wire_ttl:
+            # A proxied record's TTL is auto whatever was set, so it would
+            # always read as mismatched; there is nothing to correct.
+            if not match.get("proxied") and match.get("ttl") != wire_ttl:
+                if "proxied" in match:
+                    payload["proxied"] = match["proxied"]
                 resp = await client.put(f"/zones/{zone_id}/dns_records/{match['id']}", json=payload)
                 self._unwrap(resp)
 
@@ -427,7 +453,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 return
 
             if change.op == "update":
-                rid = await self._find_record_id(
+                existing = await self._find_record(
                     client,
                     zone_id,
                     payload["name"],
@@ -435,14 +461,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=change.record.value,
                     priority=change.record.priority,
                 )
-                if rid is None:
+                if existing is None:
                     # No existing row to update — treat as create so the
                     # desired state still lands (mirrors the windows_dns +
                     # _cloud_base "update is create on miss" contract).
                     resp = await client.post(f"/zones/{zone_id}/dns_records", json=payload)
                     self._unwrap(resp)
                     return
-                resp = await client.put(f"/zones/{zone_id}/dns_records/{rid}", json=payload)
+                # A PUT replaces the whole record: without the row's own
+                # ``proxied`` it would land DNS-only.
+                if "proxied" in existing:
+                    payload["proxied"] = existing["proxied"]
+                resp = await client.put(
+                    f"/zones/{zone_id}/dns_records/{existing['id']}", json=payload
+                )
                 self._unwrap(resp)
                 return
 

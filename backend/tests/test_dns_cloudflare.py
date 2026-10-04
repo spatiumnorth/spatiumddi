@@ -768,3 +768,146 @@ async def test_delete_with_rrset_stays_a_single_value_delete(
     await driver._apply_record(_Server(), _CREDS, change)
 
     assert [c["method"] for c in fake.calls] == ["get", "get", "delete"]
+
+
+# ── Cloudflare's ``proxied`` flag survives every write ─────────────────
+#
+# SpatiumDDI does not model ``proxied``, and a PUT or POST that omits it
+# lands DNS-only, which publishes the origin's address. A proxied row's TTL
+# also always reads back as 1 (auto), whatever was set.
+
+
+async def test_set_write_leaves_a_proxied_row_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row's TTL (auto) differs from the op's, but correcting it would PUT
+    the row without ``proxied`` and expose the origin: no write at all."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([_row("p", "203.0.113.10", rtype="A", ttl=1, proxied=True)])
+                ),
+            ],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("203.0.113.10", None)], rtype="A", name="www")
+    )
+
+    assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+async def test_set_write_ttl_correction_carries_proxied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DNS-only sibling of a proxied row still gets its TTL corrected, and
+    the PUT states its proxy status instead of leaving it to the default."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200,
+                    _env(
+                        [
+                            _row("p", "203.0.113.10", rtype="A", ttl=1, proxied=True),
+                            _row("d", "203.0.113.11", rtype="A", ttl=3600, proxied=False),
+                        ]
+                    ),
+                ),
+            ],
+            "put": [_FakeResponse(200, _env({"id": "d"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(),
+        _CREDS,
+        _set_change(
+            "update", [("203.0.113.10", None), ("203.0.113.11", None)], rtype="A", name="www"
+        ),
+    )
+
+    puts = [c for c in fake.calls if c["method"] == "put"]
+    assert [p["path"] for p in puts] == ["/zones/zid/dns_records/d"]
+    assert puts[0]["json"]["ttl"] == 300
+    assert puts[0]["json"]["proxied"] is False
+
+
+async def test_set_write_value_change_keeps_the_record_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editing a proxied record's address replaces the row; the new row must
+    be proxied too, or the edit would publish the new origin address."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([_row("old", "203.0.113.10", rtype="A", ttl=1, proxied=True)])
+                ),
+            ],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+            "delete": [_FakeResponse(200, _env({"id": "old"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("203.0.113.20", None)], rtype="A", name="www")
+    )
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["content"] == "203.0.113.20"
+    assert post["json"]["proxied"] is True
+    assert next(c for c in fake.calls if c["method"] == "delete")["path"].endswith("/old")
+
+
+async def test_set_write_new_name_does_not_send_proxied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing at the name yet: the create leaves ``proxied`` to Cloudflare."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("create", [("203.0.113.20", None)], rtype="A", name="www")
+    )
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert "proxied" not in post["json"]
+
+
+async def test_apply_record_update_without_rrset_carries_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-value update path (no ``rrset``) PUTs the row it matched; that
+    PUT must keep the row proxied too."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([{"id": "rid", "content": "203.0.113.10", "proxied": True}])
+                ),
+            ],
+            "put": [_FakeResponse(200, _env({"id": "rid"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="203.0.113.10", ttl=120),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/zones/zid/dns_records/rid"
+    assert put["json"]["proxied"] is True

@@ -190,8 +190,14 @@ PowerShell paths and as an RFC 2136 `replace` on its Path A path; Route 53,
 Azure DNS and Google Cloud DNS apply it on their `update` path, which
 previously replaced the whole RRset with the op's single value (their
 create/delete paths already read-merged and were never affected).
-Cloudflare addresses individual records by provider id and never collapsed.
-A driver that sees `rrset=None` keeps its previous per-value behaviour.
+Cloudflare stores one row per value and applies it on create and update as
+a set write (#1494): rows matching a member are kept, missing members are
+created, then the remaining rows at that name + type are deleted. That
+includes a row added in the Cloudflare dashboard, by design: SpatiumDDI
+owns the RRsets it manages, so a value it does not know is removed on the
+next create or update at that name + type, as with the other drivers that
+write whole RRsets. A delete stays a single-value delete. A driver that sees
+`rrset=None` keeps its previous per-value behaviour.
 
 ### TSIG Authentication
 
@@ -685,7 +691,7 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 
-- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. `update` is create-on-miss.
+- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. A create or update with its RRset is a set write (see the #783 section above; dashboard-added rows at that name + type are removed); without one, `update` is create-on-miss. SpatiumDDI does not model `proxied`, but no write drops it: a PUT carries the row's own flag, a proxied row's TTL (always auto) is never "corrected", and a row created at a name whose rows are proxied is created proxied.
 - **Route 53** — MX / SRV priority is baked into the record value (`"10 mail.example.com."`), kept raw so it isn't double-encoded on write. ALIAS rrsets (`AliasTarget`) have no TTL → surfaced with `ttl=None`. Writes are `UPSERT`/`DELETE` change batches; a `DELETE` of a non-existent rrset (`InvalidChangeBatch`) is treated as an idempotent no-op. Hosted-zone id resolved from the FQDN via `list_hosted_zones_by_name` with an exact-name match.
 - **Azure DNS** — records live in *record sets*, one per `(name, type)`, each with a typed list (`a_records`, `mx_records`, …); each set expands into one neutral `RecordData` per contained record. Create and update are both a `create_or_update` PUT of the full set. SOA is Azure-managed and dropped on read.
 - **Google Cloud DNS** — calls scope by the managed-zone *id* (a slug like `example-com`), not the DNS name, so the hooks re-resolve the managed zone by matching `dns_name`. A single rrset carries one or more `rrdatas` (one `RecordData` each on read, collapsed to a single-value rrset on write). Writes are transactional change sets (`changes.create()`); the op polls `changes.status` until `done` (bounded ~60 s) so it only returns once Cloud DNS has applied it.

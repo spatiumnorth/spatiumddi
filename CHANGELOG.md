@@ -106,7 +106,13 @@ the formatter handles the rest.
   IPv6 notation), so an unchanged record is not posted again. If
   Cloudflare still reports a value as a duplicate, nothing is deleted
   and the op fails with that message. A delete stays a single-value
-  delete.
+  delete. A row added in the Cloudflare dashboard at the same name and
+  type is removed by the next create or update there, as with the
+  other drivers that write whole RRsets. Cloudflare's `proxied` flag
+  is preserved: a proxied row's TTL (always auto) is not "corrected",
+  every PUT carries the row's own flag, and a value replacing a
+  proxied record is created proxied, so a write never exposes the
+  origin address.
 
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
