@@ -41,6 +41,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
+  dropped NFS connection no longer crashes the api (#1500).** The `nfs`
+  destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
+  the server's limit on NFSv3, but libnfs 5.0.2 (the `libnfs14` the image
+  ships) never learns the limit on NFSv4 and sends one 1 MiB WRITE. A
+  Synology DSM 7 export (limit 128 KiB) drops the connection on that, so
+  every v4 backup failed with "nfs_service failed" and left its `.part`
+  file behind, while v3 worked. Writes are now capped at the limit
+  libnfs negotiated, or at 64 KiB when it has none. Separately, after a
+  connection died mid-call, tearing down the libnfs context ran a
+  callback against a stack frame that no longer existed (a 5.0.2 bug,
+  fixed upstream in 5.0.3). The api died with SIGSEGV, and the target
+  was left `in_progress`, so its schedule stopped firing. A context
+  that still has requests queued at teardown is now leaked with its
+  socket closed instead of destroyed.
+
 - **A Technitium server that cannot be connected to is no longer reported
   as refusing the zone transfer (#1470).** Drift and Sync with Servers
   read a Technitium zone over AXFR, and the driver turned any error
