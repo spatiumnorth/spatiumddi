@@ -6632,9 +6632,19 @@ async def _push_zone_to_agentless_servers(
     drivers (bind9 / powerdns / technitium) get zone changes through the
     ConfigBundle long-poll, not here.
 
+    Disabled servers are excluded (#1537): the record path deliberately
+    skips a paused agentless server, and a paused zone target must not
+    receive writes — or, when unreachable, block every zone create,
+    delete and move in the group with its 502.
+
     Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
     — the DB row stays in an uncommitted state and the session rollback
-    cleans it up. Matches the DHCP write-through pattern.
+    cleans it up. Matches the DHCP write-through pattern. The rollback
+    only covers the DB, though: a server that already applied the change
+    keeps it. So before raising, the servers that succeeded get the
+    inverse op as compensation (create → delete, delete → create),
+    best-effort, so a partial fan-out converges back instead of leaving
+    the zone live on some servers and absent on others (#1537).
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
@@ -6646,6 +6656,7 @@ async def _push_zone_to_agentless_servers(
         select(DNSServer).where(
             DNSServer.group_id == (group_id if group_id is not None else zone.group_id),
             DNSServer.credentials_encrypted.isnot(None),
+            DNSServer.is_enabled.is_(True),
         )
     )
     targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
@@ -6653,12 +6664,14 @@ async def _push_zone_to_agentless_servers(
         return
 
     errors: list[str] = []
+    succeeded: list[DNSServer] = []
     for server in targets:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
             await driver.apply_zone_change(server, zone, op)
+            succeeded.append(server)
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
             errors.append(f"{server.name}: {exc}")
             logger.warning(
@@ -6670,13 +6683,36 @@ async def _push_zone_to_agentless_servers(
             )
 
     if errors:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Failed to {op} zone on Windows DNS: {'; '.join(errors)}. "
-                "Zone state in SpatiumDDI was not changed."
-            ),
+        compensated: list[str] = []
+        compensation_failed: list[str] = []
+        inverse = {"create": "delete", "delete": "create"}.get(op)
+        if inverse is not None:
+            for server in succeeded:
+                driver = get_driver(server.driver)
+                try:
+                    await driver.apply_zone_change(server, zone, inverse)
+                    compensated.append(server.name)
+                except Exception as exc:  # noqa: BLE001 — best effort; reported below
+                    compensation_failed.append(f"{server.name}: {exc}")
+                    logger.warning(
+                        "dns.zone.push_agentless_compensation_failed",
+                        server=str(server.id),
+                        zone=zone.name,
+                        op=inverse,
+                        error=str(exc),
+                    )
+        detail = (
+            f"Failed to {op} zone on Windows DNS: {'; '.join(errors)}. "
+            "Zone state in SpatiumDDI was not changed."
         )
+        if compensated:
+            detail += f" Rolled back on: {', '.join(compensated)}."
+        if compensation_failed:
+            detail += (
+                f" Rollback failed on: {'; '.join(compensation_failed)} — "
+                "those servers may still hold the zone; reconcile manually."
+            )
+        raise HTTPException(status_code=502, detail=detail)
 
 
 # ── Record endpoints ────────────────────────────────────────────────────────
