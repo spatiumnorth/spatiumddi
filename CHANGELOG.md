@@ -498,6 +498,18 @@ the formatter handles the rest.
 
 ### Security
 
+- **Typed-webhook subscription headers are encrypted at rest
+  (#1579).** Subscription `headers` (Authorization tokens and the
+  like) were stored in clear and rode along in "exclude secrets"
+  backups — unlike the webhook signing secret and the forward-target
+  credentials fixed in #1506. They now live in a Fernet-encrypted
+  `headers_encrypted` column (migration encrypts existing rows in
+  place; registered for backup exclusion and key-rotation rewrap),
+  API responses return only header names plus a `headers_set` flag,
+  backups no longer carry the values, and the admin UI treats
+  headers as write-only: blank keeps the stored set, typed lines
+  replace it, an explicit clear removes it.
+
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
