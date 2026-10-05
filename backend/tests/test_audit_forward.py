@@ -505,3 +505,76 @@ def test_resource_types_allowlist_matches_a_namespaced_subject() -> None:
     # The bare form still matches, and an unrelated one still does not.
     assert svc._target_accepts(target, _alert(subject_type="dns_zone")) is True
     assert svc._target_accepts(target, _alert(subject_type="appliance")) is False
+
+
+# ── Per-kind completeness validation (#1581) ───────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        # syslog: no host / port out of range / facility out of range
+        {"name": "t", "kind": "syslog"},
+        {"name": "t", "kind": "syslog", "host": "siem.example.com", "port": 99999},
+        {"name": "t", "kind": "syslog", "host": "siem.example.com", "facility": 99},
+        # webhook: no URL
+        {"name": "t", "kind": "webhook"},
+        # smtp: no host / no from-address / no recipients
+        {
+            "name": "t",
+            "kind": "smtp",
+            "smtp_from_address": "a@example.com",
+            "smtp_to_addresses": ["b@example.com"],
+        },
+        {
+            "name": "t",
+            "kind": "smtp",
+            "smtp_host": "mail.example.com",
+            "smtp_to_addresses": ["b@example.com"],
+        },
+        {
+            "name": "t",
+            "kind": "smtp",
+            "smtp_host": "mail.example.com",
+            "smtp_from_address": "a@example.com",
+            "smtp_to_addresses": [],
+        },
+    ],
+)
+async def test_incomplete_target_rejected(
+    client: AsyncClient, db_session: AsyncSession, body: dict
+) -> None:
+    _, token = await _make_user(db_session)
+    r = await client.post(
+        "/api/v1/settings/audit-forward-targets",
+        headers={"Authorization": f"Bearer {token}"},
+        json=body,
+    )
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_complete_smtp_and_webhook_targets_accepted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_user(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/v1/settings/audit-forward-targets",
+        headers=h,
+        json={
+            "name": "mail",
+            "kind": "smtp",
+            "smtp_host": "mail.example.com",
+            "smtp_from_address": "alerts@example.com",
+            "smtp_to_addresses": ["ops@example.com"],
+        },
+    )
+    assert r.status_code == 201, r.text
+    r = await client.post(
+        "/api/v1/settings/audit-forward-targets",
+        headers=h,
+        json={"name": "hook", "kind": "webhook", "url": "https://example.com/hook"},
+    )
+    assert r.status_code == 201, r.text
