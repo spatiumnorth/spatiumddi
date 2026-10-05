@@ -76,6 +76,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Proxmox sync no longer fails on an address another integration
+  already mirrors (#1622).** When a guest reported an IP that UniFi (or any
+  other integration, or a second Proxmox endpoint) already held in the
+  same subnet, the reconciler logged "owned by another integration" and
+  then inserted its own row anyway. The insert hit
+  `uq_ip_address_subnet_address`, the whole sweep rolled back, and the
+  endpoint never synced again, without a `last_sync_error` to show for
+  it. The reconciler now leaves such an address to its owner, and skips
+  moving one of its own rows onto an occupied address the same way.
+
 - **DNS agent LoadBalancer Services keep the client address and can
   pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
   and nothing else, so the rendered LoadBalancer ran with the default
