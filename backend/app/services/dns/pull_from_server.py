@@ -88,6 +88,69 @@ _IMPORTABLE_TYPES = {
     "TLSA",
 }
 
+# Every record type the DB/API layer can model (mirrors ``VALID_RECORD_TYPES``
+# in the DNS router; kept local so this service doesn't import the router).
+# A driver's advertised types are intersected with this set before sync
+# uses them — a driver may advertise zone metadata (SOA) that has no
+# ``DNSRecord`` representation.
+_DB_MODELLED_TYPES = frozenset(
+    {
+        "A",
+        "AAAA",
+        "ALIAS",
+        "CNAME",
+        "MX",
+        "TXT",
+        "NS",
+        "PTR",
+        "SRV",
+        "CAA",
+        "TLSA",
+        "SSHFP",
+        "NAPTR",
+        "LOC",
+        "LUA",
+        "SVCB",
+        "HTTPS",
+        "DNAME",
+    }
+)
+
+
+def _driver_record_types(driver: Any) -> frozenset[str] | None:
+    """Record types ``driver`` advertises via ``capabilities()``, or None.
+
+    None means the driver published no usable ``record_types`` list, in
+    which case the caller falls back to its legacy hardcoded set rather
+    than syncing nothing (or everything).
+    """
+    try:
+        caps = driver.capabilities()
+    except Exception:  # noqa: BLE001 — a broken caps probe must not break sync
+        return None
+    if not isinstance(caps, dict):
+        return None
+    raw = caps.get("record_types")
+    if not raw:
+        return None
+    return frozenset(str(t).upper() for t in raw)
+
+
+def _syncable_types(driver: Any, fallback: frozenset[str] | set[str]) -> frozenset[str]:
+    """#1533 — the type filter for one sync phase, taken from the server's
+    driver capabilities intersected with what the DB models.
+
+    The old hardcoded sets omitted CAA entirely, so CAA drift could never
+    be repaired through sync even though every cloud driver advertises
+    CAA. Deriving the set per driver also keeps the push phase honest:
+    the Windows driver's advertised set is exactly the old push set, so
+    Windows pushes gain nothing it cannot serve.
+    """
+    advertised = _driver_record_types(driver)
+    if advertised is None:
+        return frozenset(fallback)
+    return advertised & _DB_MODELLED_TYPES
+
 
 # Record types whose value is a DNS name. Same-zone targets are sometimes
 # stored relative ("aaa") and sometimes absolute ("aaa.zone.example."). A
@@ -224,8 +287,11 @@ def _additive_import(
     db_keys: set[tuple[str, str, str]],
     *,
     apply: bool,
+    importable_types: frozenset[str] | None = None,
 ) -> PullResult:
     """Create DNSRecord rows for on-wire entries that are missing from DB."""
+    if importable_types is None:
+        importable_types = frozenset(_IMPORTABLE_TYPES)
     zone_name = zone.name
     zone_name_no_dot = zone.name.rstrip(".")
     imported_records: list[dict[str, Any]] = []
@@ -235,7 +301,7 @@ def _additive_import(
 
     for rec in on_wire:
         rtype = rec.record_type.upper()
-        if rtype not in _IMPORTABLE_TYPES:
+        if rtype not in importable_types:
             skipped_unsupported += 1
             continue
         if _key(rec, zone_name) in db_keys:
@@ -300,7 +366,14 @@ async def pull_zone_from_server(
     db_keys = {_key(r, zone.name) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
-    result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
+    result = _additive_import(
+        db,
+        zone,
+        on_wire,
+        db_keys,
+        apply=apply,
+        importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+    )
     if apply and result.imported:
         await db.flush()
 
@@ -319,9 +392,11 @@ async def pull_zone_from_server(
 
 
 # Record types the push phase will send to the server via apply_record_change.
-# Mirrors the Windows driver's _SUPPORTED_RECORD_TYPES but importing that
-# would couple us to the driver module — keep a copy here and let drivers
-# raise if they really don't support something at call time.
+# Legacy fallback only (#1533): the live filter is derived per server from
+# the driver's advertised ``capabilities()["record_types"]`` — see
+# ``_syncable_types``. This set mirrors the Windows driver's
+# _SUPPORTED_RECORD_TYPES, which is what the derivation yields for Windows
+# anyway; it survives solely for a driver that publishes no record_types.
 _PUSHABLE_TYPES = frozenset({"A", "AAAA", "CNAME", "MX", "TXT", "PTR", "SRV", "NS", "TLSA"})
 
 
@@ -356,10 +431,11 @@ async def _additive_push(
     # already on the wire. Keeping this as a list (not a generator) so we
     # can zip the driver's per-op results back onto the source rows by
     # index after dispatch.
+    pushable_types = _syncable_types(driver, _PUSHABLE_TYPES)
     candidate_rows: list[DNSRecord] = []
     for row in db_rows:
         rtype = row.record_type.upper()
-        if rtype not in _PUSHABLE_TYPES:
+        if rtype not in pushable_types:
             continue
         if _key(row, zone.name) in on_wire_keys:
             continue
@@ -491,7 +567,14 @@ async def sync_zone_with_server(
     db_keys = {_key(r, zone.name) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
-    pull_result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
+    pull_result = _additive_import(
+        db,
+        zone,
+        on_wire,
+        db_keys,
+        apply=apply,
+        importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+    )
     if apply and pull_result.imported:
         await db.flush()
 
