@@ -134,3 +134,41 @@ def test_strict_gate_exempts_self_and_heartbeat(monkeypatch: pytest.MonkeyPatch)
         is None
     )
     assert sc._strict_schema_gate(sender=_Sender("app.tasks.heartbeat.beat_tick")) is None
+
+
+@pytest.mark.asyncio
+async def test_periodic_check_delivers_alert_to_forward_targets(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1576 — the schema-behind-head event must reach forward targets,
+    not just the in-app alerts page."""
+    from app.services import alerts as alert_service
+    from app.services import audit_forward
+
+    await alert_service.seed_schema_behind_head_alert_rule()
+    rule_id = (
+        await db_session.execute(select(AlertRule.id).where(AlertRule.name == "schema-behind-head"))
+    ).scalar_one()
+
+    async def _behind(**_: object) -> SchemaCheck:
+        return _BEHIND
+
+    monkeypatch.setattr(sc, "schema_at_head", _behind)
+
+    async def _fake_load() -> list[dict]:
+        return [{"name": "stub", "kind": "webhook"}]
+
+    async def _fake_deliver(rule: object, event: object, targets: list) -> tuple[bool, bool, bool]:
+        return False, True, False
+
+    monkeypatch.setattr(audit_forward, "_load_targets", _fake_load)
+    monkeypatch.setattr(alert_service, "_deliver", _fake_deliver)
+
+    out = await sc._async_check_and_alert()
+    assert out["ok"] is False
+
+    event = (
+        await db_session.execute(select(AlertEvent).where(AlertEvent.rule_id == rule_id))
+    ).scalar_one()
+    assert event.delivered_webhook is True
+    assert event.delivered_syslog is False

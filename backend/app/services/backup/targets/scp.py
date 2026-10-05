@@ -78,6 +78,20 @@ _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 # build_backup_archive timeout).
 _SSH_CONNECT_TIMEOUT = 30
 _SSH_BANNER_TIMEOUT = 30
+# Per-operation ceiling on the SFTP channel (#1515). connect / banner /
+# auth timeouts were set, but the channel itself had none, so a server
+# that stalls mid-transfer hung the backup run indefinitely — the
+# runner's row sat ``in_progress`` with no process-level bound at all.
+_SFTP_CHANNEL_TIMEOUT = 300
+
+
+def _open_sftp(client):  # type: ignore[no-untyped-def]
+    """Open the SFTP subsystem with a channel timeout set (#1515)."""
+    sftp = client.open_sftp()
+    channel = sftp.get_channel()
+    if channel is not None:
+        channel.settimeout(_SFTP_CHANNEL_TIMEOUT)
+    return sftp
 
 
 class ScpDestination(BackupDestination):
@@ -259,7 +273,7 @@ class ScpDestination(BackupDestination):
             client = self._connect(config)
             try:
                 try:
-                    sftp = client.open_sftp()
+                    sftp = _open_sftp(client)
                 except Exception as exc:  # noqa: BLE001
                     raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
                 try:
@@ -302,7 +316,7 @@ class ScpDestination(BackupDestination):
         def _do() -> list[ArchiveListing]:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     entries = sftp.listdir_attr(remote_path)
                 except FileNotFoundError as exc:
@@ -342,7 +356,7 @@ class ScpDestination(BackupDestination):
         def _do() -> bytes:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
                         return fh.read()
@@ -364,7 +378,7 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     sftp.remove(remote)
                 except FileNotFoundError:
@@ -393,7 +407,7 @@ class ScpDestination(BackupDestination):
             except BackupDestinationError as exc:
                 return {"ok": False, "error": str(exc)}
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     # Sanity-check the path exists + is a directory.
                     stat = sftp.stat(remote_path)

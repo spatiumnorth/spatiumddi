@@ -47,12 +47,14 @@ import asyncio
 import os
 import secrets
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
+from sqlalchemy import text
 
 from app.services.backup.archive import (
     BackupArchiveError,
@@ -623,14 +625,20 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
+    # Random suffix + O_EXCL (#1571): the name had one-second
+    # resolution and was written with an overwriting write, so two
+    # restores in the same second overwrote the FIRST rollback copy
+    # with the second — destroying exactly the copy the first
+    # restore might need. O_EXCL makes a residual collision fail
+    # this dump (soft-fail path below) instead of overwriting.
+    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}-{secrets.token_hex(3)}.zip"
     try:
         archive_bytes, _filename = await build_backup_archive(
             db,
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
@@ -701,7 +709,51 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-async def apply_backup_restore(
+#: Session-level Postgres advisory lock serialising restores (#1571).
+#: Neither restore endpoint took any lock, so two concurrent restores
+#: interleaved their schema clear and replay — each replaying over
+#: the other's half-cleared schema. Fixed key (this is a whole-install
+#: operation, there is only ever one restore at a time), derived from
+#: a label rather than hand-picked so it cannot collide with the
+#: crc32-based per-resource keys elsewhere by accident.
+_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+
+
+async def apply_backup_restore(db, **kwargs: Any) -> RestoreOutcome:
+    """Restore under the install-wide advisory lock (#1571).
+
+    ``pg_try_advisory_lock`` is non-blocking on purpose: a second
+    restore is refused immediately with an operator-readable error
+    rather than queued behind a replay that disposes the connection
+    pool mid-flight. The lock is session-level, held on ``db``'s
+    connection; Phase 4 of the restore disposes the whole pool,
+    which releases it on the success path, and the ``finally`` below
+    releases it on every path that gets there first. A process that
+    dies mid-restore releases it with its connection — it cannot
+    wedge restores the way a row-based mutex could.
+    """
+    if db is None:  # unit tests drive the phases with stubs
+        return await _apply_backup_restore_inner(db, **kwargs)
+    acquired = (
+        await db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _RESTORE_LOCK_KEY})
+    ).scalar_one()
+    if not acquired:
+        raise BackupRestoreError(
+            "another restore is already in progress on this install — "
+            "wait for it to finish before starting a second one"
+        )
+    await db.commit()
+    try:
+        return await _apply_backup_restore_inner(db, **kwargs)
+    finally:
+        try:
+            await db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _RESTORE_LOCK_KEY})
+            await db.commit()
+        except Exception:  # noqa: BLE001 — pool disposal releases it anyway
+            logger.debug("backup_restore_advisory_unlock_failed", exc_info=True)
+
+
+async def _apply_backup_restore_inner(
     db,
     *,
     archive_bytes: bytes,
@@ -815,6 +867,30 @@ async def apply_backup_restore(
             "the archive's head, or expect /health/ready to fail."
         )
 
+    # Phase 2c (#1575): selective-restore shape checks. Both refusals
+    # below are knowable from the parsed archive + the caller's section
+    # list alone, so they run HERE — before the Phase 3 safety dump
+    # writes a full-size archive to disk and Phase 4 disposes the
+    # connection pool. They used to sit in Phase 5, after both, so every
+    # invalid selective attempt paid for a safety dump and a pool cycle
+    # and got refused anyway.
+    selective = bool(sections)
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
+        )
+    if selective:
+        from app.services.backup.sections import SECTIONS_BY_KEY  # noqa: PLC0415
+
+        unknown_sections = [k for k in sections or [] if k not in SECTIONS_BY_KEY]
+        if unknown_sections:
+            raise BackupRestoreError(
+                f"unknown section keys: {unknown_sections}. Call GET /backup/sections "
+                "for the catalog."
+            )
+
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
     # mounted volume in dev compose, e.g.) we proceed with a logged
@@ -844,17 +920,12 @@ async def apply_backup_restore(
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.
-    selective = bool(sections)
+    # ``selective`` and the two selective-shape refusals (plain format,
+    # unknown section keys) are decided in Phase 2c, before the safety
+    # dump and the pool disposal (#1575).
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
-
-    if selective and dump_format != "custom":
-        raise BackupRestoreError(
-            "selective restore needs an archive whose database dump is in "
-            "pg_dump's custom format (dump_format=custom). This archive is "
-            "plain SQL — only full restore is supported."
-        )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -862,18 +933,11 @@ async def apply_backup_restore(
             # restore module's import graph for callers that don't
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
-                SECTIONS_BY_KEY,
                 cascade_closure,
                 tables_for_sections,
             )
 
             requested = list(sections or [])
-            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
-            if unknown:
-                raise BackupRestoreError(
-                    f"unknown section keys: {unknown}. Call GET /backup/sections "
-                    "for the catalog."
-                )
             # ``platform_internal`` (alembic_version + oui_vendor)
             # always rides along — the schema head pin + the OUI
             # cache are install-state, not user-data, and a
