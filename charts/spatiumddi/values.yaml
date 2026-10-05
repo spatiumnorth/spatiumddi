@@ -906,10 +906,11 @@ dhcpAgents:
     #                            # the default. A DHCP relay (ip
     #                            # helper-address) can only forward to
     #                            # UDP/67, so without hostNetwork point it
-    #                            # at the LoadBalancer address — or pin a
+    #                            # at the LoadBalancer address. A pinned
     #                            # NodePort (service: { type: NodePort,
-    #                            # nodePort: 30067 }) and point the relay
-    #                            # at that port. On a NodePort Service the
+    #                            # nodePort: 30067 }) only helps a relay
+    #                            # that can forward to a non-standard
+    #                            # port. On a NodePort Service the
     #                            # `port: 67` is in-cluster only; the
     #                            # node-facing port is the nodePort, which
     #                            # Kubernetes picks at random (30000–32767)

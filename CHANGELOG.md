@@ -52,7 +52,9 @@ the formatter handles the rest.
   (`ip helper-address`), which can only forward to UDP/67, got no
   answer. The chart default is now `LoadBalancer`, so a relay points
   at the LB address on UDP/67; `service.nodePort` is rendered when
-  set, for a relay pointed at the pinned port; and the chart, the
+  set, giving a stable port for a relay that can forward to a
+  non-standard port (most, including `ip helper-address`, cannot);
+  and the chart, the
   static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
   all say plainly that on a NodePort Service `port: 67` is the
   in-cluster port, not the node-facing one. `hostNetwork: true`

@@ -6,8 +6,8 @@
 # deployments either run the pod with hostNetwork (see
 # kea-statefulset.yaml), so the node itself listens on UDP/67, or use
 # this LoadBalancer Service and point the relay at the LB address.
-# To pin a NodePort instead, set `type: NodePort`, uncomment `nodePort`
-# below, and point the relay at <node>:30067.
+# A pinned NodePort (`type: NodePort` plus the `nodePort` line below)
+# only helps a relay that can forward to a non-standard port.
 apiVersion: v1
 kind: Service
 metadata:
@@ -30,7 +30,7 @@ spec:
       port: 67
       targetPort: 67
       protocol: UDP
-      # nodePort: 30067  # only with type: NodePort — the port a relay targets
+      # nodePort: 30067  # only with type: NodePort
 ---
 apiVersion: v1
 kind: Service
