@@ -5900,6 +5900,10 @@ async def _deliver(
     Per-target ``min_severity`` / ``resource_types`` filters still
     apply via ``_deliver_to_target``. A dead target isolates to its
     own row; the others still see the event.
+
+    A kind's flag is set only when at least one target of that kind
+    reports ``delivered`` (#1577) — a filtered target, a misconfigured
+    one, or one whose transport failed must not stamp the receipt.
     """
     delivered_syslog = False
     delivered_webhook = False
@@ -5927,7 +5931,9 @@ async def _deliver(
         if kind == "smtp" and not rule.notify_smtp:
             continue
         try:
-            await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            outcome = await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            if outcome != audit_forward.DELIVERED:
+                continue
             if kind == "syslog":
                 delivered_syslog = True
             elif kind == "webhook":

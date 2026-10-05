@@ -3285,9 +3285,14 @@ async def test_audit_target(
         "resource_types": None,
     }
     try:
-        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        outcome = await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+    if outcome != audit_forward_svc.DELIVERED:
+        # #1577: a filtered target, a misconfigured one, or a rejected
+        # webhook used to report "ok" here because delivery was merely
+        # attempted.
+        raise HTTPException(status_code=502, detail=f"delivery failed: {outcome}")
     return {"status": "ok", "target": row.name}
 
 
