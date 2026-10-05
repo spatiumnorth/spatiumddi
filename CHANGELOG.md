@@ -593,6 +593,20 @@ the formatter handles the rest.
   appliance** after the upgrade: remove the old entry with
   `ssh-keygen -R <host>` and verify the new fingerprint on the console
   (`spatium-state info`) before accepting it.
+
+- **The audit chain no longer reports tampering on rows nobody edited
+  (GHSA-8288-8vg9-82gr, #1615).** Each audit row was hashed with its
+  `old_value` / `new_value` as Python had them, and verified against what
+  PostgreSQL's JSONB returned. JSONB rewrites some numbers (`1e16` comes back
+  as the integer `10000000000000000`, `-0.0` as `0.0`), so any user able to
+  put such a value in an audited payload, for example a `tags` or
+  `custom_fields` entry on a create, made `GET /audit/integrity`, the chain
+  alert and the restore drill report `row_hash_mismatch` for good. Payloads
+  are now converted to exactly what JSONB returns before hashing, and the
+  converted form is what is stored. `NaN` / `Infinity`, which JSONB rejects
+  (failing the audited change with it), are stored as strings. Chain breaks
+  now name the row's action and resource. Rows written before this fix
+  that carry such a value still report a break; they are not re-hashed.
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA

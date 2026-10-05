@@ -2598,6 +2598,9 @@ export interface AuditChainBreak {
   expected_hash: string;
   actual_hash: string;
   reason: "row_hash_mismatch" | "prev_hash_mismatch";
+  action: string;
+  resource_type: string;
+  resource_id: string;
 }
 
 export interface AuditIntegrity {
