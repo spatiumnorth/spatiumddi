@@ -4605,6 +4605,9 @@ class DriftRecordEntry(BaseModel):
     record_type: str
     value: str
     ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
 
 
 class ServerDriftEntry(BaseModel):
@@ -4665,13 +4668,25 @@ async def get_zone_drift(
                 drift_count=s.drift_count,
                 extra_on_server=[
                     DriftRecordEntry(
-                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        ttl=r.ttl,
+                        priority=r.priority,
+                        weight=r.weight,
+                        port=r.port,
                     )
                     for r in s.extra_on_server
                 ],
                 missing_on_server=[
                     DriftRecordEntry(
-                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        ttl=r.ttl,
+                        priority=r.priority,
+                        weight=r.weight,
+                        port=r.port,
                     )
                     for r in s.missing_on_server
                 ],
