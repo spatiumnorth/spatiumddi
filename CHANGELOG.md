@@ -496,6 +496,95 @@ the formatter handles the rest.
 
 ### Security
 
+- **The DHCP agent's external Service no longer publishes Kea's HA listener
+  (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
+  NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
+  hook's peer listener: plain HTTP, no authentication, and it accepts the
+  commands HA peers send each other. It was latent while the listener never
+  bound (#1447); once it does, every node IP answered it. The external
+  Service now carries UDP 67 only. HA peers keep reaching each other
+  pod-to-pod, and the headless Service still lists 8000 for in-cluster DNS
+  names, so HA needs no change. Appliances were never affected: there the
+  DHCP pod uses host networking behind the appliance firewall. A new chart
+  gate (`chart-no-external-kea-ha.py`) fails CI if a NodePort or
+  LoadBalancer Service in front of a DHCP agent publishes 8000 again, on
+  every render and on the raw `k8s/dhcp` manifests.
+
+- **Logged tracebacks no longer include local variables
+  (GHSA-4mwf-qwqg-5fw7).** The api and worker rendered every unhandled
+  exception through structlog's `dict_tracebacks`, which attaches each
+  stack frame's local variables, so a failed restore wrote the backup
+  passphrase and the database password into the JSON log (and from there
+  to any forwarded log store). Exception rendering is now configured with
+  locals off, in both the JSON and console formats. The exception type,
+  message and frames (file, line, function) are still logged. Operators
+  who may have run a failing restore should rotate those credentials and
+  purge older logs.
+
+- **Regenerating MFA recovery codes no longer returns the account's TOTP
+  secret (GHSA-244w-8h9w-g58j).** `POST /api/v1/auth/mfa/recovery-codes/regenerate`
+  answered with the enrolment response model, so every regeneration
+  carried the existing `secret` and `otpauth_uri` alongside the new codes.
+  The UI reads only the codes, so nothing needed the seed, but anyone
+  holding a session and one live code could take it and keep minting
+  valid codes after the session was revoked. The endpoint now answers
+  with `{"recovery_codes": [...]}` only. Enrolment (`/mfa/enroll/begin`)
+  is unchanged, since that is where the secret is legitimately shown.
+  No operator action is needed; an account that may have been exposed
+  can disable and re-enrol MFA to rotate its secret.
+
+- **The pre-restore safety dump is no longer readable by other local users (GHSA-g996-3ph6-q3x8).**
+  `_write_pre_restore_safety_dump` created its directory and zip with
+  default modes, and the archive's secrets envelope uses a documented
+  constant passphrase, so anyone able to read the file could recover
+  `SECRET_KEY`. The directory is now created 0700 (and tightened if it
+  already existed looser) and the zip is created 0600 at open time, with
+  no window where it is group- or world-readable. Existing dumps keep
+  their old modes; the next restore tightens the directory.
+  Not yet changed: the constant passphrase itself, and pruning of old
+  dumps; both are follow-ups.
+
+- **Backup-target credentials no longer reach the audit log or error
+  messages (GHSA-m63g-667p-6qgw).** `PATCH /backup/targets/{id}` wrote
+  the raw request body into `audit_log.new_value` minus only the
+  passphrase, so a rotated S3 key, SCP password or key, Azure, GCS,
+  WebDAV, FTP, SMB or https_put credential landed in the audit table in
+  clear, readable by the Viewer role, forwarded to SIEM targets and
+  copied into every backup archive. The audit row now records only the
+  names of the config keys that changed. Separately, the https_put and
+  webdav drivers put the full destination URL, including a presigned
+  query string or `user:pass@`, into errors that reach
+  `last_run_error`, the audit log and the logs; they now show scheme,
+  host and path only. Operator action: rotate any backup-target
+  credential or presigned URL that was edited, or failed a run, on an
+  earlier release, since the audit table is append-only.
+
+- **Resolving an alert event and running an evaluation now require a
+  superadmin (GHSA-9m9r-w366-jj3v).** `POST /alerts/events/{id}/resolve` and
+  `POST /alerts/evaluate` only checked that the caller was signed in, so the
+  read-only Viewer role could dismiss a transition-once alert (registrar
+  change, hijack latch) for good, or trigger an evaluator pass that delivers
+  to the configured syslog / webhook / SMTP targets. Both now use the same
+  superadmin gate as the alert-rule writes, and a resolve writes an
+  `audit_log` row. Operators who relied on non-superadmin accounts resolving
+  alerts need to use a superadmin account.
+
+- **The IPv6 Router Advertisement config now loads, and nothing an IPAM
+  writer types can reach it as syntax (GHSA-6235-5gh6-4hr2).** The rendered
+  `radvd.conf` used `AdvMaxInterval`, which is not a radvd keyword
+  (`MaxRtrAdvInterval` is), so radvd rejected every config. Fixing the
+  keyword alone would have exposed a second problem: DNSSL search domains
+  (including the subnet `domain_name`, writable by any IPAM editor) and the
+  RA interface name were interpolated into the file unvalidated, so a crafted
+  value could inject a whole extra `interface` block. DNSSL entries and the
+  subnet `domain_name` must now be valid domain names (RFC 2181 labels, so
+  an underscore is still fine) and the interface a Linux interface name,
+  rejected with a 422 at the API and dropped again at render time (RDNSS and prefixes are
+  re-checked too). The DHCP agent now writes the new config to a staged file,
+  runs `radvd -c` on it and only then swaps it in, so a rejected config no
+  longer replaces the working one on disk. No operator action; existing
+  invalid values are skipped at render with a log line.
+
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
   without the passphrase: in `manifest.json`, in the `secrets.enc`

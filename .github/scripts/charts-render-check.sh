@@ -34,6 +34,9 @@
 #   toggle-coverage  — every ``.Values.x.enabled`` / ``.kind`` a template is
 #                      gated on must be flipped by at least one render, so a
 #                      new gate cannot silently fall out of the matrix.
+#   no-external-kea-ha — every render, plus the raw ``k8s/dhcp`` manifests: no
+#                      NodePort / LoadBalancer Service in front of a DHCP agent
+#                      publishes TCP 8000, Kea's unauthenticated HA listener.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -100,6 +103,8 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     # shellcheck disable=SC2086  # POSTURE_ARGS is a deliberate flag list
     python3 "$ROOT/.github/scripts/chart-pod-posture.py" $POSTURE_ARGS "$file" \
+        || failures=$((failures + 1))
+    python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$file" \
         || failures=$((failures + 1))
 }
 
@@ -332,6 +337,12 @@ METALLB_BGP=(
 render metallb-bgp "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 POSTURE_ARGS=""
 coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
+
+# ── Raw manifests ───────────────────────────────────────────────────────────
+# Not rendered by helm, so the per-render guard above never sees them.
+echo "── no external Kea HA port (raw k8s/dhcp manifests)"
+python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$ROOT"/k8s/dhcp/*.yaml \
+    || failures=$((failures + 1))
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2

@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 #: The archive names SpatiumDDI writes. Every driver filters its listing
 #: with this so a destination shared with unrelated files stays clean.
@@ -153,6 +154,40 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+
+
+def safe_url(url: str) -> str:
+    """``scheme://host[:port]/path`` only, for error messages.
+
+    A receiver URL can carry its credential in the query string (a
+    presigned ``X-Amz-Signature``) or in userinfo (``user:pass@``), and an
+    error message reaches ``last_run_error``, the audit log and the logs.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port:
+            host += f":{parts.port}"
+    except ValueError:
+        return "<unparseable url>"
+    if not parts.scheme or not host:
+        return "<unparseable url>"
+    return f"{parts.scheme}://{host}{parts.path}"
+
+
+def scrub_url(text: str, *urls: str) -> str:
+    """``text`` with each full URL in ``urls`` replaced by :func:`safe_url`
+    — for a library exception message that echoes the URL it was given."""
+    for url in urls:
+        if url:
+            text = text.replace(url, safe_url(url))
+            # a caller may have appended a trailing slash to what the
+            # library echoed back
+            if url.endswith("/"):
+                text = text.replace(url.rstrip("/"), safe_url(url).rstrip("/"))
+    return text
 
 
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:

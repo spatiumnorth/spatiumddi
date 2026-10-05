@@ -21,16 +21,16 @@ spec:
   selector:
     app.kubernetes.io/name: spatium-dhcp
     app.kubernetes.io/instance: dhcp1
+  # DHCP only. TCP 8000 is the Kea HA hook's peer listener, which has no
+  # authentication or TLS; it must never be published on a NodePort or
+  # LoadBalancer. HA peers reach each other pod-to-pod, and the headless
+  # Service below carries the port for in-cluster DNS names.
   ports:
     - name: dhcp-udp
       port: 67
       targetPort: 67
       protocol: UDP
       # nodePort: 30067  # only with type: NodePort — the port a relay targets
-    - name: ctrl-http
-      port: 8000
-      targetPort: 8000
-      protocol: TCP
 ---
 apiVersion: v1
 kind: Service
