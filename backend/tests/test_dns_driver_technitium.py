@@ -147,9 +147,7 @@ def test_render_zone_file_preserves_ttl_zero_and_mx_preference_zero(
     # not rewrite either to a default.
     records = [
         RecordData(name="www", record_type="A", value="10.0.0.1", ttl=0),
-        RecordData(
-            name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=0
-        ),
+        RecordData(name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=0),
     ]
     payload = json.loads(TechnitiumDriver().render_zone_file(zone, records))
     by_domain_type = {(r["domain"], r["type"]): r for r in payload["records"]}
