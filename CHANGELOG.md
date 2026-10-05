@@ -76,6 +76,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium records stop churning and silently diverging (#1518,
+  #1517, #1516, #1513).** A record TTL of 0 came back as the zone
+  TTL and an MX preference of 0 as 10 — both now round-trip as
+  written, on the agent and control-plane paths. The agent always
+  syncs TSIG keys, including an empty bundle, so removing the last
+  key actually clears it on the daemon. A Technitium apply the
+  daemon partly refuses now reports the refusal and is retried
+  instead of reading as success. And rdata normalization is
+  round-trip safe: SVCB/HTTPS parameters survive, URI records keep
+  their trailing-slash semantics, and A/AAAA values are compared in
+  canonical form on both sides, so a hand-typed expanded IPv6
+  address no longer reads back as perpetual drift.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
