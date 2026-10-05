@@ -89,19 +89,80 @@ _SUPPORTED_RECORD_TYPES = frozenset(
 )
 
 
-def _quote_txt(value: str) -> str:
-    """Quote a TXT record value per RFC 1035 (split into ≤255 chunks).
+def _parse_quoted_txt(s: str) -> str | None:
+    """Unescape a fully-quoted TXT presentation form, or None if ``s``
+    is not exactly one or more quoted character-strings."""
+    parts: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+            continue
+        if s[i] != '"':
+            return None
+        i += 1
+        buf: list[str] = []
+        closed = False
+        while i < n:
+            ch = s[i]
+            if ch == "\\" and i + 1 < n:
+                digits = s[i + 1 : i + 4]
+                if len(digits) == 3 and digits.isdigit():
+                    buf.append(chr(int(digits)))
+                    i += 4
+                    continue
+                buf.append(s[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                closed = True
+                i += 1
+                break
+            buf.append(ch)
+            i += 1
+        if not closed:
+            return None
+        parts.append("".join(buf))
+        if i < n and not s[i].isspace():
+            return None
+    return "".join(parts) if parts else None
 
-    PowerDNS's REST API accepts the same wire-format quoted-string
-    representation BIND9 zone files use, so we re-derive the format
-    here rather than depending on the BIND driver module.
+
+def _quote_txt(value: str) -> str:
+    """Quote a TXT record value per RFC 1035 (split long strings into chunks ≤255).
+
+    Keeps in step with the copies in ``drivers/dns/powerdns.py`` and the
+    DNS agent's BIND9/PowerDNS drivers (issue #1514) — the packages are
+    deployed separately, so the helper is duplicated on purpose.
+
+    Control characters are stripped. An already-quoted value is parsed
+    back to its raw text first, so quoting it again changes nothing.
+    Chunking walks the *unescaped* value one code point at a time and
+    budgets each chunk by its escaped UTF-8 octet length, so a chunk
+    can neither split an escape sequence (or a multi-byte character)
+    nor exceed the 255-octet character-string limit once escaped.
     """
-    s = value
-    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-        s = s[1:-1]
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
-    return " ".join(f'"{c}"' for c in chunks)
+    s = "".join(ch for ch in value if ord(ch) >= 0x20 and ord(ch) != 0x7F)
+    stripped = s.strip()
+    raw = s
+    if stripped.startswith('"'):
+        parsed = _parse_quoted_txt(stripped)
+        if parsed is not None:
+            raw = parsed
+    chunks: list[str] = []
+    cur = ""
+    cur_len = 0
+    for ch in raw:
+        esc = '\\"' if ch == '"' else "\\\\" if ch == "\\" else ch
+        cost = len(esc.encode("utf-8"))
+        if cur and cur_len + cost > 255:
+            chunks.append(cur)
+            cur, cur_len = "", 0
+        cur += ch
+        cur_len += cost
+    chunks.append(cur)
+    escaped_chunks = [c.replace("\\", "\\\\").replace('"', '\\"') for c in chunks]
+    return " ".join(f'"{c}"' for c in escaped_chunks)
 
 
 def _record_content(rr: RecordData) -> str:
