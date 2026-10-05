@@ -25,6 +25,24 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Alerts when a scheduled backup fails or stops running, on by
+  default (#1262).** A failed scheduled backup used to write an audit
+  row and nothing else, so on a default install a nightly backup could
+  fail for weeks unnoticed. Two new rules, seeded enabled, watch every
+  enabled backup target with a schedule. `backup_failed` (warning)
+  fires when the last finished run failed and resolves on the next
+  success. `backup_stale` (critical) fires when there has been no
+  successful run for N scheduled runs plus one hour (N on the rule,
+  default 2), counted from the last success but never from before the
+  schedule was set. It also catches a backup that stopped running at
+  all, including a run left `in_progress` by a dead process, which the
+  sweep skips from then on. A run in progress holds both events
+  instead of resolving them. Alert messages carry no destination
+  details or error text. New read-only copilot tool `get_backup_health`
+  (superadmin only) shows the same per-target state.
+
 ### Changed
 
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
