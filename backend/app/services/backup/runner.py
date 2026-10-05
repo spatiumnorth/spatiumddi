@@ -39,11 +39,13 @@ from app.services.backup.archive import (
 )
 from app.services.backup.schedule import compute_next_run
 from app.services.backup.targets import (
+    PRE_RESTORE_KEEP_LAST_N,
     BackupDestinationError,
     RetentionLockedError,
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
 )
 
 logger = structlog.get_logger(__name__)
@@ -89,6 +91,16 @@ async def _retention_sweep(
         return 0
     driver = get_destination(target.kind)
     archives = await driver.list_archives(config=config)
+    # Split the listing BEFORE any retention arithmetic (#1574). The
+    # recommended local-volume path is also where restore writes its
+    # ``pre-restore-*.zip`` safety dumps, and the name pattern matches
+    # both. Counted together, every restore pushed one real backup out
+    # of a keep-last-N window early, and a keep-days policy deleted
+    # the rollback copy on the backups' schedule. Safety dumps are
+    # listed (an operator may still want one) but pruned under their
+    # own keep-last-N, below.
+    backups = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    safety_dumps = [a for a in archives if is_pre_restore_archive(a.filename)]
     # Archives an Object Lock refused. Counted and reported rather than
     # only logged at DEBUG: a target with a 30-day lock and a keep-7
     # policy prunes NOTHING every night while the run reports success and
@@ -132,13 +144,19 @@ async def _retention_sweep(
     deleted = 0
     if target.retention_keep_last_n is not None:
         keep_n = max(target.retention_keep_last_n, 0)
-        for stale in archives[keep_n:]:
+        for stale in backups[keep_n:]:
             deleted += 1 if await _prune(stale.filename) else 0
     elif target.retention_keep_days is not None:
         cutoff = datetime.now(UTC).timestamp() - target.retention_keep_days * 86400
-        for archive in archives:
+        for archive in backups:
             if archive.created_at.timestamp() < cutoff:
                 deleted += 1 if await _prune(archive.filename) else 0
+    # Safety dumps: their own keep-last-N, independent of which (if
+    # any) retention policy the backups use (#1574). Without this the
+    # rollback copies accumulated forever; with the backups' policy
+    # they vanished on a schedule nobody chose for them.
+    for stale_dump in safety_dumps[PRE_RESTORE_KEEP_LAST_N:]:
+        deleted += 1 if await _prune(stale_dump.filename) else 0
     if locked:
         logger.info(
             "backup_retention_blocked_by_object_lock",

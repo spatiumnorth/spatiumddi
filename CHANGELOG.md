@@ -59,6 +59,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Selective restore validates before it pays for a safety dump, and
+  safety dumps no longer consume backup retention (#1575, #1574).**
+  A selective restore against a plain-format archive, or with unknown
+  section keys, was refused only after a full pre-restore safety dump
+  had been written and the connection pool disposed; both checks are
+  knowable from the parsed archive and now run before either cost.
+  On the local-volume path the same directory holds the
+  `pre-restore-*.zip` safety dumps, and retention counted them as
+  backups — each restore pushed a real backup out of a keep-last-N
+  window early, and keep-days deleted rollback copies on the backups'
+  schedule. Retention now splits the listing: backups follow the
+  target's policy, safety dumps keep their own last 3. (The
+  `archives/latest/download` endpoint can still pick a safety dump as
+  "latest" — that half of #1574 remains open.)
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
