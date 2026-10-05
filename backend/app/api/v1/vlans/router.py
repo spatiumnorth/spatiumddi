@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.models.vlans import VLAN, Router
@@ -196,7 +197,13 @@ async def update_router(
         "model": r.model,
         "notes": r.notes,
     }
-    changes = body.model_dump(exclude_unset=True)
+    # #1564 — null clears the nullable columns (management_ip / vendor /
+    # model); null for name / description / location / notes is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"management_ip", "vendor", "model"},
+        non_nullable={"name", "description", "location", "notes"},
+    )
     if "name" in changes and changes["name"] != r.name:
         dup = await db.scalar(
             select(Router).where(Router.name == changes["name"], Router.id != r.id)
@@ -339,7 +346,12 @@ async def update_vlan(
     v = await db.get(VLAN, vlan_id)
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VLAN not found")
-    changes = body.model_dump(exclude_unset=True)
+    # #1564 — every VLAN column here is NOT NULL, so any explicit null
+    # is a 422 rather than the 500 the setattr loop used to produce.
+    changes = resolve_update_changes(
+        body,
+        non_nullable={"vlan_id", "name", "description"},
+    )
     conflict = await _vlan_conflicts(
         db,
         v.router_id,
