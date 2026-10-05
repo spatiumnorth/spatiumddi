@@ -45,6 +45,23 @@ the formatter handles the rest.
 
 ### Changed
 
+- **DHCP agent Services default to LoadBalancer, and a NodePort can
+  finally be pinned (#1549).** The DHCP agent Service defaulted to
+  `type: NodePort` with `port: 67` and no way to set `nodePort`, so
+  Kubernetes picked a random 30000–32767 node port — and a DHCP relay
+  (`ip helper-address`), which can only forward to UDP/67, got no
+  answer. The chart default is now `LoadBalancer`, so a relay points
+  at the LB address on UDP/67; `service.nodePort` is rendered when
+  set, giving a stable port for a relay that can forward to a
+  non-standard port (most, including `ip helper-address`, cannot);
+  and the chart, the
+  static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
+  all say plainly that on a NodePort Service `port: 67` is the
+  in-cluster port, not the node-facing one. `hostNetwork: true`
+  remains the no-relay option. Existing installs that relied on the
+  NodePort default must set `service.type: NodePort` explicitly to
+  keep it.
+
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
   looked only at HIGH and CRITICAL, so the pip CVEs in the api image
@@ -58,6 +75,22 @@ the formatter handles the rest.
   "Scheduled Trivy scan: fixable CVEs in shipped images".
 
 ### Fixed
+
+- **System alerts reach forward targets, compliance rules require a
+  classification, audit-forward targets are validated, and conformity
+  alerts survive the evaluator (#1576, #1578, #1580, #1581).**
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
+  be created without a classification and then never fire, warning on
+  every evaluator tick — create and update now reject that with 422
+  and the evaluator warns once per rule. Audit-forward targets are
+  validated per kind at save time (syslog host/port/facility ranges,
+  webhook URL, SMTP host/port/sender/recipient) instead of being
+  saved enabled and silently skipped. Conformity events are no longer
+  closed by the generic evaluator's auto-resolve passes; the
+  conformity engine owns them.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

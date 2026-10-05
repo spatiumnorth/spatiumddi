@@ -28,8 +28,10 @@ kubectl apply -f k8s/dhcp/service-dhcp.yaml
 
 DHCPv4 requires broadcast reception on the client LAN. In most clusters you
 either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
-only.
+(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
+manifests use that LoadBalancer Service: on a `NodePort` Service the
+declared `port: 67` is in-cluster only and the node-facing port is a
+random 30000–32767 pick, which a relay cannot target.
 
 
 ## Quick Start (single-node / dev)
