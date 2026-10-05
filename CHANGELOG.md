@@ -76,6 +76,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS server groups and agentless zone pushes stop lying about
+  what landed (#1540, #1537, #1533).** A server create (or driver
+  change) could put a second driver into a group that already had
+  one, leaving the group's zones with no coherent sync target —
+  group membership now enforces one driver per group. Agentless
+  zone pushes went to disabled servers and reported success when
+  only some servers applied; disabled servers are excluded from
+  the push and a partial failure is compensated and surfaced
+  instead of acked. And the sync record-type filter is derived
+  from each driver's declared capabilities, so CAA records (and
+  any other type a driver supports) are actually pulled and pushed
+  instead of being filtered out by a hardcoded list.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
