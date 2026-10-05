@@ -131,9 +131,13 @@ spec:
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  # DHCP only. TCP 8000 is the Kea HA hook's peer listener, which has no
+  # authentication or TLS; it must never be published on a NodePort or
+  # LoadBalancer. HA peers reach each other pod-to-pod (the agent resolves
+  # ha_peer_url to an IP), and the headless Service below carries the port
+  # for in-cluster DNS names.
   ports:
     - { name: dhcp-udp,  port: 67,   targetPort: 67,   protocol: UDP }
-    - { name: ctrl-http, port: 8000, targetPort: 8000, protocol: TCP }
 ---
 apiVersion: v1
 kind: Service
