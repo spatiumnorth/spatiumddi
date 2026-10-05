@@ -25,6 +25,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.dns_names import validate_record_owner
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
@@ -437,7 +438,18 @@ async def update_pool(
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
-    payload = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears hc_target_port; null for a NOT NULL
+    # column is a 422.
+    payload = resolve_update_changes(
+        body,
+        clearable={"hc_target_port"},
+        non_nullable={
+            "name", "description", "ttl", "enabled", "hc_type", "hc_path",
+            "hc_method", "hc_verify_tls", "hc_expected_status_codes",
+            "hc_interval_seconds", "hc_timeout_seconds",
+            "hc_unhealthy_threshold", "hc_healthy_threshold",
+        },
+    )
     for k, v in payload.items():
         setattr(pool, k, v)
     db.add(
