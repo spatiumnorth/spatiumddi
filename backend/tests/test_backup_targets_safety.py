@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.backup.targets.base import BackupDestinationError
+from app.services.backup.targets.base import BackupDestinationError, DestinationConfigError
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.local_volume import LocalVolumeDestination
 from app.services.backup.targets.scp import ScpDestination
@@ -251,3 +251,43 @@ async def test_restore_helpers_spawn_pg_tools_with_the_allowlisted_env(
     for env in captured_envs:
         assert "SPATIUM_TEST_SECRET_SENTINEL" not in env
         assert env["PGHOST"] == "db.internal"
+
+
+# ── #1569: SCP strict host-key mode needs actual host keys ───────────
+
+_SCP_BASE = {
+    "host": "192.0.2.1",
+    "username": "u",
+    "password": "p",
+    "remote_path": "/backups",
+}
+_KNOWN_HOSTS = "192.0.2.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterialForTestsOnly1234"
+
+
+def test_scp_default_host_key_mode_requires_known_hosts():
+    # The default used to be "strict" with an empty host-key store,
+    # which rejects every server. The default is now "known_hosts",
+    # and a config with no host keys at all is refused up front.
+    with pytest.raises(DestinationConfigError, match="known_hosts"):
+        ScpDestination().validate_config(dict(_SCP_BASE))
+
+
+def test_scp_strict_without_known_hosts_is_refused():
+    with pytest.raises(DestinationConfigError, match="known_hosts"):
+        ScpDestination().validate_config({**_SCP_BASE, "host_key_check": "strict"})
+
+
+def test_scp_known_hosts_mode_still_requires_the_content():
+    with pytest.raises(DestinationConfigError, match="known_hosts"):
+        ScpDestination().validate_config({**_SCP_BASE, "host_key_check": "known_hosts"})
+
+
+@pytest.mark.parametrize("mode", ["strict", "known_hosts"])
+def test_scp_checked_modes_accept_supplied_known_hosts(mode: str):
+    ScpDestination().validate_config(
+        {**_SCP_BASE, "host_key_check": mode, "known_hosts": _KNOWN_HOSTS}
+    )
+
+
+def test_scp_insecure_skip_needs_no_known_hosts():
+    ScpDestination().validate_config({**_SCP_BASE, "host_key_check": "insecure_skip"})
