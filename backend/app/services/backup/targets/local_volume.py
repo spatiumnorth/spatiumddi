@@ -219,7 +219,12 @@ class LocalVolumeDestination(BackupDestination):
         def _do() -> bytes:
             root = self._path(config)
             target = root / safe
-            if not target.is_file():
+            # Refuse symlinks, matching ``list_archives`` (#1573):
+            # ``is_file`` / ``read_bytes`` follow links, so a symlink
+            # named like an archive was invisible in the listing but
+            # served here — escaping the configured root the listing
+            # deliberately never leaves.
+            if target.is_symlink() or not target.is_file():
                 raise BackupDestinationError(f"archive {safe!r} not found at {root}")
             return target.read_bytes()
 

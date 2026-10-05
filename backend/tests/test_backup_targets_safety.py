@@ -166,3 +166,32 @@ async def test_smb_failed_write_removes_the_staged_tmp(monkeypatch: pytest.Monke
         await SmbDestination().write(config=config, filename=_NAME, archive_bytes=b"x")
     assert len(removed) == 1
     assert removed[0].endswith(_NAME + ".tmp")
+
+
+# ── #1573: local-volume download refuses symlinks ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_local_volume_download_refuses_a_symlink(tmp_path: Path):
+    root = tmp_path / "backups"
+    root.mkdir()
+    outside = tmp_path / "outside.zip"
+    outside.write_bytes(b"not an archive")
+    (root / _NAME).symlink_to(outside)
+
+    driver = LocalVolumeDestination()
+    # The listing already refuses to offer the link…
+    assert await driver.list_archives(config={"path": str(root)}) == []
+    # …and the by-name download must refuse it too, not follow it out
+    # of the configured root.
+    with pytest.raises(BackupDestinationError):
+        await driver.download(config={"path": str(root)}, filename=_NAME)
+
+
+@pytest.mark.asyncio
+async def test_local_volume_download_reads_a_regular_file(tmp_path: Path):
+    root = tmp_path / "backups"
+    root.mkdir()
+    (root / _NAME).write_bytes(b"PK-bytes")
+    driver = LocalVolumeDestination()
+    assert await driver.download(config={"path": str(root)}, filename=_NAME) == b"PK-bytes"
