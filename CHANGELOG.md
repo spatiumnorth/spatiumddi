@@ -76,6 +76,39 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Backup/restore concurrency guards, "latest" is a real backup,
+  and dead runs recover (#1574, #1571, #1515).** `latest/download`
+  and restore drills no longer pick a pre-restore safety dump (it
+  is encrypted with the public constant passphrase, not the
+  target's). Restore now holds a Postgres advisory lock for the
+  whole apply — two concurrent restores interleaved their schema
+  clear and replay — and Run Now / the schedule sweep claim a
+  target with one atomic conditional UPDATE instead of a
+  read-then-run check. Archive and safety-dump filenames carry a
+  random suffix; at one-second resolution two runs in the same
+  second overwrote each other, safety dump included. A backup run
+  whose process dies no longer strands its target `in_progress`
+  forever: the sweep (and Run Now) reap a run older than the health
+  module's two-hour presumption to `failed` with an audit row and a
+  fresh `next_run_at`, the runner stamps `failed` for ANY exception
+  rather than only the three typed ones, local-volume and WebDAV
+  drivers translate `OSError` / `httpx.InvalidURL` at their
+  boundary, and the SCP driver sets an SFTP channel timeout so a
+  stalled server cannot hang a run indefinitely.
+
+- **Selective restore validates before it pays for a safety dump, and
+  safety dumps no longer consume backup retention (#1575, #1574).**
+  A selective restore against a plain-format archive, or with unknown
+  section keys, was refused only after a full pre-restore safety dump
+  had been written and the connection pool disposed; both checks are
+  knowable from the parsed archive and now run before either cost.
+  On the local-volume path the same directory holds the
+  `pre-restore-*.zip` safety dumps, and retention counted them as
+  backups — each restore pushed a real backup out of a keep-last-N
+  window early, and keep-days deleted rollback copies on the backups'
+  schedule. Retention now splits the listing: backups follow the
+  target's policy, safety dumps keep their own last 3.
+
 - **A Proxmox sync no longer fails on an address another integration
   already mirrors (#1622).** When a guest reported an IP that UniFi (or any
   other integration, or a second Proxmox endpoint) already held in the
