@@ -838,7 +838,11 @@ class PowerDNSDriver(DriverBase):
 
         url = f"{_PDNS_API_BASE}/zones/{zone}"
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
-        new_content = _record_content(rec) if op_kind != "delete" else None
+        # The content is computed for deletes too (#1520): a ``delete_value``
+        # op has to splice exactly this value out of the live rrset, and
+        # computing ``None`` for every delete made the fallback filter keep
+        # every record and PATCH the unchanged set back, acked as applied.
+        new_content = _record_content(rec)
 
         # PowerDNS rrset PATCH semantics: ``REPLACE`` swaps the entire
         # rrset contents and ``DELETE`` drops it. There is no
@@ -904,11 +908,16 @@ class PowerDNSDriver(DriverBase):
             )
             return None
 
-        # Fallback for an op enqueued by a control plane that predates the
-        # ``rrset`` payload: read the current rrset, splice the new content in
-        # (or out), and PATCH the merged set back. Without this, two
+        # Fallback for an op that carries no ``rrset`` payload. That is an
+        # op enqueued by a control plane that predates the payload — and,
+        # deliberately, every DNS-pool op: pools opt out of the stamping
+        # (#773) because a pool re-points a member as a delete-then-create
+        # pair on one serial, which only per-RR semantics make
+        # order-independent. Read the current rrset, splice the op's content
+        # in (or out), and PATCH the merged set back. Without this, two
         # consecutive ``create www A`` calls collide (the second overwrites
         # the first), which broke GSLB pool fan-out among other things.
+        rrset_action = (rec.get("rrset_action") or "").lower()
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             zone_resp = client.get(url, headers=headers)
             existing_records: list[dict[str, Any]] = []
@@ -936,7 +945,11 @@ class PowerDNSDriver(DriverBase):
             # *change* leaves the old IP in the rrset until a delete op fires
             # for the prior content.
             merged: list[dict[str, Any]] = []
-            if op_kind == "delete":
+            if op_kind == "delete" and rrset_action == "delete_value":
+                # Pool member removal (#1520): splice exactly this value
+                # out; sibling members at the same (name, type) survive.
+                # Nothing left ⇒ delete the rrset rather than REPLACE it
+                # with an empty set (PowerDNS rejects that as malformed).
                 merged = [r for r in existing_records if r["content"] != new_content]
                 if not merged:
                     rrset: dict[str, Any] = {
@@ -952,6 +965,15 @@ class PowerDNSDriver(DriverBase):
                         "changetype": "REPLACE",
                         "records": merged,
                     }
+            elif op_kind == "delete":
+                # A plain delete clears the whole rrset by (name, type) —
+                # the same value-blind semantics the BIND9 driver uses for
+                # an op with no ``rrset_action`` override.
+                rrset = {
+                    "name": name,
+                    "type": rtype,
+                    "changetype": "DELETE",
+                }
             else:  # create | update
                 merged = [r for r in existing_records if r["content"] != new_content]
                 merged.append({"content": new_content, "disabled": False})
