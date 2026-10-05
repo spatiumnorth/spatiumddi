@@ -76,6 +76,35 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS agent LoadBalancer Services keep the client address and can
+  pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
+  and nothing else, so the rendered LoadBalancer ran with the default
+  `externalTrafficPolicy: Cluster`: kube-proxy SNATed every query and
+  the DNS server saw node or CNI addresses instead of clients —
+  breaking per-client rate limits, query-log and RPZ attribution, and
+  client ACLs, the umbrella-chart twin of #1487 — and there was no way
+  to pin a stable resolver address. The Service now renders
+  `externalTrafficPolicy` (default `Local`; each server is a
+  single-replica StatefulSet, so the announcing node is the pod's node
+  anyway), `annotations` (including the MetalLB
+  `metallb.universe.tf/loadBalancerIPs` pin), `loadBalancerIP`,
+  `loadBalancerSourceRanges`, and `ipFamilyPolicy` / `ipFamilies` from
+  `server.service`. A new render check,
+  `chart-dns-agent-service.py`, fails any DNS agent LoadBalancer that
+  would SNAT its clients, and a dedicated render asserts the new
+  fields reach the Service.
+
+- **The umbrella chart refuses DNS encrypted-transport ports the
+  flavor cannot serve (#1553).** `dnsAgents.servers[].doqPort` was
+  rendered into the container ports and both Services for any flavor,
+  and `dotPort` / `dohPort` likewise for PowerDNS — but DoQ is
+  Technitium-only, and PowerDNS serves DoT/DoH only behind a dnsdist
+  front that has no Kubernetes deployment, so an operator mistake
+  produced a Service port forwarding to nothing instead of an error.
+  The render now fails with a message naming the server, the port and
+  the flavor, and the charts render check carries negative controls
+  for all three combinations.
+
 - **Integration mirrors no longer treat a failed, refused or partial
   fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
   hazards of the same class: the UniFi client collapsed a wrong-shape
