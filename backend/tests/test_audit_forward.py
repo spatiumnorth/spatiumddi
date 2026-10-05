@@ -583,6 +583,8 @@ async def test_complete_smtp_and_webhook_targets_accepted(
         json={"name": "hook", "kind": "webhook", "url": "https://example.com/hook"},
     )
     assert r.status_code == 201, r.text
+
+
 # ── Slack truncation (#1582) ───────────────────────────────────────
 #
 # Slack rejects a Block Kit section over 3,000 characters with
