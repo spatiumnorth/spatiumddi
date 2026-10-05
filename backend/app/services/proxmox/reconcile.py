@@ -113,6 +113,12 @@ class ReconcileSummary:
     addresses_updated: int = 0
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
+    # #1559 — per-pass counts of guests whose config fetch failed and
+    # PVE nodes skipped as not-online (with include_stopped armed).
+    # Non-zero means the guest read was incomplete, so the address
+    # absence-delete was skipped for the pass.
+    unreadable_guests: int = 0
+    unreadable_nodes: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -676,6 +682,18 @@ async def _apply_blocks_and_subnets(
 # ── Apply: addresses ──────────────────────────────────────────────────
 
 
+async def _address_taken(
+    db: AsyncSession, subnet_id: Any, address: str, *, exclude_id: Any = None
+) -> bool:
+    """True if a row already holds ``address`` in ``subnet_id``."""
+    stmt = select(IPAddress.id).where(
+        IPAddress.subnet_id == subnet_id, IPAddress.address == address
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(IPAddress.id != exclude_id)
+    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
+
+
 async def _apply_addresses(
     db: AsyncSession,
     node: ProxmoxNode,
@@ -765,6 +783,16 @@ async def _apply_addresses(
             # subnet_id is factual (where the address lives); always
             # update regardless of the user-modified lock.
             if row.subnet_id != subnet.id:
+                # A row another integration (or Proxmox endpoint) owns
+                # may already sit at the target (subnet, address); the
+                # move would hit ``uq_ip_address_subnet_address`` and
+                # roll back the whole sweep. Leave our row where it is.
+                if await _address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -788,6 +816,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # Phase 1 claimed every row it may claim; one still sitting
+            # at this (subnet, address) is owned by another integration
+            # or Proxmox endpoint (warned there). Inserting next to it
+            # would hit ``uq_ip_address_subnet_address``.
+            if await _address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -1049,6 +1083,8 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
     summary = ReconcileSummary(ok=False)
 
     token_secret = ""
+    unreadable_guests: list[str] = []
+    unreadable_nodes: list[str] = []
     if node.token_secret_encrypted:
         try:
             token_secret = decrypt_str(node.token_secret_encrypted)
@@ -1082,6 +1118,13 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
             all_guests: list[Any] = []
             for n in pve_nodes:
                 if n.status != "online":
+                    # #1559 — with include_stopped armed, a not-online
+                    # node's (stopped) guests are part of the desired
+                    # set; skipping the node silently would read as
+                    # "all its guests are gone" to the absence-delete.
+                    # Count it as an incomplete read instead.
+                    if node.include_stopped:
+                        unreadable_nodes.append(n.node)
                     continue
                 all_networks.extend(await client.list_networks(n.node))
                 if node.mirror_vms:
@@ -1092,6 +1135,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
                     all_guests.extend(
                         await client.list_lxc(n.node, include_stopped=node.include_stopped)
                     )
+            unreadable_guests = list(getattr(client, "unreadable_guests", []) or [])
     except ProxmoxClientError as exc:
         summary.error = str(exc)
         node.last_sync_error = summary.error
@@ -1110,8 +1154,44 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
         node, all_networks, all_guests, sdn_subnets, sdn_vnets
     )
 
-    await _apply_blocks_and_subnets(db, node, desired_subnets, summary, sdn_vnets)
-    await _apply_addresses(db, node, desired_addresses, summary)
+    # #1559 — when a whole node was not read, its bridge networks are
+    # unknown too, so the subnet absence-delete (whose cascade would
+    # sweep the node's guest addresses with it) is unsafe as well.
+    if unreadable_nodes:
+        logger.warning(
+            "proxmox_reconcile_subnet_pass_skipped_incomplete_read",
+            node=str(node.id),
+            unreadable_nodes=unreadable_nodes,
+        )
+    else:
+        await _apply_blocks_and_subnets(db, node, desired_subnets, summary, sdn_vnets)
+    # #1559 — a guest (or, with include_stopped, a whole node) that could
+    # not be read this pass is indistinguishable from "guest gone" in the
+    # desired set, and its addresses cannot be identified individually —
+    # the config that carries them is exactly what failed. So when any
+    # read was incomplete, skip the address pass entirely (creates AND
+    # deletes) rather than absence-deleting rows for guests that never
+    # went anywhere. They converge again on the next healthy pass.
+    summary.unreadable_guests = len(unreadable_guests)
+    summary.unreadable_nodes = len(unreadable_nodes)
+    if unreadable_guests or unreadable_nodes:
+        summary.warnings.append(
+            "incomplete guest read "
+            f"({len(unreadable_guests)} guest config(s) failed: "
+            f"{', '.join(unreadable_guests) or 'none'}; "
+            f"{len(unreadable_nodes)} node(s) not online: "
+            f"{', '.join(unreadable_nodes) or 'none'}) — address "
+            "absence-delete skipped for this pass so unreadable guests "
+            "keep their mirrored addresses"
+        )
+        logger.warning(
+            "proxmox_reconcile_address_pass_skipped_incomplete_read",
+            node=str(node.id),
+            unreadable_guests=unreadable_guests,
+            unreadable_nodes=unreadable_nodes,
+        )
+    else:
+        await _apply_addresses(db, node, desired_addresses, summary)
 
     node.last_synced_at = datetime.now(UTC)
     node.last_sync_error = None
@@ -1146,6 +1226,8 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
                     "updated": summary.addresses_updated,
                     "deleted": summary.addresses_deleted,
                     "skipped_no_subnet": summary.skipped_no_subnet,
+                    "unreadable_guests": summary.unreadable_guests,
+                    "unreadable_nodes": summary.unreadable_nodes,
                 },
             },
         )
