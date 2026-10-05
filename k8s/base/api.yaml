@@ -71,7 +71,7 @@ spec:
                   key: metrics-token
                   optional: true
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
             - name: REDIS_URL
               valueFrom:
                 configMapKeyRef:
@@ -87,6 +87,19 @@ spec:
                 configMapKeyRef:
                   name: spatiumddi-config
                   key: CELERY_RESULT_BACKEND
+            # #1547 — Sentinel master name + the password Sentinel
+            # itself requires (the data password, in the ConfigMap's
+            # URLs too). Same wiring as the umbrella chart's commonEnv.
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_PASSWORD
           # Liveness — "process responds to HTTP". Deliberately shallow:
           # a transient Postgres blip should not trigger a pod restart.
           #

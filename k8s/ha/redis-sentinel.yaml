@@ -204,3 +204,22 @@ spec:
   ports:
     - name: redis
       port: 6379
+---
+# #1547 — Sentinel Service: Celery/kombu reaches the Sentinels
+# through this ClusterIP (the CELERY_* sentinel:// URLs in
+# k8s/base/configmap.yaml), load-balancing across all three pods;
+# redis-py instead lists every Sentinel by its per-pod headless DNS
+# name in REDIS_URL. Mirrors the umbrella chart's redis-sentinel
+# Service. Without it there was no Service exposing port 26379 at all.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: spatiumddi
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: 26379

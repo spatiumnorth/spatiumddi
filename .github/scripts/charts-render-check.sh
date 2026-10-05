@@ -437,6 +437,26 @@ else
     failures=$((failures + 1))
 fi
 
+# #1547 — the raw manifests must point at Services that exist (or
+# that CNPG creates): postgres-rw, the `api` Service, sentinel://
+# Redis URLs and a redis-sentinel Service.
+echo "── raw k8s/ manifests point at Services that exist (#1547)"
+python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" "$ROOT/k8s" \
+    || failures=$((failures + 1))
+
+echo "── negative control: a DATABASE_URL host CNPG never creates must fail"
+cp -r "$ROOT/k8s" "$OUT/neg-k8s"
+sed -i 's/@postgres-rw:/@postgres-primary:/' "$OUT/neg-k8s/base/configmap.yaml"
+neg_out="$(python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" \
+    "$OUT/neg-k8s" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "postgres-primary"; then
+    echo "   ok: DATABASE_URL at postgres-primary refused by the #1547 guard"
+else
+    echo "   FAIL: expected the #1547 guard to refuse a postgres-primary DATABASE_URL (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2
     exit 1

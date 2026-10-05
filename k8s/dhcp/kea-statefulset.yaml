@@ -48,7 +48,10 @@ spec:
           # if your CNI can proxy UDP/67 use a plain ClusterIP + relay instead.
           env:
             - name: SPATIUM_API_URL
-              value: http://spatiumddi-api.spatiumddi.svc.cluster.local:8000
+              # The API Service is named `api` (k8s/base/api.yaml);
+              # trailing dot for the hostNetwork search-domain reason
+              # in k8s/dns/bind9-statefulset.yaml (#777).
+              value: http://api.spatiumddi.svc.cluster.local.:8000
             - name: SPATIUM_SERVER_NAME
               valueFrom:
                 fieldRef:

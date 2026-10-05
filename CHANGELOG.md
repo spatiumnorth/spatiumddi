@@ -76,6 +76,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Raw `k8s/` manifests and the DHCP agent readiness probe pointed
+  at things that don't exist (#1547, #1550, #1589).** `DATABASE_URL`
+  used `postgres-primary`, a Service CNPG never creates for the
+  `postgres` Cluster — it is now `postgres-rw` everywhere, and the
+  quick start exposes its standalone Postgres under that name. The
+  agents pointed at a `spatiumddi-api` Service; the API Service is
+  named `api`. The Redis URLs were plain `redis://` against the
+  headless Service (replica READONLY, no password against a
+  `requirepass` manifest, no Sentinel Service) — they are now
+  `sentinel://` URLs with the password, plus a `redis-sentinel`
+  Service. The DHCP agent's readiness probe gated on TCP 8000, the
+  Kea HA peer listener a standalone server never binds, so a
+  standalone pod never joined its Service endpoints; it now probes
+  the Kea control socket, as the image HEALTHCHECK does. And the
+  MetalLB VIP Services no longer allocate NodePorts nobody routes
+  through. New charts-gate checks (`chart-dhcp-readiness.py`,
+  `chart-vip-nodeports.py`, `chart-raw-k8s-refs.py`, each with a
+  negative control) pin all of it.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by

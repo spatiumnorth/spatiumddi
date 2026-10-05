@@ -4,9 +4,25 @@ metadata:
   name: spatiumddi-config
   namespace: spatiumddi
 data:
-  DATABASE_URL: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
-  REDIS_URL: "redis://redis-headless:6379/0"
-  CELERY_BROKER_URL: "redis://redis-headless:6379/1"
-  CELERY_RESULT_BACKEND: "redis://redis-headless:6379/2"
+  # #1547 — the CNPG Cluster in k8s/ha/ is named `postgres`, so the
+  # read/write Service CNPG creates is `postgres-rw` (there is no
+  # `postgres-primary` Service). The quick start exposes its
+  # standalone Postgres under the same name (see k8s/README.md).
+  DATABASE_URL: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+  # #1547 — Redis runs behind Sentinel (k8s/ha/redis-sentinel.yaml):
+  # a plain redis:// URL against the headless Service lands on a
+  # replica ~2 times in 3 (READONLY) and carries no password (NOAUTH —
+  # the manifest sets requirepass). The app and Celery both parse the
+  # sentinel:// scheme (backend/app/core/redis_client.py,
+  # backend/app/celery_app.py): REDIS_URL lists every Sentinel by its
+  # per-pod headless DNS name so one is reachable mid-failover, and
+  # the Celery URLs go through the `redis-sentinel` Service. The
+  # password is the requirepass in k8s/ha/redis-sentinel.yaml —
+  # change both together.
+  REDIS_URL: "sentinel://:CHANGEME@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
+  CELERY_BROKER_URL: "sentinel://:CHANGEME@redis-sentinel:26379/1"
+  CELERY_RESULT_BACKEND: "sentinel://:CHANGEME@redis-sentinel:26379/2"
+  REDIS_SENTINEL_MASTER: "mymaster"
+  REDIS_SENTINEL_PASSWORD: "CHANGEME"
   DEBUG: "false"
   LOG_LEVEL: "info"
