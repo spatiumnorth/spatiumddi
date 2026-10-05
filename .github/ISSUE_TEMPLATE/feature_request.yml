@@ -4,6 +4,12 @@ title: "[feat] "
 labels: ["idea"]
 type: Feature
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. To talk it through before filing, or to ask a
+        question, use [Discussions](https://github.com/spatiumnorth/spatiumddi/discussions).
+
   - type: dropdown
     id: area
     attributes:
@@ -12,12 +18,19 @@ body:
         - IPAM
         - DNS
         - DHCP
+        - Discovery (sweeps, SNMP, LLDP, nmap)
         - Auth / Providers
         - Permissions / RBAC
-        - Audit / Observability
+        - Alerts / notifications / audit forwarding
+        - Audit log / observability
+        - Backup / restore
+        - Reporting / dashboards
+        - Integrations (Kubernetes, Proxmox, firewalls, cloud, …)
+        - Operator Copilot / MCP
+        - Appliance (OS, install, upgrade, Fleet)
+        - Deployment (Compose / Helm / manifests)
         - Frontend / UI
-        - API
-        - Deployment (Compose / K8s / Appliance)
+        - API / CLI
         - Docs
         - Other
     validations:
@@ -43,7 +56,13 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What workarounds exist today? Why aren't they enough?
+      description: What workarounds exist today? Why aren't they enough? How do other DDI tools handle it?
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Your environment
+      description: Roughly how big is the estate (subnets, zones, scopes, nodes), and how is SpatiumDDI deployed? It helps us judge the design.
 
   - type: checkboxes
     id: contribution
