@@ -76,6 +76,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cloud DNS zone creates and deletes no longer duplicate or wedge
+  (#1527, #1528, #1534).** Creating a Route 53 zone that already
+  exists in the account now adopts it instead of minting a second
+  hosted zone, and the `CallerReference` is derived from the zone
+  row and name so AWS deduplicates a retried create. Deleting a
+  populated Route 53 or Google Cloud DNS zone empties it first
+  (every record set except SOA and apex NS, in batches) instead of
+  failing with `HostedZoneNotEmpty` / `containerNotEmpty`, and a
+  zone that is already absent counts as deleted, so permanent
+  delete, the trash purge and zone moves can complete. An Azure
+  DNS server now requires all five credential fields, including
+  `resource_group`, at save time and in the driver: a missing field
+  is a named error instead of a raw `KeyError`, and zone listing
+  (the connection probe) is scoped to the same resource group the
+  record paths use instead of passing subscription-wide while every
+  record op failed.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by

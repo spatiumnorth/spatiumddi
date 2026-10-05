@@ -1817,8 +1817,7 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
     which the operator may legitimately skip. The point here is to turn
     "saved fine, then every sync fails" into a 422 on save.
 
-    ``technitium_api`` (#810) is the only driver with anything to check
-    today, and it has two things worth catching:
+    ``technitium_api`` (#810) has two things worth catching:
 
     * the API URL must carry an explicit scheme. Guessing ``http`` for a
       bare host would silently put the bearer token on the wire in
@@ -1829,7 +1828,31 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
       co-located Technitium on the appliance's own loopback is a legitimate
       target, and this module's contract is to log those rather than refuse
       them.
+
+    ``azure_dns`` (#1534) validates that all five credential fields are
+    present — an empty ``resource_group`` used to pass the probe (which
+    listed zones subscription-wide) while every record op failed.
     """
+    if driver == "azure_dns":
+        from app.drivers.dns.azuredns import AzureDNSDriver  # noqa: PLC0415
+
+        missing = [
+            field
+            for field in AzureDNSDriver.credential_fields
+            if not str(creds.get(field) or "").strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "azure_dns credentials are missing required field(s): "
+                    + ", ".join(missing)
+                    + ". All of tenant_id, client_id, client_secret, "
+                    "subscription_id and resource_group are required."
+                ),
+            )
+        return
+
     if driver != "technitium_api":
         return
 
