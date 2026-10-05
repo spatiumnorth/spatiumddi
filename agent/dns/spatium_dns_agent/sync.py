@@ -550,11 +550,30 @@ class SyncLoop:
         the daemon — the next structural reload will try again.
         """
         entries: list[dict[str, Any]] = []
+        # A driver that can read back what it actually serves (PowerDNS,
+        # via its API) reports THOSE serials: the bundle's serial made
+        # per-server sync status read "in sync" whatever the server
+        # served, and reported zones the agent never served at all
+        # (forward zones on PowerDNS, #1521 / #1522). Drivers without
+        # the hook keep the bundle-serial behaviour.
+        served: dict[str, int] | None = None
+        hook = getattr(self.driver, "served_zone_serials", None)
+        if callable(hook):
+            try:
+                served = hook(bundle)
+            except Exception as e:  # noqa: BLE001 — reporting is best-effort
+                log.warning("served_zone_serials_hook_failed", error=str(e))
+                served = {}
         for z in bundle.get("zones") or []:
             name = z.get("name")
             serial = z.get("serial")
             if not name or serial is None:
                 continue
+            if served is not None:
+                actual = served.get(str(name).rstrip("."))
+                if actual is None:
+                    continue
+                serial = actual
             entries.append({"zone_name": str(name), "serial": int(serial)})
         if not entries:
             return

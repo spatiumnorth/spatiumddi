@@ -681,6 +681,16 @@ class PowerDNSDriver(DriverBase):
                             "disabled": False,
                         }
                     )
+                # The apex SOA is synthesised from the zone itself
+                # (#1522): Primary NS / Admin Email / timers / serial.
+                # Zones used to be created with only the bundle's
+                # records, so pdns filled in its default SOA and the
+                # zone's own SOA fields never reached the wire. The
+                # reconcile REPLACEs this rrset like every other, so a
+                # later edit re-renders it too.
+                rrsets[(zname, "SOA")] = [
+                    {"content": _soa_content(zone, zname), "disabled": False}
+                ]
             zones_payload.append(
                 {
                     "name": zname,
@@ -1651,6 +1661,14 @@ class PowerDNSDriver(DriverBase):
                         "kind": zone_payload.get("kind", "Native"),
                         "rrsets": zone_payload.get("rrsets") or [],
                     }
+                    # The zone's serial goes on create (#1522) — it was
+                    # in the payload but never sent, so a fresh zone
+                    # started at pdns's default serial whatever the
+                    # control plane had stamped.
+                    try:
+                        create_body["serial"] = int(zone_payload.get("serial") or 1)
+                    except (TypeError, ValueError):
+                        create_body["serial"] = 1
                     if zone_payload.get("masters"):
                         create_body["masters"] = zone_payload["masters"]
                     resp = client.post(
@@ -1856,6 +1874,40 @@ class PowerDNSDriver(DriverBase):
             log.warning("powerdns_metadata_error", zone=zone, kind=kind, error=str(exc))
 
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
+
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        """Zone name (no trailing dot) → the serial pdns actually serves.
+
+        The sync loop's zone-state reporter uses this instead of the
+        bundle's serials (#1522): reporting the bundle serial made
+        per-server sync status read "in sync" whatever pdns served, and
+        it reported zones the agent never served at all (forward zones,
+        #1521). A zone absent from the map is simply not reported. An
+        unreadable API returns an empty map — report nothing rather
+        than something unverified.
+        """
+        api_key = self._load_or_generate_api_key()
+        try:
+            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+                resp = client.get(
+                    f"{_PDNS_API_BASE}/zones", headers={"X-API-Key": api_key}
+                )
+            if resp.status_code >= 400:
+                log.warning("powerdns_served_serials_http", status=resp.status_code)
+                return {}
+            zones = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("powerdns_served_serials_failed", error=str(exc))
+            return {}
+        out: dict[str, int] = {}
+        for z in zones or []:
+            if not isinstance(z, dict) or not z.get("name"):
+                continue
+            serial = z.get("serial")
+            if isinstance(serial, bool) or not isinstance(serial, int):
+                continue
+            out[str(z["name"]).rstrip(".")] = serial
+        return out
 
     def _reload_via_api(self) -> None:
         """Optional — issue a notify on every zone after a bulk
