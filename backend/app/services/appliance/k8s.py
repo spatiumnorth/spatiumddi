@@ -1003,6 +1003,23 @@ def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
     return any(o.get("kind") == "DaemonSet" for o in owners)
 
 
+def pod_has_controller(pod: dict[str, Any]) -> bool:
+    """True if the pod has a controller ownerReference.
+
+    A pod is controller-owned when one of its ``ownerReferences``
+    either carries ``controller: true`` (what the apiserver sets for
+    the managing controller) or names a workload controller kind
+    (ReplicaSet / StatefulSet / DaemonSet / Job /
+    ReplicationController). A bare pod — created directly, with no
+    controller — has neither, and nothing re-creates it if it is
+    deleted. Drain uses this to refuse evicting such pods (#1546),
+    matching ``kubectl drain`` without ``--force``.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    controller_kinds = {"ReplicaSet", "StatefulSet", "DaemonSet", "Job", "ReplicationController"}
+    return any(o.get("controller") or o.get("kind") in controller_kinds for o in owners)
+
+
 def pod_is_terminal(pod: dict[str, Any]) -> bool:
     """True if pod.status.phase is Succeeded or Failed.
 

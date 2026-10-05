@@ -57,7 +57,7 @@ from app.services.appliance.slot_image_target import (
     SlotImageTarget,
     stamp_desired_slot_image,
 )
-from app.services.upgrades import preflight
+from app.services.upgrades import preflight, safety
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +74,7 @@ StepName = Literal[
     "convergence",
     "uncordon",
     "cluster_verify",
+    "release_node",
 ]
 
 
@@ -362,6 +363,7 @@ async def _step_drain(
 
         # Filter to evictable pods.
         candidates: list[tuple[str, str]] = []  # [(name, namespace)]
+        unowned: list[str] = []
         for pod in pods:
             if k8s.pod_is_owned_by_daemonset(pod):
                 continue
@@ -374,7 +376,33 @@ async def _step_drain(
             ns = meta.get("namespace")
             if not name or not ns:
                 continue
+            if not k8s.pod_has_controller(pod):
+                # #1546 — a bare pod has no controller to re-create
+                # it; evicting it deletes it for good. The docstring's
+                # no-force rule forbids that, so the pod is a drain
+                # blocker, never a candidate.
+                unowned.append(f"{ns}/{name}")
+                continue
             candidates.append((name, ns))
+
+        if unowned:
+            # Fail fast — an unowned pod never becomes evictable, so
+            # polling until the timeout only delays the operator.
+            # The pods are named in the step detail as blockers.
+            return step.finish(
+                False,
+                error=(
+                    f"drain blocked: {len(unowned)} pod(s) on {node_name} have "
+                    "no controller owner and would not be re-created if "
+                    "evicted (no --force semantics): " + ", ".join(sorted(unowned))
+                ),
+                evicted_count=len(set(evicted)),
+                evicted=list(set(evicted)),
+                unowned_pods=sorted(unowned),
+                blocked=[
+                    {"pod": p, "reason": "no controller owner"} for p in sorted(unowned)
+                ],
+            )
 
         if not candidates:
             return step.finish(
@@ -530,6 +558,8 @@ async def _step_convergence(
     node_name: str,
     *,
     timeout_s: float = DEFAULT_CONVERGENCE_TIMEOUT_S,
+    cnpg_cluster_name: str = "",
+    cnpg_namespace: str | None = None,
 ) -> StepResult:
     """Wait for the node to be fully back in service:
 
@@ -537,10 +567,17 @@ async def _step_convergence(
     * Every DaemonSet pod on the node reports Ready (the readiness-
       probe marker file from Phase A2 fires only after the agent has
       synced + the daemon is responding).
-
-    CNPG instance-streaming + Redis-reconnected are nice-to-have but
-    not load-bearing — CNPG's own readiness probe handles that
-    through the Cluster.status block; we don't gate uncordon on it.
+    * #1544 — when a CNPG cluster is configured, the Cluster's
+      ``status.readyInstances`` is back to ``spec.instances``. Node
+      Ready + DS Ready alone don't prove the node's Postgres instance
+      came back: the chain used to uncordon and move on with CNPG
+      short an instance, and ``check_replication_lag`` reads a
+      missing replica as "ok", so the next node's drain could take
+      the database to a single instance (or none). The check reuses
+      ``safety.check_cnpg_instances_ready`` — the same read the
+      post-run verification uses. A 404 (cluster intentionally torn
+      down) is a skip, mirroring ``_step_verify_primary_moved``;
+      any other non-ok verdict keeps polling until the timeout.
     """
     step = StepResult(name="convergence", started_at=_now_iso(), detail={"node": node_name})
     deadline = time.monotonic() + timeout_s
@@ -570,12 +607,29 @@ async def _step_convergence(
             if not is_ready:
                 meta = pod.get("metadata") or {}
                 not_ready.append(f"{meta.get('namespace')}/{meta.get('name')}")
-        if not not_ready:
+        if not_ready:
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            continue
+        if cnpg_cluster_name:
+            cnpg_check = safety.check_cnpg_instances_ready(
+                cnpg_cluster_name, namespace=cnpg_namespace
+            )
+            if cnpg_check.level == "fail":
+                await asyncio.sleep(_POLL_INTERVAL_S)
+                continue
+            if cnpg_check.level == "warn" and cnpg_check.detail.get("status") != 404:
+                await asyncio.sleep(_POLL_INTERVAL_S)
+                continue
             return step.finish(
                 True,
                 ds_pod_count=len(ds_pods),
+                cnpg_ready_instances=cnpg_check.detail.get("ready_instances"),
+                cnpg_spec_instances=cnpg_check.detail.get("spec_instances"),
             )
-        await asyncio.sleep(_POLL_INTERVAL_S)
+        return step.finish(
+            True,
+            ds_pod_count=len(ds_pods),
+        )
     return step.finish(
         False,
         error=f"convergence timed out after {timeout_s:.0f}s",
@@ -598,6 +652,15 @@ async def _step_uncordon(
     ok, err = k8s.uncordon_node(node_name)
     if not ok:
         return step.finish(False, error=err or "uncordon failed")
+    if not cluster_name:
+        # #1545 — an empty cluster name is documented as "disables
+        # CNPG-related steps", and the maintenance-window SET above is
+        # skipped on that basis. The CLEAR must be skipped too:
+        # patch_cnpg_maintenance_window("") PATCHes the clusters
+        # collection URL, gets a non-200, and fails the step after a
+        # successful uncordon — flipping a clean per-node upgrade to
+        # failed at its last step.
+        return step.finish(True, maintenance_window_clear_skipped=True)
     ok, err = k8s.patch_cnpg_maintenance_window(
         cluster_name,
         in_progress=False,
@@ -614,6 +677,55 @@ async def _step_uncordon(
             uncordon_ok=True,
         )
     return step.finish(True)
+
+
+# ── Compensation: release the node after a post-cordon failure ───────
+
+
+async def _step_release_node(
+    node_name: str,
+    cluster_name: str,
+    namespace: str | None,
+    *,
+    clear_window: bool,
+) -> StepResult:
+    """Compensating step for #1542 — best-effort release of a node
+    whose upgrade failed after the cordon.
+
+    Uncordons the node and, when this run set the CNPG maintenance
+    window, clears it. Both actions are idempotent (uncordoning an
+    uncordoned node is a 200; clearing an unset window is a no-op
+    patch), so this is safe to run even when the failing step
+    partially released the node itself. The outcome is recorded as
+    its own step in the per-node progress, so the operator can see
+    whether the node was released or is still cordoned with the
+    window on and needs a manual release.
+    """
+    step = StepResult(
+        name="release_node",
+        started_at=_now_iso(),
+        detail={"node": node_name, "cluster": cluster_name},
+    )
+    ok, err = k8s.uncordon_node(node_name)
+    if not ok:
+        return step.finish(
+            False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
+        )
+    if not (clear_window and cluster_name):
+        return step.finish(True, uncordon_ok=True, maintenance_window_clear_skipped=True)
+    ok, err = k8s.patch_cnpg_maintenance_window(
+        cluster_name,
+        in_progress=False,
+        reuse_pvc=True,
+        namespace=namespace,
+    )
+    if not ok:
+        return step.finish(
+            False,
+            error=f"uncordon ok, compensating maintenance-window clear failed: {err}",
+            uncordon_ok=True,
+        )
+    return step.finish(True, uncordon_ok=True, maintenance_window_cleared=True)
 
 
 # ── Step 11: cluster verify ──────────────────────────────────────────
@@ -708,6 +820,38 @@ async def single_node_upgrade(
 
     results: list[StepResult] = []
 
+    # #1542 — compensation state for a failure after the cordon. On a
+    # resume past a step, the earlier invocation already did it, so
+    # seed the flags from start_index; the step runs below flip them
+    # as they complete in this invocation.
+    cordon_done = start_index > steps_in_order.index("cordon")
+    window_set = bool(cnpg_cluster_name) and start_index > steps_in_order.index(
+        "cnpg_maintenance_on"
+    )
+    released = start_index > steps_in_order.index("uncordon")
+
+    async def _fail(step: StepName) -> SingleNodeResult:
+        """Fail the chain, first releasing the node if this run left
+        it cordoned (#1542). Without the compensation the node stays
+        cordoned and the CNPG maintenance window stays on until an
+        operator releases it by hand."""
+        if cordon_done and not released:
+            comp = await _step_release_node(
+                node_name,
+                cnpg_cluster_name,
+                cnpg_namespace,
+                clear_window=window_set,
+            )
+            results.append(comp)
+            if not comp.ok:
+                logger.error(
+                    "single_node_upgrade_release_failed",
+                    node=node_name,
+                    failed_at=step,
+                    error=comp.error,
+                )
+        return _failed(node_name, target_version, step, results)
+
     async def _run(step: StepName, coro: Any) -> bool:
         if steps_in_order.index(step) < start_index:
             return True
@@ -731,29 +875,39 @@ async def single_node_upgrade(
             _step_cnpg_maintenance_on(cnpg_cluster_name, cnpg_namespace),
         ):
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
+        window_set = True
     if not await _run("cordon", _step_cordon(node_name)):
         return _failed(node_name, target_version, "cordon", results)
+    cordon_done = True
     if cnpg_cluster_name:
         if not await _run(
             "verify_primary_moved",
             _step_verify_primary_moved(cnpg_cluster_name, node_name, cnpg_namespace),
         ):
-            return _failed(node_name, target_version, "verify_primary_moved", results)
+            return await _fail("verify_primary_moved")
     if not await _run("drain", _step_drain(node_name)):
-        return _failed(node_name, target_version, "drain", results)
+        return await _fail("drain")
     if not await _run(
         "trigger_slot_apply",
         _step_trigger_slot_apply(db, node_name, target_version, slot_image),
     ):
-        return _failed(node_name, target_version, "trigger_slot_apply", results)
+        return await _fail("trigger_slot_apply")
     if not await _run("health_gate", _step_health_gate(db, node_name, target_version)):
-        return _failed(node_name, target_version, "health_gate", results)
-    if not await _run("convergence", _step_convergence(node_name)):
-        return _failed(node_name, target_version, "convergence", results)
+        return await _fail("health_gate")
+    if not await _run(
+        "convergence",
+        _step_convergence(
+            node_name,
+            cnpg_cluster_name=cnpg_cluster_name,
+            cnpg_namespace=cnpg_namespace,
+        ),
+    ):
+        return await _fail("convergence")
     if not await _run("uncordon", _step_uncordon(node_name, cnpg_cluster_name, cnpg_namespace)):
-        return _failed(node_name, target_version, "uncordon", results)
+        return await _fail("uncordon")
+    released = True
     if not await _run("cluster_verify", _step_cluster_verify(target_version)):
-        return _failed(node_name, target_version, "cluster_verify", results)
+        return await _fail("cluster_verify")
 
     return SingleNodeResult(
         node_name=node_name,
@@ -770,7 +924,15 @@ def _failed(
     failed_at: StepName,
     results: list[StepResult],
 ) -> SingleNodeResult:
-    last_err = results[-1].error if results else "unknown"
+    # The error is the FAILING step's, not the last recorded step's —
+    # a #1542 release_node compensation step may have been appended
+    # after the failure, and its outcome must not mask why the chain
+    # actually failed.
+    failed_step = next((r for r in reversed(results) if r.name == failed_at), None)
+    if failed_step is not None:
+        last_err = failed_step.error
+    else:
+        last_err = results[-1].error if results else "unknown"
     return SingleNodeResult(
         node_name=node_name,
         target_version=target_version,
