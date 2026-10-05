@@ -1087,8 +1087,8 @@ async def _resolve_reverse_zone(
 # trip per zone instead of one per record (issue #341). A contextvar avoids
 # threading a parameter through ``_sync_dns_record``'s dozen enqueue calls;
 # it is task-local so concurrent requests never share a collector.
-_dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] | None] = (
-    contextvars.ContextVar("_dns_op_collector", default=None)
+_dns_op_collector: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "_dns_op_collector", default=None
 )
 
 
@@ -1101,6 +1101,9 @@ async def _enqueue_dns_op(
     value: str,
     ttl: int | None,
     record_id: uuid.UUID | None = None,
+    *,
+    ip: IPAddress | None = None,
+    stamped_record_id: uuid.UUID | None = None,
 ) -> Any:
     """Wrapper to enqueue a record op against the zone's primary server.
     Imported lazily to avoid circular import.
@@ -1108,7 +1111,12 @@ async def _enqueue_dns_op(
     Returns the ``DNSRecordOp`` (or None in batch mode / when nothing was
     enqueued). For an agentless primary (Windows DNS) the op is applied
     synchronously and its ``state`` is ``applied`` / ``failed`` on return —
-    callers use that to avoid stamping a record that didn't land (#428)."""
+    callers use that to avoid stamping a record that didn't land (#428).
+
+    In batch mode the return is always None, so a caller that stamped
+    ``ip.dns_record_id`` for the record this op creates passes ``ip`` +
+    ``stamped_record_id``: the flush then applies the #428 un-stamp itself
+    when the batched op comes back ``failed`` (#1536)."""
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
 
@@ -1125,15 +1133,22 @@ async def _enqueue_dns_op(
         # Batch mode — defer; the enclosing ``_batched_dns_ops`` flushes per
         # zone. The serial bump above still happens per op exactly as the
         # inline path does, so ``target_serial`` snapshots match.
-        collector.append((zone, {"op": op, "record": record, "target_serial": target_serial}))
+        collector.append(
+            {
+                "zone": zone,
+                "op": {"op": op, "record": record, "target_serial": target_serial},
+                "ip": ip,
+                "stamped_record_id": stamped_record_id,
+            }
+        )
         return None
 
     return await enqueue_record_op(db, zone, op, record, target_serial=target_serial)
 
 
 async def _flush_dns_op_collector(
-    db: AsyncSession, collector: list[tuple[DNSZone, dict[str, Any]]]
-) -> None:
+    db: AsyncSession, collector: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Flush deferred record ops, one batched driver call per zone.
 
     ``enqueue_record_ops_batch`` already does the right thing per driver: an
@@ -1142,21 +1157,45 @@ async def _flush_dns_op_collector(
     is safe for every group shape — no ``is_agentless`` gate needed here.
     Zone order is preserved so a delete-then-recreate (address-family swap)
     applies in the same order it was collected.
+
+    Returns one result per collected op — ``{ip, op, op_row, zone}`` — so
+    callers can do error accounting the inline path does via the returned
+    op's ``state`` (#1536). A collected op that carried ``ip`` +
+    ``stamped_record_id`` and came back ``failed`` gets the #428 un-stamp
+    here: ``ip.dns_record_id`` is cleared (only while it still points at
+    the record this op was creating) so DDNS idempotency retries it.
     """
+    results: list[dict[str, Any]] = []
     if not collector:
-        return
+        return results
     from app.services.dns.record_ops import enqueue_record_ops_batch
 
     by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
     order: list[uuid.UUID] = []
-    for zone, op in collector:
+    for entry in collector:
+        zone = entry["zone"]
         if zone.id not in by_zone:
             by_zone[zone.id] = (zone, [])
             order.append(zone.id)
-        by_zone[zone.id][1].append(op)
+        by_zone[zone.id][1].append(entry)
     for zid in order:
-        zone, ops = by_zone[zid]
-        await enqueue_record_ops_batch(db, zone, ops)
+        zone, entries = by_zone[zid]
+        op_rows = await enqueue_record_ops_batch(db, zone, [e["op"] for e in entries])
+        for entry, op_row in zip(entries, op_rows, strict=True):
+            ip = entry.get("ip")
+            stamped = entry.get("stamped_record_id")
+            if (
+                ip is not None
+                and stamped is not None
+                and getattr(op_row, "state", None) == "failed"
+                and ip.dns_record_id == stamped
+            ):
+                # #428 / #1536 — the batched twin of the singular-path guard
+                # in ``_sync_dns_record``: the provider rejected the create,
+                # so the stamp must not stand or nothing will ever retry it.
+                ip.dns_record_id = None
+            results.append({"ip": ip, "op": entry["op"], "op_row": op_row, "zone": zone})
+    return results
 
 
 @contextlib.asynccontextmanager
@@ -1165,13 +1204,19 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
     grouped by zone on a clean exit. On an exception the partial collector is
     dropped unflushed — the flush sits on the success path inside ``try`` so
     an aborting body never half-applies a batch (callers also handle per-row
-    failures inside the loop so the happy path stays exception-free)."""
-    collector: list[tuple[DNSZone, dict[str, Any]]] = []
+    failures inside the loop so the happy path stays exception-free).
+
+    Yields the flush results (see :func:`_flush_dns_op_collector`) so a
+    caller that counts outcomes can fold failed batched ops into its error
+    accounting after the block (#1536); callers that don't need them just
+    don't bind the ``as`` target."""
+    collector: list[dict[str, Any]] = []
     token = _dns_op_collector.set(collector)
+    results: list[dict[str, Any]] = []
     try:
-        yield
+        yield results
         # Reached only when the block body completed without raising.
-        await _flush_dns_op_collector(db, collector)
+        results.extend(await _flush_dns_op_collector(db, collector))
     finally:
         _dns_op_collector.reset(token)
 
@@ -1547,6 +1592,8 @@ async def _sync_dns_record(
                     forward_rtype,
                     str(ip.address),
                     ttl,
+                    ip=ip,
+                    stamped_record_id=new_rec.id,
                 )
                 # #428 — for an agentless (Windows DNS) primary the op
                 # applies synchronously; if it failed, don't leave
@@ -1596,6 +1643,8 @@ async def _sync_dns_record(
                     forward_rtype,
                     str(ip.address),
                     ttl,
+                    ip=ip,
+                    stamped_record_id=new_rec.id,
                 )
             else:
                 old_name = existing.name
@@ -1655,6 +1704,8 @@ async def _sync_dns_record(
                         forward_rtype,
                         str(ip.address),
                         existing.ttl,
+                        ip=ip,
+                        stamped_record_id=existing.id,
                     )
                 elif value_changed:
                     await _enqueue_dns_op(
@@ -6568,7 +6619,7 @@ async def _apply_dns_sync(
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
-        async with _batched_dns_ops(db):
+        async with _batched_dns_ops(db) as flush_results:
             for ip in ips_res.scalars().all():
                 sn = subnet_cache.get(ip.subnet_id)
                 if sn is None and ip.subnet_id not in subnet_cache:
@@ -6585,6 +6636,28 @@ async def _apply_dns_sync(
                         updated += 1
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
+        # #1536 — a batched agentless op that came back ``failed`` was
+        # invisible above: batch mode returns no op, so the loop counted the
+        # IP as synced. Fold the flagged (primary forward create) failures
+        # back in: the flush already un-stamped ``dns_record_id``; here the
+        # IP must not count as created/updated and the failure is an error.
+        failed_sync_ips: set[uuid.UUID] = set()
+        for result in flush_results:
+            fip = result.get("ip")
+            op_row = result.get("op_row")
+            if fip is None or getattr(op_row, "state", None) != "failed":
+                continue
+            if fip.id in failed_sync_ips:
+                continue
+            failed_sync_ips.add(fip.id)
+            errors.append(
+                f"{fip.address}: DNS create failed — "
+                f"{getattr(op_row, 'last_error', None) or 'unknown'}"
+            )
+            if fip.id in body.create_for_ip_ids:
+                created = max(0, created - 1)
+            elif fip.id in ip_ids_to_sync:
+                updated = max(0, updated - 1)
 
     if body.delete_stale_record_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
