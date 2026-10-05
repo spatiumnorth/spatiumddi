@@ -7,10 +7,13 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
+from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.permissions import is_effective_superadmin
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
@@ -60,6 +63,10 @@ class UserResponse(BaseModel):
     failed_login_count: int = 0
     failed_login_locked_until: datetime | None = None
     locked: bool = False
+    # #1355 — the flag OR a wildcard role. Resetting such an account's
+    # password needs the caller's step-up, and the UI reads this to ask for
+    # it (the flag alone misses a local user in a Superadmin-role group).
+    is_effective_superadmin: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -84,6 +91,12 @@ class UserResponse(BaseModel):
                 c.name: getattr(data, c.name) for c in data.__table__.columns
             }
             cols["locked"] = is_user_locked(data)
+            # ``groups`` is selectin-loaded; never trigger an async lazy load
+            # from this sync validator if a path skipped it.
+            if "groups" in sa_inspect(data).unloaded:
+                cols["is_effective_superadmin"] = bool(data.is_superadmin)
+            else:
+                cols["is_effective_superadmin"] = is_effective_superadmin(data)
             return cols
         return data
 
@@ -112,6 +125,12 @@ class CreateUserRequest(BaseModel):
     password: str
     is_superadmin: bool = False
     force_password_change: bool = True
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("password")
     @classmethod
@@ -153,6 +172,12 @@ class UpdateUserRequest(BaseModel):
     is_active: bool | None = None
     is_superadmin: bool | None = None
     force_password_change: bool | None = None
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("email")
     @classmethod
@@ -166,6 +191,12 @@ class LinkProviderRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     new_password: str
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("new_password")
     @classmethod
@@ -235,6 +266,18 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             detail="Username or email already in use",
         )
 
+    method = None
+    if body.is_superadmin:
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="create",
+            resource_type="user",
+            resource_id=body.username,
+            resource_display=f"superadmin {body.username}",
+        )
     policy, hashed = await _enforce_policy(db, body.password)
     history = push_history(hashed, None, policy.history_count)
     user = User(
@@ -251,7 +294,10 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
     )
     db.add(user)
     await db.flush()
-    db.add(_audit(current_user, "create", str(user.id), f"Created user {body.username}"))
+    audit = _audit(current_user, "create", str(user.id), f"Created user {body.username}")
+    if method:
+        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    db.add(audit)
     await db.commit()
     await db.refresh(user)
     logger.info("user_created", username=body.username, by=current_user.username)
@@ -297,6 +343,19 @@ async def update_user(
             ),
         )
 
+    method = None
+    if body.is_superadmin and not user.is_superadmin:
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="update",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=f"promote {user.username} to superadmin",
+        )
+
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
@@ -308,7 +367,10 @@ async def update_user(
     if body.force_password_change is not None:
         user.force_password_change = body.force_password_change
 
-    db.add(_audit(current_user, "update", str(user.id), f"Updated user {user.username}"))
+    audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
+    if method:
+        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    db.add(audit)
     await db.commit()
     await db.refresh(user)
     return user
@@ -342,6 +404,25 @@ async def reset_password(
     # of band — the user's prior choices are not in scope) but still
     # honours the complexity rules so an operator can't side-step the
     # policy via the admin path.
+    method = None
+    # A superadmin's password passes every step-up, so choosing it for them
+    # needs one (#1355). Effective superadmin: the flag or a wildcard role.
+    # The role path reads ``user.groups``: load it explicitly, since a row
+    # already in this session's identity map may not have it yet. No
+    # exemption for the caller's own account: a stolen session resetting its
+    # own password would end up holding the password every step-up asks for.
+    await db.refresh(user, ["groups"])
+    if is_effective_superadmin(user):
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="reset_password",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=f"reset password for superadmin {user.username}",
+        )
     policy, hashed = await _enforce_policy(db, body.new_password)
     user.hashed_password = hashed
     user.force_password_change = True
@@ -366,9 +447,12 @@ async def reset_password(
         .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
         .values(revoked=True)
     )
-    db.add(
-        _audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}")
+    audit = _audit(
+        current_user, "reset_password", str(user.id), f"Reset password for {user.username}"
     )
+    if method:
+        audit.new_value = {"stepup_method": method}
+    db.add(audit)
     await db.commit()
     logger.info("password_reset", target=user.username, by=current_user.username)
 

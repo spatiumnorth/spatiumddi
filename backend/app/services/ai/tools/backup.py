@@ -1,7 +1,7 @@
 """Backup + factory-reset read tools for the Operator Copilot
 (issues #117 + #116 + #702).
 
-Five read-only tools, all superadmin-only because the surface
+Six read-only tools, all superadmin-only because the surface
 exposes destination configs (even with secrets redacted, the
 target name + kind + path/bucket/host is sensitive metadata):
 
@@ -24,6 +24,9 @@ target name + kind + path/bucket/host is sensitive metadata):
 * ``get_restore_drill_readiness`` — the rollup that answers "can
   I restore this install right now, and how do I know?" per
   target, without reading the whole history.
+* ``get_backup_health`` — per target: is the schedule actually
+  producing backups? Failed / stale / stuck, decided by the same
+  function as the ``backup_failed`` / ``backup_stale`` alerts (#1262).
 
 Deliberately NO ``propose_*`` write tools. The factory-reset and
 restore paths are password-gated + confirm-phrase-gated by design;
@@ -478,4 +481,61 @@ async def get_restore_drill_readiness(
         "total_targets": len(out),
         "verified_targets": verified,
         "unverified_targets": len(out) - verified,
+    }
+
+
+# ── get_backup_health ─────────────────────────────────────────────────
+
+
+class BackupHealthArgs(BaseModel):
+    problems_only: bool = Field(
+        default=False,
+        description="When True, return only targets that are failed, stale or stuck.",
+    )
+
+
+@register_tool(
+    name="get_backup_health",
+    description=(
+        "Per backup target: is its schedule actually producing backups? "
+        "(superadmin only). Each row carries state (ok / failed / stale / "
+        "stuck / running / awaiting_first_run / manual_only / disabled), "
+        "last_run_status, last_run_at, last_success_at, next_run_at and "
+        "stale_after (when it goes stale without a success). Decided by "
+        "the same function as the backup_failed and backup_stale alerts, "
+        "so the answer matches what they fire on. 'stuck' means a run has "
+        "been in progress so long its process is presumed dead. Use for "
+        "'are my backups healthy?', 'when did the corp-vault target last "
+        "succeed?' or 'why is the backup_stale alert firing?'. No "
+        "destination config or credentials are returned."
+    ),
+    args_model=BackupHealthArgs,
+    category="admin",
+)
+async def get_backup_health(db: AsyncSession, user: User, args: BackupHealthArgs) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return gate
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+    from app.services.alerts import RULE_TYPE_BACKUP_STALE  # noqa: PLC0415
+    from app.services.backup.health import (  # noqa: PLC0415
+        STALE_AFTER_RUNS_DEFAULT,
+        evaluate_backup_health,
+    )
+
+    # Use the stale threshold the alert rule is configured with, so the
+    # tool and the alert agree on what "stale" means on this install.
+    rule = await db.scalar(
+        select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_BACKUP_STALE).limit(1)
+    )
+    runs = (rule.threshold_percent if rule is not None else None) or STALE_AFTER_RUNS_DEFAULT
+    rows = await evaluate_backup_health(db, now=datetime.now(UTC), stale_after_runs=runs)
+    targets = [h.as_dict() for h in rows]
+    if args.problems_only:
+        targets = [t for t in targets if t["state"] in ("failed", "stale", "stuck")]
+    return {
+        "stale_after_runs": runs,
+        "targets": targets,
+        "failed": sum(1 for h in rows if h.failed),
+        "stale": sum(1 for h in rows if h.stale),
     }

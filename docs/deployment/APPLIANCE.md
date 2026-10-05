@@ -532,15 +532,6 @@ state on its heartbeat:
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
-  **Known issue — setting a VIP does not work today
-  ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).** The
-  plumbing above is correct and the override reaches the cluster, but the
-  MetalLB install itself then fails permanently: Helm 4 orders the
-  validating webhooks ahead of the pool CRs, and each klipper-helm retry
-  runs `helm uninstall` first — deleting the controller that backs the
-  webhook — so no `IPAddressPool` is ever created and the frontend Service
-  stays `<pending>`. Leave the VIP unset until this is fixed; see
-  [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets
@@ -3311,8 +3302,15 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    per-role ``deployment_kind`` coupling was dropped under #170
    Wave A3 — roles are assigned post-approval from the Fleet tab,
    not baked into the code). Pick ephemeral (single-use, default
-   15 min expiry) or persistent (multi-claim, optional ``max_claims``),
-   then click **Generate code**.
+   15 min expiry) or persistent (multi-claim, optional ``max_claims``,
+   30-day expiry by default; ``0`` means never, and the dialog warns),
+   then click **Generate code**. A persistent code minted before this
+   default existed never expired; the upgrade gives it an expiry 30 days
+   after the upgrade, so re-mint it if it must outlive that. Registration is throttled (#1356): ten
+   wrong codes from one address, or a hundred across the install, in 15
+   minutes refuse further attempts with ``429`` until the window passes.
+   A right code doesn't count, so a fleet rollout behind one NAT address
+   is never throttled.
 3. The 8 digits appear in a large monospace box with a live
    countdown + copy button. Write them down or copy them to a
    second device.

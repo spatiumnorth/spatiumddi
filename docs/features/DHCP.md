@@ -141,6 +141,11 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
+
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
 equivalent and all raw codes. A client class renders into the DHCPv4
