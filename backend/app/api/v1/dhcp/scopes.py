@@ -38,6 +38,7 @@ from app.services.dhcp.option_validation import (
     option_key_code,
     validate_options,
 )
+from app.services.dhcp.radvd import validate_ra_interface
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -369,6 +370,12 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str) -> str:
+        v = (v or "").strip()
+        return validate_ra_interface(v) if v else ""
+
     @field_validator("v6_address_mode")
     @classmethod
     def _v6mode(cls, v: str | None) -> str:
@@ -445,6 +452,14 @@ class ScopeUpdate(BaseModel):
             self.model_fields_set,
         )
         return self
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_ra_interface(v) if v else ""
 
     @field_validator("v6_address_mode")
     @classmethod

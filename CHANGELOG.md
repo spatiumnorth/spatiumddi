@@ -25,6 +25,24 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Alerts when a scheduled backup fails or stops running, on by
+  default (#1262).** A failed scheduled backup used to write an audit
+  row and nothing else, so on a default install a nightly backup could
+  fail for weeks unnoticed. Two new rules, seeded enabled, watch every
+  enabled backup target with a schedule. `backup_failed` (warning)
+  fires when the last finished run failed and resolves on the next
+  success. `backup_stale` (critical) fires when there has been no
+  successful run for N scheduled runs plus one hour (N on the rule,
+  default 2), counted from the last success but never from before the
+  schedule was set. It also catches a backup that stopped running at
+  all, including a run left `in_progress` by a dead process, which the
+  sweep skips from then on. A run in progress holds both events
+  instead of resolving them. Alert messages carry no destination
+  details or error text. New read-only copilot tool `get_backup_health`
+  (superadmin only) shows the same per-target state.
+
 ### Changed
 
 - **DHCP clients renew at half the lease time instead of every 15
@@ -43,6 +61,23 @@ the formatter handles the rest.
   effect when the DHCP agent restarts on the new image; no control-plane
   change.
 
+- **DHCP agent Services default to LoadBalancer, and a NodePort can
+  finally be pinned (#1549).** The DHCP agent Service defaulted to
+  `type: NodePort` with `port: 67` and no way to set `nodePort`, so
+  Kubernetes picked a random 30000–32767 node port — and a DHCP relay
+  (`ip helper-address`), which can only forward to UDP/67, got no
+  answer. The chart default is now `LoadBalancer`, so a relay points
+  at the LB address on UDP/67; `service.nodePort` is rendered when
+  set, giving a stable port for a relay that can forward to a
+  non-standard port (most, including `ip helper-address`, cannot);
+  and the chart, the
+  static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
+  all say plainly that on a NodePort Service `port: 67` is the
+  in-cluster port, not the node-facing one. `hostNetwork: true`
+  remains the no-relay option. Existing installs that relied on the
+  NodePort default must set `service.type: NodePort` explicitly to
+  keep it.
+
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
   looked only at HIGH and CRITICAL, so the pip CVEs in the api image
@@ -56,6 +91,74 @@ the formatter handles the rest.
   "Scheduled Trivy scan: fixable CVEs in shipped images".
 
 ### Fixed
+
+- **DNS agent LoadBalancer Services keep the client address and can
+  pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
+  and nothing else, so the rendered LoadBalancer ran with the default
+  `externalTrafficPolicy: Cluster`: kube-proxy SNATed every query and
+  the DNS server saw node or CNI addresses instead of clients —
+  breaking per-client rate limits, query-log and RPZ attribution, and
+  client ACLs, the umbrella-chart twin of #1487 — and there was no way
+  to pin a stable resolver address. The Service now renders
+  `externalTrafficPolicy` (default `Local`; each server is a
+  single-replica StatefulSet, so the announcing node is the pod's node
+  anyway), `annotations` (including the MetalLB
+  `metallb.universe.tf/loadBalancerIPs` pin), `loadBalancerIP`,
+  `loadBalancerSourceRanges`, and `ipFamilyPolicy` / `ipFamilies` from
+  `server.service`. A new render check,
+  `chart-dns-agent-service.py`, fails any DNS agent LoadBalancer that
+  would SNAT its clients, and a dedicated render asserts the new
+  fields reach the Service.
+
+- **The umbrella chart refuses DNS encrypted-transport ports the
+  flavor cannot serve (#1553).** `dnsAgents.servers[].doqPort` was
+  rendered into the container ports and both Services for any flavor,
+  and `dotPort` / `dohPort` likewise for PowerDNS — but DoQ is
+  Technitium-only, and PowerDNS serves DoT/DoH only behind a dnsdist
+  front that has no Kubernetes deployment, so an operator mistake
+  produced a Service port forwarding to nothing instead of an error.
+  The render now fails with a message naming the server, the port and
+  the flavor, and the charts render check carries negative controls
+  for all three combinations.
+
+- **Integration mirrors no longer treat a failed, refused or partial
+  fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
+  hazards of the same class: the UniFi client collapsed a wrong-shape
+  200 (proxy error page, envelope without `data`, `data: null`) to an
+  empty list for networks, clients and sites, and ignored in-band
+  legacy `meta.rc == "error"` failures, so one degraded response
+  deleted a site's — or the whole controller's — mirrored rows; it
+  now routes those reads through the shared `require_list` /
+  `require_keyed_list` guards and raises. The OPNsense mirror deleted
+  mirrored DHCP leases and reservations when a DHCP backend refused
+  the API user (403) while the reconciler merely warned; a refused
+  category's rows are now frozen for that pass (the all-404 absent-
+  backend case still deletes as before). The Proxmox mirror deleted
+  a running guest's addresses when its config fetch failed once, and
+  dropped stopped guests wholesale when their node was not online
+  with `include_stopped` armed; unreadable guests/nodes are now
+  counted on the reconcile summary and the address absence-delete
+  (and, for unread nodes, the subnet pass) is skipped for that pass.
+  The Kubernetes mirror read only the first 500 Services, Ingresses,
+  nodes and pods and pruned everything past page one; it now follows
+  the `metadata.continue` token to the end and raises — aborting the
+  reconcile — if paging fails midway.
+
+- **System alerts reach forward targets, compliance rules require a
+  classification, audit-forward targets are validated, and conformity
+  alerts survive the evaluator (#1576, #1578, #1580, #1581).**
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
+  be created without a classification and then never fire, warning on
+  every evaluator tick — create and update now reject that with 422
+  and the evaluator warns once per rule. Audit-forward targets are
+  validated per kind at save time (syslog host/port/facility ranges,
+  webhook URL, SMTP host/port/sender/recipient) instead of being
+  saved enabled and silently skipped. Conformity events are no longer
+  closed by the generic evaluator's auto-resolve passes; the
+  conformity engine owns them.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
@@ -478,6 +581,95 @@ the formatter handles the rest.
   leaves it alone, as it does every reservation's row.
 
 ### Security
+
+- **The DHCP agent's external Service no longer publishes Kea's HA listener
+  (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
+  NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
+  hook's peer listener: plain HTTP, no authentication, and it accepts the
+  commands HA peers send each other. It was latent while the listener never
+  bound (#1447); once it does, every node IP answered it. The external
+  Service now carries UDP 67 only. HA peers keep reaching each other
+  pod-to-pod, and the headless Service still lists 8000 for in-cluster DNS
+  names, so HA needs no change. Appliances were never affected: there the
+  DHCP pod uses host networking behind the appliance firewall. A new chart
+  gate (`chart-no-external-kea-ha.py`) fails CI if a NodePort or
+  LoadBalancer Service in front of a DHCP agent publishes 8000 again, on
+  every render and on the raw `k8s/dhcp` manifests.
+
+- **Logged tracebacks no longer include local variables
+  (GHSA-4mwf-qwqg-5fw7).** The api and worker rendered every unhandled
+  exception through structlog's `dict_tracebacks`, which attaches each
+  stack frame's local variables, so a failed restore wrote the backup
+  passphrase and the database password into the JSON log (and from there
+  to any forwarded log store). Exception rendering is now configured with
+  locals off, in both the JSON and console formats. The exception type,
+  message and frames (file, line, function) are still logged. Operators
+  who may have run a failing restore should rotate those credentials and
+  purge older logs.
+
+- **Regenerating MFA recovery codes no longer returns the account's TOTP
+  secret (GHSA-244w-8h9w-g58j).** `POST /api/v1/auth/mfa/recovery-codes/regenerate`
+  answered with the enrolment response model, so every regeneration
+  carried the existing `secret` and `otpauth_uri` alongside the new codes.
+  The UI reads only the codes, so nothing needed the seed, but anyone
+  holding a session and one live code could take it and keep minting
+  valid codes after the session was revoked. The endpoint now answers
+  with `{"recovery_codes": [...]}` only. Enrolment (`/mfa/enroll/begin`)
+  is unchanged, since that is where the secret is legitimately shown.
+  No operator action is needed; an account that may have been exposed
+  can disable and re-enrol MFA to rotate its secret.
+
+- **The pre-restore safety dump is no longer readable by other local users (GHSA-g996-3ph6-q3x8).**
+  `_write_pre_restore_safety_dump` created its directory and zip with
+  default modes, and the archive's secrets envelope uses a documented
+  constant passphrase, so anyone able to read the file could recover
+  `SECRET_KEY`. The directory is now created 0700 (and tightened if it
+  already existed looser) and the zip is created 0600 at open time, with
+  no window where it is group- or world-readable. Existing dumps keep
+  their old modes; the next restore tightens the directory.
+  Not yet changed: the constant passphrase itself, and pruning of old
+  dumps; both are follow-ups.
+
+- **Backup-target credentials no longer reach the audit log or error
+  messages (GHSA-m63g-667p-6qgw).** `PATCH /backup/targets/{id}` wrote
+  the raw request body into `audit_log.new_value` minus only the
+  passphrase, so a rotated S3 key, SCP password or key, Azure, GCS,
+  WebDAV, FTP, SMB or https_put credential landed in the audit table in
+  clear, readable by the Viewer role, forwarded to SIEM targets and
+  copied into every backup archive. The audit row now records only the
+  names of the config keys that changed. Separately, the https_put and
+  webdav drivers put the full destination URL, including a presigned
+  query string or `user:pass@`, into errors that reach
+  `last_run_error`, the audit log and the logs; they now show scheme,
+  host and path only. Operator action: rotate any backup-target
+  credential or presigned URL that was edited, or failed a run, on an
+  earlier release, since the audit table is append-only.
+
+- **Resolving an alert event and running an evaluation now require a
+  superadmin (GHSA-9m9r-w366-jj3v).** `POST /alerts/events/{id}/resolve` and
+  `POST /alerts/evaluate` only checked that the caller was signed in, so the
+  read-only Viewer role could dismiss a transition-once alert (registrar
+  change, hijack latch) for good, or trigger an evaluator pass that delivers
+  to the configured syslog / webhook / SMTP targets. Both now use the same
+  superadmin gate as the alert-rule writes, and a resolve writes an
+  `audit_log` row. Operators who relied on non-superadmin accounts resolving
+  alerts need to use a superadmin account.
+
+- **The IPv6 Router Advertisement config now loads, and nothing an IPAM
+  writer types can reach it as syntax (GHSA-6235-5gh6-4hr2).** The rendered
+  `radvd.conf` used `AdvMaxInterval`, which is not a radvd keyword
+  (`MaxRtrAdvInterval` is), so radvd rejected every config. Fixing the
+  keyword alone would have exposed a second problem: DNSSL search domains
+  (including the subnet `domain_name`, writable by any IPAM editor) and the
+  RA interface name were interpolated into the file unvalidated, so a crafted
+  value could inject a whole extra `interface` block. DNSSL entries and the
+  subnet `domain_name` must now be valid domain names (RFC 2181 labels, so
+  an underscore is still fine) and the interface a Linux interface name,
+  rejected with a 422 at the API and dropped again at render time (RDNSS and prefixes are
+  re-checked too). The DHCP agent now writes the new config to a staged file,
+  runs `radvd -c` on it and only then swaps it in, so a rejected config no
+  longer replaces the working one on disk. No operator action; existing
+  invalid values are skipped at render with a log line.
 
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart

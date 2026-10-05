@@ -546,7 +546,17 @@ async def update_target(
             user_id=current_user.id,
             user_display_name=current_user.username,
             result="success",
-            new_value={k: v for k, v in payload.items() if k != "passphrase"},
+            # Never the raw payload: ``config`` carries credentials, and
+            # ``url`` can too (a presigned query string). Record which
+            # config keys changed, not their values.
+            new_value={
+                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
+                **(
+                    {"config_keys_changed": sorted(payload["config"] or {})}
+                    if "config" in payload
+                    else {}
+                ),
+            },
         )
     )
     await db.commit()
