@@ -50,7 +50,11 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
-from app.services.appliance.apt import render_sources_list
+from app.services.appliance.apt import (
+    mask_proxy_url,
+    render_sources_list,
+    restore_proxy_credentials,
+)
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 
@@ -321,6 +325,11 @@ class SettingsResponse(BaseModel):
                 _redact_apt_gpg_key(k) for k in (cols.get("apt_gpg_keys") or [])
             ]
             cols["apt_auth"] = [_redact_apt_auth(a) for a in (cols.get("apt_auth") or [])]
+            # GHSA-j77h-pqg7-h2g4 — a proxy URL may embed ``user:pass@``.
+            # Mask the userinfo, keep the host; ``update_settings`` puts the
+            # stored credential back when the form re-sends the mask.
+            cols["apt_proxy_http"] = mask_proxy_url(cols.get("apt_proxy_http"))
+            cols["apt_proxy_https"] = mask_proxy_url(cols.get("apt_proxy_https"))
             return cols
         return data
 
@@ -2182,6 +2191,17 @@ async def update_settings(
             ),
         )
 
+    # GHSA-j77h-pqg7-h2g4 — ``GET /settings`` masks a proxy URL's
+    # credential as ``***``; the form sends that back. Keep the stored one.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            try:
+                changes[field] = restore_proxy_credentials(changes[field], getattr(settings, field))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
+                ) from exc
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2203,6 +2223,10 @@ async def update_settings(
         changes["apt_gpg_keys"] = apt_gpg_keys_audit
     if apt_auth_audit is not None:
         changes["apt_auth"] = apt_auth_audit
+    # ``changes`` is logged below; never the proxy credential.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            changes[field] = mask_proxy_url(changes[field])
 
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who

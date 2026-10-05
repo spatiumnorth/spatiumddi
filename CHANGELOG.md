@@ -594,6 +594,16 @@ the formatter handles the rest.
   `ssh-keygen -R <host>` and verify the new fingerprint on the console
   (`spatium-state info`) before accepting it.
 
+- **APT proxy URLs no longer hand their embedded credential to every
+  signed-in account (GHSA-j77h-pqg7-h2g4).** `GET /api/v1/settings` needs
+  only a login, and returned `apt_proxy_http` / `apt_proxy_https` exactly as
+  stored, so a `http://user:password@proxy:3128` credential was readable by
+  a Viewer. It now reads as `http://***@proxy:3128`, host kept, and the same
+  masking applies to the `find_apt_settings` Copilot tool, the settings log
+  line and the support bundle. Saving the form with the mask in place keeps
+  the stored credential. Operators who configured a proxy credential should
+  consider it exposed and rotate it.
+
 - **The audit chain no longer reports tampering on rows nobody edited
   (GHSA-8288-8vg9-82gr, #1615).** Each audit row was hashed with its
   `old_value` / `new_value` as Python had them, and verified against what
