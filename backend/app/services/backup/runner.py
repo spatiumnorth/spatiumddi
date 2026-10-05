@@ -82,9 +82,10 @@ async def claim_backup_run(
     destination filename. Here the WHERE is evaluated against the
     committed row under its lock: concurrent claimers serialise, and
     exactly one gets the row back. Mirrors the WOL scheduler's claim
-    (#533). On a lost race the session is rolled back — reading the
-    target's attributes afterwards would otherwise trip a lazy
-    refresh on expired state.
+    (#533). Both exits leave ``target`` refreshed: the success
+    path after its commit, the lost-race path after its rollback
+    (which would otherwise leave every attribute expired, so the
+    next read trips a lazy refresh outside a greenlet).
     """
     claimed_id = (
         await db.execute(
@@ -106,6 +107,11 @@ async def claim_backup_run(
     ).scalar_one_or_none()
     if claimed_id is None:
         await db.rollback()
+        # The rollback expires ``target``'s attributes; refresh so
+        # callers can read the committed state (the winner's
+        # ``in_progress`` stamp) without tripping a lazy load —
+        # the success path below refreshes for the same reason.
+        await db.refresh(target)
         return False
     await db.commit()
     await db.refresh(target)
@@ -220,7 +226,10 @@ async def _retention_sweep(
     """Drop archives outside the target's retention window. One of
     ``retention_keep_last_n`` / ``retention_keep_days`` may be set
     (mutually exclusive at the validator layer); both NULL means
-    "no automatic pruning". Returns the number of archives
+    "no automatic pruning" of BACKUPS — pre-restore safety dumps
+    are still pruned to their own keep-last-N either way (#1574),
+    so this sweep lists the destination even when no backup
+    retention is configured. Returns the number of archives
     deleted.
     """
     if target.write_only:
@@ -231,8 +240,10 @@ async def _retention_sweep(
         # be refused anyway, logging a warning per file per night about
         # the feature working correctly.
         return 0
-    if target.retention_keep_last_n is None and target.retention_keep_days is None:
-        return 0
+    # No early return when both backup-retention fields are NULL:
+    # the listing is still needed to prune safety dumps under their
+    # own allowance below (#1574). The backup branches no-op on
+    # their own when their field is unset.
     driver = get_destination(target.kind)
     archives = await driver.list_archives(config=config)
     # Split the listing BEFORE any retention arithmetic (#1574). The
