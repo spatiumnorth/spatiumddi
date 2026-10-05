@@ -557,3 +557,67 @@ async def test_delete_update_clears_records(client: AsyncClient, db_session: Asy
         .all()
     )
     assert rows == []
+
+
+# ── Janitor: stale TXT sweep ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_stale_client_challenge_records(
+    db_session: AsyncSession,
+) -> None:
+    """#1530 — the stale-TXT sweep also covers the embedded client's
+    ``_acme-challenge`` records (previously it only matched acme-dns
+    provider accounts, and it had no caller at all). A 25 h-old
+    challenge record is deleted; a fresh one and an unrelated
+    operator TXT record survive."""
+    from datetime import timedelta
+
+    zone = await _make_zone_with_primary(db_session, "sweep.example.com.")
+    old = datetime.now(UTC) - timedelta(hours=25)
+    stale = DNSRecord(
+        zone_id=zone.id,
+        name="_acme-challenge.www",
+        fqdn="_acme-challenge.www.sweep.example.com",
+        record_type="TXT",
+        value="stale-token",
+        ttl=60,
+        auto_generated=True,
+    )
+    fresh = DNSRecord(
+        zone_id=zone.id,
+        name="_acme-challenge",
+        fqdn="_acme-challenge.sweep.example.com",
+        record_type="TXT",
+        value="fresh-token",
+        ttl=60,
+        auto_generated=True,
+    )
+    manual = DNSRecord(
+        zone_id=zone.id,
+        name="_acme-challenge.manual",
+        fqdn="_acme-challenge.manual.sweep.example.com",
+        record_type="TXT",
+        value="operator-token",
+        ttl=60,
+        auto_generated=False,
+    )
+    db_session.add_all([stale, fresh, manual])
+    await db_session.flush()
+    # Backdate only the stale row (created_at is server-defaulted).
+    stale.created_at = old
+    await db_session.commit()
+
+    deleted = await acme_svc.sweep_stale_txt_records(db_session)
+    assert deleted == 1
+
+    db_session.expire_all()
+    remaining = {
+        r.value
+        for r in (
+            (await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+            .scalars()
+            .all()
+        )
+    }
+    assert remaining == {"fresh-token", "operator-token"}

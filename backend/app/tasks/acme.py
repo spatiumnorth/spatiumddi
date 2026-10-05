@@ -5,6 +5,8 @@
   network-bound) DNS-01 issuance flow off the request thread.
 * :func:`renew_due_certificates` (Phase 2) is the 12 h beat task that
   re-issues active Let's Encrypt Web-UI certs nearing expiry.
+* :func:`sweep_stale_acme_txt_records` is the hourly beat task that runs
+  the stale-TXT janitor (#1530) — it previously had no caller at all.
 
 The orchestrator is idempotent + re-runnable — it records normal
 protocol / DNS failures on the order row (``status='invalid'`` +
@@ -166,3 +168,30 @@ async def _renew() -> str:
         run_acme_order.delay(oid)
     logger.info("acme_client_renew_sweep", renewed=len(new_order_ids))
     return f"renewed={len(new_order_ids)}"
+
+
+@celery_app.task(
+    name="app.tasks.acme.sweep_stale_acme_txt_records",
+    bind=True,
+    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
+    retry_backoff=True,
+    max_retries=2,
+)
+def sweep_stale_acme_txt_records(self: object) -> str:  # type: ignore[type-arg]
+    """Beat task: delete stale ACME TXT records older than 24 h (#1530).
+
+    Covers both the provider path (acme-dns account subdomains) and the
+    embedded-client path (``_acme-challenge`` records a crashed solve
+    left behind). Runs ``services.acme.sweep_stale_txt_records``, which
+    had no caller before this task existed.
+    """
+    return asyncio.run(_sweep_stale_txt())
+
+
+async def _sweep_stale_txt() -> str:
+    from app.services.acme import sweep_stale_txt_records
+
+    async with task_session() as db:
+        deleted = await sweep_stale_txt_records(db)
+    logger.info("acme_stale_txt_sweep", deleted=deleted)
+    return f"swept={deleted}"
