@@ -76,6 +76,46 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Failed backup writes no longer strand hidden `.tmp` files on
+  FTP, SCP, SMB and local-volume targets (#1570).** Each driver
+  stages an archive as `<archive>.tmp` and renames it; a write that
+  failed partway (ENOSPC, connection drop, quota) raised without
+  deleting the staged file, and since listing and retention only
+  match `*.zip`, the orphans were invisible and never pruned — on
+  exactly the destinations already running out of space. The write
+  error paths now make a best-effort attempt to delete the staged
+  file (logging any cleanup failure), mirroring the NFS driver.
+
+- **Restore no longer trusts archive-declared sizes or PBKDF2 cost
+  before validating the archive (#1568).** The database member's
+  declared uncompressed size is checked against a 20 GiB cap before
+  anything is inflated into memory, envelope iteration counts
+  outside 100k–10M are refused, KDF/AES `ValueError`s surface as a
+  clean backup error instead of a 500, the key derivation runs off
+  the api event loop, and archives downloaded from a destination
+  are held to the same 2 GiB cap as uploads.
+
+- **The SCP backup target's checked host-key modes work again
+  (#1569).** `strict` installed a reject policy but never loaded
+  any host keys, so it refused every server and pushed operators to
+  `insecure_skip`. A checked mode (`known_hosts`, now the default,
+  or `strict`) now requires supplied `known_hosts` content at
+  validation time, and the supplied keys are loaded for both modes
+  before the reject policy is installed.
+
+- **Restore's psql / pg_restore helpers no longer inherit the full
+  api environment (#1572).** Four helpers passed the whole parent
+  environment to their subprocesses; they now use the same
+  allowlisted environment (`_pg_subprocess_env`) as the dump path,
+  so unrelated api secrets stay out of the children's
+  `/proc/<pid>/environ`.
+
+- **The local-volume backup download no longer follows symlinks
+  out of the configured root (#1573).** The listing already refused
+  symlinks; `download` now refuses them too, so a symlink named
+  like an archive is not served by the by-name download endpoint or
+  accepted by restore-from-target.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
