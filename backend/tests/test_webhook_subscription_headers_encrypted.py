@@ -266,8 +266,8 @@ def test_an_exclude_secrets_archive_drops_both_header_copies() -> None:
     dump = (
         'COPY "public"."event_subscription" ("id", "name", "headers", '
         '"headers_encrypted", "secret_encrypted") FROM stdin;\n'
-        '1\\tsub\\t{"Authorization": "Bearer fixture-token-not-real"}'
-        "\\t\\\\xdeadbeef\\t\\\\xfeedface\n"
+        '1\tsub\t{"Authorization": "Bearer fixture-token-not-real"}'
+        "\t\\\\xdeadbeef\t\\\\xfeedface\n"
         "\\.\n"
     )
     out = _scrub_dump_text(dump)
