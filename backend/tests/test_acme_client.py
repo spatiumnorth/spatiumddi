@@ -1304,6 +1304,10 @@ async def test_renew_manual_dns01_skips_and_alerts(db_session: AsyncSession) -> 
         allow_manual=True,
     )
     await db_session.commit()
+    # Capture the id before expire_all() below: accessing cert.id
+    # afterwards would lazy-load an expired attribute outside a
+    # greenlet (MissingGreenlet).
+    cert_id = cert.id
 
     with patch.object(acme_tasks.run_acme_order, "delay") as delay:
         result = await acme_tasks._renew()
@@ -1321,7 +1325,7 @@ async def test_renew_manual_dns01_skips_and_alerts(db_session: AsyncSession) -> 
     )
     assert pending == []
     events = (
-        (await db_session.execute(select(AlertEvent).where(AlertEvent.subject_id == str(cert.id))))
+        (await db_session.execute(select(AlertEvent).where(AlertEvent.subject_id == str(cert_id))))
         .scalars()
         .all()
     )

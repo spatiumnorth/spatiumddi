@@ -253,6 +253,10 @@ async def test_solve_tears_down_txt_on_unexpected_error(db_session: AsyncSession
     )
     db_session.add(zone)
     await db_session.commit()
+    # Capture the id before expire_all() below: accessing zone.id
+    # afterwards would lazy-load an expired attribute outside a
+    # greenlet (MissingGreenlet).
+    zone_id = zone.id
 
     async def _boom(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
         raise RuntimeError("wait exploded")
@@ -269,7 +273,7 @@ async def test_solve_tears_down_txt_on_unexpected_error(db_session: AsyncSession
         (
             await db_session.execute(
                 select(DNSRecord).where(
-                    DNSRecord.zone_id == zone.id,
+                    DNSRecord.zone_id == zone_id,
                     DNSRecord.value == "token-1530",
                 )
             )

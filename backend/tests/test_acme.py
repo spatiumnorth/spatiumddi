@@ -611,11 +611,15 @@ async def test_sweep_removes_stale_client_challenge_records(
     deleted = await acme_svc.sweep_stale_txt_records(db_session)
     assert deleted == 1
 
+    # Capture the id before expire_all(): accessing zone.id afterwards
+    # would lazy-load an expired attribute outside a greenlet
+    # (MissingGreenlet).
+    zone_id = zone.id
     db_session.expire_all()
     remaining = {
         r.value
         for r in (
-            (await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+            (await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == zone_id)))
             .scalars()
             .all()
         )
