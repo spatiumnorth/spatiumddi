@@ -192,6 +192,26 @@ async def test_proxmox_data_null_raises(body: Any) -> None:
         await client.list_qemu("pve", include_stopped=False)
 
 
+@pytest.mark.asyncio
+async def test_proxmox_guest_config_failure_is_recorded_unreadable() -> None:
+    # #1559 — the guest list itself read fine, but this guest's config
+    # fetch failed: the guest is omitted AND recorded in
+    # ``unreadable_guests`` so the reconciler can tell "unreadable" from
+    # "gone" and skip its address absence-delete for the pass.
+    client = _proxmox()
+
+    async def _fake(path: str) -> Any:
+        if path.endswith("/qemu") or path.endswith("/lxc"):
+            return [{"vmid": 101, "name": "vm101", "status": "running"}]
+        raise ProxmoxClientError(f"{path}: HTTP 500 boom")
+
+    client._get = _fake  # type: ignore[assignment]
+    assert await client.list_qemu("pve", include_stopped=False) == []
+    assert client.unreadable_guests == ["pve/qemu/101"]
+    assert await client.list_lxc("pve", include_stopped=False) == []
+    assert client.unreadable_guests == ["pve/qemu/101", "pve/lxc/101"]
+
+
 # ── OPNsense (bespoke envelope guards) ────────────────────────────────
 
 
