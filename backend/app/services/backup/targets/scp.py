@@ -258,7 +258,10 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                try:
+                    sftp = client.open_sftp()
+                except Exception as exc:  # noqa: BLE001
+                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
