@@ -699,6 +699,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_restore_drill_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("restore_drill_alert_rule_seed_skipped", reason=str(exc))
+    # Scheduled-backup failed / stale alert rules (#1262), ENABLED. Silent
+    # until a backup target has a schedule.
+    try:
+        from app.services.alerts import seed_backup_alert_rules  # noqa: PLC0415
+
+        await seed_backup_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("backup_alert_rules_seed_skipped", reason=str(exc))
     try:
         from app.services.alerts import seed_dns_tunneling_alert_rule  # noqa: PLC0415
 

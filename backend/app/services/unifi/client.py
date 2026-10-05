@@ -50,6 +50,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services._mirror_shape import require_keyed_list, require_list
+
 logger = structlog.get_logger(__name__)
 
 
@@ -337,8 +339,19 @@ class UnifiClient:
         """Legacy responses are wrapped ``{"meta": {...}, "data": [...]}``;
         unwrap to ``data`` for callers."""
         body = await self._get(self._legacy_path(suffix))
-        if isinstance(body, dict) and "data" in body:
-            return body["data"]
+        if isinstance(body, dict):
+            # #1555 — the legacy controller also signals failure in-band:
+            # HTTP 200 with ``{"meta": {"rc": "error", ...}}`` (same
+            # convention ``_post_legacy`` already honours for writes). A
+            # read that "succeeded" this way must raise, not unwrap to a
+            # missing/empty ``data`` the caller would treat as zero rows.
+            meta = body.get("meta")
+            if isinstance(meta, dict) and str(meta.get("rc", "")).lower() == "error":
+                raise UnifiClientError(
+                    f"{suffix}: controller reported an error — {meta.get('msg') or 'rc=error'}"
+                )
+            if "data" in body:
+                return body["data"]
         return body
 
     async def _get(self, path: str) -> Any:
@@ -468,17 +481,23 @@ class UnifiClient:
             page = await self._get_integration("sites")
         except UnifiClientError as exc:
             raise UnifiClientError(f"unable to list sites: {exc}") from exc
-        rows = page.get("data") if isinstance(page, dict) else None
-        if isinstance(rows, list):
-            for s in rows:
-                if not isinstance(s, dict):
-                    continue
-                site_id = str(s.get("id") or "")
-                name = str(s.get("internalReference") or s.get("name") or "")
-                desc = str(s.get("name") or "")
-                if not site_id:
-                    continue
-                out.append(_UnifiSite(name=name or site_id, desc=desc, site_id=site_id))
+        # #1555 — a 200 whose body lacks a ``data`` list (proxy error page
+        # served as JSON, envelope change, ``data: null``) is a degraded
+        # read, not "this controller has no sites": returning [] here
+        # would empty the whole controller mirror in the absence-delete
+        # passes. Raise so the reconcile aborts with rows intact.
+        rows = require_keyed_list(
+            page, "data", make_error=UnifiClientError, context="list_sites (integration)"
+        )
+        for s in rows:
+            if not isinstance(s, dict):
+                continue
+            site_id = str(s.get("id") or "")
+            name = str(s.get("internalReference") or s.get("name") or "")
+            desc = str(s.get("name") or "")
+            if not site_id:
+                continue
+            out.append(_UnifiSite(name=name or site_id, desc=desc, site_id=site_id))
         return out
 
     async def list_networks(self, site_name: str) -> list[_UnifiNetwork]:
@@ -486,8 +505,11 @@ class UnifiClient:
         the only path that returns ``ip_subnet`` + ``vlan`` + ``dhcpd_*``.
         """
         data = await self._get_legacy(f"s/{site_name}/rest/networkconf")
-        if not isinstance(data, list):
-            return []
+        # #1555 — wrong-shape 200 (incl. ``data: null`` unwrapped by
+        # ``_get_legacy``) is a degraded read, not "site has no networks".
+        data = require_list(
+            data, make_error=UnifiClientError, context=f"list_networks site {site_name}"
+        )
         out: list[_UnifiNetwork] = []
         for n in data:
             if not isinstance(n, dict):
@@ -544,8 +566,11 @@ class UnifiClient:
         include_wireless / include_vpn afterwards.
         """
         data = await self._get_legacy(f"s/{site_name}/stat/sta")
-        if not isinstance(data, list):
-            return []
+        # #1555 — see list_networks: a wrong-shape 200 must raise, not
+        # read as "no active clients on this site".
+        data = require_list(
+            data, make_error=UnifiClientError, context=f"list_active_clients site {site_name}"
+        )
         return [c for c in (_parse_client_row(r) for r in data) if c is not None]
 
     async def list_known_clients(self, site_name: str) -> list[_UnifiClient]:
@@ -556,8 +581,11 @@ class UnifiClient:
         ``mirror_fixed_ips`` toggle).
         """
         data = await self._get_legacy(f"s/{site_name}/rest/user")
-        if not isinstance(data, list):
-            return []
+        # #1555 — see list_networks: a wrong-shape 200 must raise, not
+        # read as "no known clients / fixed-IP reservations on this site".
+        data = require_list(
+            data, make_error=UnifiClientError, context=f"list_known_clients site {site_name}"
+        )
         return [c for c in (_parse_client_row(r) for r in data) if c is not None]
 
 

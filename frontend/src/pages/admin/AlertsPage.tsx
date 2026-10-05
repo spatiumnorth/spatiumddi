@@ -131,7 +131,8 @@ function RuleEditorModal({
           ruleType === "voice_lease_count_below" ||
           ruleType === "stale_ip_count" ||
           ruleType === "dhcp_pool_exhaustion" ||
-          ruleType === "node_pressure"
+          ruleType === "node_pressure" ||
+          ruleType === "backup_stale"
             ? threshold
             : null,
         min_free_addresses:
@@ -320,6 +321,21 @@ function RuleEditorModal({
             <input
               type="number"
               min={0}
+              max={100}
+              className={inputCls}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+            />
+          </Field>
+        )}
+        {ruleType === "backup_stale" && (
+          <Field
+            label="Missed runs"
+            hint="Fires when a scheduled backup target has had no successful run for this many scheduled runs, plus one hour. Default 2."
+          >
+            <input
+              type="number"
+              min={1}
               max={100}
               className={inputCls}
               value={threshold}
@@ -836,7 +852,9 @@ export function AlertsPage() {
                                   ? `≤ ${r.threshold_days ?? 30} d`
                                   : r.rule_type === "compliance_change"
                                     ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                    : "—"}
+                                    : r.rule_type === "backup_stale"
+                                      ? `${r.threshold_percent ?? 2} missed runs`
+                                      : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

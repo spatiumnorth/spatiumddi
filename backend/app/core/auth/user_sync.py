@@ -152,6 +152,25 @@ async def _find_linked_user(
     )
 
 
+async def _email_held_elsewhere(
+    db: AsyncSession, email: str | None, *, exclude_id: uuid.UUID | None = None
+) -> bool:
+    """Whether another account already holds ``email`` (#1290).
+
+    ``user.email`` is unique among non-empty values, so storing an email
+    another account holds would fail the login with a unique violation. The
+    same person can be in two directories, or two accounts can report a
+    shared mailbox, and neither is a reason to refuse a sign-in, nor to
+    adopt the other account (#1235): the caller stores no email instead.
+    """
+    if not email:
+        return False
+    stmt = select(User.id).where(User.email == email)
+    if exclude_id is not None:
+        stmt = stmt.where(User.id != exclude_id)
+    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
+
+
 async def sync_external_user(
     db: AsyncSession, provider: AuthProvider, result: ExternalAuthResult
 ) -> User:
@@ -214,9 +233,18 @@ async def sync_external_user(
                 "auto_create_disabled",
                 "Provider does not permit auto-creating users",
             )
+        email = result.email or ""
+        if await _email_held_elsewhere(db, email):
+            logger.warning(
+                "external_user_email_in_use",
+                username=username,
+                provider=provider.name,
+                detail="provisioned without an email: another account holds it",
+            )
+            email = ""
         user = User(
             username=username,
-            email=result.email or "",
+            email=email,
             display_name=result.display_name or username,
             hashed_password=None,
             auth_source=auth_source,
@@ -248,7 +276,15 @@ async def sync_external_user(
         user.external_id = key
         if provider.auto_update_users:
             if result.email and user.email != result.email:
-                user.email = result.email
+                if await _email_held_elsewhere(db, result.email, exclude_id=user.id):
+                    logger.warning(
+                        "external_user_email_in_use",
+                        username=user.username,
+                        provider=provider.name,
+                        detail="email not updated: another account holds it",
+                    )
+                else:
+                    user.email = result.email
             if result.display_name and user.display_name != result.display_name:
                 user.display_name = result.display_name
 

@@ -33,9 +33,11 @@ user/password login fallback doesn't auto-refresh. Mint a 30-day API token inste
 TOK=$(tok)
 curl -sk -X POST https://$APP/api/v1/api-tokens -H "Authorization: Bearer $TOK" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"perf-suite","description":"perf test (#452) — destroy after","expires_in_days":30,"scopes":[]}' \
+  -d "{\"name\":\"perf-suite\",\"description\":\"perf test (#452) — destroy after\",\"expires_in_days\":30,\"scopes\":[],\"stepup_password\":\"$ADMIN_PASS\"}" \
   | jq -r .token          # ← record this ONCE; it is never shown again
 ```
+Minting a token needs the owner's step-up (#1355): `stepup_password` for a local
+account, or `stepup_totp_code` (an authenticator code) for an SSO one.
 `scopes: []` = unrestricted (superadmin). Set `SPDDI_PERF_ADMIN_TOKEN` to this value.
 Verify: `curl -sk https://$APP/api/v1/auth/me -H "Authorization: Bearer <token>" | jq '{username,is_superadmin}'`.
 
