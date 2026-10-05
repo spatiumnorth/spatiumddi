@@ -811,6 +811,30 @@ async def apply_backup_restore(
             "the archive's head, or expect /health/ready to fail."
         )
 
+    # Phase 2c (#1575): selective-restore shape checks. Both refusals
+    # below are knowable from the parsed archive + the caller's section
+    # list alone, so they run HERE — before the Phase 3 safety dump
+    # writes a full-size archive to disk and Phase 4 disposes the
+    # connection pool. They used to sit in Phase 5, after both, so every
+    # invalid selective attempt paid for a safety dump and a pool cycle
+    # and got refused anyway.
+    selective = bool(sections)
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
+        )
+    if selective:
+        from app.services.backup.sections import SECTIONS_BY_KEY  # noqa: PLC0415
+
+        unknown_sections = [k for k in sections or [] if k not in SECTIONS_BY_KEY]
+        if unknown_sections:
+            raise BackupRestoreError(
+                f"unknown section keys: {unknown_sections}. Call GET /backup/sections "
+                "for the catalog."
+            )
+
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
     # mounted volume in dev compose, e.g.) we proceed with a logged
@@ -840,17 +864,12 @@ async def apply_backup_restore(
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.
-    selective = bool(sections)
+    # ``selective`` and the two selective-shape refusals (plain format,
+    # unknown section keys) are decided in Phase 2c, before the safety
+    # dump and the pool disposal (#1575).
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
-
-    if selective and dump_format != "custom":
-        raise BackupRestoreError(
-            "selective restore needs an archive whose database dump is in "
-            "pg_dump's custom format (dump_format=custom). This archive is "
-            "plain SQL — only full restore is supported."
-        )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -858,18 +877,11 @@ async def apply_backup_restore(
             # restore module's import graph for callers that don't
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
-                SECTIONS_BY_KEY,
                 cascade_closure,
                 tables_for_sections,
             )
 
             requested = list(sections or [])
-            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
-            if unknown:
-                raise BackupRestoreError(
-                    f"unknown section keys: {unknown}. Call GET /backup/sections "
-                    "for the catalog."
-                )
             # ``platform_internal`` (alembic_version + oui_vendor)
             # always rides along — the schema head pin + the OUI
             # cache are install-state, not user-data, and a
