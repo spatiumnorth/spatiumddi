@@ -45,6 +45,23 @@ the formatter handles the rest.
 
 ### Changed
 
+- **DHCP agent Services default to LoadBalancer, and a NodePort can
+  finally be pinned (#1549).** The DHCP agent Service defaulted to
+  `type: NodePort` with `port: 67` and no way to set `nodePort`, so
+  Kubernetes picked a random 30000–32767 node port — and a DHCP relay
+  (`ip helper-address`), which can only forward to UDP/67, got no
+  answer. The chart default is now `LoadBalancer`, so a relay points
+  at the LB address on UDP/67; `service.nodePort` is rendered when
+  set, giving a stable port for a relay that can forward to a
+  non-standard port (most, including `ip helper-address`, cannot);
+  and the chart, the
+  static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
+  all say plainly that on a NodePort Service `port: 67` is the
+  in-cluster port, not the node-facing one. `hostNetwork: true`
+  remains the no-relay option. Existing installs that relied on the
+  NodePort default must set `service.type: NodePort` explicitly to
+  keep it.
+
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
   looked only at HIGH and CRITICAL, so the pip CVEs in the api image
@@ -91,6 +108,84 @@ the formatter handles the rest.
   window early, and keep-days deleted rollback copies on the backups'
   schedule. Retention now splits the listing: backups follow the
   target's policy, safety dumps keep their own last 3.
+
+- **A Proxmox sync no longer fails on an address another integration
+  already mirrors (#1622).** When a guest reported an IP that UniFi (or any
+  other integration, or a second Proxmox endpoint) already held in the
+  same subnet, the reconciler logged "owned by another integration" and
+  then inserted its own row anyway. The insert hit
+  `uq_ip_address_subnet_address`, the whole sweep rolled back, and the
+  endpoint never synced again, without a `last_sync_error` to show for
+  it. The reconciler now leaves such an address to its owner, and skips
+  moving one of its own rows onto an occupied address the same way.
+
+- **DNS agent LoadBalancer Services keep the client address and can
+  pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
+  and nothing else, so the rendered LoadBalancer ran with the default
+  `externalTrafficPolicy: Cluster`: kube-proxy SNATed every query and
+  the DNS server saw node or CNI addresses instead of clients —
+  breaking per-client rate limits, query-log and RPZ attribution, and
+  client ACLs, the umbrella-chart twin of #1487 — and there was no way
+  to pin a stable resolver address. The Service now renders
+  `externalTrafficPolicy` (default `Local`; each server is a
+  single-replica StatefulSet, so the announcing node is the pod's node
+  anyway), `annotations` (including the MetalLB
+  `metallb.universe.tf/loadBalancerIPs` pin), `loadBalancerIP`,
+  `loadBalancerSourceRanges`, and `ipFamilyPolicy` / `ipFamilies` from
+  `server.service`. A new render check,
+  `chart-dns-agent-service.py`, fails any DNS agent LoadBalancer that
+  would SNAT its clients, and a dedicated render asserts the new
+  fields reach the Service.
+
+- **The umbrella chart refuses DNS encrypted-transport ports the
+  flavor cannot serve (#1553).** `dnsAgents.servers[].doqPort` was
+  rendered into the container ports and both Services for any flavor,
+  and `dotPort` / `dohPort` likewise for PowerDNS — but DoQ is
+  Technitium-only, and PowerDNS serves DoT/DoH only behind a dnsdist
+  front that has no Kubernetes deployment, so an operator mistake
+  produced a Service port forwarding to nothing instead of an error.
+  The render now fails with a message naming the server, the port and
+  the flavor, and the charts render check carries negative controls
+  for all three combinations.
+
+- **Integration mirrors no longer treat a failed, refused or partial
+  fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
+  hazards of the same class: the UniFi client collapsed a wrong-shape
+  200 (proxy error page, envelope without `data`, `data: null`) to an
+  empty list for networks, clients and sites, and ignored in-band
+  legacy `meta.rc == "error"` failures, so one degraded response
+  deleted a site's — or the whole controller's — mirrored rows; it
+  now routes those reads through the shared `require_list` /
+  `require_keyed_list` guards and raises. The OPNsense mirror deleted
+  mirrored DHCP leases and reservations when a DHCP backend refused
+  the API user (403) while the reconciler merely warned; a refused
+  category's rows are now frozen for that pass (the all-404 absent-
+  backend case still deletes as before). The Proxmox mirror deleted
+  a running guest's addresses when its config fetch failed once, and
+  dropped stopped guests wholesale when their node was not online
+  with `include_stopped` armed; unreadable guests/nodes are now
+  counted on the reconcile summary and the address absence-delete
+  (and, for unread nodes, the subnet pass) is skipped for that pass.
+  The Kubernetes mirror read only the first 500 Services, Ingresses,
+  nodes and pods and pruned everything past page one; it now follows
+  the `metadata.continue` token to the end and raises — aborting the
+  reconcile — if paging fails midway.
+
+- **System alerts reach forward targets, compliance rules require a
+  classification, audit-forward targets are validated, and conformity
+  alerts survive the evaluator (#1576, #1578, #1580, #1581).**
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
+  be created without a classification and then never fire, warning on
+  every evaluator tick — create and update now reject that with 422
+  and the evaluator warns once per rule. Audit-forward targets are
+  validated per kind at save time (syslog host/port/facility ranges,
+  webhook URL, SMTP host/port/sender/recipient) instead of being
+  saved enabled and silently skipped. Conformity events are no longer
+  closed by the generic evaluator's auto-resolve passes; the
+  conformity engine owns them.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

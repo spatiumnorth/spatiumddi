@@ -127,7 +127,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
 spec:
-  type: {{ (get ($server.service | default dict) "type") | default "NodePort" }}
+  type: {{ (get ($server.service | default dict) "type") | default "LoadBalancer" }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
@@ -137,7 +137,13 @@ spec:
   # ha_peer_url to an IP), and the headless Service below carries the port
   # for in-cluster DNS names.
   ports:
-    - { name: dhcp-udp,  port: 67,   targetPort: 67,   protocol: UDP }
+    - name: dhcp-udp
+      port: 67
+      targetPort: 67
+      protocol: UDP
+      {{- with (get ($server.service | default dict) "nodePort") }}
+      nodePort: {{ . }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

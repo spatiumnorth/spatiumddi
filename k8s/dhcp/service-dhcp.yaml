@@ -1,7 +1,13 @@
 # Per-server external Service.
-# NOTE: in production DHCP clients normally reach the server via a relay
-# agent (option 82) — expose UDP/67 via LoadBalancer/NodePort only for lab
-# setups or where the pod is on the client broadcast domain.
+# NOTE: a DHCP relay (option 82 / ip helper-address) can only forward to
+# UDP/67. On a NodePort Service `port: 67` is the in-cluster port — the
+# node-facing port is a random 30000-32767 pick unless `nodePort` is
+# pinned — so a NodePort does not answer a relay on port 67. For relayed
+# deployments either run the pod with hostNetwork (see
+# kea-statefulset.yaml), so the node itself listens on UDP/67, or use
+# this LoadBalancer Service and point the relay at the LB address.
+# A pinned NodePort (`type: NodePort` plus the `nodePort` line below)
+# only helps a relay that can forward to a non-standard port.
 apiVersion: v1
 kind: Service
 metadata:
@@ -11,7 +17,7 @@ metadata:
     app.kubernetes.io/name: spatium-dhcp
     app.kubernetes.io/instance: dhcp1
 spec:
-  type: NodePort
+  type: LoadBalancer
   selector:
     app.kubernetes.io/name: spatium-dhcp
     app.kubernetes.io/instance: dhcp1
@@ -24,6 +30,7 @@ spec:
       port: 67
       targetPort: 67
       protocol: UDP
+      # nodePort: 30067  # only with type: NodePort
 ---
 apiVersion: v1
 kind: Service
