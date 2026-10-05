@@ -195,3 +195,59 @@ async def test_local_volume_download_reads_a_regular_file(tmp_path: Path):
     (root / _NAME).write_bytes(b"PK-bytes")
     driver = LocalVolumeDestination()
     assert await driver.download(config={"path": str(root)}, filename=_NAME) == b"PK-bytes"
+
+
+# ── #1572: restore helpers use the allowlisted subprocess env ────────
+
+
+class _FakeProc:
+    returncode = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    def kill(self) -> None:
+        pass
+
+    async def wait(self) -> int:
+        return 0
+
+
+@pytest.fixture
+def captured_envs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Record the ``env`` kwarg of every subprocess the restore
+    helpers spawn, with a sentinel secret planted in the parent env."""
+    import asyncio
+
+    envs: list[dict[str, str]] = []
+
+    async def _fake_exec(*_args: object, **kwargs: object) -> _FakeProc:
+        envs.append(dict(kwargs["env"]))  # type: ignore[arg-type]
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setenv("SPATIUM_TEST_SECRET_SENTINEL", "must-not-leak")
+    return envs
+
+
+_DB_URL = "postgresql+asyncpg://spatium:pw@db.internal:5433/spatiumddi"
+
+
+@pytest.mark.asyncio
+async def test_restore_helpers_spawn_pg_tools_with_the_allowlisted_env(
+    captured_envs: list[dict[str, str]], tmp_path: Path
+):
+    from app.services.backup import restore as restore_mod
+
+    pg_env = {"PGHOST": "db.internal", "PGPASSWORD": "pw"}
+    await restore_mod._terminate_other_db_connections(pg_env)
+    await restore_mod._truncate_tables(["dns_zone"], _DB_URL)
+    await restore_mod._run_pg_restore_data_only(tmp_path / "dump", _DB_URL, ["dns_zone"])
+    await restore_mod._collect_post_restore_warnings(_DB_URL)
+
+    # terminate (x2: standalone + inside pg_restore), truncate,
+    # pg_restore, DNSSEC scan.
+    assert len(captured_envs) == 5
+    for env in captured_envs:
+        assert "SPATIUM_TEST_SECRET_SENTINEL" not in env
+        assert env["PGHOST"] == "db.internal"
