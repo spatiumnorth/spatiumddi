@@ -120,6 +120,11 @@ class _FakeSftp:
     def __init__(self) -> None:
         self.removed: list[str] = []
 
+    def get_channel(self) -> None:
+        # Main's _open_sftp (#1515) asks the SFTP client for its
+        # channel to set a timeout; this fake has none to set one on.
+        return None
+
     def file(self, _path: str, _mode: str) -> _FakeSftpFile:
         return _FakeSftpFile()
 
