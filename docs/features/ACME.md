@@ -534,6 +534,17 @@ renewal, and a cert already comfortably inside its validity window is
 skipped. A renewal failure is recorded on the order's `last_error`
 and retried on the next 12 h tick — it never crash-loops.
 
+**Renewal reuses the shape of the order that issued the cert** — its
+domains, challenge type, and DNS provider are read from the
+successful order that produced the active cert, not from a global
+"last issue attempt". A cert issued over **http-01 renews over
+http-01**; one issued over managed-zone DNS-01 renews the same way.
+The one shape the sweep cannot renew on its own is **manual DNS-01**
+(a person has to add the TXT record at an external provider): those
+certs are skipped rather than given an order that would fail every
+12 hours, and the `secret_expiring` alert below is the signal to
+re-issue them by hand before they lapse.
+
 The shipped **`secret_expiring`** alert rule now also watches the
 Let's Encrypt Web-UI cert (subject `appliance_cert_tls:<id>`), so even
 if auto-renew is off — or a renewal keeps failing — the alerts surface

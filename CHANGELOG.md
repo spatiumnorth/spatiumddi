@@ -76,6 +76,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **ACME auto-renewal renews each certificate with the shape it was
+  issued with (#1529).** The 12-hour renewal sweep ignored the saved
+  challenge type and domains: it renewed everything as managed-zone
+  DNS-01 from one global domain list, so http-01 certificates — and
+  manual-DNS certificates for zones SpatiumDDI does not host — failed
+  every sweep until they expired. Worse, the shape was written to the
+  settings when an order was *created*, so a later failed issue
+  attempt for different domains retargeted the active cert's renewal.
+  The sweep now reads domains, challenge type, and DNS provider from
+  the successful order that produced each cert; the settings record
+  the shape only when an order succeeds (the sweep's fallback for
+  certs with no such order). Certificates issued via manual DNS-01
+  are skipped by the sweep — they need a person to add the TXT
+  record — and surface through the `secret_expiring` alert instead of
+  accumulating a doomed order every 12 hours.
+
 - **ACME DNS-01 solves no longer strand challenge records, stall on
   other groups, or verify against the wrong resolver (#1530, #1531,
   #1532).** A solve that fails after its `_acme-challenge` TXT record

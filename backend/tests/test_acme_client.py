@@ -452,6 +452,41 @@ async def test_issue_creates_pending_order_and_enqueues(
 
 
 @pytest.mark.asyncio
+async def test_issue_does_not_record_issuance_shape_on_settings(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1529 — ``POST /issue`` must NOT write the issuance shape to the
+    platform settings at order creation: a later attempt (even a failed
+    one, for different domains / another challenge type) would retarget
+    the active cert's auto-renewal. The shape is recorded only when an
+    order succeeds (orchestrator), and per-order on the order row."""
+    _, token = await _superadmin(db_session)
+    await _seed_account(db_session)
+    await _enable_acme(db_session)
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    settings.acme_domains = ["keep.example.com"]
+    settings.acme_challenge_type = "dns-01"
+    settings.acme_dns_provider = None
+    await db_session.commit()
+
+    with patch("app.tasks.acme.run_acme_order.delay"):
+        r = await client.post(
+            "/api/v1/appliance/acme/issue",
+            json={"domains": ["other.example.com"], "challenge_type": "http-01"},
+            headers=_hdr(token),
+        )
+    assert r.status_code == 201, r.text
+
+    db_session.expire_all()
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    assert settings.acme_domains == ["keep.example.com"]
+    assert settings.acme_challenge_type == "dns-01"
+    assert settings.acme_dns_provider is None
+
+
+@pytest.mark.asyncio
 async def test_issue_requires_account(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _superadmin(db_session)
     await db_session.commit()
@@ -1028,6 +1063,100 @@ async def test_renew_skips_when_auto_renew_disabled(
         result = await acme_tasks._renew()
     assert result == "disabled"
     delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_renew_reuses_http01_shape_from_successful_order(
+    db_session: AsyncSession,
+) -> None:
+    """#1529 — a cert issued over http-01 renews over http-01, with the
+    issuing order's domains/provider — NOT the hardcoded dns-01 shape
+    and NOT the global settings domains (here a decoy from a later,
+    unrelated issue attempt)."""
+    from app.models.acme_client import ACME_ORDER_VALID
+    from app.tasks import acme as acme_tasks
+
+    settings = await db_session.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db_session.add(settings)
+    settings.acme_enabled = True
+    settings.acme_auto_renew = True
+    settings.acme_domains = ["decoy.example.com"]  # later attempt's domains
+    settings.acme_challenge_type = "dns-01"
+    account = await _seed_account(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["h.example.com"])
+    db_session.add(
+        ACMEOrder(
+            account_id=account.id,
+            domains=["h.example.com", "www.h.example.com"],
+            challenge_type="http-01",
+            dns_provider=None,
+            allow_manual=False,
+            status=ACME_ORDER_VALID,
+            certificate_id=cert.id,
+        )
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    pending = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(pending) == 1
+    assert pending[0].domains == ["h.example.com", "www.h.example.com"]
+    assert pending[0].challenge_type == "http-01"
+    assert pending[0].allow_manual is False
+
+
+@pytest.mark.asyncio
+async def test_renew_skips_manual_dns01_cert(db_session: AsyncSession) -> None:
+    """#1529 — a cert issued via manual DNS-01 (operator adds the TXT at
+    an external provider) cannot be renewed by the sweep: it is skipped
+    (no doomed order every 12 h) and reported in the result; the
+    ``secret_expiring`` alert is the operator's renewal signal."""
+    from app.models.acme_client import ACME_ORDER_VALID
+    from app.tasks import acme as acme_tasks
+
+    settings = await db_session.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db_session.add(settings)
+    settings.acme_enabled = True
+    settings.acme_auto_renew = True
+    account = await _seed_account(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["m.example.com"])
+    db_session.add(
+        ACMEOrder(
+            account_id=account.id,
+            domains=["m.example.com"],
+            challenge_type="dns-01",
+            allow_manual=True,
+            status=ACME_ORDER_VALID,
+            certificate_id=cert.id,
+        )
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=0 skipped_manual=1", result
+    delay.assert_not_called()
+
+    db_session.expire_all()
+    pending = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert pending == []
 
 
 # ── (h) Phase 2 secret_expiring alert covers the LE Web-UI cert ──────

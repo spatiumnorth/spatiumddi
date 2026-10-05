@@ -79,10 +79,13 @@ async def _run(order_id: str) -> str:
 def renew_due_certificates(self: object) -> str:  # type: ignore[type-arg]
     """Beat task: re-issue active LE Web-UI certs within the renewal window.
 
-    Idempotent + advisory-locked. Creates a fresh ACMEOrder (DNS-01,
-    managed-zone only) per due cert and enqueues ``run_acme_order``;
-    skips any cert that already has an in-flight order for the same
-    domains. Gated on ``acme_enabled`` + ``acme_auto_renew``.
+    Idempotent + advisory-locked. Creates a fresh ACMEOrder per due cert
+    reusing the issuance shape (domains, challenge type, DNS provider)
+    of the successful order that produced that cert (#1529), and
+    enqueues ``run_acme_order``; skips any cert that already has an
+    in-flight order for the same domains, and certs issued via manual
+    DNS-01 (which need a person — the ``secret_expiring`` alert is
+    their renewal signal). Gated on ``acme_enabled`` + ``acme_auto_renew``.
     """
     return asyncio.run(_renew())
 
@@ -141,11 +144,65 @@ async def _renew() -> str:
         )
         inflight_domainsets = [frozenset(o.domains) for o in inflight]
 
+        # #1529 — the issuance shape lives on the SUCCESSFUL order that
+        # produced each cert (``certificate_id`` is set only when an
+        # order goes valid), not on the global settings: the settings
+        # were written at order *creation*, so a later failed issue
+        # attempt for different domains silently retargeted the active
+        # cert's renewal, and the sweep hardcoded dns-01 so http-01
+        # certs could never renew. Newest valid order per cert wins.
+        issued = (
+            (
+                await db.execute(
+                    select(ACMEOrder)
+                    .where(
+                        ACMEOrder.status == "valid",
+                        ACMEOrder.certificate_id.is_not(None),
+                    )
+                    .order_by(ACMEOrder.created_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        issuing_by_cert: dict[object, ACMEOrder] = {}
+        for past in issued:
+            issuing_by_cert.setdefault(past.certificate_id, past)
+
         new_order_ids: list[str] = []
+        skipped_manual = 0
         for cert in due:
-            # Prefer the operator-recorded issuance shape; fall back to the
-            # cert's own SANs. Auto-renewal is managed-zone only (no manual).
-            domains = list(settings.acme_domains or []) or list(cert.sans_json or [])
+            issuing = issuing_by_cert.get(cert.id)
+            if issuing is not None:
+                domains = list(issuing.domains or [])
+                challenge_type = issuing.challenge_type
+                dns_provider = issuing.dns_provider
+                was_manual = bool(issuing.allow_manual)
+            else:
+                # No successful order on record for this cert (legacy /
+                # imported row): fall back to the last SUCCESSFUL
+                # issuance shape recorded on the settings (the
+                # orchestrator now writes them only on success), then
+                # to the cert's own SANs.
+                domains = list(settings.acme_domains or []) or list(cert.sans_json or [])
+                challenge_type = settings.acme_challenge_type or "dns-01"
+                dns_provider = settings.acme_dns_provider
+                was_manual = False
+            if was_manual and challenge_type == "dns-01":
+                # Manual DNS-01 needs a person to add the TXT record at
+                # an external provider — the sweep cannot solve it, and
+                # creating an order would just fail every 12 h until
+                # expiry. Skip it; the shipped ``secret_expiring`` alert
+                # watches this cert and fires inside the same window,
+                # which is the operator's cue to re-issue by hand.
+                skipped_manual += 1
+                logger.warning(
+                    "acme_client_renew_skipped_manual_dns01",
+                    cert_id=str(cert.id),
+                    domains=domains,
+                    valid_to=cert.valid_to.isoformat() if cert.valid_to else None,
+                )
+                continue
             if not domains:
                 continue
             if frozenset(domains) in inflight_domainsets:
@@ -153,7 +210,8 @@ async def _renew() -> str:
             order = ACMEOrder(
                 account_id=account.id,
                 domains=domains,
-                challenge_type="dns-01",
+                challenge_type=challenge_type,
+                dns_provider=dns_provider,
                 status="pending",
                 allow_manual=False,
             )
@@ -166,7 +224,11 @@ async def _renew() -> str:
 
     for oid in new_order_ids:
         run_acme_order.delay(oid)
-    logger.info("acme_client_renew_sweep", renewed=len(new_order_ids))
+    logger.info(
+        "acme_client_renew_sweep", renewed=len(new_order_ids), skipped_manual=skipped_manual
+    )
+    if skipped_manual:
+        return f"renewed={len(new_order_ids)} skipped_manual={skipped_manual}"
     return f"renewed={len(new_order_ids)}"
 
 

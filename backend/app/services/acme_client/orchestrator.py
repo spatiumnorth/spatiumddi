@@ -258,6 +258,18 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         order.status = ACME_ORDER_VALID
         order.certificate_id = cert_row.id
         order.last_error = None
+        # #1529 — record the issuance shape on the settings ONLY now the
+        # order has succeeded. These columns are the renewal sweep's
+        # fallback for certs with no successful order on record; writing
+        # them at order creation let a failed attempt for other domains
+        # retarget the active cert's renewal.
+        from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+        shape = await db.get(PlatformSettings, 1)
+        if shape is not None:
+            shape.acme_challenge_type = order.challenge_type
+            shape.acme_dns_provider = order.dns_provider
+            shape.acme_domains = list(order.domains)
         await db.commit()
         logger.info(
             "acme_client_order_valid",

@@ -1099,11 +1099,14 @@ class PlatformSettings(Base):
     # configuring an ACME account (``PUT /account``) flips it True (the
     # operator's explicit opt-in), DELETE clears it. The
     # ``security.certificates`` feature module is the separate discovery
-    # toggle. ``acme_auto_renew`` is the seam for the deferred renewal
-    # beat task (not yet consumed in Phase 1). ``acme_challenge_type`` /
-    # ``acme_dns_provider`` / ``acme_domains`` are populated by
-    # ``POST /issue`` to record the desired issuance shape for that
-    # Phase-2 renewal task to read.
+    # toggle. ``acme_auto_renew`` is the operator's "keep it renewed"
+    # intent for the renewal beat task. ``acme_challenge_type`` /
+    # ``acme_dns_provider`` / ``acme_domains`` record the shape of the
+    # last SUCCESSFUL issuance — written by the orchestrator only when
+    # an order goes valid (#1529; previously written at order creation,
+    # so failed attempts retargeted renewal). The renewal task's primary
+    # source is the successful order that produced each cert; these
+    # columns are its fallback for certs with no such order.
     acme_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
