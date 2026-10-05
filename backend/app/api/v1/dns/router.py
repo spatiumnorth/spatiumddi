@@ -1691,8 +1691,13 @@ async def update_group(
         body,
         clearable={"default_view"},
         non_nullable={
-            "name", "description", "group_type", "is_recursive",
-            "catalog_zones_enabled", "catalog_zone_name", "is_public_facing",
+            "name",
+            "description",
+            "group_type",
+            "is_recursive",
+            "catalog_zones_enabled",
+            "catalog_zone_name",
+            "is_public_facing",
         },
     )
     for k, v in changes.items():
@@ -1966,7 +1971,14 @@ async def update_server(
         body,
         clearable={"api_port"},
         non_nullable={
-            "name", "driver", "host", "port", "roles", "status", "notes", "is_enabled",
+            "name",
+            "driver",
+            "host",
+            "port",
+            "roles",
+            "status",
+            "notes",
+            "is_enabled",
         },
         # ``group_id`` / ``is_primary`` (#934) are NOT plain column writes —
         # each has cross-row consequences the generic loop below can't have.
@@ -4309,7 +4321,12 @@ async def update_view(
         body,
         clearable={"allow_query", "allow_query_cache"},
         non_nullable={
-            "name", "description", "match_clients", "match_destinations", "recursion", "order",
+            "name",
+            "description",
+            "match_clients",
+            "match_destinations",
+            "recursion",
+            "order",
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
@@ -5053,9 +5070,21 @@ async def update_zone(
             "also_notify",
         },
         non_nullable={
-            "name", "zone_type", "kind", "ttl", "refresh", "retry", "expire",
-            "minimum", "primary_ns", "admin_email", "dnssec_enabled",
-            "auto_tls_probe", "dynamic_update_enabled", "forward_only", "tags",
+            "name",
+            "zone_type",
+            "kind",
+            "ttl",
+            "refresh",
+            "retry",
+            "expire",
+            "minimum",
+            "primary_ns",
+            "admin_email",
+            "dnssec_enabled",
+            "auto_tls_probe",
+            "dynamic_update_enabled",
+            "forward_only",
+            "tags",
         },
     )
     # Secondary / stub zones need at least one master to render loadable

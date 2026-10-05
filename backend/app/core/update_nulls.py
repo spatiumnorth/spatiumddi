@@ -62,9 +62,7 @@ def resolve_update_changes(
     )
     clearable_set = set(clearable)
     non_nullable_set = set(non_nullable)
-    nulled = sorted(
-        k for k, v in changes.items() if v is None and k in non_nullable_set
-    )
+    nulled = sorted(k for k, v in changes.items() if v is None and k in non_nullable_set)
     if nulled:
         raise HTTPException(
             status_code=422,
@@ -73,11 +71,7 @@ def resolve_update_changes(
                 "unchanged, or send a value."
             ),
         )
-    return {
-        k: v
-        for k, v in changes.items()
-        if v is not None or k in clearable_set
-    }
+    return {k: v for k, v in changes.items() if v is not None or k in clearable_set}
 
 
 __all__ = ["resolve_update_changes"]

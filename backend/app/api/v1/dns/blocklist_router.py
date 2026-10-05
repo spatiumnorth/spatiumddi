@@ -1002,8 +1002,15 @@ async def update_blocklist(
         body,
         clearable={"feed_url", "sinkhole_ip"},
         non_nullable={
-            "name", "description", "category", "source_type", "feed_format",
-            "update_interval_hours", "block_mode", "feed_entries_are_wildcard", "enabled",
+            "name",
+            "description",
+            "category",
+            "source_type",
+            "feed_format",
+            "update_interval_hours",
+            "block_mode",
+            "feed_entries_are_wildcard",
+            "enabled",
         },
     )
     wildcard_flipped = (

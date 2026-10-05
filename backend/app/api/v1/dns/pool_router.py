@@ -444,10 +444,19 @@ async def update_pool(
         body,
         clearable={"hc_target_port"},
         non_nullable={
-            "name", "description", "ttl", "enabled", "hc_type", "hc_path",
-            "hc_method", "hc_verify_tls", "hc_expected_status_codes",
-            "hc_interval_seconds", "hc_timeout_seconds",
-            "hc_unhealthy_threshold", "hc_healthy_threshold",
+            "name",
+            "description",
+            "ttl",
+            "enabled",
+            "hc_type",
+            "hc_path",
+            "hc_method",
+            "hc_verify_tls",
+            "hc_expected_status_codes",
+            "hc_interval_seconds",
+            "hc_timeout_seconds",
+            "hc_unhealthy_threshold",
+            "hc_healthy_threshold",
         },
     )
     for k, v in payload.items():
