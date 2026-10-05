@@ -33,14 +33,19 @@ data:
     # present but zero-filled (ext4 records the new size before the data
     # lands) — that reads as corrupt, not short, and needs this.
     aof-load-corrupt-tail-max-size 16777216
-    requirepass CHANGEME
-    masterauth CHANGEME
+    # #1547 — __PASSWORD__ is a placeholder, rendered by the
+    # init-redis container from the spatiumddi-secrets Secret's
+    # `redis-password` key (the same key the api / worker interpolate
+    # into their sentinel:// URLs). A ConfigMap never carries the
+    # credential itself.
+    requirepass __PASSWORD__
+    masterauth __PASSWORD__
 
   sentinel.conf: |
     sentinel resolve-hostnames yes
     sentinel announce-hostnames yes
     sentinel monitor mymaster redis-0.redis-headless.spatiumddi.svc.cluster.local 6379 2
-    sentinel auth-pass mymaster CHANGEME
+    sentinel auth-pass mymaster __PASSWORD__
     sentinel down-after-milliseconds mymaster 5000
     sentinel failover-timeout mymaster 60000
     sentinel parallel-syncs mymaster 1
@@ -100,13 +105,19 @@ spec:
             - sh
             - -c
             - |
-              if [ "${HOSTNAME}" = "redis-0" ]; then
-                cp /config/redis.conf /data/redis.conf
-              else
-                cp /config/redis.conf /data/redis.conf
+              # #1547 — render both configs from the ConfigMap
+              # templates, substituting the Redis password from the
+              # spatiumddi-secrets Secret (env below). Escape
+              # sed-replacement metacharacters (\ & and the /
+              # delimiter) so a password containing them still
+              # renders a valid auth line — same approach as the
+              # umbrella chart's render-config init container.
+              ESC=$(printf '%s' "${REDIS_PASSWORD:-}" | sed -e 's/[\\/&]/\\&/g')
+              sed -e "s/__PASSWORD__/${ESC}/g" /config/redis.conf > /data/redis.conf
+              if [ "${HOSTNAME}" != "redis-0" ]; then
                 echo "replicaof redis-0.redis-headless.spatiumddi.svc.cluster.local 6379" >> /data/redis.conf
               fi
-              cp /config/sentinel.conf /data/sentinel.conf
+              sed -e "s/__PASSWORD__/${ESC}/g" /config/sentinel.conf > /data/sentinel.conf
               # #590 — announce this pod by its STABLE StatefulSet FQDN rather
               # than its ephemeral pod IP. A rescheduled pod otherwise returns
               # with a new IP + a new runid, so peers add a SECOND entry while
@@ -123,6 +134,12 @@ spec:
                 "$POD_FQDN" >> /data/redis.conf
               printf 'sentinel announce-ip %s\nsentinel announce-port 26379\n' \
                 "$POD_FQDN" >> /data/sentinel.conf
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
           volumeMounts:
             - name: config
               mountPath: /config
@@ -134,12 +151,21 @@ spec:
           command: ["redis-server", "/data/redis.conf"]
           ports:
             - containerPort: 6379
+          env:
+            # Only the probe consumes this — the server itself reads
+            # the requirepass the init container rendered into
+            # /data/redis.conf from the same Secret key.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
           volumeMounts:
             - name: data
               mountPath: /data
           livenessProbe:
             exec:
-              command: ["redis-cli", "-a", "CHANGEME", "ping"]
+              command: ["sh", "-c", "exec redis-cli -a \"$REDIS_PASSWORD\" ping"]
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
@@ -206,10 +232,10 @@ spec:
       port: 6379
 ---
 # #1547 — Sentinel Service: Celery/kombu reaches the Sentinels
-# through this ClusterIP (the CELERY_* sentinel:// URLs in
-# k8s/base/configmap.yaml), load-balancing across all three pods;
-# redis-py instead lists every Sentinel by its per-pod headless DNS
-# name in REDIS_URL. Mirrors the umbrella chart's redis-sentinel
+# through this ClusterIP (the CELERY_* sentinel:// URLs in the
+# api / worker env in k8s/base/), load-balancing across all three
+# pods; redis-py instead lists every Sentinel by its per-pod headless
+# DNS name in REDIS_URL. Mirrors the umbrella chart's redis-sentinel
 # Service. Without it there was no Service exposing port 26379 at all.
 apiVersion: v1
 kind: Service

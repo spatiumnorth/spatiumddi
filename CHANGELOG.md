@@ -86,7 +86,11 @@ the formatter handles the rest.
   headless Service (replica READONLY, no password against a
   `requirepass` manifest, no Sentinel Service) — they are now
   `sentinel://` URLs with the password, plus a `redis-sentinel`
-  Service. The DHCP agent's readiness probe gated on TCP 8000, the
+  Service. The Redis password itself lives only in the
+  `spatiumddi-secrets` Secret (`redis-password`): the api / worker /
+  beat Deployments interpolate it into the URLs as
+  `$(REDIS_PASSWORD)` and the Sentinel StatefulSet's init container
+  renders it into `redis.conf` — no credential sits in the ConfigMap. The DHCP agent's readiness probe gated on TCP 8000, the
   Kea HA peer listener a standalone server never binds, so a
   standalone pod never joined its Service endpoints; it now probes
   the Kea control socket, as the image HEALTHCHECK does. And the

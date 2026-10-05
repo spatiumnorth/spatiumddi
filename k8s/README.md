@@ -42,6 +42,7 @@ kubectl apply -f k8s/base/namespace.yaml
 kubectl create secret generic spatiumddi-secrets \
   --from-literal=postgres-password=CHANGEME \
   --from-literal=secret-key=$(openssl rand -hex 32) \
+  --from-literal=redis-password=$(openssl rand -hex 32) \
   --from-literal=metrics-token=$(openssl rand -hex 32) \
   -n spatiumddi
 # metrics-token is the bearer token /metrics accepts (#1159). It's optional:
@@ -71,13 +72,17 @@ kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --tim
 
 # 4. Deploy application
 kubectl apply -f k8s/base/configmap.yaml
-# The stock ConfigMap's Redis URLs target the HA Sentinel topology
-# (k8s/ha/redis-sentinel.yaml, #1547). For this standalone Redis,
-# point them at the pod from step 2b instead:
-kubectl -n spatiumddi patch configmap spatiumddi-config --type merge -p \
-  '{"data":{"REDIS_URL":"redis://redis:6379/0","CELERY_BROKER_URL":"redis://redis:6379/1","CELERY_RESULT_BACKEND":"redis://redis:6379/2","REDIS_SENTINEL_PASSWORD":""}}'
 kubectl apply -f k8s/base/api.yaml
 kubectl apply -f k8s/base/worker.yaml
+# The stock api / worker / beat env targets the HA Sentinel topology
+# (k8s/ha/redis-sentinel.yaml, #1547): sentinel:// URLs with the
+# Secret's redis-password interpolated in. For this standalone
+# (no-auth) Redis, override the env on the Deployments instead:
+kubectl -n spatiumddi set env deployment/api deployment/worker deployment/beat \
+  REDIS_URL="redis://redis:6379/0" \
+  CELERY_BROKER_URL="redis://redis:6379/1" \
+  CELERY_RESULT_BACKEND="redis://redis:6379/2" \
+  REDIS_SENTINEL_PASSWORD="" REDIS_PASSWORD=""
 kubectl apply -f k8s/base/frontend.yaml
 ```
 
@@ -172,13 +177,15 @@ kubectl apply -f k8s/ha/redis-sentinel.yaml
 Three Redis nodes with Sentinel provides automatic failover with quorum of 2.
 
 The control plane finds the current master through Sentinel (#1547):
-`k8s/base/configmap.yaml` uses `sentinel://` URLs — `REDIS_URL` lists
-every Sentinel by its per-pod headless DNS name, the Celery URLs go
-through the `redis-sentinel` Service the manifest creates, and the
-password in the URLs is the `requirepass` in the manifest's
-`redis.conf` (change both together). A plain `redis://` URL against
-the headless Service would land on a replica ~2 times in 3 and fail
-with `READONLY` / `NOAUTH`.
+the api / worker / beat env in `k8s/base/` builds `sentinel://` URLs —
+`REDIS_URL` lists every Sentinel by its per-pod headless DNS name, the
+Celery URLs go through the `redis-sentinel` Service the manifest
+creates, and the password in the URLs is interpolated from the
+`redis-password` key of the `spatiumddi-secrets` Secret — the same
+key the manifest's init container renders into `redis.conf` as the
+`requirepass`, so there is exactly one place to rotate. A plain
+`redis://` URL against the headless Service would land on a replica
+~2 times in 3 and fail with `READONLY` / `NOAUTH`.
 
 **Surviving a hard node loss (#590).** Three properties of the manifest are
 load-bearing, and all three were learned the hard way:

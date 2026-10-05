@@ -17,14 +17,18 @@ pointing at Services no manifest (or operator) ever creates:
   manifest sets ``requirepass`` (NOAUTH), and no Service exposed the
   Sentinel port. They are now ``sentinel://`` URLs — per-pod headless
   names for ``REDIS_URL``, the ``redis-sentinel`` Service for Celery —
-  with the password embedded.
+  with the password interpolated from the ``spatiumddi-secrets``
+  Secret (``$(REDIS_PASSWORD)`` in the Deployments' env values: a
+  ConfigMap never carries a credential, and interpolation does not
+  expand in ConfigMap data).
 
 This checks every ``k8s/**/*.yaml`` manifest: every URL host in an
 env value or ConfigMap entry must resolve to a Service defined in
 ``k8s/`` or a CNPG-generated Service (``<cluster>-rw`` / ``-ro`` /
 ``-r``); every ``DATABASE_URL`` must use the ``-rw`` Service; the
-ConfigMap's Redis URLs must be ``sentinel://`` with a password; and
-the ``redis-sentinel`` Service must exist on port 26379.
+api / worker / beat env Redis URLs must be ``sentinel://`` with a
+password and must not live in the ConfigMap; and the
+``redis-sentinel`` Service must exist on port 26379.
 
 ``k8s/ha/postgres-docker-compose.yaml`` is excluded: it is a Compose
 file (its hosts are Compose service names, not Kubernetes Services)
@@ -44,6 +48,7 @@ import yaml
 
 URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\"'\)\]]+")
 EXCLUDED_FILES = {"postgres-docker-compose.yaml"}
+REDIS_URL_KEYS = ("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND")
 
 
 def _strings(node) -> list[str]:
@@ -71,6 +76,33 @@ def _url_hosts(value: str) -> list[str]:
     return hosts
 
 
+def _env_entries(node) -> list[tuple[str, str]]:
+    # Container env entries are the only dicts in these manifests
+    # carrying both a string `name` and a string `value`.
+    if isinstance(node, dict):
+        entries = []
+        name, value = node.get("name"), node.get("value")
+        if isinstance(name, str) and isinstance(value, str):
+            entries.append((name, value))
+        for child in node.values():
+            entries.extend(_env_entries(child))
+        return entries
+    if isinstance(node, list):
+        return [entry for item in node for entry in _env_entries(item)]
+    return []
+
+
+def _is_cnpg_cluster(doc: dict) -> bool:
+    # ``apiVersion`` is "<group>/<version>". Parse it rather than
+    # substring-matching the group: read it as an authority + path and
+    # compare the parsed host exactly, so a look-alike group such as
+    # "postgresql.cnpg.io.evil.example/v1" never matches, while the
+    # real "postgresql.cnpg.io/v1" (and a bare "postgresql.cnpg.io",
+    # which has no version segment) behave exactly as before.
+    parsed = urlparse(f"//{doc.get('apiVersion', '')}")
+    return parsed.hostname == "postgresql.cnpg.io" and parsed.path.startswith("/")
+
+
 def _resolves(host: str, services: set[str]) -> bool:
     # Short name, full FQDN (api.spatiumddi.svc.cluster.local), or a
     # per-pod headless name (redis-0.redis-headless.…): in each shape
@@ -96,14 +128,13 @@ def check(root: Path) -> list[str]:
             meta = doc.get("metadata") or {}
             if doc.get("kind") == "Service" and meta.get("name"):
                 services.add(meta["name"])
-            if doc.get("kind") == "Cluster" and str(doc.get("apiVersion", "")).startswith(
-                "postgresql.cnpg.io/"
-            ):
+            if doc.get("kind") == "Cluster" and _is_cnpg_cluster(doc):
                 cnpg_clusters.append(meta.get("name", ""))
     for cluster in cnpg_clusters:
         services.update({f"{cluster}-rw", f"{cluster}-ro", f"{cluster}-r"})
 
     sentinel_service_ok = False
+    redis_env_seen: set[str] = set()
     for path, docs in docs_by_file.items():
         for doc in docs:
             meta = doc.get("metadata") or {}
@@ -129,22 +160,45 @@ def check(root: Path) -> list[str]:
                                 f"({', '.join(c + '-rw' for c in cnpg_clusters)}) "
                                 "(#1547)"
                             )
+            # The Redis URLs live in the Deployments' env values, not
+            # the ConfigMap: they embed the password (interpolated
+            # from the Secret as $(REDIS_PASSWORD)), and interpolation
+            # only expands in an env `value`.
+            for env_name, env_value in _env_entries(doc):
+                if env_name not in REDIS_URL_KEYS:
+                    continue
+                redis_env_seen.add(env_name)
+                if not env_value.startswith("sentinel://"):
+                    problems.append(
+                        f"{path}: {env_name} is {env_value!r}, not a "
+                        "sentinel:// URL — a plain client against the "
+                        "headless Service lands on a replica and gets "
+                        "READONLY (#1547)"
+                    )
+                elif "@" not in env_value.split("://", 1)[1].split("/", 1)[0]:
+                    problems.append(
+                        f"{path}: {env_name} carries no password, but the "
+                        "Redis manifest sets requirepass — connections "
+                        "fail with NOAUTH (#1547)"
+                    )
             if doc.get("kind") == "ConfigMap" and meta.get("name") == "spatiumddi-config":
                 data = doc.get("data") or {}
-                for key in ("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND"):
-                    url = str(data.get(key, ""))
-                    if not url.startswith("sentinel://"):
+                for key in REDIS_URL_KEYS + ("REDIS_SENTINEL_PASSWORD",):
+                    if key in data:
                         problems.append(
-                            f"{path}: {key} is {url!r}, not a sentinel:// URL "
-                            "— a plain client against the headless Service "
-                            "lands on a replica and gets READONLY (#1547)"
+                            f"{path}: {key} is set in the ConfigMap — the "
+                            "Redis password belongs in the "
+                            "spatiumddi-secrets Secret, interpolated as "
+                            "$(REDIS_PASSWORD) in the Deployments' env, "
+                            "never in a ConfigMap (#1547)"
                         )
-                    elif "@" not in url.split("://", 1)[1].split("/", 1)[0]:
-                        problems.append(
-                            f"{path}: {key} carries no password, but the "
-                            "Redis manifest sets requirepass — connections "
-                            "fail with NOAUTH (#1547)"
-                        )
+    for key in REDIS_URL_KEYS:
+        if key not in redis_env_seen:
+            problems.append(
+                f"{key} is not set in any env in k8s/ — the api / "
+                "worker / beat must carry the sentinel:// URL inline "
+                "with $(REDIS_PASSWORD) interpolated (#1547)"
+            )
     if not sentinel_service_ok:
         problems.append(
             "no Service named redis-sentinel exposing port 26379 is "

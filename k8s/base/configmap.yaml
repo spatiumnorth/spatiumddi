@@ -12,17 +12,14 @@ data:
   # #1547 — Redis runs behind Sentinel (k8s/ha/redis-sentinel.yaml):
   # a plain redis:// URL against the headless Service lands on a
   # replica ~2 times in 3 (READONLY) and carries no password (NOAUTH —
-  # the manifest sets requirepass). The app and Celery both parse the
-  # sentinel:// scheme (backend/app/core/redis_client.py,
-  # backend/app/celery_app.py): REDIS_URL lists every Sentinel by its
-  # per-pod headless DNS name so one is reachable mid-failover, and
-  # the Celery URLs go through the `redis-sentinel` Service. The
-  # password is the requirepass in k8s/ha/redis-sentinel.yaml —
-  # change both together.
-  REDIS_URL: "sentinel://:CHANGEME@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
-  CELERY_BROKER_URL: "sentinel://:CHANGEME@redis-sentinel:26379/1"
-  CELERY_RESULT_BACKEND: "sentinel://:CHANGEME@redis-sentinel:26379/2"
+  # the manifest sets requirepass). The sentinel:// URLs themselves
+  # are NOT here: they embed the Redis password, credentials belong in
+  # the spatiumddi-secrets Secret only, and $(REDIS_PASSWORD)
+  # interpolation only expands in a Deployment env `value` — so the
+  # api / worker / beat Deployments build REDIS_URL /
+  # CELERY_BROKER_URL / CELERY_RESULT_BACKEND inline from the
+  # `redis-password` Secret key, the same wiring as the umbrella
+  # chart's commonEnv. Only the (non-secret) master name stays here.
   REDIS_SENTINEL_MASTER: "mymaster"
-  REDIS_SENTINEL_PASSWORD: "CHANGEME"
   DEBUG: "false"
   LOG_LEVEL: "info"
