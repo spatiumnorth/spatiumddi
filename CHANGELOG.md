@@ -105,6 +105,45 @@ the formatter handles the rest.
   the flavor, and the charts render check carries negative controls
   for all three combinations.
 
+- **Integration mirrors no longer treat a failed, refused or partial
+  fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
+  hazards of the same class: the UniFi client collapsed a wrong-shape
+  200 (proxy error page, envelope without `data`, `data: null`) to an
+  empty list for networks, clients and sites, and ignored in-band
+  legacy `meta.rc == "error"` failures, so one degraded response
+  deleted a site's — or the whole controller's — mirrored rows; it
+  now routes those reads through the shared `require_list` /
+  `require_keyed_list` guards and raises. The OPNsense mirror deleted
+  mirrored DHCP leases and reservations when a DHCP backend refused
+  the API user (403) while the reconciler merely warned; a refused
+  category's rows are now frozen for that pass (the all-404 absent-
+  backend case still deletes as before). The Proxmox mirror deleted
+  a running guest's addresses when its config fetch failed once, and
+  dropped stopped guests wholesale when their node was not online
+  with `include_stopped` armed; unreadable guests/nodes are now
+  counted on the reconcile summary and the address absence-delete
+  (and, for unread nodes, the subnet pass) is skipped for that pass.
+  The Kubernetes mirror read only the first 500 Services, Ingresses,
+  nodes and pods and pruned everything past page one; it now follows
+  the `metadata.continue` token to the end and raises — aborting the
+  reconcile — if paging fails midway.
+
+- **System alerts reach forward targets, compliance rules require a
+  classification, audit-forward targets are validated, and conformity
+  alerts survive the evaluator (#1576, #1578, #1580, #1581).**
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
+  be created without a classification and then never fire, warning on
+  every evaluator tick — create and update now reject that with 422
+  and the evaluator warns once per rule. Audit-forward targets are
+  validated per kind at save time (syslog host/port/facility ranges,
+  webhook URL, SMTP host/port/sender/recipient) instead of being
+  saved enabled and silently skipped. Conformity events are no longer
+  closed by the generic evaluator's auto-resolve passes; the
+  conformity engine owns them.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
