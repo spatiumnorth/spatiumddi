@@ -387,6 +387,63 @@ async def test_disappeared_lease_is_deleted(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_forbidden_backend_freezes_mirrored_dhcp_rows(db_session: AsyncSession) -> None:
+    """#1556 — a 403 from a DHCP backend must freeze that category's
+    mirrored rows, not delete them: the backend contributed nothing to
+    the desired set, so absence proves nothing this pass."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    await db_session.commit()
+
+    iface = [_iface("lan", "igb1", "10.0.0.1", "10.0.0.0/24")]
+
+    # First pass: lease at .50 and reservation at .60 created.
+    with _patch_client(
+        _FakeClient(
+            interfaces=iface,
+            leases=[_OPNLease(address="10.0.0.50", mac=None, hostname="x", state="active")],
+            reservations=[
+                _OPNReservation(
+                    address="10.0.0.60", mac="aa:bb:cc:dd:ee:ff", hostname="r", description=""
+                )
+            ],
+        )
+    ):
+        await reconcile_router(db_session, router)
+
+    # Second pass: every DHCP backend refuses (403) and returns nothing.
+    # Both rows must survive, still owned by this router, with no deletes.
+    with _patch_client(
+        _FakeClient(
+            interfaces=iface,
+            leases=[],
+            reservations=[],
+            lease_sources=[],
+            reservation_sources=[],
+            forbidden=["kea leases", "kea reservations"],
+        )
+    ):
+        summary = await reconcile_router(db_session, router)
+    assert summary.addresses_deleted == 0
+    for addr in ("10.0.0.50", "10.0.0.60"):
+        row = (
+            await db_session.execute(select(IPAddress).where(IPAddress.address == addr))
+        ).scalar_one_or_none()
+        assert row is not None, addr
+        assert row.opnsense_router_id == router.id
+
+    # Third pass: access restored, rows genuinely gone upstream → the
+    # normal absence-delete resumes (the freeze was refusal-scoped).
+    with _patch_client(_FakeClient(interfaces=iface, leases=[], reservations=[])):
+        summary = await reconcile_router(db_session, router)
+    assert summary.addresses_deleted >= 2
+    for addr in ("10.0.0.50", "10.0.0.60"):
+        assert (
+            await db_session.execute(select(IPAddress).where(IPAddress.address == addr))
+        ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
 async def test_delete_router_cascades_ipam_rows(db_session: AsyncSession) -> None:
     space = await _make_space(db_session)
     router = await _make_router(db_session, space)
