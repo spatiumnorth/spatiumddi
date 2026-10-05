@@ -20,7 +20,7 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from jose import JWTError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,6 +89,15 @@ LONGPOLL_POLL_INTERVAL = 2.0
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
 
+# #1567 — drivers an agent binary can actually serve. The full driver
+# registry also names agentless drivers (windows_dns, the cloud
+# providers, technitium_api) that the operator API accepts but no agent
+# can register as; the supervisor's driver selection raises on anything
+# outside this set, so accepting it here only wrote a junk ``active``
+# server row before the agent crash-looped.
+AGENT_CAPABLE_DRIVERS = frozenset({"bind9", "powerdns", "technitium"})
+
+
 class AgentRegisterRequestV2(BaseModel):
     # Bounds mirror the columns these land in (DNSServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DNSServerGroup.name 255) — an
@@ -101,6 +110,15 @@ class AgentRegisterRequestV2(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
+
+    @field_validator("driver")
+    @classmethod
+    def validate_driver(cls, v: str) -> str:
+        if v not in AGENT_CAPABLE_DRIVERS:
+            raise ValueError(
+                f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
+            )
+        return v
 
 
 class AgentRegisterResponseV2(BaseModel):
