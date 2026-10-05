@@ -596,6 +596,44 @@ async def test_apply_zone_delete_resolves_zone(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_apply_zone_delete_empties_populated_zone_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — records (except SOA / apex NS) are deleted before the zone."""
+    driver = GoogleCloudDNSDriver()
+    soa = _rrset("doomed.example.", "SOA", 21600, ["ns dns 1 2 3 4 5"])
+    apex_ns = _rrset("doomed.example.", "NS", 172800, ["ns-cloud.googledomains.com."])
+    www = _rrset("www.doomed.example.", "A", 300, ["10.0.0.1"])
+    sub_ns = _rrset("sub.doomed.example.", "NS", 300, ["ns.other.example."])
+    target = _StubZone("doomed-example", "doomed.example.", rrsets=[soa, apex_ns, www, sub_ns])
+    client = _client_with_zones(target)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+    ch = target.changes_obj
+    assert ch.created is True
+    # Only the non-SOA / non-apex-NS rrsets were deleted in the change set.
+    assert ch.deleted == [www, sub_ns]
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_absent_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — deleting a zone that is already gone is a no-op success."""
+    driver = GoogleCloudDNSDriver()
+    client = _client_with_zones(_StubZone("other-com", "other.com."))
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="gone.example.")
+    # No raise.
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+
+@pytest.mark.asyncio
 async def test_apply_zone_bad_op(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = GoogleCloudDNSDriver()
     _patch_client(monkeypatch, driver, _client_with_zones())

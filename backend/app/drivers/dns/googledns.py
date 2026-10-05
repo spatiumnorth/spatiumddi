@@ -399,11 +399,69 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             return
 
         if op == "delete":
-            managed = await self._resolve_zone(client, name)
-            await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
+            try:
+                managed = await self._resolve_zone(client, name)
+            except CloudDNSError as exc:
+                # #1528 — an already-absent zone is the desired end state;
+                # treat it as success so trash purge / permanent delete /
+                # move don't retry forever.
+                if "not found" in str(exc):
+                    logger.info(
+                        "google_dns.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=name,
+                    )
+                    return
+                raise
+            # #1528 — Cloud DNS refuses to delete a populated zone
+            # (containerNotEmpty); empty it first.
+            await self._empty_zone(managed, name)
+            try:
+                await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
+            except CloudDNSError as exc:
+                if "not found" in str(exc).lower() or "404" in str(exc):
+                    return
+                raise
             return
 
         raise CloudDNSError(f"google_dns._apply_zone: unsupported op {op!r}")
+
+    async def _empty_zone(self, managed: Any, apex: str) -> None:
+        """Delete every rrset in the zone except SOA and apex NS (#1528).
+
+        Cloud DNS ``managed.delete`` fails with ``containerNotEmpty``
+        while anything besides the provider-managed SOA / apex NS
+        remains, so a zone teardown has to remove the operator's records
+        first. Deletions are committed in batches through the zone's
+        transactional change sets, waiting for each to reach ``done``.
+        """
+        apex_fqdn = normalize_fqdn(apex)
+        rrsets = await asyncio.to_thread(
+            self._wrap_call,
+            "list_resource_record_sets",
+            lambda: list(managed.list_resource_record_sets()),
+        )
+        deletable = []
+        for rrset in rrsets:
+            rtype = str(rrset.record_type).upper()
+            if rtype == "SOA":
+                continue
+            if rtype == "NS" and normalize_fqdn(str(rrset.name)) == apex_fqdn:
+                continue
+            deletable.append(rrset)
+
+        for start in range(0, len(deletable), 100):
+            batch = deletable[start : start + 100]
+
+            def _commit(batch: list[Any] = batch) -> Any:
+                changes = managed.changes()
+                for rrset in batch:
+                    changes.delete_record_set(rrset)
+                changes.create()
+                return changes
+
+            committed = await asyncio.to_thread(self._wrap_call, "delete_zone_records", _commit)
+            await self._wait_for_change(committed)
 
     # ── Managed-zone resolution ─────────────────────────────────────────
     async def _resolve_zone(self, client: Any, zone_name: str) -> Any:
