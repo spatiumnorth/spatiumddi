@@ -221,6 +221,10 @@ metadata:
 spec:
   {{- if .Values.dns.useMetalLBVIP }}
   type: LoadBalancer
+  # #1550 — MetalLB (L2/BGP) never routes via NodePorts; without this
+  # every VIP port is also opened as a random NodePort on every node,
+  # served through the forward path instead of the scoped input chain.
+  allocateLoadBalancerNodePorts: false
   {{- else }}
   type: ClusterIP
   {{- end }}

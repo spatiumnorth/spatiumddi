@@ -115,6 +115,9 @@ render() { # name chart [helm --set args...]
     # listener (TCP 8000): a standalone server never binds it.
     python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" "$file" \
         || failures=$((failures + 1))
+    # #1550 — MetalLB VIP Services must not allocate NodePorts.
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -392,6 +395,44 @@ if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "HA peer listener"; t
     echo "   ok: tcpSocket readiness on port 8000 refused by the #1589 guard"
 else
     echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #1550 — no render above sets frontend.controlPlaneVIP, so the
+# frontend's LoadBalancer shape is exercised here, together with the
+# appliance all-on render (DNS VIPs + DHCP relay VIP). --require so
+# either side silently dropping its VIP Service fails the gate.
+echo "── MetalLB VIP Services allocate no NodePorts (#1550)"
+if helm template umbrella-vip "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set frontend.controlPlaneVIP=10.0.0.10 > "$OUT/umbrella-vip.yaml"; then
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" --require \
+        "$OUT/umbrella-vip.yaml" "$OUT/appliance-all-on.yaml" \
+        || failures=$((failures + 1))
+else
+    echo "   FAIL: umbrella chart did not render with frontend.controlPlaneVIP set" >&2
+    failures=$((failures + 1))
+fi
+
+echo "── negative control: a VIP LoadBalancer allocating NodePorts must fail"
+cat > "$OUT/neg-vip-nodeports.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9
+spec:
+  type: LoadBalancer
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" \
+    "$OUT/neg-vip-nodeports.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "allocateLoadBalancerNodePorts"; then
+    echo "   ok: VIP LoadBalancer without allocateLoadBalancerNodePorts: false refused by the #1550 guard"
+else
+    echo "   FAIL: expected the #1550 guard to refuse a VIP LoadBalancer allocating NodePorts (rc=$neg_rc)" >&2
     printf '%s\n' "$neg_out" | tail -5 >&2
     failures=$((failures + 1))
 fi
