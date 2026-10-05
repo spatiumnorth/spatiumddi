@@ -339,6 +339,95 @@ async def resolve_managed(db: AsyncSession, domain: str) -> ManagedZoneMatch | N
     )
 
 
+async def _authoritative_ns_hosts(challenge_fqdn_: str) -> list[str]:
+    """Resolve the authoritative NS hostnames for ``challenge_fqdn_``'s zone.
+
+    Walks up the label chain (``_acme-challenge.www.example.com`` →
+    ``www.example.com`` → ``example.com``) asking the system resolver
+    for NS records, and returns the first non-empty NS set found — that
+    set is the zone's authoritative servers, i.e. exactly what a CA
+    queries when validating. Returns ``[]`` when no level answers with
+    NS records (zone not delegated yet / resolver failure).
+    """
+    import dns.asyncresolver  # noqa: PLC0415
+
+    labels = challenge_fqdn_.rstrip(".").split(".")
+    resolver = dns.asyncresolver.Resolver()
+    resolver.lifetime = 10.0
+    # Stop before the bare TLD — it is never the challenge's zone.
+    for i in range(len(labels) - 1):
+        candidate = ".".join(labels[i:])
+        try:
+            answer = await resolver.resolve(candidate, "NS")
+        except Exception:  # noqa: BLE001 — no NS at this level; walk up
+            continue
+        hosts = [str(rdata.target).rstrip(".") for rdata in answer if str(rdata.target)]
+        if hosts:
+            return hosts
+    return []
+
+
+async def _txt_values_at(nameserver_ip: str, fqdn: str) -> set[str]:
+    """TXT values for ``fqdn`` served by ONE authoritative server.
+
+    Queries ``nameserver_ip`` directly (bypassing the system resolver's
+    cache and any split-horizon view) — the certbot/lego propagation
+    model. Raises on NXDOMAIN / timeout / no answer; the caller treats
+    that as "not propagated yet".
+    """
+    import dns.asyncresolver  # noqa: PLC0415
+
+    resolver = dns.asyncresolver.Resolver(configure=False)
+    resolver.nameservers = [nameserver_ip]
+    resolver.lifetime = 10.0
+    answer = await resolver.resolve(fqdn, "TXT")
+    values: set[str] = set()
+    for rdata in answer:
+        for chunk in rdata.strings:
+            values.add(chunk.decode("ascii", errors="ignore").strip('"'))
+    return values
+
+
+async def _ns_host_ips(host: str) -> list[str]:
+    """A/AAAA addresses for an authoritative NS hostname (system resolver)."""
+    import dns.asyncresolver  # noqa: PLC0415
+
+    resolver = dns.asyncresolver.Resolver()
+    resolver.lifetime = 10.0
+    ips: list[str] = []
+    for rdtype in ("A", "AAAA"):
+        try:
+            answer = await resolver.resolve(host, rdtype)
+        except Exception:  # noqa: BLE001 — family absent is fine
+            continue
+        ips.extend(str(rdata) for rdata in answer)
+    return ips
+
+
+async def _txt_on_all_authoritative(challenge_fqdn_: str, txt_value: str) -> bool:
+    """True only when EVERY authoritative NS serves ``txt_value``.
+
+    Any gap — the NS set not resolvable yet, an NS hostname with no
+    address, or one server not yet serving the record — returns False
+    so the poller keeps waiting instead of signalling the CA early.
+    """
+    hosts = await _authoritative_ns_hosts(challenge_fqdn_)
+    if not hosts:
+        return False
+    for host in hosts:
+        ips = await _ns_host_ips(host)
+        if not ips:
+            return False
+        for ip in ips:
+            try:
+                values = await _txt_values_at(ip, challenge_fqdn_)
+            except Exception:  # noqa: BLE001 — not propagated to this server yet
+                return False
+            if txt_value not in values:
+                return False
+    return True
+
+
 async def poll_public_txt(
     challenge_fqdn_: str,
     txt_value: str,
@@ -346,16 +435,24 @@ async def poll_public_txt(
     timeout: float = 600.0,
     interval: float = 15.0,
 ) -> bool:
-    """Poll public DNS until ``challenge_fqdn_`` serves the expected TXT.
+    """Poll until ``challenge_fqdn_`` serves the expected TXT on EVERY
+    authoritative nameserver for its zone.
 
     The gate for the manual fallback: we don't tell the CA to validate
-    until the operator-added record is observable from a public
-    resolver. Returns ``True`` once seen, ``False`` on timeout. dnspython
-    is a hard dependency for this path (it ships in ``pyproject.toml``);
-    if it can't be imported we can't verify and return ``False``.
+    until the operator-added record is observable on the servers the CA
+    will actually query. This deliberately does NOT use the worker's own
+    resolver for the TXT check (#1532): on a split-horizon or caching
+    setup that resolver can return the record while the zone's public
+    authoritative servers don't have it yet, so the CA was told "ready"
+    too early and the authorization failed. Following certbot/lego, the
+    zone's NS set is resolved first and each authoritative server is
+    queried directly; all of them must serve the value. Returns
+    ``True`` once they do, ``False`` on timeout. dnspython is a hard
+    dependency for this path (it ships in ``pyproject.toml``); if it
+    can't be imported we can't verify and return ``False``.
     """
     try:
-        import dns.asyncresolver  # noqa: PLC0415
+        import dns.asyncresolver  # noqa: PLC0415, F401 — presence check only
     except Exception:  # noqa: BLE001 — dnspython missing / import error
         logger.warning("acme_client_dnspython_unavailable", fqdn=challenge_fqdn_)
         return False
@@ -363,14 +460,9 @@ async def poll_public_txt(
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         try:
-            resolver = dns.asyncresolver.Resolver()
-            resolver.lifetime = 10.0
-            answer = await resolver.resolve(challenge_fqdn_, "TXT")
-            for rdata in answer:
-                for chunk in rdata.strings:
-                    if chunk.decode("ascii", errors="ignore").strip('"') == txt_value:
-                        return True
-        except Exception:  # noqa: BLE001 — NXDOMAIN / timeout / no answer (not yet propagated)
+            if await _txt_on_all_authoritative(challenge_fqdn_, txt_value):
+                return True
+        except Exception:  # noqa: BLE001 — transient resolver error; keep polling
             pass
         await asyncio.sleep(interval)
     return False

@@ -1062,3 +1062,81 @@ async def test_secret_expiring_covers_letsencrypt_web_cert(
     ids = {sid for sid, _disp, _msg, _sev in subjects}
     assert f"appliance_cert_tls:{near.id}" in ids
     assert f"appliance_cert_tls:{far.id}" not in ids
+
+
+# ── (i) Manual DNS-01 propagation check queries authoritative NS ─────
+
+
+@pytest.mark.asyncio
+async def test_poll_public_txt_requires_every_authoritative_ns() -> None:
+    """#1532 — the manual-fallback propagation gate requires the TXT on
+    EVERY authoritative nameserver, queried directly — not on the
+    worker's own resolver, which can serve the record (split-horizon /
+    cache) while the servers the CA queries don't have it yet."""
+    from unittest.mock import AsyncMock
+
+    from app.services.acme_client import dns01
+
+    fqdn = "_acme-challenge.www.example.com"
+
+    async def _ips(host: str) -> list[str]:
+        return {"ns1.example.com": ["192.0.2.1"], "ns2.example.com": ["192.0.2.2"]}[host]
+
+    async def _txt_complete(ip: str, name: str) -> set[str]:
+        return {"expected-token"}
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=_txt_complete) as txt_at,
+    ):
+        assert await dns01.poll_public_txt(fqdn, "expected-token", timeout=5, interval=0) is True
+    # Both authoritative servers were asked directly.
+    assert {c.args[0] for c in txt_at.call_args_list} == {"192.0.2.1", "192.0.2.2"}
+
+    async def _txt_missing_on_one(ip: str, name: str) -> set[str]:
+        return {"expected-token"} if ip == "192.0.2.1" else set()
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=_txt_missing_on_one),
+    ):
+        # One authoritative server lacks the record → keep waiting
+        # (here: until the short timeout) instead of signalling ready.
+        assert (
+            await dns01.poll_public_txt(fqdn, "expected-token", timeout=0.2, interval=0.01) is False
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ns_hosts_walks_up_to_the_zone() -> None:
+    """#1532 — the NS set is found by walking up from the challenge FQDN
+    to the first level that answers NS (the zone apex)."""
+    from types import SimpleNamespace
+
+    from app.services.acme_client import dns01
+
+    class _FakeResolver:
+        lifetime: float = 0.0
+
+        async def resolve(self, name: str, rdtype: str):  # noqa: ANN202
+            assert rdtype == "NS"
+            if name == "example.com":
+                return [
+                    SimpleNamespace(target="ns1.example.com."),
+                    SimpleNamespace(target="ns2.example.com."),
+                ]
+            raise RuntimeError("no NS here")
+
+    with patch("dns.asyncresolver.Resolver", _FakeResolver):
+        hosts = await dns01._authoritative_ns_hosts("_acme-challenge.www.example.com")
+    assert hosts == ["ns1.example.com", "ns2.example.com"]
