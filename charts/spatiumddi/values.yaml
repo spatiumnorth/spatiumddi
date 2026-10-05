@@ -859,6 +859,18 @@ dnsAgents:
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
     #   service: { type: LoadBalancer }
+    #   # LoadBalancer Services keep the client address by default
+    #   # (externalTrafficPolicy: Local — each server is a single-replica
+    #   # StatefulSet, so the announcing node is the pod's node anyway);
+    #   # set externalTrafficPolicy: Cluster to opt out. The remaining
+    #   # fields are rendered when set (#1548):
+    #   # service:
+    #   #   annotations:
+    #   #     metallb.universe.tf/address-pool: default
+    #   #     metallb.universe.tf/loadBalancerIPs: 10.0.0.53
+    #   #   loadBalancerIP: 10.0.0.53
+    #   #   loadBalancerSourceRanges: [192.0.2.0/24]
+    #   #   ipFamilyPolicy: PreferDualStack  # + ipFamilies: [IPv4, IPv6]
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
