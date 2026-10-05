@@ -76,6 +76,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Batched IPAM→DNS sync no longer reports failed agentless creates
+  as created (#1536).** The batched path collected record ops per
+  zone and flushed them without ever looking at the outcomes: a
+  create the provider rejected kept the `ip.dns_record_id` stamp the
+  singular path carefully removes (#428), so DDNS idempotency never
+  retried it, and the sync's created/failed accounting never saw it.
+  Collected ops now carry the stamped address with them, the flush
+  returns one result per op, a `failed` batched create gets the same
+  un-stamp as the inline path, and callers can fold failed batched
+  ops into their error counts.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
