@@ -545,13 +545,19 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
     if rtype == "PTR":
         return {"ptrName": value}
     if rtype == "MX":
-        return {"exchange": value, "preference": rec.get("priority") or 10}
+        # Absence, not falsiness — preference 0 is the highest priority
+        # (Microsoft 365 publishes it), and ``or 10`` silently promoted
+        # it to a backup. Issue #1518.
+        return {
+            "exchange": value,
+            "preference": rec.get("priority") if rec.get("priority") is not None else 10,
+        }
     if rtype == "SRV":
         return {
             "target": value,
-            "priority": rec.get("priority") or 0,
-            "weight": rec.get("weight") or 0,
-            "port": rec.get("port") or 0,
+            "priority": rec.get("priority") if rec.get("priority") is not None else 0,
+            "weight": rec.get("weight") if rec.get("weight") is not None else 0,
+            "port": rec.get("port") if rec.get("port") is not None else 0,
         }
     if rtype == "TXT":
         return {"text": value}
@@ -677,11 +683,21 @@ class TechnitiumDriver(DriverBase):
                         # time, pointed at the container's own hostname).
                         # Off-apex NS (delegations) are handled normally.
                         continue
+                    # Absence, not falsiness — a TTL of 0 means "never
+                    # cache" and must survive the structural reconcile
+                    # exactly as the incremental op path writes it.
+                    # Issue #1518.
+                    _rec_ttl = rec.get("ttl")
+                    _zone_ttl = zone.get("ttl")
                     records.append(
                         {
                             "domain": name,
                             "type": rtype,
-                            "ttl": rec.get("ttl") or zone.get("ttl") or 3600,
+                            "ttl": (
+                                _rec_ttl
+                                if _rec_ttl is not None
+                                else (_zone_ttl if _zone_ttl is not None else 3600)
+                            ),
                             **_record_params(rtype, rec.get("value") or "", rec),
                         }
                     )

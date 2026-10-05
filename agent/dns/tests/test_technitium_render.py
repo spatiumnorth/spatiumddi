@@ -98,6 +98,40 @@ def test_record_params_mx_default_priority() -> None:
     assert _record_params("MX", "mail.example.com.", {})["preference"] == 10
 
 
+def test_record_params_mx_zero_priority_is_preserved() -> None:
+    # #1518: preference 0 is a real value (highest priority), not "unset".
+    assert _record_params("MX", "mail.example.com.", {"priority": 0}) == {
+        "exchange": "mail.example.com",
+        "preference": 0,
+    }
+
+
+def test_render_preserves_record_ttl_zero(tmp_path: Path) -> None:
+    # #1518: a TTL of 0 ("never cache") must not be rewritten to the
+    # zone TTL by the structural render.
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle = {
+        "zones": [
+            {
+                "name": "example.com.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [
+                    {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 0},
+                    {"name": "mail", "type": "A", "value": "10.0.0.2"},
+                ],
+            }
+        ]
+    }
+    d.render(bundle)
+    import json
+
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    by_domain = {r["domain"]: r for r in payload[0]["records"]}
+    assert by_domain["www.example.com"]["ttl"] == 0
+    assert by_domain["mail.example.com"]["ttl"] == 3600
+
+
 def test_record_params_srv() -> None:
     rec = {"priority": 10, "weight": 20, "port": 5060}
     assert _record_params("SRV", "sip.example.com.", rec) == {
