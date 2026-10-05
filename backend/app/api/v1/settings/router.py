@@ -3057,6 +3057,38 @@ class AuditTargetBody(BaseModel):
             raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
         return v
 
+    @model_validator(mode="after")
+    def _valid_kind_config(self) -> AuditTargetBody:
+        # Per-kind completeness (#1581), mirroring the legacy
+        # flat-settings validators below. Without this a host-less
+        # syslog / URL-less webhook target was saved enabled, then
+        # silently skipped by ``audit_forward._load_targets``, and an
+        # SMTP target with no recipients warned on every audit row.
+        if self.kind == "syslog":
+            if not self.host.strip():
+                raise ValueError("host is required for a syslog target")
+            if not (1 <= self.port <= 65535):
+                raise ValueError("port must be 1–65535")
+            if not (0 <= self.facility <= 23):
+                raise ValueError("facility must be 0–23 (RFC 5424)")
+        elif self.kind == "webhook":
+            # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
+            # so only an explicit blank is refused here. A webhook with no
+            # URL at all is caught by ``_require_webhook_url``.
+            if self.url is not None and not self.url.strip():
+                raise ValueError("url is required for a webhook target")
+        elif self.kind == "smtp":
+            if not self.smtp_host.strip():
+                raise ValueError("smtp_host is required for an smtp target")
+            if not (1 <= self.smtp_port <= 65535):
+                raise ValueError("smtp_port must be 1–65535")
+            if not self.smtp_from_address.strip():
+                raise ValueError("smtp_from_address is required for an smtp target")
+            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
+            if not recipients:
+                raise ValueError("smtp_to_addresses must contain at least one recipient")
+        return self
+
 
 class AuditTargetResponse(BaseModel):
     id: str
@@ -3153,6 +3185,17 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.resource_types = body.resource_types
 
 
+def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
+    """Refuse a webhook target that would end up with no URL (#1581).
+
+    The body validator can't see the stored value, and an omitted ``url``
+    means "keep it", so this runs in the handler: on create there is
+    nothing to keep, on update there is only if the row already has one.
+    """
+    if body.kind == "webhook" and body.url is None and stored is None:
+        raise HTTPException(status_code=422, detail="url is required for a webhook target")
+
+
 def _save_error(exc: Exception, body: AuditTargetBody) -> str:
     """The reason a save failed, without the statement's bound parameters.
 
@@ -3163,6 +3206,63 @@ def _save_error(exc: Exception, body: AuditTargetBody) -> str:
     """
     reason = str(getattr(exc, "orig", None) or exc)
     return redact(reason, body.url or "", body.auth_header or "", body.smtp_password or "")
+
+
+def _forward_snapshot(t: AuditForwardTarget) -> dict:
+    """Audit snapshot of an audit-forward target.
+
+    Never carries the webhook URL, ``auth_header`` or SMTP password
+    (nor the CA cert) — only ``*_set`` booleans for those, per #1502 /
+    PR #1506: the audit log must not become a copy of the secrets it
+    describes.
+    """
+    return {
+        "name": t.name,
+        "enabled": t.enabled,
+        "kind": t.kind,
+        "format": t.format,
+        "host": t.host,
+        "port": t.port,
+        "protocol": t.protocol,
+        "facility": t.facility,
+        "ca_cert_pem_set": bool(t.ca_cert_pem),
+        "url_set": t.url_encrypted is not None,
+        "auth_header_set": t.auth_header_encrypted is not None,
+        "webhook_flavor": t.webhook_flavor,
+        "smtp_host": t.smtp_host,
+        "smtp_port": t.smtp_port,
+        "smtp_security": t.smtp_security,
+        "smtp_username": t.smtp_username,
+        "smtp_password_set": bool(t.smtp_password_encrypted),
+        "smtp_from_address": t.smtp_from_address,
+        "smtp_to_addresses": list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        "smtp_reply_to": t.smtp_reply_to,
+        "min_severity": t.min_severity,
+        "resource_types": t.resource_types,
+    }
+
+
+def _audit_forward_target(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: AuditForwardTarget,
+    old_value: dict | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="audit_forward_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            old_value=old_value,
+            new_value=None if action == "delete" else _forward_snapshot(row),
+        )
+    )
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
@@ -3184,9 +3284,12 @@ async def create_audit_target(
     forbid_in_demo_mode("Audit-forward target creation is disabled")
     if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    _require_webhook_url(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
+    await db.flush()
+    _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
@@ -3213,7 +3316,10 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    _require_webhook_url(body, row.url_encrypted)
+    old_value = _forward_snapshot(row)
     _apply_body(row, body)
+    _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -3232,6 +3338,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
+    _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
 
@@ -3308,10 +3415,15 @@ async def test_audit_target(
         "resource_types": None,
     }
     try:
-        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        outcome = await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
         reason = redact(str(exc), url, auth_header, smtp_password)
         raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
+    if outcome != audit_forward_svc.DELIVERED:
+        # #1577: a filtered target, a misconfigured one, or a rejected
+        # webhook used to report "ok" here because delivery was merely
+        # attempted.
+        raise HTTPException(status_code=502, detail=f"delivery failed: {outcome}")
     return {"status": "ok", "target": row.name}
 
 

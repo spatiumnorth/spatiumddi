@@ -248,16 +248,55 @@ async def test_an_update_without_the_secrets_keeps_them(
     assert url_ct and decrypt_str(url_ct) == _SLACK
 
 
+async def test_a_webhook_target_cannot_end_up_without_a_url(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An omitted URL keeps the stored one, but a webhook still needs one (#1581)."""
+    headers = await _admin(db_session)
+    body = _webhook_body()
+    created = (await client.post(_TARGETS, headers=headers, json=body)).json()
+    edit = {k: v for k, v in body.items() if k not in ("url", "auth_header")}
+
+    resp = await client.put(
+        f"{_TARGETS}/{created['id']}", headers=headers, json={**edit, "url": ""}
+    )
+    assert resp.status_code == 422, resp.text
+    url_ct, _ = await _raw(db_session, created["id"])
+    assert url_ct and decrypt_str(url_ct) == _GENERIC
+
+    # A syslog target switched to webhook has no URL to keep.
+    syslog = await client.post(
+        _TARGETS,
+        headers=headers,
+        json={"name": "siem", "kind": "syslog", "host": "siem.example.test"},
+    )
+    assert syslog.status_code == 201, syslog.text
+    resp = await client.put(
+        f"{_TARGETS}/{syslog.json()['id']}",
+        headers=headers,
+        json={"name": "siem", "kind": "webhook"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
 async def test_a_failed_save_does_not_echo_the_secrets(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """SQLAlchemy's error text lists every bound parameter of the INSERT."""
+    """SQLAlchemy's error text lists every bound parameter of the statement.
+
+    A create flushes before writing its audit row, so a duplicate name there
+    surfaces as the generic 409 and never reaches ``_save_error``; an update
+    fails at commit, and its message is built here.
+    """
     headers = await _admin(db_session)
     body = _webhook_body()
     assert (await client.post(_TARGETS, headers=headers, json=body)).status_code == 201
-    resp = await client.post(_TARGETS, headers=headers, json=body)  # same name
+
+    other = await client.post(_TARGETS, headers=headers, json={**body, "name": "other"})
+    assert other.status_code == 201, other.text
+    resp = await client.put(f"{_TARGETS}/{other.json()['id']}", headers=headers, json=body)
     assert resp.status_code == 400, resp.text
-    assert "create failed" in resp.text
+    assert "update failed" in resp.text
     assert "t0kenInPath" not in resp.text and "hdr-fixture" not in resp.text
     assert "[parameters:" not in resp.text
 

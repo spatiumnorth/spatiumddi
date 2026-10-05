@@ -76,3 +76,41 @@ def test_stop_already_gone_pid_blanks_config(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(ra.os, "kill", _raise)
     ra.apply_radvd("")  # process already dead → treated as stopped
     assert cfg.read_text() == ""
+
+
+def test_failed_validation_leaves_live_file_untouched(monkeypatch, tmp_path) -> None:
+    """GHSA-6235-5gh6-4hr2: a rejected config must never replace a working one."""
+    cfg, pidfile = _env(monkeypatch, tmp_path)
+    cfg.write_text("interface eth0 { AdvSendAdvert on; };\n")
+    pidfile.write_text("5\n")
+    killed: list = []
+    monkeypatch.setattr(ra.os, "kill", lambda *a: killed.append(a))
+    monkeypatch.setattr(ra, "_validate", lambda path: False)
+
+    ra.apply_radvd("interface eth0 { BOGUS; };\n")
+
+    assert cfg.read_text() == "interface eth0 { AdvSendAdvert on; };\n"
+    assert killed == []
+    assert [p.name for p in tmp_path.iterdir() if p.name != "radvd.pid"] == [
+        "radvd.conf"
+    ]
+
+
+def test_valid_config_is_swapped_in_and_reloaded(monkeypatch, tmp_path) -> None:
+    cfg, pidfile = _env(monkeypatch, tmp_path)
+    cfg.write_text("old\n")
+    pidfile.write_text("5\n")
+    seen: list[str] = []
+
+    def fake_validate(path) -> bool:
+        seen.append(path.read_text())
+        assert path != cfg  # validated while still staged
+        return True
+
+    killed: list = []
+    monkeypatch.setattr(ra, "_validate", fake_validate)
+    monkeypatch.setattr(ra.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    ra.apply_radvd("new\n")
+    assert seen == ["new\n"]
+    assert cfg.read_text() == "new\n"
+    assert killed == [(5, signal.SIGHUP)]

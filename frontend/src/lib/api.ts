@@ -10312,7 +10312,9 @@ export type AlertRuleType =
   | "dhcp_pool_exhaustion"
   | "secret_expiring"
   | "decom_expiring"
-  | "node_pressure";
+  | "node_pressure"
+  | "backup_failed"
+  | "backup_stale";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
