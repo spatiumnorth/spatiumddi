@@ -477,3 +477,47 @@ async def test_seed_alert_rule_idempotent(monkeypatch: pytest.MonkeyPatch) -> No
     await upgrade_alerts.seed_cluster_upgrade_failed_alert_rule()
     assert session2.added == []
     assert session2.committed is False
+
+
+@pytest.mark.asyncio
+async def test_emit_alert_delivers_to_forward_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1576 — the upgrade-failed event must reach forward targets,
+    not just the in-app alerts page."""
+    from app.services import alerts as alert_service
+    from app.services import audit_forward
+
+    rule = _FakeRule()
+    rule.notify_syslog = True  # type: ignore[attr-defined]
+    rule.notify_webhook = True  # type: ignore[attr-defined]
+    rule.notify_smtp = True  # type: ignore[attr-defined]
+    run = _FakeRun()
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=rule)
+    db.add = MagicMock()
+    db.flush = AsyncMock()
+
+    async def _fake_load() -> list[dict]:
+        return [{"name": "stub", "kind": "syslog"}]
+
+    seen: dict[str, Any] = {}
+
+    async def _fake_deliver(r: object, event: object, targets: list) -> tuple[bool, bool, bool]:
+        seen["targets"] = targets
+        return True, False, False
+
+    monkeypatch.setattr(audit_forward, "_load_targets", _fake_load)
+    monkeypatch.setattr(alert_service, "_deliver", _fake_deliver)
+
+    evt = await upgrade_alerts.emit_upgrade_failed_alert(
+        db,
+        run,  # type: ignore[arg-type]
+        failed_node="node-a",
+        failed_at_step="drain",
+        category=upgrade_alerts.CATEGORY_DRAIN_STUCK,
+    )
+    assert evt is not None
+    assert seen["targets"] == [{"name": "stub", "kind": "syslog"}]
+    assert evt.delivered_syslog is True
+    assert evt.delivered_webhook is False

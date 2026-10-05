@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
@@ -135,6 +135,14 @@ class AlertRuleCreate(BaseModel):
                 f"{', '.join(sorted(alert_service.COMPLIANCE_CHANGE_SCOPES))}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _v_compliance_requires_classification(self) -> AlertRuleCreate:
+        # #1580 — a compliance_change rule without a classification
+        # can never fire; the evaluator just warned every tick.
+        if self.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not self.classification:
+            raise ValueError("classification is required for compliance_change rules")
+        return self
 
 
 class AlertRuleUpdate(BaseModel):
@@ -330,6 +338,18 @@ async def update_rule(
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
+    # #1580 — reject an update that leaves a compliance_change rule
+    # without a classification (e.g. explicitly clearing it); such a
+    # rule can never fire. rule_type isn't updatable, so check the
+    # stored type against the merged classification.
+    effective_classification = (
+        body.classification if "classification" in body.model_fields_set else rule.classification
+    )
+    if rule.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not effective_classification:
+        raise HTTPException(
+            status_code=422,
+            detail="classification is required for compliance_change rules",
+        )
     changed: dict[str, Any] = {}
     for field, value in body.model_dump(exclude_unset=True).items():
         old = getattr(rule, field)
