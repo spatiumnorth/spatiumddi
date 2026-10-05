@@ -26,6 +26,7 @@ from app.services.kubernetes.client import KubernetesClient, KubernetesClientErr
 from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError
 from app.services.proxmox.client import ProxmoxClient, ProxmoxClientError
 from app.services.tailscale.client import TailscaleClient, TailscaleClientError
+from app.services.unifi.client import UnifiClient, UnifiClientConfig, UnifiClientError
 
 
 def _stub_get(client: Any, value: Any) -> None:
@@ -62,6 +63,59 @@ async def test_k8s_empty_cluster_is_legitimate() -> None:
 @pytest.mark.parametrize("body", [{}, {"items": None}, {"kind": "Status"}, []])
 async def test_k8s_wrong_shape_200_raises(body: Any) -> None:
     client = _k8s_with_body(body)
+    with pytest.raises(KubernetesClientError):
+        await client.list_nodes()
+
+
+# ── Kubernetes pagination (#1560) ─────────────────────────────────────
+
+
+def _k8s_paged(pages: list[tuple[int, Any]]) -> KubernetesClient:
+    """Mock transport serving ``pages`` in request order."""
+    client = KubernetesClient(api_server_url="https://k8s.test", token="t")
+    calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        status, body = pages[len(calls) - 1]
+        return httpx.Response(status, json=body)
+
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://k8s.test"
+    )
+    client._calls = calls  # type: ignore[attr-defined]
+    return client
+
+
+@pytest.mark.asyncio
+async def test_k8s_list_follows_continue_token_until_empty() -> None:
+    node = {"metadata": {"name": "n1"}, "status": {"addresses": [], "conditions": []}}
+    node2 = {"metadata": {"name": "n2"}, "status": {"addresses": [], "conditions": []}}
+    client = _k8s_paged(
+        [
+            (200, {"items": [node], "metadata": {"continue": "tok-1"}}),
+            (200, {"items": [node2], "metadata": {"continue": ""}}),
+        ]
+    )
+    out = await client.list_nodes()
+    assert [n.name for n in out] == ["n1", "n2"]
+    calls = client._calls  # type: ignore[attr-defined]
+    assert len(calls) == 2
+    assert calls[0].url.params.get("continue") is None
+    assert calls[1].url.params.get("continue") == "tok-1"
+
+
+@pytest.mark.asyncio
+async def test_k8s_paging_failure_midway_raises_instead_of_partial_list() -> None:
+    # 410 Gone = expired continue token. The reconcile must abort, not
+    # prune everything past page one against a partial list.
+    node = {"metadata": {"name": "n1"}, "status": {"addresses": [], "conditions": []}}
+    client = _k8s_paged(
+        [
+            (200, {"items": [node], "metadata": {"continue": "tok-1"}}),
+            (410, {"kind": "Status", "reason": "Expired"}),
+        ]
+    )
     with pytest.raises(KubernetesClientError):
         await client.list_nodes()
 
