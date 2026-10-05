@@ -555,7 +555,15 @@ class AzureDNSDriver(CloudDNSDriverBase):
         return params
 
     # ── Zone write ───────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         client = self._client(creds)
         rg = self._resource_group(creds)
         zone_label = _zone_label(getattr(zone, "name", ""))

@@ -77,15 +77,20 @@ the formatter handles the rest.
 ### Fixed
 
 - **Cloud DNS zone creates and deletes no longer duplicate or wedge
-  (#1527, #1528, #1534).** Creating a Route 53 zone that already
-  exists in the account now adopts it instead of minting a second
-  hosted zone, and the `CallerReference` is derived from the zone
-  row and name so AWS deduplicates a retried create. Deleting a
-  populated Route 53 or Google Cloud DNS zone empties it first
-  (every record set except SOA and apex NS, in batches) instead of
-  failing with `HostedZoneNotEmpty` / `containerNotEmpty`, and a
-  zone that is already absent counts as deleted, so permanent
-  delete, the trash purge and zone moves can complete. An Azure
+  (#1527, #1528, #1534).** Creating a Route 53 zone whose name
+  already exists in the account is refused with a conflict error
+  naming the existing hosted zone id and pointing at **Import
+  existing zones** — SpatiumDDI never silently adopts a zone it did
+  not create; a retried create of the same zone row still dedupes
+  via the deterministic `CallerReference`. Deleting a populated
+  Route 53 or Google Cloud DNS zone first removes only the records
+  SpatiumDDI manages (those in its DB) instead of failing with
+  `HostedZoneNotEmpty` / `containerNotEmpty`; records the provider
+  holds that SpatiumDDI never managed are left untouched, and if
+  they block the provider-side delete that refusal now surfaces
+  instead of the records being silently wiped. A zone that is
+  already absent counts as deleted, so permanent delete, the trash
+  purge and zone moves can complete. An Azure
   DNS server now requires all five credential fields, including
   `resource_group`, at save time and in the driver: a missing field
   is a named error instead of a raw `KeyError`, and zone listing
