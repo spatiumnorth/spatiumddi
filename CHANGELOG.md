@@ -76,6 +76,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Update endpoints handle explicit nulls consistently (#1564,
+  #1563).** Sending `null` for a NOT NULL field on domain, ASN,
+  circuit, router or VLAN updates used to reach Postgres and come
+  back as a 500; it is now a 422 naming the fields, via a shared
+  `resolve_update_changes` helper that separates "field absent"
+  from "clear this nullable column" from "null for a NOT NULL
+  column". And where an explicit null was previously ignored — so
+  the UI's "clear" silently did nothing — it now clears: DHCP pool,
+  static and phone-profile fields, DNS group/server/view/zone/record
+  fields, blocklist `feed_url`/`sinkhole_ip`, blocklist-entry
+  target, and pool `hc_target_port`.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
