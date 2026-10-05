@@ -279,10 +279,24 @@ class ScpDestination(BackupDestination):
                     except OSError:
                         pass  # didn't exist
                     sftp.rename(tmp, remote)
+                except Exception as exc:  # noqa: BLE001
+                    # Best-effort cleanup of the staged file (#1570),
+                    # mirroring the NFS driver: listing and retention
+                    # only match ``*.zip``, so a leftover ``.tmp`` is
+                    # invisible and is never pruned.
+                    try:
+                        sftp.remove(tmp)
+                    except FileNotFoundError:
+                        pass  # the failure predates the staged file
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        logger.warning(
+                            "scp_partial_cleanup_failed",
+                            path=tmp,
+                            error=str(cleanup_exc),
+                        )
+                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
                 finally:
                     sftp.close()
-            except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
             finally:
                 client.close()
 
