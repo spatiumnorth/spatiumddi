@@ -277,9 +277,7 @@ async def test_step_drain_refuses_controllerless_pods(monkeypatch: pytest.Monkey
     assert step.ok is False
     assert "no controller owner" in step.error
     assert step.detail["unowned_pods"] == ["default/debug-pod"]
-    assert step.detail["blocked"] == [
-        {"pod": "default/debug-pod", "reason": "no controller owner"}
-    ]
+    assert step.detail["blocked"] == [{"pod": "default/debug-pod", "reason": "no controller owner"}]
     # The bare pod was never evicted.
     assert ("debug-pod", "default") not in evictions
 
@@ -790,9 +788,7 @@ async def test_single_node_upgrade_releases_node_on_post_cordon_failure(
     assert release.ok is True
     assert release.detail["maintenance_window_cleared"] is True
     un.assert_called_once_with("node-1")
-    mw.assert_called_once_with(
-        "pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium"
-    )
+    mw.assert_called_once_with("pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium")
 
 
 @pytest.mark.asyncio

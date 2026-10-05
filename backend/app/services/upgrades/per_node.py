@@ -399,9 +399,7 @@ async def _step_drain(
                 evicted_count=len(set(evicted)),
                 evicted=list(set(evicted)),
                 unowned_pods=sorted(unowned),
-                blocked=[
-                    {"pod": p, "reason": "no controller owner"} for p in sorted(unowned)
-                ],
+                blocked=[{"pod": p, "reason": "no controller owner"} for p in sorted(unowned)],
             )
 
         if not candidates:
@@ -708,9 +706,7 @@ async def _step_release_node(
     )
     ok, err = k8s.uncordon_node(node_name)
     if not ok:
-        return step.finish(
-            False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
-        )
+        return step.finish(False, error=f"compensating uncordon failed: {err}", uncordon_ok=False)
     if not (clear_window and cluster_name):
         return step.finish(True, uncordon_ok=True, maintenance_window_clear_skipped=True)
     ok, err = k8s.patch_cnpg_maintenance_window(
