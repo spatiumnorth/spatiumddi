@@ -24,6 +24,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.backup import restore
 from app.services.backup import runner as runner_mod
@@ -193,3 +194,119 @@ def test_latest_download_skips_safety_dumps() -> None:
     src = inspect.getsource(api_targets.download_latest_target_archive)
     assert "is_pre_restore_archive" in src
     assert src.index("is_pre_restore_archive") < src.index("newest = real_archives[0]")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# #1571 — concurrency guards + collision-proof names
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def test_claim_stamps_in_progress_once(db_session: AsyncSession) -> None:
+    target = _retention_target(last_run_status="success")
+    db_session.add(target)
+    await db_session.flush()
+
+    started = datetime.now(UTC)
+    assert await runner_mod.claim_backup_run(db_session, target=target, started=started) is True
+    assert target.last_run_status == "in_progress"
+    assert target.last_run_at is not None
+
+    # A second claim — Run Now racing the sweep — loses atomically.
+    assert await runner_mod.claim_backup_run(db_session, target=target, started=started) is False
+    assert target.last_run_status == "in_progress"
+
+
+async def test_runner_refuses_a_target_already_in_progress(db_session: AsyncSession) -> None:
+    target = _retention_target(last_run_status="in_progress", last_run_at=datetime.now(UTC))
+    db_session.add(target)
+    await db_session.flush()
+
+    with pytest.raises(runner_mod.BackupRunBusyError):
+        await runner_mod.run_backup_for_target(db_session, target=target, triggered_by="manual")
+
+
+class _LockResult:
+    def __init__(self, value: bool) -> None:
+        self._value = value
+
+    def scalar_one(self) -> bool:
+        return self._value
+
+
+class _LockSession:
+    """Minimal session stub recording the advisory-lock SQL."""
+
+    def __init__(self, acquired: bool) -> None:
+        self._acquired = acquired
+        self.statements: list[str] = []
+
+    async def execute(self, stmt, params=None):  # type: ignore[no-untyped-def]
+        self.statements.append(str(stmt))
+        return _LockResult(self._acquired)
+
+    async def commit(self) -> None:
+        return None
+
+
+async def test_restore_refuses_when_the_advisory_lock_is_held(monkeypatch) -> None:
+    async def _inner_must_not_run(db, **kwargs):  # pragma: no cover — tripwire
+        raise AssertionError("restore body ran without the advisory lock")
+
+    monkeypatch.setattr(restore, "_apply_backup_restore_inner", _inner_must_not_run)
+    session = _LockSession(acquired=False)
+    with pytest.raises(BackupRestoreError, match="already in progress"):
+        await restore.apply_backup_restore(
+            session,
+            archive_bytes=b"zip",
+            passphrase="hunter2hunter2",
+            confirmation_phrase=restore.CONFIRM_PHRASE,
+            db_url="postgresql+asyncpg://u:p@h:5432/db",
+        )
+    assert any("pg_try_advisory_lock" in s for s in session.statements)
+
+
+async def test_restore_releases_the_advisory_lock(monkeypatch) -> None:
+    sentinel = object()
+
+    async def _inner(db, **kwargs):
+        return sentinel
+
+    monkeypatch.setattr(restore, "_apply_backup_restore_inner", _inner)
+    session = _LockSession(acquired=True)
+    out = await restore.apply_backup_restore(
+        session,
+        archive_bytes=b"zip",
+        passphrase="hunter2hunter2",
+        confirmation_phrase=restore.CONFIRM_PHRASE,
+        db_url="postgresql+asyncpg://u:p@h:5432/db",
+    )
+    assert out is sentinel
+    assert any("pg_advisory_unlock" in s for s in session.statements)
+
+
+async def test_two_safety_dumps_in_one_second_do_not_collide(tmp_path, monkeypatch) -> None:
+    """Same-second restores used to share one filename, the second
+    overwriting the first's rollback copy via an overwriting write."""
+
+    async def _fake_build(db, *, passphrase, passphrase_hint):
+        return b"zipbytes", "x.zip"
+
+    monkeypatch.setattr(restore, "PRE_RESTORE_DIR", tmp_path)
+    monkeypatch.setattr(restore, "build_backup_archive", _fake_build)
+    first = await restore._write_pre_restore_safety_dump(None)
+    second = await restore._write_pre_restore_safety_dump(None)
+    assert first is not None and second is not None
+    assert first != second
+    from pathlib import Path
+
+    assert Path(first).is_file() and Path(second).is_file()
+
+
+def test_archive_filename_carries_a_random_suffix() -> None:
+    import inspect
+
+    from app.services.backup import archive as archive_mod
+
+    src = inspect.getsource(archive_mod.build_backup_archive)
+    assert "token_hex" in src
+    assert 'f"spatiumddi-backup-{safe_host}-{timestamp}-' in src

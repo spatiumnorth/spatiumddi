@@ -9,7 +9,9 @@ sweep.
 State machine on the row:
 
 * Pre-run → ``last_run_status = "in_progress"``, all other
-  ``last_run_*`` cleared. Stamp committed before the destination
+  ``last_run_*`` cleared — via ONE atomic conditional UPDATE
+  (:func:`claim_backup_run`, #1571), so two callers cannot both
+  claim the same target. Stamp committed before the destination
   write so a stuck driver can't leave the row in ambiguous state.
 * On success → ``last_run_status = "success"``, filename / bytes
   / duration_ms populated, ``last_run_error = NULL``,
@@ -28,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
@@ -49,6 +52,63 @@ from app.services.backup.targets import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class BackupRunBusyError(Exception):
+    """Another run already holds this target's ``in_progress`` claim.
+
+    Raised by :func:`run_backup_for_target` when its atomic claim
+    loses the race (#1571). Callers translate it: Run Now answers
+    409, the schedule sweep counts a skip. Distinct from a run
+    *failure* — nothing was attempted, so nothing is stamped and no
+    audit row is written.
+    """
+
+
+async def claim_backup_run(
+    db: AsyncSession,
+    *,
+    target: BackupTarget,
+    started: datetime,
+) -> bool:
+    """Atomically claim ``target`` for a run: one conditional UPDATE
+    that stamps ``in_progress`` only when the row is not already
+    claimed (#1571).
+
+    The old shape — read the status, decide, stamp, commit — let two
+    callers (Run Now double-clicked, Run Now racing the sweep) both
+    read "not running" and both run, interleaving writes to the same
+    destination filename. Here the WHERE is evaluated against the
+    committed row under its lock: concurrent claimers serialise, and
+    exactly one gets the row back. Mirrors the WOL scheduler's claim
+    (#533). On a lost race the session is rolled back — reading the
+    target's attributes afterwards would otherwise trip a lazy
+    refresh on expired state.
+    """
+    claimed_id = (
+        await db.execute(
+            update(BackupTarget)
+            .where(
+                BackupTarget.id == target.id,
+                BackupTarget.last_run_status != "in_progress",
+            )
+            .values(
+                last_run_status="in_progress",
+                last_run_at=started,
+                last_run_filename=None,
+                last_run_bytes=None,
+                last_run_duration_ms=None,
+                last_run_error=None,
+            )
+            .returning(BackupTarget.id)
+        )
+    ).scalar_one_or_none()
+    if claimed_id is None:
+        await db.rollback()
+        return False
+    await db.commit()
+    await db.refresh(target)
+    return True
 
 
 def _decrypt_passphrase(target: BackupTarget) -> str:
@@ -185,16 +245,14 @@ async def run_backup_for_target(
 
     Returns a result dict the caller can render straight to the
     UI: ``{success, filename, bytes, duration_ms, error, deleted}``.
+
+    The run is claimed atomically first (:func:`claim_backup_run`);
+    a target already ``in_progress`` raises
+    :class:`BackupRunBusyError` rather than running twice (#1571).
     """
     started = datetime.now(UTC)
-    target.last_run_status = "in_progress"
-    target.last_run_at = started
-    target.last_run_filename = None
-    target.last_run_bytes = None
-    target.last_run_duration_ms = None
-    target.last_run_error = None
-    await db.commit()
-    await db.refresh(target)
+    if not await claim_backup_run(db, target=target, started=started):
+        raise BackupRunBusyError(f"backup target {target.name!r} already has a run in progress")
 
     result: dict[str, Any] = {
         "success": False,

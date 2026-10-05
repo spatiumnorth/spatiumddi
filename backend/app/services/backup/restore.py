@@ -47,12 +47,14 @@ import asyncio
 import os
 import secrets
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
+from sqlalchemy import text
 
 from app.services.backup.archive import (
     BackupArchiveError,
@@ -623,14 +625,20 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
+    # Random suffix + O_EXCL (#1571): the name had one-second
+    # resolution and was written with an overwriting write, so two
+    # restores in the same second overwrote the FIRST rollback copy
+    # with the second — destroying exactly the copy the first
+    # restore might need. O_EXCL makes a residual collision fail
+    # this dump (soft-fail path below) instead of overwriting.
+    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}-{secrets.token_hex(3)}.zip"
     try:
         archive_bytes, _filename = await build_backup_archive(
             db,
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
@@ -701,7 +709,51 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-async def apply_backup_restore(
+#: Session-level Postgres advisory lock serialising restores (#1571).
+#: Neither restore endpoint took any lock, so two concurrent restores
+#: interleaved their schema clear and replay — each replaying over
+#: the other's half-cleared schema. Fixed key (this is a whole-install
+#: operation, there is only ever one restore at a time), derived from
+#: a label rather than hand-picked so it cannot collide with the
+#: crc32-based per-resource keys elsewhere by accident.
+_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+
+
+async def apply_backup_restore(db, **kwargs: Any) -> RestoreOutcome:
+    """Restore under the install-wide advisory lock (#1571).
+
+    ``pg_try_advisory_lock`` is non-blocking on purpose: a second
+    restore is refused immediately with an operator-readable error
+    rather than queued behind a replay that disposes the connection
+    pool mid-flight. The lock is session-level, held on ``db``'s
+    connection; Phase 4 of the restore disposes the whole pool,
+    which releases it on the success path, and the ``finally`` below
+    releases it on every path that gets there first. A process that
+    dies mid-restore releases it with its connection — it cannot
+    wedge restores the way a row-based mutex could.
+    """
+    if db is None:  # unit tests drive the phases with stubs
+        return await _apply_backup_restore_inner(db, **kwargs)
+    acquired = (
+        await db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _RESTORE_LOCK_KEY})
+    ).scalar_one()
+    if not acquired:
+        raise BackupRestoreError(
+            "another restore is already in progress on this install — "
+            "wait for it to finish before starting a second one"
+        )
+    await db.commit()
+    try:
+        return await _apply_backup_restore_inner(db, **kwargs)
+    finally:
+        try:
+            await db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _RESTORE_LOCK_KEY})
+            await db.commit()
+        except Exception:  # noqa: BLE001 — pool disposal releases it anyway
+            logger.debug("backup_restore_advisory_unlock_failed", exc_info=True)
+
+
+async def _apply_backup_restore_inner(
     db,
     *,
     archive_bytes: bytes,

@@ -8,9 +8,10 @@ itself recomputes ``next_run_at`` after the run lands so the row
 won't fire twice in the same tick.
 
 Per-target dispatch is mutexed by ``last_run_status =
-"in_progress"`` — the runner stamps that on entry, so a slow
-target whose backup spans more than one tick won't double up.
-The sweep skips rows already in_progress.
+"in_progress"`` — the runner claims that state with one atomic
+conditional UPDATE on entry (#1571), so a slow target whose backup
+spans more than one tick won't double up, and neither can a Run Now
+racing this sweep. The sweep skips rows already in_progress.
 
 The sweep is its own task module so it can opt out via a
 platform-settings toggle later (Phase 1c) — for now it fires
@@ -29,7 +30,7 @@ from sqlalchemy import select
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.backup import BackupTarget
-from app.services.backup.runner import run_backup_for_target
+from app.services.backup.runner import BackupRunBusyError, run_backup_for_target
 
 logger = structlog.get_logger(__name__)
 
@@ -66,6 +67,13 @@ async def _sweep() -> dict[str, int]:
                     actor_display="system (schedule)",
                 )
                 fired += 1
+            except BackupRunBusyError:
+                # Lost the claim race to a concurrent Run Now / sweep
+                # (#1571). The pre-check above is only a filter; the
+                # runner's atomic claim is the authority, and losing
+                # it is a skip, not an error.
+                skipped_in_progress += 1
+                continue
             except Exception as exc:  # noqa: BLE001
                 # ``run_backup_for_target`` already swallows its
                 # own driver / archive errors and persists a
