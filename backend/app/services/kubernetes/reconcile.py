@@ -54,7 +54,10 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
-from app.services.integration_ownership import owned_by_other_integration
+from app.services.integration_ownership import (
+    owned_by_other_integration,
+    subnet_has_surviving_addresses,
+)
 from app.services.kubernetes.client import (
     KubernetesClient,
     KubernetesClientError,
@@ -466,9 +469,16 @@ async def _apply_blocks_and_subnets(
     # owned NOT in here becomes a deletion candidate.
     used_wrapper_cidrs: set[str] = set()
 
-    # Deletes first: current subnets we no longer want.
+    # Deletes first: current subnets we no longer want. #1558: a blind
+    # delete cascades to every address in the subnet — un-claim instead
+    # when operator / foreign / operator-edited addresses survive in it,
+    # like the OPNsense reconciler does.
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
+            if await subnet_has_surviving_addresses(db, row.id, "kubernetes_cluster_id"):
+                row.kubernetes_cluster_id = None
+                summary.subnets_updated += 1
+                continue
             await db.delete(row)
             summary.subnets_deleted += 1
 

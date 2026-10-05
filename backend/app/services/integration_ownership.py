@@ -18,6 +18,13 @@ on any hand-written chain of these columns elsewhere in ``app/``.
 
 from __future__ import annotations
 
+import uuid
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.ipam import IPAddress
+
 # Ownership FK → the integration's name, as block-sync targets and the
 # block-move blockers report it.
 INTEGRATION_OWNERSHIP: dict[str, str] = {
@@ -58,9 +65,75 @@ def owned_by_other_integration(row: object, own_fk: str) -> bool:
     return any(getattr(row, fk) is not None for fk in INTEGRATION_OWNERSHIP if fk != own_fk)
 
 
+async def subnet_has_surviving_addresses(
+    db: AsyncSession, subnet_id: uuid.UUID, own_fk: str
+) -> bool:
+    """Whether deleting the subnet would cascade-delete addresses that are
+    not purely the caller's own (#1558).
+
+    ``IPAddress.subnet_id`` is ON DELETE CASCADE, so deleting a mirrored
+    ``Subnet`` takes every address in it with it — including operator
+    allocations, rows another integration owns, and the caller's own rows
+    an operator edited (``user_modified_at`` set), which the address pass
+    would otherwise un-claim and keep. A mirror whose upstream network
+    left the desired set must check here first and un-claim the subnet
+    (clear its own FK) instead of deleting it when this returns True.
+    The OPNsense and firewall-mirror reconcilers hand-rolled this check
+    first; every other mirror goes through here so the predicate can't
+    drift again.
+    """
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    survivor = or_(
+        IPAddress.user_modified_at.is_not(None),
+        getattr(IPAddress, own_fk).is_(None),
+        *(getattr(IPAddress, fk).is_not(None) for fk in INTEGRATION_OWNERSHIP if fk != own_fk),
+    )
+    count = await db.scalar(
+        select(func.count())
+        .select_from(IPAddress)
+        .where(IPAddress.subnet_id == subnet_id)
+        .where(survivor)
+    )
+    return bool(count)
+
+
+# Ownership FKs stamped on ``DNSRecord`` rows by a non-IPAM owner: the
+# three integration mirrors plus the DNS pool health-check pipeline.
+# IPAM's DNS drift sweep must never treat these rows as its own stale
+# output (#1554).
+DNS_RECORD_OWNER_FKS: tuple[str, ...] = (
+    "kubernetes_cluster_id",
+    "tailscale_tenant_id",
+    "netbird_instance_id",
+    "pool_member_id",
+)
+
+# ``DNSRecord.tags`` key marking a record as an ACME challenge TXT
+# (acme-dns provider or the DNS-01 client). ACME records are not IPAM
+# sync output — they have their own writers and janitor (#1554).
+ACME_RECORD_TAG = "acme_challenge"
+
+
+def dns_record_owned_elsewhere(record: object) -> bool:
+    """True if a ``DNSRecord`` belongs to something other than IPAM DNS
+    sync (#1554): an integration mirror's FK, the DNS pool pipeline, or
+    the ACME challenge marker. Such rows carry no ``ip_address_id``, so
+    the drift sweep's orphan query would otherwise report (and, with
+    auto-delete on, delete) them as stale IPAM output."""
+    if any(getattr(record, fk, None) is not None for fk in DNS_RECORD_OWNER_FKS):
+        return True
+    tags = getattr(record, "tags", None) or {}
+    return bool(tags.get(ACME_RECORD_TAG))
+
+
 __all__ = [
+    "ACME_RECORD_TAG",
+    "DNS_RECORD_OWNER_FKS",
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",
+    "dns_record_owned_elsewhere",
     "owned_by_other_integration",
     "owning_integration",
+    "subnet_has_surviving_addresses",
 ]
