@@ -100,7 +100,7 @@ def downgrade() -> None:
             # column as it was.
             continue
         conn.execute(
-            sa.text("UPDATE event_subscription SET headers = :value::jsonb WHERE id = :id"),
+            sa.text("UPDATE event_subscription SET headers = CAST(:value AS jsonb) WHERE id = :id"),
             {"value": json.dumps(headers), "id": row_id},
         )
     op.drop_column("event_subscription", "headers_encrypted")
