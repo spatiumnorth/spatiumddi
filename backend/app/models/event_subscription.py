@@ -58,8 +58,19 @@ class EventSubscription(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     event_types: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     # Optional custom headers (auth tokens, routing hints) merged in on
     # delivery. Keys with names colliding with the X-SpatiumDDI-* family
-    # are silently overridden by the publisher.
-    headers: Mapped[dict[str, str] | None] = mapped_column(JSONB, nullable=True)
+    # are silently overridden by the publisher. The whole dict is
+    # Fernet-encrypted at rest (#1579, mirroring #1506): the values are
+    # receiver credentials (``Authorization: Bearer …``), so they get the
+    # same treatment as ``secret_encrypted`` above — the API takes them
+    # write-only and returns header names plus a ``headers_set`` flag,
+    # never the values. Serialised with ``encrypt_dict`` /
+    # ``decrypt_dict`` (JSON, sorted keys), the same convention as
+    # ``auth_provider.secrets_encrypted``.
+    #
+    # The pre-#1579 plaintext ``headers`` JSONB column is still in the
+    # table, unmapped and unread, for one release, so a rolling
+    # upgrade's old pods keep working (#296). The next release drops it.
+    headers_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # Per-subscription HTTP timeout. The default (10s) is high enough to
     # let receivers do real work but low enough that one slow consumer
     # can't starve the worker. Min 1s, max 30s — clamped server-side.
