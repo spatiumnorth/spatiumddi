@@ -431,12 +431,14 @@ async def issue_certificate(
     db.add(order)
     await db.flush()
 
-    # Record the desired issuance shape so the deferred Phase-2 auto-renew
-    # task knows what to renew (these columns are populated here, consumed
-    # by that task).
-    settings.acme_challenge_type = body.challenge_type
-    settings.acme_dns_provider = body.dns_provider
-    settings.acme_domains = domains
+    # NOTE (#1529): the issuance shape is deliberately NOT recorded on
+    # ``platform_settings`` here. These settings used to be written at
+    # order *creation*, so a later issue attempt for different domains —
+    # even one that failed — changed what the active cert would be
+    # renewed for. The shape now lives on the order itself; the
+    # orchestrator copies it to settings only when an order SUCCEEDS,
+    # and the renewal sweep reads the per-certificate shape from the
+    # successful order that produced the cert.
 
     db.add(
         AuditLog(
