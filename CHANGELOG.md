@@ -76,6 +76,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Integration mirrors no longer treat a failed, refused or partial
+  fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
+  hazards of the same class: the UniFi client collapsed a wrong-shape
+  200 (proxy error page, envelope without `data`, `data: null`) to an
+  empty list for networks, clients and sites, and ignored in-band
+  legacy `meta.rc == "error"` failures, so one degraded response
+  deleted a site's — or the whole controller's — mirrored rows; it
+  now routes those reads through the shared `require_list` /
+  `require_keyed_list` guards and raises. The OPNsense mirror deleted
+  mirrored DHCP leases and reservations when a DHCP backend refused
+  the API user (403) while the reconciler merely warned; a refused
+  category's rows are now frozen for that pass (the all-404 absent-
+  backend case still deletes as before). The Proxmox mirror deleted
+  a running guest's addresses when its config fetch failed once, and
+  dropped stopped guests wholesale when their node was not online
+  with `include_stopped` armed; unreadable guests/nodes are now
+  counted on the reconcile summary and the address absence-delete
+  (and, for unread nodes, the subnet pass) is skipped for that pass.
+  The Kubernetes mirror read only the first 500 Services, Ingresses,
+  nodes and pods and pruned everything past page one; it now follows
+  the `metadata.continue` token to the end and raises — aborting the
+  reconcile — if paging fails midway.
+
 - **System alerts reach forward targets, compliance rules require a
   classification, audit-forward targets are validated, and conformity
   alerts survive the evaluator (#1576, #1578, #1580, #1581).**
