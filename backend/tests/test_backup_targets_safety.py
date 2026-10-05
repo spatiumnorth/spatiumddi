@@ -1,4 +1,4 @@
-"""Backup-target safety fixes (#1570 first; sibling sections follow).
+"""Backup-target safety fixes (#1568, #1569, #1570, #1572, #1573).
 
 Failed writes used to leave the staged ``<archive>.tmp`` behind on the
 FTP, SCP, SMB and local-volume drivers. Listing and retention only
@@ -7,18 +7,38 @@ match ``*.zip``, so those orphans were invisible and were never pruned
 next failure more likely (#1570). The NFS driver already cleaned its
 ``.part`` up; these tests pin the same behaviour for the other four.
 
+The remaining sections pin, per issue:
+
+* #1573 — the local-volume ``download`` refuses a symlink, matching
+  what its listing already does, instead of following it out of the
+  configured root;
+* #1572 — the restore helpers pass the allowlisted
+  ``_pg_subprocess_env`` to psql / pg_restore, not the full api
+  environment;
+* #1569 — the SCP driver's checked host-key modes can no longer be
+  configured with an empty host-key store (``strict`` rejected every
+  server, because no keys were ever loaded);
+* #1568 — restore refuses an archive whose database member declares
+  an uncompressed size past the cap before reading it, and the
+  secrets envelope refuses out-of-band PBKDF2 iteration counts and
+  wraps KDF / AES ``ValueError``\\ s as ``BackupCryptoError``.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import types
+import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from app.services.backup import archive as archive_mod
+from app.services.backup.crypto import BackupCryptoError, decrypt_secrets, encrypt_secrets
 from app.services.backup.targets.base import BackupDestinationError, DestinationConfigError
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.local_volume import LocalVolumeDestination
@@ -291,3 +311,65 @@ def test_scp_checked_modes_accept_supplied_known_hosts(mode: str):
 
 def test_scp_insecure_skip_needs_no_known_hosts():
     ScpDestination().validate_config({**_SCP_BASE, "host_key_check": "insecure_skip"})
+
+
+# ── #1568: archive size cap + envelope hardening ─────────────────────
+
+
+def _archive_bytes(dump: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps({"format": "spatiumddi-backup", "dump_format": "custom"}),
+        )
+        zf.writestr("database.dump", dump)
+        zf.writestr("secrets.enc", encrypt_secrets({"k": "v"}, passphrase="passphrase-1"))
+    return buf.getvalue()
+
+
+def test_extract_refuses_a_dump_member_past_the_size_cap(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(archive_mod, "_MAX_DUMP_MEMBER_BYTES", 4)
+    with pytest.raises(archive_mod.BackupArchiveError, match="exceeds"):
+        archive_mod.extract_archive_members(_archive_bytes(b"12345"))
+
+
+def test_extract_accepts_a_dump_member_under_the_size_cap():
+    manifest, db_bytes, dump_format, _secrets = archive_mod.extract_archive_members(
+        _archive_bytes(b"dump")
+    )
+    assert manifest["dump_format"] == "custom"
+    assert db_bytes == b"dump"
+    assert dump_format == "custom"
+
+
+def _envelope_with(**overrides: Any) -> bytes:
+    env = json.loads(encrypt_secrets({"k": "v"}, passphrase="passphrase-1"))
+    env.update(overrides)
+    return json.dumps(env).encode()
+
+
+@pytest.mark.parametrize("iterations", [0, 1, 99_999, 10_000_001, 10**12])
+def test_decrypt_refuses_out_of_band_iteration_counts(iterations: int):
+    # The count comes from the (untrusted) envelope; deriving at a
+    # declared 10**12 would pin the api CPU, and a count under the
+    # floor is not an envelope this build wrote.
+    with pytest.raises(BackupCryptoError, match="iterations"):
+        decrypt_secrets(_envelope_with(iterations=iterations), passphrase="passphrase-1")
+
+
+def test_decrypt_accepts_the_envelope_iteration_count():
+    payload = decrypt_secrets(_envelope_with(), passphrase="passphrase-1")
+    assert payload == {"k": "v"}
+
+
+def test_decrypt_wraps_a_malformed_nonce_as_crypto_error():
+    # A 1-byte nonce makes AESGCM raise ValueError, which used to
+    # escape decrypt_secrets and surface as a 500 on restore.
+    with pytest.raises(BackupCryptoError):
+        decrypt_secrets(_envelope_with(nonce="00"), passphrase="passphrase-1")
+
+
+def test_decrypt_wraps_a_malformed_salt_as_crypto_error():
+    with pytest.raises(BackupCryptoError):
+        decrypt_secrets(_envelope_with(salt="not-hex"), passphrase="passphrase-1")

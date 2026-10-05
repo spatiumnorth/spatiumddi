@@ -54,6 +54,19 @@ logger = structlog.get_logger(__name__)
 # top end); operators with bigger fleets need to revisit this.
 _PG_DUMP_TIMEOUT_SECONDS = 30 * 60
 
+# Ceiling on a backup archive as downloaded from a destination, in
+# compressed bytes — the same 2 GB the upload endpoints enforce
+# (``app.api.v1.backup.router._MAX_UPLOAD_BYTES``). Destination
+# downloads used to have no cap at all (#1568).
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+
+# Ceiling on the database member's DECLARED uncompressed size
+# (``ZipInfo.file_size``) that ``extract_archive_members`` will read
+# into memory (#1568). Same 20 GiB the restore drill allows a scratch
+# database (``SPATIUM_DRILL_MAX_DB_BYTES`` default): far above any
+# realistic dump, far below "crafted zip header OOMs the api".
+_MAX_DUMP_MEMBER_BYTES = 20 * 1024**3
+
 
 class BackupArchiveError(Exception):
     """Raised when archive building or reading fails for a reason
@@ -618,6 +631,18 @@ def extract_archive_members(
                 raise BackupArchiveError(
                     f"archive declares dump_format={dump_format!r} but "
                     f"member {dump_member!r} is missing"
+                )
+            # Refuse on the DECLARED size before inflating anything
+            # (#1568): the archive is untrusted until the passphrase
+            # check passes, and ``zf.read`` would materialise the
+            # whole member in memory — a crafted header is a zip bomb
+            # aimed at the api.
+            declared_size = zf.getinfo(dump_member).file_size
+            if declared_size > _MAX_DUMP_MEMBER_BYTES:
+                raise BackupArchiveError(
+                    f"archive's database member {dump_member!r} declares "
+                    f"{declared_size} bytes uncompressed, which exceeds the "
+                    f"{_MAX_DUMP_MEMBER_BYTES}-byte cap — refusing to read it"
                 )
             db_bytes = zf.read(dump_member)
             secrets_enc = zf.read("secrets.enc")

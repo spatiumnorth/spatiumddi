@@ -768,8 +768,12 @@ async def apply_backup_restore(
 
     # Phase 2: passphrase verify. Decrypt secrets.enc up front so
     # we fail with "wrong passphrase" before deleting anything.
+    # The PBKDF2 derivation is ~0.3 s of CPU by design; run it off
+    # the event loop so a restore can't stall the api (#1568).
     try:
-        secrets_payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        secrets_payload = await asyncio.to_thread(
+            decrypt_secrets, secrets_enc, passphrase=passphrase
+        )
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
 
