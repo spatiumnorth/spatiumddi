@@ -1093,7 +1093,7 @@ async def test_poll_public_txt_requires_every_authoritative_ns() -> None:
             new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
         ),
         patch.object(dns01, "_ns_host_ips", new=_ips),
-        patch.object(dns01, "_txt_values_at", new=_txt_complete) as txt_at,
+        patch.object(dns01, "_txt_values_at", new=AsyncMock(side_effect=_txt_complete)) as txt_at,
     ):
         assert await dns01.poll_public_txt(fqdn, "expected-token", timeout=5, interval=0) is True
     # Both authoritative servers were asked directly.
@@ -1198,6 +1198,10 @@ async def test_record_issuance_shape_copies_successful_order(
     await db_session.commit()
 
     await orchestrator._record_issuance_shape(db_session, order)
+    # ``_record_issuance_shape`` runs inside ``execute_order``'s unit of
+    # work; the caller commits. Commit here too, or ``expire_all``
+    # below discards the unflushed change and reloads the old row.
+    await db_session.commit()
 
     db_session.expire_all()
     settings = await db_session.get(PlatformSettings, 1)
