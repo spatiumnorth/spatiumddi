@@ -243,6 +243,47 @@ async def test_step_drain_timeout_reports_blocked(monkeypatch: pytest.MonkeyPatc
     assert step.detail["blocked"][0]["pod"] == "default/blocked"
 
 
+@pytest.mark.asyncio
+async def test_step_drain_refuses_controllerless_pods(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1546: a bare pod (no controller ownerReference) must never be
+    evicted — nothing re-creates it. The drain fails fast and lists
+    the pod as a blocker in the step detail instead of deleting it,
+    matching kubectl drain without --force."""
+    pods: list[dict[str, Any]] = [
+        {
+            "metadata": {"name": "debug-pod", "namespace": "default"},
+            "status": {"phase": "Running"},
+        },
+        {
+            "metadata": {
+                "name": "api-1",
+                "namespace": "spatium",
+                "ownerReferences": [{"kind": "ReplicaSet"}],
+            },
+            "status": {"phase": "Running"},
+        },
+    ]
+    evictions: list[tuple[str, str]] = []
+
+    def _evict(name: str, namespace: str, **_kw: Any) -> tuple[int, str | None]:
+        evictions.append((name, namespace))
+        return 200, None
+
+    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _n: list(pods))
+    monkeypatch.setattr(per_node.k8s, "evict_pod", _evict)
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+
+    step = await per_node._step_drain("node-1", timeout_s=5.0)
+    assert step.ok is False
+    assert "no controller owner" in step.error
+    assert step.detail["unowned_pods"] == ["default/debug-pod"]
+    assert step.detail["blocked"] == [
+        {"pod": "default/debug-pod", "reason": "no controller owner"}
+    ]
+    # The bare pod was never evicted.
+    assert ("debug-pod", "default") not in evictions
+
+
 # ── Step 7: trigger slot apply ───────────────────────────────────────
 
 
@@ -484,6 +525,60 @@ async def test_step_convergence_times_out_on_unready_ds_pod(
     assert "timed out" in step.error
 
 
+@pytest.mark.asyncio
+async def test_step_convergence_waits_for_cnpg_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: Node Ready + DS Ready is not enough — convergence must
+    also wait until the CNPG Cluster reports every instance ready,
+    or the chain uncordons and drains the next node with Postgres
+    short an instance."""
+    ready_node = {
+        "metadata": {"name": "node-1"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    cluster = {
+        "spec": {"instances": 3},
+        "status": {"readyInstances": 3, "currentPrimary": "pg-cluster-1"},
+    }
+    monkeypatch.setattr(per_node.k8s, "get_node", lambda _name: (200, ready_node))
+    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _name: [])
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, cluster))
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    step = await per_node._step_convergence(
+        "node-1", timeout_s=5.0, cnpg_cluster_name="pg-cluster", cnpg_namespace="spatium"
+    )
+    assert step.ok is True
+    assert step.detail["cnpg_ready_instances"] == 3
+    assert step.detail["cnpg_spec_instances"] == 3
+
+
+@pytest.mark.asyncio
+async def test_step_convergence_times_out_when_cnpg_instance_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: the upgraded node's CNPG instance never came back
+    (readyInstances stays below spec) → convergence times out
+    instead of passing on Node/DS readiness alone."""
+    ready_node = {
+        "metadata": {"name": "node-1"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    cluster = {
+        "spec": {"instances": 3},
+        "status": {"readyInstances": 2, "currentPrimary": "pg-cluster-1"},
+    }
+    monkeypatch.setattr(per_node.k8s, "get_node", lambda _name: (200, ready_node))
+    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _name: [])
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, cluster))
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    step = await per_node._step_convergence(
+        "node-1", timeout_s=0.05, cnpg_cluster_name="pg-cluster", cnpg_namespace="spatium"
+    )
+    assert step.ok is False
+    assert "timed out" in step.error
+
+
 # ── Step 10: uncordon + clear window ─────────────────────────────────
 
 
@@ -500,6 +595,25 @@ async def test_step_uncordon_clears_maintenance_window() -> None:
     assert step.ok is True
     un.assert_called_once_with("node-1")
     mw.assert_called_once_with("pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium")
+
+
+@pytest.mark.asyncio
+async def test_step_uncordon_skips_window_clear_without_cluster_name() -> None:
+    """#1545: an empty cluster name disables CNPG steps — the
+    maintenance-window clear must be skipped like the set is, or the
+    PATCH to the clusters collection URL fails the step after a
+    successful uncordon."""
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        step = await per_node._step_uncordon("node-1", "", "spatium")
+    assert step.ok is True
+    assert step.detail["maintenance_window_clear_skipped"] is True
+    un.assert_called_once_with("node-1")
+    mw.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -624,6 +738,105 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
         "cnpg_maintenance_on",
         "cordon",
     ]
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_releases_node_on_post_cordon_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1542: a failure after the cordon must not leave the node
+    cordoned with the CNPG maintenance window on. The chain appends
+    a release_node compensation step (uncordon + clear window) and
+    still reports the ORIGINAL failing step + error."""
+
+    async def _ok(name: per_node.StepName) -> per_node.StepResult:
+        return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
+
+    async def _fail_drain(_node: str, **_kw: Any) -> per_node.StepResult:
+        return per_node.StepResult(name="drain", started_at="t", finished_at="t").finish(
+            False, error="drain timed out"
+        )
+
+    monkeypatch.setattr(per_node, "_step_preflight", lambda *a, **k: _ok("preflight"))
+    monkeypatch.setattr(per_node, "_step_etcd_snapshot", lambda *a, **k: _ok("etcd_snapshot"))
+    monkeypatch.setattr(
+        per_node, "_step_cnpg_maintenance_on", lambda *a, **k: _ok("cnpg_maintenance_on")
+    )
+    monkeypatch.setattr(per_node, "_step_cordon", lambda *a, **k: _ok("cordon"))
+    monkeypatch.setattr(
+        per_node, "_step_verify_primary_moved", lambda *a, **k: _ok("verify_primary_moved")
+    )
+    monkeypatch.setattr(per_node, "_step_drain", _fail_drain)
+
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            cnpg_namespace="spatium",
+        )
+    assert result.ok is False
+    assert result.failed_at == "drain"
+    assert result.error == "drain timed out"
+    release = result.steps[-1]
+    assert release.name == "release_node"
+    assert release.ok is True
+    assert release.detail["maintenance_window_cleared"] is True
+    un.assert_called_once_with("node-1")
+    mw.assert_called_once_with(
+        "pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium"
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_records_failed_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1542: when the compensation itself fails, the release_node
+    step records the failure distinctly in the per-node progress —
+    the chain result still blames the original failing step."""
+
+    async def _ok(name: per_node.StepName) -> per_node.StepResult:
+        return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
+
+    async def _fail_drain(_node: str, **_kw: Any) -> per_node.StepResult:
+        return per_node.StepResult(name="drain", started_at="t", finished_at="t").finish(
+            False, error="drain timed out"
+        )
+
+    monkeypatch.setattr(per_node, "_step_preflight", lambda *a, **k: _ok("preflight"))
+    monkeypatch.setattr(per_node, "_step_etcd_snapshot", lambda *a, **k: _ok("etcd_snapshot"))
+    monkeypatch.setattr(
+        per_node, "_step_cnpg_maintenance_on", lambda *a, **k: _ok("cnpg_maintenance_on")
+    )
+    monkeypatch.setattr(per_node, "_step_cordon", lambda *a, **k: _ok("cordon"))
+    monkeypatch.setattr(
+        per_node, "_step_verify_primary_moved", lambda *a, **k: _ok("verify_primary_moved")
+    )
+    monkeypatch.setattr(per_node, "_step_drain", _fail_drain)
+
+    with patch.object(per_node.k8s, "uncordon_node", return_value=(False, "rbac forbidden")):
+        result = await per_node.single_node_upgrade(
+            MagicMock(),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            cnpg_namespace="spatium",
+        )
+    assert result.ok is False
+    assert result.failed_at == "drain"
+    release = result.steps[-1]
+    assert release.name == "release_node"
+    assert release.ok is False
+    assert "compensating uncordon failed" in release.error
 
 
 @pytest.mark.asyncio
