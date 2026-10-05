@@ -28,6 +28,13 @@ def _fail() -> None:
 def test_traceback_has_frames_but_no_locals(monkeypatch: pytest.MonkeyPatch, fmt: str) -> None:
     monkeypatch.setattr(settings, "log_format", fmt)
     buf = io.StringIO()
+    # Restore what configure_logging replaces (structlog config, root handlers
+    # and level), as worker_logging does, or later tests that capture structlog
+    # events see this test's pipeline instead of their own.
+    saved_config = structlog.get_config()
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
     try:
         configure_logging("api", stream=buf)
         log = structlog.get_logger("t")
@@ -40,9 +47,9 @@ def test_traceback_has_frames_but_no_locals(monkeypatch: pytest.MonkeyPatch, fmt
         except RuntimeError:
             logging.getLogger("stdlib").exception("boom2")
     finally:
-        for h in list(logging.getLogger().handlers):
-            if getattr(h, "stream", None) is buf:
-                logging.getLogger().removeHandler(h)
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+        structlog.configure(**saved_config)
     out = buf.getvalue()
     assert SENTINEL not in out
     assert "RuntimeError" in out and "restore failed" in out and "_fail" in out
