@@ -397,6 +397,33 @@ def _pdns_masters(entries: Any) -> list[str]:
     return out
 
 
+#: The ``notify`` value grammar (control-plane validator, #1316).
+_NOTIFY_VALUES = frozenset({"yes", "no", "explicit", "master-only", "primary-only"})
+
+
+def _also_notify_targets(entries: Any) -> list[str]:
+    """Bundle also-notify entries → PowerDNS ``ALSO-NOTIFY`` values (#1523).
+
+    The stored shape is BIND grammar, ``<ip> [port <n>] [key <name>]``
+    (#1316); the PowerDNS metadata wants ``ip`` / ``ip:port`` and has no
+    per-target TSIG key, so a key token is dropped. Unusable entries are
+    dropped by the same conversion the masters list goes through.
+    """
+    out: list[str] = []
+    for entry in entries or []:
+        tokens = str(entry).split()
+        if not tokens:
+            continue
+        port: str | None = None
+        if "port" in tokens:
+            idx = tokens.index("port")
+            if idx + 1 < len(tokens) and tokens[idx + 1].isdigit():
+                port = tokens[idx + 1]
+        host = tokens[0]
+        out.extend(_pdns_masters([f"{host}@{port}" if port else host]))
+    return out
+
+
 # Characters a zone-file / SOA name cannot carry unescaped — the same set
 # the BIND9 apex renderer guards (backend ``contains_zonefile_unsafe``
 # mirrors it on write; rows written before that guard still reach here).
@@ -651,6 +678,41 @@ class PowerDNSDriver(DriverBase):
                     zone_type=ztype,
                 )
                 continue
+            # NOTIFY behaviour (#1523): the zone's own override wins,
+            # else the server options'. A primary that may notify must
+            # be kind Master — Native never sends NOTIFY at all, which
+            # is why also-notify targets configured in SpatiumDDI were
+            # never notified. The targets ride the payload and the
+            # reconciler applies them as ALSO-NOTIFY metadata.
+            zone_notify = str(zone.get("notify_enabled") or "").strip().lower()
+            server_notify = str(opts.get("notify_enabled") or "yes").strip().lower()
+            eff_notify = (
+                zone_notify
+                if zone_notify in _NOTIFY_VALUES
+                else (
+                    server_notify
+                    if server_notify in _NOTIFY_VALUES
+                    else "yes"
+                )
+            )
+            eff_also = zone.get("also_notify")
+            if eff_also is None:
+                eff_also = opts.get("also_notify") or []
+            if kind == "Native" and eff_notify != "no":
+                kind = "Master"
+            if zone.get("allow_query"):
+                # pdns auth has no per-zone query ACL (no metadata kind
+                # expresses it) — say so loudly instead of letting the
+                # saved setting look applied (#1523).
+                log.warning(
+                    "powerdns_zone_allow_query_unsupported",
+                    zone=zname,
+                    hint=(
+                        "PowerDNS authoritative cannot enforce a per-zone "
+                        "allow-query; the restriction is not applied on "
+                        "this group. Use a BIND9 group if it is required."
+                    ),
+                )
             # Dynamic-update ACL (issue #641). PowerDNS is coarse-only:
             # ALLOW-DNSUPDATE-FROM (IP grants) + TSIG-ALLOW-DNSUPDATE (key
             # grants); name-scope / per-type / deny are rejected at the
@@ -699,6 +761,11 @@ class PowerDNSDriver(DriverBase):
                     # only; #1521). The reconciler PUTs kind/masters on
                     # an existing zone whose type or primaries changed.
                     "masters": masters,
+                    # Effective NOTIFY behaviour (#1523) — the zone's
+                    # override already folded over the server options;
+                    # applied as ALSO-NOTIFY metadata by the reconciler.
+                    "notify_enabled": eff_notify,
+                    "also_notify": [str(e) for e in eff_also or []],
                     "serial": zone.get("serial") or 1,
                     "rrsets": [
                         {
@@ -733,6 +800,22 @@ class PowerDNSDriver(DriverBase):
                     "This agent does not wire up PowerDNS catalog-consumer "
                     "mode. Use AXFR-based secondaries against the producer "
                     "instead."
+                ),
+            )
+
+        # Server-wide allow-query (#1523): pdns auth serves any client
+        # and has no equivalent of BIND's options allow-query — warn
+        # loudly when an operator configured a restriction here, rather
+        # than letting it look applied.
+        server_allow_query = [str(a).strip() for a in (opts.get("allow_query") or ["any"])]
+        if server_allow_query != ["any"]:
+            log.warning(
+                "powerdns_allow_query_unsupported",
+                allow_query=server_allow_query,
+                hint=(
+                    "PowerDNS authoritative cannot restrict which clients "
+                    "may query it; the server allow-query is not applied "
+                    "on this group."
                 ),
             )
 
@@ -1762,6 +1845,9 @@ class PowerDNSDriver(DriverBase):
                 # Dynamic-update (RFC 2136) ACL metadata (issue #641).
                 self._apply_dynamic_update(client, headers, zone_payload)
 
+                # NOTIFY targets (issue #1523) — ALSO-NOTIFY metadata.
+                self._apply_notify_settings(client, headers, zone_payload)
+
                 # LUA records are enabled globally via
                 # ``enable-lua-records=yes`` in pdns.conf (see
                 # ``_render_conf``). Earlier code attempted a per-zone
@@ -1772,6 +1858,28 @@ class PowerDNSDriver(DriverBase):
                 # ``powerdns_lua_metadata_failed`` warning on every
                 # bulk reconcile of a LUA-bearing zone. The global
                 # knob makes the per-zone PUT unnecessary.
+
+    # ── NOTIFY settings (issue #1523) ─────────────────────────────────────
+
+    def _apply_notify_settings(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone_payload: dict[str, Any],
+    ) -> None:
+        """Set (or clear) a primary zone's ALSO-NOTIFY metadata (#1523).
+
+        The kind decision (Master vs Native) happens in render(); this is
+        the target list. An empty effective list clears the metadata so
+        removed targets stop being notified. Secondaries do not notify
+        their primaries, so they are skipped.
+        """
+        if _kind_category(zone_payload.get("kind")) not in ("native", "primary"):
+            return
+        targets = _also_notify_targets(zone_payload.get("also_notify"))
+        self._put_metadata(
+            client, headers, zone_payload["name"], "ALSO-NOTIFY", targets
+        )
 
     # ── Dynamic-update ACLs (issue #641) ───────────────────────────────────
 

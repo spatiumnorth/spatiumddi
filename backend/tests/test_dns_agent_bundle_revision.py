@@ -44,6 +44,13 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "c69af6546ce6118fe11c4abfeb4abc230e7d4c8b33c679444fa6e06cfba33748",
         "views": "1e70781c25f21f3563a0800205adfaef09b615eb0990e0f4ab8569f9d02bb7a0",
     },
+    # 2 (#1523): the bundle ships the NOTIFY fields — server options
+    # notify_enabled / also_notify / allow_notify + zone allow_query /
+    # also_notify / notify_enabled.
+    2: {
+        "plain": "c1d6e4b64ef3bab17a558a00e4fa3e320cf8529795594e82cda4016e154b743f",
+        "views": "9cba0278d99a1215151c0b160673d35864064d2cd4356a4a71bcdd42f61c40be",
+    },
 }
 
 

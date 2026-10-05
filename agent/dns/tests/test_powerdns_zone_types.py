@@ -56,9 +56,12 @@ def _zone(name: str, ztype: str, **extra: Any) -> dict[str, Any]:
 # ── render: type → kind / masters ───────────────────────────────────────────
 
 
-def test_render_primary_is_native_with_records(tmp_path: Path) -> None:
+def test_render_primary_is_master_with_records(tmp_path: Path) -> None:
+    """A primary that may notify (the default) is kind Master (#1523):
+    Native never sends NOTIFY. #1521 originally asserted Native here —
+    that was the bug #1523 describes."""
     payload = _render_zones(tmp_path, [_zone("example.com", "primary")])
-    assert payload[0]["kind"] == "Native"
+    assert payload[0]["kind"] == "Master"
     assert payload[0]["masters"] == []
     assert payload[0]["rrsets"], "primary zones ship their records"
 

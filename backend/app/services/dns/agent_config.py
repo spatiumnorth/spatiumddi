@@ -495,6 +495,18 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # emits a zone-level clause only for a non-None value, because in
             # BIND a zone-level allow-transfer shadows the options one.
             "allow_transfer": getattr(z, "allow_transfer", None),
+            # #1523 — per-zone NOTIFY / query overrides. Same stored-but-
+            # never-shipped class as #734: accepted, validated (#1316) and
+            # persisted, but absent from the bundle, so neither agent could
+            # render them. None means "inherit the server options"; the
+            # BIND9 agent emits a zone clause only for a non-None value and
+            # the PowerDNS agent folds the effective values into the zone
+            # kind + ALSO-NOTIFY metadata. Shipping them here also puts
+            # them inside the structural fingerprint (zones_structural
+            # derives from zone_payload), so an edit re-renders.
+            "allow_query": getattr(z, "allow_query", None),
+            "also_notify": getattr(z, "also_notify", None),
+            "notify_enabled": getattr(z, "notify_enabled", None),
             # #1153 — the zone's SOA MNAME / RNAME, and its NS when it has no
             # NS records of its own. Settable and persisted, never shipped, so
             # the BIND9 agent served the placeholder ``ns1.<zone>`` (glued to
@@ -605,6 +617,16 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
+        # NOTIFY behaviour (#1523). Settable in the UI / API, validated
+        # (#1316) and persisted, but never shipped, so `notify no` (a
+        # stealth primary) still sent NOTIFY from BIND9 (whose default is
+        # yes), also-notify targets were never notified, and PowerDNS
+        # zones stayed Native (which never notifies). The agents render
+        # these now; shipping them here puts them inside the structural
+        # fingerprint via options_block.
+        "notify_enabled": (getattr(opts, "notify_enabled", "yes") if opts else "yes"),
+        "also_notify": (list(getattr(opts, "also_notify", []) or []) if opts else []),
+        "allow_notify": (list(getattr(opts, "allow_notify", []) or []) if opts else []),
         # Query logging — surfaced to BIND9's named.conf via template
         # render and to PowerDNS's pdns.conf via the agent's
         # ``_render_conf``. Keep ``query_log_enabled`` in the
