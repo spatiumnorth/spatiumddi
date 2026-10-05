@@ -184,6 +184,40 @@ render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 
+# #1553 — the dns-agent template must REFUSE encrypted-transport ports a
+# flavor cannot serve (DoQ on anything but Technitium; DoT/DoH on
+# PowerDNS, which needs a dnsdist front that has no Kubernetes
+# deployment), instead of rendering a Service port that forwards to
+# nothing. Same grep-the-message discipline as the priorityClasses
+# negative control below: an exit code alone would also pass if the
+# render broke for a different reason.
+echo "── negative controls: dns-agent encrypted ports on the wrong flavor must fail"
+neg1553() { # label expected-message [helm --set args...]
+    local label="$1" expect="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set dnsAgents.enabled=true "$@" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$expect"; then
+        echo "   ok: $label refused by the dns-agent flavor guard"
+    else
+        echo "   FAIL: $label — expected the dns-agent flavor guard to refuse this render (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg1553 "doqPort on bind9" "doqPort is only supported with flavor: technitium" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=bind9 \
+    --set dnsAgents.servers[0].doqPort=853
+neg1553 "dotPort on powerdns" "not supported with flavor: powerdns" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=powerdns \
+    --set dnsAgents.servers[0].dotPort=853
+neg1553 "dohPort on powerdns" "not supported with flavor: powerdns" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=powerdns \
+    --set dnsAgents.servers[0].dohPort=8443
+
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
 # node never runs all three DNS drivers) — it is the render that exercises

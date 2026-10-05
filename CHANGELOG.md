@@ -76,6 +76,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The umbrella chart refuses DNS encrypted-transport ports the
+  flavor cannot serve (#1553).** `dnsAgents.servers[].doqPort` was
+  rendered into the container ports and both Services for any flavor,
+  and `dotPort` / `dohPort` likewise for PowerDNS — but DoQ is
+  Technitium-only, and PowerDNS serves DoT/DoH only behind a dnsdist
+  front that has no Kubernetes deployment, so an operator mistake
+  produced a Service port forwarding to nothing instead of an error.
+  The render now fails with a message naming the server, the port and
+  the flavor, and the charts render check carries negative controls
+  for all three combinations.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by

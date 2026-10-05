@@ -17,6 +17,19 @@ stringData:
 {{- end }}
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
+{{- /* #1553 — refuse encrypted-transport ports the flavor cannot serve,
+       instead of rendering a Service port that forwards to nothing.
+       DoQ is Technitium-only (BIND9 and PowerDNS have no QUIC listener,
+       and the API refuses doq_enabled on a group with a non-Technitium
+       member). PowerDNS serves DoT/DoH only behind a dnsdist front,
+       which has no Kubernetes deployment yet — its ports would be
+       declared on the pod and both Services and answer nothing. */ -}}
+{{- if and $server.doqPort (ne $flavor "technitium") }}
+{{- fail (printf "dnsAgents server %q: doqPort is only supported with flavor: technitium (got flavor: %s) — remove doqPort or change the flavor" $server.name $flavor) }}
+{{- end }}
+{{- if and (eq $flavor "powerdns") (or $server.dotPort $server.dohPort) }}
+{{- fail (printf "dnsAgents server %q: dotPort/dohPort are not supported with flavor: powerdns — PowerDNS needs a dnsdist front for DoT/DoH, which has no Kubernetes deployment yet; remove dotPort/dohPort" $server.name) }}
+{{- end }}
 {{- $instance := printf "dns-%s-%s" $flavor $server.name -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
        optionally overrides repository + tag; missing keys (or the default
