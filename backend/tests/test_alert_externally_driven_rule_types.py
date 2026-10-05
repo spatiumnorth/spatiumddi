@@ -100,9 +100,7 @@ async def test_audit_chain_broken_event_reaches_forward_target(
 ) -> None:
     await alerts.seed_audit_chain_alert_rule()
     rule_id = (
-        await db_session.execute(
-            select(AlertRule.id).where(AlertRule.name == "audit-chain-broken")
-        )
+        await db_session.execute(select(AlertRule.id).where(AlertRule.name == "audit-chain-broken"))
     ).scalar_one()
 
     async def _broken(db: AsyncSession, **_: object) -> ChainVerifyResult:

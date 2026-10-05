@@ -62,10 +62,10 @@ the formatter handles the rest.
 - **System alerts reach forward targets, compliance rules require a
   classification, audit-forward targets are validated, and conformity
   alerts survive the evaluator (#1576, #1578, #1580, #1581).**
-  Audit-chain-broken and schema-behind-head alerts were created but
-  never delivered to syslog/webhook/SMTP targets (the third type,
-  cluster-upgrade-failed, already delivered via #1590); both tasks now
-  deliver like the generic evaluator. A `compliance_change` rule could
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
   be created without a classification and then never fire, warning on
   every evaluator tick — create and update now reject that with 422
   and the evaluator warns once per rule. Audit-forward targets are
