@@ -34,6 +34,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
+from app.services.dns.cname_conflict import find_record_insert_conflict
 from app.services.integration_ownership import owned_by_other_integration
 from app.services.tailscale.client import (
     TailscaleClient,
@@ -196,6 +197,10 @@ def _compute_desired(
         cf: dict[str, Any] = {
             "tailscale_id": d.id,
             "tailscale_node_id": d.node_id,
+            # #1557: the device name is an FQDN — keep it here, NOT in
+            # ``hostname`` (IPAM publishing appends the zone to hostname,
+            # which doubled the suffix: host.tailnet.ts.net.<zone>).
+            "fqdn": d.name,
             "os": d.os,
             "client_version": d.client_version,
             "user": d.user,
@@ -216,7 +221,9 @@ def _compute_desired(
             out.append(
                 _DesiredAddress(
                     address=ip,
-                    hostname=d.name,
+                    # Host label only (#1557) — the short hostname the
+                    # client reports, else the FQDN's first label.
+                    hostname=d.hostname or d.name.split(".")[0],
                     description=description,
                     custom_fields=cf,
                 )
@@ -559,9 +566,25 @@ async def _apply_synthetic_dns(
         await db.delete(row)
         summary.dns_records_deleted += 1
 
-    # Insert records that are new.
+    # Insert records that are new. #1561: never insert beside a
+    # non-owned record at the same name — skip + warn instead.
     for key in desired_keys - current_by_key.keys():
         label, rtype, value = key
+        conflict = await find_record_insert_conflict(
+            db,
+            zone.id,
+            name=label,
+            record_type=rtype,
+            own_fk="tailscale_tenant_id",
+            own_id=tenant.id,
+        )
+        if conflict is not None:
+            summary.warnings.append(
+                f"DNS record {label} ({rtype}) in zone {zone_name!r} conflicts with "
+                f"existing {conflict.record_type} record at the same name, not owned "
+                f"by this tenant; skipping insert"
+            )
+            continue
         fqdn = zone_name.rstrip(".") if label == "@" else f"{label}.{zone_name.rstrip('.')}"
         db.add(
             DNSRecord(
