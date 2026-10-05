@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,10 +83,11 @@ async def claim_backup_run(
     destination filename. Here the WHERE is evaluated against the
     committed row under its lock: concurrent claimers serialise, and
     exactly one gets the row back. Mirrors the WOL scheduler's claim
-    (#533). Both exits leave ``target`` refreshed: the success
-    path after its commit, the lost-race path after its rollback
-    (which would otherwise leave every attribute expired, so the
-    next read trips a lazy refresh outside a greenlet).
+    (#533). Both exits leave a persistent ``target`` refreshed:
+    the success path after its commit, the lost-race path after
+    its rollback (which would otherwise leave every attribute
+    expired, so the next read trips a lazy refresh outside a
+    greenlet).
     """
     claimed_id = (
         await db.execute(
@@ -111,7 +113,11 @@ async def claim_backup_run(
         # callers can read the committed state (the winner's
         # ``in_progress`` stamp) without tripping a lazy load —
         # the success path below refreshes for the same reason.
-        await db.refresh(target)
+        # Only when the instance is persistent: a never-committed
+        # target is transient again after the rollback and has no
+        # committed state to read back (refresh would raise).
+        if sa_inspect(target).persistent:
+            await db.refresh(target)
         return False
     await db.commit()
     await db.refresh(target)
