@@ -521,6 +521,25 @@ within **30 days of its `valid_to`**. The re-issue reuses the exact
 `POST /issue` machinery (same orchestrator, same self-solve), so a
 renewal is just a normal order against the stored account.
 
+**Renewal reuses each cert's own issuance shape.** The sweep reads the
+challenge type, DNS provider and domain list from the *successful
+order that produced that cert* — an http-01 cert renews as http-01,
+with its own domains. (Before #1529 the sweep renewed everything as
+managed-zone DNS-01 from one global domain list, so http-01 certs
+never renewed.) For certs with no linked order it falls back to the
+shape recorded on `platform_settings`, which is written **only when an
+order succeeds** — never at order creation, so a failed issue attempt
+can't retarget an existing cert's renewal.
+
+**Manual DNS-01 certs are the exception.** A cert issued with the
+manual TXT fallback for domains SpatiumDDI doesn't host cannot be
+renewed unattended. If every domain has since become covered by a
+managed zone, the sweep renews it as plain DNS-01; otherwise it
+**skips the cert and opens an `acme-manual-renewal` alert** instead of
+minting an order that can never succeed — renew it by hand via a fresh
+issue before it expires. The alert auto-resolves the next time the
+sweep renews that cert.
+
 The task is **gated on two flags** — it does nothing unless both
 `platform_settings.acme_enabled` and
 `platform_settings.acme_auto_renew` are on. `acme_enabled` is set
