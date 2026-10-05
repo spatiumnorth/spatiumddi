@@ -38,6 +38,7 @@ from app.services.dhcp.option_validation import (
     option_key_code,
     validate_options,
 )
+from app.services.dhcp.radvd import validate_ra_interface
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -82,6 +83,19 @@ async def group_raw_codes(db: AsyncSession, group_id: Any) -> str:
     if "windows_dhcp" not in drivers:
         return RAW_CODES_KEA
     return RAW_CODES_WINDOWS if drivers == {"windows_dhcp"} else RAW_CODES_NONE
+
+
+async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
+    """Whether ``group_id`` has a Windows DHCP member (#1480)."""
+    if group_id is None:
+        return False
+    return bool(
+        await db.scalar(
+            select(DHCPServer.id)
+            .where(DHCPServer.server_group_id == group_id, DHCPServer.driver == "windows_dhcp")
+            .limit(1)
+        )
+    )
 
 
 async def validate_dhcp_options(
@@ -356,6 +370,12 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str) -> str:
+        v = (v or "").strip()
+        return validate_ra_interface(v) if v else ""
+
     @field_validator("v6_address_mode")
     @classmethod
     def _v6mode(cls, v: str | None) -> str:
@@ -432,6 +452,14 @@ class ScopeUpdate(BaseModel):
             self.model_fields_set,
         )
         return self
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_ra_interface(v) if v else ""
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -700,6 +728,19 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
+    if address_family == "ipv6" and await _group_has_windows(db, group_id):
+        # #1480 — the Windows write path speaks DHCPv4 only (Add-/Set-
+        # DhcpServerv4Scope, Set-DhcpServerv4OptionValue), so a v6 scope on a
+        # group with a Windows member would be handed to v4 cmdlets: a 502,
+        # or a scope that exists here and on no Windows server.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This group has a Windows DHCP server, and SpatiumDDI manages Windows "
+                "DHCP over DHCPv4 only. Put DHCPv6 scopes in a group without Windows "
+                "members."
+            ),
+        )
     _create_options = normalize_options(body.options)
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family

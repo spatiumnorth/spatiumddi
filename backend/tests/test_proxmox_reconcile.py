@@ -90,6 +90,7 @@ class _FakeClient:
         lxc: dict[str, list[_ProxmoxGuest]] | None = None,
         sdn_subnets: list[_ProxmoxSDNSubnet] | None = None,
         sdn_vnets: list[_ProxmoxSDNVnet] | None = None,
+        unreadable_guests: list[str] | None = None,
     ) -> None:
         self.version = version or _ProxmoxVersion(version="9.1.9", release="9.1", repoid="xyz")
         self.cluster = cluster or _ProxmoxClusterInfo(cluster_name=None, node_count=1, quorate=None)
@@ -99,6 +100,8 @@ class _FakeClient:
         self.lxc = lxc or {}
         self.sdn_subnets = sdn_subnets or []
         self.sdn_vnets = sdn_vnets or []
+        # #1559 — mirrors ProxmoxClient.unreadable_guests.
+        self.unreadable_guests = unreadable_guests or []
 
     async def __aenter__(self):
         return self
@@ -961,6 +964,144 @@ async def test_removed_vm_deletes_its_address(db_session: AsyncSession) -> None:
         .all()
     )
     assert list(rows) == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_guest_config_keeps_its_address(db_session: AsyncSession) -> None:
+    """#1559 — a guest whose config fetch fails once is unreadable, not
+    gone: the address absence-delete must not remove its rows."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    net = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.1/24",
+            active=True,
+        )
+    ]
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="db01",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    with _patch_client(_FakeClient(networks={"pve01": net}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+
+    # Second pass: the guest's config fetch failed — it is absent from
+    # the guest list but reported unreadable by the client.
+    with _patch_client(
+        _FakeClient(
+            networks={"pve01": net},
+            qemu={"pve01": []},
+            unreadable_guests=["pve01/qemu/100"],
+        )
+    ):
+        summary = await reconcile_node(db_session, node)
+
+    assert summary.ok, summary.error
+    assert summary.unreadable_guests == 1
+    assert summary.addresses_deleted == 0
+    assert any("absence-delete skipped" in w for w in summary.warnings)
+    rows = (
+        (
+            await db_session.execute(
+                select(IPAddress).where(
+                    IPAddress.proxmox_node_id == node.id,
+                    IPAddress.status == "proxmox-vm",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [str(r.address) for r in rows] == ["10.0.0.50"]
+
+
+@pytest.mark.asyncio
+async def test_offline_node_with_include_stopped_keeps_guest_addresses(
+    db_session: AsyncSession,
+) -> None:
+    """#1559 — with include_stopped armed, a not-online node's guests
+    are part of the desired set; skipping the node must freeze the
+    mirror for it, not delete its rows (subnet pass included)."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space, include_stopped=True)
+    await db_session.commit()
+
+    net = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.1/24",
+            active=True,
+        )
+    ]
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="db01",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    with _patch_client(_FakeClient(networks={"pve01": net}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+
+    # Second pass: the node reports not-online.
+    with _patch_client(
+        _FakeClient(
+            nodes=[_ProxmoxNodeInfo(node="pve01", status="offline")],
+            networks={"pve01": net},
+            qemu={"pve01": [vm]},
+        )
+    ):
+        summary = await reconcile_node(db_session, node)
+
+    assert summary.ok, summary.error
+    assert summary.unreadable_nodes == 1
+    assert summary.addresses_deleted == 0
+    assert summary.subnets_deleted == 0
+    rows = (
+        (
+            await db_session.execute(
+                select(IPAddress).where(
+                    IPAddress.proxmox_node_id == node.id,
+                    IPAddress.status == "proxmox-vm",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [str(r.address) for r in rows] == ["10.0.0.50"]
 
 
 @pytest.mark.asyncio

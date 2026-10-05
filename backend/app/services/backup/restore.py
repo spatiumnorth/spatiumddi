@@ -596,9 +596,14 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
     archive use that constant. The intent is "let the operator roll
     back via a SQL replay if Phase 1a's hard-overwrite was a
     mistake," not "long-term forensic vault."
+
+    Because that passphrase is public, filesystem permissions are the
+    only protection for the SECRET_KEY inside: the directory is 0700
+    (tightened if it already existed looser) and the file is created
+    0600 up front, never written world-readable and chmod'd after.
     """
     try:
-        PRE_RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+        PRE_RESTORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     except (PermissionError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dir_unavailable",
@@ -606,6 +611,17 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    try:
+        os.chmod(PRE_RESTORE_DIR, 0o700)
+    except OSError as exc:
+        # A directory this process doesn't own (a root-owned volume shared
+        # through fsGroup) can't be tightened. That must not cost the
+        # operator the rollback copy: the file below is still created 0600.
+        logger.warning(
+            "pre_restore_safety_dir_chmod_failed",
+            path=str(PRE_RESTORE_DIR),
+            error=str(exc),
+        )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
     try:
@@ -614,7 +630,9 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        out_path.write_bytes(archive_bytes)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dump_failed",
