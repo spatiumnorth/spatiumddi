@@ -128,9 +128,7 @@ async def test_notify_change_moves_the_structural_etag(
     zones_structural), so toggling one must re-render the agent config —
     the #899 failure mode is a saved setting that never wakes the agent."""
     db_session.add(PlatformSettings(id=1))
-    server, opts = await _server_with(
-        db_session, options={"notify_enabled": "yes"}, zone={}
-    )
+    server, opts = await _server_with(db_session, options={"notify_enabled": "yes"}, zone={})
     before = (await render_bundle_body(db_session, server)).body["structural_etag"]
     opts.notify_enabled = "no"
     await db_session.flush()
