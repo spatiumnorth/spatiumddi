@@ -31,7 +31,7 @@ A couple of Route-53-specific wrinkles the hooks paper over:
 from __future__ import annotations
 
 import asyncio
-import uuid
+import hashlib
 from typing import Any
 
 import structlog
@@ -441,14 +441,36 @@ class Route53DNSDriver(CloudDNSDriverBase):
             raise CloudDNSError("route53._apply_zone: zone name is required")
 
         if op == "create":
+            # #1527 — adopt an existing exact-name hosted zone instead of
+            # minting a duplicate. Route 53 accepts any number of same-name
+            # zones, so a retry after a DB rollback (or creating a zone the
+            # account already holds) must not call create again.
+            try:
+                existing_id = await self._resolve_zone_id(client, name)
+            except CloudDNSError as exc:
+                if "not found" not in str(exc):
+                    raise
+                existing_id = None
+            if existing_id is not None:
+                logger.info(
+                    "route53.apply_zone.create_adopt_existing",
+                    server=str(getattr(server, "id", "")),
+                    zone=name,
+                    zone_id=existing_id,
+                )
+                return
+            # #1527 — derive CallerReference from the logical create (the
+            # zone row id when the caller carries one, plus the zone name)
+            # so AWS deduplicates a retried request under the same
+            # reference instead of minting a second hosted zone.
+            caller_reference = hashlib.sha256(
+                f"{getattr(zone, 'id', '')}:{name}".encode()
+            ).hexdigest()
             try:
                 await asyncio.to_thread(
                     client.create_hosted_zone,
                     Name=name,
-                    # CallerReference must be unique per create — a fresh
-                    # uuid makes the call idempotently safe to retry only
-                    # within the same uuid; a new attempt mints a new one.
-                    CallerReference=uuid.uuid4().hex,
+                    CallerReference=caller_reference,
                 )
             except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
                 raise CloudDNSError(
@@ -457,16 +479,90 @@ class Route53DNSDriver(CloudDNSDriverBase):
             return
 
         if op == "delete":
-            zone_id = await self._resolve_zone_id(client, name)
+            try:
+                zone_id = await self._resolve_zone_id(client, name)
+            except CloudDNSError as exc:
+                # #1528 — an already-absent zone is the desired end state;
+                # treat it as success so trash purge / permanent delete /
+                # move don't retry forever.
+                if "not found" in str(exc):
+                    logger.info(
+                        "route53.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=name,
+                    )
+                    return
+                raise
+            # #1528 — Route 53 refuses to delete a populated zone
+            # (HostedZoneNotEmpty); empty it first.
+            await self._empty_zone(client, zone_id, name)
             try:
                 await asyncio.to_thread(client.delete_hosted_zone, Id=zone_id)
             except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+                if _is_no_such_hosted_zone(exc):
+                    return
                 raise CloudDNSError(
                     f"route53 delete_hosted_zone failed for {name!r}: {exc}"
                 ) from exc
             return
 
         raise CloudDNSError(f"route53._apply_zone: unsupported op {op!r}")
+
+    async def _empty_zone(self, client: Any, zone_id: str, apex: str) -> None:
+        """Delete every rrset in the zone except SOA and apex NS (#1528).
+
+        Route 53 ``delete_hosted_zone`` fails with ``HostedZoneNotEmpty``
+        while anything besides the provider-managed SOA / apex NS remains,
+        so a zone teardown has to remove the operator's records first.
+        Deletions are submitted in batches (the exact live rrset, as Route
+        53 requires for a DELETE) rather than one change per rrset.
+        """
+        apex_fqdn = normalize_fqdn(apex)
+        deletable: list[dict[str, Any]] = []
+        next_name: str | None = None
+        next_type: str | None = None
+        try:
+            while True:
+                kwargs: dict[str, Any] = {"HostedZoneId": zone_id, "MaxItems": "300"}
+                if next_name:
+                    kwargs["StartRecordName"] = next_name
+                if next_type:
+                    kwargs["StartRecordType"] = next_type
+                resp = await asyncio.to_thread(client.list_resource_record_sets, **kwargs)
+                for rrset in resp.get("ResourceRecordSets", []):
+                    rtype = str(rrset.get("Type", "")).upper()
+                    if rtype == "SOA":
+                        continue
+                    if rtype == "NS" and normalize_fqdn(str(rrset.get("Name", ""))) == apex_fqdn:
+                        continue
+                    deletable.append(rrset)
+                if resp.get("IsTruncated") is not True:
+                    break
+                next_name = resp.get("NextRecordName")
+                next_type = resp.get("NextRecordType")
+                if next_name is None and next_type is None:
+                    break
+        except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+            raise CloudDNSError(
+                f"route53 list_resource_record_sets (zone empty) failed for " f"{apex!r}: {exc}"
+            ) from exc
+
+        for start in range(0, len(deletable), 100):
+            batch = deletable[start : start + 100]
+            change_batch = {
+                "Changes": [{"Action": "DELETE", "ResourceRecordSet": rrset} for rrset in batch]
+            }
+            try:
+                await asyncio.to_thread(
+                    client.change_resource_record_sets,
+                    HostedZoneId=zone_id,
+                    ChangeBatch=change_batch,
+                )
+            except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+                raise CloudDNSError(
+                    f"route53 change_resource_record_sets (zone empty) failed "
+                    f"for {apex!r}: {exc}"
+                ) from exc
 
     # ── Hosted-zone id resolution ───────────────────────────────────────
     async def _resolve_zone_id(self, client: Any, zone_name: str) -> str:
@@ -566,6 +662,16 @@ def _is_invalid_change_batch(exc: Exception) -> bool:
         if code in {"InvalidChangeBatch", "NoSuchChange"}:
             return True
     return "InvalidChangeBatch" in str(exc)
+
+
+def _is_no_such_hosted_zone(exc: Exception) -> bool:
+    """True when ``exc`` is a Route 53 NoSuchHostedZone error (#1528)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))
+        if code == "NoSuchHostedZone":
+            return True
+    return "NoSuchHostedZone" in str(exc)
 
 
 __all__ = ["Route53DNSDriver"]
