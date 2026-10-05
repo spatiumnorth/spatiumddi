@@ -1164,14 +1164,18 @@ class ProposeAssignRoleArgs(BaseModel):
         default=None,
         description=(
             "Optional DNSServerGroup UUID. Required if roles include "
-            "a DNS role and there's no existing assignment."
+            "a DNS role and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
     dhcp_group_id: str | None = Field(
         default=None,
         description=(
             "Optional DHCPServerGroup UUID. Required if roles include "
-            "dhcp and there's no existing assignment."
+            "dhcp and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
 
@@ -1211,7 +1215,10 @@ async def propose_assign_role(
         db,
         user=user,
         operation="assign_appliance_role",
-        args=args.model_dump(),
+        # exclude_unset (#1562): an explicit null group id means
+        # "unassign", an omitted one means "leave it" — a full dump
+        # would turn every omitted group into an unassign on apply.
+        args=args.model_dump(exclude_unset=True),
         preview_text=preview.preview_text,
     )
     return _proposal_result(proposal, preview_text=preview.preview_text)

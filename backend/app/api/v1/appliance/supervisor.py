@@ -4004,6 +4004,8 @@ class ApplianceRolesUpdate(BaseModel):
             "mutually exclusive — one engine per appliance."
         ),
     )
+    # ``dns_group_id`` / ``dhcp_group_id``: omitted leaves the current
+    # group alone; an explicit ``null`` unassigns it (#1562).
     dns_group_id: uuid.UUID | None = None
     dhcp_group_id: uuid.UUID | None = None
     tags: dict[str, str] | None = None
@@ -4089,27 +4091,38 @@ async def update_appliance_roles(
                 )
         row.assigned_roles = list(body.roles)
 
-    if body.dns_group_id is not None:
-        # Best-effort existence check — wrong group_id → 422.
-        from app.models.dns import DNSServerGroup
+    # #1562 — presence in the payload decides, not non-None: an
+    # explicit ``null`` (the Fleet "(unassigned)" option) clears the
+    # assignment, an omitted field leaves it alone. The downstream
+    # role_assignment builder already handles a group-less role (no
+    # AGENT_GROUP shipped), so clearing is a supported state.
+    if "dns_group_id" in body.model_fields_set:
+        if body.dns_group_id is None:
+            row.assigned_dns_group_id = None
+        else:
+            # Best-effort existence check — wrong group_id → 422.
+            from app.models.dns import DNSServerGroup
 
-        dns_group = await db.get(DNSServerGroup, body.dns_group_id)
-        if dns_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DNS server group {body.dns_group_id} not found.",
-            )
-        row.assigned_dns_group_id = dns_group.id
-    if body.dhcp_group_id is not None:
-        from app.models.dhcp import DHCPServerGroup
+            dns_group = await db.get(DNSServerGroup, body.dns_group_id)
+            if dns_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {body.dns_group_id} not found.",
+                )
+            row.assigned_dns_group_id = dns_group.id
+    if "dhcp_group_id" in body.model_fields_set:
+        if body.dhcp_group_id is None:
+            row.assigned_dhcp_group_id = None
+        else:
+            from app.models.dhcp import DHCPServerGroup
 
-        dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
-        if dhcp_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DHCP server group {body.dhcp_group_id} not found.",
-            )
-        row.assigned_dhcp_group_id = dhcp_group.id
+            dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
+            if dhcp_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DHCP server group {body.dhcp_group_id} not found.",
+                )
+            row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
         # Coerce every value to string — JSONB will accept anything
