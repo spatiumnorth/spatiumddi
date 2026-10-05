@@ -101,6 +101,54 @@ def normalize_fqdn(name: str) -> str:
     return n
 
 
+def compose_structured_rdata(record: RecordData) -> str:
+    """Compose the provider rdata string for one record from the split form.
+
+    The record API stores MX / SRV split: ``value`` is the bare target and
+    priority / weight / port live in their own columns (#1526). Providers
+    whose rdata is a single string (Route 53, Google Cloud DNS) need the
+    composed wire form — ``"<pref> <target>"`` for MX,
+    ``"<priority> <weight> <port> <target>"`` for SRV. Defaults mirror the
+    agent renderers: MX preference 10, SRV fields 0. Every other type's
+    rdata is the value verbatim.
+    """
+    rtype = record.record_type.upper()
+    if rtype == "MX":
+        pref = record.priority if record.priority is not None else 10
+        return f"{pref} {record.value}"
+    if rtype == "SRV":
+        prio = record.priority if record.priority is not None else 0
+        weight = record.weight if record.weight is not None else 0
+        port = record.port if record.port is not None else 0
+        return f"{prio} {weight} {port} {record.value}"
+    return record.value
+
+
+def split_structured_rdata(
+    record_type: str, rdata: str
+) -> tuple[str, int | None, int | None, int | None]:
+    """Split a provider rdata string into ``(value, priority, weight, port)``.
+
+    The inverse of :func:`compose_structured_rdata`, for MX / SRV reads so
+    imports + drift store the same split shape the record API writes. A
+    value that doesn't parse as the structured form is returned verbatim
+    with all three fields ``None`` rather than failing the whole pull.
+    """
+    rtype = record_type.upper()
+    raw = (rdata or "").strip()
+    if rtype == "MX":
+        head, sep, rest = raw.partition(" ")
+        if sep and head.isdigit() and rest.strip():
+            return rest.strip(), int(head), None, None
+        return raw, None, None, None
+    if rtype == "SRV":
+        parts = raw.split(None, 3)
+        if len(parts) == 4 and all(p.isdigit() for p in parts[:3]):
+            return parts[3].strip(), int(parts[0]), int(parts[1]), int(parts[2])
+        return raw, None, None, None
+    return raw, None, None, None
+
+
 class CloudDNSDriverBase(DNSDriver):
     """Agentless base for cloud-hosted authoritative DNS providers."""
 
@@ -297,5 +345,7 @@ __all__ = [
     "CloudDNSError",
     "CloudDNSProbe",
     "CloudDNSZone",
+    "compose_structured_rdata",
     "normalize_fqdn",
+    "split_structured_rdata",
 ]

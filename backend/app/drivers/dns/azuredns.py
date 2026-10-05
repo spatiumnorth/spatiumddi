@@ -215,7 +215,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(cname.cname)
         elif rtype == "MX":
             for r in getattr(rs, "mx_records", None) or []:
-                add(f"{r.preference} {r.exchange}")
+                # Split form (#1526): bare exchange in value, preference in
+                # its own column — NOT the composed "10 mail.example.com".
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.exchange,
+                        ttl=ttl,
+                        priority=int(r.preference),
+                    )
+                )
         elif rtype == "TXT":
             for r in getattr(rs, "txt_records", None) or []:
                 add("".join(r.value))
@@ -224,7 +234,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(r.nsdname)
         elif rtype == "SRV":
             for r in getattr(rs, "srv_records", None) or []:
-                add(f"{r.priority} {r.weight} {r.port} {r.target}")
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.target,
+                        ttl=ttl,
+                        priority=int(r.priority),
+                        weight=int(r.weight),
+                        port=int(r.port),
+                    )
+                )
         elif rtype == "PTR":
             for r in getattr(rs, "ptr_records", None) or []:
                 add(r.ptrdname)
@@ -480,8 +500,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
         """Build the create_or_update body for one neutral record.
 
         Returns the loosely-typed dict form the SDK accepts (``ttl`` plus
-        the type-specific record list); MX / SRV string values are split
-        back into their structured components.
+        the type-specific record list). MX / SRV take their structured
+        components from the record's own columns (#1526) — ``value`` is
+        the bare target, never a composed string to split back apart.
         """
         rtype = record.record_type.upper()
         ttl = record.ttl if record.ttl is not None else 3600
@@ -495,20 +516,19 @@ class AzureDNSDriver(CloudDNSDriverBase):
         elif rtype == "CNAME":
             params["cname_record"] = {"cname": value}
         elif rtype == "MX":
-            pref, _, exch = value.partition(" ")
-            params["mx_records"] = [{"preference": int(pref), "exchange": exch.strip()}]
+            pref = record.priority if record.priority is not None else 10
+            params["mx_records"] = [{"preference": pref, "exchange": value}]
         elif rtype == "TXT":
             params["txt_records"] = [{"value": [value]}]
         elif rtype == "NS":
             params["ns_records"] = [{"nsdname": value}]
         elif rtype == "SRV":
-            prio, weight, port, target = (value.split(None, 3) + ["", "", "", ""])[:4]
             params["srv_records"] = [
                 {
-                    "priority": int(prio),
-                    "weight": int(weight),
-                    "port": int(port),
-                    "target": target.strip(),
+                    "priority": record.priority if record.priority is not None else 0,
+                    "weight": record.weight if record.weight is not None else 0,
+                    "port": record.port if record.port is not None else 0,
+                    "target": value,
                 }
             ]
         elif rtype == "PTR":

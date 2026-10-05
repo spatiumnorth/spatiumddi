@@ -34,7 +34,9 @@ from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
     normalize_fqdn,
+    split_structured_rdata,
 )
 from app.drivers.dns.base import RecordChange, RecordData
 
@@ -189,13 +191,31 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 for rec in body.get("result") or []:
                     raw_ttl = rec.get("ttl")
                     ttl = None if raw_ttl == _TTL_AUTO else raw_ttl
+                    rtype = str(rec["type"]).upper()
+                    value = rec.get("content") or ""
+                    priority = rec.get("priority")
+                    weight: int | None = None
+                    port: int | None = None
+                    if rtype == "SRV":
+                        # SRV components live in the ``data`` object
+                        # (#1526); ``content`` is the composed string.
+                        data = rec.get("data") or {}
+                        if data:
+                            value = str(data.get("target") or value)
+                            priority = data.get("priority", priority)
+                            weight = data.get("weight")
+                            port = data.get("port")
+                        else:
+                            value, priority, weight, port = split_structured_rdata(rtype, value)
                     records.append(
                         RecordData(
                             name=self._relativize(rec["name"], zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["content"],
+                            value=value,
                             ttl=ttl,
-                            priority=rec.get("priority"),
+                            priority=priority,
+                            weight=weight,
+                            port=port,
                         )
                     )
                 info = body.get("result_info") or {}
@@ -226,10 +246,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         payload: dict[str, Any] = {
             "type": rec.record_type,
             "name": self._absolute_name(rec.name, zone_fqdn),
-            "content": rec.value,
             # Cloudflare's "automatic" TTL is the sentinel 1.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "SRV":
+            # Cloudflare takes SRV components as a ``data`` object, not a
+            # content string (#1526): priority / weight / port / target.
+            payload["data"] = {
+                "priority": rec.priority if rec.priority is not None else 0,
+                "weight": rec.weight if rec.weight is not None else 0,
+                "port": rec.port if rec.port is not None else 0,
+                "target": rec.value,
+            }
+            return payload
+        payload["content"] = rec.value
         if rec.priority is not None:
             payload["priority"] = rec.priority
         return payload
@@ -296,7 +326,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if rid is None:
@@ -316,7 +350,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if rid is None:

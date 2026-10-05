@@ -145,6 +145,31 @@ class VultrDNSDriver(CloudDNSDriverBase):
             return ""
         return rel
 
+    @staticmethod
+    def _srv_data(record: RecordData) -> str:
+        """Compose Vultr's SRV ``data`` string from the split columns.
+
+        Vultr's record model has a ``priority`` field of its own but no
+        weight / port fields (#1526): its API docs say to omit the
+        priority from ``data``, so the SRV data string is
+        ``"<weight> <port> <target>"``.
+        """
+        weight = record.weight if record.weight is not None else 0
+        port = record.port if record.port is not None else 0
+        return f"{weight} {port} {record.value}"
+
+    @staticmethod
+    def _split_srv_data(data: str) -> tuple[str, int | None, int | None]:
+        """Split Vultr's SRV ``data`` into ``(target, weight, port)``.
+
+        Inverse of :meth:`_srv_data`. A value that doesn't parse is
+        returned verbatim with ``None`` fields rather than failing the pull.
+        """
+        parts = (data or "").strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            return parts[2].strip(), int(parts[0]), int(parts[1])
+        return (data or "").strip(), None, None
+
     # ── Zone reads ──────────────────────────────────────────────────────
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:
         token = self._token(creds)
@@ -208,13 +233,22 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     priority = rec.get("priority")
                     if rec.get("type") not in ("MX", "SRV"):
                         priority = None
+                    value = rec["data"]
+                    weight: int | None = None
+                    port: int | None = None
+                    if rec.get("type") == "SRV":
+                        # Priority is Vultr's own field; weight/port ride
+                        # inside the data string (#1526).
+                        value, weight, port = self._split_srv_data(value)
                     records.append(
                         RecordData(
                             name=self._relativize(rec.get("name", ""), zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["data"],
+                            value=value,
                             ttl=ttl,
                             priority=priority,
+                            weight=weight,
+                            port=port,
                         )
                     )
                 cursor = self._next_cursor(body)
@@ -228,7 +262,9 @@ class VultrDNSDriver(CloudDNSDriverBase):
         payload: dict[str, Any] = {
             "name": self._relative_name(rec.name),
             "type": rec.record_type,
-            "data": rec.value,
+            # SRV: weight/port have no Vultr fields — they ride in data
+            # (priority stays in its own field, omitted from data) (#1526).
+            "data": self._srv_data(rec) if rec.record_type.upper() == "SRV" else rec.value,
             # Vultr's "automatic" TTL is the sentinel 0.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
@@ -296,7 +332,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     label,
                     payload["name"],
                     change.record.record_type,
-                    change.record.value,
+                    payload["data"],
                     priority=change.record.priority,
                 )
                 if rid is None:
@@ -318,7 +354,7 @@ class VultrDNSDriver(CloudDNSDriverBase):
                     label,
                     payload["name"],
                     change.record.record_type,
-                    change.record.value,
+                    payload["data"],
                     priority=change.record.priority,
                 )
                 if rid is None:

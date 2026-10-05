@@ -195,7 +195,7 @@ async def test_list_zone_records_expands_multiple_types(
     assert records == [
         RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
         RecordData(name="www", record_type="A", value="10.0.0.2", ttl=300),
-        RecordData(name="@", record_type="MX", value="10 mail.example.com", ttl=3600),
+        RecordData(name="@", record_type="MX", value="mail.example.com", ttl=3600, priority=10),
         RecordData(name="@", record_type="TXT", value="v=spf1 -all", ttl=3600),
     ]
 
@@ -226,7 +226,13 @@ async def test_list_zone_records_expands_srv_and_caa(
     records = await driver._list_zone_records(server, dict(_CREDS), "example.com.")
 
     assert records[0] == RecordData(
-        name="_sip._tcp", record_type="SRV", value="10 20 5060 sip.example.com", ttl=3600
+        name="_sip._tcp",
+        record_type="SRV",
+        value="sip.example.com",
+        ttl=3600,
+        priority=10,
+        weight=20,
+        port=5060,
     )
     assert records[1] == RecordData(
         name="@", record_type="CAA", value="0 issue letsencrypt.org", ttl=3600
@@ -375,7 +381,9 @@ async def test_apply_record_update_replaces_rrset(
     change = RecordChange(
         op="update",
         zone_name="example.com.",
-        record=RecordData(name="@", record_type="MX", value="20 mail2.example.com", ttl=3600),
+        record=RecordData(
+            name="@", record_type="MX", value="mail2.example.com", ttl=3600, priority=20
+        ),
         target_serial=2,
     )
     await driver._apply_record(server, dict(_CREDS), change)
@@ -400,7 +408,13 @@ async def test_apply_record_create_builds_srv_params(
         op="create",
         zone_name="example.com.",
         record=RecordData(
-            name="_sip._tcp", record_type="SRV", value="10 20 5060 sip.example.com", ttl=3600
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
         ),
         target_serial=3,
     )
@@ -611,3 +625,29 @@ async def test_probe_ok_reports_zone_count(
     probe = await driver.probe(server)
     assert probe.ok is True
     assert probe.zone_count == 1
+
+
+# ── MX / SRV split-form contract (#1526) ────────────────────────────────────
+
+
+async def test_apply_record_create_mx_bare_target_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """Regression: an API-shaped MX (bare target + priority column) used to
+    raise ValueError when the driver tried int() on the split value."""
+    client = Mock()
+    client.record_sets.get.return_value = None
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="@", record_type="MX", value="mail.example.com", ttl=3600, priority=15
+        ),
+        target_serial=1,
+    )
+    await driver._apply_record(server, dict(_CREDS), change)
+
+    _, _, _, _, params = client.record_sets.create_or_update.call_args.args
+    assert params["mx_records"] == [{"preference": 15, "exchange": "mail.example.com"}]

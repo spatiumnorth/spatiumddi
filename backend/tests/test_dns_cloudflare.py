@@ -540,3 +540,95 @@ def test_capabilities_shape() -> None:
     assert caps["dnssec_online"] is False  # #29 — cloud DNSSEC deferred
     assert caps["apex_cname"] == "flatten"
     assert "CAA" in caps["record_types"]
+
+
+# ── MX / SRV split-form contract (#1526) ────────────────────────────────────
+
+
+async def test_apply_record_create_srv_sends_data_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SRV goes out as a Cloudflare ``data`` object — priority, weight,
+    port and target — not a bare-target content string."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["data"] == {
+        "priority": 10,
+        "weight": 20,
+        "port": 5060,
+        "target": "sip.example.com",
+    }
+    assert "content" not in post["json"]
+
+
+async def test_list_zone_records_splits_srv_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    zone_lookup = _env([{"id": "zid"}])
+    records = _env(
+        [
+            {
+                "name": "_sip._tcp.example.com",
+                "type": "SRV",
+                "content": "10 20 5060 sip.example.com",
+                "ttl": 3600,
+                "data": {
+                    "priority": 10,
+                    "weight": 20,
+                    "port": 5060,
+                    "target": "sip.example.com",
+                },
+            },
+            {
+                "name": "_xmpp._tcp.example.com",
+                "type": "SRV",
+                "content": "5 0 5222 xmpp.example.com",
+                "ttl": 3600,
+            },
+        ]
+    )
+    fake = _FakeClient({"get": [_FakeResponse(200, zone_lookup), _FakeResponse(200, records)]})
+    driver = _patch_client(monkeypatch, fake)
+
+    out = await driver._list_zone_records(_Server(), _CREDS, "example.com.")
+
+    assert out[0] == RecordData(
+        name="_sip._tcp",
+        record_type="SRV",
+        value="sip.example.com",
+        ttl=3600,
+        priority=10,
+        weight=20,
+        port=5060,
+    )
+    # No ``data`` object → the composed content string is split instead.
+    assert out[1] == RecordData(
+        name="_xmpp._tcp",
+        record_type="SRV",
+        value="xmpp.example.com",
+        ttl=3600,
+        priority=5,
+        weight=0,
+        port=5222,
+    )

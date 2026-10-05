@@ -52,7 +52,9 @@ from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
     normalize_fqdn,
+    split_structured_rdata,
 )
 from app.drivers.dns.base import RecordChange, RecordData
 
@@ -186,12 +188,19 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             name = self._relativize(str(rrset.name), apex)
             ttl = rrset.ttl
             for rdata in rrset.rrdatas:
+                # MX / SRV rdata arrives composed ("10 mail.example.com.")
+                # — split it into the structured columns so the stored
+                # shape matches the record API's split contract (#1526).
+                bare, priority, weight, port = split_structured_rdata(rtype, str(rdata))
                 records.append(
                     RecordData(
                         name=name,
                         record_type=rtype,
-                        value=str(rdata),
+                        value=bare,
                         ttl=int(ttl) if ttl is not None else None,
+                        priority=priority,
+                        weight=weight,
+                        port=port,
                     )
                 )
         return records
@@ -235,6 +244,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         rr = change.record
         rtype = rr.record_type.upper()
         absolute = self._absolutize(rr.name, apex)
+        # The op's value in provider form — MX / SRV compose the structured
+        # columns into the rdata string Cloud DNS stores (#1526). The live
+        # rrset's rrdatas are already in that form.
+        composed = compose_structured_rdata(rr)
 
         # Cloud DNS groups every same-{name,type} value under a single
         # rrset (round-robin A, multiple MX/NS/TXT, …) but SpatiumDDI
@@ -248,7 +261,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
 
             if change.op == "create":
                 existing = self._find_rrset(zone, absolute, rtype)
-                merged, ttl = self._merge_create(existing, rr.value, rr.ttl)
+                merged, ttl = self._merge_create(existing, composed, rr.ttl)
                 if existing is not None and self._rrdatas(existing) == merged:
                     # Value already present with an unchanged set — no-op.
                     return None
@@ -263,12 +276,12 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
 
             if change.op == "delete":
                 existing = self._find_rrset(zone, absolute, rtype)
-                if existing is None or rr.value not in self._rrdatas(existing):
+                if existing is None or composed not in self._rrdatas(existing):
                     # Value (or whole rrset) already gone — idempotent
                     # no-op. Skip the commit so we don't fire an empty
                     # change set (Cloud DNS rejects those).
                     return None
-                reduced = [v for v in self._rrdatas(existing) if v != rr.value]
+                reduced = [v for v in self._rrdatas(existing) if v != composed]
                 changes.delete_record_set(existing)
                 if reduced:
                     # Siblings remain — re-add the reduced rrset rather
@@ -289,10 +302,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             # ``rrset_action``) the single-value replace is kept — right for
             # the common single-value rrset (CNAME, a host with one A/TXT).
             if change.rrset is not None and change.rrset.members:
-                values = [m.value for m in change.rrset.members]
+                values = [compose_structured_rdata(m) for m in change.rrset.as_records(rr)]
                 ttl = int(change.rrset.ttl or (rr.ttl if rr.ttl else 0) or 300)
             else:
-                values = [rr.value]
+                values = [composed]
                 ttl = int(rr.ttl) if rr.ttl else 300
             existing = self._find_rrset(zone, absolute, rtype)
             if existing is not None:
@@ -451,7 +464,8 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 "Calls scope by the managed-zone id (slug) resolved from the "
                 "zone DNS name; writes go through transactional change sets "
                 "and the op blocks until the change reaches 'done'. MX/SRV "
-                "priority is carried inside the record value."
+                "structured fields are composed into the provider rdata on "
+                "write and split back out on read."
             ),
         }
 

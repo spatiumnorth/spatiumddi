@@ -174,10 +174,11 @@ async def test_list_zone_records_relativize_and_expand(
     assert www.name == "www"
     assert www.ttl == 300
 
-    # MX keeps the priority baked into the value; priority stays None.
+    # MX rdata is split on read (#1526): bare target in value, the
+    # preference in its own column.
     mx = next(r for r in records if r.record_type == "MX")
-    assert mx.value == "10 mail.example.com."
-    assert mx.priority is None
+    assert mx.value == "mail.example.com."
+    assert mx.priority == 10
     assert mx.name == "@"
 
     # ALIAS rrset → value is the target DNS name, ttl is None.
@@ -777,3 +778,103 @@ def test_credential_fields() -> None:
     driver = Route53DNSDriver()
     assert driver.name == "route53"
     assert driver.credential_fields == ("access_key_id", "secret_access_key")
+
+
+# ── MX / SRV split-form contract (#1526) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_mx_composes_preference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An API-shaped MX (bare target + priority column) goes out composed."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {"ResourceRecordSets": []}
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=10
+        ),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    rrset = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0][
+        "ResourceRecordSet"
+    ]
+    assert rrset["ResourceRecords"] == [{"Value": "10 mail.example.com."}]
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_srv_composes_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {"ResourceRecordSets": []}
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    rrset = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]["Changes"][0][
+        "ResourceRecordSet"
+    ]
+    assert rrset["ResourceRecords"] == [{"Value": "10 20 5060 sip.example.com."}]
+
+
+@pytest.mark.asyncio
+async def test_list_zone_records_splits_srv(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z1", "Name": "example.com."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "_sip._tcp.example.com.",
+                "Type": "SRV",
+                "TTL": 3600,
+                "ResourceRecords": [{"Value": "10 20 5060 sip.example.com."}],
+            }
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    records = await driver._list_zone_records(_server(), CREDS, "example.com.")
+    assert records == [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    ]
