@@ -3028,6 +3028,35 @@ class AuditTargetBody(BaseModel):
             raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
         return v
 
+    @model_validator(mode="after")
+    def _valid_kind_config(self) -> AuditTargetBody:
+        # Per-kind completeness (#1581), mirroring the legacy
+        # flat-settings validators below. Without this a host-less
+        # syslog / URL-less webhook target was saved enabled, then
+        # silently skipped by ``audit_forward._load_targets``, and an
+        # SMTP target with no recipients warned on every audit row.
+        if self.kind == "syslog":
+            if not self.host.strip():
+                raise ValueError("host is required for a syslog target")
+            if not (1 <= self.port <= 65535):
+                raise ValueError("port must be 1–65535")
+            if not (0 <= self.facility <= 23):
+                raise ValueError("facility must be 0–23 (RFC 5424)")
+        elif self.kind == "webhook":
+            if not self.url.strip():
+                raise ValueError("url is required for a webhook target")
+        elif self.kind == "smtp":
+            if not self.smtp_host.strip():
+                raise ValueError("smtp_host is required for an smtp target")
+            if not (1 <= self.smtp_port <= 65535):
+                raise ValueError("smtp_port must be 1–65535")
+            if not self.smtp_from_address.strip():
+                raise ValueError("smtp_from_address is required for an smtp target")
+            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
+            if not recipients:
+                raise ValueError("smtp_to_addresses must contain at least one recipient")
+        return self
+
 
 class AuditTargetResponse(BaseModel):
     id: str
