@@ -76,6 +76,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **ACME DNS-01 solves no longer strand challenge records, stall on
+  other groups, or verify against the wrong resolver (#1530, #1531,
+  #1532).** A solve that fails after its `_acme-challenge` TXT record
+  commits now tears the record down on every failure path, and the
+  stale-TXT sweep — which existed but had no caller — is on an hourly
+  beat schedule and also covers stranded client-path records, not
+  just acme-dns provider accounts. The sibling-op wait in `solve()`
+  is scoped to servers in the zone's own group: serials are
+  date-based, so a same-name zone in another group (a split-horizon
+  pair) could otherwise stall or fail the solve. And the manual
+  DNS-01 propagation check walks the domain's authoritative name
+  servers (found by walking up from the challenge FQDN) and requires
+  the TXT on every one, instead of asking the appliance's own
+  resolver, which is not what the CA queries.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
