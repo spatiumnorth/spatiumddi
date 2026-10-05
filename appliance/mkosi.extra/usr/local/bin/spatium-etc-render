@@ -64,20 +64,95 @@ fi
 # ── SSH host keys ────────────────────────────────────────────────────
 # Authoritative copy lives in STATE. Restore into /etc/ssh so sshd
 # presents a stable identity across slot swaps. If STATE has none yet
-# (fresh install where the seeding step didn't run, or an upgrade off
-# a pre-#276 image), generate the standard set + persist to STATE so
-# the next boot is authoritative.
-if ls "$STATE_DIR"/ssh/ssh_host_*_key >/dev/null 2>&1; then
-    mkdir -p /etc/ssh
-    cp -a "$STATE_DIR"/ssh/ssh_host_* /etc/ssh/ 2>/dev/null || true
-    chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
-    chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+# (a fresh install — the image ships no host keys and the installer no
+# longer seeds any — or an upgrade off a pre-#276 image), generate the
+# standard set + persist to STATE so the next boot is authoritative.
+#
+# GHSA-vvh9-6gfw-wphp — until the fix, the openssh postinst generated
+# host keys inside the mkosi build container and the installer copied
+# THOSE into STATE, so every appliance installed from one release
+# presented the same keys, and the private halves shipped in the public
+# ISO. Such a key is recognised by the comment ssh-keygen stamped on it:
+# ``root@`` + docker's default hostname, the 12-hex short container id
+# (the builder runs with no --hostname, in CI and in `make appliance`
+# alike). A key generated ON an appliance carries ``root@<its own
+# hostname>``, and an operator's own key whatever comment they chose, so
+# neither matches — the one ambiguity, a node genuinely named like a
+# container id, is excluded by comparing against this node's hostname.
+# Rotation runs at most once per STATE: the marker records that the
+# check was done, so a later rename can never trigger a second rotation.
+SSH_DIR=/etc/ssh
+SSH_STATE="$STATE_DIR/ssh"
+BUILD_KEY_MARKER="$SSH_STATE/.build-keys-checked"
+
+# True when any public host key in $1 carries a build-container comment.
+has_build_key() {
+    _self="$(hostname 2>/dev/null || true)"
+    for _pub in "$1"/ssh_host_*_key.pub; do
+        [ -f "$_pub" ] || continue
+        _comment="$(awk '{print $3; exit}' "$_pub")"
+        case "$_comment" in
+            root@*) _host="${_comment#root@}" ;;
+            *) continue ;;
+        esac
+        [ "$_host" = "$HOSTNAME_VAL" ] && continue
+        [ "$_host" = "$_self" ] && continue
+        if printf '%s\n' "$_host" | grep -Eqx '[0-9a-f]{12}'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Generate a fresh set into a scratch prefix and only THEN replace
+# STATE's, so a failed ssh-keygen leaves the old keys in place rather
+# than none (sshd refuses to start keyless).
+generate_into_state() {
+    _tmp="$(mktemp -d)"
+    mkdir -p "$_tmp/etc/ssh"
+    if ssh-keygen -A -f "$_tmp" >/dev/null 2>&1 \
+            && ls "$_tmp"/etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+        mkdir -p "$SSH_STATE"
+        rm -f "$SSH_STATE"/ssh_host_*
+        cp -a "$_tmp"/etc/ssh/ssh_host_* "$SSH_STATE/"
+        rm -rf "$_tmp"
+        return 0
+    fi
+    rm -rf "$_tmp"
+    return 1
+}
+
+if [ ! -f "$BUILD_KEY_MARKER" ] && has_build_key "$SSH_STATE"; then
+    echo "STATE holds the image-baked build host keys — rotating once (GHSA-vvh9-6gfw-wphp)"
+    generate_into_state \
+        || echo "WARN: ssh-keygen failed — keeping the existing keys, will retry next boot"
+fi
+
+if ! ls "$SSH_STATE"/ssh_host_*_key >/dev/null 2>&1; then
+    # Pre-#276 upgrades parked unique keys in /etc; adopt those, but
+    # never a baked set.
+    if ls "$SSH_DIR"/ssh_host_*_key >/dev/null 2>&1 && ! has_build_key "$SSH_DIR"; then
+        echo "no SSH host keys in STATE — persisting the ones in $SSH_DIR"
+        mkdir -p "$SSH_STATE"
+        cp -a "$SSH_DIR"/ssh_host_*_key "$SSH_DIR"/ssh_host_*_key.pub "$SSH_STATE/" 2>/dev/null || true
+    else
+        echo "no SSH host keys in STATE — generating + persisting"
+        generate_into_state || echo "WARN: ssh-keygen failed — no SSH host keys in STATE"
+    fi
+fi
+
+if ls "$SSH_STATE"/ssh_host_*_key >/dev/null 2>&1; then
+    mkdir -p "$SSH_DIR"
+    # Clear first: the overlay upper still holds whatever was restored on
+    # earlier boots, and a key type STATE no longer has must not linger.
+    rm -f "$SSH_DIR"/ssh_host_*
+    cp -a "$SSH_STATE"/ssh_host_* "$SSH_DIR/" 2>/dev/null || true
+    chmod 600 "$SSH_DIR"/ssh_host_*_key 2>/dev/null || true
+    chmod 644 "$SSH_DIR"/ssh_host_*_key.pub 2>/dev/null || true
+    if ! has_build_key "$SSH_STATE"; then
+        touch "$BUILD_KEY_MARKER"
+    fi
     echo "SSH host keys restored from STATE"
-else
-    echo "no SSH host keys in STATE — generating + persisting"
-    ssh-keygen -A >/dev/null 2>&1 || true
-    mkdir -p "$STATE_DIR/ssh"
-    cp -a /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub "$STATE_DIR/ssh/" 2>/dev/null || true
 fi
 
 # ── role-config ──────────────────────────────────────────────────────

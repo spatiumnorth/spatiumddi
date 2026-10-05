@@ -72,6 +72,7 @@ for unit in chrony.service ssh.service \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
+            spatium-ssh-hostkeys.service \
             spatium-console.service \
             spatium-etc-reconcile.service \
             qemu-guest-agent.service \
@@ -274,6 +275,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
+# GHSA-vvh9-6gfw-wphp — generates SSH host keys where etc-render did not.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-ssh-hostkeys.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"
