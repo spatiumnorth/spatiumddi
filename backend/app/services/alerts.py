@@ -760,6 +760,10 @@ _COMPLIANCE_CHANGE_AUTO_RESOLVE_HOURS = 24
 # tick picks up where this one left off.
 _COMPLIANCE_CHANGE_SCAN_LIMIT = 1000
 
+# Rule ids already warned about for a missing/unknown classification
+# (#1580) — log once per rule per process instead of every 60 s tick.
+_COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED: set[str] = set()
+
 # Resource types in audit_log we know how to map back to a Subnet for
 # classification lookup. Anything outside this set is skipped with a
 # logged debug. The map values name a mapper function below.
@@ -4498,11 +4502,17 @@ async def _evaluate_compliance_change_rule(
 
     classification = rule.classification or ""
     if classification not in COMPLIANCE_CLASSIFICATIONS:
-        logger.warning(
-            "alert_compliance_unknown_classification",
-            rule=str(rule.id),
-            classification=classification,
-        )
+        # #1580 — warn once per rule, not on every 60 s tick. Rules
+        # created before the API required a classification (or with
+        # an unknown one) are dead until fixed; one warning says so.
+        rule_key = str(rule.id)
+        if rule_key not in _COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED:
+            _COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED.add(rule_key)
+            logger.warning(
+                "alert_compliance_unknown_classification",
+                rule=rule_key,
+                classification=classification,
+            )
         return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
 
     actions = _COMPLIANCE_CHANGE_SCOPE_ACTIONS.get(
@@ -4519,6 +4529,10 @@ async def _evaluate_compliance_change_rule(
         )
     )
     for ev in open_res.scalars().all():
+        # #1578 — conformity events are owned by the conformity
+        # engine; this window must not auto-resolve them.
+        if ev.subject_type == "conformity":
+            continue
         if ev.fired_at < auto_resolve_cutoff:
             ev.resolved_at = now
             resolved += 1
@@ -5884,6 +5898,10 @@ async def _deliver(
     Per-target ``min_severity`` / ``resource_types`` filters still
     apply via ``_deliver_to_target``. A dead target isolates to its
     own row; the others still see the event.
+
+    A kind's flag is set only when at least one target of that kind
+    reports ``delivered`` (#1577) — a filtered target, a misconfigured
+    one, or one whose transport failed must not stamp the receipt.
     """
     delivered_syslog = False
     delivered_webhook = False
@@ -5911,7 +5929,9 @@ async def _deliver(
         if kind == "smtp" and not rule.notify_smtp:
             continue
         try:
-            await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            outcome = await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            if outcome != audit_forward.DELIVERED:
+                continue
             if kind == "syslog":
                 delivered_syslog = True
             elif kind == "webhook":
@@ -6771,7 +6791,15 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 )
             )
             open_events = list(open_res.scalars().all())
-            open_by_subject = {ev.subject_id: ev for ev in open_events}
+            # #1578 — conformity events (subject_type="conformity") are
+            # opened by the conformity engine against an ordinary rule;
+            # no matcher here ever produces that subject_type, so the
+            # resolve-if-unmatched pass below would close them within
+            # a tick and the engine would not re-fire while the policy
+            # keeps failing. They are not this evaluator's to manage.
+            open_by_subject = {
+                ev.subject_id: ev for ev in open_events if ev.subject_type != "conformity"
+            }
 
             match_ids = {sid for sid, _, _, _ in matches}
 

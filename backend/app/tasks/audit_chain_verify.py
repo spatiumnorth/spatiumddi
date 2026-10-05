@@ -116,6 +116,21 @@ async def _async_verify_and_alert() -> dict:
             },
         )
         db.add(evt)
+        await db.flush()
+        # #1576 — deliver to forward targets like every other alert;
+        # the generic evaluator skips externally-driven rule types,
+        # so without this the event only ever showed in-app.
+        try:
+            from app.services import alerts as alert_service  # noqa: PLC0415
+            from app.services import audit_forward  # noqa: PLC0415
+
+            targets = await audit_forward._load_targets()  # noqa: SLF001
+            ds, dw, dm = await alert_service._deliver(rule, evt, targets)  # noqa: SLF001
+            evt.delivered_syslog = ds
+            evt.delivered_webhook = dw
+            evt.delivered_smtp = dm
+        except Exception as exc:  # noqa: BLE001 — delivery must not lose the alert
+            logger.warning("audit_chain_broken_delivery_failed", error=str(exc))
         await db.commit()
         logger.error(
             "audit_chain_broken",

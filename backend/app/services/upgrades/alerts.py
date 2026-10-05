@@ -299,6 +299,22 @@ async def emit_upgrade_failed_alert(
         last_observed_value=detail,
     )
     db.add(evt)
+    # #1576 — deliver to forward targets; the generic evaluator skips
+    # externally-driven rule types, so without this the event only
+    # ever showed in-app. Caller still owns the commit. Delivery
+    # failures must not break the orchestrator's failure transition.
+    try:
+        await db.flush()
+        from app.services import alerts as alert_service  # noqa: PLC0415
+        from app.services import audit_forward  # noqa: PLC0415
+
+        targets = await audit_forward._load_targets()  # noqa: SLF001
+        ds, dw, dm = await alert_service._deliver(rule, evt, targets)  # noqa: SLF001
+        evt.delivered_syslog = ds
+        evt.delivered_webhook = dw
+        evt.delivered_smtp = dm
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("upgrade_failed_alert_delivery_failed", run_id=str(run.id), error=str(exc))
     logger.info(
         "upgrade_failed_alert_emitted",
         run_id=str(run.id),
