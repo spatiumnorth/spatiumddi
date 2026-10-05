@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.ipam import CustomFieldDefinition
 
 logger = structlog.get_logger(__name__)
@@ -195,7 +196,13 @@ async def update_custom_field(
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")
 
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears default_value / options; null for a
+    # NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"default_value", "options"},
+        non_nullable={"label", "is_required", "is_searchable", "display_order", "description"},
+    )
     for attr, value in changes.items():
         setattr(field, attr, value)
 
