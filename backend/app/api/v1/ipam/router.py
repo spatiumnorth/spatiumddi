@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname
+from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -1092,6 +1092,24 @@ _dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] |
 )
 
 
+def _never_publishable(name: str, rtype: str, value: str) -> bool:
+    """Whether a record could never have been accepted by a DNS server.
+
+    Before #1459 an integration's free-text name ("Vitrinen Schalter") was
+    published verbatim. The servers refuse such a record, so a delete of it
+    fails on every retry and stays ``failed`` forever. Once the name is
+    folded into a legal one, the rename retracts the old name, and that
+    retraction has nothing to remove on the wire.
+    """
+    try:
+        validate_record_owner(name)
+        if rtype == "PTR":
+            validate_fqdn(value)
+    except ValueError:
+        return True
+    return False
+
+
 async def _enqueue_dns_op(
     db: AsyncSession,
     zone: DNSZone,
@@ -1111,6 +1129,16 @@ async def _enqueue_dns_op(
     callers use that to avoid stamping a record that didn't land (#428)."""
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
+
+    if op == "delete" and _never_publishable(name, rtype, value):
+        logger.info(
+            "ipam_dns_delete_skipped_invalid_name",
+            zone=zone.name,
+            name=name,
+            record_type=rtype,
+            detail="the record is not a legal DNS name, so no server holds it",
+        )
+        return None
 
     target_serial = bump_zone_serial(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}

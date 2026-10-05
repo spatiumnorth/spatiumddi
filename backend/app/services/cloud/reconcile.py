@@ -56,6 +56,7 @@ from app.core.crypto import decrypt_dict
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.cloud.base import (
     CloudConnectorError,
     CloudInventory,
@@ -97,6 +98,9 @@ class _DesiredAddress:
     # to the endpoint's ``public_space_id`` when one is configured; every
     # other row (and the fallback) lands in ``ipam_space_id``.
     public: bool = False
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass

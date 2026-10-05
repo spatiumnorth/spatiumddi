@@ -54,6 +54,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import owned_by_other_integration
 from app.services.kubernetes.client import (
     KubernetesClient,
@@ -140,6 +141,9 @@ class _DesiredAddress:
     status: str  # kubernetes-node | kubernetes-lb | kubernetes-service | kubernetes-pod
     hostname: str
     description: str
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass(frozen=True)

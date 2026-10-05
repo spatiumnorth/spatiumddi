@@ -76,6 +76,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Names from integrations are turned into legal host names before
+  they reach IPAM and DNS (#1459).** UniFi, Docker, Proxmox, Meraki,
+  the cloud providers, OPNsense, Kubernetes, Tailscale, NetBird and the
+  Fortinet / PAN-OS mirrors copied the upstream display name into the
+  address's hostname verbatim, and IPAM's DNS sync published it as a
+  record. A free-text name like `Vitrinen Schalter` or `John's iPhone`
+  became a record every DNS server refused, on every retry. Names that
+  are already legal host names are kept exactly as they are. Anything
+  else is folded once, where the integration builds the address:
+  umlauts spelled out, accents and apostrophes dropped, everything
+  outside letters, digits and hyphens turned into `-`, lower-cased
+  (`Sonos Büro` → `sonos-buero`). The original name is kept at the end
+  of the address's description (`… — name: Sonos Büro`). An address
+  that already carries an illegal name is renamed on the next sync, and
+  the delete for the old name is no longer queued, since no server ever
+  held it (it used to fail forever). Duplicate names are not suffixed:
+  two clients both called `Office PC` still share one name.
+
 - **DNS agent LoadBalancer Services keep the client address and can
   pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
   and nothing else, so the rendered LoadBalancer ran with the default
