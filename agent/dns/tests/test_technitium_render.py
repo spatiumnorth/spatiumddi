@@ -20,6 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
     TechnitiumDriver,
     _blocking_payload,
@@ -1542,3 +1545,114 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── swap_and_reload: TSIG sync (#1517) + partial refusal (#1516) ────────
+
+
+def _ok_responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+    if path == "zones/records/get":
+        return {"status": "ok", "response": {"records": []}}
+    return {"status": "ok"}
+
+
+def _prep_swap(driver: TechnitiumDriver, responder: Any) -> list:
+    """Stub out the daemon/token plumbing so swap_and_reload runs
+    entirely against the fake ``_request``."""
+    driver.daemon_running = lambda: True  # type: ignore[method-assign]
+    driver._wait_for_api_up = lambda: None  # type: ignore[method-assign]
+    driver._get_api_token = lambda: "tok-1"  # type: ignore[method-assign]
+    return _install_fake_request(driver, responder)
+
+
+_ONE_ZONE_BUNDLE = {
+    "zones": [
+        {
+            "name": "example.com.",
+            "type": "primary",
+            "ttl": 3600,
+            "records": [
+                {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 300},
+            ],
+        }
+    ]
+}
+
+
+def test_swap_syncs_empty_tsig_key_list(tmp_path: Path) -> None:
+    """#1517: a bundle with NO keys must still call settings/set with an
+    empty tsigKeys value, clearing keys the daemon already holds. The old
+    truthiness guard never called the sync at all in that state."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()
+    tsig_calls = [
+        c for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3]
+    ]
+    assert len(tsig_calls) == 1
+    assert tsig_calls[0][3]["tsigKeys"] == ""
+
+
+def test_swap_succeeds_when_every_step_is_accepted(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()  # must not raise
+
+
+def test_swap_raises_when_a_record_add_is_refused(tmp_path: Path) -> None:
+    """#1516: a refused record add used to be a log line and a reported
+    success. Now the apply raises (ConfigApplyError via apply_config, so
+    quarantine/revert engages) — after still attempting the add."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "invalid record name"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    with pytest.raises(ConfigApplyError) as excinfo:
+        d.apply_config(_ONE_ZONE_BUNDLE)
+    assert excinfo.value.phase == "reload"
+    assert any(c[2] == "zones/records/add" for c in calls)
+
+
+def test_swap_raises_when_zone_create_is_refused_but_still_reconciles(
+    tmp_path: Path,
+) -> None:
+    """#1516: one refused zone must not stop the rest of the apply —
+    every zone is attempted, then the collected failures raise."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "no SOA from primary"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    with pytest.raises(RuntimeError, match="partly refused"):
+        d.swap_and_reload()
+    # Records for the (missing) zone were still attempted.
+    assert any(c[2] == "zones/records/add" for c in calls)
+
+
+def test_swap_raises_when_tsig_sync_is_refused(tmp_path: Path) -> None:
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "settings/set" and "tsigKeys" in params:
+            return {"status": "error", "errorMessage": "bad key"}
+        return _ok_responder(path, params, _n)
+
+    bundle = {
+        **_ONE_ZONE_BUNDLE,
+        "tsig_keys": [
+            {"name": "xfer.example.com.", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}
+        ],
+    }
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d.render(bundle)
+    with pytest.raises(RuntimeError, match="tsig keys"):
+        d.swap_and_reload()

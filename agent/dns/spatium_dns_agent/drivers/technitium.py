@@ -621,6 +621,19 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
 
+    # Per-apply failure collector (#1516). ``swap_and_reload`` installs a
+    # list here; the log-and-continue helpers below append every refused
+    # step to it, and ``swap_and_reload`` raises at the end if it is
+    # non-empty, so a partly refused apply engages the #882 quarantine /
+    # revert machinery instead of being reported as success. ``None``
+    # outside an apply (record ops, direct helper calls) means "log
+    # only", preserving the helpers' standalone behaviour.
+    _apply_failures: list[str] | None = None
+
+    def _note_apply_failure(self, what: str) -> None:
+        if self._apply_failures is not None:
+            self._apply_failures.append(what)
+
 
     # ── Render / validate / swap ────────────────────────────────────────────
 
@@ -787,42 +800,71 @@ class TechnitiumDriver(DriverBase):
             payload = json.loads(zones_path.read_text())
         except Exception as exc:  # noqa: BLE001
             log.error("technitium_zones_payload_unreadable", error=str(exc))
-            return
+            # #1516: returning normally here read as a successful apply —
+            # the sync loop advanced the etag, reported the serials as
+            # served and committed the bundle as last-known-good with
+            # nothing applied at all. Raise so the #882 quarantine /
+            # revert path engages and the bundle is retried.
+            raise RuntimeError(f"technitium zones.json unreadable: {exc}") from exc
 
         token = self._get_api_token()
         if token is None:
             log.error("technitium_reconcile_skipped_no_token")
-            return
+            raise RuntimeError("technitium reconcile skipped: no API token available")
 
         # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
         # even when it names a key the server does not have (verified — the
         # API stores it happily), and the failure only shows up later as a
         # refused transfer. Push the keys before anything references them.
-        server_path = current / "server.json"
-        server_state: dict[str, Any] = {}
-        if server_path.exists():
-            try:
-                server_state = json.loads(server_path.read_text())
-            except ValueError as exc:
-                log.error("technitium_server_payload_unreadable", error=str(exc))
-        if server_state.get("tsig_keys"):
-            self._sync_tsig_keys(token, server_state["tsig_keys"])
+        #
+        # Every step below still runs even when an earlier one is refused
+        # (#1516): attempt everything, collect the refusals, and raise at
+        # the end so the apply as a whole is not reported as success.
+        self._apply_failures = []
+        try:
+            server_path = current / "server.json"
+            server_state: dict[str, Any] = {}
+            server_state_known = False
+            if server_path.exists():
+                try:
+                    server_state = json.loads(server_path.read_text())
+                    server_state_known = True
+                except ValueError as exc:
+                    log.error("technitium_server_payload_unreadable", error=str(exc))
+                    self._note_apply_failure(f"server.json unreadable: {exc}")
+            # #1517: unconditional whenever server.json was readable —
+            # an emptied key list is a real desired state and the callee
+            # clears every key on the daemon. Only an unreadable (or
+            # missing) server.json skips it: then the desired list is
+            # unknown, not empty, and clearing would be a guess.
+            if server_state_known:
+                self._sync_tsig_keys(token, server_state.get("tsig_keys") or [])
 
-        # Encrypted listeners + upstream forwarding (#741). Before the zone
-        # reconcile so a slow zone pass cannot delay bringing a listener up.
-        server_options = server_state.get("options") or {}
-        if server_options:
-            self._apply_transport_settings(
-                token, server_options, server_state.get("tls_cert")
+            # Encrypted listeners + upstream forwarding (#741). Before the zone
+            # reconcile so a slow zone pass cannot delay bringing a listener up.
+            server_options = server_state.get("options") or {}
+            if server_options:
+                self._apply_transport_settings(
+                    token, server_options, server_state.get("tls_cert")
+                )
+                self._apply_forwarders(token, server_options)
+
+            # Blocklists (#744). Always applied, even when empty — an emptied
+            # list has to actually clear on the daemon.
+            self._apply_blocking(token, server_state.get("blocking") or {})
+
+            self._reconcile_zones(token, payload)
+            self._apply_catalog(token, server_state.get("catalog"), payload)
+            failures = list(self._apply_failures)
+        finally:
+            self._apply_failures = None
+        if failures:
+            raise RuntimeError(
+                "technitium apply partly refused ("
+                + "; ".join(failures[:10])
+                + (f"; +{len(failures) - 10} more" if len(failures) > 10 else "")
+                + ")"
             )
-            self._apply_forwarders(token, server_options)
-
-        # Blocklists (#744). Always applied, even when empty — an emptied
-        # list has to actually clear on the daemon.
-        self._apply_blocking(token, server_state.get("blocking") or {})
-
-        self._reconcile_zones(token, payload)
-        self._apply_catalog(token, server_state.get("catalog"), payload)
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -866,6 +908,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_tsig_keys_apply_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"tsig keys: {body.get('errorMessage')}")
         else:
             log.info("technitium_tsig_keys_applied", count=len(tokens) // 3)
 
@@ -898,6 +941,7 @@ class TechnitiumDriver(DriverBase):
                     zone=cat_name or None,
                     producer=producer,
                 )
+                self._note_apply_failure("catalog consumer: incomplete catalog block")
                 return
             self._ensure_zone_exists(
                 token,
@@ -929,6 +973,9 @@ class TechnitiumDriver(DriverBase):
                     zone=zone,
                     catalog=desired or None,
                     error=body.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"catalog membership {zone}: {body.get('errorMessage')}"
                 )
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
@@ -1182,6 +1229,7 @@ class TechnitiumDriver(DriverBase):
                 value=blocking_type,
                 supported=sorted(_BLOCKING_TYPES),
             )
+            self._note_apply_failure(f"blocking: invalid type {blocking_type}")
             return
 
         settings: dict[str, Any] = {
@@ -1203,6 +1251,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_blocking_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"blocking settings: {body.get('errorMessage')}")
             return
 
         for kind in ("blocked", "allowed"):
@@ -1211,6 +1260,9 @@ class TechnitiumDriver(DriverBase):
                 log.error(
                     f"technitium_{kind}_flush_failed",
                     error=flushed.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"blocking {kind} flush: {flushed.get('errorMessage')}"
                 )
                 continue
             for domain in blocking.get(kind) or []:
@@ -1222,6 +1274,9 @@ class TechnitiumDriver(DriverBase):
                         f"technitium_{kind}_add_failed",
                         domain=domain,
                         error=added.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"blocking {kind} add {domain}: {added.get('errorMessage')}"
                     )
         log.info(
             "technitium_blocking_applied",
@@ -1306,6 +1361,7 @@ class TechnitiumDriver(DriverBase):
         if wants_tls:
             if not cert_path:
                 log.error("technitium_encrypted_transport_skipped_no_cert")
+                self._note_apply_failure("encrypted transport: no usable TLS cert")
                 cert_ok = False
             else:
                 body = self._call(
@@ -1316,6 +1372,9 @@ class TechnitiumDriver(DriverBase):
                         "technitium_tls_cert_path_rejected",
                         path=cert_path,
                         error=body.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"tls cert path: {body.get('errorMessage')}"
                     )
                     cert_ok = False
 
@@ -1358,6 +1417,9 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_transport_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(
+                f"transport settings: {body.get('errorMessage')}"
+            )
             return
         log.info(
             "technitium_transport_settings_applied",
@@ -1387,6 +1449,7 @@ class TechnitiumDriver(DriverBase):
         protocol = _FORWARDER_PROTOCOLS.get(transport)
         if protocol is None:
             log.warning("technitium_forward_transport_unsupported", transport=transport)
+            self._note_apply_failure(f"forwarders: unsupported transport {transport}")
             return
 
         if not forwarders:
@@ -1401,6 +1464,9 @@ class TechnitiumDriver(DriverBase):
             if body.get("status") != "ok":
                 log.error(
                     "technitium_forwarders_clear_failed", error=body.get("errorMessage")
+                )
+                self._note_apply_failure(
+                    f"forwarders clear: {body.get('errorMessage')}"
                 )
             else:
                 log.info("technitium_forwarders_cleared")
@@ -1424,6 +1490,9 @@ class TechnitiumDriver(DriverBase):
                     transport=transport,
                     hint="forward_tls_hostname is required for tls/https/quic",
                 )
+                self._note_apply_failure(
+                    f"forwarders: no forward_tls_hostname for {transport}"
+                )
                 return
 
         resp = self._call(
@@ -1439,6 +1508,7 @@ class TechnitiumDriver(DriverBase):
                 protocol=protocol,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(f"forwarders: {body.get('errorMessage')}")
             return
         log.info(
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
@@ -1637,6 +1707,10 @@ class TechnitiumDriver(DriverBase):
                             record=rec,
                             error=body.get("errorMessage"),
                         )
+                        self._note_apply_failure(
+                            f"record delete {zone}/{rec.get('domain')}: "
+                            f"{body.get('errorMessage')}"
+                        )
                 else:
                     deleted += 1
 
@@ -1658,6 +1732,10 @@ class TechnitiumDriver(DriverBase):
                             zone=zone,
                             record=rec,
                             error=body.get("errorMessage"),
+                        )
+                        self._note_apply_failure(
+                            f"record add {zone}/{rec.get('domain')}: "
+                            f"{body.get('errorMessage')}"
                         )
                     continue
                 added += 1
@@ -1721,6 +1799,9 @@ class TechnitiumDriver(DriverBase):
                 zone_type=ztype,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(
+                f"zone create {zone}: {body.get('errorMessage')}"
+            )
 
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
@@ -1740,6 +1821,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
+            )
+            self._note_apply_failure(
+                f"zone upstream {zone}: {body.get('errorMessage')}"
             )
 
     def _apply_zone_options(
@@ -1765,6 +1849,7 @@ class TechnitiumDriver(DriverBase):
                 value=transfer,
                 supported=sorted(_ZONE_TRANSFER_VALUES),
             )
+            self._note_apply_failure(f"zone options {zone}: bad zoneTransfer {transfer}")
             return
 
         params: dict[str, Any] = {"zone": zone}
@@ -1780,6 +1865,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(
+                f"zone options {zone}: {body.get('errorMessage')}"
+            )
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
         resp = self._call(
@@ -1791,8 +1879,15 @@ class TechnitiumDriver(DriverBase):
         try:
             body = resp.json()
         except ValueError:
+            self._note_apply_failure(f"zone records get {zone}: non-JSON response")
             return []
         if body.get("status") != "ok":
+            # Reading an empty/error body as "zone is empty" would make
+            # the reconcile re-add everything and report the refused
+            # reads as churn (#1516).
+            self._note_apply_failure(
+                f"zone records get {zone}: {body.get('errorMessage') or body.get('status')}"
+            )
             return []
         out = []
         for rec in body.get("response", {}).get("records") or []:
