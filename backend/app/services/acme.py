@@ -28,6 +28,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db import AsyncSessionLocal
 from app.models.acme import ACMEAccount
+from app.services.integration_ownership import ACME_RECORD_TAG
 from app.models.dns import DNSAgentBundle, DNSRecord, DNSRecordOp, DNSZone
 
 log = structlog.get_logger(__name__)
@@ -260,6 +261,9 @@ async def apply_txt_update(db: AsyncSession, account: ACMEAccount, txt: str) -> 
         value=txt,
         ttl=ACME_TXT_TTL,
         auto_generated=True,
+        # #1554: ACME records are not IPAM sync output — mark them so
+        # the IPAM DNS drift sweep leaves them alone.
+        tags={ACME_RECORD_TAG: True},
     )
     db.add(new_rec)
     # Let _enqueue_dns_op bump the serial + hit the primary server.

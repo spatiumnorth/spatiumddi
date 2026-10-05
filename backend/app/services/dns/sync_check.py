@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.integration_ownership import dns_record_owned_elsewhere
 
 # ── Drift report dataclasses ─────────────────────────────────────────────────
 
@@ -392,6 +393,13 @@ async def compute_subnet_dns_drift(
             )
         )
         for r in orphan_res.scalars().all():
+            # #1554: records owned by an integration mirror, the DNS
+            # pool pipeline, or ACME also carry no ip_address_id, but
+            # they are not IPAM sync output — never report them stale
+            # here (auto-sync would delete them and the owner would
+            # recreate them on its next pass, flapping the name).
+            if dns_record_owned_elsewhere(r):
+                continue
             zone_name = (
                 forward_zone.name
                 if forward_zone and r.zone_id == forward_zone.id

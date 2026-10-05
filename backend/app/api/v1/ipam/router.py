@@ -6601,6 +6601,17 @@ async def _apply_dns_sync(
         )
         stale_records = list(stale_res.scalars().all())
 
+        # #1554 re-check: a stale ID handed to us (by the auto-sync task
+        # or a manual apply) may name a record owned by an integration
+        # mirror, the DNS pool pipeline, or ACME — those are not IPAM
+        # sync output and must never be deleted here, whatever the
+        # report that produced the ID said.
+        from app.services.integration_ownership import (  # noqa: PLC0415
+            dns_record_owned_elsewhere,
+        )
+
+        stale_records = [r for r in stale_records if not dns_record_owned_elsewhere(r)]
+
         # Group by zone so each zone's primary server gets a single
         # batched driver call (critical for agentless Windows DNS — one
         # WinRM round trip per zone instead of one per record).
