@@ -135,20 +135,44 @@ class KubernetesClient:
 
     async def _list(self, path: str) -> list[dict[str, Any]]:
         assert self._client is not None, "use within 'async with'"
-        try:
-            resp = await self._client.get(path, params={"limit": "500"})
-        except httpx.HTTPError as exc:
-            raise KubernetesClientError(f"{path}: {exc}") from exc
-        if resp.status_code in (401, 403):
-            raise KubernetesClientError(f"{path}: HTTP {resp.status_code} — RBAC or token issue")
-        if resp.status_code >= 400:
-            raise KubernetesClientError(f"{path}: HTTP {resp.status_code} {resp.text[:200]}")
-        # #430 — a 200 that isn't a List object (auth-proxy page, Status
-        # object, envelope change) must raise, not collapse to [] and purge
-        # the whole cluster mirror. A real empty cluster is {"items": []}.
-        return require_keyed_list(
-            resp.json(), "items", make_error=KubernetesClientError, context=path
-        )
+        # #1560 — follow the ``metadata.continue`` token until it is
+        # empty. Reading only the first ``limit=500`` page and treating
+        # it as the whole cluster made the reconciler's absence-delete
+        # prune every Service / Ingress / node past page one on large
+        # clusters. Any failure mid-paging (including a 410 Gone on an
+        # expired continue token) raises, so the reconcile aborts
+        # instead of pruning against a partial list.
+        items: list[dict[str, Any]] = []
+        continue_token: str | None = None
+        while True:
+            params: dict[str, str] = {"limit": "500"}
+            if continue_token:
+                params["continue"] = continue_token
+            try:
+                resp = await self._client.get(path, params=params)
+            except httpx.HTTPError as exc:
+                raise KubernetesClientError(f"{path}: {exc}") from exc
+            if resp.status_code in (401, 403):
+                raise KubernetesClientError(
+                    f"{path}: HTTP {resp.status_code} — RBAC or token issue"
+                )
+            if resp.status_code >= 400:
+                raise KubernetesClientError(f"{path}: HTTP {resp.status_code} {resp.text[:200]}")
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise KubernetesClientError(f"{path}: non-JSON body: {resp.text[:200]}") from exc
+            # #430 — a 200 that isn't a List object (auth-proxy page, Status
+            # object, envelope change) must raise, not collapse to [] and purge
+            # the whole cluster mirror. A real empty cluster is {"items": []}.
+            items.extend(
+                require_keyed_list(body, "items", make_error=KubernetesClientError, context=path)
+            )
+            metadata = body.get("metadata") if isinstance(body, dict) else None
+            token = metadata.get("continue") if isinstance(metadata, dict) else None
+            if not token:
+                return items
+            continue_token = str(token)
 
     # ── Public surface ───────────────────────────────────────────────
 
@@ -231,10 +255,9 @@ class KubernetesClient:
         and pull ``status.podIP`` — the first IP k8s assigned. Pods with
         no IP yet (Pending + unscheduled) are filtered out.
 
-        No pagination beyond ``limit=500`` — busy clusters with >500
-        pods will get the first 500 and miss the rest until we adopt
-        the ``continue`` token. Fine for v1; the flag defaults off so
-        operators who trip this are already opting in.
+        Pagination is handled by ``_list`` (#1560): every page is read
+        via the ``continue`` token, so busy clusters with >500 pods are
+        mirrored in full.
         """
         items = await self._list("/api/v1/pods")
         out: list[_K8sPod] = []

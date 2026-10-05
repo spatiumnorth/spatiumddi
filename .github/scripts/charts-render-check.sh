@@ -42,6 +42,13 @@
 #                      readiness probe gates on that same HA listener
 #                      (#1589) — a standalone Kea server never binds it, so
 #                      the pod would never become Ready.
+#   dns-agent-service — every render: a DNS agent LoadBalancer Service keeps
+#                      the client address (``externalTrafficPolicy: Local``,
+#                      #1548), plus one dedicated render asserting the
+#                      ``server.service`` fields (VIP, source ranges, IP
+#                      family policy, annotations) reach the Service, and
+#                      negative controls for encrypted-transport ports a
+#                      flavor cannot serve (#1553).
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -117,6 +124,10 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     # #1550 — MetalLB VIP Services must not allocate NodePorts.
     python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" "$file" \
+        || failures=$((failures + 1))
+    # #1548 — a DNS agent LoadBalancer Service must keep the client
+    # address (externalTrafficPolicy: Local); see the script's docstring.
+    python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
         || failures=$((failures + 1))
 }
 
@@ -195,6 +206,68 @@ render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@]}"
 POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
+
+# #1553 — the dns-agent template must REFUSE encrypted-transport ports a
+# flavor cannot serve (DoQ on anything but Technitium; DoT/DoH on
+# PowerDNS, which needs a dnsdist front that has no Kubernetes
+# deployment), instead of rendering a Service port that forwards to
+# nothing. Same grep-the-message discipline as the priorityClasses
+# negative control below: an exit code alone would also pass if the
+# render broke for a different reason.
+echo "── negative controls: dns-agent encrypted ports on the wrong flavor must fail"
+neg1553() { # label expected-message [helm --set args...]
+    local label="$1" expect="$2"; shift 2
+    local out rc
+    out="$(helm template neg "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set dnsAgents.enabled=true "$@" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "$expect"; then
+        echo "   ok: $label refused by the dns-agent flavor guard"
+    else
+        echo "   FAIL: $label — expected the dns-agent flavor guard to refuse this render (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+}
+neg1553 "doqPort on bind9" "doqPort is only supported with flavor: technitium" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=bind9 \
+    --set dnsAgents.servers[0].doqPort=853
+neg1553 "dotPort on powerdns" "not supported with flavor: powerdns" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=powerdns \
+    --set dnsAgents.servers[0].dotPort=853
+neg1553 "dohPort on powerdns" "not supported with flavor: powerdns" \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=powerdns \
+    --set dnsAgents.servers[0].dohPort=8443
+
+# #1548 — the DNS agent Service render that exercises every field
+# ``server.service`` now carries beyond ``type``: a pinned MetalLB VIP,
+# source ranges, the IP family policy and a provider annotation, on a
+# Technitium server (the one flavor that may declare all three encrypted
+# transports at once). chart-dns-agent-service.py --require asserts the
+# fields actually reach the Service and the policy stayed Local.
+render umbrella-dns-agent-lb "$UMBRELLA" \
+    --set dnsAgents.enabled=true \
+    --set dnsAgents.servers[0].name=ns1 \
+    --set dnsAgents.servers[0].flavor=technitium \
+    --set dnsAgents.servers[0].dotPort=853 \
+    --set dnsAgents.servers[0].dohPort=8443 \
+    --set dnsAgents.servers[0].doqPort=853 \
+    --set dnsAgents.servers[0].service.loadBalancerIP=10.0.0.53 \
+    --set dnsAgents.servers[0].service.loadBalancerSourceRanges[0]=192.0.2.0/24 \
+    --set dnsAgents.servers[0].service.ipFamilyPolicy=PreferDualStack \
+    --set 'dnsAgents.servers[0].service.annotations.metallb\.universe\.tf/loadBalancerIPs=10.0.0.53' \
+    --set 'dnsAgents.servers[0].service.annotations.metallb\.universe\.tf/address-pool=default'
+echo "── dns-agent Service fields (umbrella, #1548)"
+python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
+    --expect externalTrafficPolicy=Local \
+    --expect loadBalancerIP=10.0.0.53 \
+    --expect loadBalancerSourceRanges=192.0.2.0/24 \
+    --expect ipFamilyPolicy=PreferDualStack \
+    --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
+    --expect-annotation metallb.universe.tf/address-pool=default \
+    "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
