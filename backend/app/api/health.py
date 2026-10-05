@@ -149,6 +149,79 @@ async def startup() -> JSONResponse:
     return await readiness()
 
 
+# ── Celery worker ping: single-flight + short cache (GHSA-c58p-8cq9-g3gm) ──
+#
+# ``/health/platform`` is unauthenticated, and ``inspect().ping()`` is a
+# broadcast that holds one pooled broker connection while it acquires a
+# second for its producer. Run once per request, a burst of anonymous
+# callers filled kombu's connection pool with these hold-and-wait pings —
+# and ``asyncio.wait_for`` abandons the *request* at the timeout but not the
+# thread, so stuck pings accumulated. The next inline ``.delay()`` on the
+# event loop then blocked forever on the pool, hanging the whole api.
+#
+# So at most ONE ping is in flight per process: concurrent callers await the
+# same task, a caller arriving while a ping is still hung past its timeout
+# joins it rather than starting another, and a finished result (or error)
+# answers every caller for ``WORKER_PING_CACHE_TTL_S``.
+WORKER_PING_TIMEOUT_S = 3.0
+WORKER_PING_CACHE_TTL_S = 5.0
+
+_ping_task: asyncio.Future[dict[str, Any] | None] | None = None
+_ping_loop: asyncio.AbstractEventLoop | None = None
+# (completed_at, result, exception) — exactly one of result/exception is meaningful.
+_ping_cached: tuple[float, dict[str, Any] | None, BaseException | None] | None = None
+
+
+def _inspect_ping() -> dict[str, Any] | None:
+    from app.celery_app import celery_app  # noqa: PLC0415
+
+    return celery_app.control.inspect(timeout=2).ping()
+
+
+def invalidate_worker_ping_cache() -> None:
+    """Forget the cached / in-flight ping (tests; the next call re-pings)."""
+    global _ping_task, _ping_loop, _ping_cached
+    _ping_task = None
+    _ping_loop = None
+    _ping_cached = None
+
+
+def _store_ping(fut: asyncio.Future[dict[str, Any] | None]) -> None:
+    global _ping_cached
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    _ping_cached = (monotonic(), None if exc else fut.result(), exc)
+
+
+async def _worker_ping() -> dict[str, Any] | None:
+    """Return the worker ping, issuing at most one broadcast at a time.
+
+    Raises ``TimeoutError`` when the ping has not answered within
+    ``WORKER_PING_TIMEOUT_S`` (the ping keeps running and later callers join
+    it), or whatever the ping itself raised.
+    """
+    global _ping_task, _ping_loop
+    cached = _ping_cached
+    if cached is not None and monotonic() - cached[0] < WORKER_PING_CACHE_TTL_S:
+        if cached[2] is not None:
+            # Fresh traceback each time, or every re-raise appends to it.
+            raise cached[2].with_traceback(None)
+        return cached[1]
+
+    loop = asyncio.get_running_loop()
+    # No await between the check and the assignment, so two coroutines on
+    # this loop cannot both start a ping. A task from another (closed) loop
+    # can never complete here, so it is replaced rather than awaited.
+    if _ping_task is None or _ping_task.done() or _ping_loop is not loop:
+        _ping_task = asyncio.ensure_future(asyncio.to_thread(_inspect_ping))
+        _ping_task.add_done_callback(_store_ping)
+        _ping_loop = loop
+    # shield: one caller timing out must not cancel the ping the others await
+    # (cancelling would not stop the thread anyway, only orphan it).
+    return await asyncio.wait_for(asyncio.shield(_ping_task), timeout=WORKER_PING_TIMEOUT_S)
+
+
 @router.get("/health/platform")
 async def platform_health() -> JSONResponse:
     """Dashboard-oriented rollup of every control-plane component.
@@ -238,13 +311,10 @@ async def platform_health() -> JSONResponse:
     # is amplification an anonymous caller controls. The celery-beat
     # component BELOW is the signal that does surface a wedged pool —
     # which is why its detail must not blame beat for it.
-    def _inspect_ping() -> dict[str, Any] | None:
-        from app.celery_app import celery_app  # noqa: PLC0415
-
-        return celery_app.control.inspect(timeout=2).ping()
-
+    #
+    # The ping itself is single-flight + cached — see ``_worker_ping``.
     try:
-        ping = await asyncio.wait_for(asyncio.to_thread(_inspect_ping), timeout=3)
+        ping = await _worker_ping()
     except TimeoutError:
         ping = None
         workers_detail = "inspect timed out"
