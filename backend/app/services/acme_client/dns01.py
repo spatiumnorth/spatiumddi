@@ -159,7 +159,14 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
         # Agent-based groups fan out one op per enabled server; the
         # singular ``enqueue_record_op`` return only covers the primary.
         # Wait on EVERY sibling op (same zone + serial) so the CA can't
-        # query a secondary whose op is still pending.
+        # query a secondary whose op is still pending. The query is
+        # scoped to servers in THIS zone's group (#1531): serials are
+        # date-based (``YYYYMMDDNN``), so a same-name zone in another
+        # group — e.g. the internal half of a split-horizon pair — can
+        # easily hold a create op at the same serial, and waiting on it
+        # would stall (or fail) a solve that had in fact applied
+        # everywhere it needed to.
+        group_server_ids = select(DNSServer.id).where(DNSServer.group_id == zone.group_id)
         sibling_ids = list(
             (
                 await db.execute(
@@ -167,6 +174,7 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
                         DNSRecordOp.zone_name == zone.name,
                         DNSRecordOp.target_serial == target_serial,
                         DNSRecordOp.op == "create",
+                        DNSRecordOp.server_id.in_(group_server_ids),
                     )
                 )
             )

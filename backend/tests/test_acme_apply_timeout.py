@@ -173,3 +173,58 @@ async def test_solve_waits_for_the_scaled_timeout(db_session: AsyncSession) -> N
     # One op per server, so three renders: the one in the slot and both
     # servers' own.
     assert seen["timeout"] == 3 * 30 + APPLY_TIMEOUT_MARGIN_SECONDS
+
+
+async def test_solve_ignores_same_serial_ops_from_other_groups(db_session: AsyncSession) -> None:
+    """#1531 — the sibling-op wait is scoped to this zone's group.
+
+    Serials are date-based (``YYYYMMDDNN``) and the first change of the
+    day on any zone is ``YYYYMMDD00``, so a same-name zone in another
+    group (the internal half of a split-horizon pair) can hold a create
+    op at the exact serial ``solve`` waits on. Before the fix that
+    foreign op was waited on too, so a slow/failed agent in the other
+    group timed out a solve that had applied everywhere it needed to.
+    """
+    from app.services.acme_client import dns01  # noqa: PLC0415
+    from app.services.dns.serial import compute_next_serial  # noqa: PLC0415
+
+    group, servers = await _group(db_session, 1)
+    zone = DNSZone(
+        name="example.test.",
+        zone_type="primary",
+        kind="forward",
+        group_id=group.id,
+        primary_ns="ns1.example.test.",
+        admin_email="hostmaster.example.test.",
+    )
+    db_session.add(zone)
+
+    # A leftover create op at today's first serial on a server in a
+    # DIFFERENT group, carrying this zone's name (split-horizon twin).
+    other_group, other_servers = await _group(db_session, 1)
+    foreign = DNSRecordOp(
+        server_id=other_servers[0].id,
+        zone_name="example.test.",
+        op="create",
+        record={"name": "_acme-challenge", "type": "TXT", "value": "foreign", "ttl": 60},
+        target_serial=compute_next_serial(0),
+        state="pending",
+    )
+    db_session.add(foreign)
+    await db_session.commit()
+    foreign_id = foreign.id
+
+    waited: dict[str, list[uuid.UUID]] = {}
+
+    async def _applied(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
+        waited["ids"] = list(op_ids)
+        return {op_id: "applied" for op_id in op_ids}
+
+    with (
+        patch.object(acme_svc, "wait_for_ops_applied", new=_applied),
+        patch.object(dns01, "publish_wake", new=AsyncMock()),
+    ):
+        await dns01.solve(db_session, "host.example.test", "token-1531")
+
+    assert waited["ids"], "solve must wait on its own fanned-out op"
+    assert foreign_id not in waited["ids"]
