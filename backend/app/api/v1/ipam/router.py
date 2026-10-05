@@ -2329,6 +2329,15 @@ class SubnetCreate(BaseModel):
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
 
+    @field_validator("domain_name")
+    @classmethod
+    def _domain_name(cls, v: str | None) -> str | None:
+        # Feeds radvd's DNSSL (GHSA-6235-5gh6-4hr2) and Kea's domain-name; a
+        # delegated subnet writer must not be able to smuggle config syntax.
+        if v is None or not v.strip():
+            return v
+        return validate_fqdn(v, field="domain_name")
+
 
 class SubnetUpdate(BaseModel):
     name: str | None = None
@@ -2448,6 +2457,15 @@ class SubnetUpdate(BaseModel):
         if v < 1 or v > 365:
             raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
+
+    @field_validator("domain_name")
+    @classmethod
+    def _domain_name(cls, v: str | None) -> str | None:
+        # Feeds radvd's DNSSL (GHSA-6235-5gh6-4hr2) and Kea's domain-name; a
+        # delegated subnet writer must not be able to smuggle config syntax.
+        if v is None or not v.strip():
+            return v
+        return validate_fqdn(v, field="domain_name")
 
 
 class SubnetVLANRef(BaseModel):
