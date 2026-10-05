@@ -3149,6 +3149,63 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.resource_types = body.resource_types
 
 
+def _forward_snapshot(t: AuditForwardTarget) -> dict:
+    """Audit snapshot of an audit-forward target.
+
+    Never carries the webhook URL, ``auth_header`` or SMTP password
+    (nor the CA cert) — only ``*_set`` booleans for those, per #1502 /
+    PR #1506: the audit log must not become a copy of the secrets it
+    describes.
+    """
+    return {
+        "name": t.name,
+        "enabled": t.enabled,
+        "kind": t.kind,
+        "format": t.format,
+        "host": t.host,
+        "port": t.port,
+        "protocol": t.protocol,
+        "facility": t.facility,
+        "ca_cert_pem_set": bool(t.ca_cert_pem),
+        "url_set": bool(t.url),
+        "auth_header_set": bool(t.auth_header),
+        "webhook_flavor": t.webhook_flavor,
+        "smtp_host": t.smtp_host,
+        "smtp_port": t.smtp_port,
+        "smtp_security": t.smtp_security,
+        "smtp_username": t.smtp_username,
+        "smtp_password_set": bool(t.smtp_password_encrypted),
+        "smtp_from_address": t.smtp_from_address,
+        "smtp_to_addresses": list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        "smtp_reply_to": t.smtp_reply_to,
+        "min_severity": t.min_severity,
+        "resource_types": t.resource_types,
+    }
+
+
+def _audit_forward_target(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: AuditForwardTarget,
+    old_value: dict | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="audit_forward_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            old_value=old_value,
+            new_value=None if action == "delete" else _forward_snapshot(row),
+        )
+    )
+
+
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
 async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
     if not is_effective_superadmin(current_user):
@@ -3171,6 +3228,8 @@ async def create_audit_target(
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
+    await db.flush()
+    _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
@@ -3195,7 +3254,9 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    old_value = _forward_snapshot(row)
     _apply_body(row, body)
+    _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -3212,6 +3273,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
+    _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
 

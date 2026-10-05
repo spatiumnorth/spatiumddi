@@ -10,6 +10,7 @@ network send, not the real wire.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import socket
 import uuid
@@ -20,9 +21,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.services import audit_forward as svc
 
@@ -274,6 +277,68 @@ async def test_crud_roundtrip(client: AsyncClient, db_session: AsyncSession) -> 
     assert r.status_code == 204
     r = await client.get("/api/v1/settings/audit-forward-targets", headers=h)
     assert r.json() == []
+
+
+@pytest.mark.asyncio
+async def test_crud_writes_audit_log_without_secrets(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1584: create/update/delete of an audit-forward target must each
+    write an audit_log row, and the row must never carry the webhook
+    URL, auth header or SMTP password — only ``*_set`` booleans."""
+    _, token = await _make_user(db_session)
+    h = {"Authorization": f"Bearer {token}"}
+
+    body = {
+        "name": "SIEM webhook",
+        "enabled": True,
+        "kind": "webhook",
+        "format": "json_lines",
+        "url": "https://hooks.example.com/ingest/secret-path",
+        "auth_header": "Bearer <redacted>",
+    }
+    r = await client.post("/api/v1/settings/audit-forward-targets", headers=h, json=body)
+    assert r.status_code == 201, r.text
+    target_id = r.json()["id"]
+
+    r = await client.put(
+        f"/api/v1/settings/audit-forward-targets/{target_id}",
+        headers=h,
+        json={**body, "enabled": False},
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.delete(f"/api/v1/settings/audit-forward-targets/{target_id}", headers=h)
+    assert r.status_code == 204
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.resource_type == "audit_forward_target",
+                    AuditLog.resource_id == target_id,
+                )
+                .order_by(AuditLog.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.action for row in rows] == ["create", "update", "delete"]
+    create_row, update_row, delete_row = rows
+    assert create_row.new_value is not None
+    assert create_row.new_value["url_set"] is True
+    assert create_row.new_value["auth_header_set"] is True
+    assert create_row.new_value["smtp_password_set"] is False
+    assert update_row.old_value is not None and update_row.new_value is not None
+    assert update_row.old_value["enabled"] is True
+    assert update_row.new_value["enabled"] is False
+    assert delete_row.old_value is not None
+    assert delete_row.new_value is None
+    blob = json.dumps([row.old_value for row in rows] + [row.new_value for row in rows])
+    assert "hooks.example.com" not in blob
+    assert "topsecret" not in blob
 
 
 @pytest.mark.asyncio
