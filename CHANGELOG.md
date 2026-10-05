@@ -76,6 +76,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The PowerDNS agent stops serving zones wrong in three ways
+  (#1520, #1521, #1522).** Pool member address deletes were applied
+  as no-ops and acked ok — the record-op fallback ignored the rrset
+  action — so a removed member's address stayed served; deletes now
+  delete. Zone type was ignored: secondaries are now created as
+  Slave with their masters (a secondary without masters, and a
+  forward zone — which has no PowerDNS equivalent — are skipped
+  loudly instead of silently vanishing or being served as a primary
+  copy). And served zones now carry the zone's own Primary NS,
+  Admin Email, SOA timers and serial instead of daemon defaults,
+  with the served serial reported back.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
