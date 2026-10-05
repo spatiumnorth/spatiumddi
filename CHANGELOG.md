@@ -45,6 +45,14 @@ the formatter handles the rest.
 
 ### Changed
 
+- **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
+  vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
+  go.mod pins the x/net, x/text and grpc versions the Looking Glass
+  Dockerfile used to force with `go get` overrides, so the overrides
+  are dropped and the build takes upstream's pins as-is. The
+  swagger-ui-dist files behind `/api/docs` were re-vendored
+  byte-for-byte from the 5.33.1 npm tarball.
+
 - **DHCP agent Services default to LoadBalancer, and a NodePort can
   finally be pinned (#1549).** The DHCP agent Service defaulted to
   `type: NodePort` with `port: 67` and no way to set `nodePort`, so
