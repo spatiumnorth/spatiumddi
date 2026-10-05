@@ -161,6 +161,27 @@ async def test_safety_dumps_pruned_under_their_own_allowance(monkeypatch) -> Non
     assert driver.deleted == names[PRE_RESTORE_KEEP_LAST_N:]
 
 
+async def test_unlistable_destination_without_retention_does_not_fail_the_run(
+    monkeypatch,
+) -> None:
+    # With no backup retention the listing only serves the safety-dump
+    # allowance. A credential that may write but not list must not turn
+    # the backup that was just written into a failed run.
+    class _Unlistable(_ListingDriver):
+        async def list_archives(self, *, config):
+            raise BackupDestinationError("ListBucket denied")
+
+    driver = _Unlistable([])
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    target = _retention_target(write_only=False)
+    assert await runner_mod._retention_sweep(None, target=target, config={}) == 0
+
+    # With backup retention configured, a failed listing still surfaces.
+    target = _retention_target(write_only=False, retention_keep_last_n=3)
+    with pytest.raises(BackupDestinationError):
+        await runner_mod._retention_sweep(None, target=target, config={})
+
+
 async def test_keep_days_does_not_delete_fresh_safety_dumps(monkeypatch) -> None:
     # A 40-day-old backup goes under keep-days=30; a safety dump of
     # the same age is governed by its own allowance, not the days.

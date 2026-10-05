@@ -250,8 +250,25 @@ async def _retention_sweep(
     # the listing is still needed to prune safety dumps under their
     # own allowance below (#1574). The backup branches no-op on
     # their own when their field is unset.
+    backup_retention = (
+        target.retention_keep_last_n is not None or target.retention_keep_days is not None
+    )
     driver = get_destination(target.kind)
-    archives = await driver.list_archives(config=config)
+    try:
+        archives = await driver.list_archives(config=config)
+    except Exception as exc:
+        if backup_retention:
+            raise
+        # With no backup retention configured this listing only serves
+        # the safety-dump allowance, so it is best effort: a credential
+        # that may write but not list must not turn a backup that was
+        # just written into a failed run.
+        logger.warning(
+            "backup_safety_dump_prune_skipped",
+            target_id=str(target.id),
+            error=str(exc),
+        )
+        return 0
     # Split the listing BEFORE any retention arithmetic (#1574). The
     # recommended local-volume path is also where restore writes its
     # ``pre-restore-*.zip`` safety dumps, and the name pattern matches
