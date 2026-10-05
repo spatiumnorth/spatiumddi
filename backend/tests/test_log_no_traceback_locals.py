@@ -20,7 +20,9 @@ SENTINEL = "s3ntinel-passphrase-9f2c"
 
 
 def _fail() -> None:
-    backup_passphrase = SENTINEL  # noqa: F841 - the local under test
+    # The local under test: it must be in the frame, and never in the log.
+    backup_passphrase = SENTINEL
+    assert backup_passphrase
     raise RuntimeError("restore failed")
 
 
