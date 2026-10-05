@@ -88,6 +88,26 @@ the formatter handles the rest.
   Admin Email, SOA timers and serial instead of daemon defaults,
   with the served serial reported back.
 
+- **NOTIFY settings and zone allow-query now reach the agents
+  (#1523).** The server options `notify_enabled` / `also_notify` /
+  `allow_notify` and the zone-level `also_notify` / `notify_enabled` /
+  `allow_query` overrides were saved but never shipped in the agent
+  bundle. They ship now (renderer revision 2): the BIND9 agent renders
+  them in the options block and zone stanzas, and the PowerDNS agent
+  folds the effective notify setting into the zone kind (Master when
+  notifying — Native never sends NOTIFY) and applies the targets as
+  ALSO-NOTIFY metadata. A PowerDNS group cannot enforce allow-query
+  (the authoritative server has no query ACL); the agent logs that
+  loudly instead of letting the setting look applied.
+
+- **Records written to PowerDNS zones over RFC 2136 are ingested back
+  (#1524).** The ingest-back worker that mirrors externally written
+  records into SpatiumDDI ran only for BIND9, so dynamic records on
+  PowerDNS were invisible — and were silently overwritten where they
+  shared a name with managed records. The PowerDNS agent now reads
+  dynamic zones back over its loopback REST API on the same interval
+  and ships them to the same ingest endpoint.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
