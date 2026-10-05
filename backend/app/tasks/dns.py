@@ -280,6 +280,35 @@ def agent_stale_sweep() -> dict[str, int]:
     return asyncio.run(_dns_agent_stale_sweep_async())
 
 
+# ── Agentless record-op retry sweep (#1538) ────────────────────────────────
+
+
+async def _agentless_op_retry_sweep_async() -> dict[str, int]:
+    """Replay due agentless record ops that a transient provider error
+    rescheduled. Agentless servers have no agent heartbeat to drain their
+    op queue, so this beat sweep is what makes the #1232 retry budget real
+    for them."""
+    from app.services.dns.record_ops import apply_pending_agentless_ops
+
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            if not await is_module_enabled(db, "core.dns"):
+                return {"applied": 0, "rescheduled": 0, "skipped": 0}
+            counts = await apply_pending_agentless_ops(db)
+            await db.commit()
+            return counts
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="app.tasks.dns.agentless_op_retry_sweep")
+def agentless_op_retry_sweep() -> dict[str, int]:
+    """Celery beat task — runs every 60s, replays due agentless record ops."""
+    return asyncio.run(_agentless_op_retry_sweep_async())
+
+
 async def _probe_server_soa(host: str, port: int) -> bool:
     """Send an SOA query for "." to ``host:port`` using ``dnspython``.
 
