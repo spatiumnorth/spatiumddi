@@ -28,8 +28,8 @@ Design:
   readable — ``dhcp-20-5`` for ``10.1.20.5``). For IPv6 we use the low
   32 bits hex-encoded (``dhcp-0-abcd1234``) — it's ugly but unique,
   and v6 DDNS is a rare path.
-* **Idempotent.** If the IPAM row already has the same hostname, no
-  DNS op is queued.
+* **Idempotent.** If the IPAM row already has the same hostname and its
+  published record carries that name, no DNS op is queued.
 
 Circular-import note: ``_sync_dns_record`` lives in
 ``app.api.v1.ipam.router`` and is the canonical A/PTR pipeline. The
@@ -226,6 +226,16 @@ async def resolve_ddns_hostname(
     return client_name or _generate_hostname(ip_str)
 
 
+async def _published_name(db: AsyncSession, ipam_row: IPAddress) -> str | None:
+    """Name of the forward record DDNS published for this row, if any."""
+    if ipam_row.dns_record_id is None:
+        return None
+    from app.models.dns import DNSRecord  # noqa: PLC0415 — lazy, avoid cycle
+
+    record = await db.get(DNSRecord, ipam_row.dns_record_id)
+    return record.name if record is not None else None
+
+
 async def apply_ddns_for_lease(
     db: AsyncSession,
     *,
@@ -241,7 +251,8 @@ async def apply_ddns_for_lease(
       * the subnet has DDNS enabled,
       * the IPAM row is ``auto_from_lease=True`` (manual allocations
         are never touched by DDNS — the owner picked the hostname),
-      * the resolved hostname differs from what's already on the row.
+      * the resolved hostname differs from what's already on the row or
+        from the name of the record it published.
 
     Lazy-imports ``_sync_dns_record`` from the IPAM router to avoid a
     circular import at module load.
@@ -256,9 +267,13 @@ async def apply_ddns_for_lease(
     if not hostname:
         return False
 
-    # Idempotency: if the hostname is unchanged and an auto-generated
-    # DNS record already points at this IP, skip the sync entirely.
-    if ipam_row.hostname == hostname and ipam_row.dns_record_id is not None:
+    # Idempotency: if the hostname is unchanged and the auto-generated
+    # record already published for this IP carries it, skip the sync.
+    # Compare against the record, not just the row: both lease ingest paths
+    # stamp the client's new hostname onto the row before calling us, so a
+    # rename would otherwise look unchanged and the old A/PTR would stay
+    # (#1618).
+    if ipam_row.hostname == hostname and await _published_name(db, ipam_row) == hostname:
         return False
 
     ipam_row.hostname = hostname

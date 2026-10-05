@@ -76,6 +76,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DDNS follows a hostname change on an existing lease (#1618).**
+  Both lease ingest paths (Kea lease events and the agentless lease
+  pull) write the client's new hostname onto the auto-from-lease IPAM
+  row before DDNS runs, and DDNS's idempotency check compared against
+  that row — so a renamed client looked unchanged, kept its old A/PTR,
+  and the new name was never published. The check now compares against
+  the name of the record that is actually published, so a rename
+  retracts the old name and creates the new one; a renewal with the
+  same name still queues nothing. Rows already left behind by this get
+  fixed on the client's next renewal, or by the DDNS backstop when DNS
+  auto-sync is on.
+
 - **DNS agent LoadBalancer Services keep the client address and can
   pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
   and nothing else, so the rendered LoadBalancer ran with the default
