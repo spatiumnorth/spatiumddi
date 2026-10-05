@@ -123,9 +123,14 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     return f"{v}.".lower()
 
 
-def _key(
-    r: RecordData | DNSRecord, zone_name: str
-) -> tuple[str, str, str, int | None, int | None, int | None]:
+#: Identity key for pull/sync dedup: (name, type, canonical value,
+#: priority, weight, port) — see :func:`_key`. The structured fields are
+#: only non-None for MX / SRV, whose priority (and weight/port) live in
+#: their own columns rather than in the value (#1525).
+RecordKey = tuple[str, str, str, int | None, int | None, int | None]
+
+
+def _key(r: RecordData | DNSRecord, zone_name: str) -> RecordKey:
     """Identity key for dedup: (name, type, canonical-value, priority,
     weight, port). TTL-only differences don't count — neither does
     relative-vs-FQDN storage for name-valued records.
@@ -160,7 +165,7 @@ def without_agent_ns_glue(
     on_wire: list[RecordData],
     server: Any,
     zone_name: str,
-    db_keys: set[tuple[str, str, str, int | None, int | None, int | None]],
+    db_keys: set[RecordKey],
 ) -> list[RecordData]:
     """``on_wire`` minus the agent's own NS glue, when ``server`` is agent-managed BIND9.
 
@@ -238,7 +243,7 @@ def _additive_import(
     db: AsyncSession,
     zone: DNSZone,
     on_wire: list[RecordData],
-    db_keys: set[tuple[str, str, str]],
+    db_keys: set[RecordKey],
     *,
     apply: bool,
 ) -> PullResult:
