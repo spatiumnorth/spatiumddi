@@ -108,7 +108,11 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
     handle, so its finally-block cleanup can't fire for it.
 
     Raises :class:`DNS01SolveError` if no managed zone covers ``fqdn`` or
-    if an agent failed / timed out applying the record.
+    if an agent failed / timed out applying the record. Any other
+    exception after the commit (a DB error in the sibling-op query, a
+    Celery soft time limit, …) also tears the record down before
+    re-raising (#1530) — the teardown is keyed on the handle, which is
+    built BEFORE the commit for exactly that reason.
     """
     from app.services.acme import (  # noqa: PLC0415 — avoid cycle
         apply_timeout_for,
@@ -142,12 +146,9 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
         {"name": relative, "type": "TXT", "value": txt_value, "ttl": ACME_TXT_TTL},
         target_serial=target_serial,
     )
-    await db.commit()
-    # Worker context: ``enqueue_record_op``'s ``collect_wake`` is a no-op
-    # outside a request, so wake every agent in the group explicitly —
-    # otherwise the TXT only converges on the slow safety tick.
-    await publish_wake(dns_group_channel(zone.group_id))
-
+    # Build the handle BEFORE the commit (#1530): everything from the
+    # commit on runs under the teardown guard below, and the teardown
+    # needs the handle to find the record again.
     handle = DNS01Handle(
         zone_id=zone.id,
         record_name=relative,
@@ -156,6 +157,12 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
     )
 
     try:
+        await db.commit()
+        # Worker context: ``enqueue_record_op``'s ``collect_wake`` is a no-op
+        # outside a request, so wake every agent in the group explicitly —
+        # otherwise the TXT only converges on the slow safety tick.
+        await publish_wake(dns_group_channel(zone.group_id))
+
         # Agent-based groups fan out one op per enabled server; the
         # singular ``enqueue_record_op`` return only covers the primary.
         # Wait on EVERY sibling op (same zone + serial) so the CA can't
@@ -200,9 +207,20 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
                 f"TXT record for {challenge_fqdn!r} was not applied by all DNS "
                 f"agents within {timeout:.0f} s (op states: {not_applied})"
             )
-    except DNS01SolveError:
+    except Exception:
         # Tear down the committed record so a failed solve doesn't orphan
-        # a public _acme-challenge TXT (no janitor sweeps these).
+        # a public _acme-challenge TXT. This covers EVERY failure after
+        # the commit (#1530), not just DNS01SolveError: a DB error in the
+        # sibling query, an error inside the wait helpers, or a Celery
+        # soft time limit would otherwise strand the record (the stale
+        # TXT sweep in ``services/acme.py`` is only a backstop). Roll
+        # back first — a DB error may have left the session unusable,
+        # and the record itself was committed, so the rollback can't
+        # undo it.
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001 — session may already be clean
+            pass
         try:
             await cleanup(db, handle)
         except Exception as exc:  # noqa: BLE001 — best-effort teardown

@@ -228,3 +228,53 @@ async def test_solve_ignores_same_serial_ops_from_other_groups(db_session: Async
 
     assert waited["ids"], "solve must wait on its own fanned-out op"
     assert foreign_id not in waited["ids"]
+
+
+async def test_solve_tears_down_txt_on_unexpected_error(db_session: AsyncSession) -> None:
+    """#1530 — a non-``DNS01SolveError`` failure after the commit (here the
+    wait helper blowing up, standing in for a DB error or a Celery soft
+    time limit) must still tear the challenge TXT down. Before the fix
+    the teardown only ran for ``DNS01SolveError``, so the record stayed
+    in the zone and on the servers with nothing sweeping it."""
+    import pytest
+    from sqlalchemy import select
+
+    from app.models.dns import DNSRecord
+    from app.services.acme_client import dns01  # noqa: PLC0415
+
+    group, _servers = await _group(db_session, 1)
+    zone = DNSZone(
+        name="example.test.",
+        zone_type="primary",
+        kind="forward",
+        group_id=group.id,
+        primary_ns="ns1.example.test.",
+        admin_email="hostmaster.example.test.",
+    )
+    db_session.add(zone)
+    await db_session.commit()
+
+    async def _boom(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
+        raise RuntimeError("wait exploded")
+
+    with (
+        patch.object(acme_svc, "wait_for_ops_applied", new=_boom),
+        patch.object(dns01, "publish_wake", new=AsyncMock()),
+    ):
+        with pytest.raises(RuntimeError, match="wait exploded"):
+            await dns01.solve(db_session, "host.example.test", "token-1530")
+
+    db_session.expire_all()
+    leftovers = (
+        (
+            await db_session.execute(
+                select(DNSRecord).where(
+                    DNSRecord.zone_id == zone.id,
+                    DNSRecord.value == "token-1530",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert leftovers == []
