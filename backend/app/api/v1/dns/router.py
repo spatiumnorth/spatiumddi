@@ -131,7 +131,11 @@ from app.services.dns.resolver_presets import (
     find_forwarder_conflict,
 )
 from app.services.dns.serial import bump_zone_serial
-from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.server_move import (
+    ServerMoveError,
+    ensure_group_single_driver,
+    move_server_to_group,
+)
 from app.services.dns.tld_registry import (
     SOURCE_URL,
     TldFetchError,
@@ -339,8 +343,8 @@ class ServerGroupResponse(BaseModel):
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
-    # is a group that got mixed through the create path, which does not
-    # enforce homogeneity (only the move and the driver-gated operations do).
+    # is a group that was mixed before create / driver-change enforcement
+    # landed (#1540) — those paths now 422 like the move does.
     # Exposed so a client can tell which groups a given server may move into
     # without fetching every group's server list to find out.
     server_drivers: list[str] = []
@@ -1862,7 +1866,22 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
 async def create_server(
     group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
 ) -> ServerResponse:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    # #1540 — a group is single-driver (DNS_DRIVERS.md §5.1). The move path
+    # has always enforced it; create did not, and a mixed group silently
+    # diverges: record fan-out follows the primary's driver while zone
+    # create/delete fan out to every agentless server. Fail closed here
+    # with the move path's check instead of manufacturing that state.
+    try:
+        await ensure_group_single_driver(
+            db,
+            group_id,
+            body.driver,
+            group_name=group.name,
+            hint=f"create it in a {body.driver}-only group, or an empty one.",
+        )
+    except ServerMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
@@ -1950,6 +1969,32 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
+    # #1540 — a driver change on update is the other path that used to
+    # manufacture a mixed group. Enforce single-driver against the OTHER
+    # members of the group the server stays in. When the same request
+    # also moves the server to a different group, the move path runs its
+    # own check against the target group with the new driver applied, so
+    # checking here too would refuse a legitimate combined change.
+    if (
+        body.driver is not None
+        and body.driver != server.driver
+        and (body.group_id is None or body.group_id == server.group_id)
+    ):
+        group = await _require_group(server.group_id, db)
+        try:
+            await ensure_group_single_driver(
+                db,
+                server.group_id,
+                body.driver,
+                group_name=group.name,
+                hint=(
+                    f"change the driver only in a group whose other servers "
+                    f"all run {body.driver}, or an empty one."
+                ),
+                exclude_server_id=server.id,
+            )
+        except ServerMoveError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     changes = body.model_dump(
         exclude_none=True,
         # ``group_id`` / ``is_primary`` (#934) are NOT plain column writes —
