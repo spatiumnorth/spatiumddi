@@ -9,10 +9,15 @@ network send, not the real wire.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import socket
 import uuid
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -505,3 +510,247 @@ def test_resource_types_allowlist_matches_a_namespaced_subject() -> None:
     # The bare form still matches, and an unrelated one still does not.
     assert svc._target_accepts(target, _alert(subject_type="dns_zone")) is True
     assert svc._target_accepts(target, _alert(subject_type="appliance")) is False
+
+
+# ── Slack truncation (#1582) ───────────────────────────────────────
+#
+# Slack rejects a Block Kit section over 3,000 characters with
+# ``invalid_blocks``; the flavor used to send the whole body, so a
+# long digest or alert was dropped outright.
+
+
+def test_slack_payload_truncates_long_body() -> None:
+    payload = svc._slack_payload(_digest(summary="x" * 5000))  # noqa: SLF001
+    section = payload["blocks"][1]["text"]["text"]
+    assert len(section) <= 3000
+    assert section.endswith("…")
+    assert len(payload["text"]) <= 3000
+    assert payload["text"].endswith("…")
+
+
+def test_slack_payload_truncates_long_title_section() -> None:
+    payload = svc._slack_payload(_alert(rule_name="r" * 5000))  # noqa: SLF001
+    header = payload["blocks"][0]["text"]["text"]
+    assert len(header) <= 3000
+    assert header.endswith("…")
+
+
+def test_slack_payload_short_body_unchanged() -> None:
+    payload = svc._slack_payload(_payload())  # noqa: SLF001
+    assert payload["blocks"][1]["text"]["text"] == "example.com. (success) by alice"
+    assert "…" not in payload["blocks"][1]["text"]["text"]
+
+
+# ── UDP syslog address family (#1583) ──────────────────────────────
+
+
+class _FakeDatagramSocket:
+    instances: list[_FakeDatagramSocket] = []
+
+    def __init__(self, family: int, type_: int) -> None:
+        self.family = family
+        self.sent: tuple[bytes, object] | None = None
+        _FakeDatagramSocket.instances.append(self)
+
+    def __enter__(self) -> _FakeDatagramSocket:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def sendto(self, data: bytes, address: object) -> None:
+        self.sent = (data, address)
+
+
+@pytest.mark.asyncio
+async def test_send_syslog_udp_ipv6_literal_uses_inet6() -> None:
+    _FakeDatagramSocket.instances = []
+    with patch.object(svc.socket, "socket", _FakeDatagramSocket):
+        await svc._send_syslog("::1", 514, "udp", "hello")  # noqa: SLF001
+    sock = _FakeDatagramSocket.instances[0]
+    assert sock.family == socket.AF_INET6
+    assert sock.sent is not None
+    assert sock.sent[1][0] == "::1"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_send_syslog_udp_ipv4_still_uses_inet() -> None:
+    _FakeDatagramSocket.instances = []
+    with patch.object(svc.socket, "socket", _FakeDatagramSocket):
+        await svc._send_syslog("127.0.0.1", 514, "udp", "hello")  # noqa: SLF001
+    assert _FakeDatagramSocket.instances[0].family == socket.AF_INET
+
+
+@pytest.mark.asyncio
+async def test_send_syslog_udp_aaaa_only_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostname resolving only to AAAA must deliver over IPv6. The
+    old AF_INET socket failed on every event for such a collector."""
+
+    async def _fake_getaddrinfo(self: object, host: str, port: int, **kwargs: object) -> list:
+        return [
+            (
+                socket.AF_INET6,
+                socket.SOCK_DGRAM,
+                17,
+                "",
+                ("2001:db8::99", port, 0, 0),
+            )
+        ]
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "getaddrinfo", _fake_getaddrinfo)
+    _FakeDatagramSocket.instances = []
+    with patch.object(svc.socket, "socket", _FakeDatagramSocket):
+        await svc._send_syslog("collector.example.com", 514, "udp", "hello")  # noqa: SLF001
+    sock = _FakeDatagramSocket.instances[0]
+    assert sock.family == socket.AF_INET6
+    assert sock.sent is not None
+    assert sock.sent[1][0] == "2001:db8::99"  # type: ignore[index]
+
+
+# ── Delivery outcomes (#1577) ──────────────────────────────────────
+
+
+def _syslog_target(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "name": "t",
+        "kind": "syslog",
+        "format": "rfc5424_json",
+        "host": "10.0.0.1",
+        "port": 514,
+        "protocol": "udp",
+        "facility": 16,
+        "ca_cert_pem": None,
+        "min_severity": None,
+        "resource_types": None,
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_deliver_returns_delivered_on_success() -> None:
+    with patch.object(svc, "_send_syslog", new=AsyncMock()):
+        outcome = await svc._deliver_to_target(_syslog_target(), _payload())  # noqa: SLF001
+    assert outcome == svc.DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_deliver_returns_filtered_when_filter_rejects() -> None:
+    with patch.object(svc, "_send_syslog", new=AsyncMock()) as mock_send:
+        outcome = await svc._deliver_to_target(  # noqa: SLF001
+            _syslog_target(min_severity="denied"), _payload(result="success")
+        )
+    assert outcome == svc.FILTERED
+    mock_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deliver_returns_failed_when_transport_raises() -> None:
+    with patch.object(svc, "_send_syslog", new=AsyncMock(side_effect=OSError("unreachable"))):
+        outcome = await svc._deliver_to_target(_syslog_target(), _payload())  # noqa: SLF001
+    assert outcome == svc.FAILED
+
+
+@pytest.mark.asyncio
+async def test_deliver_smtp_missing_config_is_failed_not_delivered() -> None:
+    target = {
+        "name": "mail",
+        "kind": "smtp",
+        "smtp_host": "",
+        "smtp_from_address": "",
+        "smtp_to_addresses": [],
+        "min_severity": None,
+        "resource_types": None,
+    }
+    outcome = await svc._deliver_to_target(target, _payload())  # noqa: SLF001
+    assert outcome == svc.FAILED
+
+
+class _FakeWebhookResponse:
+    status_code = 500
+    text = "nope"
+    request = httpx.Request("POST", "https://example.com/ingest")
+
+
+class _FakeWebhookClient:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    async def __aenter__(self) -> _FakeWebhookClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def post(self, url: str, **kwargs: object) -> _FakeWebhookResponse:
+        return _FakeWebhookResponse()
+
+
+@pytest.mark.asyncio
+async def test_send_webhook_raises_on_non2xx() -> None:
+    with patch.object(svc.httpx, "AsyncClient", _FakeWebhookClient):
+        with pytest.raises(httpx.HTTPStatusError):
+            await svc._send_webhook("https://example.com/ingest", "", _payload())  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_deliver_webhook_non2xx_is_failed() -> None:
+    target = {
+        "name": "wh",
+        "kind": "webhook",
+        "url": "https://example.com/ingest",
+        "auth_header": "",
+        "min_severity": None,
+        "resource_types": None,
+    }
+    with patch.object(svc.httpx, "AsyncClient", _FakeWebhookClient):
+        outcome = await svc._deliver_to_target(target, _payload())  # noqa: SLF001
+    assert outcome == svc.FAILED
+
+
+@pytest.mark.asyncio
+async def test_alert_deliver_stamps_flag_only_on_actual_delivery() -> None:
+    """The receipts regression: filtered and failed deliveries used to
+    stamp ``delivered_webhook=True`` because the call merely returned."""
+    from app.services import alerts as alerts_svc
+
+    rule = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="r",
+        rule_type="appliance_storage_degraded",
+        notify_syslog=False,
+        notify_webhook=True,
+        notify_smtp=False,
+    )
+    event = SimpleNamespace(
+        severity="warning",
+        fired_at=datetime.now(UTC),
+        subject_type="appliance",
+        subject_id="ap-1",
+        subject_display="ddi1",
+        message="degraded",
+    )
+    base_target: dict[str, object] = {
+        "name": "wh",
+        "kind": "webhook",
+        "url": "https://example.com/ingest",
+        "auth_header": "",
+        "resource_types": None,
+    }
+
+    # Filtered out by the target's min_severity — not delivered.
+    filtered = {**base_target, "min_severity": "denied"}
+    assert await alerts_svc._deliver(rule, event, [filtered]) == (
+        False,
+        False,
+        False,
+    )  # noqa: SLF001
+
+    # Actually delivered.
+    ok = {**base_target, "min_severity": None}
+    with patch.object(svc, "_send_webhook", new=AsyncMock()):
+        assert await alerts_svc._deliver(rule, event, [ok]) == (False, True, False)  # noqa: SLF001
+
+    # Transport raised — not delivered.
+    with patch.object(svc, "_send_webhook", new=AsyncMock(side_effect=OSError("down"))):
+        assert await alerts_svc._deliver(rule, event, [ok]) == (False, False, False)  # noqa: SLF001
