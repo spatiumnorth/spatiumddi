@@ -1271,6 +1271,47 @@ def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
             ip.dns_record_id = None
 
 
+async def _cname_at(
+    db: AsyncSession,
+    zone: DNSZone,
+    ip: IPAddress,
+    rtype: str,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
+    """Whether a CNAME (or, for a CNAME, anything) already holds the name an
+    IP's forward record would be written at (#1441).
+
+    A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
+    RFC 2181 section 10.1). #1381 made the record API refuse such a pair,
+    but IPAM's auto-generated records do not go through it, so an address
+    or a DDNS lease whose hostname matched an operator's CNAME wrote an A
+    beside it. BIND then refuses the whole zone and the agent quarantines
+    the server's config, stopping every record change on that server
+    (#1378); PowerDNS refuses the patch. The caller skips the record
+    instead: a DNS naming clash must not fail an IP allocation or a lease.
+    """
+    from app.services.dns.cname_conflict import find_cname_conflict  # noqa: PLC0415
+
+    if not ip.hostname:
+        return False
+    other = await find_cname_conflict(
+        db, zone.id, view_id=None, name=ip.hostname, record_type=rtype, exclude_id=exclude_id
+    )
+    if other is None:
+        return False
+    logger.warning(
+        "ipam_dns_record_skipped_cname",
+        address=str(ip.address),
+        hostname=ip.hostname,
+        zone=zone.name,
+        conflicting_record_id=str(other.id),
+        conflicting_type=other.record_type,
+        detail=f"{ip.hostname} already holds a {other.record_type}; no {rtype} written",
+    )
+    return True
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -1479,6 +1520,8 @@ async def _sync_dns_record(
 
             existing = existing_by_zone.get(desired_zone_id)
             if existing is None:
+                if await _cname_at(db, target_zone, ip, forward_rtype):
+                    continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
                     name=ip.hostname,
@@ -1525,6 +1568,10 @@ async def _sync_dns_record(
                     record_id=existing.id,
                 )
                 await db.delete(existing)
+                if await _cname_at(db, target_zone, ip, forward_rtype, exclude_id=existing.id):
+                    if desired_zone_id == effective_zone_id:
+                        ip.dns_record_id = None
+                    continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
                     name=ip.hostname,
@@ -1555,6 +1602,26 @@ async def _sync_dns_record(
                 old_value = existing.value
                 name_changed = old_name != ip.hostname
                 value_changed = old_value != str(ip.address)
+                if name_changed and await _cname_at(
+                    db, target_zone, ip, forward_rtype, exclude_id=existing.id
+                ):
+                    # Renamed onto a CNAME's name: retract the record at the
+                    # old name, which no longer names this address, and write
+                    # nothing at the new one.
+                    await _enqueue_dns_op(
+                        db,
+                        target_zone,
+                        "delete",
+                        old_name,
+                        forward_rtype,
+                        old_value,
+                        existing.ttl,
+                        record_id=existing.id,
+                    )
+                    await db.delete(existing)
+                    if desired_zone_id == effective_zone_id:
+                        ip.dns_record_id = None
+                    continue
                 if name_changed:
                     # A rename is delete-at-old-name + create-at-new-name at
                     # the driver level: the agent's "update" op replaces the
@@ -2262,6 +2329,15 @@ class SubnetCreate(BaseModel):
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
 
+    @field_validator("domain_name")
+    @classmethod
+    def _domain_name(cls, v: str | None) -> str | None:
+        # Feeds radvd's DNSSL (GHSA-6235-5gh6-4hr2) and Kea's domain-name; a
+        # delegated subnet writer must not be able to smuggle config syntax.
+        if v is None or not v.strip():
+            return v
+        return validate_fqdn(v, field="domain_name")
+
 
 class SubnetUpdate(BaseModel):
     name: str | None = None
@@ -2381,6 +2457,15 @@ class SubnetUpdate(BaseModel):
         if v < 1 or v > 365:
             raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
+
+    @field_validator("domain_name")
+    @classmethod
+    def _domain_name(cls, v: str | None) -> str | None:
+        # Feeds radvd's DNSSL (GHSA-6235-5gh6-4hr2) and Kea's domain-name; a
+        # delegated subnet writer must not be able to smuggle config syntax.
+        if v is None or not v.strip():
+            return v
+        return validate_fqdn(v, field="domain_name")
 
 
 class SubnetVLANRef(BaseModel):
