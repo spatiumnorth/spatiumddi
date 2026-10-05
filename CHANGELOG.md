@@ -76,6 +76,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Rolling upgrades no longer strand nodes or skip their safety
+  checks (#1542, #1545, #1546, #1544).** A failure after the cordon
+  now runs a compensating release — uncordon the node and clear the
+  CNPG maintenance window this run set — instead of leaving the
+  node cordoned with the window on. When no CNPG cluster name is
+  configured, the maintenance-window clear at uncordon time is
+  skipped instead of failing every node's uncordon. The drain step
+  refuses to evict pods with no controller owner, honouring the
+  no-force rule (a bare pod would never be re-created). And the
+  chain verifies the upgraded node's Postgres instance actually
+  came back before moving to the next node.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
