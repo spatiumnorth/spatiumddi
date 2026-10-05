@@ -54,6 +54,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
+from app.services.dns.cname_conflict import find_record_insert_conflict
 from app.services.integration_ownership import (
     owned_by_other_integration,
     subnet_has_surviving_addresses,
@@ -747,6 +748,24 @@ async def _apply_records(
             if changed:
                 summary.records_updated += 1
         else:
+            # #1561: never insert beside a non-owned record at this
+            # name (operator A, another cluster's record, a CNAME) —
+            # the API would 409 it and BIND refuses a CNAME conflict.
+            conflict = await find_record_insert_conflict(
+                db,
+                zone.id,
+                name=label,
+                record_type=d.record_type,
+                own_fk="kubernetes_cluster_id",
+                own_id=cluster.id,
+            )
+            if conflict is not None:
+                summary.warnings.append(
+                    f"record {full_fqdn} ({d.record_type}) conflicts with existing "
+                    f"{conflict.record_type} record at the same name, not owned by "
+                    f"this cluster; skipping insert"
+                )
+                continue
             db.add(
                 DNSRecord(
                     zone_id=zone.id,

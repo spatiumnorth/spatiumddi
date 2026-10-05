@@ -79,9 +79,7 @@ async def test_survivor_predicate(db_session: AsyncSession) -> None:
         ipam_space_id=space.id,
         client_key_encrypted=b"",
     )
-    controller = UnifiController(
-        name=f"unifi-{uuid.uuid4().hex[:6]}", ipam_space_id=space.id
-    )
+    controller = UnifiController(name=f"unifi-{uuid.uuid4().hex[:6]}", ipam_space_id=space.id)
     db_session.add_all([host, controller])
     await db_session.flush()
     host_id = host.id
@@ -300,3 +298,147 @@ async def test_drift_sweep_ignores_records_owned_elsewhere(
     assert stale.id in stale_ids, "plain IPAM orphan must still be reported stale"
     assert ingress.id not in stale_ids
     assert acme.id not in stale_ids
+
+
+# ── #1557: mirrors store the host label, not the FQDN ────────────────
+
+
+def test_tailscale_hostname_is_host_label() -> None:
+    from app.services.tailscale.client import _TailscaleDevice
+    from app.services.tailscale.reconcile import ReconcileSummary, _compute_desired
+
+    device = _TailscaleDevice(
+        id="dev1",
+        node_id="node1",
+        name="nas.mytailnet.ts.net",
+        hostname="nas",
+        addresses=["100.64.0.1"],
+    )
+    summary = ReconcileSummary(ok=True)
+    desired = _compute_desired(SimpleNamespace(skip_expired=False), [device], summary)
+    assert len(desired) == 1
+    assert desired[0].hostname == "nas"
+    assert desired[0].custom_fields["fqdn"] == "nas.mytailnet.ts.net"
+
+    # No short hostname reported → fall back to the FQDN's first label.
+    device2 = _TailscaleDevice(
+        id="dev2",
+        node_id="node2",
+        name="printer.mytailnet.ts.net",
+        hostname="",
+        addresses=["100.64.0.2"],
+    )
+    desired = _compute_desired(SimpleNamespace(skip_expired=False), [device2], summary)
+    assert desired[0].hostname == "printer"
+
+
+def test_netbird_hostname_is_host_label() -> None:
+    from app.services.netbird.client import _NetbirdPeer
+    from app.services.netbird.reconcile import ReconcileSummary, _compute_desired
+
+    peer = _NetbirdPeer(
+        id="peer1",
+        name="laptop",
+        ip="100.96.0.1",
+        dns_label="laptop.netbird.cloud",
+        hostname="laptop",
+    )
+    summary = ReconcileSummary(ok=True)
+    desired = _compute_desired(SimpleNamespace(skip_expired=False), [peer], summary)
+    assert len(desired) == 1
+    assert desired[0].hostname == "laptop"
+    # The full FQDN remains available in custom_fields.
+    assert desired[0].custom_fields["dns_label"] == "laptop.netbird.cloud"
+
+
+# ── #1561: record passes never insert beside a non-owned record ──────
+
+
+@pytest.mark.asyncio
+async def test_k8s_record_pass_skips_conflicting_inserts(
+    db_session: AsyncSession,
+) -> None:
+    from app.core.crypto import encrypt_str
+    from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+    from app.models.kubernetes import KubernetesCluster
+    from app.services.kubernetes.reconcile import (
+        ReconcileSummary,
+        _apply_records,
+        _DesiredRecord,
+    )
+
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    zone = DNSZone(
+        group_id=grp.id,
+        name="apps.example.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.apps.example.",
+        admin_email="admin.apps.example.",
+    )
+    space = await _space(db_session)
+    db_session.add(zone)
+    await db_session.flush()
+    cluster = KubernetesCluster(
+        name=f"cluster-{uuid.uuid4().hex[:6]}",
+        api_server_url="https://k8s.example.test:6443",
+        ca_bundle_pem="",
+        token_encrypted=encrypt_str("faketoken"),
+        ipam_space_id=space.id,
+        dns_group_id=grp.id,
+    )
+    db_session.add(cluster)
+    # Operator A at "web"; operator CNAME at "alias".
+    db_session.add_all(
+        [
+            DNSRecord(
+                zone_id=zone.id,
+                name="web",
+                fqdn="web.apps.example",
+                record_type="A",
+                value="192.0.2.10",
+            ),
+            DNSRecord(
+                zone_id=zone.id,
+                name="alias",
+                fqdn="alias.apps.example",
+                record_type="CNAME",
+                value="target.example.net",
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    summary = ReconcileSummary(ok=True)
+    await _apply_records(
+        db_session,
+        cluster,
+        [
+            # A beside the operator's A at the same name → skip.
+            _DesiredRecord(fqdn="web.apps.example", record_type="A", value="10.0.0.5"),
+            # CNAME beside the operator's A → skip (CNAME conflict).
+            _DesiredRecord(fqdn="web.apps.example", record_type="CNAME", value="lb.example.net"),
+            # A beside the operator's CNAME → skip (CNAME conflict).
+            _DesiredRecord(fqdn="alias.apps.example", record_type="A", value="10.0.0.6"),
+            # Free name → inserted.
+            _DesiredRecord(fqdn="api.apps.example", record_type="A", value="10.0.0.7"),
+        ],
+        summary,
+    )
+    # desired_map dedupes by fqdn: "web" keeps the first (A) entry, so
+    # the CNAME variant never reaches the pass — 2 skips + 1 create.
+    assert summary.records_created == 1
+    assert len(summary.warnings) == 2
+
+    rows = (
+        (
+            await db_session.execute(
+                select(DNSRecord).where(DNSRecord.kubernetes_cluster_id == cluster.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [r.name for r in rows] == ["api"]
