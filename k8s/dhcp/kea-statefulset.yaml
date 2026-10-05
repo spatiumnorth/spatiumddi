@@ -77,8 +77,18 @@ spec:
               mountPath: /var/lib/spatium-dhcp-agent
             - name: kea-state
               mountPath: /var/lib/kea
+          # #1589 — readiness must mean "Kea is up", independent of HA.
+          # TCP 8000 is the Kea HA hook's peer listener: a standalone
+          # server never binds it, so a tcpSocket probe on 8000 kept a
+          # healthy standalone pod out of the Service endpoints forever.
+          # Probe the Kea control socket instead — the same check the
+          # image's HEALTHCHECK runs (either family counts).
           readinessProbe:
-            tcpSocket: { port: 8000 }
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -S /run/kea/kea4-ctrl-socket || test -S /run/kea/kea6-ctrl-socket"
             initialDelaySeconds: 5
             periodSeconds: 10
   volumeClaimTemplates:

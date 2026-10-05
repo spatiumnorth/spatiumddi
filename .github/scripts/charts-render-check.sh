@@ -37,6 +37,11 @@
 #   no-external-kea-ha — every render, plus the raw ``k8s/dhcp`` manifests: no
 #                      NodePort / LoadBalancer Service in front of a DHCP agent
 #                      publishes TCP 8000, Kea's unauthenticated HA listener.
+#   dhcp-readiness   — every render, plus a dedicated pass over the umbrella
+#                      posture render and the raw manifests: no DHCP agent
+#                      readiness probe gates on that same HA listener
+#                      (#1589) — a standalone Kea server never binds it, so
+#                      the pod would never become Ready.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -105,6 +110,10 @@ render() { # name chart [helm --set args...]
     python3 "$ROOT/.github/scripts/chart-pod-posture.py" $POSTURE_ARGS "$file" \
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$file" \
+        || failures=$((failures + 1))
+    # #1589 — no DHCP agent readiness probe may gate on the Kea HA
+    # listener (TCP 8000): a standalone server never binds it.
+    python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" "$file" \
         || failures=$((failures + 1))
 }
 
@@ -343,6 +352,49 @@ coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 echo "── no external Kea HA port (raw k8s/dhcp manifests)"
 python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$ROOT"/k8s/dhcp/*.yaml \
     || failures=$((failures + 1))
+
+# #1589 — the DHCP agent's readiness probe must test the Kea control
+# socket, not the HA listener, in the umbrella chart's render (the
+# posture render is the one that names a DHCP server) and in the raw
+# manifests alike. --require so a render that stops exercising the
+# template fails instead of passing vacuously.
+echo "── DHCP agent readiness probes the Kea control socket (#1589)"
+python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require --require-kea-socket \
+    "$OUT/umbrella-posture.yaml" "$ROOT/k8s/dhcp/kea-statefulset.yaml" \
+    || failures=$((failures + 1))
+
+# The guard must still FIRE on the probe shape it exists to catch.
+# Grep the message, not just the exit code (same reasoning as the
+# priorityClasses negative control above).
+echo "── negative control: tcpSocket readiness on the Kea HA port must fail"
+cat > "$OUT/neg-dhcp-readiness.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dhcp-kea-dhcp1
+  labels:
+    app.kubernetes.io/name: spatium-dhcp
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spatium-dhcp
+    spec:
+      containers:
+        - name: dhcp
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require-kea-socket "$OUT/neg-dhcp-readiness.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "HA peer listener"; then
+    echo "   ok: tcpSocket readiness on port 8000 refused by the #1589 guard"
+else
+    echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2
