@@ -899,8 +899,22 @@ dhcpAgents:
     #   role: primary
     #   group: default
     #   storage: { agentState: 1Gi, keaState: 2Gi }
-    #   service: { type: NodePort }
-    #   hostNetwork: false       # true required for L2 DHCP broadcast (no relay)
+    #   hostNetwork: false       # true binds the node's UDP/67 directly:
+    #                            # broadcast clients work with no relay,
+    #                            # and a relay reaches the node on 67
+    #   service: { type: LoadBalancer }
+    #                            # the default. A DHCP relay (ip
+    #                            # helper-address) can only forward to
+    #                            # UDP/67, so without hostNetwork point it
+    #                            # at the LoadBalancer address. A pinned
+    #                            # NodePort (service: { type: NodePort,
+    #                            # nodePort: 30067 }) only helps a relay
+    #                            # that can forward to a non-standard
+    #                            # port. On a NodePort Service the
+    #                            # `port: 67` is in-cluster only; the
+    #                            # node-facing port is the nodePort, which
+    #                            # Kubernetes picks at random (30000–32767)
+    #                            # when it is not pinned.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
