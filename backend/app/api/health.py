@@ -167,7 +167,6 @@ WORKER_PING_TIMEOUT_S = 3.0
 WORKER_PING_CACHE_TTL_S = 5.0
 
 _ping_task: asyncio.Future[dict[str, Any] | None] | None = None
-_ping_loop: asyncio.AbstractEventLoop | None = None
 # (completed_at, result, exception) — exactly one of result/exception is meaningful.
 _ping_cached: tuple[float, dict[str, Any] | None, BaseException | None] | None = None
 
@@ -180,9 +179,8 @@ def _inspect_ping() -> dict[str, Any] | None:
 
 def invalidate_worker_ping_cache() -> None:
     """Forget the cached / in-flight ping (tests; the next call re-pings)."""
-    global _ping_task, _ping_loop, _ping_cached
+    global _ping_task, _ping_cached
     _ping_task = None
-    _ping_loop = None
     _ping_cached = None
 
 
@@ -201,7 +199,7 @@ async def _worker_ping() -> dict[str, Any] | None:
     ``WORKER_PING_TIMEOUT_S`` (the ping keeps running and later callers join
     it), or whatever the ping itself raised.
     """
-    global _ping_task, _ping_loop
+    global _ping_task
     cached = _ping_cached
     if cached is not None and monotonic() - cached[0] < WORKER_PING_CACHE_TTL_S:
         if cached[2] is not None:
@@ -213,10 +211,9 @@ async def _worker_ping() -> dict[str, Any] | None:
     # No await between the check and the assignment, so two coroutines on
     # this loop cannot both start a ping. A task from another (closed) loop
     # can never complete here, so it is replaced rather than awaited.
-    if _ping_task is None or _ping_task.done() or _ping_loop is not loop:
+    if _ping_task is None or _ping_task.done() or _ping_task.get_loop() is not loop:
         _ping_task = asyncio.ensure_future(asyncio.to_thread(_inspect_ping))
         _ping_task.add_done_callback(_store_ping)
-        _ping_loop = loop
     # shield: one caller timing out must not cancel the ping the others await
     # (cancelling would not stop the thread anyway, only orphan it).
     return await asyncio.wait_for(asyncio.shield(_ping_task), timeout=WORKER_PING_TIMEOUT_S)

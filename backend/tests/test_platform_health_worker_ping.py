@@ -148,21 +148,19 @@ def test_exhausted_broker_pool_raises_instead_of_hanging(monkeypatch: pytest.Mon
     from kombu.exceptions import LimitExceeded
     from kombu.pools import ProducerPool
 
-    import app.celery_app as celery_module
-
-    monkeypatch.setattr(celery_module, "BROKER_POOL_ACQUIRE_TIMEOUT_S", 0.3, raising=False)
+    monkeypatch.setattr("app.celery_app.BROKER_POOL_ACQUIRE_TIMEOUT_S", 0.3)
 
     conns = Connection("memory://").Pool(limit=1)
     producers = ProducerPool(conns, limit=2)
     held = conns.acquire(block=True)
 
-    outcome: dict[str, BaseException | None] = {}
+    outcome: dict[str, Exception | None] = {}
 
     def _try(name: str, fn: Any) -> None:
         try:
             fn()
             outcome[name] = None
-        except BaseException as exc:  # noqa: BLE001 — recorded for the assertion
+        except Exception as exc:  # noqa: BLE001 — recorded for the assertion
             outcome[name] = exc
 
     threads = [
