@@ -40,6 +40,7 @@ from app.services.backup.archive import (
     BackupArchiveError,
     build_backup_archive,
 )
+from app.services.backup.health import RUN_PRESUMED_DEAD_AFTER
 from app.services.backup.schedule import compute_next_run
 from app.services.backup.targets import (
     PRE_RESTORE_KEEP_LAST_N,
@@ -108,6 +109,89 @@ async def claim_backup_run(
         return False
     await db.commit()
     await db.refresh(target)
+    return True
+
+
+def backup_run_is_stale(target: BackupTarget, now: datetime) -> bool:
+    """True when an ``in_progress`` claim was stranded by a dead
+    process rather than being genuinely held (#1515).
+
+    The runner stamps ``in_progress`` and commits BEFORE doing any
+    work, so a process that dies mid-run (OOM kill, pod restart, a
+    native-library crash) never reaches a terminal branch — and the
+    sweep used to skip the row forever, silently stopping that
+    target's schedule. The age test reuses the health module's
+    presumption threshold (:data:`RUN_PRESUMED_DEAD_AFTER`, 2 h —
+    far above a legitimate run: pg_dump is capped at 30 min and the
+    destination write has its own timeouts), so the alerting code
+    and the recovery code agree on when a run is dead. A NULL
+    ``last_run_at`` on an ``in_progress`` row was never stamped
+    properly at all, which is also stale.
+    """
+    if target.last_run_status != "in_progress":
+        return False
+    if target.last_run_at is None:
+        return True
+    return now - target.last_run_at >= RUN_PRESUMED_DEAD_AFTER
+
+
+async def reap_stale_backup_run(
+    db: AsyncSession,
+    *,
+    target: BackupTarget,
+    actor_display: str = "system (stale-run reaper)",
+) -> bool:
+    """Stamp a stranded ``in_progress`` run ``failed`` so the target
+    can run again (#1515). Returns True when it reaped.
+
+    Writes the same terminal state + audit shape the runner's own
+    failure branch writes, recomputes ``next_run_at`` so the
+    schedule resumes, and commits — after which the caller proceeds
+    with the due run in the same tick.
+    """
+    now = datetime.now(UTC)
+    if not backup_run_is_stale(target, now):
+        return False
+    started_at = target.last_run_at
+    error = (
+        f"run marked in progress since {started_at.isoformat() if started_at else 'an unknown time'} "
+        "never finished — the process running it most likely died (OOM kill, "
+        "pod restart, deploy). Stamped failed by the staleness reaper so the "
+        "schedule can resume."
+    )
+    target.last_run_status = "failed"
+    target.last_run_error = error[:5000]
+    if target.schedule_cron:
+        try:
+            target.next_run_at = compute_next_run(target.schedule_cron, after=now)
+        except Exception as exc:  # noqa: BLE001 — a bad cron must not wedge the reaper
+            logger.warning(
+                "backup_stale_reap_next_run_failed",
+                target_id=str(target.id),
+                cron=target.schedule_cron,
+                error=str(exc),
+            )
+            target.next_run_at = None
+    db.add(
+        AuditLog(
+            action="backup_target_run_failed",
+            resource_type="backup_target",
+            resource_id=str(target.id),
+            resource_display=target.name,
+            user_id=None,
+            user_display_name=actor_display,
+            result="failure",
+            new_value={"triggered_by": "stale_reaper", "kind": target.kind},
+            error_detail=error,
+        )
+    )
+    await db.commit()
+    await db.refresh(target)
+    logger.warning(
+        "backup_stale_run_reaped",
+        target_id=str(target.id),
+        in_progress_since=started_at.isoformat() if started_at else None,
+    )
     return True
 
 
@@ -197,6 +281,17 @@ async def _retention_sweep(
                 target_id=str(target.id),
                 filename=filename,
                 error=str(exc),
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            # A driver bug must not escape the retention sweep either
+            # (#1515): this runs AFTER the archive was written, so an
+            # escape here would strand the run's terminal stamp.
+            logger.warning(
+                "backup_retention_delete_failed",
+                target_id=str(target.id),
+                filename=filename,
+                error=f"unexpected: {exc}",
             )
             return False
         return True
@@ -312,6 +407,33 @@ async def run_backup_for_target(
         result_state = "failed"
         logger.warning(
             "backup_target_run_failed",
+            target_id=str(target.id),
+            kind=target.kind,
+            error=str(exc),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The catch-all IS the fix (#1515). The typed catch above
+        # covers the errors drivers are SUPPOSED to raise; anything
+        # else — a driver bug, a bare OSError that escaped
+        # translation, a library exception — used to propagate past
+        # the terminal stamp entirely, leaving the row ``in_progress``
+        # (which the sweep then skipped forever) and giving the API
+        # caller a bare 500. Stamp it failed, recompute next_run_at,
+        # write the audit row below; the run is recorded, the
+        # schedule survives, and the failure is visible in the UI
+        # instead of only in a traceback.
+        finished = datetime.now(UTC)
+        duration_ms = int((finished - started).total_seconds() * 1000)
+        target.last_run_status = "failed"
+        target.last_run_duration_ms = duration_ms
+        target.last_run_error = f"unexpected error: {exc}"[:5000]
+        if target.schedule_cron:
+            target.next_run_at = compute_next_run(target.schedule_cron, after=finished)
+        result.update({"error": f"unexpected error: {exc}", "duration_ms": duration_ms})
+        action = "backup_target_run_failed"
+        result_state = "failed"
+        logger.exception(
+            "backup_target_run_unexpected_error",
             target_id=str(target.id),
             kind=target.kind,
             error=str(exc),

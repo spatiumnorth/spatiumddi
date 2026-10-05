@@ -33,7 +33,11 @@ from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
-from app.services.backup.runner import BackupRunBusyError, run_backup_for_target
+from app.services.backup.runner import (
+    BackupRunBusyError,
+    reap_stale_backup_run,
+    run_backup_for_target,
+)
 from app.services.backup.schedule import (
     InvalidCronExpression,
     compute_next_run,
@@ -618,6 +622,10 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
         raise HTTPException(status_code=404, detail="backup target not found")
     if not row.enabled:
         raise HTTPException(status_code=409, detail="target is disabled — enable it first")
+    # A run stranded by a dead process (#1515) is reaped to ``failed``
+    # first — otherwise a manual-only target (which the schedule
+    # sweep never visits) would 409 here forever.
+    await reap_stale_backup_run(db, target=row, actor_display=current_user.username)
     try:
         result = await run_backup_for_target(
             db,

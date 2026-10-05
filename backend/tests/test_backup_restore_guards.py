@@ -26,9 +26,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import encrypt_str
 from app.services.backup import restore
 from app.services.backup import runner as runner_mod
 from app.services.backup.restore import BackupRestoreError
+from app.services.backup.targets import BackupDestinationError, DestinationConfigError
 from app.services.backup.targets.base import (
     PRE_RESTORE_KEEP_LAST_N,
     ArchiveListing,
@@ -310,3 +312,150 @@ def test_archive_filename_carries_a_random_suffix() -> None:
     src = inspect.getsource(archive_mod.build_backup_archive)
     assert "token_hex" in src
     assert 'f"spatiumddi-backup-{safe_host}-{timestamp}-' in src
+
+
+# ══════════════════════════════════════════════════════════════════════
+# #1515 — dead / unexpected runs must not strand a target in_progress
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_backup_run_is_stale_only_for_old_in_progress() -> None:
+    now = datetime.now(UTC)
+    fresh = _retention_target(last_run_status="in_progress", last_run_at=now)
+    old = _retention_target(last_run_status="in_progress", last_run_at=now - timedelta(hours=3))
+    unstamped = _retention_target(last_run_status="in_progress", last_run_at=None)
+    done = _retention_target(last_run_status="success", last_run_at=now - timedelta(days=9))
+    assert runner_mod.backup_run_is_stale(fresh, now) is False
+    assert runner_mod.backup_run_is_stale(old, now) is True
+    assert runner_mod.backup_run_is_stale(unstamped, now) is True
+    assert runner_mod.backup_run_is_stale(done, now) is False
+
+
+async def test_reap_stamps_failed_audits_and_reschedules(db_session: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from app.models.audit import AuditLog
+
+    target = _retention_target(
+        name="stranded",
+        last_run_status="in_progress",
+        last_run_at=datetime.now(UTC) - timedelta(hours=5),
+        schedule_cron="0 2 * * *",
+        next_run_at=datetime.now(UTC) - timedelta(hours=3),
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    assert await runner_mod.reap_stale_backup_run(db_session, target=target) is True
+    assert target.last_run_status == "failed"
+    assert "most likely died" in (target.last_run_error or "")
+    assert target.next_run_at is not None and target.next_run_at > datetime.now(UTC)
+    rows = (
+        (await db_session.execute(select(AuditLog).where(AuditLog.resource_id == str(target.id))))
+        .scalars()
+        .all()
+    )
+    assert [r.action for r in rows] == ["backup_target_run_failed"]
+    assert rows[0].new_value["triggered_by"] == "stale_reaper"
+
+    # Idempotent: a reaped (failed) row is not reaped again.
+    assert await runner_mod.reap_stale_backup_run(db_session, target=target) is False
+
+
+async def test_reap_leaves_a_live_run_alone(db_session: AsyncSession) -> None:
+    target = _retention_target(last_run_status="in_progress", last_run_at=datetime.now(UTC))
+    db_session.add(target)
+    await db_session.flush()
+    assert await runner_mod.reap_stale_backup_run(db_session, target=target) is False
+    assert target.last_run_status == "in_progress"
+
+
+async def test_runner_catch_all_stamps_failed_for_unexpected_errors(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    """A driver raising something the typed catch does not know —
+    here a bare RuntimeError standing in for an untranslated driver
+    exception — must still land the terminal stamp + audit row."""
+
+    class _ExplodingDriver:
+        def validate_config(self, config) -> None:
+            return None
+
+        async def write(self, *, config, filename, archive_bytes) -> None:
+            raise RuntimeError("driver exploded in a new and exciting way")
+
+    async def _build(db, **kw):
+        return b"zip", "spatiumddi-backup-h-20261004-020000-ab12cd.zip"
+
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: _ExplodingDriver())
+    monkeypatch.setattr(runner_mod, "decrypt_config_secrets", lambda driver, cfg: cfg)
+    monkeypatch.setattr(runner_mod, "build_backup_archive", _build)
+
+    target = _retention_target(
+        name="explody",
+        last_run_status="never",
+        schedule_cron="0 2 * * *",
+        passphrase_encrypted=encrypt_str("hunter2hunter2"),
+    )
+    db_session.add(target)
+    await db_session.flush()
+
+    result = await runner_mod.run_backup_for_target(
+        db_session, target=target, triggered_by="schedule"
+    )
+    assert result["success"] is False
+    assert "unexpected error" in (result["error"] or "")
+    assert target.last_run_status == "failed"
+    assert target.next_run_at is not None
+
+
+async def test_local_volume_delete_translates_oserror(tmp_path) -> None:
+    from app.services.backup.targets.local_volume import LocalVolumeDestination
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    # A directory wearing an archive's name: unlink() on it raises
+    # IsADirectoryError, an OSError the old code re-raised bare.
+    (root / "spatiumddi-backup-h-20261004-020000.zip").mkdir()
+    driver = LocalVolumeDestination()
+    with pytest.raises(BackupDestinationError):
+        await driver.delete(
+            config={"path": str(root)}, filename="spatiumddi-backup-h-20261004-020000.zip"
+        )
+
+
+async def test_local_volume_list_translates_oserror(tmp_path) -> None:
+    from app.services.backup.targets.local_volume import LocalVolumeDestination
+
+    not_a_dir = tmp_path / "a-file"
+    not_a_dir.write_bytes(b"x")
+    driver = LocalVolumeDestination()
+    with pytest.raises(BackupDestinationError):
+        await driver.list_archives(config={"path": str(not_a_dir)})
+
+
+async def test_webdav_invalid_url_is_a_destination_error() -> None:
+    from app.services.backup.targets.webdav import WebDAVDestination
+
+    driver = WebDAVDestination()
+    config = {"url": "http://invalid host.example/backups", "username": "u", "password": "p"}
+    with pytest.raises(BackupDestinationError):
+        await driver.write(config=config, filename="a.zip", archive_bytes=b"zip")
+
+
+def test_webdav_validate_config_rejects_hostless_url() -> None:
+    from app.services.backup.targets.webdav import WebDAVDestination
+
+    with pytest.raises(DestinationConfigError):
+        WebDAVDestination().validate_config(
+            {"url": "https:///backups", "username": "u", "password": "p"}
+        )
+
+
+def test_scp_sets_an_sftp_channel_timeout() -> None:
+    import inspect
+
+    from app.services.backup.targets import scp as scp_mod
+
+    assert "channel.settimeout" in inspect.getsource(scp_mod._open_sftp)
+    assert inspect.getsource(scp_mod.ScpDestination).count("_open_sftp(client)") == 5
