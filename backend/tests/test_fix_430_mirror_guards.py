@@ -270,3 +270,101 @@ async def test_opnsense_vlans_missing_envelope_raises(body: Any) -> None:
     _stub_get(client, body)
     with pytest.raises(OPNsenseClientError):
         await client.list_vlans()
+
+
+# ── UniFi (require_list / require_keyed_list after _get_legacy) ───────
+# #1555 — UniFi was the one mirror still collapsing a wrong-shape 200 to
+# [] in its list methods, bypassing the reconciler's #430 abort guard.
+
+
+def _unifi() -> UnifiClient:
+    return UnifiClient(
+        UnifiClientConfig(
+            mode="local",
+            host="unifi.test",
+            port=443,
+            cloud_host_id=None,
+            verify_tls=False,
+            ca_bundle_pem="",
+            auth_kind="api_key",
+            api_key="k",
+            username="",
+            password="",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_unifi_empty_legacy_lists_are_legitimate() -> None:
+    client = _unifi()
+    _stub_get(client, {"meta": {"rc": "ok"}, "data": []})
+    assert await client.list_networks("default") == []
+    assert await client.list_active_clients("default") == []
+    assert await client.list_known_clients("default") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"meta": {"rc": "ok"}, "data": None},
+        {"meta": {"rc": "ok"}, "data": {"message": "bad gateway"}},
+        {"meta": {"rc": "ok"}},  # envelope without data
+        None,
+        "oops",
+    ],
+)
+async def test_unifi_wrong_shape_200_raises(body: Any) -> None:
+    client = _unifi()
+    _stub_get(client, body)
+    with pytest.raises(UnifiClientError):
+        await client.list_networks("default")
+    with pytest.raises(UnifiClientError):
+        await client.list_active_clients("default")
+    with pytest.raises(UnifiClientError):
+        await client.list_known_clients("default")
+
+
+@pytest.mark.asyncio
+async def test_unifi_legacy_meta_rc_error_raises() -> None:
+    # Legacy in-band failure: HTTP 200 with meta.rc == "error" must be a
+    # failed read even when a data key rides along.
+    client = _unifi()
+    _stub_get(client, {"meta": {"rc": "error", "msg": "api.err.NoSiteContext"}, "data": []})
+    with pytest.raises(UnifiClientError):
+        await client.list_networks("default")
+
+
+def _stub_unifi_sites(client: UnifiClient, integration_body: Any) -> None:
+    """Legacy sites unavailable (the documented fallback trigger);
+    the Integration API answers with ``integration_body``."""
+
+    async def _legacy_fail(*_a: Any, **_k: Any) -> Any:
+        raise UnifiClientError("legacy 404")
+
+    async def _integration(*_a: Any, **_k: Any) -> Any:
+        return integration_body
+
+    client._get_legacy = _legacy_fail  # type: ignore[assignment]
+    client._get_integration = _integration  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"data": None}, {"foo": 1}, [], None])
+async def test_unifi_list_sites_wrong_shape_fallback_raises(body: Any) -> None:
+    client = _unifi()
+    _stub_unifi_sites(client, body)
+    with pytest.raises(UnifiClientError):
+        await client.list_sites()
+
+
+@pytest.mark.asyncio
+async def test_unifi_list_sites_fallback_empty_and_rows() -> None:
+    client = _unifi()
+    _stub_unifi_sites(client, {"data": []})
+    assert await client.list_sites() == []
+
+    client = _unifi()
+    _stub_unifi_sites(client, {"data": [{"id": "abc", "name": "Branch"}]})
+    sites = await client.list_sites()
+    assert len(sites) == 1 and sites[0].site_id == "abc"
