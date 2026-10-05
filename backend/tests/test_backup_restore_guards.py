@@ -21,10 +21,18 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from app.services.backup import restore
+from app.services.backup import runner as runner_mod
 from app.services.backup.restore import BackupRestoreError
+from app.services.backup.targets.base import (
+    PRE_RESTORE_KEEP_LAST_N,
+    ArchiveListing,
+    is_pre_restore_archive,
+)
 
 # ══════════════════════════════════════════════════════════════════════
 # #1575 — selective restore validates before the safety dump
@@ -83,3 +91,105 @@ async def test_selective_restore_with_unknown_section_refused_before_safety_dump
             sections=["no_such_section"],
         )
     assert state["safety_dump_calls"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# #1574 — safety dumps are not backups for retention or "latest"
+# ══════════════════════════════════════════════════════════════════════
+
+
+class _ListingDriver:
+    """Newest-first listing + recorded deletes, like the write-only
+    suite's counting driver."""
+
+    def __init__(self, filenames: list[str]) -> None:
+        self._filenames = filenames
+        self.deleted: list[str] = []
+
+    async def list_archives(self, *, config):
+        now = datetime.now(UTC)
+        return [
+            ArchiveListing(filename=n, size_bytes=1, created_at=now - timedelta(days=i))
+            for i, n in enumerate(self._filenames)
+        ]
+
+    async def delete(self, *, config, filename):
+        self.deleted.append(filename)
+
+
+def _retention_target(**kw):
+    from app.models.backup import BackupTarget
+
+    defaults = dict(name="t", kind="local_volume", config={}, passphrase_encrypted=b"x")
+    return BackupTarget(**{**defaults, **kw})
+
+
+def test_is_pre_restore_archive_matches_only_safety_dumps() -> None:
+    assert is_pre_restore_archive("pre-restore-20261004-120000.zip")
+    assert not is_pre_restore_archive("spatiumddi-backup-host-20261004-120000.zip")
+    assert not is_pre_restore_archive("a.zip")
+
+
+async def test_safety_dumps_do_not_consume_keep_last_n_slots(monkeypatch) -> None:
+    # Newest first: a fresh safety dump, then three real backups.
+    # keep-last-2 must keep the two newest BACKUPS; before the split
+    # the safety dump took one slot and b2 was pruned early.
+    driver = _ListingDriver(
+        [
+            "pre-restore-20261004-120000.zip",
+            "spatiumddi-backup-h-20261004-020000.zip",
+            "spatiumddi-backup-h-20261003-020000.zip",
+            "spatiumddi-backup-h-20261002-020000.zip",
+        ]
+    )
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    target = _retention_target(write_only=False, retention_keep_last_n=2)
+    deleted = await runner_mod._retention_sweep(None, target=target, config={})
+    assert driver.deleted == ["spatiumddi-backup-h-20261002-020000.zip"]
+    assert deleted == 1
+
+
+async def test_safety_dumps_pruned_under_their_own_allowance(monkeypatch) -> None:
+    names = [f"pre-restore-2026100{i}-020000.zip" for i in range(1, 7)]
+    driver = _ListingDriver(names)  # listing order is newest-first as given
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    target = _retention_target(write_only=False)  # no backup retention at all
+    await runner_mod._retention_sweep(None, target=target, config={})
+    assert driver.deleted == names[PRE_RESTORE_KEEP_LAST_N:]
+
+
+async def test_keep_days_does_not_delete_fresh_safety_dumps(monkeypatch) -> None:
+    # A 40-day-old backup goes under keep-days=30; a safety dump of
+    # the same age is governed by its own allowance, not the days.
+    old = datetime.now(UTC) - timedelta(days=40)
+    driver = _ListingDriver(
+        ["pre-restore-20260825-020000.zip", "spatiumddi-backup-h-20260825-020000.zip"]
+    )
+
+    async def _list(*, config):
+        return [
+            ArchiveListing(
+                filename="pre-restore-20260825-020000.zip", size_bytes=1, created_at=old
+            ),
+            ArchiveListing(
+                filename="spatiumddi-backup-h-20260825-020000.zip", size_bytes=1, created_at=old
+            ),
+        ]
+
+    driver.list_archives = _list  # type: ignore[method-assign]
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    target = _retention_target(write_only=False, retention_keep_days=30)
+    await runner_mod._retention_sweep(None, target=target, config={})
+    assert driver.deleted == ["spatiumddi-backup-h-20260825-020000.zip"]
+
+
+def test_latest_download_skips_safety_dumps() -> None:
+    """Source-level pin, matching the write-only suite's style: the
+    latest endpoint must filter before it picks ``[0]``."""
+    import inspect
+
+    from app.api.v1.backup import targets as api_targets
+
+    src = inspect.getsource(api_targets.download_latest_target_archive)
+    assert "is_pre_restore_archive" in src
+    assert src.index("is_pre_restore_archive") < src.index("newest = real_archives[0]")

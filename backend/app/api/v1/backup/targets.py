@@ -49,6 +49,7 @@ from app.services.backup.targets import (
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
     redact_config_secrets,
@@ -749,7 +750,16 @@ async def download_latest_target_archive(
     if not archives:
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
-    newest = archives[0]
+    # "Latest" means the newest real BACKUP (#1574): a pre-restore
+    # safety dump shares this listing on the recommended local-volume
+    # path, is newest by mtime right after a restore, and is encrypted
+    # with the public constant passphrase rather than this target's —
+    # serving it here hands the puller an archive their passphrase
+    # cannot open. Safety dumps stay listed and downloadable by name.
+    real_archives = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    if not real_archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    newest = real_archives[0]
     # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
     # than a local pair: that module already handles ``*``, comma lists,
     # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
