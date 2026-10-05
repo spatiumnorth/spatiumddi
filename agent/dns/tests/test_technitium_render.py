@@ -1656,3 +1656,60 @@ def test_swap_raises_when_tsig_sync_is_refused(tmp_path: Path) -> None:
     d.render(bundle)
     with pytest.raises(RuntimeError, match="tsig keys"):
         d.swap_and_reload()
+
+
+# ── #1513: rdata round-trip canonicalisation ────────────────────────────
+
+
+def test_svcb_params_sorted_by_key() -> None:
+    """Read-back rebuilds svcParams sorted; the write side must sort
+    too or the record churns on every structural reconcile."""
+    _, _, params = _svcb_params('1 . port=443 alpn="h2"')
+    assert params == "alpn|h2,port|443"
+
+
+def test_svcb_params_valueless_key_is_emitted_not_dropped() -> None:
+    _, _, params = _svcb_params('1 . no-default-alpn alpn="h2"')
+    assert params == "alpn|h2,no-default-alpn|"
+
+
+def test_svcb_round_trip_no_churn() -> None:
+    desired = _record_params("SVCB", '1 . port=443 alpn="h2" no-default-alpn', {})
+    from_daemon = _normalize_rdata(
+        "SVCB",
+        {
+            "svcPriority": 1,
+            "svcTargetName": ".",
+            "svcParams": {"alpn": "h2", "port": "443", "no-default-alpn": ""},
+        },
+    )
+    assert desired == from_daemon
+
+
+def test_record_params_uri_preserves_path_trailing_slash() -> None:
+    out = _record_params("URI", "1 1 https://example.com/path/", {})
+    assert out["uri"] == "https://example.com/path/"
+    out = _record_params("URI", "1 1 https://example.com/", {})
+    assert out["uri"] == "https://example.com"
+
+
+def test_normalize_rdata_uri_preserves_path_trailing_slash() -> None:
+    out = _normalize_rdata(
+        "URI", {"priority": 1, "weight": 1, "uri": "https://example.test/path/"}
+    )
+    assert out["uri"] == "https://example.test/path/"
+
+
+def test_aaaa_canonical_form_no_churn() -> None:
+    """A hand-typed expanded/upper-case AAAA must match the daemon's
+    canonical read-back instead of being deleted and re-added."""
+    desired = _record_params("AAAA", "2001:DB8:0:0::1", {})
+    assert desired == {"ipAddress": "2001:db8::1"}
+    from_daemon = _normalize_rdata("AAAA", {"ipAddress": "2001:db8::1"})
+    assert desired == from_daemon
+
+
+def test_name_valued_case_fold_no_churn() -> None:
+    desired = _record_params("CNAME", "WWW.Example.COM.", {})
+    from_daemon = _normalize_rdata("CNAME", {"cname": "www.example.com"})
+    assert desired == from_daemon
