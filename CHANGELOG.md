@@ -76,6 +76,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **TXT records are quoted properly on every DNS driver (#1514).**
+  TXT values are stored unquoted, and the BIND9 agent dropped them
+  into zone files and RFC 2136 updates verbatim — so a `;` in a
+  DMARC value started a zone-file comment and spaces in an SPF
+  value split it into character-strings resolvers join without the
+  spaces. All driver copies of the quoting helper (BIND9, PowerDNS
+  and Technitium agents, and the backend BIND9/PowerDNS drivers)
+  now quote and escape consistently, chunk long values at 255
+  *octets* without splitting an escape sequence (the old copies cut
+  at 255 characters after escaping, which could do both), strip
+  control characters, and leave already-quoted values untouched.
+  A cross-driver test asserts the copies agree.
+
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
