@@ -60,6 +60,7 @@ from app.services.ai.tools import (
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
     effective_tool_names,
 )
 
@@ -652,7 +653,11 @@ class ChatOrchestrator:
             provider_enabled=provider_enabled,
             enabled_modules=enabled_modules,
         )
-        tools = [t for t in REGISTRY.read_only() if t.name in effective]
+        # Only the tools this user may call (GHSA-4wrc-78rq-vgcg) — the
+        # registry enforces the same check at dispatch.
+        tools = REGISTRY.callable_by(
+            self.user, [t for t in REGISTRY.read_only() if t.name in effective]
+        )
         system_prompt = await build_system_prompt(self.db, self.user, tools, provider)
         # "Ask AI about this" — operator clicked a context affordance
         # in the IPAM / DNS / DHCP UI; the frontend supplied a
@@ -754,14 +759,18 @@ class ChatOrchestrator:
             provider_enabled=provider_enabled,
             enabled_modules=enabled_modules,
         )
+        # Narrowed to the tools this user may call (GHSA-4wrc-78rq-vgcg);
+        # ``ToolRegistry.call`` enforces the same check at dispatch.
+        callable_tools = REGISTRY.callable_by(
+            self.user, [t for t in REGISTRY.read_only() if t.name in effective]
+        )
         return [
             ToolDefinition(
                 name=t.name,
                 description=t.description,
                 parameters=t.parameters_schema(),
             )
-            for t in REGISTRY.read_only()
-            if t.name in effective
+            for t in callable_tools
         ]
 
     async def _build_fallback_chain(self, primary: AIProvider) -> list[AIProvider]:
@@ -1117,6 +1126,17 @@ class ChatOrchestrator:
                                 "to ask their administrator to enable "
                                 f"'{exc.name}' under Settings → AI → Tool Catalog. "
                                 "Do not retry this tool call."
+                            ),
+                        }
+                    )
+                    is_error = True
+                except ToolPermissionDenied as exc:
+                    result_text = json.dumps(
+                        {
+                            "error": str(exc),
+                            "hint": (
+                                "The signed-in user's role does not grant this. "
+                                "Tell them; do not retry this tool call."
                             ),
                         }
                     )

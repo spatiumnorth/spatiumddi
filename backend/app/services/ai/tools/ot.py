@@ -63,6 +63,7 @@ class FindOTDevicesArgs(BaseModel):
 
 @register_tool(
     name="find_ot_devices",
+    permission=("read", "ot_device"),
     description=(
         "List industrial / OT devices (PROFINET, EtherNet/IP, Modbus TCP, "
         "OPC UA, S7) with their protocol, role, vendor, PROFINET device name "
@@ -147,6 +148,7 @@ class CountOTDevicesArgs(BaseModel):
 
 @register_tool(
     name="count_ot_devices",
+    permission=("read", "ot_device"),
     description=(
         "Count industrial / OT devices grouped by protocol, role, or Purdue "
         "level. Use for an estate rollup such as 'how many PLCs do we have' "
@@ -192,6 +194,7 @@ class FindOTZonesArgs(BaseModel):
 
 @register_tool(
     name="find_ot_zones",
+    permission=("read", "ot_device"),
     description=(
         "List OT zone records — which subnet is zoned at which Purdue level "
         "and cell/area. This is the segmentation documentation the "
