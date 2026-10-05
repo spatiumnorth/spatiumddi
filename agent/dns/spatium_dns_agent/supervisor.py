@@ -22,7 +22,7 @@ from .drivers.bind9 import Bind9Driver
 from .drivers.powerdns import PowerDNSDriver
 from .drivers.technitium import TechnitiumDriver
 from .heartbeat import HeartbeatClient
-from .ingest import IngestWorker
+from .ingest import IngestWorker, PowerDNSIngestWorker
 from .metrics import MetricsPoller
 from .query_log_shipper import QueryLogShipper
 from .spool import SpoolManager
@@ -134,8 +134,8 @@ def run(cfg: AgentConfig) -> int:
         query_log = QueryLogShipper(cfg, token_ref, spool=spools.get("query_log"))
         rndc_status = RndcStatusPoller(cfg, token_ref)
         # Ingest-back for externally-injected DDNS records (issue #641).
-        # BIND9 only — AXFRs dynamic zones from loopback and ships unknown
-        # records to the control plane.
+        # AXFRs dynamic zones from loopback and ships unknown records to
+        # the control plane. (PowerDNS runs its own variant, #1524.)
         ingest = IngestWorker(cfg, token_ref)
         threads.extend(
             [
@@ -156,8 +156,16 @@ def run(cfg: AgentConfig) -> int:
         query_log = QueryLogShipper(
             cfg, token_ref, path=pdns_log_path, spool=spools.get("query_log")
         )
+        # Ingest-back for externally-injected DDNS records (issues #641 /
+        # #1524) — reads dynamic zones back over the loopback REST API
+        # and ships unknown records to the control plane, closing the
+        # loop the BIND9 worker already closed via AXFR.
+        ingest = PowerDNSIngestWorker(cfg, token_ref)
         threads.append(
             threading.Thread(target=query_log.run, name="query-log", daemon=True),
+        )
+        threads.append(
+            threading.Thread(target=ingest.run, name="ingest", daemon=True),
         )
     # technitium: no query-log thread in v1 — Technitium's query logging is
     # API/DB-backed (``/api/logs/query*``), not a tailable text file like
