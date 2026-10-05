@@ -278,6 +278,9 @@ subcharts verbatim — any option those charts accept works here. See:
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `storage.dnsState` (or `storage.keaState`), `service.type`,
+`service.nodePort` (DHCP only; pin it and point the relay at it when the
+DHCP Service is a NodePort — otherwise the node-facing port is random
+and a relay, which can only forward to UDP/67, never reaches the agent),
 `hostNetwork` (DHCP only), and `resources`.
 
 ## Upgrade

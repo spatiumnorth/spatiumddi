@@ -240,11 +240,15 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 [`k8s/README.md` → How servers register](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
-> `hostNetwork: true`, or front it with a DHCP relay (option 82). The static
-> manifests under `k8s/dhcp/` expose UDP/67 via `NodePort` for lab use only.
+> `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
+> at a LoadBalancer Service on UDP/67. The static manifests under
+> `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
+> declared `port: 67` is in-cluster only, and the node-facing port is a
+> random 30000–32767 pick that a relay cannot target unless it is pinned
+> (`service.nodePort` in the chart) and the relay is pointed at it.
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
-`hostNetwork`, `resources`) are documented in the
+`service.nodePort`, `hostNetwork`, `resources`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---

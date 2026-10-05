@@ -45,6 +45,21 @@ the formatter handles the rest.
 
 ### Changed
 
+- **DHCP agent Services default to LoadBalancer, and a NodePort can
+  finally be pinned (#1549).** The DHCP agent Service defaulted to
+  `type: NodePort` with `port: 67` and no way to set `nodePort`, so
+  Kubernetes picked a random 30000–32767 node port — and a DHCP relay
+  (`ip helper-address`), which can only forward to UDP/67, got no
+  answer. The chart default is now `LoadBalancer`, so a relay points
+  at the LB address on UDP/67; `service.nodePort` is rendered when
+  set, for a relay pointed at the pinned port; and the chart, the
+  static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
+  all say plainly that on a NodePort Service `port: 67` is the
+  in-cluster port, not the node-facing one. `hostNetwork: true`
+  remains the no-relay option. Existing installs that relied on the
+  NodePort default must set `service.type: NodePort` explicitly to
+  keep it.
+
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
   looked only at HIGH and CRITICAL, so the pip CVEs in the api image

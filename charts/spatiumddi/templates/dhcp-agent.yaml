@@ -127,12 +127,18 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
 spec:
-  type: {{ (get ($server.service | default dict) "type") | default "NodePort" }}
+  type: {{ (get ($server.service | default dict) "type") | default "LoadBalancer" }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
   ports:
-    - { name: dhcp-udp,  port: 67,   targetPort: 67,   protocol: UDP }
+    - name: dhcp-udp
+      port: 67
+      targetPort: 67
+      protocol: UDP
+      {{- with (get ($server.service | default dict) "nodePort") }}
+      nodePort: {{ . }}
+      {{- end }}
     - { name: ctrl-http, port: 8000, targetPort: 8000, protocol: TCP }
 ---
 apiVersion: v1
