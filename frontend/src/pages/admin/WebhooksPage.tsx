@@ -77,6 +77,10 @@ function SubscriptionEditor({
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [url, setUrl] = useState(existing?.url ?? "");
   const [secret, setSecret] = useState("");
+  // Edit only: send `secret: ""`, which the API reads as "store no secret".
+  // An empty field is `null` ("keep"), so without this the console could
+  // not remove a webhook's secret at all (#1397).
+  const [removeSecret, setRemoveSecret] = useState(false);
   const [eventTypes, setEventTypes] = useState<string[]>(
     existing?.event_types ?? [],
   );
@@ -132,11 +136,14 @@ function SubscriptionEditor({
         timeout_seconds: timeoutSeconds,
         max_attempts: maxAttempts,
         // ``null`` on edit when the operator didn't retype it = keep
-        // existing. On create we let the server auto-generate.
+        // existing; ``""`` = remove it. On create we let the server
+        // auto-generate.
         secret: existing
-          ? secret.length > 0
-            ? secret
-            : null
+          ? removeSecret
+            ? ""
+            : secret.length > 0
+              ? secret
+              : null
           : secret.length > 0
             ? secret
             : undefined,
@@ -271,7 +278,9 @@ function SubscriptionEditor({
           label={existing ? "Rotate secret (optional)" : "Secret (optional)"}
           hint={
             existing
-              ? "Leave blank to keep the stored secret. Type a new one to rotate; clearing the field stores no secret (HMAC header omitted)."
+              ? existing.secret_set
+                ? "Leave blank to keep the stored secret, or type a new one to rotate it."
+                : "No secret is stored, so deliveries go unsigned. Type one to sign them."
               : "Leave blank and the server will auto-generate a 32-byte secret. We surface it once after create — copy and store it on your receiver."
           }
         >
@@ -279,10 +288,24 @@ function SubscriptionEditor({
             type="password"
             autoComplete="new-password"
             className={cn(inputCls, "font-mono")}
-            value={secret}
+            value={removeSecret ? "" : secret}
+            disabled={removeSecret}
             onChange={(e) => setSecret(e.target.value)}
-            placeholder={existing && existing.secret_set ? "(stored)" : ""}
+            placeholder={
+              existing && existing.secret_set && !removeSecret ? "(stored)" : ""
+            }
           />
+          {existing?.secret_set && (
+            <label className="flex cursor-pointer items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={removeSecret}
+                onChange={(e) => setRemoveSecret(e.target.checked)}
+              />
+              Remove the stored secret: deliveries then go unsigned, with no
+              X-SpatiumDDI-Signature header.
+            </label>
+          )}
         </Field>
 
         <div className="rounded-md border p-3">
