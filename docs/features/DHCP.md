@@ -661,6 +661,20 @@ is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
 
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
+
 ### Known gap — Windows scope sync (issue #620)
 
 `services/dhcp/pull_leases.py::_upsert_scope` still Core-`DELETE`s a Windows

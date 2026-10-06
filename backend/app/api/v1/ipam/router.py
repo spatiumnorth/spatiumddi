@@ -63,6 +63,11 @@ from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.dns.reverse_zone import cidrs_overlap
+from app.services.dns.sync_check import (
+    ipam_authors_zone,
+    reverse_owner_candidates,
+    reverse_owner_key,
+)
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -1017,6 +1022,11 @@ async def _resolve_reverse_zone(
     group whose name is a suffix of the IP's reverse_pointer.
 
     "Effective" is load-bearing here — see ``_resolve_effective_dns``.
+
+    Only a zone IPAM authors (a primary) is returned (#1419). The zone that
+    owns the IP's reverse name is the most specific one that covers it,
+    whatever its type: when that is a forwarder, a secondary or a stub,
+    another server owns the name and there is no zone to write the PTR into.
     """
     rev_pointer = ip_addr.reverse_pointer + "."
     # 1. Subnet-linked reverse zone
@@ -1027,7 +1037,7 @@ async def _resolve_reverse_zone(
         )
     )
     z = res.scalar_one_or_none()
-    if z and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
+    if z and ipam_authors_zone(z) and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
         return z
     # 2. Walk effective DNS group(s) for the subnet — inheritance-aware.
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
@@ -1050,10 +1060,11 @@ async def _resolve_reverse_zone(
         .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
         .where(
             DNSZone.group_id.in_(effective_group_ids),
-            DNSZone.kind == "reverse",
+            reverse_owner_candidates(),
         )
     )
-    # Choose the longest matching suffix (most specific)
+    # Choose the longest matching suffix (most specific); the PTR is written
+    # only if that zone is one IPAM authors (#1419).
     best: DNSZone | None = None
     for z, linked_space_id, linked_network in res.all():
         zname = z.name.rstrip(".") + "."
@@ -1078,9 +1089,9 @@ async def _resolve_reverse_zone(
                     "IP space; PTR would leak across tenants (#844)",
                 )
                 continue
-            if best is None or len(z.name) > len(best.name):
+            if best is None or reverse_owner_key(z) > reverse_owner_key(best):
                 best = z
-    return best
+    return best if best is not None and ipam_authors_zone(best) else None
 
 
 # When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
@@ -1361,7 +1372,10 @@ async def _sync_dns_record(
         records = list(result.scalars().all())
         for record in records:
             zone = record.zone
-            if zone is not None:
+            # #1419 — a zone IPAM does not author (a release before the fix
+            # wrote PTRs into forwarders, secondaries and stubs) never took
+            # the record: drop the row, queue no op it would refuse.
+            if zone is not None and ipam_authors_zone(zone):
                 await _enqueue_dns_op(
                     db,
                     zone,
@@ -1700,7 +1714,7 @@ async def _sync_dns_record(
         )
         for rec in stale_ptrs:
             old_zone = await db.get(DNSZone, rec.zone_id)
-            if old_zone is not None:
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db, old_zone, "delete", rec.name, "PTR", rec.value, rec.ttl, record_id=rec.id
                 )
@@ -1714,7 +1728,34 @@ async def _sync_dns_record(
         return True
     rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
     if rev_zone is None:
-        return True  # No reverse zone covers this IP — quietly skip the PTR
+        # No zone IPAM authors covers this IP — skip the PTR. A PTR in a
+        # primary zone is left alone, as before; one a release before #1419
+        # wrote into a forwarder, a secondary or a stub is dropped, with no
+        # op: such a zone never took it. That write stamped the IP's
+        # ``reverse_zone_id``, so an IP without one has nothing to drop.
+        if ip.reverse_zone_id is None:
+            return True
+        unauthored = (
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+                    .where(
+                        DNSRecord.ip_address_id == ip.id,
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.record_type == "PTR",
+                        DNSZone.zone_type != "primary",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rec in unauthored:
+            if ip.reverse_zone_id == rec.zone_id:
+                ip.reverse_zone_id = None
+            await db.delete(rec)
+        return True
 
     rev_pointer_full = ip_obj.reverse_pointer + "."
     rev_zone_name = rev_zone.name.rstrip(".") + "."
@@ -1753,7 +1794,7 @@ async def _sync_dns_record(
         for record in existing_ptr:
             if record.zone_id != rev_zone.id:
                 old_zone = await db.get(DNSZone, record.zone_id)
-                if old_zone is not None:
+                if old_zone is not None and ipam_authors_zone(old_zone):
                     await _enqueue_dns_op(
                         db,
                         old_zone,
