@@ -52,7 +52,7 @@ timers, the zone's SOA changes back, so its serial moves, as the switch did.
 Then the two columns go.
 
 Revision ID: ff32b91acad8
-Revises: 61566a119901
+Revises: e51ab0dede3e
 Create Date: 2026-10-02
 """
 
@@ -65,7 +65,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "ff32b91acad8"
-down_revision = "61566a119901"
+down_revision = "e51ab0dede3e"
 branch_labels = None
 depends_on = None
 
