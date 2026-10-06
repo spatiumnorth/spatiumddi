@@ -46,7 +46,10 @@ vi.mock("@/lib/api", async () => {
         ),
       ]),
   );
-  return { ...actual, ...stubs };
+  return {
+    ...actual,
+    ...stubs,
+  };
 });
 
 vi.mock("@/hooks/useFeatureModules", async () => {
@@ -734,5 +737,159 @@ describe("#1341 Administration, Tools and the IPAM side pages", () => {
     await permissionsLoaded();
     const switches = screen.getAllByRole("switch") as HTMLButtonElement[];
     expect(switches.filter((s) => s.disabled)).toEqual([]);
+  });
+});
+
+// ── #1342: the Appliance tabs ────────────────────────────────────────────────
+
+const APPLIANCE_ADMIN = "Requires admin permission on the appliance";
+
+const SYSTEM_INFO = {
+  hostname: "appliance-1",
+  host_ips: ["192.0.2.10"],
+  uptime_seconds: 3600,
+  maintenance_mode: false,
+  reboot_pending_from_host: false,
+  reboot_scheduled: false,
+  appliance_version: "2026.10.05-1",
+  appliance_mode: true,
+};
+
+const POLICY = {
+  id: "pol-1",
+  name: "viewer-policy",
+  description: null,
+  scope_kind: "role",
+  scope_role: "dns",
+  scope_appliance_id: null,
+  enabled: true,
+  is_builtin: false,
+  priority: 100,
+  rules: [],
+};
+
+function applianceAnswers() {
+  answers.applianceSystemApi = { info: async () => SYSTEM_INFO };
+  answers.applianceContainersApi = {
+    list: async () => [
+      {
+        name: "api",
+        image: "spatiumddi-api",
+        state: "running",
+        status: "Up 1 hour",
+        health: "healthy",
+        short_id: "abc123",
+        started_at: STAMP,
+        is_spatium: true,
+      },
+    ],
+  };
+  answers.firewallApi = {
+    getEnforcement: async () => ({
+      enabled: false,
+      logging_enabled: false,
+      reported_count: 1,
+      hardened_count: 1,
+      lanwide_count: 0,
+      all_hardened: true,
+      safe_to_enable: true,
+      nodes: [],
+    }),
+    listPolicies: async () => [POLICY],
+    listAliases: async () => [],
+    getWebUIAccess: async () => ({
+      allowed_cidrs: [],
+      open: true,
+      caller_ip: "192.0.2.50",
+      caller_covered: true,
+    }),
+  };
+  answers.applianceSetupApi = {
+    state: async () => ({
+      complete: false,
+      completed_at: null,
+      completed_by: null,
+    }),
+  };
+  answers.applianceTlsApi = { list: async () => [] };
+}
+
+/** tab, the component's module and export, and the controls it must gate.
+ *  Cluster › Overview's Reboot host renders only under a live cluster-health
+ *  snapshot; the deep-tier ui check reads it on a running appliance. */
+const APPLIANCE_TABS: [string, string, string, (string | RegExp)[]][] = [
+  [
+    "Maintenance",
+    "./appliance/MaintenanceTab.tsx",
+    "MaintenanceTab",
+    ["Enable", "Reboot now"],
+  ],
+  [
+    "Cluster › Pods",
+    "./appliance/ContainersTab.tsx",
+    "ContainersTab",
+    ["Restart", "Stop"],
+  ],
+  [
+    "Firewall",
+    "./appliance/FirewallTab.tsx",
+    "FirewallTab",
+    ["Enable…", "New policy", "Edit rules", "Edit…"],
+  ],
+  [
+    "Setup",
+    "./appliance/SetupWizardPage.tsx",
+    "SetupWizardPage",
+    ["Finish setup"],
+  ],
+];
+
+const applianceModules = import.meta.glob("./appliance/*.tsx");
+
+async function openTab(module: string, name: string, first: string | RegExp) {
+  const mod = (await applianceModules[module]()) as Record<
+    string,
+    () => ReactNode
+  >;
+  const Tab = mod[name];
+  show(<Tab />, "/appliance");
+  await screen.findAllByRole("button", { name: first });
+  await permissionsLoaded();
+}
+
+describe("#1342 the Appliance tabs", () => {
+  it("offers a Viewer none of the appliance's actions, and says why", async () => {
+    signInAs(VIEWER);
+    for (const [, module, name, controls] of APPLIANCE_TABS) {
+      cleanup();
+      applianceAnswers();
+      await openTab(module, name, controls[0]);
+      for (const c of controls) {
+        expect(
+          expectAllDenied(c, new RegExp(`^${APPLIANCE_ADMIN}$`)),
+          `${name} ${String(c)}`,
+        ).toBeGreaterThan(0);
+      }
+      // The posture presets: every Apply preset is denied too.
+      if (name === "FirewallTab")
+        expectAllDenied("Apply preset", /^Requires admin/);
+    }
+  });
+
+  it("offers an appliance admin every one of them", async () => {
+    signInAs([...VIEWER, ["admin", "appliance"]]);
+    for (const [, module, name, controls] of APPLIANCE_TABS) {
+      cleanup();
+      applianceAnswers();
+      await openTab(module, name, controls[0]);
+      for (const c of controls) {
+        for (const b of screen.getAllByRole("button", { name: c })) {
+          expect(
+            (b as HTMLButtonElement).disabled,
+            `${name} ${String(c)}`,
+          ).toBe(false);
+        }
+      }
+    }
   });
 });

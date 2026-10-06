@@ -2387,6 +2387,17 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **The Appliance tabs offer a read-only user none of the appliance's
+  actions (#1342).** The built-in Viewer was offered Reboot host, every
+  pod's Restart and Stop (Stop has no confirm), maintenance mode and
+  Reboot now, the host firewall (enforcement, Web UI access, posture
+  presets, policies and their rules) and first-boot Finish setup, all
+  enabled, each refused by the server. Each now asks for admin on the
+  appliance, as its route does, and is otherwise disabled with the
+  reason. The first-boot setup banner is shown only to a user who can
+  finish setup, and Network & Host no longer says the firewall editor is
+  still to come.
+
 - **Administration, Tools and the IPAM side pages offer a read-only user
   no write it would be refused (#1341).** The built-in Viewer was
   offered New Role (and every role's Edit, Clone and Delete), New User,

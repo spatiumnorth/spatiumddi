@@ -10,6 +10,7 @@ import {
 
 import { applianceSystemApi } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4f — Maintenance tab.
@@ -24,6 +25,8 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
  * operators don't have to flip back and forth.
  */
 export function MaintenanceTab() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const [confirmReboot, setConfirmReboot] = useState(false);
 
@@ -107,6 +110,7 @@ export function MaintenanceTab() {
                 ? "border-amber-500/50 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
                 : "bg-background hover:bg-accent"
             } disabled:opacity-50`}
+            {...applianceGate}
           >
             <ShieldAlert className="h-3.5 w-3.5" />
             {data?.maintenance_mode ? "Disable" : "Enable"}
@@ -132,6 +136,7 @@ export function MaintenanceTab() {
             onClick={() => setConfirmReboot(true)}
             disabled={data?.reboot_scheduled}
             className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+            {...applianceGate}
           >
             <Power className="h-3.5 w-3.5" />
             {data?.reboot_scheduled ? "Already scheduled" : "Reboot now"}

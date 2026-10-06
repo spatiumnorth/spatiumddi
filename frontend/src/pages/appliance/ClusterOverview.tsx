@@ -68,6 +68,7 @@ import {
   useClusterHealthStream,
   type HistPoint,
 } from "./clusterShared";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 /**
  * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
@@ -1252,6 +1253,8 @@ function LiveLogPane({ workload }: { workload: string }) {
 export function ClusterOverview({
   onViewPods,
 }: { onViewPods?: () => void } = {}) {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const { snapshot, history, connected } = useClusterHealthStream();
 
   // Identity + lifecycle for the header / reboot action (folds in the former
@@ -1623,6 +1626,7 @@ export function ClusterOverview({
               : "Reboot is only available on appliance hosts"
           }
           className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+          {...applianceGate}
         >
           <Power className="h-3.5 w-3.5" />
           Reboot host

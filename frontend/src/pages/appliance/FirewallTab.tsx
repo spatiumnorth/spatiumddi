@@ -51,6 +51,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { WebUIAccessCard } from "@/components/WebUIAccessCard";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -429,6 +430,8 @@ function FirewallLogsSection() {
 // ── Enforcement master switch + all-CP-hardened gate (Phase 4a) ──────
 
 function EnforcementCard() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const { data: e } = useQuery({
     queryKey: ["firewall", "enforcement"],
@@ -485,7 +488,8 @@ function EnforcementCard() {
             <button
               type="button"
               onClick={() => setConfirm("disable")}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Disable
             </button>
@@ -495,7 +499,8 @@ function EnforcementCard() {
               onClick={() =>
                 setConfirm(e.safe_to_enable ? "enable" : "enable-override")
               }
-              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Enable…
             </button>
@@ -586,6 +591,8 @@ function EnforcementCard() {
 // ── Policies ─────────────────────────────────────────────────────────
 
 function PoliciesSection() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const { data: policies, isLoading } = useQuery({
     queryKey: ["firewall", "policies"],
@@ -630,7 +637,7 @@ function PoliciesSection() {
           bars above the whole tab. Two columns so they stay compact. */}
       <div className="grid gap-3 xl:grid-cols-2">
         <EnforcementCard />
-        <WebUIAccessCard />
+        <WebUIAccessCard editDisabledReason={applianceGate.title} />
       </div>
       <div className="grid gap-2 sm:grid-cols-3">
         {POSTURE_PRESETS.map((p) => (
@@ -642,7 +649,8 @@ function PoliciesSection() {
             <button
               type="button"
               onClick={() => setConfirmPreset(p.key)}
-              className="mt-2 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+              className="mt-2 rounded-md border px-2.5 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+              {...applianceGate}
             >
               Apply preset
             </button>
@@ -671,7 +679,8 @@ function PoliciesSection() {
           <button
             type="button"
             onClick={() => setShowNew(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...applianceGate}
           >
             <Plus className="h-3.5 w-3.5" /> New policy
           </button>
@@ -722,6 +731,7 @@ function PoliciesSection() {
                           ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
                           : "bg-muted text-muted-foreground",
                       )}
+                      {...applianceGate}
                     >
                       {p.enabled ? "enabled" : "disabled"}
                     </button>
@@ -731,7 +741,8 @@ function PoliciesSection() {
                       <button
                         type="button"
                         onClick={() => setEditPolicy(p)}
-                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        {...applianceGate}
                       >
                         Edit rules
                       </button>
@@ -745,6 +756,7 @@ function PoliciesSection() {
                             : "Delete"
                         }
                         className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                        {...applianceGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

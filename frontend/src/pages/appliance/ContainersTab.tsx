@@ -20,6 +20,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4d (rewritten as Phase 11 wave 4) — Pod management tab.
@@ -133,6 +134,8 @@ function ContainerCard({
   onLogs: () => void;
   busy: boolean;
 }) {
+  // #1342 — a pod's Restart / Stop / Start takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const isRunning = container.state === "running";
   const healthTone =
     container.health === "healthy"
@@ -191,6 +194,7 @@ function ContainerCard({
                 label="Restart"
                 onClick={() => onAction("restart")}
                 disabled={busy}
+                {...applianceGate}
               />
               <ActionButton
                 icon={Square}
@@ -198,6 +202,7 @@ function ContainerCard({
                 onClick={() => onAction("stop")}
                 disabled={busy}
                 destructive
+                {...applianceGate}
               />
             </>
           )}
@@ -207,6 +212,7 @@ function ContainerCard({
               label="Start"
               onClick={() => onAction("start")}
               disabled={busy}
+              {...applianceGate}
             />
           )}
         </div>
@@ -221,19 +227,22 @@ function ActionButton({
   onClick,
   disabled,
   destructive,
+  title,
 }: {
   icon: typeof Play;
   label: string;
   onClick: () => void;
   disabled?: boolean;
   destructive?: boolean;
+  /** Tooltip; the reason while denied (#1342). Defaults to the label. */
+  title?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      title={label}
+      title={title ?? label}
       className={`inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50 ${
         destructive
           ? "text-destructive hover:bg-destructive/10"
