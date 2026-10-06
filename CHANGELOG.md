@@ -118,6 +118,16 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
+  with `is_active: false` only set the flag: the account's sessions
+  were refused while it stayed disabled, but they stayed valid, so
+  re-enabling it brought every one back (an attacker's included), and
+  a refused request still showed as activity in Sessions. A change of
+  `is_active` now revokes every session the account holds, as an admin
+  password reset does, and the audit row says how many; a re-enabled
+  account starts with none, and a disabled account's refused requests
+  no longer move a session's last-seen time.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

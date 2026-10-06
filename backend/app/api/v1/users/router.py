@@ -354,11 +354,33 @@ async def update_user(
             resource_display=f"promote {user.username} to superadmin",
         )
 
+    changes: dict[str, object] = {}
+    if method:
+        changes.update(is_superadmin=True, stepup_method=method)
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
         user.email = body.email
-    if body.is_active is not None:
+    if body.is_active is not None and body.is_active != user.is_active:
+        # #1383 — a change of ``is_active`` ends every session the account
+        # holds, as an admin password reset does (#400 M3). Disabling is how an
+        # administrator contains an account (a leaver, a compromised login),
+        # and the sessions only stayed refused for as long as it stayed
+        # disabled: re-enabling it brought every one back, an attacker's
+        # included, and each refresh extended it. Revoking on re-enable too
+        # means a re-enabled account starts with none, even one disabled
+        # before this change or in the database; no session can be in honest
+        # use while the account is disabled, as login and refresh refuse it.
+        changes.update(
+            is_active=body.is_active,
+            sessions_revoked=(
+                await db.execute(
+                    update(UserSession)
+                    .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+                    .values(revoked=True)
+                )
+            ).rowcount,
+        )
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin
@@ -366,8 +388,8 @@ async def update_user(
         user.force_password_change = body.force_password_change
 
     audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
-    if method:
-        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    if changes:
+        audit.new_value = changes
     db.add(audit)
     await db.commit()
     await db.refresh(user)
