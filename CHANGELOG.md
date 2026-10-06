@@ -2387,6 +2387,17 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **The Network and integration pages offer a read-only user no write it
+  would be refused (#1340).** 26 of the 30 pages offered the built-in
+  Viewer their create, edit and delete controls: Customers, Providers,
+  Sites, Services, Circuits, Overlays, VRFs, VLANs, Multicast,
+  Certificates, Devices and ASNs, and all 11 integrations (Kubernetes,
+  Docker, Proxmox, OPNsense, FortiGate, Meraki, Cloud, NetBird,
+  Tailscale, UniFi, PAN-OS) with their rows' Test, Sync Now, Edit and
+  Delete. Each control now asks what its router asks, as AV, BACnet,
+  DICOM and OT already did: write (or delete) on the registry's own
+  resource type, or a superadmin for an integration.
+
 - **The DHCP page offers a read-only user no write it would be refused
   (#1339).** A user whose only role is the built-in Viewer was offered
   New group, Edit and Delete Group, Add Server, every server's Pause,

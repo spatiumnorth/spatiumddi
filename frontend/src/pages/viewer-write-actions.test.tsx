@@ -116,6 +116,10 @@ function expectOffered(names: (string | RegExp)[]) {
   }
 }
 
+// The walks render up to 16 pages each; on a build whose pages never ask for
+// the permission set, every page waits out permissionsLoaded()'s 500 ms.
+vi.setConfig({ testTimeout: 30_000 });
+
 afterEach(() => {
   cleanup();
   for (const k of Object.keys(answers)) delete answers[k];
@@ -384,5 +388,170 @@ describe("#1339 the DHCP page", () => {
       screen.getAllByRole("button", { name: "New group" }).length,
     ).toBeGreaterThan(0);
     await eachKeaTab((create) => expectOffered([create]));
+  });
+});
+
+// ── #1340: the Network and integration pages ─────────────────────────────────
+
+/** Every button by this name (a page can show its create both in its header
+ *  and in its empty state) is disabled and says why. */
+function expectAllDenied(name: string | RegExp, reason: RegExp) {
+  const all = screen.queryAllByRole("button", { name }) as HTMLButtonElement[];
+  for (const b of all) {
+    expect(b.disabled, `${String(name)} is offered`).toBe(true);
+    expect(b.title, `${String(name)} does not say why`).toMatch(reason);
+  }
+  return all.length;
+}
+
+const CUSTOMER = {
+  id: "cust-1",
+  name: "viewer-customer",
+  account_number: null,
+  contact_email: null,
+  contact_phone: null,
+  contact_address: null,
+  status: "active",
+  notes: "",
+  tags: {},
+  custom_fields: {},
+  created_at: STAMP,
+  modified_at: STAMP,
+};
+
+/** route, the page module and export, and the create the check reads. */
+const NETWORK_PAGES: [string, string, string, string][] = [
+  [
+    "/network/customers",
+    "network/CustomersPage",
+    "CustomersPage",
+    "New customer",
+  ],
+  [
+    "/network/providers",
+    "network/ProvidersPage",
+    "ProvidersPage",
+    "New provider",
+  ],
+  ["/network/sites", "network/SitesPage", "SitesPage", "New site"],
+  ["/network/services", "network/ServicesPage", "ServicesPage", "New service"],
+  ["/network/circuits", "network/CircuitsPage", "CircuitsPage", "New circuit"],
+  ["/network/overlays", "network/OverlaysPage", "OverlaysPage", "New overlay"],
+  ["/network/vrfs", "vrfs/VRFsPage", "VRFsPage", "New VRF"],
+  [
+    "/network/multicast",
+    "network/MulticastGroupsPage",
+    "MulticastGroupsPage",
+    "New group",
+  ],
+  [
+    "/network/certificates",
+    "network/CertificatesPage",
+    "CertificatesPage",
+    "New target",
+  ],
+  ["/network/devices", "network/NetworkPage", "NetworkPage", "Add Device"],
+  ["/network/asns", "network/AsnsPage", "AsnsPage", "New ASN"],
+  ["/cloud", "cloud/CloudPage", "CloudPage", "Add account"],
+  ["/docker", "docker/DockerPage", "DockerPage", "Add Host"],
+  ["/proxmox", "proxmox/ProxmoxPage", "ProxmoxPage", "Add Endpoint"],
+  ["/unifi", "unifi/UnifiPage", "UnifiPage", "Add Controller"],
+];
+
+const pageModules = import.meta.glob("./**/*Page.tsx");
+
+async function openPage(route: string, module: string, name: string) {
+  const mod = (await pageModules[`./${module}.tsx`]()) as Record<
+    string,
+    () => ReactNode
+  >;
+  const Page = mod[name];
+  show(<Page />, route);
+}
+
+describe("#1340 the Network and integration pages", () => {
+  it("offers a Viewer no create on any of them, and says why", async () => {
+    signInAs(VIEWER);
+    for (const [route, module, name, create] of NETWORK_PAGES) {
+      cleanup();
+      await openPage(route, module, name);
+      await screen.findAllByRole("button", { name: create });
+      await permissionsLoaded();
+      expect(expectAllDenied(create, /^Requires /), `${route}`).toBeGreaterThan(
+        0,
+      );
+    }
+    // VLANs' "New Router" is an icon button: named by its reason while denied.
+    cleanup();
+    await openPage("/network/vlans", "vlans/VLANsPage", "VLANsPage");
+    await screen.findByTitle(/^Refresh routers/);
+    await permissionsLoaded();
+    expect(screen.queryByRole("button", { name: "New Router" })).toBeNull();
+  });
+
+  it("offers a Viewer neither a customer's Edit nor its Delete", async () => {
+    signInAs(VIEWER);
+    answers.customersApi = {
+      list: async () => ({
+        items: [CUSTOMER],
+        total: 1,
+        limit: 500,
+        offset: 0,
+      }),
+    };
+    await openPage(
+      "/network/customers",
+      "network/CustomersPage",
+      "CustomersPage",
+    );
+    const row = (await screen.findByText("viewer-customer")).closest("tr")!;
+    await permissionsLoaded();
+    // Icon buttons, named by their tooltip: the reason while denied.
+    const rowButtons = Array.from(row.querySelectorAll("button"));
+    expect(rowButtons.map((b) => [b.title, b.disabled])).toEqual([
+      ["Requires write permission on customers", true],
+      ["Requires delete permission on customers", true],
+    ]);
+  });
+
+  it("offers an operator exactly the registry it may write", async () => {
+    signInAs([...VIEWER, ["write", "customer"]]);
+    await openPage(
+      "/network/customers",
+      "network/CustomersPage",
+      "CustomersPage",
+    );
+    await screen.findAllByRole("button", { name: "New customer" });
+    await permissionsLoaded();
+    expectOffered(["New customer"]);
+    cleanup();
+    await openPage(
+      "/network/providers",
+      "network/ProvidersPage",
+      "ProvidersPage",
+    );
+    await screen.findAllByRole("button", { name: "New provider" });
+    await permissionsLoaded();
+    expectAllDenied("New provider", /^Requires write permission on providers$/);
+  });
+
+  it("offers a superadmin every one of them", async () => {
+    signInAs("superadmin");
+    for (const [route, module, name, create] of NETWORK_PAGES) {
+      cleanup();
+      await openPage(route, module, name);
+      await screen.findAllByRole("button", { name: create });
+      await permissionsLoaded();
+      for (const b of screen.getAllByRole("button", { name: create })) {
+        expect((b as HTMLButtonElement).disabled, `${route} ${create}`).toBe(
+          false,
+        );
+      }
+    }
+    cleanup();
+    await openPage("/network/vlans", "vlans/VLANsPage", "VLANsPage");
+    await screen.findByTitle(/^Refresh routers/);
+    await permissionsLoaded();
+    expectOffered(["New Router"]);
   });
 });

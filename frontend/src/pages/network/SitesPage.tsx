@@ -36,6 +36,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -415,6 +416,17 @@ function SiteTreeRow({
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'site'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "site"),
+    "Requires write permission on sites",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "site"),
+    "Requires delete permission on sites",
+  );
   const kids = childrenByParent.get(site.id) ?? [];
   const hasKids = kids.length > 0;
   const isExpanded = expanded.has(site.id);
@@ -503,7 +515,8 @@ function SiteTreeRow({
             type="button"
             title="Move"
             onClick={() => onMove(site)}
-            className="ml-1 rounded p-1 hover:bg-muted"
+            className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Move className="h-3.5 w-3.5" />
           </button>
@@ -511,7 +524,8 @@ function SiteTreeRow({
             type="button"
             title="Edit"
             onClick={() => onEdit(site)}
-            className="ml-1 rounded p-1 hover:bg-muted"
+            className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
@@ -519,7 +533,8 @@ function SiteTreeRow({
             type="button"
             title="Delete"
             onClick={() => onDelete(site)}
-            className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+            className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+            {...deleteGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -693,6 +708,17 @@ function SiteTreeView({
 }
 
 export function SitesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'site'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "site"),
+    "Requires write permission on sites",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "site"),
+    "Requires delete permission on sites",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [kindFilter, setKindFilter] = useState<SiteKind | "">("");
@@ -854,6 +880,7 @@ export function SitesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New site
             </HeaderButton>
@@ -899,6 +926,7 @@ export function SitesPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -991,7 +1019,8 @@ export function SitesPage() {
                         type="button"
                         title="Move"
                         onClick={() => setMoving(s)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...writeGate}
                       >
                         <Move className="h-3.5 w-3.5" />
                       </button>
@@ -999,7 +1028,8 @@ export function SitesPage() {
                         type="button"
                         title="Edit"
                         onClick={() => setEditing(s)}
-                        className="ml-1 rounded p-1 hover:bg-muted"
+                        className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
@@ -1007,7 +1037,8 @@ export function SitesPage() {
                         type="button"
                         title="Delete"
                         onClick={() => askDelete(s)}
-                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
