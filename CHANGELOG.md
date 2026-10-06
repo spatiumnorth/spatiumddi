@@ -45,6 +45,14 @@ the formatter handles the rest.
 
 ### Changed
 
+- **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
+  vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
+  go.mod pins the x/net, x/text and grpc versions the Looking Glass
+  Dockerfile used to force with `go get` overrides, so the overrides
+  are dropped and the build takes upstream's pins as-is. The
+  swagger-ui-dist files behind `/api/docs` were re-vendored
+  byte-for-byte from the 5.33.1 npm tarball.
+
 - **DHCP agent Services default to LoadBalancer, and a NodePort can
   finally be pinned (#1549).** The DHCP agent Service defaulted to
   `type: NodePort` with `port: 67` and no way to set `nodePort`, so
@@ -75,6 +83,40 @@ the formatter handles the rest.
   "Scheduled Trivy scan: fixable CVEs in shipped images".
 
 ### Fixed
+
+- **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
+  Hetzner retired the standalone DNS Console API, which now answers every
+  call with a `301` redirect to the Cloud Console's web UI, so the driver
+  failed every probe, import and write with a bare "Hetzner API error:
+  HTTP 301" and no zone could be managed. It now drives
+  `api.hetzner.cloud/v1` with a Cloud **project** token
+  (`Authorization: Bearer`, Read & Write to apply changes). A token from
+  the old DNS Console does not work, so an existing Hetzner server needs
+  its token replaced. The Cloud API is RRset-oriented, so an op carrying
+  the resolved set (#783) is one `set_records` write and replaying it
+  converges; the per-value fallback uses `add_records` /
+  `remove_records` against the live set. Writes are asynchronous actions
+  and are now awaited, so a change the API rejects after accepting it is
+  reported as failed rather than applied. Action polling backs off from
+  1 s to 5 s to stay inside the API's 3600 requests per hour per project,
+  a write refused because another action is running on the zone is
+  retried, and hitting the rate limit says when it resets. TXT values are
+  quoted on write (split into strings of at most 255 bytes) and joined on
+  read, hostname targets are absolutised, and
+  secondary-mode zones (transferred from your own primaries) are no longer
+  offered for import, since they have no RRsets to manage. A redirect is
+  reported as such instead of as "HTTP 301". Contributed by
+  @containerguy.
+
+- **The looking-glass image reports its GoBGP version again
+  (follow-up to #1625).** `/etc/spatiumddi-versions` in the
+  gobgp image wrote `gobgp=` empty: `GOBGP_VERSION` is a global
+  build arg, and Docker only makes it available in a stage that
+  re-declares it — the runtime stage did not (pre-existing on
+  4.9.0 too). The runtime stage now re-declares `ARG
+  GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
+  which told maintainers to run `make trivy IMAGE=gobgp`; the
+  TRIVY_IMAGES spec is `looking-glass`.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
@@ -687,6 +729,87 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+
+- **Webhook forward targets keep their URL and Authorization header
+  encrypted, and no longer show or log them (#1502).** For a Slack,
+  Discord or Teams target the incoming-webhook URL is the credential:
+  whoever has it can post into the channel. It sat in a plaintext
+  column (`audit_forward_target.url`), and so in every backup archive's
+  unencrypted database dump and in "exclude secrets" diagnostic
+  archives. The API returned it in full, and httpx logged it at INFO on
+  every delivery (`HTTP Request: POST <URL>`), which put it in the api
+  and worker logs and in an appliance support bundle. A generic
+  target's `Authorization` header was stored the same way. The legacy
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
+  (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
+  cross-install backup rewrap). The API takes them write-only and
+  returns `url_set`, `auth_header_set` and a `url_display` that shows
+  only the scheme and host (`https://hooks.slack.com/…`). The httpx
+  request line for a webhook delivery shows only that host, and
+  delivery and save errors are redacted. The support-bundle scrubber
+  also recognises Slack, Discord and Teams webhook URLs and a SAS
+  `sig=` parameter, wherever else one is printed. The form uses
+  password inputs, shows the stored host, and keeps a field left blank
+  on edit.
+  **Behaviour changes:** `GET /settings/audit-forward-targets` no
+  longer has `url`, and `GET /settings` no longer has
+  `audit_forward_webhook_url` / `audit_forward_webhook_auth_header`
+  (each is replaced by the `*_set` / `*_display` fields). On
+  `PUT /settings/audit-forward-targets/{id}`, an omitted or `null`
+  `url` / `auth_header` now keeps the stored value, and `""` clears it.
+  Before, an omitted header was wiped, so editing a generic target in
+  the UI silently removed its header. **Upgrade notes:** the old
+  plaintext columns are kept, unread, for one release so a rolling
+  upgrade's old api pods keep working, and the next release drops them.
+  Until then they hold the pre-upgrade values, so a full archive still
+  carries those in clear, as every earlier archive does. Re-issuing the
+  webhook URL in Slack / Discord / Teams (and any collector token) once
+  the upgrade has finished, and pasting the new one in, is the only way
+  to retire a value that is already in an archive.
+
+- **Making someone a superadmin through a group needs the operator
+  step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
+  user is also a superadmin when one of their groups holds a role
+  carrying `*` / `*`, or a live `*` / `*` time-bound grant. A stolen
+  session could therefore still make an account it controls a superadmin
+  by adding it to such a group, giving such a role to its group, adding
+  `*` / `*` to a role its group already holds, or granting `*` / `*`
+  temporarily. Each of those now needs the step-up when, and only when,
+  it would make someone a superadmin who is not one; the check is on the
+  effect and runs before anything is written, and the audit row records
+  how many users it reached. Superadmin status here ignores whether the
+  account is enabled: before, a disabled role-only superadmin's password
+  could be reset with no step-up and the account re-enabled. The Groups,
+  Roles and time-bound grant dialogs ask for the step-up when the server
+  says it is needed (a 403 with `X-Stepup-Required`). The Users page's
+  Role column now shows a superadmin through a group's role, marked
+  "(role)", where it said "user". The Copilot's temporary-access proposal
+  refuses a `*` / `*` grant that would make superadmins, since a chat
+  Apply cannot ask for a password. An auth-provider group mapping into a
+  superadmin group needs it as well (#1476): it grants nothing until an
+  account from the external group signs in, so the check is on the target
+  group, and covers creating such a mapping, re-pointing one at such a
+  group and renaming its external group. The mapping editor now asks for
+  the step-up, and shows a failed save instead of saying nothing.
+  **Behaviour change:** an API client that makes such a group, role,
+  grant or mapping change must send `stepup_password` (or
+  `stepup_totp_code`).
+- **The older secret reveals count wrong answers like every other
+  step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing
+  codes, appliance kubeconfig, SNMP community, block-sync and
+  firewall-feed secrets, the approvals break-glass) re-confirmed the
+  operator without the per-account wrong-answer budget the #1355 actions
+  spend, so a stolen session could guess the operator's password, or a
+  TOTP code, through any of them without limit. Each now spends the same
+  budget, refusals keep their own `*_reveal_denied` audit action, and the
+  pairing-code reveal is audited for the first time. Once the budget is
+  spent, every step-up answers 429 with `Retry-After` set to the time left
+  on the block, and the refusal is audited (`error_detail:
+  stepup_blocked`); both were missing (found by ddi-pg on #1414). The
+  budget check now lives in one place for the reveals, the #1355 actions
+  and the MFA endpoints alike, and a test fails any new reveal that checks
+  the operator outside it.
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
@@ -803,7 +926,6 @@ the formatter handles the rest.
   **If you are affected:** set a new passphrase and a new hint, take a
   backup, and delete the older archives. The old passphrase stays in the
   audit log, so do not reuse it.
-
 - **Actions that mint a credential need the operator step-up (#1355).**
   #408 made secret reveals ask for a password or authenticator code so a
   stolen session cannot read them, but a stolen session could still mint
@@ -816,8 +938,7 @@ the formatter handles the rest.
   Wrong answers spend the per-account step-up budget (an omitted answer
   is refused without spending it), and each answered attempt is audited
   with the method used. Once the budget is spent the action answers 429
-  for 15 minutes; that refusal is not yet audited and carries no
-  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  until the 15-minute window resets. Resetting your own password through the admin path counts:
   a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
   create tokens, superadmins or a superadmin's password must send
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
@@ -947,6 +1068,15 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `e51ab0dede3e` — #1502, expand only: adds `url_encrypted` /
+  `auth_header_encrypted` to `audit_forward_target` and
+  `audit_forward_webhook_url_encrypted` /
+  `audit_forward_webhook_auth_header_encrypted` to `platform_settings`,
+  fills them from the plaintext columns with `encrypt_str` (so it needs
+  `SECRET_KEY`, like `b3c71e9a4d25`), and makes the plaintext columns
+  nullable. It does not drop them; the next release does. Downgrade
+  copies the current values back into the plaintext columns and drops
+  the encrypted ones.
 
 ## 2026.10.02-1 — 2026-10-02
 
