@@ -674,6 +674,19 @@ the formatter handles the rest.
 
 ### Security
 
+- **A resource-scoped API token no longer sees zones, records or addresses
+  outside its grant through group record lists or search
+  (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
+  narrowed a `dns_zone`-scoped token to its bound zones, but
+  `GET /api/v1/dns/groups/{id}/records` returned every record of every zone
+  in the group, and global search (`GET /api/v1/search`, and the Copilot's
+  `global_search`, which runs the same engine) returned zones and records
+  outside the grant. Search had the same gap for subnet-scoped tokens and
+  addresses. The group record list now narrows to the token's zones, and the
+  search engine drops every zone, record, subnet, address, block and space
+  row outside the token's bound instances. Sessions and unscoped tokens are
+  unaffected.
+
 - **Webhook forward targets keep their URL and Authorization header
   encrypted, and no longer show or log them (#1502).** For a Slack,
   Discord or Teams target the incoming-webhook URL is the credential:
