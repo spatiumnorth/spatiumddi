@@ -90,6 +90,71 @@ def render_sources_list(settings: PlatformSettings) -> str:
     return "\n".join(lines) + "\n"
 
 
+#: What a proxy URL's userinfo reads as on every read surface.
+PROXY_USERINFO_MASK = "***"
+
+
+def _split_proxy_userinfo(url: str) -> tuple[str, str | None, str]:
+    """``(scheme://, userinfo or None, host-and-rest)`` for a proxy URL.
+
+    The authority ends at the first ``/``, ``?`` or ``#``; userinfo is
+    everything before its LAST ``@`` (how urllib, curl and apt read it).
+    A value with no ``://`` is returned whole as host-and-rest.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return "", None, url
+    end = len(rest)
+    for ch in "/?#":
+        idx = rest.find(ch)
+        if idx != -1:
+            end = min(end, idx)
+    authority = rest[:end]
+    if "@" not in authority:
+        return f"{scheme}://", None, rest
+    userinfo, _, host = authority.rpartition("@")
+    return f"{scheme}://", userinfo, host + rest[end:]
+
+
+def mask_proxy_url(url: str | None) -> str:
+    """A proxy URL with any embedded credential replaced by ``***``
+    (GHSA-j77h-pqg7-h2g4).
+
+    ``http://bob:pw@proxy:3128/`` reads as ``http://***@proxy:3128/``: the
+    host stays visible (which proxy is a fair question for any reader),
+    the credential does not leave the server. A URL with no userinfo is
+    returned unchanged.
+    """
+    if not url:
+        return url or ""
+    prefix, userinfo, rest = _split_proxy_userinfo(url)
+    if userinfo is None:
+        return url
+    return f"{prefix}{PROXY_USERINFO_MASK}@{rest}"
+
+
+def restore_proxy_credentials(incoming: str, stored: str | None) -> str:
+    """Put the stored credential back into a proxy URL that carries the mask.
+
+    The Settings form re-sends the value ``GET /settings`` showed it, i.e.
+    the masked one; writing that literally would replace the real
+    credential with ``***``. So a userinfo of exactly ``***`` means "keep
+    the stored one", spliced onto whatever host / port / path the caller
+    sent. Raises ``ValueError`` when there is no stored credential to keep.
+    """
+    prefix, userinfo, rest = _split_proxy_userinfo(incoming)
+    if userinfo != PROXY_USERINFO_MASK:
+        return incoming
+    _, stored_userinfo, _ = _split_proxy_userinfo(stored or "")
+    if not stored_userinfo:
+        raise ValueError(
+            "proxy URL carries the '***' credential placeholder, but no "
+            "credential is stored to keep; enter the user:password or remove "
+            "the '***@'"
+        )
+    return f"{prefix}{stored_userinfo}@{rest}"
+
+
 def render_proxy_conf(settings: PlatformSettings) -> str:
     """Render ``/etc/apt/apt.conf.d/95spatiumddi-proxy`` — empty string
     when no proxy is configured (the runner then removes the file)."""

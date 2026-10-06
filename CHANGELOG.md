@@ -881,6 +881,85 @@ the formatter handles the rest.
 
 ### Security
 
+- **Unauthenticated `/health/platform` requests can no longer deadlock the
+  api (GHSA-c58p-8cq9-g3gm).** Each request ran its own Celery `inspect ping`
+  in a thread, and the 3 s timeout abandoned the request but not the thread.
+  A burst of anonymous requests filled the broker connection pool with pings
+  that each held one connection while waiting for another, and the next task
+  dispatch on the event loop then waited forever, hanging every request
+  until the api was restarted. The ping is now single-flight with a 5 s
+  result cache, so concurrent callers share one broadcast and a hung ping is
+  joined rather than repeated. `broker_pool_limit` is set explicitly and an
+  exhausted broker pool now raises after 5 s instead of blocking forever. No
+  operator action.
+
+- **Every appliance now has its own SSH host keys; existing installs rotate
+  them once on upgrade (GHSA-vvh9-6gfw-wphp).** The host keys were generated
+  once, inside the image build container, and the installer copied them into
+  STATE, so every appliance installed from one release presented the same
+  keys and the private halves shipped in the public ISO. Anyone able to
+  intercept SSH traffic could impersonate any appliance of that release. The
+  image now ships no host keys, the installer no longer seeds them, and each
+  appliance generates its own on first boot. On the first boot after
+  upgrading, an appliance whose STATE still holds a build-time key
+  (recognised by its `root@<container id>` comment) replaces it, once; keys
+  generated on the appliance or installed by an operator are never touched.
+  **Expect one "REMOTE HOST IDENTIFICATION HAS CHANGED" warning per
+  appliance** after the upgrade: remove the old entry with
+  `ssh-keygen -R <host>` and verify the new fingerprint on the console
+  (`spatium-state info`) before accepting it.
+
+- **APT proxy URLs no longer hand their embedded credential to every
+  signed-in account (GHSA-j77h-pqg7-h2g4).** `GET /api/v1/settings` needs
+  only a login, and returned `apt_proxy_http` / `apt_proxy_https` exactly as
+  stored, so a `http://user:password@proxy:3128` credential was readable by
+  a Viewer. It now reads as `http://***@proxy:3128`, host kept, and the same
+  masking applies to the `find_apt_settings` Copilot tool, the settings log
+  line and the support bundle. Saving the form with the mask in place keeps
+  the stored credential. Operators who configured a proxy credential should
+  consider it exposed and rotate it.
+
+- **The audit chain no longer reports tampering on rows nobody edited
+  (GHSA-8288-8vg9-82gr, #1615).** Each audit row was hashed with its
+  `old_value` / `new_value` as Python had them, and verified against what
+  PostgreSQL's JSONB returned. JSONB rewrites some numbers (`1e16` comes back
+  as the integer `10000000000000000`, `-0.0` as `0.0`), so any user able to
+  put such a value in an audited payload, for example a `tags` or
+  `custom_fields` entry on a create, made `GET /audit/integrity`, the chain
+  alert and the restore drill report `row_hash_mismatch` for good. Payloads
+  are now converted to exactly what JSONB returns before hashing, and the
+  converted form is what is stored. `NaN` / `Infinity`, which JSONB rejects
+  (failing the audited change with it), are stored as strings. Chain breaks
+  now name the row's action and resource. Rows written before this fix
+  that carry such a value still report a break; they are not re-hashed.
+
+- **Operator Copilot and MCP tools now enforce the caller's permissions
+  (GHSA-4wrc-78rq-vgcg).** A tool ran with no authorization, so any
+  signed-in account, or a read-scoped API token bound to one DNS zone,
+  could read DNS, DHCP, IPAM and capture data its role does not grant by
+  calling the read tools over `POST /api/v1/ai/mcp`. Every tool now
+  declares the permission its REST equivalent requires, and the tool
+  registry checks it on every call from chat and MCP alike. List tools
+  narrow rows to the zones / subnets a resource-scoped token is bound to.
+  MCP now offers only the tools chat would (Tool Catalog, defaults and
+  feature modules) and lists only those the caller may call, and
+  `tls_cert_check` refuses loopback, link-local and metadata targets.
+  No operator action needed; MCP clients may see fewer tools.
+
+- **On the appliance, a local unprivileged account can no longer become
+  root through file permissions (GHSA-h2j9-qrg7-grfw).** Three modes
+  combined to allow it: the k3s cluster-admin kubeconfig was 0644, the
+  `release-state` directory every root host runner takes its triggers
+  from was 1777 (and the slot-upgrade sidecars 0666), and
+  `/etc/spatiumddi/.env` was 0644. The kubeconfig is now 0640 to a new
+  `spatium-host` group (gid 2770), set by a k3s drop-in; the directory is
+  1770 root:2770, enforced at every boot by systemd-tmpfiles and
+  firstboot; the sidecars are 0660; `.env` is 0600. The supervisor's uid
+  is pinned to 100 and it, the api pod and the installer's admin carry gid
+  2770, so they keep their access. Every runner now checks the trigger's
+  owner first and renames a foreign one aside instead of acting on it.
+  Existing appliances are repaired on their next boot; no operator action.
+
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
@@ -974,7 +1053,6 @@ the formatter handles the rest.
   budget check now lives in one place for the reveals, the #1355 actions
   and the MFA endpoints alike, and a test fails any new reveal that checks
   the operator outside it.
-
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
@@ -1063,6 +1141,17 @@ the formatter handles the rest.
   runs `radvd -c` on it and only then swaps it in, so a rejected config no
   longer replaces the working one on disk. No operator action; existing
   invalid values are skipped at render with a log line.
+
+- **An Address Set Editor scoped to one address set can no longer resize, merge, split, purge, DNS-sync or delete IPAM subnets, blocks and spaces it holds no grant on (GHSA-6g57-4vj6-87mv).**
+  The IPAM router's coarse gate admits any mutating request from a holder of an `address_set`
+  grant and ignores the grant's `resource_id`, so the structural routes beyond create and update,
+  which had no per-type check of their own, were open to such a delegate. A block resize
+  changed a block's CIDR for a user with no block permission. Every structural subnet, block and
+  space route (resize, split, merge, move, purge orphans, discover, DNS sync, reverse-zone
+  backfill, subnet domains, bulk edit, allocate-subnet, delete) and the IPAM import commit now
+  requires `write` (or `delete`) on the matching `subnet` / `ip_block` / `ip_space` type. Address
+  CRUD and its per-IP address-set gate are unchanged. No operator action is needed, but a role
+  that relied on the gap, such as write on one IPAM type only, must now hold the matching one.
 
 - **A backup passphrase hint may no longer contain the passphrase (#1498).**
   The hint is stored in clear on purpose, so archives can be told apart
