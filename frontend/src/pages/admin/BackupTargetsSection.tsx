@@ -892,7 +892,10 @@ function TargetFormModal({
               className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </Field>
-          <Field label="Passphrase hint">
+          <Field
+            label="Passphrase hint"
+            help="A short label to remind you which passphrase decrypts this target's archives. Stored in clear text in every archive and in the audit log — never put the passphrase itself here."
+          >
             <input
               type="text"
               value={passphraseHint}

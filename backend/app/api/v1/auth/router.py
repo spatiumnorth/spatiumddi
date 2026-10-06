@@ -1074,6 +1074,14 @@ class MfaEnrolBeginResponse(BaseModel):
     recovery_codes: list[str]
 
 
+class MfaRecoveryCodesResponse(BaseModel):
+    """Regenerate's answer: the new codes and nothing else. The TOTP secret
+    must never be returned after enrolment — one live code plus a session
+    would otherwise hand over the second factor for good."""
+
+    recovery_codes: list[str]
+
+
 class MfaEnrolVerifyRequest(BaseModel):
     code: str
 
@@ -1349,11 +1357,11 @@ async def mfa_disable(
 
 @router.post(
     "/mfa/recovery-codes/regenerate",
-    response_model=MfaEnrolBeginResponse,
+    response_model=MfaRecoveryCodesResponse,
 )
 async def mfa_regenerate_recovery_codes(
     body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
-) -> MfaEnrolBeginResponse:
+) -> MfaRecoveryCodesResponse:
     """Replace the recovery-code list. Same two-factor reauth as
     ``/disable``. Returns the new codes ONCE — operator must record them.
     The existing ``secret`` is kept so the authenticator app entry stays
@@ -1393,11 +1401,7 @@ async def mfa_regenerate_recovery_codes(
         )
     )
     await db.commit()
-    return MfaEnrolBeginResponse(
-        secret=secret,
-        otpauth_uri=otpauth_uri(secret, current_user.username),
-        recovery_codes=codes,
-    )
+    return MfaRecoveryCodesResponse(recovery_codes=codes)
 
 
 # ── OIDC / SAML redirect flow ────────────────────────────────────────────────

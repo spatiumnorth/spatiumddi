@@ -309,6 +309,15 @@ class TechnitiumDriver(DNSDriver):
             # A bare "REFUSED" tells the operator nothing about what to do.
             # Name the setting that governs it, and distinguish the two very
             # different reasons a Technitium transfer gets declined.
+            #
+            # Only for the DNS answer, though (#1470). A TCP "Connection
+            # refused" carries the same word, and ``axfr_zone_records``
+            # already reports it as unreachable with the right hint — read
+            # as a refused transfer it sent the operator to the TSIG key on
+            # a server nobody could open a socket to (an appliance whose
+            # Technitium answers only on the DNS VIP, not the node address).
+            if isinstance(exc.__cause__, OSError):
+                raise
             if "REFUSED" in str(exc).upper():
                 if tsig is None:
                     raise RuntimeError(

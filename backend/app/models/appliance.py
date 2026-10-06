@@ -196,9 +196,10 @@ class PairingCode(Base):
     # from the full 8 digits + expiry + single-use, not from this.
     code_last_two: Mapped[str] = mapped_column(String(2), nullable=False)
 
-    # Wall-clock expiry. NULL = no expiry (persistent codes default
-    # to this; admin can override). Ephemeral codes always carry an
-    # expiry — validated at the API layer.
+    # Wall-clock expiry. NULL = no expiry (persistent codes only, and
+    # only when asked for with expires_in_minutes=0; the default is 30
+    # days, #1356). Ephemeral codes always carry an expiry — validated at
+    # the API layer.
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
