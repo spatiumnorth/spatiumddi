@@ -314,6 +314,29 @@ the formatter handles the rest.
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
 
+- **Editing a record's value on Cloudflare replaces it instead of adding
+  a second record (#1494).** The driver handled `update` by looking up
+  the Cloudflare row by the op's value, which is the NEW value and not
+  on Cloudflare yet, so the lookup missed and the "update is create on
+  miss" fallback added a second row next to the old one. For a DMARC
+  record that turned the domain's policy off, since two DMARC records
+  mean none. A create or update that carries its complete desired RRset
+  (every agentless op since #783) is now written as a set: rows that
+  match a member are kept, with the TTL corrected in place, missing
+  members are created, and the remaining rows are deleted last so the
+  name never goes empty. Values are compared in a normalised form (TXT
+  with or without quotes, host names with or without the trailing dot,
+  IPv6 notation), so an unchanged record is not posted again. If
+  Cloudflare still reports a value as a duplicate, nothing is deleted
+  and the op fails with that message. A delete stays a single-value
+  delete. A row added in the Cloudflare dashboard at the same name and
+  type is removed by the next create or update there, as with the
+  other drivers that write whole RRsets. Cloudflare's `proxied` flag
+  is preserved: a proxied row's TTL (always auto) is not "corrected",
+  every PUT carries the row's own flag, and a value replacing a
+  proxied record is created proxied, so a write never exposes the
+  origin address.
+
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
   an explicit `"server_group_id": null` was dropped like an absent key:
@@ -686,6 +709,57 @@ the formatter handles the rest.
 
 ### Security
 
+- **A resource-scoped API token no longer sees zones, records or addresses
+  outside its grant through group record lists or search
+  (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
+  narrowed a `dns_zone`-scoped token to its bound zones, but
+  `GET /api/v1/dns/groups/{id}/records` returned every record of every zone
+  in the group, and global search (`GET /api/v1/search`, and the Copilot's
+  `global_search`, which runs the same engine) returned zones and records
+  outside the grant. Search had the same gap for subnet-scoped tokens and
+  addresses. The group record list now narrows to the token's zones, and the
+  search engine drops every zone, record, subnet, address, block and space
+  row outside the token's bound instances. Sessions and unscoped tokens are
+  unaffected.
+
+- **Webhook forward targets keep their URL and Authorization header
+  encrypted, and no longer show or log them (#1502).** For a Slack,
+  Discord or Teams target the incoming-webhook URL is the credential:
+  whoever has it can post into the channel. It sat in a plaintext
+  column (`audit_forward_target.url`), and so in every backup archive's
+  unencrypted database dump and in "exclude secrets" diagnostic
+  archives. The API returned it in full, and httpx logged it at INFO on
+  every delivery (`HTTP Request: POST <URL>`), which put it in the api
+  and worker logs and in an appliance support bundle. A generic
+  target's `Authorization` header was stored the same way. The legacy
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
+  (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
+  cross-install backup rewrap). The API takes them write-only and
+  returns `url_set`, `auth_header_set` and a `url_display` that shows
+  only the scheme and host (`https://hooks.slack.com/…`). The httpx
+  request line for a webhook delivery shows only that host, and
+  delivery and save errors are redacted. The support-bundle scrubber
+  also recognises Slack, Discord and Teams webhook URLs and a SAS
+  `sig=` parameter, wherever else one is printed. The form uses
+  password inputs, shows the stored host, and keeps a field left blank
+  on edit.
+  **Behaviour changes:** `GET /settings/audit-forward-targets` no
+  longer has `url`, and `GET /settings` no longer has
+  `audit_forward_webhook_url` / `audit_forward_webhook_auth_header`
+  (each is replaced by the `*_set` / `*_display` fields). On
+  `PUT /settings/audit-forward-targets/{id}`, an omitted or `null`
+  `url` / `auth_header` now keeps the stored value, and `""` clears it.
+  Before, an omitted header was wiped, so editing a generic target in
+  the UI silently removed its header. **Upgrade notes:** the old
+  plaintext columns are kept, unread, for one release so a rolling
+  upgrade's old api pods keep working, and the next release drops them.
+  Until then they hold the pre-upgrade values, so a full archive still
+  carries those in clear, as every earlier archive does. Re-issuing the
+  webhook URL in Slack / Discord / Teams (and any collector token) once
+  the upgrade has finished, and pasting the new one in, is the only way
+  to retire a value that is already in an archive.
+
 - **Making someone a superadmin through a group needs the operator
   step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
   user is also a superadmin when one of their groups holds a role
@@ -976,6 +1050,15 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `e51ab0dede3e` — #1502, expand only: adds `url_encrypted` /
+  `auth_header_encrypted` to `audit_forward_target` and
+  `audit_forward_webhook_url_encrypted` /
+  `audit_forward_webhook_auth_header_encrypted` to `platform_settings`,
+  fills them from the plaintext columns with `encrypt_str` (so it needs
+  `SECRET_KEY`, like `b3c71e9a4d25`), and makes the plaintext columns
+  nullable. It does not drop them; the next release does. Downgrade
+  copies the current values back into the plaintext columns and drops
+  the encrypted ones.
 - `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
   default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
   the value the BIND9 agent has always served (3600, 600, 86400, 300),
