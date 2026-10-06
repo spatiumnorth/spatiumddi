@@ -84,6 +84,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
+  Hetzner retired the standalone DNS Console API, which now answers every
+  call with a `301` redirect to the Cloud Console's web UI, so the driver
+  failed every probe, import and write with a bare "Hetzner API error:
+  HTTP 301" and no zone could be managed. It now drives
+  `api.hetzner.cloud/v1` with a Cloud **project** token
+  (`Authorization: Bearer`, Read & Write to apply changes). A token from
+  the old DNS Console does not work, so an existing Hetzner server needs
+  its token replaced. The Cloud API is RRset-oriented, so an op carrying
+  the resolved set (#783) is one `set_records` write and replaying it
+  converges; the per-value fallback uses `add_records` /
+  `remove_records` against the live set. Writes are asynchronous actions
+  and are now awaited, so a change the API rejects after accepting it is
+  reported as failed rather than applied. Action polling backs off from
+  1 s to 5 s to stay inside the API's 3600 requests per hour per project,
+  a write refused because another action is running on the zone is
+  retried, and hitting the rate limit says when it resets. TXT values are
+  quoted on write (split into strings of at most 255 bytes) and joined on
+  read, hostname targets are absolutised, and
+  secondary-mode zones (transferred from your own primaries) are no longer
+  offered for import, since they have no RRsets to manage. A redirect is
+  reported as such instead of as "HTTP 301". Contributed by
+  @containerguy.
+
 - **The looking-glass image reports its GoBGP version again
   (follow-up to #1625).** `/etc/spatiumddi-versions` in the
   gobgp image wrote `gobgp=` empty: `GOBGP_VERSION` is a global
