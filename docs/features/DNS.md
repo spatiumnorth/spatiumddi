@@ -1016,6 +1016,15 @@ letting one silently win.
   rewriting is by definition answer tampering). The agent handles this
   automatically; it is why a filtered group cannot also validate.
 
+#### How often are feeds refreshed?
+
+A URL list is fetched when it is created, when someone presses **Refresh**,
+and by an hourly sweep once its **Update interval** has passed since the last
+sync (`update_interval_hours`, default 24; `0` = manual only, at most 8760).
+A failed fetch counts as a sync too, so a broken feed is retried once per
+interval rather than every hour; Refresh retries it at once. Lists that come
+due together are queued a minute apart.
+
 #### Do feed entries block subdomains?
 
 Yes by default, and it is a **per-list** setting — *Block subdomains of
