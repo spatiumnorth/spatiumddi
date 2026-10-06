@@ -47,6 +47,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mac import canonicalize_mac
+from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
@@ -696,11 +697,62 @@ async def _linked_static_for_row(db: AsyncSession, row: IPAddress) -> DHCPStatic
     return res.scalars().first()
 
 
+def _audit_static_change(
+    db: AsyncSession,
+    user: User | None,
+    action: str,
+    *,
+    static_id: uuid.UUID,
+    mac: str,
+    ip: str,
+    changed_fields: list[str] | None = None,
+    old_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> None:
+    """Write the same audit row the statics endpoints write (#1629 review).
+
+    ``sync_static_for_ipam_row`` creates / updates / deletes reservations
+    on behalf of an IPAM save or an import; without a row of their own
+    those reservation changes left no trail as a reservation
+    (non-negotiable #4). Mirrors ``api/v1/dhcp/statics.py``: resource
+    type ``dhcp_static_assignment``, display ``<mac>-><ip>``, attributed
+    to the acting user (``system`` when there is none).
+    """
+    from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
+
+    write_audit(
+        db,
+        user=user,
+        action=action,
+        resource_type="dhcp_static_assignment",
+        resource_id=str(static_id),
+        resource_display=f"{mac}->{ip}",
+        changed_fields=changed_fields,
+        old_value=old_value,
+        new_value=new_value,
+    )
+
+
+def _static_audit_value(
+    st: DHCPStaticAssignment, scope_id: uuid.UUID, row: IPAddress
+) -> dict[str, Any]:
+    """The reservation snapshot an audit row carries, statics-shaped."""
+    return {
+        "scope_id": str(scope_id),
+        "ip_address": str(st.ip_address),
+        "mac_address": str(st.mac_address),
+        "hostname": st.hostname or "",
+        "description": st.description or "",
+        "ip_address_id": str(row.id),
+    }
+
+
 async def sync_static_for_ipam_row(
     db: AsyncSession,
     row: IPAddress,
     *,
     created_by_user_id: uuid.UUID | None = None,
+    user: User | None = None,
 ) -> IPAMStaticSync:
     """Keep the DHCP reservation for an IPAM row in step with the row (#1628).
 
@@ -720,6 +772,16 @@ async def sync_static_for_ipam_row(
     from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
     from app.services.dhcp.windows_writethrough import push_static_change  # noqa: PLC0415
 
+    # The acting user for the audit rows: an explicit ``user`` wins;
+    # callers that only pass ``created_by_user_id`` (the IPAM router and
+    # the importer) still get their reservation changes attributed by
+    # loading that user.
+    acting_user = user
+    if acting_user is None and created_by_user_id is not None:
+        acting_user = await db.get(User, created_by_user_id)
+    elif acting_user is not None and created_by_user_id is None:
+        created_by_user_id = acting_user.id
+
     linked = await _linked_static_for_row(db, row)
     is_reservation = row.status == "static_dhcp" and bool(row.mac_address)
 
@@ -733,8 +795,21 @@ async def sync_static_for_ipam_row(
         # The row is the caller's to keep (it merely changed status) — do NOT
         # detach_ipam_for_static here, which would free the row itself.
         row.static_assignment_id = None
+        deleted_id, deleted_mac, deleted_ip = (
+            linked.id,
+            str(linked.mac_address),
+            str(linked.ip_address),
+        )
         await db.delete(linked)
         await db.flush()
+        _audit_static_change(
+            db,
+            acting_user,
+            "delete",
+            static_id=deleted_id,
+            mac=deleted_mac,
+            ip=deleted_ip,
+        )
         return IPAMStaticSync(static=None, scope=scope, action="delete")
 
     try:
@@ -756,14 +831,35 @@ async def sync_static_for_ipam_row(
                 warning=f"MAC {mac} is already reserved in this DHCP group (scope {clash.scope_id})",
             )
         prev_mac, prev_ip = str(linked.mac_address), str(linked.ip_address)
+        prev_hostname, prev_description = linked.hostname or "", linked.description or ""
         changed = (
             prev_mac != mac
             or prev_ip != str(row.address)
-            or (linked.hostname or "") != (row.hostname or "")
-            or (linked.description or "") != (row.description or "")
+            or prev_hostname != (row.hostname or "")
+            or prev_description != (row.description or "")
         )
         if not changed and row.static_assignment_id == str(linked.id):
             return IPAMStaticSync(static=linked, scope=scope)
+        changed_fields: list[str] = []
+        if prev_ip != str(row.address):
+            changed_fields.append("ip_address")
+        if prev_mac != mac:
+            changed_fields.append("mac_address")
+        if prev_hostname != (row.hostname or ""):
+            changed_fields.append("hostname")
+        if prev_description != (row.description or ""):
+            changed_fields.append("description")
+        if not changed_fields:
+            # Only the back-link was missing; upsert below restores it.
+            changed_fields = ["ip_address_id"]
+        old_value = {
+            "scope_id": str(scope.id),
+            "ip_address": prev_ip,
+            "mac_address": prev_mac,
+            "hostname": prev_hostname,
+            "description": prev_description,
+            "ip_address_id": str(row.id),
+        }
         linked.ip_address = str(row.address)
         linked.mac_address = mac
         linked.hostname = row.hostname or ""
@@ -775,6 +871,17 @@ async def sync_static_for_ipam_row(
             )
             collect_wake(dhcp_group_channel(scope.group_id))
         await upsert_ipam_for_static(db, scope, linked, action="update")
+        _audit_static_change(
+            db,
+            acting_user,
+            "update",
+            static_id=linked.id,
+            mac=str(linked.mac_address),
+            ip=str(linked.ip_address),
+            changed_fields=changed_fields,
+            old_value=old_value,
+            new_value=_static_audit_value(linked, scope.id, row),
+        )
         return IPAMStaticSync(static=linked, scope=scope, action="update")
 
     scopes = await candidate_scopes_for_ipam_row(db, row)
@@ -816,6 +923,16 @@ async def sync_static_for_ipam_row(
     if existing is not None:
         if str(existing.ip_address) == str(row.address) and str(existing.mac_address) == mac:
             await upsert_ipam_for_static(db, scope, existing, action="update")
+            _audit_static_change(
+                db,
+                acting_user,
+                "update",
+                static_id=existing.id,
+                mac=str(existing.mac_address),
+                ip=str(existing.ip_address),
+                changed_fields=["ip_address_id"],
+                new_value=_static_audit_value(existing, scope.id, row),
+            )
             return IPAMStaticSync(static=existing, scope=scope, action="update")
         return IPAMStaticSync(
             scope=scope,
@@ -845,6 +962,15 @@ async def sync_static_for_ipam_row(
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="create")
+    _audit_static_change(
+        db,
+        acting_user,
+        "create",
+        static_id=st.id,
+        mac=str(st.mac_address),
+        ip=str(st.ip_address),
+        new_value=_static_audit_value(st, scope.id, row),
+    )
     return IPAMStaticSync(static=st, scope=scope, action="create")
 
 

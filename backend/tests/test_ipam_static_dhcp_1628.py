@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup, DHCPStaticAssignment
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
@@ -80,11 +81,27 @@ async def _statics(db: AsyncSession) -> list[DHCPStaticAssignment]:
     return list(res.scalars().all())
 
 
+async def _static_audits(db: AsyncSession) -> list[AuditLog]:
+    """Audit rows for the reservation itself (#1629 review).
+
+    ``sync_static_for_ipam_row`` must write the same rows the statics
+    endpoints write — resource ``dhcp_static_assignment`` — for every
+    reservation create / update / delete it performs.
+    """
+    res = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.resource_type == "dhcp_static_assignment")
+        .order_by(AuditLog.seq)
+    )
+    return list(res.scalars().all())
+
+
 @pytest.mark.asyncio
 async def test_api_create_static_dhcp_creates_reservation(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    _, headers = await _admin(db_session)
+    user, headers = await _admin(db_session)
+    admin_id = user.id
     subnet = await _subnet(db_session)
     scope = await _scope(db_session, subnet)
     subnet_id, scope_id = subnet.id, scope.id
@@ -111,6 +128,13 @@ async def test_api_create_static_dhcp_creates_reservation(
     assert st.scope_id == scope_id
     assert str(st.ip_address) == "10.80.0.50"
     assert str(st.mac_address) == MAC
+    # The reservation creation is audited as a reservation (#1629).
+    audits = await _static_audits(db_session)
+    assert len(audits) == 1
+    assert audits[0].action == "create"
+    assert audits[0].resource_id == str(st.id)
+    assert audits[0].resource_display == f"{MAC}->10.80.0.50"
+    assert audits[0].user_id == admin_id
     row = await db_session.get(IPAddress, uuid.UUID(body["id"]))
     assert row is not None
     assert row.static_assignment_id == str(st.id)
@@ -249,6 +273,12 @@ async def test_api_update_keeps_reservation_in_step(
     statics = await _statics(db_session)
     assert len(statics) == 1
     assert str(statics[0].mac_address) == new_mac
+    # The MAC change is audited as a reservation update (#1629).
+    audits = await _static_audits(db_session)
+    assert [a.action for a in audits] == ["create", "update"]
+    assert audits[1].resource_id == str(statics[0].id)
+    assert "mac_address" in (audits[1].changed_fields or [])
+    assert audits[1].resource_display == f"{new_mac}->10.80.0.53"
 
     # Flipping the row away from static_dhcp removes the reservation.
     flipped = await client.put(
@@ -259,6 +289,10 @@ async def test_api_update_keeps_reservation_in_step(
     assert flipped.status_code == 200, flipped.text
     db_session.expire_all()
     assert await _statics(db_session) == []
+    # …and the reservation removal is audited as a delete (#1629).
+    audits = await _static_audits(db_session)
+    assert [a.action for a in audits] == ["create", "update", "delete"]
+    assert audits[2].resource_display == f"{new_mac}->10.80.0.53"
 
 
 @pytest.mark.asyncio
@@ -266,6 +300,7 @@ async def test_import_creates_reservation_and_preview_flags_it(
     db_session: AsyncSession,
 ) -> None:
     user, _ = await _admin(db_session)
+    importer_id = user.id
     subnet = await _subnet(db_session)
     scope = await _scope(db_session, subnet)
     subnet_id, scope_id = subnet.id, scope.id
@@ -301,6 +336,12 @@ async def test_import_creates_reservation_and_preview_flags_it(
     assert statics[0].scope_id == scope_id
     assert str(statics[0].ip_address) == "10.80.0.106"
     assert str(statics[0].mac_address) == "00:c0:8f:88:5f:06"
+    # Imported reservations are audited too, attributed to the importer.
+    audits = await _static_audits(db_session)
+    assert len(audits) == 1
+    assert audits[0].action == "create"
+    assert audits[0].resource_id == str(statics[0].id)
+    assert audits[0].user_id == importer_id
 
 
 @pytest.mark.asyncio
