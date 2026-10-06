@@ -371,6 +371,18 @@ the formatter handles the rest.
   is now copied under a hidden `.part` name the watcher ignores,
   synced, and renamed into place.
 
+- **An image tarball k3s failed to import is noticed and imported
+  again (#1630).** k3s imports every tarball's `index.json` under
+  one containerd ref, and an import that died part-way left a
+  stale write there that failed every shorter `index.json` after
+  it, on every boot. k3s retries a failed tarball only when the
+  file changes, so a slot upgrade's first boot could leave a node
+  without its DNS and DHCP agents' images for good, with the pods
+  in `ErrImageNeverPull`. k3s.service now clears unfinished
+  containerd writes before k3s starts. On every boot, firstboot
+  checks k3s's own record of what it imported against containerd,
+  and has k3s re-import anything missing.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

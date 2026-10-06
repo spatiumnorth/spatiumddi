@@ -1605,6 +1605,33 @@ if [ -x /usr/local/bin/spatium-host-migrate ]; then
     fi
 fi
 
+# #1630 — every image this slot bakes must be in containerd. Every pod on
+# the appliance runs ``imagePullPolicy: Never``, so a baked tarball k3s did
+# not import is a workload that never starts (``ErrImageNeverPull``).
+# Nothing reported it: a slot upgrade's first boot lost seven tarballs to a
+# stale containerd ingest, the DNS and DHCP agents' among them, and the node
+# served no DNS and no DHCP until it was torn down. k3s retries a failed
+# tarball only when the file changes again.
+#
+# ``verify --repair`` waits for k3s's start-up import to finish (the kubelet
+# starts after it). It then checks k3s's own record of what it imported and
+# what containerd holds. Whatever is missing it re-imports through k3s,
+# clearing a stale ingest first. Returns non-zero only when an image is still
+# missing after that. Runs on every boot, and is bounded well inside this
+# unit's start timeout (2 min for the kubelet, 3 for the re-import). The
+# kubelet is up long before this point on any boot that got here.
+check_slot_images() {
+    if [ ! -x /usr/local/bin/spatium-k3s-images ]; then
+        echo "WARN: /usr/local/bin/spatium-k3s-images is missing — this slot's images were not checked." >&2
+        return 0
+    fi
+    if /usr/local/bin/spatium-k3s-images verify --repair; then
+        return 0
+    fi
+    echo "ERROR: this slot's images are not all in containerd, even after a re-import (above)." >&2
+    return 1
+}
+
 # ── Readiness wait + slot commit ─────────────────────────────────────────────
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a
@@ -1910,6 +1937,7 @@ if [ "$ready" = 1 ]; then
     place_deferred_tls_manifest
     reassert_control_plane_class || true
     place_deferred_control_manifest
+    check_slot_images || true
     commit_slot_if_healthy
     # #779 — immediate first verdict on Web UI firewall reachability, so a
     # missing accept rule (#776's failure) is volunteered right here in the
