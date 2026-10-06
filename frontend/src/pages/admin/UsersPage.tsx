@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Plus,
   Pencil,
@@ -13,6 +14,8 @@ import {
 import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { stepUpBody } from "@/lib/stepup";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -46,6 +49,8 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [password, setPassword] = useState("");
   const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [forceChange, setForceChange] = useState(true);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
@@ -57,6 +62,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
         password,
         is_superadmin: isSuperadmin,
         force_password_change: forceChange,
+        ...(isSuperadmin ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -122,6 +128,15 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             Require password change on first login
           </label>
         </div>
+        {isSuperadmin && (
+          <StepUpSection
+            reason="A superadmin's password passes every re-confirmation, so creating one needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -135,7 +150,13 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
               setError(null);
               mutation.mutate();
             }}
-            disabled={!username || !email || !password || mutation.isPending}
+            disabled={
+              !username ||
+              !email ||
+              !password ||
+              (isSuperadmin && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Creating…" : "Create"}
@@ -160,7 +181,10 @@ function EditUserModal({
   const [email, setEmail] = useState(user.email);
   const [isSuperadmin, setIsSuperadmin] = useState(user.is_superadmin);
   const [isActive, setIsActive] = useState(user.is_active);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const promoting = isSuperadmin && !user.is_superadmin;
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -169,6 +193,7 @@ function EditUserModal({
         email,
         is_superadmin: isSuperadmin,
         is_active: isActive,
+        ...(promoting ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -220,6 +245,15 @@ function EditUserModal({
           </label>
         </div>
         {user.auth_source !== "local" && <ProviderLink user={user} />}
+        {promoting && (
+          <StepUpSection
+            reason="A superadmin's password passes every re-confirmation, so promoting an account needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -233,7 +267,9 @@ function EditUserModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={mutation.isPending}
+            disabled={
+              (promoting && !stepPassword && !stepTotp) || mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
@@ -335,10 +371,20 @@ function ResetPasswordModal({
 }) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // The server asks for a step-up on an effective superadmin (flag or a
+  // wildcard role), the caller's own account included.
+  const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
 
   const mutation = useMutation({
-    mutationFn: () => usersApi.resetPassword(user.id, password),
+    mutationFn: () =>
+      usersApi.resetPassword(
+        user.id,
+        password,
+        needsStepUp ? stepUpBody(stepPassword, stepTotp) : {},
+      ),
     onSuccess: onClose,
     onError: (err: unknown) => {
       const msg =
@@ -376,6 +422,15 @@ function ResetPasswordModal({
         <p className="text-xs text-muted-foreground">
           The user will be required to change their password on next login.
         </p>
+        {needsStepUp && (
+          <StepUpSection
+            reason="This account is a superadmin, and its password passes every re-confirmation, so resetting it needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -389,7 +444,12 @@ function ResetPasswordModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!password || mismatch || mutation.isPending}
+            disabled={
+              !password ||
+              mismatch ||
+              (needsStepUp && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Resetting…" : "Reset Password"}
@@ -454,7 +514,12 @@ export function UsersPage() {
   const [resetUser, setResetUser] = useState<AppUser | null>(null);
   const [deleteUser, setDeleteUser] = useState<AppUser | null>(null);
 
-  const { data: users, isLoading } = useQuery({
+  const {
+    data: users,
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["users"],
     queryFn: usersApi.list,
   });
@@ -502,6 +567,14 @@ export function UsersPage() {
                   </td>
                 </tr>
               )}
+              {/* A refused or failed read says so, not a blank table (#1343). */}
+              {!isLoading && !users?.length && isError && (
+                <tr>
+                  <td colSpan={8} className="px-4 py-6 text-center">
+                    <ListReadError error={error} what="users" />
+                  </td>
+                </tr>
+              )}
               {users?.map((user) => (
                 <tr
                   key={user.id}
@@ -528,9 +601,19 @@ export function UsersPage() {
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    {user.is_superadmin ? (
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                    {(user.is_effective_superadmin ?? user.is_superadmin) ? (
+                      <span
+                        className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"
+                        title={
+                          user.is_superadmin
+                            ? undefined
+                            : "Superadmin through a group's role (#1412)"
+                        }
+                      >
                         <ShieldCheck className="h-3.5 w-3.5" /> superadmin
+                        {!user.is_superadmin && (
+                          <span className="text-muted-foreground">(role)</span>
+                        )}
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 text-xs text-muted-foreground">

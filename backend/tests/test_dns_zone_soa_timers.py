@@ -95,8 +95,9 @@ async def test_every_zone_copy_carries_its_timers(db_session: AsyncSession) -> N
     assert len(corp) == 2  # one per view
     assert {tuple(z[k] for k in TIMERS) for z in corp} == {(7200, 900, 1209600, 60)}
     lab, *_rest = [z for z in bundle["zones"] if z["name"] == "lab.example.test."]
-    # The stored defaults: RIPE-203's refresh/retry/expire, RFC 2308's hour.
-    assert tuple(lab[k] for k in TIMERS) == (86400, 7200, 3600000, 3600)
+    # The defaults: what the agent served for every zone before it rendered
+    # the stored timers, so a new zone serves what every zone always has.
+    assert tuple(lab[k] for k in TIMERS) == (3600, 600, 86400, 300)
 
 
 @pytest.mark.asyncio
@@ -201,3 +202,20 @@ async def test_a_timer_bind_would_refuse_is_refused(
         f"/api/v1/dns/groups/{grp.id}/zones/{zone['id']}", json={timer: value}, headers=headers
     )
     assert updated.status_code == 422, updated.text
+
+
+@pytest.mark.asyncio
+async def test_a_zone_created_without_timers_serves_what_every_zone_always_has(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The create API defaults the timers to what the agent served for every
+    zone before it rendered them, so a new zone's SOA matches every existing
+    one's (and the migration that keeps old-default zones on those values)."""
+    headers = await _headers(db_session)
+    grp, server = await _group_with_server(db_session)
+    zone = await _zone_via_api(client, headers, grp)
+
+    assert tuple(zone[k] for k in TIMERS) == (3600, 600, 86400, 300)
+    bundle = await build_config_bundle(db_session, server)
+    (shipped,) = [z for z in bundle["zones"] if z["id"] == zone["id"]]
+    assert tuple(shipped[k] for k in TIMERS) == (3600, 600, 86400, 300)

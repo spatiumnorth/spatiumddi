@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import structlog
 
+from . import features
 from .admin_pusher import push_rendered_config
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
@@ -257,7 +258,10 @@ class SyncLoop:
         verify = self.cfg.httpx_verify()
         # server holds for ~30s, give client a bit more
         return httpx.Client(
-            base_url=self.cfg.control_plane_url, verify=verify, timeout=60.0
+            base_url=self.cfg.control_plane_url,
+            verify=verify,
+            timeout=60.0,
+            headers=features.headers(),
         )
 
     def _poll_once(self) -> None:

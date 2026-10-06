@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -50,6 +51,21 @@ group_role = Table(
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "user"
+    __table_args__ = (
+        # #1290 — an email is unique when there is one. RADIUS and TACACS+
+        # never report an email, and neither does an LDAP entry without
+        # ``mail`` or an OIDC token without the claim, so their accounts are
+        # created with "". A plain unique index let exactly one such account
+        # exist: every later first-time login hit the index, a 23505, and
+        # failed. Empty values are left out of the index; real ones stay
+        # unique.
+        Index(
+            "ix_user_email",
+            "email",
+            unique=True,
+            postgresql_where=sa_text("email <> ''"),
+        ),
+    )
 
     # ``_active_time_bound_grants`` below is a plain per-request attribute,
     # not a mapped column. ``__allow_unmapped__`` tells SQLAlchemy 2.0's
@@ -70,7 +86,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     _active_time_bound_grants: "list[TimeBoundGrant] | None" = None
 
     username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
@@ -236,9 +252,9 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     # name) so the viewer can show "Logged in via Okta" without a
     # join. ``last_seen_at`` is bumped on each authenticated request
     # (throttled to ~60 s in the auth dep) so the viewer can render
-    # a relative-age hint.
+    # a relative-age hint. As wide as ``auth_provider.name`` (#1337).
     auth_source: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="local", server_default=sa_text("'local'")
+        String(255), nullable=False, default="local", server_default=sa_text("'local'")
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

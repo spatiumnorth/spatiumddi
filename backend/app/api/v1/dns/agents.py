@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
@@ -75,6 +75,11 @@ from app.services.dns.agent_token import (
 )
 from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
+from app.services.dns.soa_timers import (
+    AGENT_FEATURES_HEADER,
+    reconcile_soa_timers,
+    renders_soa_timers,
+)
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
@@ -225,6 +230,23 @@ async def _auth_agent(
     return server, payload
 
 
+async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
+    """#1171 — after an agent says what it renders, bring its group's SOA
+    timers in line, in a transaction of its own (the caller's has committed).
+
+    Never fails the request: register and heartbeat carry the agent's token
+    and op acks, and the next heartbeat of any agent in the group retries the
+    switch. The rollback expires every instance in the session, so the caller
+    must have read what it returns before calling this.
+    """
+    try:
+        if await reconcile_soa_timers(db, group_id) is not None:
+            await db.commit()
+    except Exception:  # noqa: BLE001 — see the docstring
+        await db.rollback()
+        logger.exception("dns_group_soa_timers_failed", group_id=str(group_id))
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
@@ -233,6 +255,9 @@ async def agent_register(
     body: AgentRegisterRequestV2,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
+    # #1171 — what the agent renders (``soa-timers``: each zone's own SOA
+    # timers). A header so an older control plane ignores it.
+    agent_features: str | None = Header(default=None, alias=AGENT_FEATURES_HEADER),
 ) -> AgentRegisterResponseV2:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
@@ -246,7 +271,7 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DNS subsystem is disabled on this control plane, so new "
-                "agents cannot register. Enable it under Settings → Features."
+                "agents cannot register. Enable it on the Features & Integrations page."
             ),
         )
     # Resolve or create group
@@ -357,6 +382,7 @@ async def agent_register(
     )
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
+    server.agent_renders_soa_timers = renders_soa_timers(agent_features)
 
     db.add(
         AuditLog(
@@ -385,7 +411,7 @@ async def agent_register(
         pending_approval=pending_approval,
     )
 
-    return AgentRegisterResponseV2(
+    response = AgentRegisterResponseV2(
         server_id=str(server.id),
         agent_id=str(server.agent_id),
         agent_token=token,
@@ -393,6 +419,11 @@ async def agent_register(
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
     )
+    # Before the agent's first poll: an agent of an older release joining a
+    # group that serves the zones' own timers switches it to the literal here,
+    # so its first bundle already carries a serial nobody served them under.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 _BODY_CHUNK = 64 * 1024
@@ -755,6 +786,10 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #1171 — on every heartbeat, from the header: the same server row is run
+    # by an older agent until the upgrade replaces its pod, and by an older one
+    # again if a node is rolled back.
+    server.agent_renders_soa_timers = renders_soa_timers(request.headers.get(AGENT_FEATURES_HEADER))
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents
@@ -837,13 +872,18 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
-    return AgentHeartbeatResponseV2(
+    response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
         acknowledged_at=now,
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
+    # now renders the zones' own SOA timers), or brings an older agent back,
+    # switches the group and moves the serials.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 @router.get("/record-ops")
@@ -909,52 +949,79 @@ async def agent_zone_state(
     ``zone_serial_drift`` alert-rule type.
 
     Upsert by ``(server_id, zone_id)`` — no history, one row per
-    pair. Unknown zone names are silently skipped (zone deleted from
-    control plane but agent still serves it; the next config bundle
-    will drop it).
+    pair. The names are the bundle's own, and each is looked up among the
+    live zones of the reporting server's group (#1408). A name the group
+    does not hold (the zone was deleted from the control plane but the agent
+    still serves it; the next config bundle drops it) or holds more than once
+    (one zone per view, and the report names no view) is skipped, counted in
+    the answer, and logged once per report.
     """
     server, _ = auth
     now = datetime.now(UTC)
-    updated = 0
+    if not body.zones:
+        return {"updated": 0, "skipped": 0}
 
-    # Index known zones by name for one DB round-trip on the lookup.
-    names = [e.zone_name.rstrip(".") for e in body.zones]
-    if not names:
-        return {"updated": 0}
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
-    zones_by_name: dict[str, DNSZone] = {}
+    # #1408 — zone names are stored with the trailing dot, and the lookup
+    # stripped it from the reported names only, so it matched nothing: every
+    # report was dropped behind a 200 and every server read "never reported".
+    # Both sides are compared without it now, and only within this server's
+    # group: another group's zone of the same name is another zone.
+    def _key(name: str) -> str:
+        return name.rstrip(".").lower()
+
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == server.group_id,
+            DNSZone.deleted_at.is_(None),
+            func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
+        )
+    )
+    zones_by_key: dict[str, list[DNSZone]] = {}
     for z in res.scalars().all():
-        zones_by_name[z.name.rstrip(".")] = z
+        zones_by_key.setdefault(_key(z.name), []).append(z)
 
+    # A zone the bundle renders into several views is reported once per view:
+    # one zone, its last report wins.
+    serial_by_zone: dict[uuid.UUID, int] = {}
+    unknown: list[str] = []
+    ambiguous: list[str] = []
     for entry in body.zones:
-        key = entry.zone_name.rstrip(".")
-        zone = zones_by_name.get(key)
-        if zone is None:
-            continue
+        matches = zones_by_key.get(_key(entry.zone_name), [])
+        if len(matches) == 1:
+            serial_by_zone[matches[0].id] = entry.serial
+        else:
+            (ambiguous if matches else unknown).append(entry.zone_name)
 
+    for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.
         existing_res = await db.execute(
             select(DNSServerZoneState).where(
                 DNSServerZoneState.server_id == server.id,
-                DNSServerZoneState.zone_id == zone.id,
+                DNSServerZoneState.zone_id == zone_id,
             )
         )
         row = existing_res.scalar_one_or_none()
         if row is None:
             row = DNSServerZoneState(
                 server_id=server.id,
-                zone_id=zone.id,
-                current_serial=entry.serial,
+                zone_id=zone_id,
+                current_serial=serial,
                 reported_at=now,
             )
             db.add(row)
         else:
-            row.current_serial = entry.serial
+            row.current_serial = serial
             row.reported_at = now
-        updated += 1
 
+    if unknown or ambiguous:
+        logger.info(
+            "dns_agent_zone_state_skipped",
+            server=str(server.id),
+            unknown=sorted(set(unknown))[:20],
+            ambiguous=sorted(set(ambiguous))[:20],
+        )
     await db.commit()
-    return {"updated": updated}
+    return {"updated": len(serial_by_zone), "skipped": len(unknown) + len(ambiguous)}
 
 
 class DNSKeyReport(BaseModel):

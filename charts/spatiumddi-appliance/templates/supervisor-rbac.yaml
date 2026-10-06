@@ -119,11 +119,12 @@ subjects:
     namespace: spatium
 ---
 {{- /* #272 — the supervisor scales the CNPG Postgres Cluster directly
-       (``k8s_api.patch_cnpg_instances`` from the heartbeat). It can't go
-       through the HelmChartConfig like the other workloads because the
-       Cluster carries ``helm.sh/resource-policy: keep`` (data-safety) and
-       the helm-controller won't patch a kept resource's spec — so a
-       promote left Postgres single-node while api/worker/redis scaled.
+       (``k8s_api.patch_cnpg_instances`` from the heartbeat): a promote once
+       left Postgres single-node while api/worker/redis scaled, and a
+       scale-down is held while a dead node is replaced (#1059). The
+       Cluster's ``helm.sh/resource-policy: keep`` (data-safety) keeps it
+       through an uninstall; it does not stop an upgrade re-applying it, so
+       the chart renders the count the supervisor left (#1313).
        The direct merge-patch needs get + patch on the Cluster CR; without
        it the GET 403s every heartbeat and CNPG never scales (caught on the
        #272 fresh-install test). Namespaced to spatium — narrowest grant. */}}

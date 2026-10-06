@@ -247,6 +247,15 @@ def _load() -> ctypes.CDLL:
     lib.nfs_set_autoreconnect.argtypes = [ctx, ctypes.c_int]
     lib.nfs_set_tcp_syncnt.restype = None
     lib.nfs_set_tcp_syncnt.argtypes = [ctx, ctypes.c_int]
+    # The server's WRITE limit as libnfs learned it at mount. uint64_t,
+    # and 0 on NFSv4 in 5.0.2 — see ``NfsConnection._write_chunk``.
+    lib.nfs_get_writemax.restype = _u64
+    lib.nfs_get_writemax.argtypes = [ctx]
+    # Teardown introspection for ``connect``'s dead-session guard.
+    lib.nfs_queue_length.restype = ctypes.c_int
+    lib.nfs_queue_length.argtypes = [ctx]
+    lib.nfs_get_fd.restype = ctypes.c_int
+    lib.nfs_get_fd.argtypes = [ctx]
 
     lib.nfs_open.restype = ctypes.c_int
     lib.nfs_open.argtypes = [ctx, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(fh)]
@@ -323,10 +332,34 @@ _O_WRONLY = 1
 _O_CREAT = 0o100
 _O_TRUNC = 0o1000
 
-#: Chunk size for reads / writes. libnfs negotiates its own rsize/wsize
-#: with the server and splits internally; 1 MiB simply bounds how much
-#: we copy per ctypes call.
+#: Upper bound for one ctypes read / write call. On NFSv3 libnfs splits
+#: a larger call itself, by the rtmax / wtmax the server reported in
+#: FSINFO. On NFSv4 it does NOT for writes — see ``_V4_WRITE_CHUNK``.
 _CHUNK = 1024 * 1024
+
+#: Per-call WRITE size when libnfs does not know the server's limit,
+#: which on libnfs 5.0.2 is every NFSv4 mount (#1500).
+#:
+#: 5.0.2 only fills ``writemax`` from the v3 FSINFO reply. On v4 it stays
+#: 0, and ``nfs_pwrite`` goes out as ONE WRITE of whatever size it was
+#: handed. A server whose limit is below that drops the connection rather
+#: than returning an error: libnfs reports EIO "nfs_service failed", the
+#: session is dead, and every call after it fails the same way. Against a
+#: Synology DSM 7 export (FSINFO wtmax 128 KiB) every 1 MiB WRITE did
+#: this, so every v4 backup failed while v3 worked. libnfs learned to
+#: read FATTR4_MAXWRITE at mount only in 7.0.0, behind a soname we
+#: refuse (see ``_SONAME``).
+#:
+#: 64 KiB is below any limit we know of in practice: Linux knfsd sizes
+#: its limit from RAM and only goes under 64 KiB below 256 MiB, and
+#: FreeBSD's default is 128 KiB. Measured over v4 against the Synology:
+#: 32 / 64 / 128 KiB all fine, 160 KiB and up all failed. A 16 MiB
+#: write + read-back took 0.57 s at 64 KiB against 0.42 s at 128 KiB.
+#:
+#: READ needs no counterpart. A server returns at most its own limit
+#: and ``read`` already loops on short reads. 1 MiB READs over v4
+#: worked against the same server that rejected 160 KiB WRITEs.
+_V4_WRITE_CHUNK = 64 * 1024
 
 
 class NfsConnection:
@@ -353,6 +386,14 @@ class NfsConnection:
         if detail:
             message = f"{message}: {detail}"
         return NfsError(message, errno=errno)
+
+    def _write_chunk(self) -> int:
+        """Bytes per ``nfs_pwrite`` call. The limit libnfs negotiated
+        when it has one (v3). Otherwise ``_V4_WRITE_CHUNK``, because a
+        WRITE over the server's limit kills the session (see there).
+        """
+        negotiated = int(self._lib.nfs_get_writemax(self._ctx))
+        return min(_CHUNK, negotiated if negotiated > 0 else _V4_WRITE_CHUNK)
 
     # -- operations ------------------------------------------------------
 
@@ -467,8 +508,9 @@ class NfsConnection:
             base = ctypes.cast(src, ctypes.c_void_p).value or 0
             offset = 0
             total = len(data)
+            chunk = self._write_chunk()
             while offset < total:
-                span = min(_CHUNK, total - offset)
+                span = min(chunk, total - offset)
                 put = self._lib.nfs_pwrite(
                     self._ctx, handle, offset, span, ctypes.c_void_p(base + offset)
                 )
@@ -604,4 +646,37 @@ def connect(
     finally:
         if url_struct:
             lib.nfs_destroy_url(url_struct)
-        lib.nfs_destroy_context(ctx)
+        _release_context(lib, ctx)
+
+
+def _release_context(lib: ctypes.CDLL, ctx: ctypes.c_void_p) -> None:
+    """Destroy ``ctx``, unless that would crash the process (#1500).
+
+    In libnfs 5.0.2, when the connection dies under a synchronous call
+    ("nfs_service failed"), the call returns but leaves its request
+    queued. That request's callback data is a struct on the C stack of
+    the call that already returned. ``nfs_destroy_context`` cancels
+    every queued request and runs those callbacks, which then read and
+    write a stack frame that no longer exists. Seen as SIGSEGV (exit
+    139) of the api pod right after a failed v4 backup write: the run
+    never got to record its failure, so the target stayed
+    ``in_progress``. Upstream fixed it in 5.0.3 (libnfs commit db1cc8c)
+    by failing the queued requests before the sync call returns.
+    Debian's 5.0.2 package does not carry that fix.
+
+    Every synchronous call waits until its own request is gone, so a
+    request still queued here was left behind by a dead session. In
+    that case close the socket ourselves (with autoreconnect off, libnfs
+    does not close it on failure) and leak the context. That leaks the
+    context and its queued requests (at most about one ``_CHUNK``) per
+    dead session, which beats a segfault.
+    """
+    if lib.nfs_queue_length(ctx) > 0:
+        fd = lib.nfs_get_fd(ctx)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:  # pragma: no cover - already gone
+                pass
+        return
+    lib.nfs_destroy_context(ctx)

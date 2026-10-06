@@ -218,6 +218,7 @@ backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_colum
 backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_column:54
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:43
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:44
+backend/alembic/versions/b3c71e9a4d25_dns_group_tsig_secret_encrypted.py:drop_column:95
 backend/alembic/versions/b3e7d1f9a204_appliance_host_migration_health.py:drop_column:47
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:148
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:149
@@ -650,6 +651,7 @@ backend/alembic/versions/e4c1a8f63b29_dhcp_scope_v6_mode.py:drop_column:60
 backend/alembic/versions/e4c1a8f63b29_dhcp_scope_v6_mode.py:drop_column:61
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:100
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:98
+backend/alembic/versions/e51ab0dede3e_forward_webhook_secrets_encrypted.py:drop_column:107
 backend/alembic/versions/e5a18c40729b_ai_tool_catalog.py:drop_column:47
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:365
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:370
@@ -825,3 +827,5 @@ backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:d
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:52
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:53
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:54
+backend/alembic/versions/ff32b91acad8_zone_soa_timers_served_defaults.py:drop_column:163
+backend/alembic/versions/ff32b91acad8_zone_soa_timers_served_defaults.py:drop_column:164
