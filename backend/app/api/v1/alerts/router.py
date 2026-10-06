@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select
 
 from app.api.deps import DB, CurrentUser
@@ -135,6 +135,14 @@ class AlertRuleCreate(BaseModel):
                 f"{', '.join(sorted(alert_service.COMPLIANCE_CHANGE_SCOPES))}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _v_compliance_requires_classification(self) -> AlertRuleCreate:
+        # #1580 — a compliance_change rule without a classification
+        # can never fire; the evaluator just warned every tick.
+        if self.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not self.classification:
+            raise ValueError("classification is required for compliance_change rules")
+        return self
 
 
 class AlertRuleUpdate(BaseModel):
@@ -278,7 +286,7 @@ def _require_superadmin(current_user: CurrentUser) -> None:
     if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Superadmin required to manage alert rules",
+            detail="Superadmin required to manage alerts",
         )
 
 
@@ -330,6 +338,18 @@ async def update_rule(
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
+    # #1580 — reject an update that leaves a compliance_change rule
+    # without a classification (e.g. explicitly clearing it); such a
+    # rule can never fire. rule_type isn't updatable, so check the
+    # stored type against the merged classification.
+    effective_classification = (
+        body.classification if "classification" in body.model_fields_set else rule.classification
+    )
+    if rule.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not effective_classification:
+        raise HTTPException(
+            status_code=422,
+            detail="classification is required for compliance_change rules",
+        )
     changed: dict[str, Any] = {}
     for field, value in body.model_dump(exclude_unset=True).items():
         old = getattr(rule, field)
@@ -421,12 +441,29 @@ async def list_events(
 @router.post("/events/{event_id}/resolve", response_model=AlertEventResponse)
 async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertEvent:
     """Manually mark an event resolved. Useful to silence a known-good
-    alert while the underlying metric is still above threshold."""
+    alert while the underlying metric is still above threshold.
+
+    Superadmin only, like the rule writes: for transition-once rules a
+    resolve dismisses the signal for good. Audited.
+    """
+    _require_superadmin(current_user)
     event = await db.get(AlertEvent, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
     if event.resolved_at is None:
         event.resolved_at = datetime.now(UTC)
+        db.add(
+            AuditLog(
+                action="resolve",
+                resource_type="alert_event",
+                resource_id=str(event.id),
+                resource_display=event.subject_display,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                new_value={"rule_id": str(event.rule_id), "subject_type": event.subject_type},
+            )
+        )
     await db.commit()
     await db.refresh(event)
     return event
@@ -441,7 +478,9 @@ async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
 
     Handy for "did that rule I just created fire?" workflows — skips
     waiting for the 60 s Celery tick. Same semantics as the scheduled
-    run, just synchronous.
+    run, just synchronous. Superadmin only: a pass delivers to the
+    configured syslog / webhook / SMTP targets.
     """
+    _require_superadmin(current_user)
     result = await alert_service.evaluate_all(db)
     return EvaluateResponse(**result)
