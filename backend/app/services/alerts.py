@@ -3255,7 +3255,7 @@ async def _matching_secret_expiring_subjects(
         message = (
             f"API token '{t.name}' ({t.prefix}…) {_descriptor(days)} "
             f"({t.expires_at.isoformat()}, threshold {threshold_days} d). "
-            f"Rotate it from Settings → API Tokens."
+            f"Rotate it from Administration → API Tokens."
         )
         matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
 
@@ -5682,7 +5682,8 @@ async def seed_bgp_hijack_alert_rules() -> None:
                 "critical when RPKI says the announcement is invalid, warning "
                 "when RPKI coverage is unknown. Auto-resolves when the "
                 "announcement delists or is acknowledged. Enable once BGP "
-                "monitoring (Settings → bgp_monitoring_enabled) is on."
+                "monitoring is on: the bgp_monitoring_enabled platform setting, "
+                "set through the settings API (the console has no switch for it)."
             ),
         ),
         (

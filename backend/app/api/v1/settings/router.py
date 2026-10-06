@@ -2779,7 +2779,7 @@ async def reveal_snmp_community(
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Stored community could not be decrypted (key mismatch?). "
-            "Re-set the community in Settings → Appliance → SNMP.",
+            "Re-set the community under Appliance → Fleet → Services → SNMP.",
         ) from None
 
     db.add(

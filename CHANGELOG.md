@@ -144,6 +144,82 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **IPAM's delete confirmations say the delete goes to Trash (#1398).**
+  #1152 fixed Edit subnet's Danger zone, but every other space, block
+  and subnet delete still called itself permanent: the tree's Delete…
+  and both bulk deletes ended on "Confirm Permanent Deletion — This
+  action cannot be undone — Delete permanently", the block view said
+  "Blocks are not restorable from Trash", and Edit Space and Edit Block
+  said the delete "permanently removes every … row" behind "a typed
+  confirm" that is a checkbox. All of these deletes go to Trash and
+  come back intact on restore. Each now says the object and what it
+  holds move to Trash, restorable for 30 days, after which the nightly
+  purge deletes them for good; "permanent" stays on the IP address
+  purges, the one IPAM delete that is.
+
+- **Edit webhook can remove a subscription's secret, and its hint says
+  what a blank field does (#1397).** The Rotate secret hint said
+  "clearing the field stores no secret (HMAC header omitted)", but the
+  field always opens empty and an empty field is sent as "keep", so
+  clearing it and leaving it alone sent the same request and the
+  console could not remove a secret at all. The dialog now offers
+  "Remove the stored secret" (deliveries then go unsigned, with no
+  `X-SpatiumDDI-Signature` header), and the hint says a blank field
+  keeps the secret and a typed one rotates it.
+
+- **The UniFi page says when SpatiumDDI writes to a controller
+  (#1396).** It said "Read-only integration. … SpatiumDDI never writes
+  to UniFi.", and its setup guide that SpatiumDDI "never writes back",
+  while the controllers it lists are also Active block sync's targets:
+  an armed one is pushed client blocks (L2 quarantine), with its own
+  write credentials. The page now says the mirror only reads and that
+  SpatiumDDI writes to a controller only when block sync is armed on
+  it; the setup guide's read-only advice is for the mirror's key.
+
+- **Console copy sends operators only to places that exist (#1395).**
+  Feature descriptions, AI tool descriptions, alert texts, API errors
+  and several notices told operators to turn things on under "Settings
+  → …" places the Settings page does not have: "Settings →
+  firewall_enabled", "Settings → acme_enabled", "Settings →
+  dnsbl_monitoring_enabled", "Settings → Import → DNS surface",
+  "Settings → AI → Tool Catalog", "Settings → Features", "Settings →
+  Backup", "Settings → Appliance → SNMP". Each now names where the
+  control is (Features & Integrations, Administration → Import,
+  Administration → AI Tool Catalog, Administration → DNS Blocklists,
+  Administration → Backup, Administration → API Tokens, Appliance →
+  Firewall, Appliance → Fleet), says that ACME is switched on by
+  registering an account, and says so plainly where the console has no
+  control at all (BGP monitoring, a provider's tool allowlist). A
+  frontend and a backend test hold every "Settings → …" path in the
+  console's and the API's copy against the Settings page's sections.
+
+- **A role's dialog shows the grants the role holds (#1394).** Roles →
+  View is the only place the console shows what a built-in role grants,
+  and it showed each grant through two selects offering fixed lists: a
+  stored action or resource type the lists did not name fell back to
+  their first option. Appliance Operator's one grant, admin on
+  appliance, read "admin · *", Change Approver showed no approve at
+  all, and nine of the twelve built-in roles read broader or different
+  grants than they hold. A custom role's Edit dialog showed the same
+  wrong values. Each select now also offers the value its row holds, so
+  every grant shows as stored.
+
+- **Delete Server Group no longer takes a group's live DHCP scopes with
+  it, and says what it does take (#1399).** The DHCP page's Delete
+  Server Group said "The group must be empty — move or delete its
+  servers first", but the server refused a group only while it held
+  servers: a group holding scopes was deleted, and every scope with its
+  pools and reservations went with it, none of them into Trash. A group
+  that still holds a scope is now refused (409) until its scopes are
+  deleted, by the API, the two-person approval queue and the Copilot
+  alike. The DHCP and DNS dialogs read what the group holds first:
+  while it holds servers or live scopes (zones), they say so and offer
+  no delete, so the console never sends one the server will refuse.
+  Scopes already in Trash still go with their group, for good: the
+  dialog and the approval preview say so, and the DNS dialog now says
+  the same of a group's zones in Trash, where it promised an empty
+  group too.
+
 - **A full restore no longer fails at random with "deadlock detected" while
   the appliance is serving (#1444).** A full restore ends every other
   database session once, then clears the schema and replays the archive in
