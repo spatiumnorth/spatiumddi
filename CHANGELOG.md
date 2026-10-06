@@ -84,6 +84,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrading an appliance from 2026.09.04-1 can no longer replace
+  SECRET_KEY (#1448).** #1042 marked the chart's
+  `spatium-control-spatiumddi-app` Secret `helm.sh/resource-policy: keep`,
+  but Helm takes that policy from the release manifest it has stored, and
+  on the first upgrade from 2026.09.04-1 the stored manifest is
+  2026.09.04-1's, which has none. So if the new slot's first
+  `spatium-control` install failed for any reason, helm-controller's
+  uninstall deleted the Secret and the reinstall generated a new key, and
+  every credential encrypted at rest (the appliance CA key, certificates,
+  integration and SSO secrets) could no longer be read. firstboot now
+  copies `secret-key` and `metrics-token` into `spatium-control-app-keys`,
+  a Secret Helm does not own, before it releases the control chart, and
+  points the chart at it with `auth.existingSecret`; a fresh install
+  generates both values there. An existing `spatium-control-app-keys` is
+  never overwritten, and firstboot refuses to generate a key while the
+  chart's own Secret exists without one. When it cannot make sure the
+  Secret exists (the apiserver does not answer, or k3s never became
+  ready), the chart is released without `auth.existingSecret` and keeps
+  its own Secret as before, and firstboot tries again on the next boot.
+  One limit: an appliance upgraded straight from 2026.09.04-1 loses the
+  chart's own Secret on that upgrade (the stored manifest does not keep
+  it), so rolling it back to 2026.10.02-1 afterwards generates a new key.
+  Back up the Secret before such an upgrade, as the 2026.10.02-1 notes
+  already say, and back up `spatium-control-app-keys` from then on
+  (`docs/deployment/APPLIANCE.md`).
+
 - **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
   Hetzner retired the standalone DNS Console API, which now answers every
   call with a `301` redirect to the Cloud Console's web UI, so the driver
@@ -117,6 +143,36 @@ the formatter handles the rest.
   GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
+
+- **A full restore no longer fails at random with "deadlock detected" while
+  the appliance is serving (#1444).** A full restore ends every other
+  database session once, then clears the schema and replays the archive in
+  one transaction (#1363), dropping the tables one at a time and holding
+  each lock to commit. The api, the worker and the agents reconnect at
+  once. A session that read a table the drops had not reached yet, and then
+  waited for one they had already dropped, closed a cycle when the drops
+  reached its table. When PostgreSQL rolled back the restore's side, the
+  restore answered 400 "deadlock detected" and restored nothing (3 of 50 QA
+  restores). Before it clears the schema, the restore now ends its own
+  role's sessions that came back and hold a table, then takes every table
+  in one `LOCK TABLE`, and tries again if a deadlock picks that attempt, so
+  the drops wait for nobody.
+
+- **IPAM writes PTRs only into a reverse zone it serves as primary
+  (#1419).** IPAM picked the zone for a PTR by kind and name alone, so a
+  conditional forwarder, a secondary or a stub named under in-addr.arpa or
+  ip6.arpa and stored as reverse (the importers store every such zone that
+  way, and so does an operator who picks Reverse lookup for one) took
+  IPAM's PTR records for the gateway and every host, and the record
+  updates went to a zone that cannot take them. The drift check found the
+  same zone and showed the subnet in sync, and the reverse-zone backfill
+  reported such a zone as created. The zone that owns an address's
+  reverse name is now the most specific zone covering it, whatever its
+  type: IPAM writes the PTR there only when that zone is a primary;
+  otherwise it writes none and queues nothing, and the drift check
+  expects none. A PTR an earlier release wrote into such a zone is
+  dropped, with no update sent, the next time IPAM syncs or deletes the
+  address.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`

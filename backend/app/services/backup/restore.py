@@ -183,9 +183,75 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
 # recreates everything that should exist. Names are captured as text up
 # front, because a CASCADE drop removes later rows' objects and a regclass of
 # a dropped oid renders as a bare number.
-_CLEAR_PUBLIC_SCHEMA_SQL = """\
--- One NOTICE per cascaded constraint would otherwise bury the error, if any.
-SET client_min_messages = warning;
+#
+# Before that block, ``_LOCK_PUBLIC_TABLES_SQL`` takes every table at once. The
+# drops lock as they go, and every lock is held to the end of the transaction,
+# while the appliance keeps working: the api, worker and agents reconnect the
+# moment ``_terminate_other_db_connections`` has run. A session that read a
+# table the drops had not reached yet and then waited for one they had already
+# dropped closed a cycle when the drops reached the table it held, and
+# PostgreSQL aborted the replay: "deadlock detected" at the clearing block's
+# last line, a 400, nothing restored. So the lock block first ends the sessions
+# of this role that came back and hold one of the tables, then takes every
+# table in one ``LOCK TABLE``, inside a subtransaction: if a session that
+# slipped in between still closes a cycle and PostgreSQL picks this side, only
+# the attempt is rolled back, and it is tried again. Waits on anything else
+# (autovacuum, which the deadlock check cancels after ``deadlock_timeout``; a
+# long reader of another role) are waited out, as the drops always did.
+_LOCK_PUBLIC_TABLES_SQL = """\
+DO $lock$
+DECLARE
+    tables text;
+    attempts integer := 0;
+BEGIN
+    -- Tables only: a LOCK on a view also locks whatever the view reads, wherever
+    -- it lives, and a sequence cannot be LOCKed. The product has no views, and
+    -- its sequences are only used through their tables' INSERTs.
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ' ORDER BY c.relname)
+    INTO tables
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      );
+    IF tables IS NULL THEN
+        RETURN;
+    END IF;
+    LOOP
+        -- Only this role's sessions: ending another role's (a superuser's) is
+        -- refused with an ERROR, which would end the restore instead.
+        PERFORM pg_terminate_backend(h.pid, 1000)
+        FROM (
+            SELECT DISTINCT l.pid
+            FROM pg_locks l
+            JOIN pg_class c ON c.oid = l.relation
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.granted
+              AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND n.nspname = 'public'
+              AND l.pid <> pg_backend_pid()
+              AND a.usename = current_user
+        ) h;
+        BEGIN
+            EXECUTE 'LOCK TABLE ' || tables || ' IN ACCESS EXCLUSIVE MODE';
+            RETURN;
+        EXCEPTION WHEN deadlock_detected THEN
+            -- The attempt's locks went with its subtransaction.
+            attempts := attempts + 1;
+            IF attempts >= 10 THEN
+                RAISE;
+            END IF;
+        END;
+    END LOOP;
+END
+$lock$;
+"""
+
+_DROP_PUBLIC_SCHEMA_SQL = """\
 DO $clear$
 DECLARE
     r record;
@@ -250,6 +316,13 @@ BEGIN
 END
 $clear$;
 """
+
+_CLEAR_PUBLIC_SCHEMA_SQL = (
+    # One NOTICE per cascaded constraint would otherwise bury the error, if any.
+    "SET client_min_messages = warning;\n"
+    + _LOCK_PUBLIC_TABLES_SQL
+    + _DROP_PUBLIC_SCHEMA_SQL
+)
 
 _REPLAY_CHUNK_BYTES = 64 * 1024
 
