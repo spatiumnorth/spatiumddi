@@ -2986,6 +2986,16 @@ the formatter handles the rest.
   a reservation takes over now drops both, and the lease mirror
   leaves it alone, as it does every reservation's row.
 
+- **DICOM AE import reads a CSV with classic Mac line endings (#1370).**
+  Import preview and commit read the pasted text without handing its
+  line endings to the csv reader, so a carriage return not followed
+  by a line feed (a file saved with CR-only line endings, or a paste
+  that keeps them) reached it inside a field. The reader refused it,
+  and both calls answered 500 with nothing saying the line endings
+  were the problem. The importer now reads `\n`, `\r\n` and a bare
+  `\r` alike, and anything else the csv reader refuses (a cell over
+  its size limit, say) is a 422 that gives the reason.
+
 ### Security
 
 - **The Looking Glass image is rebuilt past three Go CVEs (#1729).**
