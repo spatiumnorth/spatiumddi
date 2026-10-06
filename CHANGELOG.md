@@ -627,6 +627,22 @@ the formatter handles the rest.
 
 ### Security
 
+- **The older secret reveals count wrong answers like every other
+  step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing
+  codes, appliance kubeconfig, SNMP community, block-sync and
+  firewall-feed secrets, the approvals break-glass) re-confirmed the
+  operator without the per-account wrong-answer budget the #1355 actions
+  spend, so a stolen session could guess the operator's password, or a
+  TOTP code, through any of them without limit. Each now spends the same
+  budget, refusals keep their own `*_reveal_denied` audit action, and the
+  pairing-code reveal is audited for the first time. Once the budget is
+  spent, every step-up answers 429 with `Retry-After` set to the time left
+  on the block, and the refusal is audited (`error_detail:
+  stepup_blocked`); both were missing (found by ddi-pg on #1414). The
+  budget check now lives in one place for the reveals, the #1355 actions
+  and the MFA endpoints alike, and a test fails any new reveal that checks
+  the operator outside it.
+
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
@@ -745,8 +761,7 @@ the formatter handles the rest.
   Wrong answers spend the per-account step-up budget (an omitted answer
   is refused without spending it), and each answered attempt is audited
   with the method used. Once the budget is spent the action answers 429
-  for 15 minutes; that refusal is not yet audited and carries no
-  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  until the 15-minute window resets. Resetting your own password through the admin path counts:
   a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
   create tokens, superadmins or a superadmin's password must send
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
