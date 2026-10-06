@@ -25,6 +25,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const PAGE_SIZE = 100;
 
@@ -75,6 +76,13 @@ function timeAgo(iso: string): string {
 }
 
 export function NewDevicesPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'ip_address'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const qc = useQueryClient();
 
   const [classification, setClassification] =
@@ -230,7 +238,11 @@ export function NewDevicesPage() {
         <HeaderButton icon={ListChecks} onClick={() => setShowAllowlist(true)}>
           Allowlist
         </HeaderButton>
-        <HeaderButton icon={History} onClick={() => setShowBaseline(true)}>
+        <HeaderButton
+          icon={History}
+          onClick={() => setShowBaseline(true)}
+          {...writeGate}
+        >
           Run baseline import
         </HeaderButton>
       </div>
@@ -358,6 +370,7 @@ export function NewDevicesPage() {
               icon={ShieldCheck}
               onClick={() => ackMut.mutate()}
               disabled={ackMut.isPending}
+              {...writeGate}
             >
               Acknowledge
             </HeaderButton>

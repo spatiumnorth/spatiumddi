@@ -49,9 +49,15 @@ vi.mock("@/lib/api", async () => {
   return { ...actual, ...stubs };
 });
 
-vi.mock("@/hooks/useFeatureModules", () => ({
-  useFeatureModules: () => ({ ready: true, enabled: () => true }),
-}));
+vi.mock("@/hooks/useFeatureModules", async () => {
+  const actual = await vi.importActual<
+    typeof import("@/hooks/useFeatureModules")
+  >("@/hooks/useFeatureModules");
+  return {
+    ...actual,
+    useFeatureModules: () => ({ ready: true, enabled: () => true }),
+  };
+});
 
 const SUPERADMIN = "Requires superadmin";
 
@@ -553,5 +559,180 @@ describe("#1340 the Network and integration pages", () => {
     await screen.findByTitle(/^Refresh routers/);
     await permissionsLoaded();
     expectOffered(["New Router"]);
+  });
+});
+
+// ── #1341: Administration, Tools and the IPAM side pages ─────────────────────
+
+/** route, the page module and export, and the write the check reads. */
+const ADMIN_TOOLS_PAGES: [string, string, string, string][] = [
+  ["/admin/users", "admin/UsersPage", "UsersPage", "New User"],
+  ["/admin/groups", "admin/GroupsPage", "GroupsPage", "New Group"],
+  ["/admin/webhooks", "admin/WebhooksPage", "WebhooksPage", "New subscription"],
+  ["/admin/alerts", "admin/AlertsPage", "AlertsPage", "New rule"],
+  [
+    "/admin/ipam/templates",
+    "admin/IPAMTemplatesPage",
+    "IPAMTemplatesPage",
+    "New template",
+  ],
+  ["/admin/domains", "admin/DomainsPage", "DomainsPage", "New domain"],
+  [
+    "/tools/wake-schedules",
+    "tools/WakeSchedulesPage",
+    "WakeSchedulesPage",
+    "New schedule",
+  ],
+  ["/tools/nmap", "nmap/NmapToolsPage", "NmapToolsPage", "Start scan"],
+  [
+    "/tools/pcap",
+    "pcap/PacketCapturePage",
+    "PacketCapturePage",
+    "Start capture",
+  ],
+  [
+    "/security/new-devices",
+    "security/NewDevicesPage",
+    "NewDevicesPage",
+    "Run baseline import",
+  ],
+  [
+    "/security/firewall-feeds",
+    "firewall_feeds/FirewallFeedsPage",
+    "FirewallFeedsPage",
+    "New feed",
+  ],
+  ["/ipam/nat", "ipam/NATPage", "NATPage", "New mapping"],
+  [
+    "/ipam/plans",
+    "ipam/SubnetPlannerListPage",
+    "SubnetPlannerListPage",
+    "New plan",
+  ],
+];
+
+const ROLE = {
+  id: "role-1",
+  name: "viewer-role",
+  description: "",
+  is_builtin: false,
+  permissions: [{ action: "read", resource_type: "subnet", resource_id: null }],
+};
+
+const MODULES = [
+  {
+    id: "core.dhcp",
+    label: "DHCP",
+    group: "DHCP",
+    enabled: true,
+    requires: [],
+  },
+  {
+    id: "reports.top_n",
+    label: "Top-N reports",
+    group: "Compliance",
+    enabled: true,
+    requires: [],
+  },
+].map((m) => ({
+  ...m,
+  description: `${m.label} description`,
+  default_enabled: true,
+}));
+
+describe("#1341 Administration, Tools and the IPAM side pages", () => {
+  async function openAndRead(
+    route: string,
+    module: string,
+    name: string,
+    write: string,
+  ) {
+    await openPage(route, module, name);
+    await screen.findAllByRole("button", { name: write });
+    await permissionsLoaded();
+  }
+
+  it("offers a Viewer none of their writes, and says why", async () => {
+    signInAs(VIEWER);
+    for (const [route, module, name, write] of ADMIN_TOOLS_PAGES) {
+      cleanup();
+      await openAndRead(route, module, name, write);
+      expect(expectAllDenied(write, /^Requires /), route).toBeGreaterThan(0);
+    }
+  });
+
+  it("offers a Viewer no role write: a role opens to be read, not edited", async () => {
+    signInAs(VIEWER);
+    answers.rolesApi = { list: async () => [ROLE] };
+    await openAndRead(
+      "/admin/roles",
+      "admin/RolesPage",
+      "RolesPage",
+      "New Role",
+    );
+    expectAllDenied("New Role", /^Requires admin permission on roles$/);
+    const row = (await screen.findByText("viewer-role")).closest("tr")!;
+    const [view, clone, del] = Array.from(row.querySelectorAll("button"));
+    expect(view.title).toBe("View");
+    expect([clone.disabled, clone.title]).toEqual([
+      true,
+      "Requires admin permission on roles",
+    ]);
+    expect([del.disabled, del.title]).toEqual([
+      true,
+      "Requires admin permission on roles",
+    ]);
+  });
+
+  it("offers a Viewer none of the Features page's switches", async () => {
+    signInAs(VIEWER);
+    answers.featureModulesApi = { list: async () => MODULES };
+    await openPage("/admin/features", "admin/FeaturesPage", "FeaturesPage");
+    await screen.findByText("DHCP description");
+    await permissionsLoaded();
+    const switches = screen.getAllByRole("switch") as HTMLButtonElement[];
+    expect(switches.length).toBeGreaterThan(0);
+    expect(switches.filter((s) => !s.disabled)).toEqual([]);
+    expect(switches[0].title).toBe(SUPERADMIN);
+  });
+
+  it("offers a superadmin every one of them", async () => {
+    signInAs("superadmin");
+    for (const [route, module, name, write] of ADMIN_TOOLS_PAGES) {
+      cleanup();
+      await openAndRead(route, module, name, write);
+      for (const b of screen.getAllByRole("button", { name: write })) {
+        expect((b as HTMLButtonElement).disabled, `${route} ${write}`).toBe(
+          false,
+        );
+      }
+    }
+    cleanup();
+    answers.rolesApi = { list: async () => [ROLE] };
+    await openAndRead(
+      "/admin/roles",
+      "admin/RolesPage",
+      "RolesPage",
+      "New Role",
+    );
+    expectOffered(["New Role"]);
+    const row = (await screen.findByText("viewer-role")).closest("tr")!;
+    expect(
+      Array.from(row.querySelectorAll("button")).map((b) => [
+        b.title,
+        b.disabled,
+      ]),
+    ).toEqual([
+      ["Edit", false],
+      ["Clone", false],
+      ["Delete", false],
+    ]);
+    cleanup();
+    answers.featureModulesApi = { list: async () => MODULES };
+    await openPage("/admin/features", "admin/FeaturesPage", "FeaturesPage");
+    await screen.findByText("DHCP description");
+    await permissionsLoaded();
+    const switches = screen.getAllByRole("switch") as HTMLButtonElement[];
+    expect(switches.filter((s) => s.disabled)).toEqual([]);
   });
 });

@@ -2387,6 +2387,18 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **Administration, Tools and the IPAM side pages offer a read-only user
+  no write it would be refused (#1341).** The built-in Viewer was
+  offered New Role (and every role's Edit, Clone and Delete), New User,
+  New Group, New subscription, New rule, New template, New domain, the
+  Features page's module switches, New schedule, Start scan, Start
+  capture, Run baseline import, New block, New feed, New mapping, New
+  plan and Cutover's New plan, each refused only after the form was
+  filled in. Each control now asks what its route asks (a superadmin, or
+  admin / write / delete on its resource type) and, denied, stays in
+  place, disabled, with the reason as its tooltip. A role opens read-only
+  for a user who may not edit roles, as a built-in role already did.
+
 - **The Network and integration pages offer a read-only user no write it
   would be refused (#1340).** 26 of the 30 pages offered the built-in
   Viewer their create, edit and delete controls: Customers, Providers,

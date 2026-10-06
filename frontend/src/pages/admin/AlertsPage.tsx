@@ -22,6 +22,11 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -598,6 +603,12 @@ function RuleEditorModal({
 // ── Page ───────────────────────────────────────────────────────────────────
 
 export function AlertsPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<AlertRule | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -663,6 +674,7 @@ export function AlertsPage() {
                 "inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
                 "hover:bg-primary/90",
               )}
+              {...superadminGate}
             >
               <Plus className="h-3.5 w-3.5" />
               New rule
@@ -908,14 +920,16 @@ export function AlertsPage() {
                         <button
                           onClick={() => toggle.mutate(r)}
                           title={r.enabled ? "Disable" : "Enable"}
-                          className="rounded p-1.5 hover:bg-accent"
+                          className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Power className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setEditing(r)}
                           title="Edit"
-                          className="rounded p-1.5 hover:bg-accent"
+                          className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -926,7 +940,8 @@ export function AlertsPage() {
                             }
                           }}
                           title="Delete"
-                          className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                          className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+                          {...superadminGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
