@@ -950,8 +950,9 @@ def create_app() -> FastAPI:
         # error (#865). Without this the header is present on the wire but
         # the JS layer can't read it under CORS — for a cross-origin
         # frontend the feature would silently degrade to the dead end it
-        # fixes.
-        expose_headers=["X-Total-Count", "X-Adoption-Required"],
+        # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
+        # step-up, so a dialog can prompt and resubmit (#1412).
+        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given

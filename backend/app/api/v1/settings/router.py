@@ -2722,9 +2722,9 @@ async def reveal_snmp_community(
     at least visible. Local-auth users only; external-auth users have
     no local password to re-confirm.
     """
+    from app.api.stepup import require_operator_stepup
     from app.core.crypto import decrypt_str
     from app.models.audit import AuditLog
-    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -2751,19 +2751,18 @@ async def reveal_snmp_community(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="snmp_community_reveal_denied",
+        resource_type="platform_settings",
+        resource_id="snmp",
+        resource_display="SNMP community",
+    )
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:

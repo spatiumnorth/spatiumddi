@@ -7351,11 +7351,8 @@ async def reveal_appliance_kubeconfig(
     downloaded file directly; operators on a different network may
     need to edit the server line to a reachable address.
     """
+    from app.api.stepup import require_operator_stepup  # noqa: PLC0415
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.services.reauth import (  # noqa: PLC0415
-        ReauthOutcome,
-        reverify_operator,
-    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -7382,20 +7379,18 @@ async def reveal_appliance_kubeconfig(
         )
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        await asyncio.sleep(0.1)
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="appliance_kubeconfig_reveal_denied",
+        resource_type="appliance",
+        resource_id=str(appliance_id),
+        resource_display=str(appliance_id),
+    )
 
     row = await db.get(Appliance, appliance_id)
     if row is None:
