@@ -1423,7 +1423,7 @@ def test_apply_blocking_imports_in_chunks_not_one_call_per_domain(tmp_path: Path
     """``blocked/add`` rewrote Technitium's zone file on every call, so a 16k
     list took ~30 minutes (#1425). ``blocked/import`` takes a comma-separated
     list and saves once per call."""
-    import spatium_dns_agent.drivers.technitium as mod
+    from spatium_dns_agent.drivers.technitium import _BLOCKING_IMPORT_CHUNK
 
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, _blocking_responder())
@@ -1432,7 +1432,7 @@ def test_apply_blocking_imports_in_chunks_not_one_call_per_domain(tmp_path: Path
         "t", {"enabled": True, "blocked": domains, "blocking_type": "NxDomain"}
     )
     imports = [c for c in calls if c[2] == "blocked/import"]
-    assert len(imports) == -(-len(domains) // mod._BLOCKING_IMPORT_CHUNK)
+    assert len(imports) == -(-len(domains) // _BLOCKING_IMPORT_CHUNK)
     sent = [x for c in imports for x in c[3]["blockedZones"].split(",")]
     assert sorted(sent) == sorted(domains)
     assert all(c[1] == "POST" for c in imports)  # form body, not a URL
