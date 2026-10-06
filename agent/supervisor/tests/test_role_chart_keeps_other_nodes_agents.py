@@ -389,3 +389,142 @@ def test_role_labels_of_reads_the_other_nodes_true_role_labels() -> None:
         "looking-glass",
     }
     assert k8s_api.role_labels_of({}) == set()
+
+
+# ---- #1427: a node given some of the roles keeps the others' agents ---------------
+
+DNS_ONLY = {
+    "roles": ["dns-bind9"],
+    "dns_group_name": "default",
+    "dns_agent_key": DNS_KEY,
+}
+DHCP_ONLY = {
+    "roles": ["dhcp"],
+    "dhcp_group_name": "default-dhcp",
+    "dhcp_agent_key": DHCP_KEY,
+}
+
+
+def test_a_member_given_a_subset_keeps_the_roles_it_was_not_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#1427's 21:48Z case: all three nodes hold dhcp + dns-bind9, then
+    member-2 is given dns-bind9 alone. Its apply used to write ``dhcpKea`` off,
+    and the upgrade deleted the dhcp-kea DaemonSet on the seed and member-1,
+    whose roles never changed. It now writes the seed's chart unchanged, and
+    only its own label moves: member-2's kea is unscheduled, no other node's."""
+    cluster = Cluster()
+    _seed(monkeypatch, cluster)
+    _apply(tmp_path, SEED_ROLES)
+    seed_chart = cluster.values_content
+    for name in (MEMBER_1, MEMBER_2):
+        _member(monkeypatch, cluster, name=name)
+        _apply(tmp_path, SEED_ROLES)
+        assert cluster.writes[-1] == seed_chart
+    result = _apply(tmp_path, DNS_ONLY)
+    assert result.state == "ready"
+    assert cluster.writes[-1] == seed_chart
+    assert cluster.labels[MEMBER_2] == {
+        "spatium.io/role-dns-bind9": "true",
+        "spatium.io/role-control-plane": "true",
+    }
+    assert "spatium.io/role-dhcp" in cluster.labels[SEED]
+    assert "spatium.io/role-dhcp" in cluster.labels[MEMBER_1]
+
+
+TECHNITIUM = {
+    "roles": ["dns-technitium"],
+    "dns_group_name": "default",
+    "dns_agent_key": DNS_KEY,
+}
+TECHNITIUM_DHCP = {
+    "roles": ["dns-technitium", "dhcp"],
+    "dns_group_name": "default",
+    "dhcp_group_name": "vlan-30",
+    "dns_agent_key": DNS_KEY,
+    "dhcp_agent_key": DHCP_KEY,
+}
+
+
+def test_taking_a_role_back_from_one_node_keeps_it_on_the_node_still_assigned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The field report on #1427: ddi03 holds dns-technitium + dhcp and serves
+    DHCP; ddi02 holds dns-technitium. ddi02 is given dhcp for a few minutes,
+    then its roles are put back. Putting them back made ddi02 write ``dhcpKea``
+    off, and the dhcp-kea DaemonSet, ddi03's Kea with it, was deleted: no DHCP
+    anywhere until ddi03's roles were re-sent. Taking a role from one node now
+    moves only that node's label."""
+    cluster = Cluster()
+    _seed(monkeypatch, cluster)
+    _apply(tmp_path, NO_ROLES)
+    _member(monkeypatch, cluster, name="ddi03")
+    _apply(tmp_path, TECHNITIUM_DHCP)
+    ddi03_chart = cluster.values_content
+    assert cluster.agent_blocks()["dhcpKea"] is True
+    _member(monkeypatch, cluster, name="ddi02")
+    _apply(tmp_path, TECHNITIUM)
+    assert cluster.writes[-1] == ddi03_chart
+    assert _apply(tmp_path, TECHNITIUM_DHCP).state == "ready"
+    assert "spatium.io/role-dhcp" in cluster.labels["ddi02"]
+    assert _apply(tmp_path, TECHNITIUM).state == "ready"
+    assert cluster.writes[-1] == ddi03_chart
+    assert "spatium.io/role-dhcp" not in cluster.labels["ddi02"]
+    assert cluster.labels["ddi03"]["spatium.io/role-dhcp"] == "true"
+
+
+def test_two_nodes_with_different_roles_write_one_chart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The seed serves DNS, member-1 DHCP. Each apply keeps the other's agent,
+    so either node writing again (a role toggle, a watchdog heal) leaves the
+    chart as it is instead of flipping the other's DaemonSet off and on."""
+    cluster = Cluster()
+    _seed(monkeypatch, cluster)
+    _apply(tmp_path, DNS_ONLY)
+    _member(monkeypatch, cluster)
+    assert _apply(tmp_path, DHCP_ONLY).state == "ready"
+    both = cluster.values_content
+    assert cluster.agent_blocks() == {
+        "dnsBind9": True,
+        "dnsPowerdns": True,
+        "dnsTechnitium": True,
+        "dhcpKea": True,
+        "lookingGlass": False,
+    }
+    _seed(monkeypatch, cluster)
+    assert _apply(tmp_path, DNS_ONLY).state == "ready"
+    assert cluster.writes[-1] == both
+
+
+def test_dropping_a_role_no_other_node_serves_still_removes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """member-1 alone held DHCP; it drops it. No other node is labelled for
+    DHCP, so ``dhcpKea`` goes off, while the seed's DNS stays as it was."""
+    cluster = Cluster()
+    _seed(monkeypatch, cluster)
+    _apply(tmp_path, DNS_ONLY)
+    _member(monkeypatch, cluster)
+    _apply(tmp_path, DHCP_ONLY)
+    assert _apply(tmp_path, NO_ROLES).state == "ready"
+    assert cluster.agent_blocks() == {
+        "dnsBind9": True,
+        "dnsPowerdns": True,
+        "dnsTechnitium": True,
+        "dhcpKea": False,
+        "lookingGlass": False,
+    }
+
+
+def test_a_node_rendering_every_agent_reads_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing it writes can be another node's loss: no read, no keep."""
+    cluster = Cluster()
+    _seed(monkeypatch, cluster)
+    everything = dict(SEED_ROLES, roles=["dhcp", "dns-bind9", "looking-glass"])
+    everything["lg_agent_key"] = "c" * 48
+    assert _apply(tmp_path, everything).state == "ready"
+    assert cluster.reads == []
+    assert all(cluster.agent_blocks().values())

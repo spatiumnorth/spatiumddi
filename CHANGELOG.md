@@ -133,6 +133,17 @@ the formatter handles the rest.
   own render; a node list or chart it cannot read fails the apply
   instead of writing it blind.
 
+- **Giving a cluster node some of the roles, or taking one back, no
+  longer stops that role's agents on every node (#1427).** A node
+  renders an agent only when it holds that role's key, so a member given
+  DNS alone, or a node DHCP was taken back from, wrote the DHCP agent off
+  in the cluster's one role chart, and Kea was killed on every node still
+  assigned DHCP until a watchdog wrote the chart again (89 seconds without
+  DHCP on a three-node cluster; about 3.5 minutes on a field cluster of
+  2026.10.02-1). Every agent a node does not hold now stays on while
+  another node is labelled for its role, so a role change is a node label
+  again, as the chart intends.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

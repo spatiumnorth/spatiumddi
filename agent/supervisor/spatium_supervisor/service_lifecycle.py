@@ -626,21 +626,22 @@ def apply_role_assignment(
         # heartbeat that brings the key re-applies with it.
         log.info("supervisor.k3s_lifecycle.roles_awaiting_key", roles=sorted(held_back))
 
-    # #1439 — a node that holds no agent key keeps on the agents other nodes are
-    # labelled for. This is a member just promoted, before any role reaches it:
-    # its promotion changes the role apply key (#1281's control-plane URL), and
-    # its apply turned every agent off cluster-wide, at every join and every
-    # Replace, until the seed's watchdog wrote the chart again.
-    if not any(_agent_block_on(values, b) for blocks, _ in _AGENT_FAMILIES for b in blocks):
-        values, kept, keep_err = _keep_agents_other_nodes_serve(values)
-        if keep_err:
-            return LifecycleResult(state="failed", reason=keep_err)
-        if kept:
-            log.info(
-                "supervisor.k3s_lifecycle.agents_kept",
-                blocks=kept,
-                reason="another node serves them",
-            )
+    # #1439, #1427 — every agent this node does not hold stays on while another
+    # node is labelled for its role. #1439: a member just promoted, before any
+    # role reaches it (its promotion changes the role apply key, #1281's
+    # control-plane URL), turned every agent off cluster-wide at every join and
+    # every Replace, until the seed's watchdog wrote the chart again. #1427: a
+    # node given some of the roles, or one a role was taken back from, turned
+    # that role off the same way, on the nodes still assigned it.
+    values, kept, keep_err = _keep_agents_other_nodes_serve(values)
+    if keep_err:
+        return LifecycleResult(state="failed", reason=keep_err)
+    if kept:
+        log.info(
+            "supervisor.k3s_lifecycle.agents_kept",
+            blocks=kept,
+            reason="another node serves them",
+        )
 
     try:
         chart_bytes = _read_chart_tarball()
