@@ -118,6 +118,23 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **Console copy sends operators only to places that exist (#1395).**
+  Feature descriptions, AI tool descriptions, alert texts, API errors
+  and several notices told operators to turn things on under "Settings
+  → …" places the Settings page does not have: "Settings →
+  firewall_enabled", "Settings → acme_enabled", "Settings →
+  dnsbl_monitoring_enabled", "Settings → Import → DNS surface",
+  "Settings → AI → Tool Catalog", "Settings → Features", "Settings →
+  Backup", "Settings → Appliance → SNMP". Each now names where the
+  control is (Features & Integrations, Administration → Import,
+  Administration → AI Tool Catalog, Administration → DNS Blocklists,
+  Administration → Backup, Administration → API Tokens, Appliance →
+  Firewall, Appliance → Fleet), says that ACME is switched on by
+  registering an account, and says so plainly where the console has no
+  control at all (BGP monitoring, a provider's tool allowlist). A
+  frontend and a backend test hold every "Settings → …" path in the
+  console's and the API's copy against the Settings page's sections.
+
 - **A role's dialog shows the grants the role holds (#1394).** Roles →
   View is the only place the console shows what a built-in role grants,
   and it showed each grant through two selects offering fixed lists: a
