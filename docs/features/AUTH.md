@@ -137,8 +137,29 @@ session alone doesn't prove and an SSO account has no local password.
   method used (`stepup_method`). Once the budget is spent the step-up
   answers `429` with `Retry-After` set to the time left on the block, and
   that refusal is audited too (`error_detail: stepup_blocked`, #1413). An SSO account must enrol TOTP before it can
-  mint an API token. Granting superadmin through a group's role is not yet
-  covered (#1412).
+  mint an API token.
+- **So does granting superadmin through a group (#1412).** A user is also
+  a superadmin when one of their groups holds a role carrying `*` / `*`, or
+  a live `*` / `*` time-bound grant. So the step-up is required by any
+  group create / edit, role edit or time-bound grant that would make someone
+  a superadmin who is not one: adding a member to such a group, giving such
+  a role to a group with members, adding `*` / `*` to a role groups already
+  hold, or a `*` / `*` grant. The check is on the effect, computed before
+  anything is written (`app.services.superadmin_grant`), so an edit that
+  touches only existing superadmins needs none, and one that reaches fifty
+  users needs one. Superadmin status here ignores `is_active`: judged the
+  active-only way, a stolen session could disable a role-only superadmin,
+  reset its password with no step-up, and re-enable it. The dialogs learn
+  that a step-up is needed from the server — a `403` carrying
+  `X-Stepup-Required: true` — then ask for it and resubmit. The Copilot's
+  temporary-access proposal refuses such a grant, since a chat Apply cannot
+  ask for a password. An auth-provider group mapping that targets a
+  superadmin group needs it too (#1476): it grants nothing at once, but the
+  next sign-in from any account in the external group becomes a superadmin,
+  and who that is cannot be known when the mapping is saved. So the check
+  there is on the target group: creating such a mapping, re-pointing one at
+  such a group, or renaming the external group of one that targets it. A
+  priority change needs none, since every matching mapping applies.
 
 ## External identity providers
 
