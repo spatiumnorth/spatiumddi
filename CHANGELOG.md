@@ -118,6 +118,19 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **IPAM's delete confirmations say the delete goes to Trash (#1398).**
+  #1152 fixed Edit subnet's Danger zone, but every other space, block
+  and subnet delete still called itself permanent: the tree's Delete…
+  and both bulk deletes ended on "Confirm Permanent Deletion — This
+  action cannot be undone — Delete permanently", the block view said
+  "Blocks are not restorable from Trash", and Edit Space and Edit Block
+  said the delete "permanently removes every … row" behind "a typed
+  confirm" that is a checkbox. All of these deletes go to Trash and
+  come back intact on restore. Each now says the object and what it
+  holds move to Trash, restorable for 30 days, after which the nightly
+  purge deletes them for good; "permanent" stays on the IP address
+  purges, the one IPAM delete that is.
+
 - **Edit webhook can remove a subscription's secret, and its hint says
   what a blank field does (#1397).** The Rotate secret hint said
   "clearing the field stores no secret (HMAC header omitted)", but the
