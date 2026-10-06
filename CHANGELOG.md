@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The looking-glass image reports its GoBGP version again
+  (follow-up to #1625).** `/etc/spatiumddi-versions` in the
+  gobgp image wrote `gobgp=` empty: `GOBGP_VERSION` is a global
+  build arg, and Docker only makes it available in a stage that
+  re-declares it — the runtime stage did not (pre-existing on
+  4.9.0 too). The runtime stage now re-declares `ARG
+  GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
+  which told maintainers to run `make trivy IMAGE=gobgp`; the
+  TRIVY_IMAGES spec is `looking-glass`.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
