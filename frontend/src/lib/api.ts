@@ -2443,19 +2443,31 @@ export interface AppUser {
   failed_login_count?: number;
   failed_login_locked_until?: string | null;
   locked?: boolean;
+  /** #1355 — the flag OR a wildcard role; resetting such an account's
+   *  password needs the caller's step-up. */
+  is_effective_superadmin?: boolean;
+}
+
+/** #1355 — the caller's own step-up on actions that mint a credential:
+ *  a local user's password, or an SSO user's authenticator code. */
+export interface StepUp {
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 export const usersApi = {
   list: () => api.get<AppUser[]>("/users").then((r) => r.data),
   get: (id: string) => api.get<AppUser>(`/users/${id}`).then((r) => r.data),
-  create: (data: {
-    username: string;
-    email: string;
-    display_name: string;
-    password: string;
-    is_superadmin: boolean;
-    force_password_change: boolean;
-  }) => api.post<AppUser>("/users", data).then((r) => r.data),
+  create: (
+    data: {
+      username: string;
+      email: string;
+      display_name: string;
+      password: string;
+      is_superadmin: boolean;
+      force_password_change: boolean;
+    } & StepUp,
+  ) => api.post<AppUser>("/users", data).then((r) => r.data),
   update: (
     id: string,
     data: Partial<
@@ -2467,10 +2479,14 @@ export const usersApi = {
         | "is_superadmin"
         | "force_password_change"
       >
-    >,
+    > &
+      StepUp,
   ) => api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
-  resetPassword: (id: string, newPassword: string) =>
-    api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
+  resetPassword: (id: string, newPassword: string, stepUp: StepUp = {}) =>
+    api.post(`/users/${id}/reset-password`, {
+      new_password: newPassword,
+      ...stepUp,
+    }),
   /** Clear lockout state on a user account (issue #71). */
   unlock: (id: string) => api.post(`/users/${id}/unlock`),
   /** Link an external account to its provider (#1235). Clears the stored
@@ -3596,8 +3612,11 @@ export interface PlatformSettings {
   audit_forward_syslog_protocol: string;
   audit_forward_syslog_facility: number;
   audit_forward_webhook_enabled: boolean;
-  audit_forward_webhook_url: string;
-  audit_forward_webhook_auth_header: string;
+  // The legacy webhook's URL and header are write-only (#1502): the server
+  // returns whether each is set, and the URL's scheme + host only.
+  audit_forward_webhook_url_set: boolean;
+  audit_forward_webhook_url_display: string;
+  audit_forward_webhook_auth_header_set: boolean;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -4052,7 +4071,11 @@ export interface AuditForwardTarget {
   protocol: AuditForwardProtocol;
   facility: number;
   ca_cert_pem: string | null;
-  url: string;
+  // The webhook URL and Authorization header are Fernet-encrypted at rest
+  // and never returned (#1502). ``url_display`` is scheme + host only, e.g.
+  // ``https://hooks.slack.com/…``.
+  url_set: boolean;
+  url_display: string;
   auth_header_set: boolean;
   webhook_flavor: AuditForwardWebhookFlavor;
   smtp_host: string;
@@ -4080,8 +4103,10 @@ export interface AuditForwardTargetWrite {
   protocol?: AuditForwardProtocol;
   facility?: number;
   ca_cert_pem?: string | null;
-  url?: string;
-  auth_header?: string;
+  // Same contract as ``smtp_password``: omitted or ``null`` keeps the stored
+  // value, ``""`` clears it, any other string replaces it.
+  url?: string | null;
+  auth_header?: string | null;
   webhook_flavor?: AuditForwardWebhookFlavor;
   smtp_host?: string;
   smtp_port?: number;
@@ -4273,13 +4298,14 @@ export interface AuthGroupMapping {
   modified_at: string;
 }
 
-export interface AuthGroupMappingCreate {
+// #1476 — a mapping into a group that grants superadmin needs the step-up.
+export interface AuthGroupMappingCreate extends StepUp {
   external_group: string;
   internal_group_id: string;
   priority?: number;
 }
 
-export interface AuthGroupMappingUpdate {
+export interface AuthGroupMappingUpdate extends StepUp {
   external_group?: string;
   internal_group_id?: string;
   priority?: number;
@@ -4301,7 +4327,7 @@ export interface InternalGroup {
   user_ids?: string[];
 }
 
-export interface InternalGroupCreate {
+export interface InternalGroupCreate extends StepUp {
   name: string;
   description?: string;
   auth_source?: string;
@@ -4310,7 +4336,7 @@ export interface InternalGroupCreate {
   user_ids?: string[];
 }
 
-export interface InternalGroupUpdate {
+export interface InternalGroupUpdate extends StepUp {
   name?: string;
   description?: string;
   external_dn?: string | null;
@@ -4345,7 +4371,7 @@ export interface TimeBoundGrant {
   created_at: string;
 }
 
-export interface TimeBoundGrantCreate {
+export interface TimeBoundGrantCreate extends StepUp {
   group_id: string;
   action: string;
   resource_type: string;
@@ -4396,7 +4422,7 @@ export interface RoleCreate {
   permissions?: PermissionEntry[];
 }
 
-export interface RoleUpdate {
+export interface RoleUpdate extends StepUp {
   name?: string;
   description?: string;
   permissions?: PermissionEntry[];
@@ -4439,9 +4465,13 @@ export const authProvidersApi = {
   update: (id: string, body: AuthProviderUpdate) =>
     api.put<AuthProvider>(`/auth-providers/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/auth-providers/${id}`),
-  revealSecrets: (id: string) =>
+  // #1355 — a POST carrying the step-up, like every other secret reveal.
+  revealSecrets: (id: string, password: string, totpCode: string) =>
     api
-      .get<Record<string, unknown>>(`/auth-providers/${id}/secrets`)
+      .post<Record<string, unknown>>(`/auth-providers/${id}/secrets`, {
+        password: password || null,
+        totp_code: totpCode || null,
+      })
       .then((r) => r.data),
   listMappings: (id: string) =>
     api
@@ -10216,6 +10246,9 @@ export interface ApiTokenCreate {
   expires_in_days?: number | null;
   scopes?: ApiTokenScope[];
   resource_grants?: ApiTokenResourceGrant[];
+  /** #1355 — the owner's step-up; a token outlives the session. */
+  stepup_password?: string | null;
+  stepup_totp_code?: string | null;
 }
 
 /** Response from POST — contains the raw token ONCE. */
@@ -10280,7 +10313,9 @@ export type AlertRuleType =
   | "dhcp_pool_exhaustion"
   | "secret_expiring"
   | "decom_expiring"
-  | "node_pressure";
+  | "node_pressure"
+  | "backup_failed"
+  | "backup_stale";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -12303,7 +12338,8 @@ export const clusterUpgradesApi = {
 // Two flavours:
 //   * Ephemeral (persistent=false) — single-use, short expiry,
 //     cleartext shown once on create.
-//   * Persistent (persistent=true) — multi-claim; default no expiry;
+//   * Persistent (persistent=true) — multi-claim; default 30-day expiry
+//     (expires_in_minutes: 0 = never, #1356);
 //     admin can disable / re-reveal the cleartext via Fernet decrypt
 //     after a password re-check.
 //

@@ -341,7 +341,7 @@ const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
     {
       key: "api_token",
       label: "API token",
-      placeholder: "Hetzner DNS API token",
+      placeholder: "Hetzner Cloud API token",
       secret: true,
     },
   ],
@@ -515,16 +515,20 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
         {driver === "hetzner" && (
           <div>
             <p>
-              Open the{" "}
+              In the{" "}
               <span className="font-medium text-foreground">
-                Hetzner DNS Console
-              </span>{" "}
-              (dns.hetzner.com) and go to{" "}
-              <span className="font-medium text-foreground">
-                API tokens → Create access token
+                Hetzner Console
               </span>
-              . This is a DNS-specific token (separate from the Hetzner Cloud
-              API). Paste it above.
+              , open the project that holds your DNS zones and go to{" "}
+              <span className="font-medium text-foreground">
+                Security → API tokens → Generate API token
+              </span>{" "}
+              with{" "}
+              <span className="font-medium text-foreground">
+                Read &amp; Write
+              </span>{" "}
+              permission (read-only is enough to list and import). Paste it
+              above. Tokens from the retired DNS Console no longer work.
             </p>
           </div>
         )}

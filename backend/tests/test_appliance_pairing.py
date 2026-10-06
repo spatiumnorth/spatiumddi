@@ -85,9 +85,11 @@ async def test_create_ephemeral_pairing_code_happy_path(
 
 
 @pytest.mark.asyncio
-async def test_create_persistent_pairing_code_defaults_to_no_expiry(
+async def test_create_persistent_pairing_code_defaults_to_30_days(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:
+    """#1356 — an 8-digit code that never expires is a standing fleet-join
+    credential, so "never" has to be asked for (``expires_in_minutes: 0``)."""
     _, token = await _make_user(db_session, username="pcpersistent")
     await db_session.commit()
     headers = {"Authorization": f"Bearer {token}"}
@@ -100,8 +102,17 @@ async def test_create_persistent_pairing_code_defaults_to_no_expiry(
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["persistent"] is True
-    assert body["expires_at"] is None  # default for persistent
     assert body["max_claims"] == 50
+    expires = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
+    assert timedelta(days=29) < expires - datetime.now(UTC) <= timedelta(days=30)
+
+    resp = await client.post(
+        "/api/v1/appliance/pairing-codes",
+        headers=headers,
+        json={"persistent": True, "expires_in_minutes": 0},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["expires_at"] is None
 
 
 @pytest.mark.asyncio

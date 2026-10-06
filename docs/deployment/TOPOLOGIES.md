@@ -300,8 +300,7 @@ recommended HA path for operators who installed from the ISO.
   guardrailed).
 - **One floating VIP, set in the UI.** A bundled MetalLB (L2) hands the
   frontend Service a control-plane VIP you pick in `Appliance → Network &
-  Host`. (**Currently broken — see the known-issue note under Bring-up
-  below, [#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103).**) Point DNS/DHCP agents + operator browsers at the VIP, not a
+  Host`. Point DNS/DHCP agents + operator browsers at the VIP, not a
   single node IP — an agent pinned to one node's address loses its
   control plane whenever that node is down. (Control-plane *cluster
   members* need no such care: their supervisor heartbeats the in-cluster
@@ -327,20 +326,6 @@ recommended HA path for operators who installed from the ISO.
 4. `Appliance → Network & Host` → set a MetalLB pool + a control-plane
    VIP. The frontend moves onto the VIP; the cert auto-covers it. Point
    every off-cluster DNS/DHCP agent's control-plane URL at this VIP.
-
-> ⚠️ **Known issue — step 4 does not work today
-> ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).**
-> Setting a control-plane VIP currently leaves MetalLB failing to install:
-> the `helm-install-spatium-metallb` Job enters `CrashLoopBackOff`, no
-> `IPAddressPool` is created, and the frontend Service stays
-> `EXTERNAL-IP: <pending>` — so the VIP never appears. It does not recover
-> on its own. Helm 4 orders the MetalLB validating webhooks ahead of the
-> pool CRs, and each install retry deletes the controller backing that
-> webhook, so every attempt destroys the prerequisite the next one needs.
-> Until this is fixed, run the cluster **without** a VIP and point agents
-> and browsers at a node address; everything else in this topology
-> (etcd quorum, CNPG failover, Redis Sentinel, 3-replica api/worker) works
-> normally. See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
 
 **Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving

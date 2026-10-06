@@ -44,6 +44,7 @@ from app.services.backup import (
     apply_backup_restore,
     build_backup_archive,
 )
+from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
 from app.services.backup.sections import SECTIONS
 
 router = APIRouter()
@@ -141,6 +142,8 @@ async def create_and_download_backup(
     operator re-enters them by hand.
     """
     _require_superadmin(current_user)
+    if hint_reveals_passphrase(passphrase, passphrase_hint):
+        raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
     # #296 Phase H — refuse if a rolling upgrade is in flight. The
     # backup snapshot captures schema + data state; running one mid-
     # upgrade would capture a half-upgraded cluster that would surprise

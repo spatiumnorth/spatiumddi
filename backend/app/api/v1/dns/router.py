@@ -6671,7 +6671,7 @@ class GroupRecordResponse(BaseModel):
 async def list_group_records(
     group_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     search: str | None = Query(
         None, description="substring over name / fqdn / value / type / zone"
     ),
@@ -6685,9 +6685,14 @@ async def list_group_records(
     """
     await _require_group(group_id, db)
 
-    zones = list(
-        (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars().all()
-    )
+    zone_stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    # GHSA-wr8j-6r46-pj7g: like list_zones, a dns_zone-scoped token sees only
+    # its bound zones' records, not every zone in the group. No-op (None) for
+    # sessions / unscoped / wildcard-grant tokens.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        zone_stmt = zone_stmt.where(DNSZone.id.in_(token_zone_ids))
+    zones = list((await db.execute(zone_stmt)).scalars().all())
     empty: Page[GroupRecordResponse] = Page(items=[], total=0, page=page, page_size=page_size)
     if not zones:
         return empty

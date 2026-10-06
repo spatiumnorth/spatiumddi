@@ -21,6 +21,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, SuperAdmin
+from app.api.stepup import require_operator_stepup
 from app.core.auth.ldap import test_connection as ldap_test_connection
 from app.core.auth.oidc import invalidate_caches as oidc_invalidate_caches
 from app.core.auth.oidc import probe_discovery as oidc_probe_discovery
@@ -36,6 +37,7 @@ from app.models.auth_provider import (
     AuthProvider,
 )
 from app.models.settings import PlatformSettings
+from app.services.superadmin_grant import load_model
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -98,6 +100,9 @@ class MappingCreate(BaseModel):
     external_group: str
     internal_group_id: uuid.UUID
     priority: int = 100
+    # #1476 — needed only when the internal group grants superadmin.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
 
 class MappingUpdate(BaseModel):
@@ -106,6 +111,8 @@ class MappingUpdate(BaseModel):
     external_group: str | None = None
     internal_group_id: uuid.UUID | None = None
     priority: int | None = None
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
 
 class MappingResponse(BaseModel):
@@ -506,11 +513,33 @@ async def test_provider(
     )
 
 
-# Debug-only: decrypt + return secrets. Kept out of GET to avoid accidental exposure.
-# Used by the admin UI's "Reveal" button (explicit action).
-@router.get("/{provider_id}/secrets", response_model=dict[str, Any])
-async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[str, Any]:
+class RevealSecretsRequest(BaseModel):
+    """The operator step-up (#408): a local user's password, or an external
+    user's authenticator code."""
+
+    password: str | None = None
+    totp_code: str | None = None
+
+
+# Decrypt + return a provider's secrets (the LDAP bind password, the OIDC /
+# SAML / RADIUS / TACACS+ secrets). A POST carrying the operator step-up,
+# like every other secret reveal (#1355): it was a GET with none, the one
+# reveal a stolen session could read outright.
+@router.post("/{provider_id}/secrets", response_model=dict[str, Any])
+async def reveal_secrets(
+    provider_id: uuid.UUID, body: RevealSecretsRequest, db: DB, user: SuperAdmin
+) -> dict[str, Any]:
     provider = await _get_provider_or_404(db, provider_id)
+    method = await require_operator_stepup(
+        db,
+        user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="read",
+        resource_type="auth_provider_secret",
+        resource_id=str(provider.id),
+        resource_display=provider.name,
+    )
     if provider.secrets_encrypted is None:
         return {}
     db.add(
@@ -523,6 +552,7 @@ async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> di
             resource_id=str(provider.id),
             resource_display=provider.name,
             result="success",
+            new_value={"stepup_method": method},
         )
     )
     await db.commit()
@@ -539,6 +569,40 @@ async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> di
 
 
 # ── Mapping endpoints ─────────────────────────────────────────────────────────
+
+
+async def _stepup_if_group_grants_superadmin(
+    db: DB,
+    user: User,
+    group: Group,
+    *,
+    password: str | None,
+    totp_code: str | None,
+    action: str,
+    resource_id: str,
+    resource_display: str,
+) -> str | None:
+    """Step up when a mapping would route IdP accounts into a group that
+    makes its members superadmins (#1476, the path #1412 left open).
+
+    The mapping grants nothing at once: the next sign-in from any account in
+    the external group becomes a superadmin. So a stolen session that also
+    controls an IdP account would have a step-up-free way in. Who signs in
+    is unknown here, so the check is on the target group, not on users.
+    Returns the step-up method, or None when the group grants no superadmin.
+    """
+    if not (await load_model(db)).group_grants_superadmin(group.id):
+        return None
+    return await require_operator_stepup(
+        db,
+        user,
+        password=password,
+        totp_code=totp_code,
+        action=action,
+        resource_type="auth_group_mapping",
+        resource_id=resource_id,
+        resource_display=f"{resource_display} (into superadmin group {group.name})",
+    )
 
 
 async def _mapping_with_group_name(db: DB, mapping: AuthGroupMapping) -> MappingResponse:
@@ -586,6 +650,17 @@ async def create_mapping(
             status_code=409, detail="A mapping for that external group already exists"
         )
 
+    method = await _stepup_if_group_grants_superadmin(
+        db,
+        user,
+        group,
+        password=body.stepup_password,
+        totp_code=body.stepup_totp_code,
+        action="create",
+        resource_id=str(provider_id),
+        resource_display=f"{provider.name}: {body.external_group.strip()} → {group.name}",
+    )
+
     mapping = AuthGroupMapping(
         provider_id=provider_id,
         external_group=body.external_group.strip(),
@@ -608,6 +683,7 @@ async def create_mapping(
                 "provider_id": str(provider_id),
                 "external_group": mapping.external_group,
                 "internal_group_id": str(mapping.internal_group_id),
+                **({"grants_superadmin": True, "stepup_method": method} if method else {}),
             },
             result="success",
         )
@@ -629,14 +705,34 @@ async def update_mapping(
     if mapping is None or mapping.provider_id != provider_id:
         raise HTTPException(status_code=404, detail="Mapping not found")
 
+    target_id = body.internal_group_id or mapping.internal_group_id
+    target = await db.get(Group, target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Internal group not found")
+    new_external = body.external_group.strip() if body.external_group is not None else None
+    # Re-pointing the mapping, or renaming the external group of one that
+    # points at a superadmin group, changes which IdP accounts land in it.
+    # The priority does not: every matching mapping applies on sign-in.
+    method: str | None = None
+    if (
+        body.internal_group_id is not None and body.internal_group_id != mapping.internal_group_id
+    ) or (new_external is not None and new_external != mapping.external_group):
+        method = await _stepup_if_group_grants_superadmin(
+            db,
+            user,
+            target,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="update",
+            resource_id=str(mapping.id),
+            resource_display=f"{new_external or mapping.external_group} → {target.name}",
+        )
+
     changes: dict[str, Any] = {}
-    if body.external_group is not None:
-        mapping.external_group = body.external_group.strip()
+    if new_external is not None:
+        mapping.external_group = new_external
         changes["external_group"] = mapping.external_group
     if body.internal_group_id is not None:
-        group = await db.get(Group, body.internal_group_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="Internal group not found")
         mapping.internal_group_id = body.internal_group_id
         changes["internal_group_id"] = str(body.internal_group_id)
     if body.priority is not None:
@@ -653,7 +749,10 @@ async def update_mapping(
             resource_id=str(mapping.id),
             resource_display=mapping.external_group,
             changed_fields=list(changes.keys()),
-            new_value=changes,
+            new_value={
+                **changes,
+                **({"grants_superadmin": True, "stepup_method": method} if method else {}),
+            },
             result="success",
         )
     )
