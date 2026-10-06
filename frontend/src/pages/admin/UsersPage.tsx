@@ -11,14 +11,52 @@ import {
   Lock,
   LockOpen,
 } from "lucide-react";
-import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
+import {
+  authProvidersApi,
+  usersApi,
+  type AppUser,
+  type StepUp,
+} from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ReauthFields } from "@/components/ReauthFields";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
+
+function stepUpBody(password: string, totp: string): StepUp {
+  return { stepup_password: password || null, stepup_totp_code: totp || null };
+}
+
+/** #1355 — confirming yourself before handing out a credential that passes
+ *  every later step-up (a superadmin, or a superadmin's password). */
+function StepUpSection({
+  reason,
+  password,
+  onPassword,
+  totp,
+  onTotp,
+}: {
+  reason: string;
+  password: string;
+  onPassword: (v: string) => void;
+  totp: string;
+  onTotp: (v: string) => void;
+}) {
+  return (
+    <div className="rounded-md border bg-amber-500/5 p-3">
+      <p className="mb-2 text-xs text-muted-foreground">{reason}</p>
+      <ReauthFields
+        password={password}
+        onPassword={onPassword}
+        totp={totp}
+        onTotp={onTotp}
+      />
+    </div>
+  );
+}
 
 function Field({
   label,
@@ -47,6 +85,8 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [password, setPassword] = useState("");
   const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [forceChange, setForceChange] = useState(true);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
@@ -58,6 +98,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
         password,
         is_superadmin: isSuperadmin,
         force_password_change: forceChange,
+        ...(isSuperadmin ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -123,6 +164,15 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             Require password change on first login
           </label>
         </div>
+        {isSuperadmin && (
+          <StepUpSection
+            reason="A superadmin's password passes every re-confirmation, so creating one needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -136,7 +186,13 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
               setError(null);
               mutation.mutate();
             }}
-            disabled={!username || !email || !password || mutation.isPending}
+            disabled={
+              !username ||
+              !email ||
+              !password ||
+              (isSuperadmin && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Creating…" : "Create"}
@@ -161,7 +217,10 @@ function EditUserModal({
   const [email, setEmail] = useState(user.email);
   const [isSuperadmin, setIsSuperadmin] = useState(user.is_superadmin);
   const [isActive, setIsActive] = useState(user.is_active);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const promoting = isSuperadmin && !user.is_superadmin;
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -170,6 +229,7 @@ function EditUserModal({
         email,
         is_superadmin: isSuperadmin,
         is_active: isActive,
+        ...(promoting ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -221,6 +281,15 @@ function EditUserModal({
           </label>
         </div>
         {user.auth_source !== "local" && <ProviderLink user={user} />}
+        {promoting && (
+          <StepUpSection
+            reason="A superadmin's password passes every re-confirmation, so promoting an account needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -234,7 +303,9 @@ function EditUserModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={mutation.isPending}
+            disabled={
+              (promoting && !stepPassword && !stepTotp) || mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
@@ -336,10 +407,20 @@ function ResetPasswordModal({
 }) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // The server asks for a step-up on an effective superadmin (flag or a
+  // wildcard role), the caller's own account included.
+  const needsStepUp = user.is_effective_superadmin ?? user.is_superadmin;
 
   const mutation = useMutation({
-    mutationFn: () => usersApi.resetPassword(user.id, password),
+    mutationFn: () =>
+      usersApi.resetPassword(
+        user.id,
+        password,
+        needsStepUp ? stepUpBody(stepPassword, stepTotp) : {},
+      ),
     onSuccess: onClose,
     onError: (err: unknown) => {
       const msg =
@@ -377,6 +458,15 @@ function ResetPasswordModal({
         <p className="text-xs text-muted-foreground">
           The user will be required to change their password on next login.
         </p>
+        {needsStepUp && (
+          <StepUpSection
+            reason="This account is a superadmin, and its password passes every re-confirmation, so resetting it needs yours."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -390,7 +480,12 @@ function ResetPasswordModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!password || mismatch || mutation.isPending}
+            disabled={
+              !password ||
+              mismatch ||
+              (needsStepUp && !stepPassword && !stepTotp) ||
+              mutation.isPending
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Resetting…" : "Reset Password"}

@@ -291,6 +291,12 @@ class ProxmoxClient:
         self._verify_tls = verify_tls
         self._ca_bundle_pem = ca_bundle_pem.strip()
         self._client: httpx.AsyncClient | None = None
+        # #1559 — guests whose per-guest config fetch failed during the
+        # most recent list_qemu / list_lxc pass, as ``"<node>/<kind>/<vmid>"``
+        # labels. Such a guest is *unreadable*, not *gone*: the reconciler
+        # reads this list and skips its address absence-delete for the pass
+        # rather than deleting the guest's mirrored rows over one hiccup.
+        self.unreadable_guests: list[str] = []
 
     async def __aenter__(self) -> ProxmoxClient:
         verify: Any
@@ -558,6 +564,9 @@ class ProxmoxClient:
                 cfg = await self._get(f"/nodes/{node}/qemu/{vmid}/config")
             except ProxmoxClientError as exc:
                 logger.warning("proxmox_qemu_config_failed", node=node, vmid=vmid, error=str(exc))
+                # #1559 — record the guest as unreadable so the reconciler
+                # does not absence-delete its addresses this pass.
+                self.unreadable_guests.append(f"{node}/qemu/{vmid}")
                 continue
             agent_enabled = _agent_flag_from_config(
                 cfg.get("agent") if isinstance(cfg, dict) else None
@@ -598,6 +607,8 @@ class ProxmoxClient:
                 cfg = await self._get(f"/nodes/{node}/lxc/{vmid}/config")
             except ProxmoxClientError as exc:
                 logger.warning("proxmox_lxc_config_failed", node=node, vmid=vmid, error=str(exc))
+                # #1559 — see list_qemu: unreadable, not gone.
+                self.unreadable_guests.append(f"{node}/lxc/{vmid}")
                 continue
             nics = _nics_from_lxc_config(cfg if isinstance(cfg, dict) else {})
             hostname = (str(cfg.get("hostname") or "") if isinstance(cfg, dict) else "") or name

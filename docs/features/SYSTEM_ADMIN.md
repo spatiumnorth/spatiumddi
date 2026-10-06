@@ -367,7 +367,7 @@ So treat an archive as the install itself. Keep it at a destination that restric
 
 #### Passphrase rules
 
-Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
+Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one. The hint is **not** secret: it is written in clear into `manifest.json` and the `secrets.enc` header of every archive, returned by the API, and recorded in the audit log when a target is edited. So a hint that contains the passphrase is refused with a 422 on every path that sets one (target create / update, create-and-download), compared case-insensitively. A target saved before that check existed keeps backing up, but its archives are written without the hint (logged as `backup_hint_contains_passphrase_dropped`); re-save it with a new passphrase and hint, because the old pair is already in its earlier archives and in the audit log.
 
 The passphrase is **not** the destination's auth credential — every destination type has its own credential fields (S3 keys, SCP password / private key, Azure account key, etc.) which are Fernet-encrypted at rest in the `backup_target.config` JSONB.
 
@@ -633,6 +633,8 @@ Each target carries:
 | `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
 
 Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+
+Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
 
 #### Manual triggers
 
