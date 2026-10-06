@@ -656,7 +656,7 @@ describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => 
     expect(createStatic).not.toHaveBeenCalled();
   });
 
-  it("static_dhcp reserves the address on the scope it shows", async () => {
+  it("static_dhcp no longer chains a DHCP call — the server syncs the reservation (#1628)", async () => {
     const { nextAddress, createStatic } = allocateWithScope();
 
     fireEvent.change(await findControl<HTMLSelectElement>("Type / Status"), {
@@ -673,9 +673,12 @@ describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => 
     });
     await press("Allocate");
 
-    await waitFor(() => expect(createStatic).toHaveBeenCalledTimes(1));
-    expect(nextAddress).toHaveBeenCalledTimes(1);
-    expect(createStatic.mock.calls[0][0]).toBe("scope-1");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({
+      status: "static_dhcp",
+      mac_address: "aa:bb:cc:dd:ee:ff",
+    });
+    expect(createStatic).not.toHaveBeenCalled();
   });
 });
 // ── #1307 — "Next available" on an IPv6 subnet ───────────────────────────────

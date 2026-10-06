@@ -3478,28 +3478,17 @@ export function AddAddressModal({
               reserved_until: reservedIso,
               force,
             });
-      // If the user picked a static_dhcp status and a scope, mirror the row
-      // into the DHCP side so the two stay in sync (the backend
-      // `upsert_ipam_for_static` helper in `services/dhcp/static_ipam.py` will
-      // find the existing IPAM row and just link / update it — no duplicate is
-      // created).
-      // #516 — the address IS already created at this point; a failing
-      // reservation must NOT surface as "Failed to allocate address" (the
-      // row exists, so re-submitting collides). Catch it separately and
-      // report it as a partial success instead.
-      let staticError: string | null = null;
-      if (ipStatus === "static_dhcp" && dhcpScopeId && mac) {
-        try {
-          await dhcpApi.createStatic(dhcpScopeId, {
-            ip_address: String(created.address),
-            mac_address: mac,
-            hostname: hostname || "",
-            description: description || "",
-          });
-        } catch (e) {
-          staticError = formatApiError(e, "DHCP reservation failed");
-        }
-      }
+      // #1628 — the backend now creates the DHCP reservation server-side
+      // when the row is a ``static_dhcp`` reservation
+      // (``sync_static_for_ipam_row``), so there is no chained
+      // ``createStatic`` call anymore. When the server could not mirror
+      // the row (no scope, several scopes, a conflicting reservation),
+      // the response carries ``dhcp_static_warning`` instead.
+      // #516 — the address IS already created at this point; an
+      // unmirrored reservation must NOT surface as "Failed to allocate
+      // address" (the row exists, so re-submitting collides). Report it
+      // as a partial success instead.
+      const staticError = created.dhcp_static_warning ?? null;
       return { created, staticError };
     },
     onSuccess: ({ staticError }) => {
@@ -3510,12 +3499,13 @@ export function AddAddressModal({
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
       if (staticError) {
-        // Address created, reservation failed — keep the modal open so the
-        // operator sees this; the row already exists (don't re-submit).
+        // Address created, reservation not mirrored — keep the modal open
+        // so the operator sees this; the row already exists (don't
+        // re-submit).
         setAddressCreated(true);
         setError(
-          `Address allocated, but the DHCP reservation failed: ${staticError}. ` +
-            "The address row was created — close this and edit the row to retry the reservation.",
+          `Address allocated, but the DHCP reservation was not created: ${staticError}. ` +
+            "The address row was created — close this and edit the row once the cause is fixed.",
         );
         return;
       }
@@ -8937,23 +8927,14 @@ export function EditAddressModal({
         reserved_until: reservedIso,
         force,
       });
-      // #867 — mirror the row into the DHCP side, same chained pattern +
-      // partial-failure contract as AddAddressModal (#516). Unlike create,
-      // the row update is idempotent, so a failed reservation is retried by
-      // simply saving again.
-      let staticError: string | null = null;
-      if (needsDhcpScope && dhcpScopeId && macAddress) {
-        try {
-          await dhcpApi.createStatic(dhcpScopeId, {
-            ip_address: String(address.address),
-            mac_address: macAddress,
-            hostname: hostname || "",
-            description: description || "",
-          });
-        } catch (e) {
-          staticError = formatApiError(e, "DHCP reservation failed");
-        }
-      }
+      // #1628 — the backend syncs the DHCP reservation server-side on
+      // update (``sync_static_for_ipam_row``), so there is no chained
+      // ``createStatic`` call anymore. When the server could not mirror
+      // the row, the response carries ``dhcp_static_warning`` instead.
+      // #867 — same partial-failure contract as AddAddressModal (#516):
+      // the row update is idempotent, so an unmirrored reservation is
+      // retried by simply saving again once the cause is fixed.
+      const staticError = updated.dhcp_static_warning ?? null;
       return { updated, staticError };
     },
     onSuccess: ({ staticError }) => {
@@ -8965,10 +8946,11 @@ export function EditAddressModal({
         qc.invalidateQueries({ queryKey: ["dhcp-statics", dhcpScopeId] });
       }
       if (staticError) {
-        // Row saved, reservation failed — keep the modal open so the
-        // operator sees it; saving again retries just the reservation.
+        // Row saved, reservation not mirrored — keep the modal open so
+        // the operator sees it; saving again retries once the cause is
+        // fixed.
         setError(
-          `Address saved, but the DHCP reservation failed: ${staticError}. ` +
+          `Address saved, but the DHCP reservation was not created: ${staticError}. ` +
             "Fix the cause and press Save again to retry the reservation.",
         );
         return;

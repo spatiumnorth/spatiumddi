@@ -36,6 +36,7 @@ that genuinely vanished from the server.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -45,6 +46,7 @@ import structlog
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.mac import canonicalize_mac
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
@@ -53,13 +55,16 @@ from app.services.dhcp.lease_cleanup import _resolve_lease_subnet_id
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "IPAMStaticSync",
     "LeaseHandover",
+    "candidate_scopes_for_ipam_row",
     "detach_ipam_for_static",
     "publish_handover_ddns",
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
     "sweep_orphaned_static_mirrors",
+    "sync_static_for_ipam_row",
     "upsert_ipam_for_static",
 ]
 
@@ -625,3 +630,239 @@ async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
     for st in statics:
         await upsert_ipam_for_static(db, scope, st, action="create")
     return len(statics)
+
+
+# ── IPAM → DHCP direction (#1628) ─────────────────────────────────────────────
+#
+# Everything above flows reservation → IPAM. The paths that *start* in IPAM —
+# address create / update, and the IPAM address importer — used to create only
+# the ``ip_address`` row: a row at ``status="static_dhcp"`` with a MAC but no
+# ``DHCPStaticAssignment`` behind it, so the address never reached the rendered
+# Kea bundle until an operator opened the row in the UI and saved it again
+# (the frontend's second, chained ``createStatic`` call was the only thing
+# that ever created the reservation, and the importer never made it at all).
+# ``sync_static_for_ipam_row`` is the reverse direction: it keeps a
+# reservation in step with an IPAM row, reusing the statics create path's
+# internals — ``push_static_change`` for the driver write-through,
+# ``upsert_ipam_for_static`` for the back-link, and ``collect_wake`` so the
+# serving group re-renders.
+
+
+@dataclass(frozen=True)
+class IPAMStaticSync:
+    """Outcome of :func:`sync_static_for_ipam_row`.
+
+    ``action`` is ``"create"`` / ``"update"`` / ``"delete"`` when a
+    reservation was changed, else ``None``. ``warning`` is a human-readable
+    reason no reservation was created/updated (ambiguous scope, conflict) —
+    the row itself is *not* an error, so callers surface it as a warning
+    rather than failing the IPAM write.
+    """
+
+    static: DHCPStaticAssignment | None = None
+    scope: DHCPScope | None = None
+    action: str | None = None
+    warning: str | None = None
+
+
+async def candidate_scopes_for_ipam_row(db: AsyncSession, row: IPAddress) -> list[DHCPScope]:
+    """The DHCP scopes that could serve a reservation for ``row``.
+
+    Scopes on the row's subnet whose address family matches the row's
+    address. Zero or one is unambiguous; more than one means the subnet is
+    served by several groups and there is no way to know which one the
+    operator meant — callers must not guess.
+    """
+    try:
+        family = "ipv6" if ipaddress.ip_address(str(row.address)).version == 6 else "ipv4"
+    except ValueError:
+        return []
+    res = await db.execute(
+        select(DHCPScope).where(
+            DHCPScope.subnet_id == row.subnet_id,
+            DHCPScope.address_family == family,
+        )
+    )
+    return list(res.scalars().all())
+
+
+async def _linked_static_for_row(db: AsyncSession, row: IPAddress) -> DHCPStaticAssignment | None:
+    """The live reservation linked to ``row``, by either back-link direction."""
+    conds = [DHCPStaticAssignment.ip_address_id == row.id]
+    linked_id = _parse_uuid(row.static_assignment_id)
+    if linked_id is not None:
+        conds.append(DHCPStaticAssignment.id == linked_id)
+    res = await db.execute(select(DHCPStaticAssignment).where(or_(*conds)))
+    return res.scalars().first()
+
+
+async def sync_static_for_ipam_row(
+    db: AsyncSession,
+    row: IPAddress,
+    *,
+    created_by_user_id: uuid.UUID | None = None,
+) -> IPAMStaticSync:
+    """Keep the DHCP reservation for an IPAM row in step with the row (#1628).
+
+    A row that *is* a reservation — ``status="static_dhcp"`` with a MAC —
+    gets exactly one ``DHCPStaticAssignment``: created on the subnet's sole
+    matching-family scope, updated in place (MAC / hostname / description)
+    when one is already linked, and adopted when an identical unlinked one
+    already sits on that scope. A row that stops being a reservation has its
+    linked reservation pushed out and deleted. More than one candidate
+    scope, or a conflicting reservation (same MAC elsewhere in the group,
+    same IP pinned to another MAC), creates nothing and returns a warning.
+
+    Driver push + agent wake mirror ``api/v1/dhcp/statics.py``; a Windows /
+    cloud push failure propagates so the caller's transaction rolls back,
+    exactly as it does on the statics endpoints.
+    """
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+    from app.services.dhcp.windows_writethrough import push_static_change  # noqa: PLC0415
+
+    linked = await _linked_static_for_row(db, row)
+    is_reservation = row.status == "static_dhcp" and bool(row.mac_address)
+
+    if not is_reservation:
+        if linked is None:
+            return IPAMStaticSync()
+        scope = await db.get(DHCPScope, linked.scope_id)
+        await push_static_change(db, linked, action="delete")
+        if scope is not None:
+            collect_wake(dhcp_group_channel(scope.group_id))
+        # The row is the caller's to keep (it merely changed status) — do NOT
+        # detach_ipam_for_static here, which would free the row itself.
+        row.static_assignment_id = None
+        await db.delete(linked)
+        await db.flush()
+        return IPAMStaticSync(static=None, scope=scope, action="delete")
+
+    try:
+        mac = canonicalize_mac(str(row.mac_address))
+    except ValueError:
+        return IPAMStaticSync(warning=f"Invalid MAC address {row.mac_address!r}")
+
+    if linked is not None:
+        scope = await db.get(DHCPScope, linked.scope_id)
+        if scope is None:
+            return IPAMStaticSync(warning="Linked DHCP reservation's scope no longer exists")
+        # A MAC the group already reserves under another row would collide
+        # in the rendered bundle; leave the reservation untouched and warn.
+        clash = await _static_mac_clash(db, scope, mac, exclude_id=linked.id)
+        if clash is not None:
+            return IPAMStaticSync(
+                static=linked,
+                scope=scope,
+                warning=f"MAC {mac} is already reserved in this DHCP group (scope {clash.scope_id})",
+            )
+        prev_mac, prev_ip = str(linked.mac_address), str(linked.ip_address)
+        changed = (
+            prev_mac != mac
+            or prev_ip != str(row.address)
+            or (linked.hostname or "") != (row.hostname or "")
+            or (linked.description or "") != (row.description or "")
+        )
+        if not changed and row.static_assignment_id == str(linked.id):
+            return IPAMStaticSync(static=linked, scope=scope)
+        linked.ip_address = str(row.address)
+        linked.mac_address = mac
+        linked.hostname = row.hostname or ""
+        linked.description = row.description or ""
+        await db.flush()
+        if changed:
+            await push_static_change(
+                db, linked, action="update", prev_mac=prev_mac, prev_ip=prev_ip
+            )
+            collect_wake(dhcp_group_channel(scope.group_id))
+        await upsert_ipam_for_static(db, scope, linked, action="update")
+        return IPAMStaticSync(static=linked, scope=scope, action="update")
+
+    scopes = await candidate_scopes_for_ipam_row(db, row)
+    if not scopes:
+        return IPAMStaticSync(
+            warning=(
+                f"No DHCP scope serves {row.address} — no reservation was created. "
+                "Create a scope for this subnet to pin the reservation."
+            )
+        )
+    if len(scopes) > 1:
+        return IPAMStaticSync(
+            warning=(
+                f"{len(scopes)} DHCP scopes serve this subnet — not guessing which one "
+                f"should hold the reservation for {row.address}; no reservation was created."
+            )
+        )
+    scope = scopes[0]
+
+    # An identical reservation already on the scope (created from the DHCP
+    # side but never back-linked, e.g. a pre-#1628 row) is adopted, not
+    # duplicated — the (scope, ip) / (scope, mac) unique indexes would
+    # reject a second one anyway.
+    existing = (
+        (
+            await db.execute(
+                select(DHCPStaticAssignment).where(
+                    DHCPStaticAssignment.scope_id == scope.id,
+                    or_(
+                        DHCPStaticAssignment.ip_address == str(row.address),
+                        DHCPStaticAssignment.mac_address == mac,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        if str(existing.ip_address) == str(row.address) and str(existing.mac_address) == mac:
+            await upsert_ipam_for_static(db, scope, existing, action="update")
+            return IPAMStaticSync(static=existing, scope=scope, action="update")
+        return IPAMStaticSync(
+            scope=scope,
+            warning=(
+                f"A conflicting DHCP reservation already exists on this scope for "
+                f"{row.address} / {mac}; no reservation was created."
+            ),
+        )
+    clash = await _static_mac_clash(db, scope, mac, exclude_id=None)
+    if clash is not None:
+        return IPAMStaticSync(
+            scope=scope,
+            warning=f"MAC {mac} is already reserved in this DHCP group (scope {clash.scope_id})",
+        )
+
+    st = DHCPStaticAssignment(
+        scope_id=scope.id,
+        ip_address=str(row.address),
+        mac_address=mac,
+        hostname=row.hostname or "",
+        description=row.description or "",
+        ip_address_id=row.id,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(st)
+    await db.flush()
+    await push_static_change(db, st, action="create")
+    collect_wake(dhcp_group_channel(scope.group_id))
+    await upsert_ipam_for_static(db, scope, st, action="create")
+    return IPAMStaticSync(static=st, scope=scope, action="create")
+
+
+async def _static_mac_clash(
+    db: AsyncSession, scope: DHCPScope, mac: str, *, exclude_id: uuid.UUID | None
+) -> DHCPStaticAssignment | None:
+    """Another live reservation in ``scope``'s group already holding ``mac``.
+
+    Mirrors the MAC half of ``statics._conflict_check`` (uniqueness is
+    group-wide there because Kea renders one config per group).
+    """
+    res = await db.execute(
+        select(DHCPStaticAssignment)
+        .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
+        .where(DHCPScope.group_id == scope.group_id, DHCPStaticAssignment.mac_address == mac)
+    )
+    for other in res.scalars().all():
+        if exclude_id is not None and other.id == exclude_id:
+            continue
+        return other
+    return None
