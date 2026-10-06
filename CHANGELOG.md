@@ -580,6 +580,20 @@ the formatter handles the rest.
   the template sets gets the DDNS inheritance it would get with no
   template.
 
+- **Applying a DDNS template to an existing subnet or block no longer
+  turns its DDNS off (#1421).** Apply (`POST /ipam/templates/{id}/apply`)
+  without `force` fills only the target's empty columns, and a stored
+  `ddns_enabled = false` or hostname policy is not empty, so a template
+  that turns DDNS on never wrote either one. Its DDNS lock still turned
+  the target's DDNS inheritance off, so a subnet that inherited DDNS (on,
+  say, from its block) was pinned to its own stored DDNS, which was off.
+  The lock now comes with all four of the template's DDNS values. That
+  overwrites nothing an operator set, because a carrier that inherits
+  DDNS ignores its own DDNS columns. A carrier with its own DDNS keeps
+  its values without `force`, as before. `fields_written`, and the
+  apply's audit row, now name `ddns_inherit_settings` when the apply
+  turns DDNS inheritance off.
+
 - **A custom field's Default Value is what the IPAM dialogs send, not
   only what they show (#1303).** Allocate IP, New Subnet and New IP Block
   showed a field's Default Value (Settings → Custom Fields) as its value,
