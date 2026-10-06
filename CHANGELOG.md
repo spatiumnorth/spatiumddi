@@ -144,6 +144,20 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **A full restore no longer fails at random with "deadlock detected" while
+  the appliance is serving (#1444).** A full restore ends every other
+  database session once, then clears the schema and replays the archive in
+  one transaction (#1363), dropping the tables one at a time and holding
+  each lock to commit. The api, the worker and the agents reconnect at
+  once. A session that read a table the drops had not reached yet, and then
+  waited for one they had already dropped, closed a cycle when the drops
+  reached its table. When PostgreSQL rolled back the restore's side, the
+  restore answered 400 "deadlock detected" and restored nothing (3 of 50 QA
+  restores). Before it clears the schema, the restore now ends its own
+  role's sessions that came back and hold a table, then takes every table
+  in one `LOCK TABLE`, and tries again if a deadlock picks that attempt, so
+  the drops wait for nobody.
+
 - **IPAM writes PTRs only into a reverse zone it serves as primary
   (#1419).** IPAM picked the zone for a PTR by kind and name alone, so a
   conditional forwarder, a secondary or a stub named under in-addr.arpa or
