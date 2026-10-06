@@ -4,7 +4,7 @@ Layout (matches the spec in the issue body):
 
 .. code-block:: text
 
-    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip
+    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip
     ├── manifest.json     # version, schema head, hostname, created_at
     ├── database.sql      # pg_dump --format=plain
     ├── secrets.enc       # passphrase-wrapped SECRET_KEY + metadata
@@ -31,6 +31,7 @@ import asyncio
 import io
 import json
 import os
+import secrets
 import socket
 import tempfile
 import zipfile
@@ -44,7 +45,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.services.backup.crypto import encrypt_secrets
+from app.services.backup.crypto import encrypt_secrets, hint_reveals_passphrase
 
 logger = structlog.get_logger(__name__)
 
@@ -424,7 +425,7 @@ async def build_backup_archive(
 
     Caller (the API endpoint) streams the bytes back to the
     operator. Filename pattern:
-    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip``.
+    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip``.
 
     ``exclude_secrets`` (Phase 3 diagnostic mode): every
     Fernet-encrypted column + every ``__enc__:`` JSONB field is
@@ -440,6 +441,13 @@ async def build_backup_archive(
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
+    if hint_reveals_passphrase(passphrase, passphrase_hint):
+        # The write paths refuse this; a target saved before they did
+        # can still hold it. Dropped rather than raised so the schedule
+        # keeps producing backups — the hint is a convenience, the
+        # backup is not. Never log the hint itself.
+        logger.warning("backup_hint_contains_passphrase_dropped")
+        passphrase_hint = None
     schema_head = await _read_alembic_head(db)
     hostname = socket.gethostname()
     created_at = datetime.now(UTC)
@@ -538,7 +546,13 @@ async def build_backup_archive(
         "".join(c if c.isalnum() or c in "-_" else "-" for c in hostname).strip("-") or "spatiumddi"
     )
     timestamp = created_at.strftime("%Y%m%d-%H%M%S")
-    filename = f"spatiumddi-backup-{safe_host}-{timestamp}.zip"
+    # One-second resolution alone collided (#1571): two runs in the
+    # same second — two targets sharing a destination, or a manual
+    # run racing the schedule — wrote the SAME filename with
+    # different passphrases, and the survivor would not decrypt with
+    # the overwritten target's passphrase while both runs reported
+    # success. A short random suffix makes each name unique.
+    filename = f"spatiumddi-backup-{safe_host}-{timestamp}-{secrets.token_hex(3)}.zip"
     logger.info(
         "backup_archive_built",
         bytes=len(archive_bytes),

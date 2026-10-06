@@ -45,7 +45,13 @@ from .identity import (
 )
 from .log import configure_logging
 from .nettools_proxy import start_nettool_thread
-from .register import RegisterDisabled, RegisterFatal, register
+from .register import (
+    RegisterCodeRejected,
+    RegisterDisabled,
+    RegisterFatal,
+    RegisterThrottled,
+    register,
+)
 from .state import ensure_layout
 
 
@@ -242,6 +248,25 @@ def _maybe_register(
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
         return cfg
+    except RegisterThrottled as exc:
+        # #1356 — the main loop calls us again on its next tick.
+        log.warning("supervisor.register.throttled", reason=str(exc))
+        return cfg
+    except RegisterCodeRejected as exc:
+        # #1356 — drop the dead code instead of re-presenting it every tick:
+        # each retry spends one of this address's registration attempts, so
+        # a box stuck on a dead code would keep the address throttled for
+        # every appliance pairing from behind it. A remote appliance waits
+        # for the operator to hand it a new code (spatium-pair restarts us);
+        # the control-plane node clears the URL too, so the next tick mints a
+        # fresh self-bootstrap code (e.g. its 10-minute one expired while the
+        # control plane was refusing attempts).
+        log.error("supervisor.register.code_rejected", reason=str(exc))
+        if appliance_state.detect_appliance_variant() == "control-plane":
+            return dataclasses.replace(
+                cfg, bootstrap_pairing_code="", control_plane_url=""
+            )
+        return dataclasses.replace(cfg, bootstrap_pairing_code="")
     except RegisterFatal as exc:
         log.error("supervisor.register.fatal", reason=str(exc))
         # A certificate that changed before approval is re-pinned here, or

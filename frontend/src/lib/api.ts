@@ -10304,7 +10304,9 @@ export type AlertRuleType =
   | "dhcp_pool_exhaustion"
   | "secret_expiring"
   | "decom_expiring"
-  | "node_pressure";
+  | "node_pressure"
+  | "backup_failed"
+  | "backup_stale";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -12327,7 +12329,8 @@ export const clusterUpgradesApi = {
 // Two flavours:
 //   * Ephemeral (persistent=false) — single-use, short expiry,
 //     cleartext shown once on create.
-//   * Persistent (persistent=true) — multi-claim; default no expiry;
+//   * Persistent (persistent=true) — multi-claim; default 30-day expiry
+//     (expires_in_minutes: 0 = never, #1356);
 //     admin can disable / re-reveal the cleartext via Fernet decrypt
 //     after a password re-check.
 //
