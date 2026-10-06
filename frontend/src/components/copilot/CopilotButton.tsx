@@ -49,8 +49,8 @@ export function CopilotButton() {
     });
   }, []);
 
-  // Hide when we *know* no providers are enabled. Show optimistically
-  // when we couldn't fetch (403) since non-superadmins still get to chat.
+  // Shown only when the server says a chat would find an enabled
+  // provider; every signed-in user may ask it (#1345).
   if (!aiAvailable) return null;
 
   return (

@@ -115,9 +115,13 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # TSIG key shared by all servers in this group, used to authenticate
     # RFC 2136 dynamic updates from the agent over loopback. Auto-generated
-    # on first server registration.
+    # on first server registration. The BIND9 agent grants it allow-update
+    # and allow-transfer on every primary zone the group serves, so the
+    # secret is Fernet-encrypted like every other credential (#1364); read
+    # and write it through ``group_tsig_secret`` / ``set_group_tsig_secret``
+    # in ``app.services.dns.tsig``.
     tsig_key_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tsig_key_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tsig_key_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     tsig_key_algorithm: Mapped[str] = mapped_column(
         String(50), nullable=False, default="hmac-sha256"
     )

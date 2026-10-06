@@ -18,6 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select, update
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import refuse_if_stepup_blocked
 from app.config import settings
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
@@ -33,6 +34,9 @@ from app.core.auth.saml import (
     build_authorize_url as saml_authorize_url,
 )
 from app.core.auth.saml import (
+    claim_assertion as saml_claim_assertion,
+)
+from app.core.auth.saml import (
     consume_assertion as saml_consume_assertion,
 )
 from app.core.auth.tacacs import TACACSServiceError, authenticate_tacacs
@@ -42,13 +46,10 @@ from app.core.auth.user_sync import (
     sync_external_user,
 )
 from app.core.auth_throttle import (
-    StepupThrottleUnavailable,
-    claim_stepup_attempt,
     login_rate_limited,
     mfa_challenge_consume,
     record_stepup_password_failure,
     refund_stepup_attempt,
-    stepup_password_blocked,
 )
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import effective_grants, is_effective_superadmin
@@ -1073,6 +1074,14 @@ class MfaEnrolBeginResponse(BaseModel):
     recovery_codes: list[str]
 
 
+class MfaRecoveryCodesResponse(BaseModel):
+    """Regenerate's answer: the new codes and nothing else. The TOTP secret
+    must never be returned after enrolment — one live code plus a session
+    would otherwise hand over the second factor for good."""
+
+    recovery_codes: list[str]
+
+
 class MfaEnrolVerifyRequest(BaseModel):
     code: str
 
@@ -1125,35 +1134,17 @@ async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusRe
 
 
 async def _refuse_if_stepup_blocked(user: User, *, claim: bool = False) -> None:
-    """429 once the account has spent its wrong-answer budget on MFA
-    step-ups (#1241). These run for a caller who already holds a session —
-    the hijacked session they exist to stop — so unthrottled, each is an
-    oracle for the password (or, on disable / regenerate, the TOTP code).
-
-    ``claim=True`` spends the attempt atomically up front instead of only
-    reading the count (#1354); the caller refunds it on a right answer.
-
-    503 while the budget cannot be read: the throttle fails closed, so a
-    Redis outage pauses MFA changes rather than lifting the limit."""
-    try:
-        if claim:
-            blocked = not await claim_stepup_attempt(user.id)
-        else:
-            blocked = await stepup_password_blocked(user.id)
-    except StepupThrottleUnavailable:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Two-factor settings can't be changed right now because the "
-                "attempt limiter is unavailable. Try again in a minute."
-            ),
-            headers={"Retry-After": "60"},
-        ) from None
-    if blocked:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many incorrect attempts. Try again in 15 minutes.",
-        )
+    """The shared step-up budget gate (``app.api.stepup``), with the MFA
+    wording for its 503. Kept as a wrapper so every MFA endpoint keeps one
+    call site; the budget logic itself lives once, in the shared module."""
+    await refuse_if_stepup_blocked(
+        user,
+        claim=claim,
+        unavailable_detail=(
+            "Two-factor settings can't be changed right now because the "
+            "attempt limiter is unavailable. Try again in a minute."
+        ),
+    )
 
 
 @router.post("/mfa/enroll/begin", response_model=MfaEnrolBeginResponse)
@@ -1366,11 +1357,11 @@ async def mfa_disable(
 
 @router.post(
     "/mfa/recovery-codes/regenerate",
-    response_model=MfaEnrolBeginResponse,
+    response_model=MfaRecoveryCodesResponse,
 )
 async def mfa_regenerate_recovery_codes(
     body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
-) -> MfaEnrolBeginResponse:
+) -> MfaRecoveryCodesResponse:
     """Replace the recovery-code list. Same two-factor reauth as
     ``/disable``. Returns the new codes ONCE — operator must record them.
     The existing ``secret`` is kept so the authenticator app entry stays
@@ -1410,11 +1401,7 @@ async def mfa_regenerate_recovery_codes(
         )
     )
     await db.commit()
-    return MfaEnrolBeginResponse(
-        secret=secret,
-        otpauth_uri=otpauth_uri(secret, current_user.username),
-        recovery_codes=codes,
-    )
+    return MfaRecoveryCodesResponse(recovery_codes=codes)
 
 
 # ── OIDC / SAML redirect flow ────────────────────────────────────────────────
@@ -1636,7 +1623,7 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
 
     relay_state = py_secrets.token_urlsafe(32)
     try:
-        authorize_url = saml_authorize_url(cfg, base, relay_state)
+        authorize_url, request_id = saml_authorize_url(cfg, base, relay_state)
     except Exception as exc:  # noqa: BLE001 — python3-saml surfaces plain Exception
         logger.warning("saml_authorize_build_error", provider=provider.name, error=str(exc))
         return _login_error_redirect("saml_build_failed")
@@ -1645,6 +1632,8 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
         {
             "provider_id": str(provider.id),
             "relay_state": relay_state,
+            # The AuthnRequest this flow sent: the Response must answer it (#1335).
+            "request_id": request_id,
             "exp": int(datetime.now(UTC).timestamp()) + _SAML_FLOW_TTL,
         }
     )
@@ -1782,12 +1771,29 @@ async def saml_callback(
         return _login_error_redirect("saml_state_mismatch")
     if RelayState != flow.get("relay_state"):
         return _login_error_redirect("saml_state_mismatch")
+    # A flow that kept no AuthnRequest ID (started before #1335's fix) cannot
+    # tell its own Response from another flow's, so it starts again.
+    request_id = flow.get("request_id")
+    if not request_id:
+        return _login_error_redirect("saml_state_invalid")
 
     try:
         cfg = SAMLConfig.from_provider(provider, base)
+        # The Response must answer this flow's AuthnRequest, and its Assertion
+        # signs in once (#1335). Bound to its request, a Response lifted from
+        # one browser's sign-in does not sign in through another's; spent on
+        # first use, it does not sign in twice through its own.
         consumed = saml_consume_assertion(
-            cfg, base, {"SAMLResponse": SAMLResponse, "RelayState": RelayState}
+            cfg,
+            base,
+            {"SAMLResponse": SAMLResponse, "RelayState": RelayState},
+            request_id=request_id,
         )
+        if not await saml_claim_assertion(consumed):
+            raise SAMLServiceError(
+                f"SAML response rejected: assertion {consumed.assertion_id} has "
+                "already been used to sign in"
+            )
     except SAMLServiceError as exc:
         logger.warning("saml_assertion_rejected", provider=provider.name, error=str(exc))
         db.add(

@@ -2696,9 +2696,9 @@ async def reveal_snmp_community(
     at least visible. Local-auth users only; external-auth users have
     no local password to re-confirm.
     """
+    from app.api.stepup import require_operator_stepup
     from app.core.crypto import decrypt_str
     from app.models.audit import AuditLog
-    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -2725,19 +2725,18 @@ async def reveal_snmp_community(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="snmp_community_reveal_denied",
+        resource_type="platform_settings",
+        resource_id="snmp",
+        resource_display="SNMP community",
+    )
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:
@@ -3028,6 +3027,35 @@ class AuditTargetBody(BaseModel):
             raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
         return v
 
+    @model_validator(mode="after")
+    def _valid_kind_config(self) -> AuditTargetBody:
+        # Per-kind completeness (#1581), mirroring the legacy
+        # flat-settings validators below. Without this a host-less
+        # syslog / URL-less webhook target was saved enabled, then
+        # silently skipped by ``audit_forward._load_targets``, and an
+        # SMTP target with no recipients warned on every audit row.
+        if self.kind == "syslog":
+            if not self.host.strip():
+                raise ValueError("host is required for a syslog target")
+            if not (1 <= self.port <= 65535):
+                raise ValueError("port must be 1–65535")
+            if not (0 <= self.facility <= 23):
+                raise ValueError("facility must be 0–23 (RFC 5424)")
+        elif self.kind == "webhook":
+            if not self.url.strip():
+                raise ValueError("url is required for a webhook target")
+        elif self.kind == "smtp":
+            if not self.smtp_host.strip():
+                raise ValueError("smtp_host is required for an smtp target")
+            if not (1 <= self.smtp_port <= 65535):
+                raise ValueError("smtp_port must be 1–65535")
+            if not self.smtp_from_address.strip():
+                raise ValueError("smtp_from_address is required for an smtp target")
+            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
+            if not recipients:
+                raise ValueError("smtp_to_addresses must contain at least one recipient")
+        return self
+
 
 class AuditTargetResponse(BaseModel):
     id: str
@@ -3120,6 +3148,63 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.resource_types = body.resource_types
 
 
+def _forward_snapshot(t: AuditForwardTarget) -> dict:
+    """Audit snapshot of an audit-forward target.
+
+    Never carries the webhook URL, ``auth_header`` or SMTP password
+    (nor the CA cert) — only ``*_set`` booleans for those, per #1502 /
+    PR #1506: the audit log must not become a copy of the secrets it
+    describes.
+    """
+    return {
+        "name": t.name,
+        "enabled": t.enabled,
+        "kind": t.kind,
+        "format": t.format,
+        "host": t.host,
+        "port": t.port,
+        "protocol": t.protocol,
+        "facility": t.facility,
+        "ca_cert_pem_set": bool(t.ca_cert_pem),
+        "url_set": bool(t.url),
+        "auth_header_set": bool(t.auth_header),
+        "webhook_flavor": t.webhook_flavor,
+        "smtp_host": t.smtp_host,
+        "smtp_port": t.smtp_port,
+        "smtp_security": t.smtp_security,
+        "smtp_username": t.smtp_username,
+        "smtp_password_set": bool(t.smtp_password_encrypted),
+        "smtp_from_address": t.smtp_from_address,
+        "smtp_to_addresses": list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        "smtp_reply_to": t.smtp_reply_to,
+        "min_severity": t.min_severity,
+        "resource_types": t.resource_types,
+    }
+
+
+def _audit_forward_target(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: AuditForwardTarget,
+    old_value: dict | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="audit_forward_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            old_value=old_value,
+            new_value=None if action == "delete" else _forward_snapshot(row),
+        )
+    )
+
+
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
 async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
     if not is_effective_superadmin(current_user):
@@ -3142,6 +3227,8 @@ async def create_audit_target(
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
+    await db.flush()
+    _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
@@ -3166,7 +3253,9 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    old_value = _forward_snapshot(row)
     _apply_body(row, body)
+    _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -3183,6 +3272,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
+    _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
 
@@ -3256,9 +3346,14 @@ async def test_audit_target(
         "resource_types": None,
     }
     try:
-        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        outcome = await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+    if outcome != audit_forward_svc.DELIVERED:
+        # #1577: a filtered target, a misconfigured one, or a rejected
+        # webhook used to report "ok" here because delivery was merely
+        # attempted.
+        raise HTTPException(status_code=502, detail=f"delivery failed: {outcome}")
     return {"status": "ok", "target": row.name}
 
 

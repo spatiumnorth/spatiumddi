@@ -93,7 +93,7 @@ DHCPScope
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
   ddns_enabled: bool
-  ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
+  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -140,6 +140,11 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
+
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
@@ -1459,8 +1464,11 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Hostname sync mode must be one of the configured values.** Mode
   picker is validated against `VALID_SYNC_MODES`; reserved / internal
   modes are not selectable from the API. `422`.
-- **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
-  of the documented values (see §13). Pydantic validator.
+- **DDNS hostname policy enum.** `ddns_hostname_policy` must be one of
+  `client`, `server_name`, `derived` or `none`, on create and on update
+  (#1308). An edit checks the policy only when it changes it, so a value
+  stored before update checked it does not block an unrelated edit.
+  `422`.
 - **A field must not be set twice, under both its names, to different
   values.** Two scope fields are accepted under two names: `enabled`
   (what the response emits) is the same column as `is_active` (what

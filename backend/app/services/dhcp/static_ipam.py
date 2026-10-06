@@ -184,6 +184,15 @@ async def upsert_ipam_for_static(
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
+    # A row taken over here may be a lease's mirror: the address a client
+    # leases, pinned to that client, or one #1274 / #1302 handed to the live
+    # lease. Its lease flags go with it (#1404). The lease-event ingest takes
+    # ``auto_from_lease`` as "this row is mine", so a reservation's row that
+    # kept it was turned back into a ``dhcp`` row by the client's next lease
+    # event, and deleted by the lease's release or expiry, while the
+    # reservation stood.
+    row.auto_from_lease = False
+    row.dhcp_lease_id = None
     # Restore any operator-authored columns captured when this reservation's
     # mirror was deleted (lossless Trash restore, #630), then clear the
     # snapshot so it can't go stale or re-apply on a later ordinary edit.

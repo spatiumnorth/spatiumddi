@@ -662,7 +662,7 @@ def _consume_with_nameid_format(
         def __init__(self, *_a: object, **_k: object) -> None:
             pass
 
-        def process_response(self) -> None:
+        def process_response(self, request_id: str | None = None) -> None:
             return None
 
         def get_errors(self) -> list[str]:
@@ -682,6 +682,12 @@ def _consume_with_nameid_format(
 
         def get_session_index(self) -> str:
             return ""
+
+        def get_last_assertion_id(self) -> str:
+            return "_assertion"
+
+        def get_last_assertion_not_on_or_after(self) -> int | None:
+            return None
 
     monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Settings", lambda *_a, **_k: None)
     monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Auth", _FakeAuth)

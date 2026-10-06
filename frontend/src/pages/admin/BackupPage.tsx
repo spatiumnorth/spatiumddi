@@ -190,7 +190,7 @@ function CreateBackupCard() {
         </Field>
         <Field
           label="Hint (optional)"
-          help="A short label to remind you which passphrase decrypts this archive. Stored in the archive in clear text."
+          help="A short label to remind you which passphrase decrypts this archive. Stored in the archive in clear text — never put the passphrase itself here."
         >
           <input
             type="text"

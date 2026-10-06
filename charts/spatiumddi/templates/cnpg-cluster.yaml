@@ -46,21 +46,20 @@ metadata:
     # Observed live on a #272 promote: the Postgres data volume was
     # destroyed while Redis (a plain StatefulSet) scaled in place.
     #
-    # ``resource-policy: keep`` makes Helm leave this resource untouched —
-    # not just on uninstall/rollback (the data-safety goal) but on
-    # *upgrade* too: the k3s helm-controller will NOT patch a kept
-    # resource's spec. So when the seed scales the control plane via the
-    # spatium-control HelmChartConfig, Helm bumps api/worker/frontend/redis
-    # but silently skips this Cluster — it stays at whatever instance
-    # count it was first created with (observed live: a 1->3 promote left
-    # Postgres single-node while everything else scaled). The supervisor
-    # therefore scales the Cluster OUT OF BAND with a direct merge-patch on
-    # ``spec.instances`` (k8s_api.patch_cnpg_instances, called from the
-    # heartbeat) — a merge-patch isn't a Helm op, so ``keep`` doesn't
-    # apply and the CNPG operator reconciles the new replica set normally.
-    # ``instances`` below is just the initial value at first create; the
-    # supervisor owns it thereafter. The data only ever goes away when the
-    # node/cluster is intentionally destroyed (factory reset / node delete).
+    # ``resource-policy: keep`` makes Helm leave this resource in place on
+    # uninstall/rollback — the data-safety goal. It does NOT stop an
+    # upgrade from patching it: the k3s helm-controller re-applies this
+    # Cluster on every upgrade, as a server-side apply that may not force
+    # a conflict (#1313). The supervisor sizes ``spec.instances`` itself
+    # (k8s_api.patch_cnpg_instances, called from the heartbeat: a scale-up
+    # at once, a scale-down held while a dead node is replaced, #1059) and
+    # renders ``postgresql.cnpg.instances`` into the spatium-control
+    # HelmChartConfig as the count that patch left, so the apply below
+    # never tries to change a field the supervisor's patch wrote. One that
+    # did failed the upgrade, and the helm-controller's recovery
+    # uninstalled the whole release, again on every retry. The data only
+    # ever goes away when the node/cluster is intentionally destroyed
+    # (factory reset / node delete).
     helm.sh/resource-policy: keep
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
@@ -81,12 +80,10 @@ spec:
   seccompProfile:
     type: {{ . }}
   {{- end }}
-  # NOTE both fields above only reach a cluster on FIRST CREATE. The
-  # ``helm.sh/resource-policy: keep`` annotation stops Helm patching this CR
-  # on upgrade, so an appliance installed before #983 keeps whatever the
-  # operator defaulted to until the Cluster is recreated. That is the
-  # accepted trade — the annotation exists because a Helm-driven delete of
-  # this CR destroys the database, which is far worse than an unranked pod.
+  # NOTE ``helm.sh/resource-policy: keep`` does not make these fields
+  # first-create-only: the helm-controller re-applies this CR on every
+  # upgrade (#1313). ``keep`` only keeps it, and the database with it,
+  # through a Helm-driven delete.
 
   # #296 Phase A — PDB on by default (set in values.yaml). Suspended
   # during a rolling-upgrade node's maintenance window — the api-side

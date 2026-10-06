@@ -28,6 +28,8 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 
 // ── tool catalog ────────────────────────────────────────────────────
 
@@ -208,11 +210,13 @@ export function NetworkToolsPage() {
 
   // Fleet appliances we can dispatch reachability tools to. Cheap +
   // shared list endpoint; refetch on a short cadence so the online set
-  // tracks heartbeats while the page is open.
-  const { data: appliances } = useQuery({
+  // tracks heartbeats while the page is open — until the read is refused
+  // (#1343): a caller without admin on appliance is refused every time,
+  // and every refusal is a denied audit row.
+  const { data: appliances, error: appliancesError } = useQuery({
     queryKey: ["appliance-approval-list"],
     queryFn: () => applianceApprovalApi.list(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
     staleTime: 15_000,
   });
 
@@ -254,6 +258,7 @@ export function NetworkToolsPage() {
               value={effectiveRunFrom}
               onChange={setRunFrom}
               appliances={onlineAppliances}
+              listError={appliances ? null : appliancesError}
             />
           )}
           <div className="mt-2 space-y-1">
@@ -306,15 +311,19 @@ export function NetworkToolsPage() {
 
 /** Live run-from selector for the reachability tools — "Server" plus
  *  every online Fleet appliance. With zero online appliances it still
- *  offers "Server" and notes that nothing's reachable. */
+ *  offers "Server" and notes that nothing's reachable. When the appliance
+ *  list could not be read it says that instead: "no appliances online" is
+ *  then something nobody knows (#1343). */
 function RunFromSelector({
   value,
   onChange,
   appliances,
+  listError,
 }: {
   value: string;
   onChange: (v: string) => void;
   appliances: ApplianceRow[];
+  listError?: unknown;
 }) {
   return (
     <div className="rounded-md border border-border bg-muted/30 p-2">
@@ -332,9 +341,16 @@ function RunFromSelector({
         ))}
       </select>
       <p className="mt-1 text-[10px] leading-tight text-muted-foreground/70">
-        {appliances.length === 0
-          ? "Runs execute from the control-plane server — no appliances online."
-          : "Pick the control plane or a Fleet appliance's vantage point."}
+        {listError ? (
+          <>
+            Runs execute from the control-plane server.{" "}
+            <ListReadError error={listError} what="the Fleet appliances" />
+          </>
+        ) : appliances.length === 0 ? (
+          "Runs execute from the control-plane server — no appliances online."
+        ) : (
+          "Pick the control plane or a Fleet appliance's vantage point."
+        )}
       </p>
     </div>
   );

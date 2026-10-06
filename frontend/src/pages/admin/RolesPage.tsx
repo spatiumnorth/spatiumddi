@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
   rolesApi,
   type AppRole,
   type PermissionEntry,
@@ -10,6 +11,8 @@ import {
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
 // Mirror of docs/PERMISSIONS.md — keep these in sync.
@@ -157,6 +160,11 @@ function RoleModal({
     role?.permissions ?? [],
   );
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -166,7 +174,10 @@ function RoleModal({
         permissions,
       };
       return role
-        ? rolesApi.update(role.id, payload as RoleUpdate)
+        ? rolesApi.update(role.id, {
+            ...(payload as RoleUpdate),
+            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
+          })
         : rolesApi.create(payload as RoleCreate);
     },
     onSuccess: () => {
@@ -174,6 +185,11 @@ function RoleModal({
       onClose();
     },
     onError: (err: unknown) => {
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: unknown } } })?.response?.data
           ?.detail ?? "Failed to save role";
@@ -216,6 +232,15 @@ function RoleModal({
         <fieldset disabled={readOnly} className="disabled:opacity-60">
           <PermissionEditor value={permissions} onChange={setPermissions} />
         </fieldset>
+        {needsStepUp && (
+          <StepUpSection
+            reason="This change makes members of the groups holding this role superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -230,7 +255,11 @@ function RoleModal({
                 setError(null);
                 mutation.mutate();
               }}
-              disabled={!name || mutation.isPending}
+              disabled={
+                !name ||
+                mutation.isPending ||
+                (needsStepUp && !stepPassword && !stepTotp)
+              }
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {mutation.isPending ? "Saving…" : "Save"}
@@ -318,6 +347,12 @@ function DeleteModal({
           Any groups referencing it will lose those permissions. This cannot be
           undone.
         </p>
+        {/* A refused or failed delete says so; the dialog stays (#1344). */}
+        {mutation.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
