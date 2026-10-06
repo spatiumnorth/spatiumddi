@@ -633,7 +633,7 @@ describe("Allocate IP has no DHCP Scope picker — the server picks the scope (#
     return { nextAddress, createStatic };
   }
 
-  it('no status shows a scope picker, because the request carries none', async () => {
+  it("no status shows a scope picker, because the request carries none", async () => {
     const { nextAddress, createStatic } = allocateWithScope();
     const status = await findControl<HTMLSelectElement>("Type / Status");
 

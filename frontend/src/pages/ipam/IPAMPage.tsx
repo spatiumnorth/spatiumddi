@@ -3833,8 +3833,8 @@ export function AddAddressModal({
         </div>
         {needsDhcpScope && dhcpScopes.length === 0 && (
           <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-            No DHCP scope exists for this subnet — a reservation needs one,
-            so the server will create the address without one and say so.
+            No DHCP scope exists for this subnet — a reservation needs one, so
+            the server will create the address without one and say so.
             <button
               type="button"
               onClick={() => setShowCreateScope(true)}
@@ -9109,8 +9109,8 @@ export function EditAddressModal({
             picks the subnet's sole matching scope itself. */}
         {needsDhcpScope && dhcpScopes.length === 0 && (
           <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-            No DHCP scope exists for this subnet — a reservation needs one,
-            so the server will save the address without one and say so.
+            No DHCP scope exists for this subnet — a reservation needs one, so
+            the server will save the address without one and say so.
             <button
               type="button"
               onClick={() => setShowCreateScope(true)}
@@ -9134,17 +9134,17 @@ export function EditAddressModal({
         )}
         {status === "static_dhcp" && address.static_assignment_id && (
           <p className="text-[11px] text-muted-foreground">
-            A DHCP reservation is linked to this address. Saving keeps it
-            in step — the reservation takes this row's MAC and hostname —
-            and it is removed if the status moves away from static_dhcp.
+            A DHCP reservation is linked to this address. Saving keeps it in
+            step — the reservation takes this row's MAC and hostname — and it is
+            removed if the status moves away from static_dhcp.
           </p>
         )}
         {address.status === "static_dhcp" &&
           status !== "static_dhcp" &&
           address.static_assignment_id && (
             <p className="text-[11px] text-amber-700 dark:text-amber-400">
-              Saving removes the linked DHCP reservation — the server
-              deletes it in step with this row's status change.
+              Saving removes the linked DHCP reservation — the server deletes it
+              in step with this row's status change.
             </p>
           )}
         <div className="grid grid-cols-2 gap-2">
