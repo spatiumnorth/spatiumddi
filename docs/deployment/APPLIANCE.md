@@ -2559,18 +2559,32 @@ introduced by an upgrade don't clobber operator-created ones.
    - Re-stamps the slot filesystem UUID into `/boot/efi/grub/
      grub.cfg` (since the slot raw.xz carries its own UUID
      baked at build time, the menuentry has to be patched).
+   - Copies the new slot's image tarballs to `/var/lib/rancher/
+     k3s/agent/images/`, each under a hidden `.part` name and
+     then renamed into place, so the running k3s never imports a
+     half-written tarball (#1630).
    - The active slot is never touched.
 4. `spatium-upgrade-slot set-next-boot` writes
    `next_entry=slot_b` (one-shot) via grub-reboot.
 5. Operator reboots. Grub honours `next_entry`, clears it,
    and falls back to `saved_entry` (the durable default) if
    anything in steps 6-8 fails before they finish.
-6. New slot boots. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200.
+6. New slot boots. Before k3s starts, `k3s.service` clears
+   containerd's unfinished content writes (`spatium-k3s-images
+   clear-ingests`), so a write an earlier import left behind
+   cannot fail this boot's imports (#1630). k3s imports the new
+   tarballs. `spatiumddi-firstboot.service` waits for
+   `/health/live` to return 200. It then checks that k3s
+   imported every baked tarball and that every image is in
+   containerd, and has k3s re-import whatever is missing
+   (`spatium-k3s-images verify --repair`, #1630).
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
-   broken): no commit happens. Next reboot reverts to the
+   broken, or an image still missing after the re-import,
+   which would leave a workload in `ErrImageNeverPull`; for
+   that one firstboot exits 1 before the commit): no commit
+   happens. Next reboot reverts to the
    previous `saved_entry` automatically. If the new slot's
    migrate step had already run, the reverted release cannot
    start on the migrated database: see

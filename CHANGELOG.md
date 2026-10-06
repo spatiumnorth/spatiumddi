@@ -383,6 +383,16 @@ the formatter handles the rest.
   checks k3s's own record of what it imported against containerd,
   and has k3s re-import anything missing.
 
+- **A trial slot is not committed while one of its images is
+  missing (#1630).** firstboot committed a slot upgrade's trial
+  boot once the apiserver answered and the control chart was
+  placed, whatever k3s had imported, so a node whose DNS and DHCP
+  agents' images had failed to import made the swap durable
+  without them. If an image is still missing after the re-import
+  above, a trial boot now exits before the commit. The previous
+  slot stays the durable default and the next reboot reverts to
+  it, as with a failed host migration.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

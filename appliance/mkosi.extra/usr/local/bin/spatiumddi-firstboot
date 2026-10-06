@@ -1632,6 +1632,22 @@ check_slot_images() {
     return 1
 }
 
+# #1630 — a TRIAL boot does not commit while one of the slot's images is
+# missing. Committing made the swap durable with, for instance, the DNS and
+# DHCP agents unable to start on this node. Not committing leaves the
+# previous slot as the durable default, so the next reboot reverts to it,
+# the same path a failed host-migrate reconcile takes (#554). A steady-state
+# boot has nothing to commit: the miss is logged and the boot goes on.
+slot_images_allow_commit() {
+    check_slot_images && return 0
+    if is_trial_boot; then
+        echo "       trial boot: NOT committing this slot; next reboot reverts." >&2
+        return 1
+    fi
+    echo "       steady-state boot: nothing to commit; continuing." >&2
+    return 0
+}
+
 # ── Readiness wait + slot commit ─────────────────────────────────────────────
 # Phase 8c — commit the active slot as the durable default after a
 # successful trial boot. spatium-upgrade-slot set-next-boot writes a
@@ -1937,7 +1953,7 @@ if [ "$ready" = 1 ]; then
     place_deferred_tls_manifest
     reassert_control_plane_class || true
     place_deferred_control_manifest
-    check_slot_images || true
+    slot_images_allow_commit || exit 1
     commit_slot_if_healthy
     # #779 — immediate first verdict on Web UI firewall reachability, so a
     # missing accept rule (#776's failure) is volunteered right here in the

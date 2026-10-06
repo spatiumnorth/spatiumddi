@@ -367,7 +367,9 @@ def _ready_branch() -> list[str]:
 
 def test_firstboot_checks_the_slots_images_before_the_slot_commit() -> None:
     branch = _ready_branch()
-    calls = [i for i, ln in enumerate(branch) if ln.startswith("check_slot_images")]
+    # directly, or through the trial-boot gate (test_firstboot_slot_images_gate.py)
+    calls = [i for i, ln in enumerate(branch)
+             if ln.startswith(("check_slot_images", "slot_images_allow_commit"))]
     assert calls, (
         "firstboot never checks that the slot's images are in containerd before it "
         "commits the slot (#1630)"
