@@ -1015,11 +1015,12 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     ``ValueError``.
 
     Secondary, stub and forward zones keep the kind they are given
-    (``forward`` when omitted, as before). IPAM's PTR lookup does not look at
-    the zone type, and those zones are not SpatiumDDI's to write into, so a
-    derived ``reverse`` would newly send PTR updates to a zone that refuses
-    them. Only one direction is enforced: kind "reverse" on a name outside
-    those trees is left to the operator, since IPAM never matches such a zone.
+    (``forward`` when omitted, as before). Those zones are not SpatiumDDI's to
+    write into, and IPAM writes no PTR into them whatever their kind (#1419):
+    the zone that owns a reverse name is the most specific one covering it, of
+    any type, and IPAM writes there only when it is a primary. Only one
+    direction is enforced: kind "reverse" on a name outside those trees is
+    left to the operator, since IPAM never matches such a zone.
     """
     if zone_type != "primary":
         return kind if kind is not None else "forward"
@@ -1759,6 +1760,11 @@ async def rotate_group_key(
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+    """Delete a DNS server group.
+
+    Refused (409) while the group holds servers or zones. Its zones already in
+    Trash are deleted with it, for good, with their records (#1399).
+    """
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
