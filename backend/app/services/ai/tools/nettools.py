@@ -365,7 +365,8 @@ class NetworkWhoisArgs(BaseModel):
         "Run a WHOIS query from the SpatiumDDI server against public "
         "registries — answers 'who owns this IP / domain / ASN?'. Makes "
         "an OUTBOUND connection to a WHOIS server, so it's disabled by "
-        "default; enable it in Settings → AI → Tool Catalog."
+        "default; an administrator enables it in Administration → AI Tool "
+        "Catalog."
     ),
     args_model=NetworkWhoisArgs,
     default_enabled=False,

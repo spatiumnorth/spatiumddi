@@ -103,6 +103,6 @@ async def find_branding_settings(
         "note": (
             "Branding writes are superadmin-only because these fields render "
             "to anonymous visitors on the login page. Change them in "
-            "Settings -> Branding."
+            "Settings -> Branding & URL."
         ),
     }

@@ -1011,8 +1011,8 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Pick a category to see example prompts, or type your own. Some
-          examples need their underlying tool turned on in Settings → AI → Tool
-          Catalog.
+          examples need their underlying tool turned on in Administration → AI
+          Tool Catalog.
         </p>
       </div>
       <div className="mt-4 space-y-2">

@@ -68,7 +68,7 @@ def render_sources_list(settings: PlatformSettings) -> str:
     """
     lines = [
         "# Managed by SpatiumDDI — edits will be overwritten on next config push.",
-        "# Source of truth: Settings → Appliance → APT in the SpatiumDDI UI.",
+        "# Source of truth: Appliance → Fleet → Services → APT in the SpatiumDDI UI.",
         "",
     ]
     for src in settings.apt_sources or []:
@@ -164,7 +164,7 @@ def render_proxy_conf(settings: PlatformSettings) -> str:
     if not http and not https:
         return ""
     lines = [
-        "// Managed by SpatiumDDI — Settings → Appliance → APT.",
+        "// Managed by SpatiumDDI — Appliance → Fleet → Services → APT.",
     ]
     if http:
         lines.append(f'Acquire::http::Proxy "{http}";')
@@ -185,7 +185,7 @@ def render_auth_conf(settings: PlatformSettings) -> str:
     """Render ``/etc/apt/auth.conf.d/spatiumddi.conf`` (netrc-style) from
     the decrypted private-mirror credentials. Empty when none set; the
     runner writes it 0600."""
-    out: list[str] = ["# Managed by SpatiumDDI — Settings → Appliance → APT."]
+    out: list[str] = ["# Managed by SpatiumDDI — Appliance → Fleet → Services → APT."]
     any_entry = False
     for entry in settings.apt_auth or []:
         if not isinstance(entry, dict):

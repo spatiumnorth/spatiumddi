@@ -84,6 +84,93 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Imported `static_dhcp` IPAM records now get their Kea
+  reservation without a manual re-save (#1628).** Only the UI ever
+  created the DHCP reservation behind a reservation-style IPAM row —
+  the browser chained a second `createStatic` call after saving the
+  address — so rows created through the API or the address importer
+  sat in IPAM with a MAC but no `DHCPStaticAssignment`, and never
+  reached the rendered Kea bundle until each was opened and saved
+  by hand. The reservation is now synced server-side
+  (`sync_static_for_ipam_row`) whenever an IPAM row is created,
+  updated, allocated or imported at `status="static_dhcp"` with a
+  MAC: created on the subnet's sole matching scope, updated in
+  place, and removed when the row stops being a reservation. When
+  no reservation can be mirrored (no scope, several candidate
+  scopes, or a conflicting reservation) the write still succeeds
+  and the response / import result carries a `dhcp_static_warning`
+  instead of silently skipping it; the import preview flags the
+  same outcome. The frontend's chained `createStatic` calls are
+  gone. Follow-up from the QA walk (#1629): the sync now enforces
+  the acting user's `dhcp_static` permission (`write` to create
+  or update a reservation, `delete` to remove one — without it,
+  the warning above and no reservation change; GHSA-44ph);
+  bulk-edit runs the same per-row sync; an edit sending
+  `mac_address: null` on a `static_dhcp` row is a 422 instead of
+  quietly deleting its reservation; a save no longer overwrites
+  a reservation's description with the IPAM row's empty one; the
+  dialogs' dead DHCP Scope picker is removed; and the import
+  preview now matches commit for a linked row on a two-scope
+  subnet. **No backfill:** `static_dhcp` rows that predate this
+  sync get their reservation only when an operator re-saves the
+  row, or re-imports it with `overwrite`.
+
+- **A Technitium blocklist no longer delays zone changes by half an hour
+  (#1425).** On every structural apply (a zone created, deleted or
+  converted) the agent flushed Technitium's blocked set and re-added it
+  one `blocked/add` call per domain. Each of those calls rewrites
+  Technitium's zone file, so the cost grew roughly quadratically: a 16k
+  entry list took about 30 minutes per apply on a small node, during
+  which the new zones were not answered and nothing was blocked. The
+  agent now reads the live set with `blocked/export` and leaves it alone
+  when it already matches, which is the case for every structural apply
+  that did not change a blocklist. When it differs, the set is flushed
+  and written with `blocked/import`, 5,000 names per call, so a
+  16k-entry list takes a few seconds. The allowed set is handled the
+  same way. Reported by @stefanriegel.
+
+- **Cloud DNS servers no longer show unreachable while they work
+  (#1455).** The DNS health task asks a driver for `health_check()` and
+  otherwise sends a SOA query to the server's host and port. No driver
+  had one, so a Cloudflare server was probed as the host `cloudflare` on
+  port 443, which can never answer, and every cloud server (Cloudflare,
+  Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode,
+  Vultr) sat at `unreachable` while its zone list, imports and record
+  pulls succeeded. `CloudDNSDriverBase` now implements `health_check()`
+  on top of the existing credential `probe()`, so health is measured
+  against the provider API the control plane actually drives, and a
+  failure carries the provider's message into the `dns_health_checked`
+  log line. `technitium_api` inherits the same hook and is checked
+  through its HTTP API instead of a SOA query. A test pins the hook on
+  every credentialed agentless driver, so a new provider cannot fall
+  back to the SOA probe.
+
+- **Upgrading an appliance from 2026.09.04-1 can no longer replace
+  SECRET_KEY (#1448).** #1042 marked the chart's
+  `spatium-control-spatiumddi-app` Secret `helm.sh/resource-policy: keep`,
+  but Helm takes that policy from the release manifest it has stored, and
+  on the first upgrade from 2026.09.04-1 the stored manifest is
+  2026.09.04-1's, which has none. So if the new slot's first
+  `spatium-control` install failed for any reason, helm-controller's
+  uninstall deleted the Secret and the reinstall generated a new key, and
+  every credential encrypted at rest (the appliance CA key, certificates,
+  integration and SSO secrets) could no longer be read. firstboot now
+  copies `secret-key` and `metrics-token` into `spatium-control-app-keys`,
+  a Secret Helm does not own, before it releases the control chart, and
+  points the chart at it with `auth.existingSecret`; a fresh install
+  generates both values there. An existing `spatium-control-app-keys` is
+  never overwritten, and firstboot refuses to generate a key while the
+  chart's own Secret exists without one. When it cannot make sure the
+  Secret exists (the apiserver does not answer, or k3s never became
+  ready), the chart is released without `auth.existingSecret` and keeps
+  its own Secret as before, and firstboot tries again on the next boot.
+  One limit: an appliance upgraded straight from 2026.09.04-1 loses the
+  chart's own Secret on that upgrade (the stored manifest does not keep
+  it), so rolling it back to 2026.10.02-1 afterwards generates a new key.
+  Back up the Secret before such an upgrade, as the 2026.10.02-1 notes
+  already say, and back up `spatium-control-app-keys` from then on
+  (`docs/deployment/APPLIANCE.md`).
+
 - **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
   Hetzner retired the standalone DNS Console API, which now answers every
   call with a `301` redirect to the Cloud Console's web UI, so the driver
@@ -117,6 +204,112 @@ the formatter handles the rest.
   GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
+
+- **IPAM's delete confirmations say the delete goes to Trash (#1398).**
+  #1152 fixed Edit subnet's Danger zone, but every other space, block
+  and subnet delete still called itself permanent: the tree's Delete…
+  and both bulk deletes ended on "Confirm Permanent Deletion — This
+  action cannot be undone — Delete permanently", the block view said
+  "Blocks are not restorable from Trash", and Edit Space and Edit Block
+  said the delete "permanently removes every … row" behind "a typed
+  confirm" that is a checkbox. All of these deletes go to Trash and
+  come back intact on restore. Each now says the object and what it
+  holds move to Trash, restorable for 30 days, after which the nightly
+  purge deletes them for good; "permanent" stays on the IP address
+  purges, the one IPAM delete that is.
+
+- **Edit webhook can remove a subscription's secret, and its hint says
+  what a blank field does (#1397).** The Rotate secret hint said
+  "clearing the field stores no secret (HMAC header omitted)", but the
+  field always opens empty and an empty field is sent as "keep", so
+  clearing it and leaving it alone sent the same request and the
+  console could not remove a secret at all. The dialog now offers
+  "Remove the stored secret" (deliveries then go unsigned, with no
+  `X-SpatiumDDI-Signature` header), and the hint says a blank field
+  keeps the secret and a typed one rotates it.
+
+- **The UniFi page says when SpatiumDDI writes to a controller
+  (#1396).** It said "Read-only integration. … SpatiumDDI never writes
+  to UniFi.", and its setup guide that SpatiumDDI "never writes back",
+  while the controllers it lists are also Active block sync's targets:
+  an armed one is pushed client blocks (L2 quarantine), with its own
+  write credentials. The page now says the mirror only reads and that
+  SpatiumDDI writes to a controller only when block sync is armed on
+  it; the setup guide's read-only advice is for the mirror's key.
+
+- **Console copy sends operators only to places that exist (#1395).**
+  Feature descriptions, AI tool descriptions, alert texts, API errors
+  and several notices told operators to turn things on under "Settings
+  → …" places the Settings page does not have: "Settings →
+  firewall_enabled", "Settings → acme_enabled", "Settings →
+  dnsbl_monitoring_enabled", "Settings → Import → DNS surface",
+  "Settings → AI → Tool Catalog", "Settings → Features", "Settings →
+  Backup", "Settings → Appliance → SNMP". Each now names where the
+  control is (Features & Integrations, Administration → Import,
+  Administration → AI Tool Catalog, Administration → DNS Blocklists,
+  Administration → Backup, Administration → API Tokens, Appliance →
+  Firewall, Appliance → Fleet), says that ACME is switched on by
+  registering an account, and says so plainly where the console has no
+  control at all (BGP monitoring, a provider's tool allowlist). A
+  frontend and a backend test hold every "Settings → …" path in the
+  console's and the API's copy against the Settings page's sections.
+
+- **A role's dialog shows the grants the role holds (#1394).** Roles →
+  View is the only place the console shows what a built-in role grants,
+  and it showed each grant through two selects offering fixed lists: a
+  stored action or resource type the lists did not name fell back to
+  their first option. Appliance Operator's one grant, admin on
+  appliance, read "admin · *", Change Approver showed no approve at
+  all, and nine of the twelve built-in roles read broader or different
+  grants than they hold. A custom role's Edit dialog showed the same
+  wrong values. Each select now also offers the value its row holds, so
+  every grant shows as stored.
+
+- **Delete Server Group no longer takes a group's live DHCP scopes with
+  it, and says what it does take (#1399).** The DHCP page's Delete
+  Server Group said "The group must be empty — move or delete its
+  servers first", but the server refused a group only while it held
+  servers: a group holding scopes was deleted, and every scope with its
+  pools and reservations went with it, none of them into Trash. A group
+  that still holds a scope is now refused (409) until its scopes are
+  deleted, by the API, the two-person approval queue and the Copilot
+  alike. The DHCP and DNS dialogs read what the group holds first:
+  while it holds servers or live scopes (zones), they say so and offer
+  no delete, so the console never sends one the server will refuse.
+  Scopes already in Trash still go with their group, for good: the
+  dialog and the approval preview say so, and the DNS dialog now says
+  the same of a group's zones in Trash, where it promised an empty
+  group too.
+
+- **A full restore no longer fails at random with "deadlock detected" while
+  the appliance is serving (#1444).** A full restore ends every other
+  database session once, then clears the schema and replays the archive in
+  one transaction (#1363), dropping the tables one at a time and holding
+  each lock to commit. The api, the worker and the agents reconnect at
+  once. A session that read a table the drops had not reached yet, and then
+  waited for one they had already dropped, closed a cycle when the drops
+  reached its table. When PostgreSQL rolled back the restore's side, the
+  restore answered 400 "deadlock detected" and restored nothing (3 of 50 QA
+  restores). Before it clears the schema, the restore now ends its own
+  role's sessions that came back and hold a table, then takes every table
+  in one `LOCK TABLE`, and tries again if a deadlock picks that attempt, so
+  the drops wait for nobody.
+
+- **IPAM writes PTRs only into a reverse zone it serves as primary
+  (#1419).** IPAM picked the zone for a PTR by kind and name alone, so a
+  conditional forwarder, a secondary or a stub named under in-addr.arpa or
+  ip6.arpa and stored as reverse (the importers store every such zone that
+  way, and so does an operator who picks Reverse lookup for one) took
+  IPAM's PTR records for the gateway and every host, and the record
+  updates went to a zone that cannot take them. The drift check found the
+  same zone and showed the subnet in sync, and the reverse-zone backfill
+  reported such a zone as created. The zone that owns an address's
+  reverse name is now the most specific zone covering it, whatever its
+  type: IPAM writes the PTR there only when that zone is a primary;
+  otherwise it writes none and queues nothing, and the drift check
+  expects none. A PTR an earlier release wrote into such a zone is
+  dropped, with no update sent, the next time IPAM syncs or deletes the
+  address.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
@@ -278,6 +471,29 @@ the formatter handles the rest.
   warnings per 60 s tick, the bulk of its warnings on an appliance. The
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
+
+- **Editing a record's value on Cloudflare replaces it instead of adding
+  a second record (#1494).** The driver handled `update` by looking up
+  the Cloudflare row by the op's value, which is the NEW value and not
+  on Cloudflare yet, so the lookup missed and the "update is create on
+  miss" fallback added a second row next to the old one. For a DMARC
+  record that turned the domain's policy off, since two DMARC records
+  mean none. A create or update that carries its complete desired RRset
+  (every agentless op since #783) is now written as a set: rows that
+  match a member are kept, with the TTL corrected in place, missing
+  members are created, and the remaining rows are deleted last so the
+  name never goes empty. Values are compared in a normalised form (TXT
+  with or without quotes, host names with or without the trailing dot,
+  IPv6 notation), so an unchanged record is not posted again. If
+  Cloudflare still reports a value as a duplicate, nothing is deleted
+  and the op fails with that message. A delete stays a single-value
+  delete. A row added in the Cloudflare dashboard at the same name and
+  type is removed by the next create or update there, as with the
+  other drivers that write whole RRsets. Cloudflare's `proxied` flag
+  is preserved: a proxied row's TTL (always auto) is not "corrected",
+  every PUT carries the row's own flag, and a value replacing a
+  proxied record is created proxied, so a write never exposes the
+  origin address.
 
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
@@ -500,6 +716,20 @@ the formatter handles the rest.
   value it took from the template: a request that sets every DDNS value
   the template sets gets the DDNS inheritance it would get with no
   template.
+
+- **Applying a DDNS template to an existing subnet or block no longer
+  turns its DDNS off (#1421).** Apply (`POST /ipam/templates/{id}/apply`)
+  without `force` fills only the target's empty columns, and a stored
+  `ddns_enabled = false` or hostname policy is not empty, so a template
+  that turns DDNS on never wrote either one. Its DDNS lock still turned
+  the target's DDNS inheritance off, so a subnet that inherited DDNS (on,
+  say, from its block) was pinned to its own stored DDNS, which was off.
+  The lock now comes with all four of the template's DDNS values. That
+  overwrites nothing an operator set, because a carrier that inherits
+  DDNS ignores its own DDNS columns. A carrier with its own DDNS keeps
+  its values without `force`, as before. `fields_written`, and the
+  apply's audit row, now name `ddns_inherit_settings` when the apply
+  turns DDNS inheritance off.
 
 - **A custom field's Default Value is what the IPAM dialogs send, not
   only what they show (#1303).** Allocate IP, New Subnet and New IP Block
@@ -729,6 +959,19 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+
+- **A resource-scoped API token no longer sees zones, records or addresses
+  outside its grant through group record lists or search
+  (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
+  narrowed a `dns_zone`-scoped token to its bound zones, but
+  `GET /api/v1/dns/groups/{id}/records` returned every record of every zone
+  in the group, and global search (`GET /api/v1/search`, and the Copilot's
+  `global_search`, which runs the same engine) returned zones and records
+  outside the grant. Search had the same gap for subnet-scoped tokens and
+  addresses. The group record list now narrows to the token's zones, and the
+  search engine drops every zone, record, subnet, address, block and space
+  row outside the token's bound instances. Sessions and unscoped tokens are
+  unaffected.
 
 - **Webhook forward targets keep their URL and Authorization header
   encrypted, and no longer show or log them (#1502).** For a Slack,

@@ -341,17 +341,19 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 return
 
             new_status: str
+            health_detail: str | None = None
 
             if is_agentless(server.driver):
-                # Agentless drivers (windows_dns) have no heartbeat — the
-                # control plane has to do the poking. Falls back to the raw
-                # SOA probe since the Windows driver doesn't yet implement a
-                # dedicated health_check(); either way answer is the same.
+                # Agentless drivers have no heartbeat — the control plane has
+                # to do the poking. Cloud drivers and ``technitium_api`` check
+                # the API they are driven through (``health_check`` on
+                # ``CloudDNSDriverBase``, #1455); ``windows_dns`` doesn't
+                # implement one yet and falls back to the raw SOA probe.
                 try:
                     driver = get_driver(server.driver)
                     health_check = getattr(driver, "health_check", None)
                     if callable(health_check):
-                        ok, _msg = await health_check(server)
+                        ok, health_detail = await health_check(server)
                     else:
                         ok = await _probe_server_soa(server.host, server.port)
                     new_status = "active" if ok else "unreachable"
@@ -388,6 +390,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 agentless=is_agentless(server.driver),
                 status=new_status,
                 host=server.host,
+                detail=health_detail,
             )
     finally:
         await engine.dispose()

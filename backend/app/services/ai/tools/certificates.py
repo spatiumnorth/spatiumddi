@@ -213,7 +213,7 @@ class GetACMEAccountArgs(BaseModel):
         "returned. Use to answer 'is an ACME account configured?' or "
         "'which CA are we issuing against?'. Read-only; disabled by "
         "default (off-prem CA + auth-material adjacency) — opt in via "
-        "Settings -> AI -> Tool Catalog."
+        "Administration -> AI Tool Catalog."
     ),
     args_model=GetACMEAccountArgs,
     category="admin",

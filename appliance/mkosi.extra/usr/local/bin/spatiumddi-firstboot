@@ -62,6 +62,13 @@ METALLB_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-metallb.tgz
 K3S_MANIFESTS_DIR=/var/lib/rancher/k3s/server/manifests
 BOOTSTRAP_MANIFEST="$K3S_MANIFESTS_DIR/spatium-bootstrap.yaml"
 CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
+# #1448 — the Secret that carries SECRET_KEY + the /metrics token, created by
+# ensure_app_key_secret and NOT owned by Helm, so no helm uninstall can delete
+# it. APP_KEY_STAMP records that it exists, for the one path that cannot ask
+# the apiserver (k3s never became ready).
+APP_KEY_SECRET=spatium-control-app-keys
+CHART_APP_SECRET=spatium-control-spatiumddi-app
+APP_KEY_STAMP=/var/lib/spatiumddi/app-key-secret.done
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
@@ -989,6 +996,13 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #1448 — SECRET_KEY lives in a Secret this chart does not own
+    # (ensure_app_key_secret creates it), so no helm uninstall can delete it.
+    # Both lines carry the marker: _strip_control_app_secret removes them if
+    # that Secret could not be ensured, and the chart then keeps managing its
+    # own ${CHART_APP_SECRET} as before.
+    auth:  # spatium:app-key-secret
+      existingSecret: "${APP_KEY_SECRET}"  # spatium:app-key-secret
     # #272 Phase 1 — gate every control-plane workload onto nodes
     # carrying ``spatium.io/role-control-plane=true``. Install-time
     # bakes the label for full-stack + frontend-core variants (see
@@ -1771,6 +1785,79 @@ reassert_control_plane_class() {
         >/dev/null 2>&1 || true
 }
 
+# #1448 — keep SECRET_KEY out of Helm's hands.
+#
+# The chart's own Secret (${CHART_APP_SECRET}) is deleted by a helm uninstall
+# unless the STORED release manifest marks it ``keep``, and 2026.09.04-1's does
+# not (#1042 added it later). So on the first upgrade from that release, a
+# failed first ``spatium-control`` install on the new slot made helm-controller
+# uninstall with the old manifest, delete the Secret, and mint a new key on the
+# reinstall: every credential encrypted at rest became unreadable (#1445).
+#
+# This copies secret-key (and metrics-token, generated when the source lacks it,
+# as 2026.09.04-1's does) into ${APP_KEY_SECRET}, which carries no Helm
+# ownership metadata, BEFORE the control chart that points at it is released.
+# A fresh install, with neither Secret, generates both values here.
+#
+# It NEVER overwrites: an existing ${APP_KEY_SECRET} is the key, full stop. And
+# it never generates a key while the chart's own Secret exists without one; that
+# is refused, because a new key there is the bug this exists to prevent.
+# Returns non-zero when it could not make sure the Secret exists; the caller
+# then strips ``auth.existingSecret`` so the chart keeps its own Secret.
+ensure_app_key_secret() {
+    local kc="/usr/local/bin/k3s kubectl -n spatium"
+    # Initialised: this script runs under ``set -u``, where a bare ``local
+    # token`` is unset and the metrics-token check below would abort it.
+    local found="" key="" token=""
+    found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+    if [ -n "$found" ]; then
+        date -Iseconds > "$APP_KEY_STAMP"
+        return 0
+    fi
+    found=$($kc get secret "$CHART_APP_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+    if [ -n "$found" ]; then
+        key=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null) || return 1
+        token=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.metrics-token}' 2>/dev/null) || return 1
+        if [ -z "$key" ]; then
+            echo "WARN: ${CHART_APP_SECRET} exists but carries no secret-key; not generating one (#1448)." >&2
+            return 1
+        fi
+        echo "Copying SECRET_KEY from ${CHART_APP_SECRET} into ${APP_KEY_SECRET} (#1448)"
+    else
+        echo "Generating SECRET_KEY into ${APP_KEY_SECRET} (fresh install, #1448)"
+        key=$(openssl rand -hex 32 | tr -d '\n' | base64 | tr -d '\n')
+    fi
+    [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
+    # Values go through stdin as base64, never argv, so they never show in a
+    # process listing. ``create`` (not ``apply``) fails if the Secret appeared
+    # meanwhile, so a race can only ever keep the existing key.
+    if ! printf '%s\n' \
+        "apiVersion: v1" \
+        "kind: Secret" \
+        "metadata:" \
+        "  name: ${APP_KEY_SECRET}" \
+        "  namespace: spatium" \
+        "  labels:" \
+        "    app.kubernetes.io/name: spatiumddi" \
+        "    app.kubernetes.io/component: app-keys" \
+        "type: Opaque" \
+        "data:" \
+        "  secret-key: ${key}" \
+        "  metrics-token: ${token}" \
+        | $kc create -f - >/dev/null 2>&1; then
+        found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+        [ -n "$found" ] || return 1
+    fi
+    # Read it back: the copy must be byte-identical to the source key.
+    [ "$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null)" = "$key" ] \
+        || { echo "WARN: ${APP_KEY_SECRET} read back with a different secret-key (#1448)." >&2; return 1; }
+    date -Iseconds > "$APP_KEY_STAMP"
+}
+
+_strip_control_app_secret() {
+    sed -i '/# spatium:app-key-secret$/d' "$1"
+}
+
 place_deferred_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
@@ -1788,6 +1875,11 @@ place_deferred_control_manifest() {
         echo "CNPG webhook ready — applying control chart."
     else
         echo "WARN: CNPG webhook not ready after 4 min — applying control chart anyway (helm-controller retries)." >&2
+    fi
+    if ! ensure_app_key_secret; then
+        echo "WARN: could not ensure ${APP_KEY_SECRET}; releasing the control chart with its own" >&2
+        echo "      ${CHART_APP_SECRET} as before (#1448). Retried on the next boot." >&2
+        _strip_control_app_secret "$deferred"
     fi
     release_control_manifest
 }
@@ -1848,6 +1940,13 @@ if [ -f "$TLS_CERT_MANIFEST_DEFERRED" ] && ! node_is_cluster_member; then
     mv -f "$TLS_CERT_MANIFEST_DEFERRED" "$TLS_CERT_MANIFEST"
     chmod 0600 "$TLS_CERT_MANIFEST"
     echo "      placed the staged TLS Secret manifest anyway ($TLS_CERT_MANIFEST)." >&2
+fi
+# #1448 — no apiserver, so ensure_app_key_secret cannot run. Point the chart at
+# the key Secret only if an earlier boot confirmed it exists; otherwise keep the
+# chart on its own Secret, since releasing ``auth.existingSecret`` without the
+# copy is exactly the path that loses the key.
+if [ -f "${CONTROL_MANIFEST}.deferred" ] && [ ! -f "$APP_KEY_STAMP" ]; then
+    _strip_control_app_secret "${CONTROL_MANIFEST}.deferred"
 fi
 release_control_manifest || true
 exit 1

@@ -171,6 +171,7 @@ async def import_addresses_preview(
         payload,
         subnet_id=subnet_id,
         strategy=strategy,
+        current_user=current_user,
     )
     logger.info(
         "ipam_address_import_preview",

@@ -2694,6 +2694,26 @@ so a reinstall during the rollback can mint a new `SECRET_KEY` and
 leave every credential encrypted at rest unreadable. If you must go
 back, restore the pre-upgrade backup together with the older release.
 
+**Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
+firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
+`spatium` namespace, a Secret no Helm release owns, and points the
+control chart at it with `auth.existingSecret`. A failed install and the
+helm-controller's uninstall can therefore no longer delete it. On the
+first boot of that release it copies the key from the chart's own
+`spatium-control-spatiumddi-app`; it never overwrites an existing
+`spatium-control-app-keys`, and never generates a key while the chart's
+Secret exists without one. That is the Secret to back up:
+
+```bash
+kubectl -n spatium get secret spatium-control-app-keys -o yaml > app-keys.yaml
+```
+
+An appliance upgraded straight from 2026.09.04-1 loses
+`spatium-control-spatiumddi-app` on that upgrade, because the stored
+2026.09.04-1 manifest does not keep it. Going back to 2026.10.02-1 from
+there makes that chart generate a new key, so don't; if you must, restore
+the pre-upgrade backup together with it, as above.
+
 **If an appliance is already stuck.** The older release's
 `wait-for-migrate` init container prints the cause once, including
 `The database was migrated by a NEWER SpatiumDDI release`, then keeps

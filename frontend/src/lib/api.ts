@@ -812,6 +812,10 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // #1628 — transient, only set on create/update responses when a
+  // ``static_dhcp`` row could not be mirrored into a DHCP reservation
+  // server-side (no scope, several scopes, or a conflict).
+  dhcp_static_warning?: string | null;
   // True when this row is a dynamic-lease mirror created by the DHCP
   // lease-pull task. Such rows are read-only in the UI — the DHCP server
   // owns their state and any edit would get overwritten on the next pull.

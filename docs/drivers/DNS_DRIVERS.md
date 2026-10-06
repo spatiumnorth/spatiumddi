@@ -190,8 +190,14 @@ PowerShell paths and as an RFC 2136 `replace` on its Path A path; Route 53,
 Azure DNS and Google Cloud DNS apply it on their `update` path, which
 previously replaced the whole RRset with the op's single value (their
 create/delete paths already read-merged and were never affected).
-Cloudflare addresses individual records by provider id and never collapsed.
-A driver that sees `rrset=None` keeps its previous per-value behaviour.
+Cloudflare stores one row per value and applies it on create and update as
+a set write (#1494): rows matching a member are kept, missing members are
+created, then the remaining rows at that name + type are deleted. That
+includes a row added in the Cloudflare dashboard, by design: SpatiumDDI
+owns the RRsets it manages, so a value it does not know is removed on the
+next create or update at that name + type, as with the other drivers that
+write whole RRsets. A delete stays a single-value delete. A driver that sees
+`rrset=None` keeps its previous per-value behaviour.
 
 ### TSIG Authentication
 
@@ -685,7 +691,7 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 
-- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. `update` is create-on-miss.
+- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. A create or update with its RRset is a set write (see the #783 section above; dashboard-added rows at that name + type are removed); without one, `update` is create-on-miss. SpatiumDDI does not model `proxied`, but no write drops it: a PUT carries the row's own flag, a proxied row's TTL (always auto) is never "corrected", and a row created at a name whose rows are proxied is created proxied.
 - **Route 53** — MX / SRV priority is baked into the record value (`"10 mail.example.com."`), kept raw so it isn't double-encoded on write. ALIAS rrsets (`AliasTarget`) have no TTL → surfaced with `ttl=None`. Writes are `UPSERT`/`DELETE` change batches; a `DELETE` of a non-existent rrset (`InvalidChangeBatch`) is treated as an idempotent no-op. Hosted-zone id resolved from the FQDN via `list_hosted_zones_by_name` with an exact-name match.
 - **Azure DNS** — records live in *record sets*, one per `(name, type)`, each with a typed list (`a_records`, `mx_records`, …); each set expands into one neutral `RecordData` per contained record. Create and update are both a `create_or_update` PUT of the full set. SOA is Azure-managed and dropped on read.
 - **Google Cloud DNS** — calls scope by the managed-zone *id* (a slug like `example-com`), not the DNS name, so the hooks re-resolve the managed zone by matching `dns_name`. A single rrset carries one or more `rrdatas` (one `RecordData` each on read, collapsed to a single-value rrset on write). Writes are transactional change sets (`changes.create()`); the op polls `changes.status` until `done` (bounded ~60 s) so it only returns once Cloud DNS has applied it.
@@ -826,7 +832,7 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 
 Per-view blocklists **collapse into one flat set**: Technitium's native blocking is server-wide with no view concept, and the driver declines views outright. Collapsing is the honest reading of "block these names on this server" — the alternative would be silently applying one view's list to every client. `is_wildcard` is likewise dropped: Technitium blocks a domain *and* its subdomains by default, so exact-match and wildcard land identically.
 
-The apply is **flush-then-rewrite, not a diff**, and that is deliberate. `blocked/list` is a one-level *tree browser*: `domain=""` returns top-level nodes, `domain="foo.test"` returns its children, and only a leaf carries the actual block under `records`. Intermediate nodes therefore appear in a listing without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of the root wiped every entry in testing. Flush-and-rewrite needs no read model, so it cannot be subtly wrong that way; the cost is a brief window with no blocking on each structural apply, which record CRUD does not trigger.
+The apply **reads the live set with `blocked/export` / `allowed/export`** and leaves a set alone when it already matches the bundle, so a structural apply that did not touch a blocklist rewrites nothing and opens no window without blocking (#1425). `export` is a flat list, one name per line, which `blocked/list` is not: `list` is a one-level *tree browser* whose intermediate nodes appear without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of its root wiped every entry in testing. A set that differs is **flushed, then written with `{kind}/import`** in chunks of 5,000 comma-separated names. Never per-domain `blocked/add` or `delete`: each of those rewrites Technitium's zone file, so a 16k-entry list took about 30 minutes and grew roughly quadratically, while `import` saves once per call. Names compare in their IDNA form, which is how Technitium stores and exports them; an error answer to `export` is treated as a difference and rewritten, never as a match.
 
 **Live-pull importer** (`services/dns_import/technitium.py`) — one-shot migration off an existing Technitium install, feeding the same canonical IR and commit pipeline as the BIND9 / Windows / PowerDNS importers.
 
