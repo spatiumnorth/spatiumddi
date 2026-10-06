@@ -307,14 +307,22 @@ Flow:
    (ACS endpoint).
 3. Backend consumes the assertion and redirects to `/auth/callback#token=…`.
 4. `GET /auth/{provider_id}/metadata` returns SP metadata XML so admins
-   can register SpatiumDDI at the IdP.
+   can register SpatiumDDI at the IdP. It advertises one endpoint, the ACS
+   above (HTTP-POST).
+
+**No single logout.** SpatiumDDI does not take part in SAML single logout
+(SLO): its metadata advertises no `SingleLogoutService`, it sends no
+LogoutRequest, and signing out of SpatiumDDI ends only its own session. A
+logout at the IdP does not end a SpatiumDDI session, which lasts until it
+expires or the user signs out (#1420: the metadata used to advertise an
+`/auth/{provider_id}/slo` endpoint that no route served).
 
 Key config fields:
 
 | Field | Notes |
 |---|---|
 | `idp_metadata_url` | Optional — backend can pull IdP details automatically. |
-| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. |
+| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. `idp_slo_url` is stored but not used: see "No single logout" above. |
 | `idp_x509_cert` | Base64 or PEM — used to verify the assertion. |
 | `sp_entity_id` | Defaults to the app URL. |
 | `attr_username` / `attr_email` / `attr_display_name` / `attr_groups` | SAML attribute names. |
