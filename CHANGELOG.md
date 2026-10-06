@@ -118,6 +118,15 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **The UniFi page says when SpatiumDDI writes to a controller
+  (#1396).** It said "Read-only integration. … SpatiumDDI never writes
+  to UniFi.", and its setup guide that SpatiumDDI "never writes back",
+  while the controllers it lists are also Active block sync's targets:
+  an armed one is pushed client blocks (L2 quarantine), with its own
+  write credentials. The page now says the mirror only reads and that
+  SpatiumDDI writes to a controller only when block sync is armed on
+  it; the setup guide's read-only advice is for the mirror's key.
+
 - **Console copy sends operators only to places that exist (#1395).**
   Feature descriptions, AI tool descriptions, alert texts, API errors
   and several notices told operators to turn things on under "Settings
