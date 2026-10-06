@@ -36,6 +36,7 @@ from app.services.ai.operations import (
     CreateDNSZoneArgs,
     CreateIPAddressArgs,
     CreateMulticastGroupArgs,
+    ReprovisionLeaseArgs,
     RunNmapScanArgs,
     WakeHostArgs,
 )
@@ -467,6 +468,49 @@ async def propose_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="create_dhcp_static", args=args)
+
+
+# ── propose_reprovision_lease (#1287) ─────────────────────────────────
+
+
+@register_tool(
+    name="propose_reprovision_lease",
+    description=(
+        "Prepare a proposal to move a device with a dynamic DHCPv4 lease (Kea) "
+        "to a static address: a reservation for its MAC, A + PTR under the new "
+        "name, and the old lease, its IPAM mirror and DNS removed. Pass lease_id; "
+        "target_ip and hostname are optional (default: first free address in the "
+        "scope's reserved pools, and the lease's hostname). Run "
+        "preview_reprovision_lease first if the operator wants to see the plan. "
+        "The operator must click Apply."
+    ),
+    args_model=ReprovisionLeaseArgs,
+    writes=False,
+    category="dhcp",
+    default_enabled=True,
+    module="core.dhcp",
+)
+async def propose_reprovision_lease(
+    db: AsyncSession, user: User, args: ReprovisionLeaseArgs
+) -> dict[str, Any]:
+    # Pin the picked address into the proposal, so Apply moves the device to
+    # the address the operator approved — not whatever is first free later.
+    if not args.target_ip:
+        from uuid import UUID  # noqa: PLC0415
+
+        from app.services.dhcp.reprovision import (  # noqa: PLC0415
+            ReprovisionError,
+            preview_reprovision,
+        )
+
+        try:
+            plan = await preview_reprovision(db, UUID(args.lease_id), hostname=args.hostname)
+        except ValueError:
+            return {"error": f"Invalid lease id {args.lease_id!r}"}
+        except ReprovisionError as exc:
+            return {"error": exc.detail, "status": exc.status_code}
+        args = args.model_copy(update={"target_ip": plan.target_ip})
+    return await _propose_via(db=db, user=user, operation_name="reprovision_lease", args=args)
 
 
 # ── propose_create_alert_rule ─────────────────────────────────────────

@@ -567,6 +567,65 @@ normal way to pin a device, and every driver honours it (#631; see §16).
 
 ---
 
+### Re-provision a lease to a static address (issue #1287)
+
+The usual way to onboard a UPS card, BMC, printer or camera: it plugs in,
+takes a lease from a small dynamic pool under its factory hostname, and is
+then moved to a permanent address with a real name. One preview + commit does
+the whole move for a DHCPv4 lease on Kea:
+
+- `GET /api/v1/dhcp/leases/{lease_id}/reprovision/preview` (optional
+  `target_ip`, `hostname`) — read-only. Picks the **first free address in the
+  scope's `reserved` pools** (the static range: held for static assignments,
+  never rendered into Kea), or, for a scope without one, the first free address
+  outside every dynamic and excluded pool. Shows why it chose it, the
+  reservation, the A + PTR records created under the new name, the lease
+  mirror and DNS records removed, the servers whose lease is deleted, and when
+  the device is expected to move.
+- `POST /api/v1/dhcp/leases/{lease_id}/reprovision` with `{"target_ip", "hostname"}`
+  — superadmin, like the two steps it replaces. Re-runs every check and
+  creates the reservation through the IPAM-row path (`static_dhcp` row →
+  `sync_static_for_ipam_row`, #1628): reservation, driver push, A + PTR, audit.
+
+What happens to the old lease depends on whether the device still holds it
+(`old_lease` in the preview):
+
+- **`kept_until_moved`** (live lease): nothing is deleted. The device keeps
+  using its address until it moves, and the lease keeps Kea from handing that
+  address to anyone else. With a reservation for the MAC elsewhere, Kea NAKs
+  the next RENEW / REBIND; the device rediscovers and takes the reserved
+  address, Kea drops the old lease, and the lease-event path removes the IPAM
+  mirror and its DDNS records. (Deleting the lease up front does not work: Kea
+  answers a RENEW for an address it holds no lease for with silence, not a
+  NAK, so the device would keep the address until the lease ran out while Kea
+  could give it to another client.)
+- **`removed_now`** (the lease is expired or released): every copy of the
+  lease in the group, its IPAM mirror and DDNS records are removed before the
+  reservation is created, plus a `lease4_del` agent op per Kea server so a
+  later lease snapshot cannot bring the lease back. The two commits keep a
+  reused factory name's delete and create apart (#1489).
+
+Refused: a target inside a dynamic pool (the point is to leave it) or an
+excluded range, an address already in use, a MAC that already has a
+reservation in the group, a name another address holds in the zone, a subnet
+served by more than one scope, DHCPv6, and groups with a Windows DHCP or other
+agentless server (Windows wants its reservations inside the scope range,
+#631) — follow-ups.
+
+When the device moves: at its next renewal (T1, half the lease) when Kea
+NAKs it, or right away if it is rebooted. FORCERENEW (RFC 3203) is not used;
+embedded management cards rarely support it.
+
+The Kea agent also reads the memfile's deletion marker right: Kea records a
+deleted lease by appending it again with `valid_lifetime` 0 and state 0, which
+the agent used to report as an *active* lease (bringing the lease, its mirror
+and its DNS records straight back). It is now reported as expired.
+
+MCP: `preview_reprovision_lease` (read-only) and `propose_reprovision_lease`
+(copilot proposal; the picked address is pinned into the proposal so Apply moves
+the device where the preview said). Both are default-on: the write touches one
+device and always goes through operator approval.
+
 ## 3a. Scope deletion, cascade, and restore
 
 Deleting a DHCP scope is a **soft delete** by default: the row is stamped

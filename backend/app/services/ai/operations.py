@@ -2805,6 +2805,102 @@ register(
 )
 
 
+# ── reprovision_lease (#1287) ─────────────────────────────────────────
+
+
+class ReprovisionLeaseArgs(BaseModel):
+    """Args for the ``reprovision_lease`` operation."""
+
+    lease_id: str = Field(description="UUID of the DHCPv4 lease to move to a static address.")
+    target_ip: str | None = Field(
+        default=None,
+        description=(
+            "Static address to move the device to. Leave empty to take the first "
+            "free address in the scope's reserved pools (else outside the dynamic pools)."
+        ),
+    )
+    hostname: str | None = Field(
+        default=None, description="New host name (single label); default: the lease's."
+    )
+
+
+async def _preview_reprovision_lease(
+    db: AsyncSession, user: User, args: ReprovisionLeaseArgs
+) -> PreviewResult:
+    from uuid import UUID as _UUID  # noqa: PLC0415
+
+    from app.services.dhcp.reprovision import (  # noqa: PLC0415
+        ReprovisionError,
+        preview_reprovision,
+    )
+
+    try:
+        plan = await preview_reprovision(
+            db, _UUID(args.lease_id), target_ip=args.target_ip, hostname=args.hostname
+        )
+    except ValueError:
+        return PreviewResult(ok=False, detail=f"Invalid lease id {args.lease_id!r}.")
+    except ReprovisionError as exc:
+        return PreviewResult(ok=False, detail=exc.detail)
+    lines = [
+        f"Move {plan.mac_address} from {plan.old_ip} to {plan.target_ip} "
+        f"({plan.target_reason}) as a DHCP reservation"
+        + (f" named {plan.fqdn or plan.hostname}" if plan.hostname else ""),
+    ]
+    if plan.dns_create:
+        lines.append("Create: " + "; ".join(plan.dns_create))
+    if plan.dns_remove:
+        when = "now" if plan.old_lease == "removed_now" else "once the device has moved"
+        lines.append(f"Remove ({when}): " + "; ".join(plan.dns_remove))
+    if plan.old_lease == "removed_now":
+        lines.append(f"Delete the expired lease on {', '.join(plan.servers)}.")
+    lines.append(plan.expected_move)
+    lines.extend(f"Note: {w}" for w in plan.warnings)
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(lines))
+
+
+async def _apply_reprovision_lease(
+    db: AsyncSession, user: User, args: ReprovisionLeaseArgs
+) -> dict[str, Any]:
+    from uuid import UUID as _UUID  # noqa: PLC0415
+
+    from app.api.deps import require_superadmin  # noqa: PLC0415
+    from app.services.dhcp.reprovision import (  # noqa: PLC0415
+        ReprovisionError,
+        commit_reprovision,
+    )
+
+    enforce_operation_permission(user, _OPERATIONS["reprovision_lease"])
+    # Superadmin, like the REST commit and the two steps it replaces.
+    require_superadmin(user)
+    if not args.target_ip:
+        raise ValueError("target_ip is required to apply; re-run the proposal.")
+    try:
+        return await commit_reprovision(
+            db, user, _UUID(args.lease_id), target_ip=args.target_ip, hostname=args.hostname
+        )
+    except ReprovisionError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+register(
+    Operation(
+        name="reprovision_lease",
+        description=(
+            "Move a device with a dynamic DHCPv4 lease to a static address (Kea): "
+            "a reservation for its MAC, A + PTR under the new name, and the old "
+            "lease, its IPAM mirror and DNS removed. Route via "
+            "propose_reprovision_lease; the operator approves."
+        ),
+        args_model=ReprovisionLeaseArgs,
+        preview=_preview_reprovision_lease,
+        apply=_apply_reprovision_lease,
+        category="dhcp",
+        required_permission=("write", "dhcp_static"),
+    )
+)
+
+
 # ── create_alert_rule ─────────────────────────────────────────────────
 #
 # Scoped to the simplest rule_type — ``subnet_utilization`` — so the

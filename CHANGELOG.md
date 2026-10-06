@@ -27,6 +27,23 @@ the formatter handles the rest.
 
 ### Added
 
+- **Move a leased device to a static address in one step (#1287).**
+  Onboarding a UPS card, BMC or printer meant finding its lease, picking a
+  free address outside the pool, creating the reservation and the A and PTR
+  records, and cleaning up the lease's IPAM row and factory-name record by
+  hand. `GET /dhcp/leases/{id}/reprovision/preview` and
+  `POST /dhcp/leases/{id}/reprovision` now do it for a DHCPv4 lease on Kea:
+  the target is the first free address in the scope's `reserved` pools (else
+  outside the dynamic pools), and the reservation goes through the IPAM-row
+  path from #1628. A live lease is left alone: Kea NAKs its next renewal, the
+  device takes the reserved address, and the lease-event path removes the old
+  IPAM row and DNS records. An expired lease is removed at once, from the
+  database and, through a new `lease4_del` agent op, from Kea. MCP:
+  `preview_reprovision_lease`, `propose_reprovision_lease`. Windows DHCP,
+  DHCPv6 and the UI action are follow-ups. Agent: a lease Kea deleted (its
+  memfile writes it again with lifetime 0) was reported as active and
+  re-created on the control plane; it is now reported as expired.
+
 - **Alerts when a scheduled backup fails or stops running, on by
   default (#1262).** A failed scheduled backup used to write an audit
   row and nothing else, so on a default install a nightly backup could

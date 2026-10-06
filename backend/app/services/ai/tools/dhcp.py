@@ -1252,3 +1252,53 @@ async def preview_dhcp_device_policy(
             "next renewal, not instantly."
         ),
     }
+
+
+# ── preview_reprovision_lease (#1287) ───────────────────────────────────────
+
+
+class PreviewReprovisionLeaseArgs(BaseModel):
+    lease_id: str = Field(description="UUID of the DHCPv4 lease to move to a static address.")
+    target_ip: str | None = Field(
+        default=None, description="Static address to check instead of the automatic pick."
+    )
+    hostname: str | None = Field(
+        default=None, description="New host name (single label); default: the lease's."
+    )
+
+
+@register_tool(
+    name="preview_reprovision_lease",
+    description=(
+        "Show what moving a device with a dynamic DHCPv4 lease (Kea) to a static "
+        "address would do, WITHOUT doing it: the address picked (first free in "
+        "the scope's reserved pools, else outside every dynamic pool) and why, "
+        "the reservation, the DNS records created and removed, the servers whose "
+        "lease is deleted, and when the device is expected to move. Answers "
+        "'make this device permanent' / 'move the UPS card out of the DHCP pool'. "
+        "Read-only; propose_reprovision_lease prepares the change."
+    ),
+    args_model=PreviewReprovisionLeaseArgs,
+    category="dhcp",
+    default_enabled=True,
+    module="core.dhcp",
+)
+async def preview_reprovision_lease(
+    db: AsyncSession, user: User, args: PreviewReprovisionLeaseArgs
+) -> dict[str, Any]:
+    from app.services.dhcp.reprovision import (  # noqa: PLC0415
+        ReprovisionError,
+        preview_reprovision,
+    )
+
+    try:
+        lease_uuid = uuid.UUID(args.lease_id)
+    except ValueError:
+        return {"error": f"Invalid lease id {args.lease_id!r}"}
+    try:
+        plan = await preview_reprovision(
+            db, lease_uuid, target_ip=args.target_ip, hostname=args.hostname
+        )
+    except ReprovisionError as exc:
+        return {"error": exc.detail, "status": exc.status_code}
+    return plan.as_dict()
