@@ -21,6 +21,8 @@ use the gate directly. Either way the budget logic exists once.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,12 +36,16 @@ from app.core.auth_throttle import (
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.services.reauth import ReauthOutcome, reverify_operator, uses_local_password
+from app.services.superadmin_grant import SuperadminModel, newly_superadmin
 
 
 def stepup_method(user: User) -> str:
     """What the user proves at a step-up: ``password`` or ``totp``."""
     return "password" if uses_local_password(user) else "totp"
 
+
+# Set on the 403 for an omitted step-up, so a client can prompt and resubmit.
+STEPUP_REQUIRED_HEADER = "X-Stepup-Required"
 
 _UNAVAILABLE_DETAIL = (
     "This needs a password or authenticator check, and the attempt "
@@ -168,14 +174,55 @@ async def require_operator_stepup(
     # 403, not 401: the SPA reads any 401 off a non-login path as an expired
     # token and resubmits, which would spend two attempts on one typo.
     if missing:
+        # The header lets a client tell "ask the user for a step-up" from any
+        # other 403 without parsing the message. #1412's group and role edits
+        # need it: whether they need a step-up depends on server state the
+        # dialog cannot see, so it learns from this answer and resubmits.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "This needs re-confirmation: send your password, or an authenticator "
                 "code if your account has no local password."
             ),
+            headers={STEPUP_REQUIRED_HEADER: "true"},
         )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Password or authenticator code is incorrect",
     )
+
+
+async def require_stepup_if_granting_superadmin(
+    db: AsyncSession,
+    user: User,
+    *,
+    password: str | None,
+    totp_code: str | None,
+    change: Callable[[SuperadminModel], None],
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    resource_display: str,
+) -> tuple[str | None, int]:
+    """Step up only when ``change`` would make someone a superadmin (#1412).
+
+    Group and role edits grant superadmin indirectly, through a ``*`` / ``*``
+    role, so whether one needs the step-up depends on its effect, not on the
+    endpoint. Call this before writing anything. Returns ``(method, count)``:
+    the step-up method used (None when none was needed) and how many users
+    the change makes superadmins, for the caller's success audit row.
+    """
+    newly = await newly_superadmin(db, change)
+    if not newly:
+        return None, 0
+    method = await require_operator_stepup(
+        db,
+        user,
+        password=password,
+        totp_code=totp_code,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        resource_display=f"{resource_display} (makes {len(newly)} user(s) superadmin)",
+    )
+    return method, len(newly)

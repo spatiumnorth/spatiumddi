@@ -3,6 +3,8 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { timeBoundGrantsApi, type TimeBoundGrantCreate } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
 const inputCls =
@@ -100,6 +102,11 @@ export function CreateTimeBoundGrantModal({
   const [expiresAt, setExpiresAt] = useState<string>(defaultExpiry());
   const [reason, setReason] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -113,6 +120,7 @@ export function CreateTimeBoundGrantModal({
         resource_id: resourceId.trim() || null,
         expires_at: iso,
         reason: reason.trim(),
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
       };
       return timeBoundGrantsApi.create(payload);
     },
@@ -121,6 +129,11 @@ export function CreateTimeBoundGrantModal({
       onClose();
     },
     onError: (err: unknown) => {
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: unknown } } })?.response?.data
           ?.detail ?? "Failed to create grant";
@@ -196,6 +209,15 @@ export function CreateTimeBoundGrantModal({
           />
         </Field>
 
+        {needsStepUp && (
+          <StepUpSection
+            reason="A * on * grant makes every member of this group a superadmin until it expires. Confirm it's you to grant it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -209,7 +231,12 @@ export function CreateTimeBoundGrantModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!resourceType || !expiresAt || mutation.isPending}
+            disabled={
+              !resourceType ||
+              !expiresAt ||
+              mutation.isPending ||
+              (needsStepUp && !stepPassword && !stepTotp)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Granting…" : "Grant access"}
