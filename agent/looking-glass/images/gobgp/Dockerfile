@@ -101,6 +101,10 @@ RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
 FROM alpine:3.24 AS runtime
+# Re-declared (no value) so the global GOBGP_VERSION pin is in scope in
+# this stage — without it the /etc/spatiumddi-versions write below
+# expands it to empty and the image reports `gobgp=`.
+ARG GOBGP_VERSION
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a

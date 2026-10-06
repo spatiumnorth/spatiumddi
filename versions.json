@@ -355,7 +355,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} (built from source)", "count": 1 }
       ],
       "upstream": { "kind": "github-release", "repo": "osrg/gobgp" },
-      "note": "Built from source in the image, so Dependabot's `FROM` coverage never sees it. Run `make trivy IMAGE=gobgp` on a bump -- the golang builder is a security pin (Go static-links its stdlib, so no apk upgrade can fix a stdlib CVE)."
+      "note": "Built from source in the image, so Dependabot's `FROM` coverage never sees it. Run `make trivy IMAGE=looking-glass` on a bump -- the golang builder is a security pin (Go static-links its stdlib, so no apk upgrade can fix a stdlib CVE)."
     },
 
     "technitium": {
