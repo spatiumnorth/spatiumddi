@@ -84,6 +84,37 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Imported `static_dhcp` IPAM records now get their Kea
+  reservation without a manual re-save (#1628).** Only the UI ever
+  created the DHCP reservation behind a reservation-style IPAM row —
+  the browser chained a second `createStatic` call after saving the
+  address — so rows created through the API or the address importer
+  sat in IPAM with a MAC but no `DHCPStaticAssignment`, and never
+  reached the rendered Kea bundle until each was opened and saved
+  by hand. The reservation is now synced server-side
+  (`sync_static_for_ipam_row`) whenever an IPAM row is created,
+  updated, allocated or imported at `status="static_dhcp"` with a
+  MAC: created on the subnet's sole matching scope, updated in
+  place, and removed when the row stops being a reservation. When
+  no reservation can be mirrored (no scope, several candidate
+  scopes, or a conflicting reservation) the write still succeeds
+  and the response / import result carries a `dhcp_static_warning`
+  instead of silently skipping it; the import preview flags the
+  same outcome. The frontend's chained `createStatic` calls are
+  gone. Follow-up from the QA walk (#1629): the sync now enforces
+  the acting user's `dhcp_static` permission (`write` to create
+  or update a reservation, `delete` to remove one — without it,
+  the warning above and no reservation change; GHSA-44ph);
+  bulk-edit runs the same per-row sync; an edit sending
+  `mac_address: null` on a `static_dhcp` row is a 422 instead of
+  quietly deleting its reservation; a save no longer overwrites
+  a reservation's description with the IPAM row's empty one; the
+  dialogs' dead DHCP Scope picker is removed; and the import
+  preview now matches commit for a linked row on a two-scope
+  subnet. **No backfill:** `static_dhcp` rows that predate this
+  sync get their reservation only when an operator re-saves the
+  row, or re-imports it with `overwrite`.
+
 - **A Technitium blocklist no longer delays zone changes by half an hour
   (#1425).** On every structural apply (a zone created, deleted or
   converted) the agent flushed Technitium's blocked set and re-added it

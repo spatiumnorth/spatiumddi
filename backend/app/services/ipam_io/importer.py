@@ -636,6 +636,13 @@ class AddressImportResult:
     # (subnet-wide nor any covering address set) — #103 delegation.
     skipped_no_perm: int = 0
     dns_synced: int = 0
+    # #1628 — rows whose DHCP reservation the server-side sync created or
+    # updated, and the rows it could not mirror (no scope, several
+    # candidate scopes, or a conflicting reservation). Mirrors the
+    # router's per-row ``dhcp_static_warning`` so an import reports the
+    # same outcome a UI/API create would.
+    dhcp_synced: int = 0
+    dhcp_warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -726,12 +733,79 @@ async def preview_address_import(
     *,
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
+    current_user: Any = None,
 ) -> ImportPreview:
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
 
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
+
+    # #1628 — flag rows that will (or will not) get a DHCP reservation
+    # from the server-side sync at commit, so the preview matches what
+    # commit does: a ``static_dhcp`` row with a MAC syncs only when the
+    # subnet has exactly one matching-family scope. Candidate scopes are
+    # per (subnet, family), so cache them across rows.
+    from app.services.dhcp.static_ipam import (
+        _linked_static_for_row,
+        candidate_scopes_for_ipam_row,
+    )
+
+    scopes_by_family: dict[str, list] = {}
+
+    async def _dhcp_flag(
+        canonical: str, fields: dict[str, Any], existing_ip: IPAddress | None
+    ) -> dict[str, Any]:
+        status = fields.get("status") or (existing_ip.status if existing_ip else None)
+        mac = fields.get("mac_address") or (
+            str(existing_ip.mac_address)
+            if existing_ip is not None and existing_ip.mac_address
+            else None
+        )
+        if status != "static_dhcp" or not mac:
+            return {}
+        # #1629 (GHSA-44ph) — the commit-side sync gates on the acting
+        # user's ``dhcp_static`` grant; preview the same outcome when
+        # the caller is known, or an IPAM-only importer's preview would
+        # promise a reservation commit will refuse.
+        if current_user is not None:
+            from app.core.permissions import user_has_permission  # noqa: PLC0415
+
+            if not user_has_permission(current_user, "write", "dhcp_static"):
+                return {
+                    "dhcp_static_warning": (
+                        "No 'write' permission on DHCP reservations "
+                        "(dhcp_static) — no reservation will be created."
+                    )
+                }
+        # #1629 walk — preview must match commit for a *linked* row:
+        # commit updates the linked reservation in place whatever the
+        # candidate-scope count is (the sync's linked branch never
+        # consults candidate scopes), so a two-scope subnet must not
+        # preview "no reservation will be created" for such a row.
+        if existing_ip is not None and await _linked_static_for_row(db, existing_ip) is not None:
+            return {"dhcp_static_sync": True}
+        family = "ipv6" if ipaddress.ip_address(canonical).version == 6 else "ipv4"
+        if family not in scopes_by_family:
+            probe = IPAddress(subnet_id=subnet.id, address=canonical)
+            scopes_by_family[family] = await candidate_scopes_for_ipam_row(db, probe)
+        scopes = scopes_by_family[family]
+        if len(scopes) == 1:
+            return {"dhcp_static_sync": True}
+        if not scopes:
+            return {
+                "dhcp_static_warning": (
+                    f"No DHCP scope serves {canonical} — no reservation will be "
+                    "created. Create a scope for this subnet to pin the reservation."
+                )
+            }
+        return {
+            "dhcp_static_warning": (
+                f"{len(scopes)} DHCP scopes serve this subnet — not guessing which "
+                f"one should hold the reservation for {canonical}; no reservation "
+                "will be created."
+            )
+        }
 
     seen: set[str] = set()
     for row in payload.addresses:
@@ -783,13 +857,15 @@ async def preview_address_import(
         row_hostname = fields.get("hostname") or ""
         existing_ip = existing.get(canonical)
         if existing_ip is None:
+            create_details: dict[str, Any] = {"fields": fields}
+            create_details.update(await _dhcp_flag(canonical, fields, None))
             preview.creates.append(
                 DiffRow(
                     kind="address",
                     action="create",
                     network=canonical,
                     name=row_hostname,
-                    details={"fields": fields},
+                    details=create_details,
                 )
             )
             continue
@@ -801,6 +877,8 @@ async def preview_address_import(
             "description": existing_ip.description,
         }
         diff_details = {"old": old, "new": fields}
+        if strategy == "overwrite":
+            diff_details.update(await _dhcp_flag(canonical, fields, existing_ip))
         if strategy == "overwrite":
             preview.updates.append(
                 DiffRow(
@@ -852,7 +930,8 @@ async def commit_address_import(
     hostname get an A + PTR record published via the same RFC 2136 path
     that the interactive UI uses. The import is equivalent to N calls to
     ``POST /ipam/addresses`` / ``PUT /ipam/addresses/{id}`` — same audit
-    log, same DNS side-effects.
+    log, same DNS side-effects, and (since #1628) the same server-side
+    DHCP reservation sync for ``static_dhcp`` rows.
 
     ``can_write_ip`` is the optional #103 address-set write-delegation gate
     (a closure over the caller's writable ranges). Rows the caller can't
@@ -861,9 +940,32 @@ async def commit_address_import(
     subnet-wide write).
     """
     from app.api.v1.ipam.router import _sync_dns_record
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 
     subnet = await _load_subnet(db, subnet_id)
     result_obj = AddressImportResult(subnet_id=str(subnet.id))
+
+    async def _sync_dhcp(ip_row: IPAddress, canonical: str) -> None:
+        """Mirror the router's server-side DHCP reservation sync (#1628).
+
+        Runs for every row the import wrote, so a row flipped away from
+        ``static_dhcp`` also drops its reservation, exactly like a UI
+        edit. A warning (no scope / ambiguous scope / conflict) is
+        collected, not raised; a driver push failure is appended to the
+        per-row errors — the import never hard-fails a batch.
+        """
+        try:
+            sync = await sync_static_for_ipam_row(
+                db, ip_row, created_by_user_id=current_user.id, user=current_user
+            )
+        except Exception as exc:  # noqa: BLE001
+            result_obj.errors.append(f"{canonical}: DHCP reservation sync failed: {exc}")
+            return
+        if sync.warning:
+            result_obj.dhcp_warnings.append(f"{canonical}: {sync.warning}")
+        elif sync.action:
+            result_obj.dhcp_synced += 1
+
     subnet_net = ipaddress.ip_network(str(subnet.network), strict=False)
     existing = await _load_existing_addresses(db, subnet.id)
 
@@ -969,6 +1071,7 @@ async def commit_address_import(
                         result_obj.dns_synced += 1
                     except Exception as exc:  # noqa: BLE001
                         result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
+                await _sync_dhcp(existing_ip, canonical)
                 result_obj.updated += 1
                 continue
             # strategy == "fail" already raised above; unreachable.
@@ -1013,6 +1116,8 @@ async def commit_address_import(
             except Exception as exc:  # noqa: BLE001
                 # Don't fail the whole import — user can re-run DNS Sync after.
                 result_obj.errors.append(f"{canonical}: DNS sync failed: {exc}")
+        if ip_status == "static_dhcp" and new_ip.mac_address:
+            await _sync_dhcp(new_ip, canonical)
         result_obj.created += 1
 
     # #7: surface a permission-blocked batch distinctly. ``skipped_no_perm``

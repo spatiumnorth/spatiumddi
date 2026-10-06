@@ -58,6 +58,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
@@ -614,11 +615,13 @@ def _dynamic_pool_warning(
     """Build the 'inside a dynamic DHCP pool' soft-collision warning (#631).
 
     In-pool allocation is allowed but flagged: the DHCP server owns the range
-    and will lease it on ``DISCOVER``, and a bare IPAM row — even
-    ``status="static_dhcp"`` — does not create a ``DHCPStaticAssignment`` (the
-    mirror only flows reservation → IPAM), so nothing tells the server to stop
-    handing the address out. The operator confirms via ``force=True`` and is
-    reminded to also pin a matching static reservation on the scope.
+    and will lease it on ``DISCOVER``. A bare IPAM row at
+    ``status="static_dhcp"`` now creates its ``DHCPStaticAssignment``
+    server-side when the subnet has exactly one matching DHCP scope
+    (#1628), but an ordinary in-pool row has no reservation behind it, so
+    nothing tells the server to stop handing the address out. The operator
+    confirms via ``force=True`` and is reminded to also pin a matching
+    static reservation on the scope.
     """
     pool_start = pool_end = None
     for start, end in ranges:
@@ -2851,6 +2854,12 @@ class IPAddressResponse(BaseModel):
     dns_record_id: uuid.UUID | None = None
     dhcp_lease_id: str | None = None
     static_assignment_id: str | None = None
+    # #1628 — set transiently by the create / update handlers when the row
+    # is a ``static_dhcp`` reservation the server could NOT mirror into a
+    # DHCPStaticAssignment (no scope, several candidate scopes, or a
+    # conflicting reservation). Not a column; ``None`` when the reservation
+    # is in step (or the row is not a reservation at all).
+    dhcp_static_warning: str | None = None
     # True when this IPAM row was auto-created by the DHCP lease-pull task
     # mirroring a dynamic lease. Surfaced so the UI can suppress the per-IP
     # edit/delete actions — the row reflects server state, not user intent,
@@ -7388,6 +7397,14 @@ async def create_address(
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
+    # #1628 — a ``static_dhcp`` row must own a real DHCPStaticAssignment or
+    # it never reaches the rendered Kea bundle. The server creates it here
+    # (the frontend used to chain a second createStatic call to do this);
+    # an ambiguous scope yields a warning on the response, not a guess.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -7403,6 +7420,7 @@ async def create_address(
     await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     logger.info(
         "ip_address_created", ip_id=str(ip.id), address=body.address, subnet_id=str(subnet_id)
     )
@@ -7656,9 +7674,16 @@ async def update_address(
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
 
-    # MAC required if transitioning to static_dhcp
+    # MAC required if transitioning to static_dhcp. An explicit
+    # ``mac_address: null`` is a *clear*, not "unchanged" (#1629 walk):
+    # the Edit dialog sends null for a blanked MAC, and treating it as
+    # unchanged let the save through, deleted the linked reservation in
+    # the sync, and left the row at ``static_dhcp`` with no MAC.
     new_status = body.status or ip.status
-    new_mac = body.mac_address if body.mac_address is not None else ip.mac_address
+    if "mac_address" in body.model_fields_set:
+        new_mac = body.mac_address
+    else:
+        new_mac = ip.mac_address
     if new_status == "static_dhcp" and not new_mac:
         raise HTTPException(
             status_code=422,
@@ -7799,6 +7824,14 @@ async def update_address(
     elif subnet and restoring:
         await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
 
+    # #1628 — keep the DHCP reservation in step with the row: a MAC /
+    # hostname change lands on the linked DHCPStaticAssignment, flipping
+    # the row into ``static_dhcp`` creates one (sole matching scope only),
+    # and flipping it away removes it. Ambiguity warns instead of guessing.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -7822,6 +7855,7 @@ async def update_address(
 
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     return ip
 
 
@@ -8161,9 +8195,14 @@ async def delete_address(
     # the DB row lingers with a null ip_address_id. Push the delete through
     # the write-through first — if Windows refuses, we raise 502 before
     # committing and no drift is introduced.
-    statics_res = await db.execute(
-        select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == address_id)
-    )
+    # #1628 — a reservation created from the IPAM side is also linked from
+    # the row (``static_assignment_id``); match it even if its forward
+    # link (``ip_address_id``) was never stamped.
+    _static_conds: list[Any] = [DHCPStaticAssignment.ip_address_id == address_id]
+    if ip.static_assignment_id:
+        with contextlib.suppress(ValueError, TypeError):
+            _static_conds.append(DHCPStaticAssignment.id == uuid.UUID(str(ip.static_assignment_id)))
+    statics_res = await db.execute(select(DHCPStaticAssignment).where(or_(*_static_conds)))
     statics_rows = list(statics_res.scalars().all())
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
@@ -8986,6 +9025,11 @@ async def allocate_next_ip(
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
+    # #1628 — same server-side reservation sync as create_address.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -9004,6 +9048,7 @@ async def allocate_next_ip(
     await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     logger.info(
         "ip_allocated",
         ip_id=str(ip.id),
@@ -9845,6 +9890,22 @@ async def bulk_edit_addresses(
                     new_value={**changes, "batch_id": str(batch_id)},
                 )
             )
+            # #1629 walk — bulk edit ran no reservation sync at all: rows
+            # bulk-set to ``static_dhcp`` got no reservation, and a linked
+            # row bulk-set away from it kept serving its reservation in
+            # Kea. Run the same per-row sync the single edit runs. The
+            # bulk response has no per-row warning field, so a sync
+            # warning (no grant / ambiguous scope / conflict) is logged
+            # with the address instead of surfaced.
+            dhcp_sync = await sync_static_for_ipam_row(
+                db, ip, created_by_user_id=current_user.id, user=current_user
+            )
+            if dhcp_sync.warning:
+                logger.warning(
+                    "ip_address_bulk_edit_dhcp_sync_warning",
+                    address=str(ip.address),
+                    warning=dhcp_sync.warning,
+                )
             updated += 1
 
     # Recompute utilization for every subnet whose status mix changed, plus
