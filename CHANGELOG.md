@@ -92,6 +92,13 @@ the formatter handles the rest.
   Stub ("not supported"); that is logged at error as
   `technitium_zone_type_mismatch` rather than worked around with a
   delete, since the agent never deletes zones on its own.
+  A forward zone's upstream is now written as the zone's FWD record
+  instead of through `zones/options/set`, which has no `forwarder`
+  parameter (it answers `ok` and stores nothing). So a zone converted to
+  forward gets its forwarder, and changing an existing forward zone's
+  forwarder reaches the server too (#1647). A zone converted from
+  forward to primary drops the Forwarder's placeholder SOA (responsible
+  person `invalid`, TTL 0) for the one a new primary gets.
 
 - **DNS agent LoadBalancer Services keep the client address and can
   pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`

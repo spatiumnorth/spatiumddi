@@ -1458,8 +1458,39 @@ def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
 # ── Zone type change on an existing zone (#1457) ────────────────────────
 
 
-def _existing_zone_responder(live_type: str | None, convert: dict[str, Any] | None = None):
-    """zones/create says "already exists"; options/get reports ``live_type``."""
+def _soa(zone: str, rp: str = "invalid", ttl: int = 0, serial: int = 7) -> dict[str, Any]:
+    return {
+        "name": zone,
+        "type": "SOA",
+        "ttl": ttl,
+        "rData": {
+            "primaryNameServer": "dns-1",
+            "responsiblePerson": rp,
+            "serial": serial,
+            "refresh": 900,
+            "retry": 300,
+            "expire": 604800,
+            "minimum": 900,
+        },
+    }
+
+
+def _fwd(zone: str, forwarder: str, protocol: str = "Udp") -> dict[str, Any]:
+    return {
+        "name": zone,
+        "type": "FWD",
+        "ttl": 0,
+        "rData": {"protocol": protocol, "forwarder": forwarder, "priority": 0},
+    }
+
+
+def _existing_zone_responder(
+    live_type: str | None,
+    convert: dict[str, Any] | None = None,
+    apex: list[dict[str, Any]] | None = None,
+):
+    """zones/create says "already exists"; options/get reports ``live_type``;
+    records/get returns ``apex``."""
 
     def responder(path, params, n):
         if path == "zones/create":
@@ -1470,6 +1501,8 @@ def _existing_zone_responder(live_type: str | None, convert: dict[str, Any] | No
             return {"status": "ok", "response": {"name": params["zone"], "type": live_type}}
         if path == "zones/convert":
             return convert or {"status": "ok", "response": {}}
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": apex or []}}
         return {"status": "ok"}
 
     return responder
@@ -1489,22 +1522,115 @@ def test_forwarder_zone_switched_to_primary_is_converted(tmp_path: Path) -> None
     assert converts[0][3] == {"zone": "home.test", "type": "Primary"}
 
 
-def test_primary_zone_switched_to_forwarder_is_converted_before_the_upstream(
-    tmp_path: Path,
-) -> None:
-    """The forwarder target is set with zones/options/set, which only means
-    something once the zone IS a Forwarder — so convert first."""
+def test_primary_zone_switched_to_forwarder_gets_its_fwd_record(tmp_path: Path) -> None:
+    """QA walk on #1461: zones/convert Primary → Forwarder leaves the zone
+    with no FWD record, and zones/options/set has no ``forwarder`` parameter
+    (answers ok, stores nothing). The upstream has to be added as the
+    zone's apex FWD record, after the convert."""
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, _existing_zone_responder("Primary"))
+    calls = _install_fake_request(
+        d, _existing_zone_responder("Primary", apex=[_soa("f.test")])
+    )
 
     d._ensure_zone_exists(
         "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.53"]}
     )
 
     paths = [c[2] for c in calls]
-    assert paths.index("zones/convert") < paths.index("zones/options/set")
     assert calls[paths.index("zones/convert")][3]["type"] == "Forwarder"
-    assert calls[paths.index("zones/options/set")][3]["forwarder"] == "192.0.2.53"
+    add = paths.index("zones/records/add")
+    assert paths.index("zones/convert") < add
+    assert calls[add][3] == {
+        "domain": "f.test",
+        "zone": "f.test",
+        "type": "FWD",
+        "forwarder": "192.0.2.53",
+        "protocol": "Udp",
+    }
+    assert not any(
+        c[2] == "zones/options/set" and "forwarder" in c[3] for c in calls
+    )
+
+
+def test_changed_forwarder_replaces_the_fwd_record(tmp_path: Path) -> None:
+    """#1647: retargeting an existing forward zone never reached the daemon.
+    The new record goes in before the old one is removed."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+        ),
+    )
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/convert" not in paths
+    add, delete = paths.index("zones/records/add"), paths.index("zones/records/delete")
+    assert add < delete
+    assert calls[add][3]["forwarder"] == "192.0.2.2"
+    assert calls[delete][3] == {
+        "domain": "f.test",
+        "zone": "f.test",
+        "type": "FWD",
+        "forwarder": "192.0.2.1",
+        "protocol": "Udp",
+    }
+
+
+def test_matching_fwd_record_is_left_alone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.2")]
+        ),
+    )
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/records/add" not in paths
+    assert "zones/records/delete" not in paths
+
+
+def test_forwarder_converted_to_primary_drops_the_placeholder_soa(tmp_path: Path) -> None:
+    """QA walk on #1461 (C1): the converted zone kept the Forwarder's
+    placeholder SOA (responsible person ``invalid``, TTL 0), so its
+    negative answers were not cached."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _existing_zone_responder("Forwarder", apex=[_soa("home.test", serial=4)])
+    )
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    updates = [c[3] for c in calls if c[2] == "zones/records/update"]
+    assert len(updates) == 1
+    assert updates[0]["type"] == "SOA"
+    assert updates[0]["responsiblePerson"] == "hostadmin@home.test"
+    assert updates[0]["ttl"] == "900"
+    assert updates[0]["serial"] == "4"
+    assert updates[0]["primaryNameServer"] == "dns-1"
+
+
+def test_converted_primary_with_a_real_soa_is_not_touched(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("home.test", rp="hostmaster@home.test", ttl=300)]
+        ),
+    )
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    assert "zones/records/update" not in [c[2] for c in calls]
 
 
 def test_zone_of_the_right_type_is_not_converted(tmp_path: Path) -> None:
