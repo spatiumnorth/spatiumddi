@@ -62,7 +62,11 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -133,6 +137,24 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+
+// #1338 — a read-only user is offered no DNS write it would be refused.
+// The DNS router admits a write (a delete) on any of its three resource
+// types (dns/router.py, ``require_any_resource_permission``); record writes
+// need nothing more, while every server group, server, view, ACL, TSIG key
+// and zone handler also takes a superadmin. The controls ask the same.
+const DNS_RESOURCES = ["dns_group", "dns_zone", "dns_record"];
+const NEEDS_DNS_WRITE = "Requires write permission on DNS records";
+const NEEDS_DNS_DELETE = "Requires delete permission on DNS records";
+
+function useDnsGrants() {
+  const perms = usePermissions();
+  return {
+    isSuperadmin: perms.isSuperadmin,
+    canWriteRecords: DNS_RESOURCES.some((t) => perms.can("write", t)),
+    canDeleteRecords: DNS_RESOURCES.some((t) => perms.can("delete", t)),
+  };
+}
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -3788,7 +3810,7 @@ function ZoneDetailView({
   // selection to the trash under one batch id; before #963 the grid could
   // only hard-delete, so the option stays reachable for the one role that
   // may use it.
-  const { isSuperadmin } = usePermissions();
+  const { isSuperadmin, canWriteRecords, canDeleteRecords } = useDnsGrants();
   const [bulkPermanent, setBulkPermanent] = useState(false);
   // Outcome of the last bulk delete when some rows were skipped — the
   // selection persists across pages, so the count in the modal can differ
@@ -4092,12 +4114,14 @@ function ZoneDetailView({
                       onSelect: () => syncMut.mutate(),
                       title:
                         "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                      ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                     {
                       key: "import",
                       label: "Import",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
+                      ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
                     },
                     {
                       key: "export",
@@ -4125,6 +4149,7 @@ function ZoneDetailView({
                       onSelect: () => setShowDelegate(true),
                       title:
                         "The parent zone is missing NS / glue records for this zone. Review and create them.",
+                      ...permissionGate(canWriteRecords, NEEDS_DNS_WRITE),
                     },
                   ]
                 : []),
@@ -4137,6 +4162,7 @@ function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
                   : undefined,
+                ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
               },
               ...((zone.zone_type === "primary" ||
                 zone.zone_type === "master") &&
@@ -4149,6 +4175,7 @@ function ZoneDetailView({
                       onSelect: () => setShowUpdateAcl(true),
                       title:
                         "Manage which external clients (by TSIG key or source IP/CIDR) may send RFC 2136 dynamic updates to this zone.",
+                      ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
                     },
                   ]
                 : []),
@@ -4160,6 +4187,7 @@ function ZoneDetailView({
                       icon: Plus,
                       onSelect: () => setShowAddSubzone(true),
                       title: `Create a sub-zone under ${zone.name.replace(/\.$/, "")}`,
+                      ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
                     },
                   ]
                 : []),
@@ -4172,6 +4200,7 @@ function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "This zone is synthesised by the Tailscale integration; it is bound to that tenant's group."
                   : "Move this zone to another server group",
+                ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
               },
               {
                 key: "delete",
@@ -4184,6 +4213,7 @@ function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
                   : undefined,
+                ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
               },
             ]}
           />
@@ -4198,6 +4228,7 @@ function ZoneDetailView({
                   ? "Records are managed by the Tailscale reconciler."
                   : `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`
               }
+              {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
             >
               Add Record
             </HeaderButton>
@@ -4597,23 +4628,27 @@ function ZoneDetailView({
                           )}
                         >
                           <td className="w-8 py-1.5 pl-3">
-                            {!r.auto_generated && !r.pool_member_id && (
-                              <input
-                                type="checkbox"
-                                checked={selectedRecords.has(r.id)}
-                                onChange={() =>
-                                  setSelectedRecords((prev) => {
-                                    const next = new Set(prev);
-                                    if (next.has(r.id)) next.delete(r.id);
-                                    else next.add(r.id);
-                                    return next;
-                                  })
-                                }
-                              />
-                            )}
+                            {!r.auto_generated &&
+                              !r.pool_member_id &&
+                              canDeleteRecords && (
+                                <input
+                                  type="checkbox"
+                                  checked={selectedRecords.has(r.id)}
+                                  onChange={() =>
+                                    setSelectedRecords((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(r.id)) next.delete(r.id);
+                                      else next.add(r.id);
+                                      return next;
+                                    })
+                                  }
+                                />
+                              )}
                           </td>
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                            {r.auto_generated || r.pool_member_id ? (
+                            {r.auto_generated ||
+                            r.pool_member_id ||
+                            !canWriteRecords ? (
                               r.name
                             ) : (
                               <button
@@ -4721,16 +4756,24 @@ function ZoneDetailView({
                                   <Radar className="h-3 w-3" />
                                 </button>
                                 <button
-                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                                   onClick={() => setEditRecord(r)}
                                   title="Edit record"
+                                  {...permissionGate(
+                                    canWriteRecords,
+                                    NEEDS_DNS_WRITE,
+                                  )}
                                 >
                                   <Pencil className="h-3 w-3" />
                                 </button>
                                 <button
-                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                                   onClick={() => setConfirmDeleteRecord(r)}
                                   title="Delete record"
+                                  {...permissionGate(
+                                    canDeleteRecords,
+                                    NEEDS_DNS_DELETE,
+                                  )}
                                 >
                                   <Trash2 className="h-3 w-3" />
                                 </button>
@@ -4764,11 +4807,15 @@ function ZoneDetailView({
                         ) : (
                           <>
                             <ContextMenuSeparator />
-                            <ContextMenuItem onSelect={() => setEditRecord(r)}>
+                            <ContextMenuItem
+                              disabled={!canWriteRecords}
+                              onSelect={() => setEditRecord(r)}
+                            >
                               Edit…
                             </ContextMenuItem>
                             <ContextMenuItem
                               destructive
+                              disabled={!canDeleteRecords}
                               onSelect={() => setConfirmDeleteRecord(r)}
                             >
                               Delete…
@@ -5224,6 +5271,8 @@ function Stat({
 function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const { isSuperadmin } = useDnsGrants();
+  const serverGate = permissionGate(isSuperadmin, NEEDS_SUPERADMIN);
   const [showAdd, setShowAdd] = useState(false);
   const [editServer, setEditServer] = useState<DNSServer | null>(null);
   const [detailServer, setDetailServer] = useState<DNSServer | null>(null);
@@ -5334,8 +5383,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           </p>
         </div>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => setShowAdd(true)}
+          {...serverGate}
         >
           <Plus className="h-3 w-3" /> Add Server
         </button>
@@ -5418,8 +5468,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                       state: { cloudServerId: s.id },
                     });
                   }}
-                  className="inline-flex items-center gap-1 rounded border border-sky-600/40 bg-sky-500/10 px-1.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-500/20 dark:text-sky-400"
+                  className="inline-flex items-center gap-1 rounded border border-sky-600/40 bg-sky-500/10 px-1.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-500/20 disabled:opacity-50 dark:text-sky-400"
                   title="Sync existing hosted zones in from the provider"
+                  {...serverGate}
                 >
                   <Cloud className="h-3 w-3" />
                   Sync
@@ -5439,6 +5490,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   }
                   className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
                   title="Resume — exit maintenance mode"
+                  {...serverGate}
                 >
                   <Play className="h-3 w-3" />
                   {(pauseMut.isPending || resumeMut.isPending) &&
@@ -5453,28 +5505,33 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                     e.stopPropagation();
                     setPausePrompt(s);
                   }}
-                  className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                  className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 disabled:opacity-50 dark:text-amber-400"
                   title="Pause — enter maintenance mode"
+                  {...serverGate}
                 >
                   <Pause className="h-3 w-3" />
                   Pause
                 </button>
               )}
               <button
-                className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                 onClick={(e) => {
                   e.stopPropagation();
                   setEditServer(s);
                 }}
+                title="Edit server"
+                {...serverGate}
               >
                 <Pencil className="h-3.5 w-3.5" />
               </button>
               <button
-                className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                 onClick={(e) => {
                   e.stopPropagation();
                   setConfirmDeleteServer(s);
                 }}
+                title="Delete server"
+                {...serverGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -5575,6 +5632,7 @@ function SyncStat({
  */
 function ViewsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const [editing, setEditing] = useState<DNSView | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
@@ -5625,11 +5683,12 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
           Views
         </span>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => {
             setError("");
             setCreating(true);
           }}
+          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
         >
           <Plus className="h-3 w-3" /> New View
         </button>
@@ -5684,22 +5743,24 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                   </div>
                   <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100">
                     <button
-                      className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                      className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-40"
                       title="Edit view"
                       onClick={() => {
                         setError("");
                         setEditing(v);
                       }}
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
                     <button
-                      className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                      className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:opacity-40"
                       title="Delete view"
                       onClick={() => {
                         setError("");
                         setConfirmDelete(v);
                       }}
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -6106,6 +6167,7 @@ function SubnetPickerModal({
 
 function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
   // ConfirmModal rather than window.confirm — a native dialog can't be
   // styled, can't explain the blast radius, and is blocked outright in
@@ -6160,8 +6222,9 @@ function AclsTab({ groupId }: { groupId: string }) {
           Named ACLs
         </span>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => setShowCreate(true)}
+          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
         >
           <Plus className="h-3 w-3" /> New ACL
         </button>
@@ -6240,8 +6303,10 @@ function AclsTab({ groupId }: { groupId: string }) {
                 )}
               </div>
               <button
-                className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
+                className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
                 onClick={() => setConfirmDelete(acl)}
+                title="Delete ACL"
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -6291,6 +6356,7 @@ function AclsTab({ groupId }: { groupId: string }) {
 
 function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const { data: keys = [], isFetching } = useQuery({
     queryKey: ["dns-tsig-keys", group.id],
     queryFn: () => dnsApi.listTSIGKeys(group.id),
@@ -6352,7 +6418,8 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
           </button>
           <button
             onClick={() => setShowAdd(true)}
-            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
           >
             <Plus className="h-3 w-3" /> New TSIG Key
           </button>
@@ -6406,22 +6473,25 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                   <div className="inline-flex items-center gap-1">
                     <button
                       onClick={() => setConfirmRotate(k)}
-                      className="rounded border px-2 py-0.5 text-xs hover:bg-muted/50"
+                      className="rounded border px-2 py-0.5 text-xs hover:bg-muted/50 disabled:opacity-50"
                       title="Generate a fresh secret of the same algorithm and replace the stored one"
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       Rotate
                     </button>
                     <button
                       onClick={() => setEditKey(k)}
-                      className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted/50"
+                      className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted/50 disabled:opacity-40"
                       title="Edit metadata"
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Pencil className="h-3 w-3" />
                     </button>
                     <button
                       onClick={() => setConfirmDelete(k)}
-                      className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                       title="Delete key"
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       <Trash2 className="h-3 w-3" />
                     </button>
@@ -8603,6 +8673,7 @@ function ZonesTab({
   group: DNSServerGroup;
   onSelectZone: (z: DNSZone) => void;
 }) {
+  const { isSuperadmin } = useDnsGrants();
   const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
   const [showFromTemplate, setShowFromTemplate] = useState(false);
@@ -8891,7 +8962,8 @@ function ZonesTab({
             <>
               <button
                 onClick={() => setConfirmBulkDelete(true)}
-                className="flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                className="flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <Trash2 className="h-3 w-3" /> Delete {selected.size}
               </button>
@@ -8928,15 +9000,17 @@ function ZonesTab({
             <Download className="h-3.5 w-3.5" /> Export All
           </button>
           <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowFromTemplate(true)}
             title="Stamp a starter zone from a curated template (mail, AD, web, k8s)"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
           >
             <Sparkles className="h-3 w-3" /> From Template
           </button>
           <button
-            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowAdd(true)}
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
           >
             <Plus className="h-3 w-3" /> Add Zone
           </button>
@@ -9304,6 +9378,7 @@ function BlocklistScopeModal({
 
 function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const [selected, setSelected] = useState<DNSBlockList | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
@@ -9563,15 +9638,17 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
         </span>
         <div className="flex items-center gap-2">
           <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowCatalog(true)}
             title="Subscribe to a curated public blocklist (StevenBlack / Hagezi / OISD / AdGuard / …)"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
           >
             <Sparkles className="h-3 w-3" /> Browse Catalog
           </button>
           <button
-            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowCreate(true)}
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
           >
             <Plus className="h-3 w-3" /> New Blocking List
           </button>
@@ -9606,6 +9683,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   ? "Every selected list is already applied to this group"
                   : `Apply ${selDetachedCount} list${selDetachedCount !== 1 ? "s" : ""} to ${group.name}`
               }
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               Apply ({selDetachedCount})
             </button>
@@ -9618,6 +9696,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   ? "None of the selected lists are applied to this group"
                   : `Detach ${selAppliedCount} list${selAppliedCount !== 1 ? "s" : ""} from ${group.name}`
               }
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               Detach ({selAppliedCount})
             </button>
@@ -9630,6 +9709,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   ? "Only URL-sourced lists can be refreshed"
                   : `Refresh ${selRefreshableCount} URL-sourced list${selRefreshableCount !== 1 ? "s" : ""}`
               }
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <RefreshCw className="h-3 w-3" /> Refresh ({selRefreshableCount})
             </button>
@@ -9637,6 +9717,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
               onClick={() => setConfirmBulkDelete(true)}
               disabled={bulkDelete.isPending}
               className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:opacity-40"
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Trash2 className="h-3 w-3" /> Delete ({selCount})
             </button>
@@ -9744,20 +9825,22 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       {groupAssigned(l) ? (
                         <button
                           title="Detach from this group"
-                          className="rounded border border-amber-400 px-2 py-0.5 text-xs text-amber-600"
+                          className="rounded border border-amber-400 px-2 py-0.5 text-xs text-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() =>
                             toggleAssignment.mutate({ list: l, assign: false })
                           }
+                          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                         >
                           Detach
                         </button>
                       ) : (
                         <button
                           title="Apply to every client of this group"
-                          className="rounded border border-emerald-400 px-2 py-0.5 text-xs text-emerald-600"
+                          className="rounded border border-emerald-400 px-2 py-0.5 text-xs text-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() =>
                             toggleAssignment.mutate({ list: l, assign: true })
                           }
+                          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                         >
                           Apply
                         </button>
@@ -9765,8 +9848,9 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                       {views.length > 0 && (
                         <button
                           title="Scope to specific views"
-                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => setScopeList(l)}
+                          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                         >
                           <Filter className="h-3 w-3" />
                         </button>
@@ -9781,6 +9865,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                           disabled={refreshing.has(l.id)}
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
                           onClick={() => refreshMut.mutate(l.id)}
+                          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                         >
                           <RefreshCw
                             className={cn(
@@ -9791,14 +9876,16 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         </button>
                       )}
                       <button
-                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setEditList(l)}
+                        {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Pencil className="h-3 w-3" />
                       </button>
                       <button
-                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => setConfirmDelete(l)}
+                        {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                       >
                         <Trash2 className="h-3 w-3" />
                       </button>
@@ -10619,6 +10706,7 @@ function GroupDetailView({
   onDelete: () => void;
 }) {
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const [syncing, setSyncing] = useState(false);
   const [groupSyncResult, setGroupSyncResult] = useState<{
     result: DNSGroupSyncResult | null;
@@ -10729,19 +10817,22 @@ function GroupDetailView({
               onClick={runGroupSync}
               disabled={syncing}
               title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />
               {syncing ? "Syncing…" : "Sync with Servers"}
             </button>
             <button
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onEdit}
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Pencil className="h-3 w-3" /> Edit Group
             </button>
             <button
-              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onDelete}
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Trash2 className="h-3 w-3" /> Delete Group
             </button>
@@ -11239,6 +11330,7 @@ type Selection =
 export function DNSPage() {
   useStickyLocation("spatium.lastUrl.dns");
   const qc = useQueryClient();
+  const { isSuperadmin } = useDnsGrants();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [selection, setSelectionState] = useState<Selection | null>(null);
@@ -11434,9 +11526,10 @@ export function DNSPage() {
               <RefreshCw className="h-3.5 w-3.5" />
             </button>
             <button
-              className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+              className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => setShowCreateGroup(true)}
               title="New server group"
+              {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <Plus className="h-3.5 w-3.5" />
             </button>
@@ -11454,8 +11547,9 @@ export function DNSPage() {
                 No server groups yet.
               </p>
               <button
-                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent"
+                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                 onClick={() => setShowCreateGroup(true)}
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <Plus className="h-3 w-3" /> Create Group
               </button>

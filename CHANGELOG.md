@@ -2387,6 +2387,17 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **The DNS page offers a read-only user no write it would be refused
+  (#1338).** A user whose only role is the built-in Viewer was offered
+  every DNS write (New server group, Sync with Servers, Edit and Delete
+  Group, Add Zone, Add Server, New View, New ACL, New Blocking List, New
+  TSIG Key, Add Record and the whole Zone menu) and met "Permission
+  denied" only after filling in the form. Each control now asks what its
+  route asks: a superadmin for server groups, servers, views, ACLs,
+  blocking lists, TSIG keys and zones, and write (or delete) on a DNS
+  resource type for records. A control the user may not use stays where
+  it is, disabled, with the reason as its tooltip, as IPAM's do (#1155).
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
