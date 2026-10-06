@@ -45,6 +45,14 @@ the formatter handles the rest.
 
 ### Changed
 
+- **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
+  vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
+  go.mod pins the x/net, x/text and grpc versions the Looking Glass
+  Dockerfile used to force with `go get` overrides, so the overrides
+  are dropped and the build takes upstream's pins as-is. The
+  swagger-ui-dist files behind `/api/docs` were re-vendored
+  byte-for-byte from the 5.33.1 npm tarball.
+
 - **DHCP agent Services default to LoadBalancer, and a NodePort can
   finally be pinned (#1549).** The DHCP agent Service defaulted to
   `type: NodePort` with `port: 67` and no way to set `nodePort`, so
@@ -93,6 +101,83 @@ the formatter handles the rest.
   the delete for the old name is no longer queued, since no server ever
   held it (it used to fail forever). Duplicate names are not suffixed:
   two clients both called `Office PC` still share one name.
+
+- **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
+  Hetzner retired the standalone DNS Console API, which now answers every
+  call with a `301` redirect to the Cloud Console's web UI, so the driver
+  failed every probe, import and write with a bare "Hetzner API error:
+  HTTP 301" and no zone could be managed. It now drives
+  `api.hetzner.cloud/v1` with a Cloud **project** token
+  (`Authorization: Bearer`, Read & Write to apply changes). A token from
+  the old DNS Console does not work, so an existing Hetzner server needs
+  its token replaced. The Cloud API is RRset-oriented, so an op carrying
+  the resolved set (#783) is one `set_records` write and replaying it
+  converges; the per-value fallback uses `add_records` /
+  `remove_records` against the live set. Writes are asynchronous actions
+  and are now awaited, so a change the API rejects after accepting it is
+  reported as failed rather than applied. Action polling backs off from
+  1 s to 5 s to stay inside the API's 3600 requests per hour per project,
+  a write refused because another action is running on the zone is
+  retried, and hitting the rate limit says when it resets. TXT values are
+  quoted on write (split into strings of at most 255 bytes) and joined on
+  read, hostname targets are absolutised, and
+  secondary-mode zones (transferred from your own primaries) are no longer
+  offered for import, since they have no RRsets to manage. A redirect is
+  reported as such instead of as "HTTP 301". Contributed by
+  @containerguy.
+
+- **The looking-glass image reports its GoBGP version again
+  (follow-up to #1625).** `/etc/spatiumddi-versions` in the
+  gobgp image wrote `gobgp=` empty: `GOBGP_VERSION` is a global
+  build arg, and Docker only makes it available in a stage that
+  re-declares it — the runtime stage did not (pre-existing on
+  4.9.0 too). The runtime stage now re-declares `ARG
+  GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
+  which told maintainers to run `make trivy IMAGE=gobgp`; the
+  TRIVY_IMAGES spec is `looking-glass`.
+
+- **Backup/restore concurrency guards, "latest" is a real backup,
+  and dead runs recover (#1574, #1571, #1515).** `latest/download`
+  and restore drills no longer pick a pre-restore safety dump (it
+  is encrypted with the public constant passphrase, not the
+  target's). Restore now holds a Postgres advisory lock for the
+  whole apply — two concurrent restores interleaved their schema
+  clear and replay — and Run Now / the schedule sweep claim a
+  target with one atomic conditional UPDATE instead of a
+  read-then-run check. Archive and safety-dump filenames carry a
+  random suffix; at one-second resolution two runs in the same
+  second overwrote each other, safety dump included. A backup run
+  whose process dies no longer strands its target `in_progress`
+  forever: the sweep (and Run Now) reap a run older than the health
+  module's two-hour presumption to `failed` with an audit row and a
+  fresh `next_run_at`, the runner stamps `failed` for ANY exception
+  rather than only the three typed ones, local-volume and WebDAV
+  drivers translate `OSError` / `httpx.InvalidURL` at their
+  boundary, and the SCP driver sets an SFTP channel timeout so a
+  stalled server cannot hang a run indefinitely.
+
+- **Selective restore validates before it pays for a safety dump, and
+  safety dumps no longer consume backup retention (#1575, #1574).**
+  A selective restore against a plain-format archive, or with unknown
+  section keys, was refused only after a full pre-restore safety dump
+  had been written and the connection pool disposed; both checks are
+  knowable from the parsed archive and now run before either cost.
+  On the local-volume path the same directory holds the
+  `pre-restore-*.zip` safety dumps, and retention counted them as
+  backups — each restore pushed a real backup out of a keep-last-N
+  window early, and keep-days deleted rollback copies on the backups'
+  schedule. Retention now splits the listing: backups follow the
+  target's policy, safety dumps keep their own last 3.
+
+- **A Proxmox sync no longer fails on an address another integration
+  already mirrors (#1622).** When a guest reported an IP that UniFi (or any
+  other integration, or a second Proxmox endpoint) already held in the
+  same subnet, the reconciler logged "owned by another integration" and
+  then inserted its own row anyway. The insert hit
+  `uq_ip_address_subnet_address`, the whole sweep rolled back, and the
+  endpoint never synced again, without a `last_sync_error` to show for
+  it. The reconciler now leaves such an address to its owner, and skips
+  moving one of its own rows onto an occupied address the same way.
 
 - **DNS agent LoadBalancer Services keep the client address and can
   pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
@@ -584,6 +669,49 @@ the formatter handles the rest.
 
 ### Security
 
+- **Making someone a superadmin through a group needs the operator
+  step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
+  user is also a superadmin when one of their groups holds a role
+  carrying `*` / `*`, or a live `*` / `*` time-bound grant. A stolen
+  session could therefore still make an account it controls a superadmin
+  by adding it to such a group, giving such a role to its group, adding
+  `*` / `*` to a role its group already holds, or granting `*` / `*`
+  temporarily. Each of those now needs the step-up when, and only when,
+  it would make someone a superadmin who is not one; the check is on the
+  effect and runs before anything is written, and the audit row records
+  how many users it reached. Superadmin status here ignores whether the
+  account is enabled: before, a disabled role-only superadmin's password
+  could be reset with no step-up and the account re-enabled. The Groups,
+  Roles and time-bound grant dialogs ask for the step-up when the server
+  says it is needed (a 403 with `X-Stepup-Required`). The Users page's
+  Role column now shows a superadmin through a group's role, marked
+  "(role)", where it said "user". The Copilot's temporary-access proposal
+  refuses a `*` / `*` grant that would make superadmins, since a chat
+  Apply cannot ask for a password. An auth-provider group mapping into a
+  superadmin group needs it as well (#1476): it grants nothing until an
+  account from the external group signs in, so the check is on the target
+  group, and covers creating such a mapping, re-pointing one at such a
+  group and renaming its external group. The mapping editor now asks for
+  the step-up, and shows a failed save instead of saying nothing.
+  **Behaviour change:** an API client that makes such a group, role,
+  grant or mapping change must send `stepup_password` (or
+  `stepup_totp_code`).
+- **The older secret reveals count wrong answers like every other
+  step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing
+  codes, appliance kubeconfig, SNMP community, block-sync and
+  firewall-feed secrets, the approvals break-glass) re-confirmed the
+  operator without the per-account wrong-answer budget the #1355 actions
+  spend, so a stolen session could guess the operator's password, or a
+  TOTP code, through any of them without limit. Each now spends the same
+  budget, refusals keep their own `*_reveal_denied` audit action, and the
+  pairing-code reveal is audited for the first time. Once the budget is
+  spent, every step-up answers 429 with `Retry-After` set to the time left
+  on the block, and the refusal is audited (`error_detail:
+  stepup_blocked`); both were missing (found by ddi-pg on #1414). The
+  budget check now lives in one place for the reveals, the #1355 actions
+  and the MFA endpoints alike, and a test fails any new reveal that checks
+  the operator outside it.
+
 - **The DHCP agent's external Service no longer publishes Kea's HA listener
   (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
   NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
@@ -689,7 +817,6 @@ the formatter handles the rest.
   **If you are affected:** set a new passphrase and a new hint, take a
   backup, and delete the older archives. The old passphrase stays in the
   audit log, so do not reuse it.
-
 - **Actions that mint a credential need the operator step-up (#1355).**
   #408 made secret reveals ask for a password or authenticator code so a
   stolen session cannot read them, but a stolen session could still mint
@@ -702,8 +829,7 @@ the formatter handles the rest.
   Wrong answers spend the per-account step-up budget (an omitted answer
   is refused without spending it), and each answered attempt is audited
   with the method used. Once the budget is spent the action answers 429
-  for 15 minutes; that refusal is not yet audited and carries no
-  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  until the 15-minute window resets. Resetting your own password through the admin path counts:
   a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
   create tokens, superadmins or a superadmin's password must send
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
