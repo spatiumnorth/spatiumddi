@@ -47,12 +47,14 @@ import asyncio
 import os
 import secrets
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
+from sqlalchemy import text
 
 from app.services.backup.archive import (
     BackupArchiveError,
@@ -181,9 +183,75 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
 # recreates everything that should exist. Names are captured as text up
 # front, because a CASCADE drop removes later rows' objects and a regclass of
 # a dropped oid renders as a bare number.
-_CLEAR_PUBLIC_SCHEMA_SQL = """\
--- One NOTICE per cascaded constraint would otherwise bury the error, if any.
-SET client_min_messages = warning;
+#
+# Before that block, ``_LOCK_PUBLIC_TABLES_SQL`` takes every table at once. The
+# drops lock as they go, and every lock is held to the end of the transaction,
+# while the appliance keeps working: the api, worker and agents reconnect the
+# moment ``_terminate_other_db_connections`` has run. A session that read a
+# table the drops had not reached yet and then waited for one they had already
+# dropped closed a cycle when the drops reached the table it held, and
+# PostgreSQL aborted the replay: "deadlock detected" at the clearing block's
+# last line, a 400, nothing restored. So the lock block first ends the sessions
+# of this role that came back and hold one of the tables, then takes every
+# table in one ``LOCK TABLE``, inside a subtransaction: if a session that
+# slipped in between still closes a cycle and PostgreSQL picks this side, only
+# the attempt is rolled back, and it is tried again. Waits on anything else
+# (autovacuum, which the deadlock check cancels after ``deadlock_timeout``; a
+# long reader of another role) are waited out, as the drops always did.
+_LOCK_PUBLIC_TABLES_SQL = """\
+DO $lock$
+DECLARE
+    tables text;
+    attempts integer := 0;
+BEGIN
+    -- Tables only: a LOCK on a view also locks whatever the view reads, wherever
+    -- it lives, and a sequence cannot be LOCKed. The product has no views, and
+    -- its sequences are only used through their tables' INSERTs.
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ' ORDER BY c.relname)
+    INTO tables
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      );
+    IF tables IS NULL THEN
+        RETURN;
+    END IF;
+    LOOP
+        -- Only this role's sessions: ending another role's (a superuser's) is
+        -- refused with an ERROR, which would end the restore instead.
+        PERFORM pg_terminate_backend(h.pid, 1000)
+        FROM (
+            SELECT DISTINCT l.pid
+            FROM pg_locks l
+            JOIN pg_class c ON c.oid = l.relation
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.granted
+              AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND n.nspname = 'public'
+              AND l.pid <> pg_backend_pid()
+              AND a.usename = current_user
+        ) h;
+        BEGIN
+            EXECUTE 'LOCK TABLE ' || tables || ' IN ACCESS EXCLUSIVE MODE';
+            RETURN;
+        EXCEPTION WHEN deadlock_detected THEN
+            -- The attempt's locks went with its subtransaction.
+            attempts := attempts + 1;
+            IF attempts >= 10 THEN
+                RAISE;
+            END IF;
+        END;
+    END LOOP;
+END
+$lock$;
+"""
+
+_DROP_PUBLIC_SCHEMA_SQL = """\
 DO $clear$
 DECLARE
     r record;
@@ -248,6 +316,13 @@ BEGIN
 END
 $clear$;
 """
+
+_CLEAR_PUBLIC_SCHEMA_SQL = (
+    # One NOTICE per cascaded constraint would otherwise bury the error, if any.
+    "SET client_min_messages = warning;\n"
+    + _LOCK_PUBLIC_TABLES_SQL
+    + _DROP_PUBLIC_SCHEMA_SQL
+)
 
 _REPLAY_CHUNK_BYTES = 64 * 1024
 
@@ -596,9 +671,14 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
     archive use that constant. The intent is "let the operator roll
     back via a SQL replay if Phase 1a's hard-overwrite was a
     mistake," not "long-term forensic vault."
+
+    Because that passphrase is public, filesystem permissions are the
+    only protection for the SECRET_KEY inside: the directory is 0700
+    (tightened if it already existed looser) and the file is created
+    0600 up front, never written world-readable and chmod'd after.
     """
     try:
-        PRE_RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+        PRE_RESTORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     except (PermissionError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dir_unavailable",
@@ -606,15 +686,34 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    try:
+        os.chmod(PRE_RESTORE_DIR, 0o700)
+    except OSError as exc:
+        # A directory this process doesn't own (a root-owned volume shared
+        # through fsGroup) can't be tightened. That must not cost the
+        # operator the rollback copy: the file below is still created 0600.
+        logger.warning(
+            "pre_restore_safety_dir_chmod_failed",
+            path=str(PRE_RESTORE_DIR),
+            error=str(exc),
+        )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
+    # Random suffix + O_EXCL (#1571): the name had one-second
+    # resolution and was written with an overwriting write, so two
+    # restores in the same second overwrote the FIRST rollback copy
+    # with the second — destroying exactly the copy the first
+    # restore might need. O_EXCL makes a residual collision fail
+    # this dump (soft-fail path below) instead of overwriting.
+    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}-{secrets.token_hex(3)}.zip"
     try:
         archive_bytes, _filename = await build_backup_archive(
             db,
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        out_path.write_bytes(archive_bytes)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dump_failed",
@@ -683,7 +782,51 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-async def apply_backup_restore(
+#: Session-level Postgres advisory lock serialising restores (#1571).
+#: Neither restore endpoint took any lock, so two concurrent restores
+#: interleaved their schema clear and replay — each replaying over
+#: the other's half-cleared schema. Fixed key (this is a whole-install
+#: operation, there is only ever one restore at a time), derived from
+#: a label rather than hand-picked so it cannot collide with the
+#: crc32-based per-resource keys elsewhere by accident.
+_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+
+
+async def apply_backup_restore(db, **kwargs: Any) -> RestoreOutcome:
+    """Restore under the install-wide advisory lock (#1571).
+
+    ``pg_try_advisory_lock`` is non-blocking on purpose: a second
+    restore is refused immediately with an operator-readable error
+    rather than queued behind a replay that disposes the connection
+    pool mid-flight. The lock is session-level, held on ``db``'s
+    connection; Phase 4 of the restore disposes the whole pool,
+    which releases it on the success path, and the ``finally`` below
+    releases it on every path that gets there first. A process that
+    dies mid-restore releases it with its connection — it cannot
+    wedge restores the way a row-based mutex could.
+    """
+    if db is None:  # unit tests drive the phases with stubs
+        return await _apply_backup_restore_inner(db, **kwargs)
+    acquired = (
+        await db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _RESTORE_LOCK_KEY})
+    ).scalar_one()
+    if not acquired:
+        raise BackupRestoreError(
+            "another restore is already in progress on this install — "
+            "wait for it to finish before starting a second one"
+        )
+    await db.commit()
+    try:
+        return await _apply_backup_restore_inner(db, **kwargs)
+    finally:
+        try:
+            await db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _RESTORE_LOCK_KEY})
+            await db.commit()
+        except Exception:  # noqa: BLE001 — pool disposal releases it anyway
+            logger.debug("backup_restore_advisory_unlock_failed", exc_info=True)
+
+
+async def _apply_backup_restore_inner(
     db,
     *,
     archive_bytes: bytes,
@@ -793,6 +936,30 @@ async def apply_backup_restore(
             "the archive's head, or expect /health/ready to fail."
         )
 
+    # Phase 2c (#1575): selective-restore shape checks. Both refusals
+    # below are knowable from the parsed archive + the caller's section
+    # list alone, so they run HERE — before the Phase 3 safety dump
+    # writes a full-size archive to disk and Phase 4 disposes the
+    # connection pool. They used to sit in Phase 5, after both, so every
+    # invalid selective attempt paid for a safety dump and a pool cycle
+    # and got refused anyway.
+    selective = bool(sections)
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
+        )
+    if selective:
+        from app.services.backup.sections import SECTIONS_BY_KEY  # noqa: PLC0415
+
+        unknown_sections = [k for k in sections or [] if k not in SECTIONS_BY_KEY]
+        if unknown_sections:
+            raise BackupRestoreError(
+                f"unknown section keys: {unknown_sections}. Call GET /backup/sections "
+                "for the catalog."
+            )
+
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
     # mounted volume in dev compose, e.g.) we proceed with a logged
@@ -822,17 +989,12 @@ async def apply_backup_restore(
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.
-    selective = bool(sections)
+    # ``selective`` and the two selective-shape refusals (plain format,
+    # unknown section keys) are decided in Phase 2c, before the safety
+    # dump and the pool disposal (#1575).
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
-
-    if selective and dump_format != "custom":
-        raise BackupRestoreError(
-            "selective restore needs an archive whose database dump is in "
-            "pg_dump's custom format (dump_format=custom). This archive is "
-            "plain SQL — only full restore is supported."
-        )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -840,18 +1002,11 @@ async def apply_backup_restore(
             # restore module's import graph for callers that don't
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
-                SECTIONS_BY_KEY,
                 cascade_closure,
                 tables_for_sections,
             )
 
             requested = list(sections or [])
-            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
-            if unknown:
-                raise BackupRestoreError(
-                    f"unknown section keys: {unknown}. Call GET /backup/sections "
-                    "for the catalog."
-                )
             # ``platform_internal`` (alembic_version + oui_vendor)
             # always rides along — the schema head pin + the OUI
             # cache are install-state, not user-data, and a

@@ -72,6 +72,13 @@ from app.core.agent_wake import (
     publish_wake,
     wake_subscription,
 )
+from app.core.auth_throttle import (
+    PAIRING_FAIL_MAX_GLOBAL,
+    PAIRING_FAIL_MAX_PER_IP,
+    PairingThrottleUnavailable,
+    claim_pairing_attempt,
+    refund_pairing_attempt,
+)
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
 from app.core.versions import upgrade_direction
@@ -867,6 +874,60 @@ async def supervisor_register(
             session_token=cleartext,
         )
 
+    # #1356 — spend one attempt from the per-IP and install-wide budgets
+    # before the code is looked up, so concurrent guesses cannot all read an
+    # under-budget count. A right code refunds it below; only wrong ones
+    # accumulate. The fixed delay alone allowed ~2 guesses a second per
+    # connection, without limit, against codes that may never expire.
+    try:
+        allowed, ip_failures, global_failures = await claim_pairing_attempt(client_ip)
+    except PairingThrottleUnavailable:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Registration is paused: the attempt limiter is unavailable. Retrying shortly.",
+            headers={"Retry-After": "60"},
+        ) from None
+    if not allowed:
+        # Audited once per window when a limit trips, not once per refused
+        # request: per address, and once install-wide, since spreading the
+        # guesses over many addresses is the attack the global budget is for.
+        trip: dict[str, object] | None = None
+        if ip_failures == PAIRING_FAIL_MAX_PER_IP + 1:
+            trip = {"scope": "address", "failures_in_window": ip_failures - 1}
+        elif global_failures == PAIRING_FAIL_MAX_GLOBAL + 1:
+            trip = {"scope": "install", "failures_in_window": global_failures - 1}
+        if trip is not None:
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_throttled",
+                    resource_type="pairing_code",
+                    resource_id="unknown",
+                    resource_display="supervisor registration",
+                    result="forbidden",
+                    new_value=trip,
+                )
+            )
+            await db.commit()
+        logger.warning(
+            "supervisor_register_throttled",
+            ip=client_ip,
+            failures=ip_failures,
+            # -1 is claim_pairing_attempt's "not charged" sentinel, not a
+            # count; log it as null so the line doesn't read as a bad tally.
+            global_failures=global_failures if global_failures >= 0 else None,
+        )
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many failed registration attempts. Try again in 15 minutes.",
+            headers={"Retry-After": "900"},
+        )
+
     # Look up pairing code by hash. Single-row index hit.
     stmt = select(PairingCode).where(PairingCode.code_hash == submitted_hash)
     code_row = (await db.execute(stmt)).scalar_one_or_none()
@@ -907,27 +968,36 @@ async def supervisor_register(
         failure_reason = "exhausted"
 
     if failure_reason is not None:
-        db.add(
-            AuditLog(
-                user_id=None,
-                user_display_name="anonymous supervisor",
-                auth_source="anonymous",
-                source_ip=client_ip,
-                action="appliance.supervisor_register_denied",
-                resource_type="pairing_code",
-                resource_id=str(code_row.id) if code_row is not None else "unknown",
-                resource_display=(
-                    "supervisor pairing code" if code_row is not None else "unknown pairing code"
-                ),
-                result="forbidden",
-                new_value={
-                    "reason": failure_reason,
-                    "hostname": body.hostname,
-                    "fingerprint": pubkey_fingerprint,
-                },
+        # #1356 — every wrong guess used to commit its own audit row, so a
+        # brute-force run also flooded the append-only audit table. A code
+        # that exists (revoked, expired, exhausted…) is a real event and is
+        # always audited; an unknown one is a guess, audited for the first
+        # failure from an address in each window (and the throttle trip
+        # above). Later guesses are logged, and the throttle row counts them.
+        if code_row is not None or ip_failures == 1:
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_denied",
+                    resource_type="pairing_code",
+                    resource_id=str(code_row.id) if code_row is not None else "unknown",
+                    resource_display=(
+                        "supervisor pairing code"
+                        if code_row is not None
+                        else "unknown pairing code"
+                    ),
+                    result="forbidden",
+                    new_value={
+                        "reason": failure_reason,
+                        "hostname": body.hostname,
+                        "fingerprint": pubkey_fingerprint,
+                    },
+                )
             )
-        )
-        await db.commit()
+            await db.commit()
         logger.warning(
             "supervisor_register_denied",
             reason=failure_reason,
@@ -1059,6 +1129,8 @@ async def supervisor_register(
         )
     )
     await db.commit()
+    # #1356 — a right code gives its attempt back, so only wrong ones count.
+    await refund_pairing_attempt(client_ip)
     logger.info(
         "supervisor_registration_pending",
         appliance_id=str(appliance_id),
@@ -5087,6 +5159,40 @@ def _vip_in_pool(vip: str, pool: list[str]) -> bool:
 _ASN_MIN, _ASN_MAX = 1, 4_294_967_295
 
 
+_GO_DURATION_PART = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|h|m|s)")
+_GO_DURATION_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _go_duration_seconds(value: str) -> float | None:
+    """Seconds in a Go duration (``90s``, ``1m30s``, ``2h``), or None.
+
+    MetalLB parses ``holdTime`` as a ``metav1.Duration``; anything else is a
+    config it refuses."""
+    pos = 0
+    total = 0.0
+    for match in _GO_DURATION_PART.finditer(value):
+        if match.start() != pos:
+            return None
+        total += float(match.group(1)) * _GO_DURATION_SECONDS[match.group(2)]
+        pos = match.end()
+    return total if pos and pos == len(value) else None
+
+
+def _is_uint(text: str, maximum: int) -> bool:
+    # ``isascii`` too: ``str.isdigit`` accepts "²" and other non-ASCII digits.
+    return text.isascii() and text.isdigit() and int(text) <= maximum
+
+
+def _valid_bgp_community(value: str) -> bool:
+    """A standard (``65000:100``) or large (``large:1:2:3``) community."""
+    parts = value.split(":")
+    if len(parts) == 2:
+        return all(_is_uint(p, 0xFFFF) for p in parts)
+    if len(parts) == 4 and parts[0] == "large":
+        return all(_is_uint(p, 0xFFFFFFFF) for p in parts[1:])
+    return False
+
+
 class MetalLBBgpPeer(BaseModel):
     """One BGPPeer CR — a router SpatiumDDI advertises the VIP to."""
 
@@ -5094,7 +5200,24 @@ class MetalLBBgpPeer(BaseModel):
     peer_asn: int
     peer_address: str
     peer_port: int | None = None
-    hold_time: str | None = None  # e.g. "90s" — passed through verbatim to the CR
+    hold_time: str | None = None  # e.g. "90s"; validated, then written to the CR
+
+    @field_validator("hold_time")
+    @classmethod
+    def _v_hold_time(cls, v: str | None) -> str | None:
+        """MetalLB's rule, checked here (#1103): its validating webhooks now
+        fail open while the controller starts, so a value it would refuse
+        installs anyway and leaves the VIP unadvertised behind a stale
+        config. A Go duration, at least 3 s (RFC 4271's floor for a
+        non-zero hold time) and at most the 16-bit 65535 s."""
+        if v is None or not v.strip():
+            return None
+        seconds = _go_duration_seconds(v.strip())
+        if seconds is None:
+            raise ValueError(f"hold_time {v!r} is not a duration such as 90s or 1m30s")
+        if not (3 <= seconds <= 65535):
+            raise ValueError("hold_time must be between 3s and 65535s")
+        return v.strip()
 
     @field_validator("my_asn", "peer_asn")
     @classmethod
@@ -5116,6 +5239,31 @@ class MetalLBBgpAdvertisement(BaseModel):
     ip_address_pools: list[str] = Field(default_factory=lambda: ["spatium-control-plane"])
     communities: list[str] = Field(default_factory=list)
     aggregation_length: int | None = None
+
+    # Checked here for the same reason as ``hold_time`` (#1103): MetalLB's
+    # webhooks fail open while the controller starts, and a value they would
+    # refuse then leaves the advertisement stale and the VIP unadvertised.
+    @field_validator("communities")
+    @classmethod
+    def _v_communities(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            value = raw.strip()
+            if not _valid_bgp_community(value):
+                raise ValueError(
+                    f"community {raw!r} must be ASN:NN (each 0-65535) or "
+                    "large:A:B:C (each 0-4294967295); named communities are not "
+                    "supported here"
+                )
+            out.append(value)
+        return out
+
+    @field_validator("aggregation_length")
+    @classmethod
+    def _v_aggregation_length(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 32):
+            raise ValueError("aggregation_length must be between 0 and 32 (IPv4)")
+        return v
 
 
 class MetalLBConfigResponse(BaseModel):
@@ -7203,11 +7351,8 @@ async def reveal_appliance_kubeconfig(
     downloaded file directly; operators on a different network may
     need to edit the server line to a reachable address.
     """
+    from app.api.stepup import require_operator_stepup  # noqa: PLC0415
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.services.reauth import (  # noqa: PLC0415
-        ReauthOutcome,
-        reverify_operator,
-    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -7234,20 +7379,18 @@ async def reveal_appliance_kubeconfig(
         )
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        await asyncio.sleep(0.1)
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="appliance_kubeconfig_reveal_denied",
+        resource_type="appliance",
+        resource_id=str(appliance_id),
+        resource_display=str(appliance_id),
+    )
 
     row = await db.get(Appliance, appliance_id)
     if row is None:

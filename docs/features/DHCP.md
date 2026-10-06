@@ -141,6 +141,11 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
+
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
 equivalent and all raw codes. A client class renders into the DHCPv4
@@ -639,6 +644,20 @@ The row is released to `available` (not `allocated`): a leftover `allocated` row
 is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
+
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
 
 ### Known gap — Windows scope sync (issue #620)
 

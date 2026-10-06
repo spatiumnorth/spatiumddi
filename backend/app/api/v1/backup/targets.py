@@ -25,14 +25,19 @@ from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
 from app.core.content_disposition import content_disposition
-from app.core.crypto import encrypt_str
+from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
-from app.services.backup.runner import run_backup_for_target
+from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
+from app.services.backup.runner import (
+    BackupRunBusyError,
+    reap_stale_backup_run,
+    run_backup_for_target,
+)
 from app.services.backup.schedule import (
     InvalidCronExpression,
     compute_next_run,
@@ -48,6 +53,7 @@ from app.services.backup.targets import (
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
     redact_config_secrets,
@@ -103,6 +109,17 @@ def _assert_retention_is_reachable(driver, *, write_only: bool, keep_n, keep_day
             "Clear retention_keep_last_n / retention_keep_days, or turn write_only off."
         ),
     )
+
+
+def _assert_hint_keeps_passphrase_secret(passphrase: str | None, hint: str | None) -> None:
+    """Refuse a hint that gives the passphrase away.
+
+    Checked before anything is stored, because the update path writes
+    the payload (hint included) into the append-only audit log — a hint
+    accepted once cannot be taken back out of it.
+    """
+    if hint_reveals_passphrase(passphrase, hint):
+        raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
 
 
 def _require_superadmin(current_user: CurrentUser) -> None:
@@ -319,6 +336,7 @@ async def create_target(
                 "exclusive — set exactly one (or neither for no auto-prune)"
             ),
         )
+    _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
     try:
@@ -421,6 +439,22 @@ async def update_target(
             ),
         )
 
+    # Either half of the pair can change on its own, so check the pair
+    # as it will be stored: a new hint against the stored passphrase is
+    # the common case (the form re-sends the hint on every save), and a
+    # rotated passphrase must not turn out to be the old hint.
+    if "passphrase_hint" in payload or payload.get("passphrase") is not None:
+        new_hint = payload.get("passphrase_hint", row.passphrase_hint)
+        new_passphrase = payload.get("passphrase")
+        if new_passphrase is None:
+            try:
+                new_passphrase = decrypt_str(row.passphrase_encrypted)
+            except ValueError:
+                # Unreadable stored passphrase — nothing to compare
+                # against, and the runner already reports it as such.
+                new_passphrase = None
+        _assert_hint_keeps_passphrase_secret(new_passphrase, new_hint)
+
     driver = get_destination(row.kind)
     # ``exclude_unset`` keeps a key the client explicitly set to null, and
     # ``write_only`` is ``bool | None`` in the update model — so a literal
@@ -517,7 +551,17 @@ async def update_target(
             user_id=current_user.id,
             user_display_name=current_user.username,
             result="success",
-            new_value={k: v for k, v in payload.items() if k != "passphrase"},
+            # Never the raw payload: ``config`` carries credentials, and
+            # ``url`` can too (a presigned query string). Record which
+            # config keys changed, not their values.
+            new_value={
+                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
+                **(
+                    {"config_keys_changed": sorted(payload["config"] or {})}
+                    if "config" in payload
+                    else {}
+                ),
+            },
         )
     )
     await db.commit()
@@ -578,13 +622,23 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
         raise HTTPException(status_code=404, detail="backup target not found")
     if not row.enabled:
         raise HTTPException(status_code=409, detail="target is disabled — enable it first")
-    result = await run_backup_for_target(
-        db,
-        target=row,
-        triggered_by="manual",
-        actor_id=current_user.id,
-        actor_display=current_user.username,
-    )
+    # A run stranded by a dead process (#1515) is reaped to ``failed``
+    # first — otherwise a manual-only target (which the schedule
+    # sweep never visits) would 409 here forever.
+    await reap_stale_backup_run(db, target=row, actor_display=current_user.username)
+    try:
+        result = await run_backup_for_target(
+            db,
+            target=row,
+            triggered_by="manual",
+            actor_id=current_user.id,
+            actor_display=current_user.username,
+        )
+    except BackupRunBusyError as exc:
+        # The runner's atomic claim lost to a run already in flight
+        # (a double-click, or the schedule sweep) (#1571). 409, not a
+        # second concurrent run.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunNowResponse(**result)
 
 
@@ -710,7 +764,16 @@ async def download_latest_target_archive(
     if not archives:
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
-    newest = archives[0]
+    # "Latest" means the newest real BACKUP (#1574): a pre-restore
+    # safety dump shares this listing on the recommended local-volume
+    # path, is newest by mtime right after a restore, and is encrypted
+    # with the public constant passphrase rather than this target's —
+    # serving it here hands the puller an archive their passphrase
+    # cannot open. Safety dumps stay listed and downloadable by name.
+    real_archives = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    if not real_archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    newest = real_archives[0]
     # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
     # than a local pair: that module already handles ``*``, comma lists,
     # the ``W/`` prefix and the legacy unquoted spelling, and it mints a

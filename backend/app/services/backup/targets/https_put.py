@@ -69,6 +69,8 @@ from app.services.backup.targets.base import (
     DestinationConfigError,
     UnsupportedOperationError,
     safe_filename,
+    safe_url,
+    scrub_url,
 )
 
 #: Generous, matching the WebDAV driver: a multi-GB archive over a slow
@@ -368,7 +370,9 @@ class HttpsPutDestination(BackupDestination):
                 # SecretFieldError)``, leaving the row stamped
                 # ``in_progress``, which the schedule sweep skips forever:
                 # that target's backups stop permanently and silently.
-                raise BackupDestinationError(f"{method} to {url} failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"{method} to {safe_url(url)} failed: {scrub_url(str(exc), url)}"
+                ) from exc
 
     # ── operations ────────────────────────────────────────────────────
 
@@ -385,14 +389,14 @@ class HttpsPutDestination(BackupDestination):
         )
         if resp.status_code in (301, 302, 303, 307, 308):
             raise BackupDestinationError(
-                f"receiver redirected to {resp.headers.get('location', '?')!r}. Redirects "
+                f"receiver redirected to {safe_url(resp.headers.get('location', '?'))!r}. Redirects "
                 "are not followed here, because that would re-send the archive and its "
                 "credential to an address the SSRF guard never checked — point the URL "
                 "at the final location instead."
             )
         if resp.status_code // 100 != 2:
             raise BackupDestinationError(
-                f"{_method(config)} to {url} returned {resp.status_code}: {resp.text[:300]}"
+                f"{_method(config)} to {safe_url(url)} returned {resp.status_code}: {resp.text[:300]}"
             )
 
     async def list_archives(self, *, config: dict[str, Any]) -> list[ArchiveListing]:
@@ -489,7 +493,7 @@ class HttpsPutDestination(BackupDestination):
             return {
                 "ok": False,
                 "error": (
-                    f"the receiver redirected to {resp.headers.get('location', '?')!r}. "
+                    f"the receiver redirected to {safe_url(resp.headers.get('location', '?'))!r}. "
                     "Redirects are not followed (that would re-send the archive and its "
                     "credential to an unchecked address) — configure the final URL."
                 ),
@@ -506,7 +510,7 @@ class HttpsPutDestination(BackupDestination):
             # and wonder what wrote it.
             "probe_retained": True,
             "detail": (
-                f"{method} to {url} returned {resp.status_code}. This destination cannot "
+                f"{method} to {safe_url(url)} returned {resp.status_code}. This destination cannot "
                 f"delete, so the 16-byte probe object {probe_name!r} is left on the "
                 "receiver — remove it there if it is in the way."
             ),

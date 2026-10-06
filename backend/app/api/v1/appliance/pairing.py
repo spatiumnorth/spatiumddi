@@ -11,7 +11,8 @@ What this module owns:
 
 * ``POST /api/v1/appliance/pairing-codes`` — mint a code. Required:
   ``persistent: bool``. Optional: ``expires_in_minutes`` (defaults:
-  15 min for ephemeral, no expiry for persistent), ``max_claims``
+  15 min for ephemeral, 30 days for persistent; ``0`` = never, persistent
+  only, #1356), ``max_claims``
   (only for persistent; NULL = unlimited), ``note``.
 * ``GET /api/v1/appliance/pairing-codes`` — list every code with
   redacted shape (``code_last_two`` only) + claim count + derived
@@ -53,12 +54,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
 
@@ -77,6 +78,8 @@ _EPHEMERAL_DEFAULT_EXPIRY_MINUTES = 15
 # at 5 years so an admin can't accidentally mint a code that
 # survives every operator currently working at the org.
 _PERSISTENT_MAX_EXPIRY_MINUTES = 60 * 24 * 365 * 5
+# #1356 — a persistent code expires after 30 days unless asked otherwise.
+_PERSISTENT_DEFAULT_EXPIRY_MINUTES = 30 * 24 * 60
 
 
 def _generate_code() -> str:
@@ -99,7 +102,7 @@ class PairingCodeCreate(BaseModel):
         description=(
             "False = single-use code with a short expiry (today's "
             "default). True = multi-claim code that can admit N "
-            "appliances; default no expiry; admin can disable / "
+            "appliances; default 30-day expiry; admin can disable / "
             "re-reveal."
         ),
     )
@@ -109,8 +112,8 @@ class PairingCodeCreate(BaseModel):
             f"Ephemeral codes: defaults to {_EPHEMERAL_DEFAULT_EXPIRY_MINUTES} "
             f"min, range {_EPHEMERAL_MIN_EXPIRY_MINUTES}-"
             f"{_EPHEMERAL_MAX_EXPIRY_MINUTES}. Persistent codes: NULL "
-            "= no expiry (default); 0 also means no expiry; any "
-            "positive integer up to 5 years caps the validity window."
+            "= 30 days (default); 0 = no expiry; any positive integer "
+            "up to 5 years caps the validity window."
         ),
     )
     max_claims: int | None = Field(
@@ -232,10 +235,15 @@ async def create_pairing_code(
     now = datetime.now(UTC)
     expires_at: datetime | None
     if body.persistent:
-        # Persistent code: NULL or 0 means no expiry. Positive value
-        # caps validity; values above the 5-year ceiling rejected.
+        # Persistent code: omitted means the 30-day default (#1356); an
+        # explicit 0 means no expiry. A code is 8 digits, so one that never
+        # expires is a standing fleet-join credential for as long as it
+        # exists, and "never" has to be asked for. Values above the 5-year
+        # ceiling are rejected.
         minutes = body.expires_in_minutes
-        if minutes is None or minutes == 0:
+        if minutes is None:
+            minutes = _PERSISTENT_DEFAULT_EXPIRY_MINUTES
+        if minutes == 0:
             expires_at = None
         elif minutes < 0:
             raise HTTPException(
@@ -527,15 +535,18 @@ async def reveal_pairing_code(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is ReauthOutcome.MFA_REQUIRED:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Re-confirmation requires MFA. Your account has no local password "
-            "— enrol TOTP under Settings → Security, then retry.",
-        )
-    if outcome is not ReauthOutcome.OK:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP verification failed.")
+    # #1413 — through the shared step-up: a wrong answer spends the
+    # per-account budget, and a refusal is now audited (it was not).
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="pairing_code_reveal_denied",
+        resource_type="pairing_code",
+        resource_id=str(code_id),
+        resource_display=str(code_id),
+    )
 
     row = await db.get(PairingCode, code_id)
     if row is None:
