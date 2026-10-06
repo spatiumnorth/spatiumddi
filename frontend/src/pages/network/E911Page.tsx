@@ -118,7 +118,7 @@ export function E911Page() {
         </h1>
         <p className="text-sm text-muted-foreground">
           The <code>network.e911</code> feature module is disabled. Enable it
-          under Settings → Features.
+          under Features & Integrations.
         </p>
       </div>
     );

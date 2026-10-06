@@ -171,14 +171,20 @@ _FORWARDER_PROTOCOLS = {
 #
 # Technitium has no RPZ. It blocks natively, either from subscribed URL
 # lists or from a per-domain "blocked zones" set, so SpatiumDDI's
-# effective blocklist entries map onto the latter (``blocked/add`` /
-# ``blocked/delete``) and its exceptions onto the allowed set.
+# effective blocklist entries map onto the latter (``blocked/import``,
+# read back with ``blocked/export``) and its exceptions onto the allowed set.
 #
 # ``blockingType`` decides what a blocked name answers with. Like
 # ``zoneTransfer`` it SILENTLY IGNORES an unrecognised value — verified:
 # ``blockingType="Bogus"`` returns ok and leaves the previous mode — so it
 # is validated here rather than trusted to fail loudly.
 _BLOCKING_TYPES = frozenset({"NxDomain", "AnyAddress", "CustomAddress"})
+
+# Domains per ``blocked/import`` / ``allowed/import`` call (#1425). Each
+# call rewrites the zone file once, so fewer calls is cheaper; this keeps a
+# single form body around 100-200 KB. ``blocked/add`` rewrote the file on
+# EVERY call, which is what made a 16k-entry list take ~30 minutes.
+_BLOCKING_IMPORT_CHUNK = 5000
 
 # Neutral block_mode → Technitium blocking type. ``sinkhole`` / ``redirect``
 # both answer with an operator-chosen address, which is CustomAddress;
@@ -431,6 +437,22 @@ def _zone_options_payload(
     # transfer enabled" on a zone that cannot transfer at all.
     payload["zoneTransferTsigKeyNames"] = names
     return payload
+
+
+def _ascii_domain(domain: Any) -> str:
+    """A domain as Technitium stores it: lower case, no trailing dot, IDNA.
+
+    Technitium converts a Unicode name to its ASCII form on import, and
+    ``export`` returns that form, so the desired set has to be compared in
+    it too or an IDN entry would read as changed on every apply.
+    """
+    name = str(domain).strip().rstrip(".").lower()
+    if name.isascii():
+        return name
+    try:
+        return name.encode("idna").decode("ascii")
+    except UnicodeError:
+        return name
 
 
 def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
@@ -1134,27 +1156,24 @@ class TechnitiumDriver(DriverBase):
     def _apply_blocking(self, token: str, blocking: dict[str, Any]) -> None:
         """Converge Technitium's blocked / allowed domain sets.
 
-        Implemented as flush-then-rewrite rather than a diff, and that is
-        a deliberate trade.
+        Read with ``{kind}/export``, written with ``{kind}/flush`` +
+        ``{kind}/import`` (#1425).
 
-        ``blocked/list`` is a **one-level tree browser**, not a flat list:
-        ``domain=""`` returns the top-level nodes, ``domain="foo.test"``
-        returns *its* children, and a node only holds the actual block
-        under ``records`` at the leaf. So intermediate nodes appear in the
-        listing without themselves being blocked domains. A naive
-        one-level read therefore returns names that were never blocked,
-        and deleting one of them removes the whole subtree beneath it —
-        verified: reading the root and reconciling against it wiped every
-        entry. A correct diff needs a recursive descent plus a
-        node-vs-leaf test on every level.
+        ``export`` returns the set as a flat list, one name per line. That
+        is the read model ``blocked/list`` cannot be: ``list`` is a
+        one-level tree browser whose intermediate nodes are not themselves
+        blocked domains, so reconciling against it deleted whole subtrees
+        (verified). With a flat read, a set that already matches the bundle
+        is left alone — no rewrite, no window without blocking — which is
+        every structural apply that did not touch a blocklist.
 
-        Flush-and-rewrite needs no read model at all, so it cannot be
-        subtly wrong in that way. The cost is a brief window with no
-        blocking on each structural apply — real, but structural applies
-        are infrequent (record CRUD does not trigger one), and a window
-        beats silently un-blocking names the operator still expects to be
-        blocked. Revisit if the window ever matters more than the
-        correctness does.
+        A set that differs is flushed and re-imported rather than diffed
+        entry by entry: ``delete`` also rewrites the zone file per call,
+        so a large diff would cost what the old per-domain ``add`` did.
+        ``import`` takes a comma-separated list and saves once per call;
+        a 16k-entry list that took ~30 minutes through ``add`` now takes
+        a handful of calls. An unreadable live set (an error answer) is
+        treated as different, so it is rewritten rather than trusted.
         """
         if not blocking:
             return
@@ -1189,7 +1208,15 @@ class TechnitiumDriver(DriverBase):
             )
             return
 
+        unchanged: list[str] = []
         for kind in ("blocked", "allowed"):
+            desired = sorted(
+                {_ascii_domain(d) for d in blocking.get(kind) or [] if str(d).strip()}
+            )
+            live = self._export_domains(token, kind)
+            if live is not None and live == set(desired):
+                unchanged.append(kind)
+                continue
             flushed = self._call(token, "POST", f"{kind}/flush", {}).json()
             if flushed.get("status") != "ok":
                 log.error(
@@ -1197,15 +1224,17 @@ class TechnitiumDriver(DriverBase):
                     error=flushed.get("errorMessage"),
                 )
                 continue
-            for domain in blocking.get(kind) or []:
-                added = self._call(
-                    token, "POST", f"{kind}/add", {"domain": domain}
+            for start in range(0, len(desired), _BLOCKING_IMPORT_CHUNK):
+                chunk = desired[start : start + _BLOCKING_IMPORT_CHUNK]
+                imported = self._call(
+                    token, "POST", f"{kind}/import", {f"{kind}Zones": ",".join(chunk)}
                 ).json()
-                if added.get("status") != "ok":
-                    log.warning(
-                        f"technitium_{kind}_add_failed",
-                        domain=domain,
-                        error=added.get("errorMessage"),
+                if imported.get("status") != "ok":
+                    log.error(
+                        f"technitium_{kind}_import_failed",
+                        first=chunk[0],
+                        count=len(chunk),
+                        error=imported.get("errorMessage"),
                     )
         log.info(
             "technitium_blocking_applied",
@@ -1213,7 +1242,30 @@ class TechnitiumDriver(DriverBase):
             blocking_type=settings["blockingType"],
             blocked=len(blocking.get("blocked") or []),
             allowed=len(blocking.get("allowed") or []),
+            unchanged=unchanged,
         )
+
+    def _export_domains(self, token: str, kind: str) -> set[str] | None:
+        """The live blocked / allowed set as a flat set, or None if unreadable.
+
+        ``{kind}/export`` answers ``text/plain``, one name per line. Any
+        JSON answer is an error (an invalid token, a permission refusal),
+        so None: the caller then rewrites rather than trusts it.
+        """
+        resp = self._call(token, "GET", f"{kind}/export", {})
+        try:
+            resp.json()
+        except ValueError:
+            pass
+        else:
+            return None
+        if getattr(resp, "status_code", 200) != 200:
+            return None
+        return {
+            line.strip().rstrip(".").lower()
+            for line in (resp.text or "").splitlines()
+            if line.strip()
+        }
 
     # ── Encrypted transports (issue #741) ───────────────────────────────
 
