@@ -11022,7 +11022,12 @@ function DeleteOrOrphanModal({
 }
 
 /** Two-step destruction modal: step 1 confirms intent, step 2 requires checkbox. */
-function ConfirmDestroyModal({
+/** IPAM's two-step delete confirm. Every caller deletes into Trash — the
+ *  tree's Delete… on a block or a subnet, and the block and space views'
+ *  bulk deletes — so its last step says what can be restored and until when
+ *  (#1398). An IP address purge, the one IPAM delete for good, has its own
+ *  dialogs. */
+export function ConfirmDestroyModal({
   title,
   description,
   checkLabel,
@@ -11082,12 +11087,14 @@ function ConfirmDestroyModal({
   }
 
   return (
-    <Modal title="Confirm Permanent Deletion" onClose={onClose}>
+    <Modal title="Move to Trash" onClose={onClose}>
       <div className="space-y-4">
-        <p className="text-sm font-medium text-destructive">
-          This action cannot be undone.
-        </p>
         <p className="text-sm text-muted-foreground">{description}</p>
+        <p className="text-sm text-muted-foreground">
+          Deleted objects go to Trash: you can restore them from Administration
+          → Trash within 30 days, after which the nightly purge deletes them for
+          good.
+        </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
             type="checkbox"
@@ -11119,7 +11126,7 @@ function ConfirmDestroyModal({
             disabled={!checked || isPending}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
-            {isPending ? "Deleting…" : "Delete permanently"}
+            {isPending ? "Deleting…" : "Move to Trash"}
           </button>
         </div>
       </div>
@@ -11233,7 +11240,7 @@ function SpaceAsnBadge({ asnId }: { asnId: string }) {
 
 // ─── Edit IP Space Modal (name/description + delete trigger) ─────────────────
 
-function EditSpaceModal({
+export function EditSpaceModal({
   space,
   onClose,
   onDeleted,
@@ -11349,8 +11356,8 @@ function EditSpaceModal({
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             Are you sure you want to delete{" "}
-            <strong className="text-foreground">{space.name}</strong>? This will
-            permanently delete all blocks, subnets, and IP addresses within it.
+            <strong className="text-foreground">{space.name}</strong>? It moves
+            to Trash with every block and subnet inside it.
           </p>
           <div className="flex justify-end gap-2">
             <button
@@ -11374,18 +11381,13 @@ function EditSpaceModal({
   // ── Delete step 2: final confirm with checkbox ──
   if (deleteStep === 2) {
     return (
-      <Modal
-        title="Confirm Permanent Deletion"
-        onClose={() => setDeleteStep(0)}
-      >
+      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
         <div className="space-y-4">
-          <p className="text-sm font-medium text-destructive">
-            This action cannot be undone.
-          </p>
           <p className="text-sm text-muted-foreground">
-            All subnets and IP address records in{" "}
-            <strong className="text-foreground">{space.name}</strong> will be
-            permanently removed from the database.
+            <strong className="text-foreground">{space.name}</strong>, with
+            every block and subnet inside it, will be moved to Trash. You can
+            restore them together within 30 days from Administration → Trash;
+            after that the nightly purge deletes them for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -11394,7 +11396,8 @@ function EditSpaceModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand this will permanently delete all data in this IP space.
+            I understand {space.name} and everything inside it will be moved to
+            Trash.
           </label>
           {deleteError && (
             <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -11416,7 +11419,7 @@ function EditSpaceModal({
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+              {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
             </button>
           </div>
         </div>
@@ -11552,9 +11555,10 @@ function EditSpaceModal({
       {tab === "danger" && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting an IP space permanently removes every block, subnet, and IP
-            address row inside it. The deletion is gated by a typed confirm in
-            the next step.
+            Deleting an IP space moves it to Trash with every block and subnet
+            inside it, restorable together for 30 days. Purging it from Trash
+            deletes them for good. The deletion is gated by a confirm in the
+            next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -12143,8 +12147,8 @@ function EditBlockModal({
             <strong className="text-foreground font-mono">
               {block.network}
             </strong>
-            {block.name ? ` (${block.name})` : ""}? This will permanently delete
-            all subnets and IP addresses within it.
+            {block.name ? ` (${block.name})` : ""}? It moves to Trash with every
+            block and subnet inside it.
           </p>
           <div className="flex justify-end gap-2">
             <button
@@ -12168,20 +12172,15 @@ function EditBlockModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal
-        title="Confirm Permanent Deletion"
-        onClose={() => setDeleteStep(0)}
-      >
+      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
         <div className="space-y-4">
-          <p className="text-sm font-medium text-destructive">
-            This action cannot be undone.
-          </p>
           <p className="text-sm text-muted-foreground">
-            All subnets and IP address records within{" "}
             <strong className="text-foreground font-mono">
               {block.network}
-            </strong>{" "}
-            will be permanently removed from the database.
+            </strong>
+            , with every block and subnet inside it, will be moved to Trash. You
+            can restore them together within 30 days from Administration →
+            Trash; after that the nightly purge deletes them for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -12190,7 +12189,8 @@ function EditBlockModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand this will permanently delete all data in this block.
+            I understand {block.network} and everything inside it will be moved
+            to Trash.
           </label>
           {deleteError && (
             <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -12212,7 +12212,7 @@ function EditBlockModal({
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+              {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
             </button>
           </div>
         </div>
@@ -12334,9 +12334,10 @@ function EditBlockModal({
       {tab === "danger" && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting a block permanently removes every subnet and IP address row
-            inside it. The deletion is gated by a typed confirm in the next
-            step.
+            Deleting a block moves it to Trash with every block and subnet
+            inside it, restorable together for 30 days. Purging it from Trash
+            deletes them for good. The deletion is gated by a confirm in the
+            next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -13129,14 +13130,14 @@ function BlockDetailView({
             <ConfirmDestroyModal
               title={`Delete ${noun}`}
               description={
-                sCount > 0
-                  ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash` +
-                    (bCount > 0
-                      ? ` and permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}.`
-                      : ". You can restore from Admin → Trash within 30 days.")
-                  : `This will permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}. Blocks are not restorable from Trash.`
+                (sCount > 0 && bCount > 0
+                  ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} and ${bCount} empty block${bCount === 1 ? "" : "s"} to Trash.`
+                  : sCount > 0
+                    ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash.`
+                    : `This will move ${bCount} empty block${bCount === 1 ? "" : "s"} to Trash.`) +
+                " You can restore them from Administration → Trash within 30 days."
               }
-              checkLabel={`I understand ${noun} will be deleted.`}
+              checkLabel={`I understand ${noun} will be moved to Trash.`}
               isPending={blockBulkDeleteMut.isPending}
               error={blockBulkDeleteError}
               notice={blockBulkDeleteNotice}
@@ -15422,7 +15423,7 @@ function SpaceSection({
         <ConfirmDestroyModal
           title="Delete Block"
           description={`Delete block ${blockToDelete.network}${blockToDelete.name ? ` (${blockToDelete.name})` : ""}?`}
-          checkLabel={`I understand everything inside ${blockToDelete.network} will be permanently deleted.`}
+          checkLabel={`I understand ${blockToDelete.network} and everything inside it will be moved to Trash.`}
           isPending={deleteBlockMut.isPending}
           error={blockDeleteError}
           onClose={() => {
@@ -15470,7 +15471,7 @@ function SpaceSection({
         <ConfirmDestroyModal
           title="Delete Subnet"
           description={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}?`}
-          checkLabel={`I understand ${subnetToDelete.network} and all its contents will be permanently deleted.`}
+          checkLabel={`I understand ${subnetToDelete.network} and its contents will be moved to Trash.`}
           isPending={deleteSubnet.isPending}
           error={subnetDeleteError}
           onClose={() => {

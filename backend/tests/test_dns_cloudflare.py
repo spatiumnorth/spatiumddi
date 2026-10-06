@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from app.drivers.dns._cloud_base import CloudDNSError
-from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.drivers.dns.cloudflare import CloudflareDNSDriver
 
 
@@ -573,3 +573,374 @@ def test_capabilities_shape() -> None:
     assert caps["dnssec_online"] is False  # #29 — cloud DNSSEC deferred
     assert caps["apex_cname"] == "flatten"
     assert "CAA" in caps["record_types"]
+
+
+# ── #783: create / update with the complete desired RRset ──────────────
+#
+# Cloudflare keeps one row per value and the op names only the NEW value,
+# so the per-value lookup cannot find the row an edit changes. These pin
+# the set write that replaced it for ops carrying ``rrset``.
+
+
+def _set_change(
+    op: str,
+    members: list[tuple[str, int | None]],
+    *,
+    rtype: str = "TXT",
+    name: str = "_dmarc",
+    ttl: int | None = 300,
+) -> RecordChange:
+    value, priority = members[-1]
+    return RecordChange(
+        op=op,  # type: ignore[arg-type]
+        zone_name="example.com.",
+        record=RecordData(name=name, record_type=rtype, value=value, ttl=ttl, priority=priority),
+        target_serial=1,
+        rrset=RRsetData(
+            ttl=ttl, members=tuple(RRsetMember(value=v, priority=p) for v, p in members)
+        ),
+    )
+
+
+def _row(rid: str, content: str, *, rtype: str = "TXT", ttl: int = 300, **extra: Any) -> dict:
+    return {
+        "id": rid,
+        "type": rtype,
+        "name": "_dmarc.example.com",
+        "content": content,
+        "ttl": ttl,
+        **extra,
+    }
+
+
+async def test_update_that_changes_the_value_replaces_the_old_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE regression: editing a value left the old row next to the new one
+    (two DMARC records, so no valid DMARC policy at all)."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("old", '"v=DMARC1; p=none"')])),
+            ],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+            "delete": [_FakeResponse(200, _env({"id": "old"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("v=DMARC1; p=quarantine", None)])
+    )
+
+    writes = [(c["method"], c["path"]) for c in fake.calls if c["method"] != "get"]
+    # New row first, then the old one goes: the name is never empty.
+    assert writes == [
+        ("post", "/zones/zid/dns_records"),
+        ("delete", "/zones/zid/dns_records/old"),
+    ]
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["content"] == "v=DMARC1; p=quarantine"
+    # The set is read by name + type only, not filtered by the new value.
+    assert fake.calls[1]["params"]["name"] == "_dmarc.example.com"
+    assert "content" not in fake.calls[1]["params"]
+
+
+async def test_set_write_keeps_siblings_and_adds_the_new_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("a", "10.0.0.1", rtype="A")])),
+            ],
+            "post": [_FakeResponse(200, _env({"id": "b"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(),
+        _CREDS,
+        _set_change("create", [("10.0.0.1", None), ("10.0.0.2", None)], rtype="A", name="www"),
+    )
+
+    assert [c["method"] for c in fake.calls] == ["get", "get", "post"]
+    assert fake.calls[2]["json"]["content"] == "10.0.0.2"
+
+
+async def test_set_write_corrects_ttl_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("r", "v=spf1 -all", ttl=3600)])),
+            ],
+            "put": [_FakeResponse(200, _env({"id": "r"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(_Server(), _CREDS, _set_change("update", [("v=spf1 -all", None)]))
+
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/zones/zid/dns_records/r"
+    assert put["json"]["ttl"] == 300
+    assert [c["method"] for c in fake.calls].count("delete") == 0
+
+
+@pytest.mark.parametrize(
+    ("rtype", "stored", "desired"),
+    [
+        ("TXT", '"v=spf1 -all"', "v=spf1 -all"),
+        ("CNAME", "Target.Example.net", "target.example.net."),
+        ("AAAA", "2001:db8:0:0:0:0:0:1", "2001:db8::1"),
+    ],
+)
+async def test_set_write_is_a_noop_when_only_the_spelling_differs(
+    monkeypatch: pytest.MonkeyPatch, rtype: str, stored: str, desired: str
+) -> None:
+    """A converged set costs one read. Compared literally, these would read
+    as missing and be POSTed, which Cloudflare refuses as identical."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("r", stored, rtype=rtype)])),
+            ],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [(desired, None)], rtype=rtype)
+    )
+
+    assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+async def test_set_write_matches_mx_on_priority_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("m10", "mx.example.com", rtype="MX", priority=10)])),
+            ],
+            "post": [_FakeResponse(200, _env({"id": "m20"}))],
+            "delete": [_FakeResponse(200, _env({"id": "m10"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("mx.example.com", 20)], rtype="MX", name="@")
+    )
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["priority"] == 20
+    assert next(c for c in fake.calls if c["method"] == "delete")["path"].endswith("/m10")
+
+
+async def test_set_write_deletes_nothing_when_cloudflare_reports_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Cloudflare calls the new value a duplicate of a row this driver did
+    not recognise, that row may be the record itself: never delete it."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([_row("odd", "v=spf1  -all")])),
+            ],
+            "post": [
+                _FakeResponse(
+                    400,
+                    {
+                        "success": False,
+                        "errors": [{"message": "An identical record already exists."}],
+                    },
+                )
+            ],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    with pytest.raises(CloudDNSError, match="left the existing records in place"):
+        await driver._apply_record(
+            _Server(), _CREDS, _set_change("update", [("v=spf1 -all", None)])
+        )
+
+    assert "delete" not in [c["method"] for c in fake.calls]
+
+
+async def test_delete_with_rrset_stays_a_single_value_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delete's RRset is the survivors; they are already there, so only the
+    op's own value is removed (no set write)."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(200, _env([{"id": "gone", "content": "10.0.0.2"}])),
+            ],
+            "delete": [_FakeResponse(200, _env({"id": "gone"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="delete",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="10.0.0.2"),
+        target_serial=1,
+        rrset=RRsetData(ttl=300, members=(RRsetMember(value="10.0.0.1"),)),
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    assert [c["method"] for c in fake.calls] == ["get", "get", "delete"]
+
+
+# ── Cloudflare's ``proxied`` flag survives every write ─────────────────
+#
+# SpatiumDDI does not model ``proxied``, and a PUT or POST that omits it
+# lands DNS-only, which publishes the origin's address. A proxied row's TTL
+# also always reads back as 1 (auto), whatever was set.
+
+
+async def test_set_write_leaves_a_proxied_row_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row's TTL (auto) differs from the op's, but correcting it would PUT
+    the row without ``proxied`` and expose the origin: no write at all."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([_row("p", "203.0.113.10", rtype="A", ttl=1, proxied=True)])
+                ),
+            ],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("203.0.113.10", None)], rtype="A", name="www")
+    )
+
+    assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+async def test_set_write_ttl_correction_carries_proxied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DNS-only sibling of a proxied row still gets its TTL corrected, and
+    the PUT states its proxy status instead of leaving it to the default."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200,
+                    _env(
+                        [
+                            _row("p", "203.0.113.10", rtype="A", ttl=1, proxied=True),
+                            _row("d", "203.0.113.11", rtype="A", ttl=3600, proxied=False),
+                        ]
+                    ),
+                ),
+            ],
+            "put": [_FakeResponse(200, _env({"id": "d"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(),
+        _CREDS,
+        _set_change(
+            "update", [("203.0.113.10", None), ("203.0.113.11", None)], rtype="A", name="www"
+        ),
+    )
+
+    puts = [c for c in fake.calls if c["method"] == "put"]
+    assert [p["path"] for p in puts] == ["/zones/zid/dns_records/d"]
+    assert puts[0]["json"]["ttl"] == 300
+    assert puts[0]["json"]["proxied"] is False
+
+
+async def test_set_write_value_change_keeps_the_record_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editing a proxied record's address replaces the row; the new row must
+    be proxied too, or the edit would publish the new origin address."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([_row("old", "203.0.113.10", rtype="A", ttl=1, proxied=True)])
+                ),
+            ],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+            "delete": [_FakeResponse(200, _env({"id": "old"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("update", [("203.0.113.20", None)], rtype="A", name="www")
+    )
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["content"] == "203.0.113.20"
+    assert post["json"]["proxied"] is True
+    assert next(c for c in fake.calls if c["method"] == "delete")["path"].endswith("/old")
+
+
+async def test_set_write_new_name_does_not_send_proxied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing at the name yet: the create leaves ``proxied`` to Cloudflare."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+
+    await driver._apply_record(
+        _Server(), _CREDS, _set_change("create", [("203.0.113.20", None)], rtype="A", name="www")
+    )
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert "proxied" not in post["json"]
+
+
+async def test_apply_record_update_without_rrset_carries_proxied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-value update path (no ``rrset``) PUTs the row it matched; that
+    PUT must keep the row proxied too."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _FakeResponse(200, _env([{"id": "zid"}])),
+                _FakeResponse(
+                    200, _env([{"id": "rid", "content": "203.0.113.10", "proxied": True}])
+                ),
+            ],
+            "put": [_FakeResponse(200, _env({"id": "rid"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(name="www", record_type="A", value="203.0.113.10", ttl=120),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/zones/zid/dns_records/rid"
+    assert put["json"]["proxied"] is True
