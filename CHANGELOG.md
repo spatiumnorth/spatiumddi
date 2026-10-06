@@ -674,6 +674,44 @@ the formatter handles the rest.
 
 ### Security
 
+- **Webhook forward targets keep their URL and Authorization header
+  encrypted, and no longer show or log them (#1502).** For a Slack,
+  Discord or Teams target the incoming-webhook URL is the credential:
+  whoever has it can post into the channel. It sat in a plaintext
+  column (`audit_forward_target.url`), and so in every backup archive's
+  unencrypted database dump and in "exclude secrets" diagnostic
+  archives. The API returned it in full, and httpx logged it at INFO on
+  every delivery (`HTTP Request: POST <URL>`), which put it in the api
+  and worker logs and in an appliance support bundle. A generic
+  target's `Authorization` header was stored the same way. The legacy
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
+  (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
+  cross-install backup rewrap). The API takes them write-only and
+  returns `url_set`, `auth_header_set` and a `url_display` that shows
+  only the scheme and host (`https://hooks.slack.com/…`). The httpx
+  request line for a webhook delivery shows only that host, and
+  delivery and save errors are redacted. The support-bundle scrubber
+  also recognises Slack, Discord and Teams webhook URLs and a SAS
+  `sig=` parameter, wherever else one is printed. The form uses
+  password inputs, shows the stored host, and keeps a field left blank
+  on edit.
+  **Behaviour changes:** `GET /settings/audit-forward-targets` no
+  longer has `url`, and `GET /settings` no longer has
+  `audit_forward_webhook_url` / `audit_forward_webhook_auth_header`
+  (each is replaced by the `*_set` / `*_display` fields). On
+  `PUT /settings/audit-forward-targets/{id}`, an omitted or `null`
+  `url` / `auth_header` now keeps the stored value, and `""` clears it.
+  Before, an omitted header was wiped, so editing a generic target in
+  the UI silently removed its header. **Upgrade notes:** the old
+  plaintext columns are kept, unread, for one release so a rolling
+  upgrade's old api pods keep working, and the next release drops them.
+  Until then they hold the pre-upgrade values, so a full archive still
+  carries those in clear, as every earlier archive does. Re-issuing the
+  webhook URL in Slack / Discord / Teams (and any collector token) once
+  the upgrade has finished, and pasting the new one in, is the only way
+  to retire a value that is already in an archive.
+
 - **Making someone a superadmin through a group needs the operator
   step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
   user is also a superadmin when one of their groups holds a role
@@ -964,6 +1002,15 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `e51ab0dede3e` — #1502, expand only: adds `url_encrypted` /
+  `auth_header_encrypted` to `audit_forward_target` and
+  `audit_forward_webhook_url_encrypted` /
+  `audit_forward_webhook_auth_header_encrypted` to `platform_settings`,
+  fills them from the plaintext columns with `encrypt_str` (so it needs
+  `SECRET_KEY`, like `b3c71e9a4d25`), and makes the plaintext columns
+  nullable. It does not drop them; the next release does. Downgrade
+  copies the current values back into the plaintext columns and drops
+  the encrypted ones.
 
 ## 2026.10.02-1 — 2026-10-02
 
