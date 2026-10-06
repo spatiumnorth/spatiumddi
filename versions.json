@@ -345,7 +345,7 @@
     },
 
     "gobgp": {
-      "version": "4.9.0",
+      "version": "4.10.0",
       "pinned_in": [
         {
           "path": "agent/looking-glass/images/gobgp/Dockerfile",
@@ -355,7 +355,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} (built from source)", "count": 1 }
       ],
       "upstream": { "kind": "github-release", "repo": "osrg/gobgp" },
-      "note": "Built from source in the image, so Dependabot's `FROM` coverage never sees it. Run `make trivy IMAGE=gobgp` on a bump -- the golang builder is a security pin (Go static-links its stdlib, so no apk upgrade can fix a stdlib CVE)."
+      "note": "Built from source in the image, so Dependabot's `FROM` coverage never sees it. Run `make trivy IMAGE=looking-glass` on a bump -- the golang builder is a security pin (Go static-links its stdlib, so no apk upgrade can fix a stdlib CVE)."
     },
 
     "technitium": {
@@ -538,7 +538,7 @@
       "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
     },
     "swagger-ui": {
-      "version": "5.33.0",
+      "version": "5.33.1",
       "pinned_in": [
         { "path": "backend/app/static/api-docs/README.md", "match": "swagger-ui-dist@{version}", "count": 2 },
         {

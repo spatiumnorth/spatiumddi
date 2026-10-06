@@ -31,8 +31,13 @@ install's own key, and the restore order (migrate in phase 6,
 cross-install rewrap in phase 7) handles a value already under the
 local key.
 
+Originally branched off 61566a119901; reparented onto
+e51ab0dede3e when #1506 merged first, to keep a single head.
+The two migrations touch different tables, so the order is
+immaterial.
+
 Revision ID: d27e1d8716bd
-Revises: 61566a119901
+Revises: e51ab0dede3e
 Create Date: 2026-10-04
 """
 
@@ -43,7 +48,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "d27e1d8716bd"
-down_revision = "61566a119901"
+down_revision = "e51ab0dede3e"
 branch_labels = None
 depends_on = None
 

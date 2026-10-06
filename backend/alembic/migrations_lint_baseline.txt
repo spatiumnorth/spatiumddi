@@ -652,6 +652,7 @@ backend/alembic/versions/e4c1a8f63b29_dhcp_scope_v6_mode.py:drop_column:60
 backend/alembic/versions/e4c1a8f63b29_dhcp_scope_v6_mode.py:drop_column:61
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:100
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:98
+backend/alembic/versions/e51ab0dede3e_forward_webhook_secrets_encrypted.py:drop_column:107
 backend/alembic/versions/e5a18c40729b_ai_tool_catalog.py:drop_column:47
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:365
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:370

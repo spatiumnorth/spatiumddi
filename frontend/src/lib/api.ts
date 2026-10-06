@@ -3612,8 +3612,11 @@ export interface PlatformSettings {
   audit_forward_syslog_protocol: string;
   audit_forward_syslog_facility: number;
   audit_forward_webhook_enabled: boolean;
-  audit_forward_webhook_url: string;
-  audit_forward_webhook_auth_header: string;
+  // The legacy webhook's URL and header are write-only (#1502): the server
+  // returns whether each is set, and the URL's scheme + host only.
+  audit_forward_webhook_url_set: boolean;
+  audit_forward_webhook_url_display: string;
+  audit_forward_webhook_auth_header_set: boolean;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -4068,7 +4071,11 @@ export interface AuditForwardTarget {
   protocol: AuditForwardProtocol;
   facility: number;
   ca_cert_pem: string | null;
-  url: string;
+  // The webhook URL and Authorization header are Fernet-encrypted at rest
+  // and never returned (#1502). ``url_display`` is scheme + host only, e.g.
+  // ``https://hooks.slack.com/…``.
+  url_set: boolean;
+  url_display: string;
   auth_header_set: boolean;
   webhook_flavor: AuditForwardWebhookFlavor;
   smtp_host: string;
@@ -4096,8 +4103,10 @@ export interface AuditForwardTargetWrite {
   protocol?: AuditForwardProtocol;
   facility?: number;
   ca_cert_pem?: string | null;
-  url?: string;
-  auth_header?: string;
+  // Same contract as ``smtp_password``: omitted or ``null`` keeps the stored
+  // value, ``""`` clears it, any other string replaces it.
+  url?: string | null;
+  auth_header?: string | null;
   webhook_flavor?: AuditForwardWebhookFlavor;
   smtp_host?: string;
   smtp_port?: number;
@@ -4289,13 +4298,14 @@ export interface AuthGroupMapping {
   modified_at: string;
 }
 
-export interface AuthGroupMappingCreate {
+// #1476 — a mapping into a group that grants superadmin needs the step-up.
+export interface AuthGroupMappingCreate extends StepUp {
   external_group: string;
   internal_group_id: string;
   priority?: number;
 }
 
-export interface AuthGroupMappingUpdate {
+export interface AuthGroupMappingUpdate extends StepUp {
   external_group?: string;
   internal_group_id?: string;
   priority?: number;
@@ -4317,7 +4327,7 @@ export interface InternalGroup {
   user_ids?: string[];
 }
 
-export interface InternalGroupCreate {
+export interface InternalGroupCreate extends StepUp {
   name: string;
   description?: string;
   auth_source?: string;
@@ -4326,7 +4336,7 @@ export interface InternalGroupCreate {
   user_ids?: string[];
 }
 
-export interface InternalGroupUpdate {
+export interface InternalGroupUpdate extends StepUp {
   name?: string;
   description?: string;
   external_dn?: string | null;
@@ -4361,7 +4371,7 @@ export interface TimeBoundGrant {
   created_at: string;
 }
 
-export interface TimeBoundGrantCreate {
+export interface TimeBoundGrantCreate extends StepUp {
   group_id: string;
   action: string;
   resource_type: string;
@@ -4412,7 +4422,7 @@ export interface RoleCreate {
   permissions?: PermissionEntry[];
 }
 
-export interface RoleUpdate {
+export interface RoleUpdate extends StepUp {
   name?: string;
   description?: string;
   permissions?: PermissionEntry[];
