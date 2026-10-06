@@ -118,6 +118,22 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **IPAM writes PTRs only into a reverse zone it serves as primary
+  (#1419).** IPAM picked the zone for a PTR by kind and name alone, so a
+  conditional forwarder, a secondary or a stub named under in-addr.arpa or
+  ip6.arpa and stored as reverse (the importers store every such zone that
+  way, and so does an operator who picks Reverse lookup for one) took
+  IPAM's PTR records for the gateway and every host, and the record
+  updates went to a zone that cannot take them. The drift check found the
+  same zone and showed the subnet in sync, and the reverse-zone backfill
+  reported such a zone as created. The zone that owns an address's
+  reverse name is now the most specific zone covering it, whatever its
+  type: IPAM writes the PTR there only when that zone is a primary;
+  otherwise it writes none and queues nothing, and the drift check
+  expects none. A PTR an earlier release wrote into such a zone is
+  dropped, with no update sent, the next time IPAM syncs or deletes the
+  address.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

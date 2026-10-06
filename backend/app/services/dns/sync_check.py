@@ -28,7 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
@@ -123,9 +123,52 @@ async def _effective_forward_zone_id(db: AsyncSession, subnet: Subnet) -> uuid.U
     return zone_id
 
 
+def ipam_authors_zone(zone: DNSZone) -> bool:
+    """Whether IPAM may write records into ``zone``: only a zone SpatiumDDI
+    serves as primary (spatiumddi#1419).
+
+    A forward zone is a forwarders block with no zone file and no
+    allow-update, and a secondary's or a stub's data comes from its primary:
+    a record IPAM writes there is served by nobody, and its RFC 2136 update is
+    refused.
+    """
+    return zone.zone_type == "primary"
+
+
+def reverse_owner_candidates() -> ColumnElement[bool]:
+    """The zones that can own a reverse name (spatiumddi#1419): every
+    ``kind: reverse`` zone, and every zone named under ``arpa`` that is not
+    primary, whatever its kind. Add Zone keeps the kind it is given for a
+    forwarder, a secondary or a stub (#1310), so one named under in-addr.arpa
+    may be stored ``forward`` and still own those names; a primary stored
+    ``forward`` takes no PTR, as before. The name test only narrows the
+    fetch — callers still match the name label-wise against the pointer."""
+    return or_(
+        DNSZone.kind == "reverse",
+        and_(
+            DNSZone.zone_type != "primary",
+            or_(DNSZone.name.ilike("%arpa"), DNSZone.name.ilike("%arpa.")),
+        ),
+    )
+
+
+def reverse_owner_key(zone: DNSZone) -> tuple[int, bool]:
+    """Sort key for the owner of a reverse name among the candidate zones that
+    cover it (spatiumddi#1419): the most specific zone owns the name, whatever
+    its type, so IPAM writes no PTR into a less specific primary for names a
+    forwarder, a secondary or a stub beneath it owns. At equal depth (one name
+    in two views) a primary wins."""
+    return (len(zone.name.rstrip(".")), ipam_authors_zone(zone))
+
+
 async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone | None:
     """Find the reverse zone for this subnet — first by ``linked_subnet_id``,
     then by longest-suffix match against the subnet's *effective* DNS group(s).
+
+    Only a zone IPAM authors is returned (spatiumddi#1419), by the same rule
+    as the IPAM router's ``_resolve_reverse_zone``: when the zone that owns
+    the subnet's reverse names is a forwarder, a secondary or a stub, there is
+    none, and the drift check expects no PTR.
     """
     res = await db.execute(
         select(DNSZone).where(
@@ -134,7 +177,7 @@ async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone |
         )
     )
     z = res.scalar_one_or_none()
-    if z:
+    if z and ipam_authors_zone(z):
         return z
 
     group_ids, _ = await _effective_dns(db, subnet)
@@ -151,16 +194,16 @@ async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone |
     res = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id.in_(group_ids),
-            DNSZone.kind == "reverse",
+            reverse_owner_candidates(),
         )
     )
     best: DNSZone | None = None
     for cand in res.scalars().all():
         zname = cand.name.rstrip(".") + "."
         if sample.endswith("." + zname) or sample == zname:
-            if best is None or len(cand.name) > len(best.name):
+            if best is None or reverse_owner_key(cand) > reverse_owner_key(best):
                 best = cand
-    return best
+    return best if best is not None and ipam_authors_zone(best) else None
 
 
 # ── Drift computation ────────────────────────────────────────────────────────
