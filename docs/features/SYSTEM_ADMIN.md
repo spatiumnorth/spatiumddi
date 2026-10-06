@@ -641,6 +641,8 @@ Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither f
 
 Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
 
+A failed run also writes a `backup_target_run_failed` audit row, which audit forwarding and the `system.backup_failed` event send on. It carries a fixed `failure_category` (`unreachable`, `timeout`, `permission_denied`, `auth_failed`, `no_space`, `not_found`, `config_invalid`, …) rather than the driver's error text, which often names the destination (#1617). The full text is still shown under the target in the backup targets list (`last_run_error`, superadmin-only).
+
 #### Manual triggers
 
 | Action | Endpoint |
