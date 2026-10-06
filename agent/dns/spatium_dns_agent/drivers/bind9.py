@@ -52,7 +52,7 @@ NAMED_CONF_SKELETON = """\
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
-{response_log}{forwarders}{response_policy}{rate_limit}
+{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
 }};
 statistics-channels {{
     inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
@@ -252,6 +252,72 @@ def _render_match_clients(view: dict[str, Any], view_keys: dict[str, dict[str, A
     items += [f'!key "{k["name"]}"' for name, k in view_keys.items() if name != vname]
     items += [str(c) for c in (view.get("match_clients") or ["any"])]
     return "; ".join(items)
+
+
+#: The ``notify`` statement's grammar (control-plane validator, #1316).
+_NOTIFY_CHOICES = frozenset({"yes", "no", "explicit", "master-only", "primary-only"})
+
+#: Characters that would break out of a ``{ ... };`` statement in
+#: named.conf. The control plane validates these lists on write (#1316),
+#: but rows stored before the validators existed still reach the bundle,
+#: and one bad entry must not poison the whole group's config.
+_UNSAFE_CONF_CHARS = re.compile(r"[;{}\n\r]")
+
+
+def _safe_conf_entries(entries: Any) -> list[str]:
+    """Bundle list entries safe to render inside a named.conf list."""
+    out: list[str] = []
+    for entry in entries or []:
+        token = str(entry).strip()
+        if token and not _UNSAFE_CONF_CHARS.search(token):
+            out.append(token)
+    return out
+
+
+def _render_notify_block(opts: dict[str, Any]) -> str:
+    """Server-level NOTIFY statements for the options block (#1523).
+
+    ``notify_enabled`` / ``also_notify`` / ``allow_notify`` were settable,
+    validated and stored but never shipped in the bundle, so BIND ran its
+    defaults: a stealth primary (``notify no``) still sent NOTIFY, and
+    also-notify targets were never notified. Entries are already in BIND
+    grammar (``<ip> [port <n>] [key <name>]`` / address-match lists) from
+    the #1316 validators; unsafe legacy entries are dropped, not rendered.
+    """
+    lines: list[str] = []
+    notify = str(opts.get("notify_enabled") or "").strip().lower()
+    if notify in _NOTIFY_CHOICES:
+        lines.append(f"    notify {notify};\n")
+    also = _safe_conf_entries(opts.get("also_notify"))
+    if also:
+        lines.append(f"    also-notify {{ {'; '.join(also)}; }};\n")
+    allow_notify = _safe_conf_entries(opts.get("allow_notify"))
+    if allow_notify:
+        lines.append(f"    allow-notify {{ {'; '.join(allow_notify)}; }};\n")
+    return "".join(lines)
+
+
+def _zone_notify_clauses(zone: dict[str, Any]) -> str:
+    """Zone-level ``allow-query`` / ``notify`` / ``also-notify`` clauses (#1523).
+
+    Each field is emitted only when the zone carries its own value —
+    ``None`` means "inherit the server options", and in BIND a zone-level
+    clause shadows the options one, so rendering an inherited value would
+    freeze it against later server-level edits.
+    """
+    clauses = ""
+    if zone.get("allow_query") is not None:
+        aq = _safe_conf_entries(zone.get("allow_query"))
+        if aq:
+            clauses += f"allow-query {{ {'; '.join(aq)}; }}; "
+    notify = str(zone.get("notify_enabled") or "").strip().lower()
+    if notify in _NOTIFY_CHOICES:
+        clauses += f"notify {notify}; "
+    if zone.get("also_notify") is not None:
+        also = _safe_conf_entries(zone.get("also_notify"))
+        if also:
+            clauses += f"also-notify {{ {'; '.join(also)}; }}; "
+    return clauses
 
 
 def _render_allow_transfer(
@@ -1250,6 +1316,7 @@ class Bind9Driver(DriverBase):
             allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,
             forwarders=fwd_block,
+            notify_block=_render_notify_block(opts),
             response_policy=response_policy_block,
             rate_limit=_render_rate_limit_block(opts),
             response_log=_render_response_log_option(opts),
@@ -1333,7 +1400,8 @@ class Bind9Driver(DriverBase):
                 masters_clause = "; ".join(_format_master(m) for m in masters)
                 return (
                     f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
-                    f"masters {{ {masters_clause}; }}; }};\n"
+                    f"masters {{ {masters_clause}; }}; "
+                    f"{_zone_notify_clauses(zone)}}};\n"
                 )
             # Relative path inside the rendered tree; absolute path written
             # into named.conf so BIND9 doesn't resolve against its
@@ -1376,7 +1444,8 @@ class Bind9Driver(DriverBase):
                 apex_notes.append((zname.rstrip("."), kind, detail))
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
-                f"{update_clause}{allow_transfer}{dnssec_clause}}};\n"
+                f"{update_clause}{allow_transfer}{dnssec_clause}"
+                f"{_zone_notify_clauses(zone)}}};\n"
             )
 
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:

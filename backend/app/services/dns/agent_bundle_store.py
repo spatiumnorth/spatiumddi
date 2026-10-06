@@ -61,7 +61,10 @@ _MAX_ERROR = 2000
 # replaces a newer render during a rolling upgrade (which the ``app_version``
 # equality check before #1185 did every 30 s), and a release that leaves the
 # renderer alone re-renders nothing.
-RENDERER_REVISION = 1
+# 2 (#1523): the bundle now ships the NOTIFY fields (server options
+# ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
+# ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
+RENDERER_REVISION = 2
 
 
 def _serves(revision: int | None) -> bool:
