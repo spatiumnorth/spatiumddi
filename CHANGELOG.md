@@ -3475,6 +3475,16 @@ the formatter handles the rest.
   `5e6d56b39ab7`); re-mint one with `expires_in_minutes: 0` if a code
   that never expires is what you want.
 
+- **One typo in the MFA disable or recovery-code dialog costs one
+  attempt, not two (#1371).** `POST /auth/mfa/disable` and
+  `/auth/mfa/recovery-codes/regenerate` answered a wrong password or
+  TOTP code with 401. The console reads a 401 from anything but sign-in
+  as an expired session: it rotated the session and sent the request
+  again, which failed the same way. One typo spent two of the five
+  step-up attempts the account gets per 15 minutes and checked the
+  answer twice, so the third typo locked MFA changes. Both now answer
+  403 with the same message, as enrolment does.
+
 ### Migrations
 
 - `b8e41c7a2d95` — #1817, data + server default:

@@ -247,13 +247,14 @@ async def test_local_user_disable_still_requires_password(
     headers = {"Authorization": f"Bearer {token}"}
     secret = await _enrol_mfa(client, headers, password="password123")
 
-    # TOTP only, no password → rejected.
+    # TOTP only, no password → rejected. 403, not 401 (#1371): the SPA reads
+    # a 401 as an expired session and would resubmit the refused request.
     no_pw = await client.post(
         "/api/v1/auth/mfa/disable",
         headers=headers,
         json={"code": pyotp.TOTP(secret).now()},
     )
-    assert no_pw.status_code == 401, no_pw.text
+    assert no_pw.status_code == 403, no_pw.text
 
     # Password + code → disabled.
     ok = await client.post(
