@@ -15,7 +15,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
@@ -23,7 +29,9 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
   // Every API object answers nothing (a pending request) except the
-  // controller list, which is empty: the page's own words are under test.
+  // controller list, which is empty: the page's own words are under test,
+  // and the permissions self-check, which answers as a superadmin (the
+  // page shows its setup guide to an administrator).
   const stubs = Object.fromEntries(
     Object.entries(actual)
       .filter(([name, v]) => name.endsWith("Api") && typeof v === "object")
@@ -37,7 +45,9 @@ vi.mock("@/lib/api", async () => {
                 ? undefined
                 : name === "unifiApi" && method === "listControllers"
                   ? async () => []
-                  : pending,
+                  : name === "authApi" && method === "myPermissions"
+                    ? async () => ({ is_superadmin: true, grants: [] })
+                    : pending,
           },
         ),
       ]),
@@ -92,10 +102,14 @@ describe("UniFi page: what SpatiumDDI writes", () => {
 
   it("the setup guide's read-only advice is for the mirror's key, not block sync", async () => {
     show();
-    // The header's Add Controller (the empty list offers a second one).
-    fireEvent.click(
-      (await screen.findAllByRole("button", { name: /Add Controller/ }))[0],
-    );
+    // The header's Add Controller (the empty list offers a second one),
+    // once it is offered: a console that gates it on the permissions
+    // self-check keeps it disabled until that answers.
+    const add = (
+      await screen.findAllByRole("button", { name: /Add Controller/ })
+    )[0] as HTMLButtonElement;
+    await waitFor(() => expect(add.disabled).toBe(false));
+    fireEvent.click(add);
     // A new controller's dialog opens with its setup guide shown.
     const guide = await screen.findByText(/Generate a UniFi Network API key/);
     const said = sentences(guide);

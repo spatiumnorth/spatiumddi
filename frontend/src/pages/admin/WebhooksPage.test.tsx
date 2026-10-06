@@ -47,6 +47,12 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    // An administrator's page: the permissions self-check answers as a
+    // superadmin, so write actions gated on it are offered.
+    authApi: {
+      ...actual.authApi,
+      myPermissions: async () => ({ is_superadmin: true, grants: [] }),
+    },
     webhooksApi: {
       ...actual.webhooksApi,
       list: async () => [HOOK],

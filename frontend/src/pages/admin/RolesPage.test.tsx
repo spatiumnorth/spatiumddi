@@ -16,7 +16,7 @@
  * role stores, built-in or custom, and an untouched row is saved as stored.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -134,6 +134,15 @@ async function openDialog(role: { name: string; is_builtin: boolean }) {
   const dialogs = screen.getAllByRole("dialog");
   return dialogs[dialogs.length - 1];
 }
+
+// The dialogs under test are an administrator's: answer the permissions
+// self-check as a superadmin, so a console that gates its write actions on
+// it (and fails closed while it is pending) still offers them here.
+beforeEach(() => {
+  answers.authApi = {
+    myPermissions: async () => ({ is_superadmin: true, grants: [] }),
+  };
+});
 
 afterEach(() => {
   cleanup();
