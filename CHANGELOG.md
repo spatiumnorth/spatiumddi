@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS VIP answers again after a DNS engine switch, and on a fresh
+  install (#1510).** All three engine Services in the appliance chart
+  (`dns-bind9`, `dns-powerdns`, `dns-technitium`) are rendered on every DNS
+  appliance, and under `dns.useMetalLBVIP` each one asked MetalLB for the
+  same `dns.vip`. MetalLB gives an address to one Service only, the one
+  created first, and leaves the others `<pending>`. On a fresh install that
+  could be an engine with no pods. After switching the engine (Technitium
+  to BIND9, say) the VIP stayed on the old engine's Service, which had no
+  endpoints left, so the resolver address answered nothing. A single
+  `dns-vip` LoadBalancer Service now holds the VIP and selects on
+  `spatium.io/dns-vip`, a label every engine's pods carry, so it follows
+  whichever engine runs. The engine Services are always ClusterIP. On
+  upgrade the old engine Service turns ClusterIP and releases the address,
+  and `dns-vip` takes it over; the DNS pods restart once for the new label.
+  A render gate (`chart-lb-address-single-owner.py`) now fails any chart
+  render in which two Services ask for the same MetalLB address.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —

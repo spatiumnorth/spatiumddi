@@ -535,7 +535,9 @@ state on its heartbeat:
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets
-  drop `hostNetwork` to sit behind, an L2 LoadBalancer Service) and
+  drop `hostNetwork` to sit behind, an L2 LoadBalancer Service; one
+  `dns-vip` Service selects every engine's pods, so the VIP follows an
+  engine switch, #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
   relay→server unicast forward — Kea keeps `hostNetwork` for
   direct-attached broadcast). Both live on the same `platform_settings`
