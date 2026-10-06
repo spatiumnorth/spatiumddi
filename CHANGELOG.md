@@ -119,6 +119,20 @@ the formatter handles the rest.
   logged rather than taking the zone down. PowerDNS and Technitium
   manage their own SOA and are unchanged.
 
+- **A Technitium blocklist no longer delays zone changes by half an hour
+  (#1425).** On every structural apply (a zone created, deleted or
+  converted) the agent flushed Technitium's blocked set and re-added it
+  one `blocked/add` call per domain. Each of those calls rewrites
+  Technitium's zone file, so the cost grew roughly quadratically: a 16k
+  entry list took about 30 minutes per apply on a small node, during
+  which the new zones were not answered and nothing was blocked. The
+  agent now reads the live set with `blocked/export` and leaves it alone
+  when it already matches, which is the case for every structural apply
+  that did not change a blocklist. When it differs, the set is flushed
+  and written with `blocked/import`, 5,000 names per call, so a
+  16k-entry list takes a few seconds. The allowed set is handled the
+  same way. Reported by @stefanriegel.
+
 - **Cloud DNS servers no longer show unreachable while they work
   (#1455).** The DNS health task asks a driver for `health_check()` and
   otherwise sends a SOA query to the server's host and port. No driver
