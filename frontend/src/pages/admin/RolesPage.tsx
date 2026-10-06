@@ -15,7 +15,10 @@ import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
-// Mirror of docs/PERMISSIONS.md — keep these in sync.
+// What a new grant row offers: a mirror of docs/PERMISSIONS.md, keep these in
+// sync. A role can hold more than these lists name — the built-in roles do
+// (`approve`, `appliance`, `change_request`, …) — so each select also offers
+// the value its row holds (`withHeld`), and shows it (#1394).
 const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
 const RESOURCE_TYPES = [
   "*",
@@ -44,6 +47,14 @@ const RESOURCE_TYPES = [
   "settings",
   "api_token",
 ] as const;
+
+/** A list's options plus the value a grant holds, when the list does not
+ * name it. A controlled select whose value is not among its options shows
+ * the first option instead, so a role's dialog showed `admin · *` for its
+ * `admin · appliance` grant (#1394). */
+function withHeld(list: readonly string[], held: string): string[] {
+  return list.includes(held) ? [...list] : [...list, held];
+}
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -113,7 +124,7 @@ function PermissionEditor({
             value={p.action}
             onChange={(e) => update(idx, { action: e.target.value })}
           >
-            {ACTIONS.map((a) => (
+            {withHeld(ACTIONS, p.action).map((a) => (
               <option key={a}>{a}</option>
             ))}
           </select>
@@ -122,7 +133,7 @@ function PermissionEditor({
             value={p.resource_type}
             onChange={(e) => update(idx, { resource_type: e.target.value })}
           >
-            {RESOURCE_TYPES.map((t) => (
+            {withHeld(RESOURCE_TYPES, p.resource_type).map((t) => (
               <option key={t}>{t}</option>
             ))}
           </select>

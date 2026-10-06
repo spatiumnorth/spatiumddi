@@ -812,6 +812,10 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // #1628 — transient, only set on create/update responses when a
+  // ``static_dhcp`` row could not be mirrored into a DHCP reservation
+  // server-side (no scope, several scopes, or a conflict).
+  dhcp_static_warning?: string | null;
   // True when this row is a dynamic-lease mirror created by the DHCP
   // lease-pull task. Such rows are read-only in the UI — the DHCP server
   // owns their state and any edit would get overwritten on the next pull.
@@ -3612,8 +3616,11 @@ export interface PlatformSettings {
   audit_forward_syslog_protocol: string;
   audit_forward_syslog_facility: number;
   audit_forward_webhook_enabled: boolean;
-  audit_forward_webhook_url: string;
-  audit_forward_webhook_auth_header: string;
+  // The legacy webhook's URL and header are write-only (#1502): the server
+  // returns whether each is set, and the URL's scheme + host only.
+  audit_forward_webhook_url_set: boolean;
+  audit_forward_webhook_url_display: string;
+  audit_forward_webhook_auth_header_set: boolean;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -4068,7 +4075,11 @@ export interface AuditForwardTarget {
   protocol: AuditForwardProtocol;
   facility: number;
   ca_cert_pem: string | null;
-  url: string;
+  // The webhook URL and Authorization header are Fernet-encrypted at rest
+  // and never returned (#1502). ``url_display`` is scheme + host only, e.g.
+  // ``https://hooks.slack.com/…``.
+  url_set: boolean;
+  url_display: string;
   auth_header_set: boolean;
   webhook_flavor: AuditForwardWebhookFlavor;
   smtp_host: string;
@@ -4096,8 +4107,10 @@ export interface AuditForwardTargetWrite {
   protocol?: AuditForwardProtocol;
   facility?: number;
   ca_cert_pem?: string | null;
-  url?: string;
-  auth_header?: string;
+  // Same contract as ``smtp_password``: omitted or ``null`` keeps the stored
+  // value, ``""`` clears it, any other string replaces it.
+  url?: string | null;
+  auth_header?: string | null;
   webhook_flavor?: AuditForwardWebhookFlavor;
   smtp_host?: string;
   smtp_port?: number;

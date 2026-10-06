@@ -439,7 +439,17 @@ don't serialize the queue.
   header sent verbatim. The `webhook_flavor` column picks between
   generic JSON, **Slack** (`mrkdwn` block), **Teams**
   (`MessageCard`), and **Discord** (`embed`) so chat-channel
-  delivery doesn't need a separate adapter.
+  delivery doesn't need a separate adapter. For the chat flavors the
+  URL is the credential (anyone holding it can post into the
+  channel), so the URL and the header are **write-only secrets**
+  (#1502): Fernet-encrypted at rest (`url_encrypted`,
+  `auth_header_encrypted`), never returned by the API, which shows
+  `url_set` / `auth_header_set` and a `url_display` of scheme and
+  host only (`https://hooks.slack.com/…`). On update, an omitted or
+  `null` field keeps the stored value and `""` clears it. httpx's own
+  `HTTP Request: POST …` log line for a delivery shows only that
+  host, and delivery errors are redacted before they are logged or
+  returned by **Test**.
 - **SMTP email** — stdlib `smtplib` driven through
   `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
   plaintext, optional auth (Fernet-encrypted password at rest).
@@ -528,6 +538,11 @@ are preserved and migrated into one `audit_forward_target` row apiece
 on upgrade. When the targets table is empty the service falls back to
 those flat columns so existing installs keep forwarding without
 operator intervention. They are slated for removal in a future release.
+The legacy webhook's URL and header get the same write-only treatment
+as a target's (#1502): `audit_forward_webhook_url_encrypted` /
+`audit_forward_webhook_auth_header_encrypted`, and `GET /settings`
+returns `audit_forward_webhook_url_set` / `_url_display` /
+`audit_forward_webhook_auth_header_set` instead of the values.
 
 **Known gap.** Celery-scheduled audits (e.g. the lease-pull
 housekeeping row) may not forward — Celery wraps the task body in

@@ -204,10 +204,9 @@ async def test_a_zone_that_is_not_primary_keeps_the_kind_it_is_given(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """Secondary, stub and forward zones are not SpatiumDDI's to write into,
-    and IPAM's PTR lookup does not look at the zone type, so their kind is
-    left as it was: ``forward`` when omitted, any kind when given. A derived
-    ``reverse`` would newly send PTR updates to a zone that refuses them. Made
-    primary, a zone takes the rule."""
+    and IPAM writes no PTR into them whatever their kind (#1419), so their
+    kind is left as it was: ``forward`` when omitted, any kind when given.
+    Made primary, a zone takes the rule."""
     headers = await _headers(db_session)
     grp = await _group(db_session)
     await db_session.commit()
