@@ -1216,7 +1216,9 @@ async def _create_alias_records(
     if not effective_zone_id:
         return
     zone = await db.get(DNSZone, effective_zone_id)
-    if zone is None:
+    if zone is None or not ipam_authors_zone(zone):
+        # #1633 — a forwarder, a secondary or a stub: another server owns its
+        # names, so IPAM writes no alias into it.
         return
     zone_domain = zone.name.rstrip(".")
     primary_fqdn = f"{ip.hostname}.{zone_domain}."
@@ -1344,6 +1346,9 @@ async def _sync_dns_record(
     Forward A goes in the subnet's DNS zone (or explicitly passed zone_id);
     reverse PTR goes in the matching `kind=reverse` zone. Both records are
     pushed to the agent via RFC 2136 dynamic update through the record_op queue.
+    Each is written only into a zone SpatiumDDI serves as primary (#1419 for
+    the PTR, #1633 for the forward records): a forwarder, a secondary or a stub
+    still names the host, but takes no record and no op.
 
     ``ttl`` sets the record TTL on **newly created** records (the DDNS path
     passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
@@ -1468,6 +1473,22 @@ async def _sync_dns_record(
         seen_extras.add(extra_uuid)
         desired_zone_ids.append(extra_uuid)
 
+    # #1633 — IPAM writes a forward record only into a zone it serves as
+    # primary, the rule #1419 set for PTRs. A forwarder, a secondary or a stub,
+    # whether bound to the subnet, chosen for this address or listed in
+    # ``extra_zone_ids``, is not a target: another server owns its names and
+    # refuses the record op. Such a zone still names the host (``fqdn`` above,
+    # the PTR below). A record a release before the fix wrote into one is
+    # dropped in Phase 1, with no op.
+    authored_zone_ids: list[uuid.UUID] = []
+    for desired_zone_id in desired_zone_ids:
+        target = (
+            zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
+        )
+        if target is not None and ipam_authors_zone(target):
+            authored_zone_ids.append(desired_zone_id)
+    desired_zone_ids = authored_zone_ids
+
     # Fetch any pre-existing auto-generated A/AAAA for this IP across
     # ALL zones — fanout cleanup needs the full picture. The address
     # family swap (v4↔v6) is handled by the rewrite branch below.
@@ -1482,10 +1503,11 @@ async def _sync_dns_record(
 
     if is_default_gateway_name:
         # Tear down any A/AAAA record that may have been published before the
-        # user renamed the IP back to the default. PTR continues below.
+        # user renamed the IP back to the default. PTR continues below. A
+        # zone IPAM does not author never took the record (#1633): no op.
         for record in existing_records:
             old_zone = await db.get(DNSZone, record.zone_id)
-            if old_zone is not None:
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db,
                     old_zone,
@@ -1512,7 +1534,10 @@ async def _sync_dns_record(
             if rec.zone_id in desired_zone_ids:
                 continue
             old_zone = await db.get(DNSZone, rec.zone_id)
-            if old_zone is not None:
+            # #1633 — a zone IPAM does not author never took the record (a
+            # release before the fix wrote it there): drop the row, queue no
+            # op it would refuse.
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db,
                     old_zone,
@@ -1525,6 +1550,14 @@ async def _sync_dns_record(
                 )
             await db.delete(rec)
             existing_by_zone.pop(rec.zone_id, None)
+            if ip.dns_record_id == rec.id:
+                ip.dns_record_id = None  # Phase 2 stamps the new record, if any
+
+        if zone is not None and not ipam_authors_zone(zone):
+            # #1633 — no record for the zone the host is named in, but the
+            # address keeps it as its forward zone, so a later edit stays in
+            # it rather than re-homing the host into the subnet's zone (#493).
+            ip.forward_zone_id = effective_zone_id
 
         # Phase 2: walk each desired zone, create or update.
         for desired_zone_id in desired_zone_ids:
@@ -7936,6 +7969,17 @@ async def add_alias(
         raise HTTPException(
             status_code=409,
             detail="No DNS zone configured for this subnet — add one first.",
+        )
+    zone = await db.get(DNSZone, zone_id)
+    if zone is not None and not ipam_authors_zone(zone):
+        # #1633 — say why rather than fall through to "failed to create".
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"DNS zone {zone.name} is a {zone.zone_type} zone, not one SpatiumDDI "
+                "serves as primary: another server owns its names, so IPAM writes no "
+                "records into it."
+            ),
         )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     # Find the just-created record

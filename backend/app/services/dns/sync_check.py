@@ -118,7 +118,9 @@ async def _effective_dns(db: AsyncSession, subnet: Subnet) -> tuple[list[str], u
 
 
 async def _effective_forward_zone_id(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
-    """Return the effective forward DNS zone UUID for a subnet."""
+    """Return the effective forward DNS zone UUID for a subnet, whatever the
+    zone's type: it names the subnet's hosts. IPAM writes their A/AAAA records
+    into it only if ``ipam_authors_zone`` says so (spatiumddi#1633)."""
     _, zone_id = await _effective_dns(db, subnet)
     return zone_id
 
@@ -424,8 +426,13 @@ async def compute_subnet_dns_drift(
 
     # Also pick up records that *think* they belong to a subnet IP but the IP
     # was deleted (FK is SET NULL on IPAddress delete) — these are stale.
-    # Scope: records in either of the candidate zones for this subnet.
-    candidate_zone_ids = [z.id for z in (forward_zone, reverse_zone) if z is not None]
+    # Scope: records in either of the candidate zones for this subnet, when
+    # IPAM authors the zone: applying the sync would queue a delete op into a
+    # forwarder, a secondary or a stub, which none of them can take
+    # (spatiumddi#1633).
+    candidate_zone_ids = [
+        z.id for z in (forward_zone, reverse_zone) if z is not None and ipam_authors_zone(z)
+    ]
     if candidate_zone_ids:
         orphan_res = await db.execute(
             select(DNSRecord).where(
@@ -502,7 +509,12 @@ async def compute_subnet_dns_drift(
         is_default_gateway = ip.hostname == "gateway"
 
         # ── Forward A / AAAA ─────────────────────────────────────────────────
-        if forward_zone and not is_default_gateway:
+        # Only in a zone IPAM authors (spatiumddi#1633). A forwarder, a
+        # secondary or a stub as the subnet's zone still names its hosts (the
+        # PTR below points into it), but takes no A/AAAA from IPAM, so none is
+        # expected; a row an earlier release wrote there leaves, with no op,
+        # the next time IPAM syncs the address.
+        if forward_zone and ipam_authors_zone(forward_zone) and not is_default_gateway:
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), forward_zone.name)
             if not ip_forward_records:
                 report.missing.append(
