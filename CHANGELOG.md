@@ -98,6 +98,22 @@ the formatter handles the rest.
   16k-entry list takes a few seconds. The allowed set is handled the
   same way. Reported by @stefanriegel.
 
+- **Cloud DNS servers no longer show unreachable while they work
+  (#1455).** The DNS health task asks a driver for `health_check()` and
+  otherwise sends a SOA query to the server's host and port. No driver
+  had one, so a Cloudflare server was probed as the host `cloudflare` on
+  port 443, which can never answer, and every cloud server (Cloudflare,
+  Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode,
+  Vultr) sat at `unreachable` while its zone list, imports and record
+  pulls succeeded. `CloudDNSDriverBase` now implements `health_check()`
+  on top of the existing credential `probe()`, so health is measured
+  against the provider API the control plane actually drives, and a
+  failure carries the provider's message into the `dns_health_checked`
+  log line. `technitium_api` inherits the same hook and is checked
+  through its HTTP API instead of a SOA query. A test pins the hook on
+  every credentialed agentless driver, so a new provider cannot fall
+  back to the SOA probe.
+
 - **Upgrading an appliance from 2026.09.04-1 can no longer replace
   SECRET_KEY (#1448).** #1042 marked the chart's
   `spatium-control-spatiumddi-app` Secret `helm.sh/resource-policy: keep`,
