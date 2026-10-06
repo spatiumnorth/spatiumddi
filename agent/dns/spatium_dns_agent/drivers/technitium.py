@@ -1749,6 +1749,13 @@ class TechnitiumDriver(DriverBase):
                 # permanent silent no-op: the operator edits it, the
                 # bundle changes, and the daemon keeps transferring from
                 # the old address forever.
+                #
+                # The same holds for the zone TYPE (#1457): a zone switched
+                # from forward to primary in SpatiumDDI stayed a Forwarder
+                # here, so every name that was not a local record went to
+                # the old upstream. Convert first, so the upstream below is
+                # applied to the type the zone now has.
+                self._reconcile_zone_type(token, zone, ztype)
                 self._reapply_zone_upstream(token, zone, ztype, params)
                 return
             log.error(
@@ -1758,15 +1765,62 @@ class TechnitiumDriver(DriverBase):
                 error=body.get("errorMessage"),
             )
 
+    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
+        """Bring an existing zone's type in line with the bundle (#1457).
+
+        ``zones/create`` never changes the type of a zone that already
+        exists, so a type change in SpatiumDDI used to stop at the daemon.
+        ``zones/convert`` changes it in place and keeps the zone's records
+        (verified live against 15.4.0: Forwarder → Primary keeps every
+        record, Primary → Forwarder works too). Converting to Secondary or
+        Stub is refused by Technitium ("not supported") from both Primary
+        and Forwarder; that is logged at error rather than worked around
+        with a delete + recreate, because deleting a zone is not something
+        the agent does on its own (see ``_reconcile_zones``).
+
+        An unreadable live type is skipped, not guessed: converting on a
+        wrong guess is worse than leaving the zone as it is.
+        """
+        body = self._call(token, "GET", "zones/options/get", {"zone": zone}).json()
+        live = (body.get("response") or {}).get("type") if body.get("status") == "ok" else None
+        if not live:
+            log.warning(
+                "technitium_zone_type_unreadable",
+                zone=zone,
+                error=body.get("errorMessage"),
+            )
+            return
+        if live == ztype:
+            return
+        resp = self._call(token, "POST", "zones/convert", {"zone": zone, "type": ztype}).json()
+        if resp.get("status") == "ok":
+            log.info("technitium_zone_type_converted", zone=zone, from_type=live, to_type=ztype)
+            if live == "Forwarder" and ztype == "Primary":
+                self._replace_placeholder_soa(token, zone)
+            return
+        log.error(
+            "technitium_zone_type_mismatch",
+            zone=zone,
+            live_type=live,
+            desired_type=ztype,
+            error=resp.get("errorMessage"),
+        )
+
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
     ) -> None:
-        """Push a existing zone's upstream through ``zones/options/set``."""
+        """Push an existing zone's upstream to the daemon.
+
+        A secondary/stub's primaries go through ``zones/options/set``. A
+        Forwarder's upstream does not: it lives in the zone's apex FWD
+        record, see ``_sync_forwarder_record``.
+        """
+        if "forwarder" in params:
+            self._sync_forwarder_record(token, zone, params["forwarder"])
+            return
         opts: dict[str, Any] = {"zone": zone}
         if "primaryNameServerAddresses" in params:
             opts["primaryNameServerAddresses"] = params["primaryNameServerAddresses"]
-        elif "forwarder" in params:
-            opts["forwarder"] = params["forwarder"]
         else:
             return
         body = self._call(token, "POST", "zones/options/set", opts).json()
@@ -1776,6 +1830,126 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
+            )
+
+    def _apex_records(self, token: str, zone: str) -> list[dict[str, Any]] | None:
+        """The zone's apex records, or None when they can't be read."""
+        body = self._call(
+            token, "GET", "zones/records/get", {"domain": zone, "zone": zone}
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_apex_unreadable", zone=zone, error=body.get("errorMessage")
+            )
+            return None
+        return [
+            r
+            for r in (body.get("response") or {}).get("records") or []
+            if (r.get("name") or "").rstrip(".").lower() == zone.lower()
+        ]
+
+    def _sync_forwarder_record(self, token: str, zone: str, forwarder: str) -> None:
+        """Point an existing Forwarder zone at ``forwarder``.
+
+        In Technitium (15.4) a Forwarder zone's upstream is its apex FWD
+        record. ``zones/options/set`` has no ``forwarder`` parameter: it
+        answers ``ok`` and stores nothing, so a changed forwarder never
+        reached the daemon (#1647). And ``zones/convert`` from Primary
+        leaves the zone with no FWD record at all, so a zone switched to
+        forward answered every unknown name with an empty NOERROR.
+
+        The wanted record is added before any other is removed, so the
+        zone is never left without an upstream in between. Like
+        ``zones/create``, only the first forwarder is used.
+        """
+        apex = self._apex_records(token, zone)
+        if apex is None:
+            return
+        live = [r for r in apex if r.get("type") == "FWD"]
+        if forwarder not in {(r.get("rData") or {}).get("forwarder") for r in live}:
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/add",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "FWD",
+                    "forwarder": forwarder,
+                    "protocol": "Udp",
+                },
+            ).json()
+            if body.get("status") != "ok":
+                log.warning(
+                    "technitium_zone_forwarder_set_failed",
+                    zone=zone,
+                    forwarder=forwarder,
+                    error=body.get("errorMessage"),
+                )
+                return
+            log.info("technitium_zone_forwarder_set", zone=zone, forwarder=forwarder)
+        for rec in live:
+            rdata = rec.get("rData") or {}
+            if rdata.get("forwarder") == forwarder:
+                continue
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/delete",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "FWD",
+                    "forwarder": rdata.get("forwarder"),
+                    "protocol": rdata.get("protocol") or "Udp",
+                },
+            ).json()
+            if body.get("status") != "ok":
+                log.warning(
+                    "technitium_zone_forwarder_remove_failed",
+                    zone=zone,
+                    forwarder=rdata.get("forwarder"),
+                    error=body.get("errorMessage"),
+                )
+
+    def _replace_placeholder_soa(self, token: str, zone: str) -> None:
+        """Give a zone converted from Forwarder a real SOA.
+
+        A Forwarder zone carries a placeholder SOA (responsible person
+        ``invalid``, TTL 0), and ``zones/convert`` keeps it. As a Primary
+        that means negative answers are not cached. Set what Technitium
+        gives a zone created as Primary (``hostadmin@<zone>``, TTL 900),
+        keeping the rest. Only the placeholder is touched; any other SOA
+        is left alone.
+        """
+        apex = self._apex_records(token, zone)
+        soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+        if soa is None:
+            return
+        rdata = soa.get("rData") or {}
+        if rdata.get("responsiblePerson") != "invalid":
+            return
+        body = self._call(
+            token,
+            "POST",
+            "zones/records/update",
+            {
+                "domain": zone,
+                "zone": zone,
+                "type": "SOA",
+                "ttl": "900",
+                "primaryNameServer": rdata.get("primaryNameServer") or "",
+                "responsiblePerson": f"hostadmin@{zone}",
+                "serial": str(rdata.get("serial") or 1),
+                "refresh": str(rdata.get("refresh") or 900),
+                "retry": str(rdata.get("retry") or 300),
+                "expire": str(rdata.get("expire") or 604800),
+                "minimum": str(rdata.get("minimum") or 900),
+            },
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_soa_placeholder_kept", zone=zone, error=body.get("errorMessage")
             )
 
     def _apply_zone_options(
