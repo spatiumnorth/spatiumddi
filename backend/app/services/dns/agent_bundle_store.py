@@ -67,7 +67,9 @@ _MAX_ERROR = 2000
 #   without views.
 # 4 (#1373): a group's zones are listed by name, not in the order Postgres
 #   happened to read them.
-RENDERER_REVISION = 4
+# 5 (#1171, #1373): 4 with #1171's later change, which serves a zone's own SOA
+#   timers only once the group's last BIND9 agent renders them.
+RENDERER_REVISION = 5
 
 
 def _serves(revision: int | None) -> bool:
