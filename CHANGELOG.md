@@ -84,6 +84,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrading an appliance from 2026.09.04-1 can no longer replace
+  SECRET_KEY (#1448).** #1042 marked the chart's
+  `spatium-control-spatiumddi-app` Secret `helm.sh/resource-policy: keep`,
+  but Helm takes that policy from the release manifest it has stored, and
+  on the first upgrade from 2026.09.04-1 the stored manifest is
+  2026.09.04-1's, which has none. So if the new slot's first
+  `spatium-control` install failed for any reason, helm-controller's
+  uninstall deleted the Secret and the reinstall generated a new key, and
+  every credential encrypted at rest (the appliance CA key, certificates,
+  integration and SSO secrets) could no longer be read. firstboot now
+  copies `secret-key` and `metrics-token` into `spatium-control-app-keys`,
+  a Secret Helm does not own, before it releases the control chart, and
+  points the chart at it with `auth.existingSecret`; a fresh install
+  generates both values there. An existing `spatium-control-app-keys` is
+  never overwritten, and firstboot refuses to generate a key while the
+  chart's own Secret exists without one. When it cannot make sure the
+  Secret exists (the apiserver does not answer, or k3s never became
+  ready), the chart is released without `auth.existingSecret` and keeps
+  its own Secret as before, and firstboot tries again on the next boot.
+  One limit: an appliance upgraded straight from 2026.09.04-1 loses the
+  chart's own Secret on that upgrade (the stored manifest does not keep
+  it), so rolling it back to 2026.10.02-1 afterwards generates a new key.
+  Back up the Secret before such an upgrade, as the 2026.10.02-1 notes
+  already say, and back up `spatium-control-app-keys` from then on
+  (`docs/deployment/APPLIANCE.md`).
+
 - **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
   Hetzner retired the standalone DNS Console API, which now answers every
   call with a `301` redirect to the Cloud Console's web UI, so the driver
