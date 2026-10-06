@@ -2407,6 +2407,18 @@ the formatter handles the rest.
   boundary, and the SCP driver sets an SFTP channel timeout so a
   stalled server cannot hang a run indefinitely.
 
+- **A damaged backup archive is refused as malformed, never with a 500
+  (#1426).** Restore, the restore pre-flight and the restore drill read
+  an archive's members expecting only a broken zip or bad JSON. A
+  database dump corrupt inside its first deflate block raised a
+  decompression error that escaped as a bare 500 instead of
+  "archive is malformed", and so did a corrupt bzip2 or LZMA member,
+  a member compressed with an unsupported method, an encrypted member,
+  and a manifest that is not UTF-8. Each is now a 400 that names the
+  problem, and the restore drill fails its `archive_readable` check with
+  the reason instead of raising out of the run. Nothing was ever
+  applied in these cases.
+
 - **Selective restore validates before it pays for a safety dump, and
   safety dumps no longer consume backup retention (#1575, #1574).**
   A selective restore against a plain-format archive, or with unknown
