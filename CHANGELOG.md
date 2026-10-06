@@ -2387,6 +2387,14 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **Allocate IP offers only the statuses it can allocate with (#1422).**
+  Its Type / Status menu offered `discovered`, but both of its requests
+  ("Next available" and "Specific IP") accept only the operator-settable
+  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
+  is stamped by the nmap "Stamp alive hosts" action and is no longer
+  offered there; the inline status edit and Edit address, whose update
+  accepts every status, keep it.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it

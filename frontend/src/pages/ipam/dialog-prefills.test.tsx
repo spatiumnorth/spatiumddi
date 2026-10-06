@@ -711,3 +711,51 @@ describe("Allocate IP names as next available only what it allocates (#1307)", (
     expect(screen.queryByText(/picked when you allocate/)).toBeNull();
   });
 });
+
+// ── #1422 — Allocate IP's Type / Status ─────────────────────────────────────
+
+/** What both of Allocate IP's requests accept as ``status``:
+ *  ``IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}`` (backend
+ *  ``models/ipam.py``; ``NextIPRequest`` / ``IPAddressCreate``
+ *  ``validate_status`` in ``api/v1/ipam/router.py``). */
+const CREATE_STATUSES = [
+  "available",
+  "allocated",
+  "reserved",
+  "static_dhcp",
+  "deprecated",
+  "orphan",
+  "dhcp",
+];
+
+describe("Allocate IP offers only the statuses its requests accept (#1422)", () => {
+  async function offered(): Promise<string[]> {
+    allocateIp();
+    const status = await findControl<HTMLSelectElement>("Type / Status");
+    return Array.from(status.options).map((o) => o.value);
+  }
+
+  it("offers no status both of its requests refuse", async () => {
+    // "Next available" posts /subnets/{id}/next and "Specific IP" posts
+    // /subnets/{id}/addresses; both answer 422 to anything else, so an
+    // offered "discovered" (integration-owned) could only ever fail.
+    const statuses = await offered();
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(statuses.filter((s) => !CREATE_STATUSES.includes(s))).toEqual([]);
+  });
+
+  it("still offers every status an operator allocates with", async () => {
+    const statuses = await offered();
+    expect(statuses).toEqual(
+      expect.arrayContaining([
+        "allocated",
+        "reserved",
+        "dhcp",
+        "static_dhcp",
+        "available",
+        "deprecated",
+      ]),
+    );
+    expect(control<HTMLSelectElement>("Type / Status").value).toBe("allocated");
+  });
+});
