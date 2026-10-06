@@ -489,7 +489,11 @@ async def update_group(
 async def delete_group(
     group_id: uuid.UUID, db: DB, user: SuperAdmin, request: Request
 ) -> JSONResponse | None:
-    """Delete a DHCP server group (refused if it still holds servers).
+    """Delete a DHCP server group.
+
+    Refused (409) while the group holds servers or scopes (#1399). Its scopes
+    already in Trash are deleted with it, for good, with their pools and
+    reservations.
 
     Two-person approval (#62): when the ``governance.approvals`` module is on
     and a ``delete:dhcp_server_group`` policy matches, returns ``202`` with a

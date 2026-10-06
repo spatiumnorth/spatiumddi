@@ -1011,11 +1011,12 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     ``ValueError``.
 
     Secondary, stub and forward zones keep the kind they are given
-    (``forward`` when omitted, as before). IPAM's PTR lookup does not look at
-    the zone type, and those zones are not SpatiumDDI's to write into, so a
-    derived ``reverse`` would newly send PTR updates to a zone that refuses
-    them. Only one direction is enforced: kind "reverse" on a name outside
-    those trees is left to the operator, since IPAM never matches such a zone.
+    (``forward`` when omitted, as before). Those zones are not SpatiumDDI's to
+    write into, and IPAM writes no PTR into them whatever their kind (#1419):
+    the zone that owns a reverse name is the most specific one covering it, of
+    any type, and IPAM writes there only when it is a primary. Only one
+    direction is enforced: kind "reverse" on a name outside those trees is
+    left to the operator, since IPAM never matches such a zone.
     """
     if zone_type != "primary":
         return kind if kind is not None else "forward"
@@ -1746,6 +1747,11 @@ async def rotate_group_key(
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+    """Delete a DNS server group.
+
+    Refused (409) while the group holds servers or zones. Its zones already in
+    Trash are deleted with it, for good, with their records (#1399).
+    """
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
@@ -6688,7 +6694,7 @@ class GroupRecordResponse(BaseModel):
 async def list_group_records(
     group_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     search: str | None = Query(
         None, description="substring over name / fqdn / value / type / zone"
     ),
@@ -6702,9 +6708,14 @@ async def list_group_records(
     """
     await _require_group(group_id, db)
 
-    zones = list(
-        (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars().all()
-    )
+    zone_stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    # GHSA-wr8j-6r46-pj7g: like list_zones, a dns_zone-scoped token sees only
+    # its bound zones' records, not every zone in the group. No-op (None) for
+    # sessions / unscoped / wildcard-grant tokens.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        zone_stmt = zone_stmt.where(DNSZone.id.in_(token_zone_ids))
+    zones = list((await db.execute(zone_stmt)).scalars().all())
     empty: Page[GroupRecordResponse] = Page(items=[], total=0, page=page, page_size=page_size)
     if not zones:
         return empty
