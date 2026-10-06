@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ipam.router import _sync_dns_record
 from app.core.dns_names import sanitize_mirrored_hostname
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.proxmox import ProxmoxNode
 from app.services.cloud import reconcile as cloud_reconcile
@@ -228,10 +228,21 @@ async def test_a_proxmox_guest_lands_with_a_legal_hostname_and_stays_put(
 # ── The rename away from a legacy illegal name ───────────────────────
 
 
-async def _zone_and_subnet(db: AsyncSession) -> tuple[Subnet, DNSZone]:
+async def _zone_and_subnet(db: AsyncSession, driver: str = "bind9") -> tuple[Subnet, DNSZone]:
     grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
     db.add(grp)
     await db.flush()
+    db.add(
+        DNSServer(
+            name=f"ns-{uuid.uuid4().hex[:6]}",
+            host="192.0.2.53",
+            port=53,
+            driver=driver,
+            group_id=grp.id,
+            is_primary=True,
+            is_enabled=True,
+        )
+    )
     zone = DNSZone(
         group_id=grp.id,
         name="corp.test.",
@@ -262,12 +273,13 @@ async def _zone_and_subnet(db: AsyncSession) -> tuple[Subnet, DNSZone]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["bind9", "powerdns", "technitium", "technitium_api"])
 async def test_renaming_off_an_illegal_name_sends_no_delete_for_it(
-    db_session: AsyncSession,
+    db_session: AsyncSession, driver: str
 ) -> None:
-    """The old record was refused by every server, so a delete of it can only
+    """The old record was refused by the primary, so a delete of it can only
     fail, on every retry. The rename writes the new name and drops the old row."""
-    subnet, zone = await _zone_and_subnet(db_session)
+    subnet, zone = await _zone_and_subnet(db_session, driver)
     ip = IPAddress(
         subnet_id=subnet.id, address="10.82.1.20", status="allocated", hostname="Vitrinen Schalter"
     )
@@ -301,6 +313,39 @@ async def test_renaming_off_an_illegal_name_sends_no_delete_for_it(
         .all()
     )
     assert names == ["vitrinen-schalter"]
+
+
+@pytest.mark.asyncio
+async def test_renaming_off_an_illegal_name_still_retracts_it_on_windows(
+    db_session: AsyncSession,
+) -> None:
+    """Windows DNS can be set to accept UTF-8 names, so the old record may
+    really be there; skipping the retraction would orphan it."""
+    subnet, _zone = await _zone_and_subnet(db_session, "windows_dns")
+    ip = IPAddress(
+        subnet_id=subnet.id, address="10.82.1.22", status="allocated", hostname="Büro Drucker"
+    )
+    db_session.add(ip)
+    await db_session.flush()
+
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture(
+        db: AsyncSession, zone: DNSZone, op: str, record: dict[str, Any], **_: Any
+    ) -> None:
+        sent.append((op, record))
+
+    with patch("app.services.dns.record_ops.enqueue_record_op", side_effect=_capture):
+        await _sync_dns_record(db_session, ip, subnet, backfill_reverse_zone=False)
+        await db_session.flush()
+        sent.clear()
+        ip.hostname = "buero-drucker"
+        await _sync_dns_record(db_session, ip, subnet, action="update", backfill_reverse_zone=False)
+
+    assert [(op, r["name"]) for op, r in sent] == [
+        ("delete", "Büro Drucker"),
+        ("create", "buero-drucker"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -97,9 +97,12 @@ the formatter handles the rest.
   outside letters, digits and hyphens turned into `-`, lower-cased
   (`Sonos Büro` → `sonos-buero`). The original name is kept at the end
   of the address's description (`… — name: Sonos Büro`). An address
-  that already carries an illegal name is renamed on the next sync, and
-  the delete for the old name is no longer queued, since no server ever
-  held it (it used to fail forever). Duplicate names are not suffixed:
+  that already carries an illegal name is renamed on the next sync.
+  When the zone's primary is BIND9, PowerDNS or Technitium, the delete
+  for the old name is no longer queued, since that server never held it
+  (it used to fail forever). A Windows DNS primary, which can be set to
+  accept UTF-8 names, and the cloud providers still get the delete.
+  Duplicate names are not suffixed:
   two clients both called `Office PC` still share one name.
 
 - **Imported `static_dhcp` IPAM records now get their Kea

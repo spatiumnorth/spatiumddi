@@ -1106,14 +1106,21 @@ _dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] |
 )
 
 
+# Agentless drivers that still refuse an illegal owner name, so a record
+# carrying one never landed there either. ``technitium_api`` is the same
+# daemon the agent drives. Windows DNS can be set to accept UTF-8 names, and
+# the cloud providers have their own rules, so those keep the delete.
+_AGENTLESS_REFUSING_ILLEGAL_NAMES: frozenset[str] = frozenset({"technitium_api"})
+
+
 def _never_publishable(name: str, rtype: str, value: str) -> bool:
     """Whether a record could never have been accepted by a DNS server.
 
     Before #1459 an integration's free-text name ("Vitrinen Schalter") was
-    published verbatim. The servers refuse such a record, so a delete of it
-    fails on every retry and stays ``failed`` forever. Once the name is
-    folded into a legal one, the rename retracts the old name, and that
-    retraction has nothing to remove on the wire.
+    published verbatim. BIND9, PowerDNS and Technitium refuse such a record,
+    so a delete of it fails on every retry and stays ``failed`` forever. Once
+    the name is folded into a legal one, the rename retracts the old name,
+    and on those servers that retraction has nothing to remove on the wire.
     """
     try:
         validate_record_owner(name)
@@ -1141,18 +1148,27 @@ async def _enqueue_dns_op(
     enqueued). For an agentless primary (Windows DNS) the op is applied
     synchronously and its ``state`` is ``applied`` / ``failed`` on return —
     callers use that to avoid stamping a record that didn't land (#428)."""
-    from app.services.dns.record_ops import enqueue_record_op
+    from app.drivers.dns import is_agentless
+    from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
     from app.services.dns.serial import bump_zone_serial
 
     if op == "delete" and _never_publishable(name, rtype, value):
-        logger.info(
-            "ipam_dns_delete_skipped_invalid_name",
-            zone=zone.name,
-            name=name,
-            record_type=rtype,
-            detail="the record is not a legal DNS name, so no server holds it",
-        )
-        return None
+        # Only where the primary could never have taken the name: a Windows
+        # server with UTF-8 names enabled may really hold it, and skipping
+        # the retraction there would orphan the record.
+        primary = await resolve_primary_server(db, zone)
+        if primary is not None and (
+            not is_agentless(primary.driver) or primary.driver in _AGENTLESS_REFUSING_ILLEGAL_NAMES
+        ):
+            logger.info(
+                "ipam_dns_delete_skipped_invalid_name",
+                zone=zone.name,
+                name=name,
+                record_type=rtype,
+                driver=primary.driver,
+                detail="the primary refuses this name, so it never held the record",
+            )
+            return None
 
     target_serial = bump_zone_serial(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
