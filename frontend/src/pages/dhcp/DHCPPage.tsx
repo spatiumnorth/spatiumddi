@@ -65,7 +65,11 @@ import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
@@ -115,6 +119,12 @@ function GroupSidebar({
   onSelect: (s: Selection) => void;
   onCreateGroup: () => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [expanded, setExpanded] = useSessionState<Set<string>>(
     "spatium.dhcp.expandedGroups",
@@ -160,9 +170,10 @@ function GroupSidebar({
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
           <button
-            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onCreateGroup}
             title="New group"
+            {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
@@ -180,8 +191,9 @@ function GroupSidebar({
               No server groups yet.
             </p>
             <button
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent"
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onCreateGroup}
+              {...superadminGate}
             >
               <Plus className="h-3 w-3" /> Create Group
             </button>
@@ -408,6 +420,12 @@ function GroupDetailView({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const navigate = useNavigate();
   // Per-group tab persistence keyed on group id so navigating between
@@ -486,13 +504,14 @@ function GroupDetailView({
             >
               PXE Profiles
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit Group
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete Group
             </HeaderButton>
@@ -926,6 +945,12 @@ function GroupServersList({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const pauseMutId = useRef<string | null>(null);
   // Pause / resume mutations — shared instance for every row so the
@@ -991,8 +1016,9 @@ function GroupServersList({
           </p>
         </div>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={onAddServer}
+          {...superadminGate}
         >
           <Plus className="h-3 w-3" /> Add Server
         </button>
@@ -1100,6 +1126,7 @@ function GroupServersList({
                       disabled={pauseInFlight}
                       className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
                       title="Resume — exit maintenance mode"
+                      {...superadminGate}
                     >
                       <Play className="h-3 w-3" />
                       {pauseInFlight ? "…" : "Resume"}
@@ -1111,30 +1138,33 @@ function GroupServersList({
                         e.stopPropagation();
                         setPausePrompt(s);
                       }}
-                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                       title="Pause — enter maintenance mode"
+                      {...superadminGate}
                     >
                       <Pause className="h-3 w-3" />
                       Pause
                     </button>
                   )}
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onEditServer(s);
                     }}
                     title="Edit server"
+                    {...superadminGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onDeleteServer(s);
                     }}
                     title="Delete server"
+                    {...superadminGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -1950,6 +1980,11 @@ function ServerPoolsOrStaticsTab({
 }
 
 function ClientClassesTab({ groupId }: { groupId: string }) {
+  // #1339 — every Kea-tab write takes a superadmin (SuperAdmin handlers).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", groupId],
@@ -1984,7 +2019,8 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
       <div className="flex justify-end">
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...superadminGate}
         >
           <Plus className="h-3 w-3" /> New Client Class
         </button>
@@ -2028,13 +2064,15 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        {...superadminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        {...superadminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2074,6 +2112,11 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
 }
 
 function OptionTemplatesTab({ groupId }: { groupId: string }) {
+  // #1339 — every Kea-tab write takes a superadmin (SuperAdmin handlers).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const { data: templates = [] } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
@@ -2113,7 +2156,8 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
         </p>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...superadminGate}
         >
           <Plus className="h-3 w-3" /> New Template
         </button>
@@ -2157,13 +2201,15 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        {...superadminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        {...superadminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

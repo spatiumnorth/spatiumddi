@@ -2387,6 +2387,15 @@ the formatter handles the rest.
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
 
+- **The DHCP page offers a read-only user no write it would be refused
+  (#1339).** A user whose only role is the built-in Viewer was offered
+  New group, Edit and Delete Group, Add Server, every server's Pause,
+  Resume, Edit and Delete, and the Kea tabs' New Client Class, New
+  Template, Block MAC, New Phone Profile and New Policy (with their rows'
+  Edit and Delete), each refused only after the form was filled in. Every
+  one of those routes takes a superadmin, and each control now says so:
+  disabled, with the reason as its tooltip, for any other user.
+
 - **The DNS page offers a read-only user no write it would be refused
   (#1338).** A user whose only role is the built-in Viewer was offered
   every DNS write (New server group, Sync with Servers, Edit and Delete

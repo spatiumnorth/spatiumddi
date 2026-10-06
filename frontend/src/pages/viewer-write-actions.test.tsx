@@ -265,3 +265,124 @@ describe("#1338 the DNS page", () => {
     }
   });
 });
+
+// ── #1339: the DHCP page ──────────────────────────────────────────────────────
+
+const DHCP_GROUP = {
+  id: "dgrp-1",
+  name: "viewer-walk",
+  description: "",
+  mode: "standalone",
+  heartbeat_delay_ms: 10000,
+  max_response_delay_ms: 60000,
+  max_ack_delay_ms: 10000,
+  max_unacked_clients: 5,
+  auto_failover: true,
+  lease_cache_threshold: 0,
+  lease_cache_max_age: null,
+  kea_thread_pool_size: 0,
+  kea_packet_logging: false,
+  kea_member_count: 1,
+  servers: [],
+  created_at: STAMP,
+  modified_at: STAMP,
+};
+
+const DHCP_SERVER = {
+  id: "srv-1",
+  server_group_id: "dgrp-1",
+  name: "kea-viewer",
+  description: "",
+  driver: "kea",
+  host: "192.0.2.98",
+  port: 8000,
+  roles: [],
+  status: "active",
+  last_sync_at: null,
+  last_health_check_at: null,
+  agent_registered: true,
+  agent_approved: true,
+  agent_last_seen: null,
+  last_seen_ip: null,
+  config_apply_status: null,
+  config_apply_error: null,
+  config_failed_etag: null,
+  config_apply_at: null,
+  spool_status: null,
+  daemon_status: null,
+  daemon_reason: null,
+  daemon_status_since: null,
+  daemon_not_serving: null,
+  agent_version: null,
+  config_etag: null,
+  config_pushed_at: null,
+  has_credentials: false,
+  is_agentless: false,
+  is_read_only: false,
+  maintenance_mode: false,
+  maintenance_started_at: null,
+  maintenance_reason: null,
+  created_at: STAMP,
+  modified_at: STAMP,
+};
+
+describe("#1339 the DHCP page", () => {
+  async function openDhcp() {
+    answers.dhcpApi = {
+      listGroups: async () => [DHCP_GROUP],
+      listServers: async () => [DHCP_SERVER],
+      listScopesByGroup: async () => [],
+      listClientClasses: async () => [],
+      listOptionTemplates: async () => [],
+      listMacBlocks: async () => [],
+      listPhoneProfiles: async () => [],
+      listVoipVendors: async () => [],
+      listDevicePolicies: async () => [],
+    };
+    const { DHCPPage } = await import("@/pages/dhcp/DHCPPage");
+    show(<DHCPPage />, "/dhcp?group=dgrp-1");
+    await screen.findByText("kea-viewer");
+    await permissionsLoaded();
+  }
+
+  const KEA_TABS: [string, string][] = [
+    ["Client Classes", "New Client Class"],
+    ["Option Templates", "New Template"],
+    ["MAC Blocks", "Block MAC"],
+    ["Phone Profiles", "New Phone Profile"],
+    ["Device Policies", "New Policy"],
+  ];
+
+  async function eachKeaTab(check: (create: string) => void) {
+    for (const [tab, create] of KEA_TABS) {
+      button(tab).click();
+      await screen.findByRole("button", { name: create });
+      check(create);
+    }
+  }
+
+  it("offers a Viewer no group, server or Kea-tab write, and says why", async () => {
+    signInAs(VIEWER);
+    await openDhcp();
+    expectDenied(
+      ["Edit Group", "Delete Group", "Add Server", /^Pause\b/],
+      SUPERADMIN,
+    );
+    // The icon buttons are named by their tooltip, the reason, while denied.
+    for (const name of ["New group", "Edit server", "Delete server"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    await eachKeaTab((create) => expectDenied([create], SUPERADMIN));
+  });
+
+  it("offers a superadmin every one of them", async () => {
+    signInAs("superadmin");
+    await openDhcp();
+    expectOffered(["Edit Group", "Delete Group", "Add Server", /^Pause\b/]);
+    expectOffered(["Edit server", "Delete server"]);
+    expect(
+      screen.getAllByRole("button", { name: "New group" }).length,
+    ).toBeGreaterThan(0);
+    await eachKeaTab((create) => expectOffered([create]));
+  });
+});
