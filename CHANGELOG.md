@@ -51,7 +51,13 @@ the formatter handles the rest.
   zones default to those values too, keeping the 5-minute negative TTL
   a DDNS-driven estate relies on. A zone with an edited timer starts
   serving it, under a new serial so its secondaries transfer it, and
-  reloads once. The zone API refuses a timer outside 0 to
+  reloads once. **A group switches to the zones' own timers only once
+  every BIND9 agent in it renders them:** until then, through an upgrade
+  (on a cluster, until its last DNS pod is replaced) or while an agent of
+  an older release stays in the group, it keeps serving
+  `3600 600 86400 300`, and the edited zones' serials move at the switch.
+  So no serial is ever served with two different SOAs, and no DNS change
+  is held back meanwhile. The zone API refuses a timer outside 0 to
   2147483647, and a stored one BIND would refuse is served as before and
   logged rather than taking the zone down. PowerDNS and Technitium
   manage their own SOA and are unchanged.
@@ -117,13 +123,17 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `ff32b91acad8` — #1171, data-only: each `dns_zone` SOA timer still at
-  its old default (refresh 86400, retry 7200, expire 3600000, minimum
-  3600) gets the value the BIND9 agent has always served (3600, 600,
-  86400, 300), timer by timer, so rendering the stored timers changes
-  nothing on the wire for a timer nobody set. Every zone left with any
-  other timer moves its serial (`bump_zone_serial`'s rule), since its
-  served SOA changes at this upgrade. Downgrade is a no-op.
+- `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
+  default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
+  the value the BIND9 agent has always served (3600, 600, 86400, 300),
+  timer by timer, so rendering the stored timers changes nothing on the
+  wire for a timer nobody set. Adds `dns_server.agent_renders_soa_timers`
+  (false) and `dns_server_group.serves_soa_timers` (true; false for every
+  group with a BIND9 agent, whose agents are the previous release's). It
+  moves no serial: a zone with other timers moves its serial when its
+  group switches to serving them. Downgrade moves the serial of each zone
+  whose group served its own timers (its SOA changes back) and drops the
+  two columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

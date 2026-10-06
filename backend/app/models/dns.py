@@ -147,6 +147,16 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # #1171 — the group's bundles carry each zone's own SOA timers. False while
+    # any BIND9 agent of the group writes the literal 3600 600 86400 300 (an
+    # older release): the bundles then carry that literal, so every agent
+    # serves one SOA under each serial. ``services.dns.soa_timers`` switches it
+    # and moves the serial of each zone whose timers differ, in one
+    # transaction.
+    serves_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )
@@ -236,6 +246,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #1171 — this server's agent writes each zone's own SOA timers into its
+    # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
+    # register or heartbeat. False for an agent of an older release, which
+    # writes 3600 600 86400 300 for every zone. A group serves the zones' own
+    # timers only while every BIND9 agent in it does
+    # (``services.dns.soa_timers``).
+    agent_renders_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
