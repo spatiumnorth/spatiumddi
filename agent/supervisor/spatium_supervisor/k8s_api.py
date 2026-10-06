@@ -1633,6 +1633,50 @@ def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
     return len(items), schedulable, None
 
 
+_ROLE_LABEL_PREFIX = "spatium.io/role-"
+
+
+def role_labels_of(nodes_doc: Any, exclude: str = "") -> set[str]:
+    """PURE — #1439: the roles (``spatium.io/role-<role>=true``) that every node
+    of a ``/api/v1/nodes`` list carries, except the node named ``exclude``.
+
+    The labels are what schedules the agents (each agent DaemonSet selects on
+    its role's label), so they are the cluster's own answer to "which roles does
+    another node serve right now". ``exclude`` empty counts every node."""
+    roles: set[str] = set()
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    for node in items or []:
+        meta = (node or {}).get("metadata") or {}
+        if exclude and meta.get("name") == exclude:
+            continue
+        for key, value in (meta.get("labels") or {}).items():
+            if key.startswith(_ROLE_LABEL_PREFIX) and value == "true":
+                roles.add(key[len(_ROLE_LABEL_PREFIX) :])
+    return roles
+
+
+def node_role_labels(exclude: str = "", timeout: float = 5.0) -> tuple[set[str] | None, str | None]:
+    """``(roles, error)``: :func:`role_labels_of` over ``GET /api/v1/nodes``.
+
+    ``None`` means unknown (a transport error, a status other than 200, an
+    unparseable list), never "no other node serves anything": the role apply
+    acts on the answer, and an unknown read taken as an empty one would turn off
+    the agents other nodes serve, which is the very thing it guards."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        return None, "unparseable node list"
+    return role_labels_of(doc, exclude), None
+
+
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
 _FAST_EVICT_TOLERATIONS = [

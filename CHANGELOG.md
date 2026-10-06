@@ -118,6 +118,21 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **A member joining a multi-node appliance no longer stops DNS and DHCP
+  on every node (#1439).** A member's promotion changes its role apply
+  key (the agents' control-plane URL, #1350), so its first heartbeat
+  after the join re-applied the cluster's one role chart with the roles
+  it held at that moment: none. Every agent was rendered off, and the
+  helm upgrade deleted every agent DaemonSet on every node, the seed's
+  included, until a node holding the roles wrote the chart again (its
+  watchdog, every five minutes). Forming a cluster, adding a member and
+  a Replace each left the cluster without DNS and DHCP for one to four
+  minutes. A node that holds no agent key now keeps an agent on while
+  another node is labelled for its role, with that role's key and
+  server group taken from the live chart and everything else from its
+  own render; a node list or chart it cannot read fails the apply
+  instead of writing it blind.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
