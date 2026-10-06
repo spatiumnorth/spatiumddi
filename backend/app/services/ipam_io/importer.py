@@ -733,6 +733,7 @@ async def preview_address_import(
     *,
     subnet_id: uuid.UUID,
     strategy: Strategy = "fail",
+    current_user: Any = None,
 ) -> ImportPreview:
     subnet = await _load_subnet(db, subnet_id)
     preview = ImportPreview(space_id=str(subnet.id), space_name=str(subnet.network))
@@ -745,7 +746,10 @@ async def preview_address_import(
     # commit does: a ``static_dhcp`` row with a MAC syncs only when the
     # subnet has exactly one matching-family scope. Candidate scopes are
     # per (subnet, family), so cache them across rows.
-    from app.services.dhcp.static_ipam import candidate_scopes_for_ipam_row
+    from app.services.dhcp.static_ipam import (
+        _linked_static_for_row,
+        candidate_scopes_for_ipam_row,
+    )
 
     scopes_by_family: dict[str, list] = {}
 
@@ -760,6 +764,27 @@ async def preview_address_import(
         )
         if status != "static_dhcp" or not mac:
             return {}
+        # #1629 (GHSA-44ph) — the commit-side sync gates on the acting
+        # user's ``dhcp_static`` grant; preview the same outcome when
+        # the caller is known, or an IPAM-only importer's preview would
+        # promise a reservation commit will refuse.
+        if current_user is not None:
+            from app.core.permissions import user_has_permission  # noqa: PLC0415
+
+            if not user_has_permission(current_user, "write", "dhcp_static"):
+                return {
+                    "dhcp_static_warning": (
+                        "No 'write' permission on DHCP reservations "
+                        "(dhcp_static) — no reservation will be created."
+                    )
+                }
+        # #1629 walk — preview must match commit for a *linked* row:
+        # commit updates the linked reservation in place whatever the
+        # candidate-scope count is (the sync's linked branch never
+        # consults candidate scopes), so a two-scope subnet must not
+        # preview "no reservation will be created" for such a row.
+        if existing_ip is not None and await _linked_static_for_row(db, existing_ip) is not None:
+            return {"dhcp_static_sync": True}
         family = "ipv6" if ipaddress.ip_address(canonical).version == 6 else "ipv4"
         if family not in scopes_by_family:
             probe = IPAddress(subnet_id=subnet.id, address=canonical)
@@ -930,7 +955,9 @@ async def commit_address_import(
         per-row errors — the import never hard-fails a batch.
         """
         try:
-            sync = await sync_static_for_ipam_row(db, ip_row, created_by_user_id=current_user.id)
+            sync = await sync_static_for_ipam_row(
+                db, ip_row, created_by_user_id=current_user.id, user=current_user
+            )
         except Exception as exc:  # noqa: BLE001
             result_obj.errors.append(f"{canonical}: DHCP reservation sync failed: {exc}")
             return

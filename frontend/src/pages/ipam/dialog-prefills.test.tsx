@@ -612,9 +612,9 @@ describe("Edit address shows the status and role it is stored with (#1305)", () 
     });
   });
 });
-// ── #1306 — the DHCP Scope picker ────────────────────────────────────────────
+// ── #1306 / #1629 — the DHCP Scope picker is gone ────────────────────────────
 
-describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => {
+describe("Allocate IP has no DHCP Scope picker — the server picks the scope (#1306, #1629)", () => {
   function allocateWithScope() {
     answer("dhcpApi", "listScopesBySubnet", () =>
       Promise.resolve([
@@ -633,17 +633,17 @@ describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => 
     return { nextAddress, createStatic };
   }
 
-  it('status "dhcp" shows no scope, because the request carries none', async () => {
+  it('no status shows a scope picker, because the request carries none', async () => {
     const { nextAddress, createStatic } = allocateWithScope();
     const status = await findControl<HTMLSelectElement>("Type / Status");
 
-    // Positive control first: the dialog has the subnet's scope, and offers
-    // it for a reservation. Only then is its absence below the dialog's
-    // own decision rather than a scope list still loading.
+    // The subnet HAS a scope (answered above, and the pools query that
+    // rides on it resolves) — the picker is absent by decision, not
+    // because the scope list is still loading. Since #1628 the server
+    // syncs the reservation onto the sole matching scope itself, and
+    // #1629 removed the picker the walk found no request carrying.
     fireEvent.change(status, { target: { value: "static_dhcp" } });
-    await waitFor(() =>
-      expect(control<HTMLSelectElement>("DHCP Scope").value).toBe("scope-1"),
-    );
+    expect(screen.queryByText("DHCP Scope", { selector: "label" })).toBeNull();
     fireEvent.change(status, { target: { value: "dhcp" } });
     expect(screen.queryByText("DHCP Scope", { selector: "label" })).toBeNull();
     fireEvent.change(screen.getByPlaceholderText("Required"), {
@@ -662,9 +662,7 @@ describe("Allocate IP shows a DHCP Scope only where it uses one (#1306)", () => 
     fireEvent.change(await findControl<HTMLSelectElement>("Type / Status"), {
       target: { value: "static_dhcp" },
     });
-    await waitFor(() =>
-      expect(control<HTMLSelectElement>("DHCP Scope").value).toBe("scope-1"),
-    );
+    expect(screen.queryByText("DHCP Scope", { selector: "label" })).toBeNull();
     fireEvent.change(control("MAC Address"), {
       target: { value: "aa:bb:cc:dd:ee:ff" },
     });

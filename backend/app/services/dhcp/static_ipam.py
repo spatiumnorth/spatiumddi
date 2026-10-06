@@ -747,6 +747,36 @@ def _static_audit_value(
     }
 
 
+def _dhcp_permission_warning(
+    acting_user: User | None, action: str, row: IPAddress, *, verb: str
+) -> str | None:
+    """The warning when the acting user may not touch reservations (#1629).
+
+    The statics endpoints gate on ``dhcp_static`` (router-level
+    ``require_resource_permission("dhcp_static")``: ``write`` for
+    create/update, ``delete`` for remove). The IPAM-side sync performs
+    the same reservation writes, so it applies the same gate
+    (GHSA-44ph-jfwp-2888): without the grant, warn and change nothing —
+    an IPAM write alone must not create, re-point or delete a Kea
+    reservation. ``acting_user is None`` means a system/internal caller
+    with no user to gate (the in-repo callers all pass the acting
+    user). Callers must pass the *request's* user object (``user=``),
+    not only an id: a fresh load loses the API-token narrowing
+    (``_api_token_resource_grants``) the permission check intersects.
+    """
+    if acting_user is None:
+        return None
+    from app.core.permissions import user_has_permission  # noqa: PLC0415
+
+    if user_has_permission(acting_user, action, "dhcp_static"):
+        return None
+    return (
+        f"No '{action}' permission on DHCP reservations (dhcp_static) — "
+        f"the reservation for {row.address} was not {verb}. "
+        "Ask a DHCP administrator to make the change, or have the grant added."
+    )
+
+
 async def sync_static_for_ipam_row(
     db: AsyncSession,
     row: IPAddress,
@@ -764,6 +794,14 @@ async def sync_static_for_ipam_row(
     linked reservation pushed out and deleted. More than one candidate
     scope, or a conflicting reservation (same MAC elsewhere in the group,
     same IP pinned to another MAC), creates nothing and returns a warning.
+
+    Every reservation write is gated on the acting user's ``dhcp_static``
+    permission (``write`` to create/update, ``delete`` to remove), the
+    same gate the statics endpoints enforce; without it the sync warns
+    and changes nothing (#1629, GHSA-44ph-jfwp-2888). A reservation's
+    description is only overwritten by a description the IPAM row
+    actually carries — a tags-only save of a DHCP-side reservation's
+    mirror row must not clear it (#1629 walk).
 
     Driver push + agent wake mirror ``api/v1/dhcp/statics.py``; a Windows /
     cloud push failure propagates so the caller's transaction rolls back,
@@ -789,6 +827,9 @@ async def sync_static_for_ipam_row(
         if linked is None:
             return IPAMStaticSync()
         scope = await db.get(DHCPScope, linked.scope_id)
+        perm_warning = _dhcp_permission_warning(acting_user, "delete", row, verb="removed")
+        if perm_warning is not None:
+            return IPAMStaticSync(static=linked, scope=scope, warning=perm_warning)
         await push_static_change(db, linked, action="delete")
         if scope is not None:
             collect_wake(dhcp_group_channel(scope.group_id))
@@ -832,14 +873,22 @@ async def sync_static_for_ipam_row(
             )
         prev_mac, prev_ip = str(linked.mac_address), str(linked.ip_address)
         prev_hostname, prev_description = linked.hostname or "", linked.description or ""
+        # #1629 walk — copy only a description the row actually carries.
+        # A reservation made on the DHCP side carries a description its
+        # IPAM mirror row never had; a tags-only IPAM save copied the
+        # row's empty description over it and cleared it in Kea.
+        effective_description = row.description or prev_description
         changed = (
             prev_mac != mac
             or prev_ip != str(row.address)
             or prev_hostname != (row.hostname or "")
-            or prev_description != (row.description or "")
+            or prev_description != effective_description
         )
         if not changed and row.static_assignment_id == str(linked.id):
             return IPAMStaticSync(static=linked, scope=scope)
+        perm_warning = _dhcp_permission_warning(acting_user, "write", row, verb="updated")
+        if perm_warning is not None:
+            return IPAMStaticSync(static=linked, scope=scope, warning=perm_warning)
         changed_fields: list[str] = []
         if prev_ip != str(row.address):
             changed_fields.append("ip_address")
@@ -847,7 +896,7 @@ async def sync_static_for_ipam_row(
             changed_fields.append("mac_address")
         if prev_hostname != (row.hostname or ""):
             changed_fields.append("hostname")
-        if prev_description != (row.description or ""):
+        if prev_description != effective_description:
             changed_fields.append("description")
         if not changed_fields:
             # Only the back-link was missing; upsert below restores it.
@@ -863,7 +912,7 @@ async def sync_static_for_ipam_row(
         linked.ip_address = str(row.address)
         linked.mac_address = mac
         linked.hostname = row.hostname or ""
-        linked.description = row.description or ""
+        linked.description = effective_description
         await db.flush()
         if changed:
             await push_static_change(
@@ -883,6 +932,12 @@ async def sync_static_for_ipam_row(
             new_value=_static_audit_value(linked, scope.id, row),
         )
         return IPAMStaticSync(static=linked, scope=scope, action="update")
+
+    # Create / adopt path — gate before any scope or conflict work so a
+    # caller without the grant learns nothing and changes nothing.
+    perm_warning = _dhcp_permission_warning(acting_user, "write", row, verb="created or updated")
+    if perm_warning is not None:
+        return IPAMStaticSync(warning=perm_warning)
 
     scopes = await candidate_scopes_for_ipam_row(db, row)
     if not scopes:

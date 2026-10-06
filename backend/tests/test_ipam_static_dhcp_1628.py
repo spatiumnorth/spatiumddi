@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import Group, Role, User
 from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup, DHCPStaticAssignment
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam_io.importer import commit_address_import, preview_address_import
@@ -43,6 +43,34 @@ async def _admin(db: AsyncSession) -> tuple[User, dict[str, str]]:
     db.add(user)
     await db.flush()
     return user, {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+async def _user_with_perms(
+    db: AsyncSession, permissions: list[dict]
+) -> tuple[User, dict[str, str]]:
+    """A non-superadmin user holding exactly ``permissions`` (#1629)."""
+    tag = uuid.uuid4().hex[:8]
+    role = Role(name=f"r-{tag}", permissions=permissions)
+    group = Group(name=f"g-{tag}")
+    group.roles = [role]
+    user = User(
+        username=f"u-{tag}",
+        email=f"{tag}@example.test",
+        display_name="Scoped User",
+        hashed_password=hash_password("x" * 12),
+        auth_source="local",
+        is_superadmin=False,
+    )
+    user.groups = [group]
+    db.add_all([role, group, user])
+    await db.flush()
+    return user, {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+_IPAM_WRITE = [
+    {"action": "admin", "resource_type": "subnet"},
+    {"action": "admin", "resource_type": "ip_address"},
+]
 
 
 async def _subnet(db: AsyncSession) -> Subnet:
@@ -378,3 +406,388 @@ async def test_import_without_scope_warns_in_preview_and_result(
     assert "No DHCP scope" in result.dhcp_warnings[0]
     db_session.expire_all()
     assert await _statics(db_session) == []
+
+
+# ── #1629 rework (QA walk findings + GHSA-44ph) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ipam_only_user_gets_warning_and_no_reservation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GHSA-44ph: IPAM write without a ``dhcp_static`` grant must not
+    create a reservation through the IPAM routes."""
+    _, headers = await _user_with_perms(db_session, _IPAM_WRITE)
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{subnet.id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.70",
+            "hostname": "printer-ipam-only",
+            "status": "static_dhcp",
+            "mac_address": MAC,
+        },
+    )
+    # The IPAM row is created; the reservation is not, and the
+    # response says why instead of silently skipping it.
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["dhcp_static_warning"] or ""
+    assert "dhcp_static" in warning, warning
+    db_session.expire_all()
+    assert await _statics(db_session) == []
+    assert await _static_audits(db_session) == []
+
+
+@pytest.mark.asyncio
+async def test_dhcp_static_writer_can_create_reservation_via_ipam(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The gate is the ``dhcp_static`` grant, not superadmin: a user
+    holding ``write`` on it (who the statics endpoints themselves
+    would still refuse — they require SuperAdmin) syncs fine."""
+    _, headers = await _user_with_perms(
+        db_session, [*_IPAM_WRITE, {"action": "write", "resource_type": "dhcp_static"}]
+    )
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{subnet.id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.71",
+            "hostname": "printer-dhcp-writer",
+            "status": "static_dhcp",
+            "mac_address": MAC,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["dhcp_static_warning"] is None
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_ipam_only_user_cannot_update_or_remove_linked_reservation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """GHSA-44ph (b)/(c): re-pointing and removing an existing
+    reservation through IPAM edits are gated the same way."""
+    _, admin_headers = await _admin(db_session)
+    _, ipam_headers = await _user_with_perms(db_session, _IPAM_WRITE)
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    subnet_id = subnet.id
+    await db_session.commit()
+
+    created = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=admin_headers,
+        json={
+            "address": "10.80.0.72",
+            "hostname": "printer-gated",
+            "status": "static_dhcp",
+            "mac_address": MAC,
+        },
+    )
+    assert created.status_code == 201, created.text
+    row_id = created.json()["id"]
+
+    # MAC change: row saves, reservation keeps the old MAC and warns.
+    updated = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=ipam_headers,
+        json={"mac_address": "aa:bb:cc:dd:ee:09"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert "dhcp_static" in (updated.json()["dhcp_static_warning"] or "")
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert len(statics) == 1
+    assert str(statics[0].mac_address) == MAC
+
+    # Flip away from static_dhcp: reservation is NOT removed.
+    flipped = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=ipam_headers,
+        json={"status": "allocated"},
+    )
+    assert flipped.status_code == 200, flipped.text
+    assert "dhcp_static" in (flipped.json()["dhcp_static_warning"] or "")
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_grant_without_delete_cannot_remove_reservation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The remove path needs ``delete`` on ``dhcp_static``, not just
+    ``write`` — the split the statics router's method mapping makes."""
+    _, headers = await _user_with_perms(
+        db_session, [*_IPAM_WRITE, {"action": "write", "resource_type": "dhcp_static"}]
+    )
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    subnet_id = subnet.id
+    await db_session.commit()
+
+    created = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.73",
+            "hostname": "printer-write-only",
+            "status": "static_dhcp",
+            "mac_address": MAC,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["dhcp_static_warning"] is None
+    row_id = created.json()["id"]
+
+    flipped = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=headers,
+        json={"status": "allocated"},
+    )
+    assert flipped.status_code == 200, flipped.text
+    warning = flipped.json()["dhcp_static_warning"] or ""
+    assert "'delete'" in warning, warning
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_tags_only_save_keeps_reservation_description(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Walk finding: a reservation made on the DHCP side carries a
+    description its IPAM mirror row never had; a tags-only IPAM save
+    copied the row's empty description over it and cleared it."""
+    _, headers = await _admin(db_session)
+    subnet = await _subnet(db_session)
+    scope = await _scope(db_session, subnet)
+    scope_id = scope.id
+    await db_session.commit()
+
+    made = await client.post(
+        f"/api/v1/dhcp/scopes/{scope_id}/statics",
+        headers=headers,
+        json={
+            "ip_address": "10.80.0.74",
+            "mac_address": MAC,
+            "hostname": "printer-desc",
+            "description": "by the door",
+        },
+    )
+    assert made.status_code == 201, made.text
+    row_id = made.json()["ip_address_id"]
+    assert row_id
+
+    tagged = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=headers,
+        json={"tags": {"site": "hq"}},
+    )
+    assert tagged.status_code == 200, tagged.text
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert len(statics) == 1
+    assert statics[0].description == "by the door"
+
+    # A description the row actually carries still lands.
+    described = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=headers,
+        json={"description": "from ipam"},
+    )
+    assert described.status_code == 200, described.text
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert statics[0].description == "from ipam"
+
+
+@pytest.mark.asyncio
+async def test_update_mac_null_on_static_dhcp_row_is_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Walk finding: ``mac_address: null`` (what the Edit dialog sends
+    for a blanked MAC) was accepted, deleted the reservation, and left
+    the row at ``static_dhcp`` with no MAC."""
+    _, headers = await _admin(db_session)
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    subnet_id = subnet.id
+    await db_session.commit()
+
+    created = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.75",
+            "hostname": "printer-null-mac",
+            "status": "static_dhcp",
+            "mac_address": MAC,
+        },
+    )
+    assert created.status_code == 201, created.text
+    row_id = created.json()["id"]
+
+    resp = await client.put(
+        f"/api/v1/ipam/addresses/{row_id}",
+        headers=headers,
+        json={"mac_address": None},
+    )
+    assert resp.status_code == 422, resp.text
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+    row = await db_session.get(IPAddress, uuid.UUID(row_id))
+    assert row is not None
+    assert row.status == "static_dhcp"
+    assert str(row.mac_address) == MAC
+
+
+@pytest.mark.asyncio
+async def test_bulk_edit_runs_the_reservation_sync(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Walk finding: bulk edit ran no sync — rows bulk-set to
+    ``static_dhcp`` got no reservation, and a linked row bulk-set to
+    ``allocated`` kept its reservation in Kea."""
+    _, headers = await _admin(db_session)
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    subnet_id = subnet.id
+    await db_session.commit()
+
+    plain = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.76",
+            "hostname": "bulk-plain",
+            "status": "allocated",
+            "mac_address": MAC,
+        },
+    )
+    assert plain.status_code == 201, plain.text
+    linked = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+        json={
+            "address": "10.80.0.77",
+            "hostname": "bulk-linked",
+            "status": "static_dhcp",
+            "mac_address": "aa:bb:cc:dd:ee:77",
+        },
+    )
+    assert linked.status_code == 201, linked.text
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+
+    to_static = await client.post(
+        "/api/v1/ipam/addresses/bulk-edit",
+        headers=headers,
+        json={
+            "ip_ids": [plain.json()["id"]],
+            "changes": {"status": "static_dhcp"},
+        },
+    )
+    assert to_static.status_code == 200, to_static.text
+    assert to_static.json()["updated_count"] == 1
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert len(statics) == 2
+    assert {str(s.ip_address) for s in statics} == {"10.80.0.76", "10.80.0.77"}
+
+    to_allocated = await client.post(
+        "/api/v1/ipam/addresses/bulk-edit",
+        headers=headers,
+        json={
+            "ip_ids": [linked.json()["id"]],
+            "changes": {"status": "allocated"},
+        },
+    )
+    assert to_allocated.status_code == 200, to_allocated.text
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert len(statics) == 1
+    assert str(statics[0].ip_address) == "10.80.0.76"
+
+
+@pytest.mark.asyncio
+async def test_import_preview_linked_row_on_two_scope_subnet_matches_commit(
+    db_session: AsyncSession,
+) -> None:
+    """Walk finding: for a linked row on a two-scope subnet the
+    preview said "no reservation will be created" while commit
+    updated the linked reservation."""
+    user, headers = await _admin(db_session)
+    subnet = await _subnet(db_session)
+    await _scope(db_session, subnet)
+    subnet_id = subnet.id
+    await db_session.commit()
+
+    created = await _make_linked_row(db_session, headers, subnet_id)
+    # Second scope arrives after the reservation exists.
+    subnet = await db_session.get(Subnet, subnet_id)
+    await _scope(db_session, subnet)
+    await db_session.commit()
+
+    new_mac = "00:c0:8f:88:5f:99"
+    payload = ParsedPayload(
+        addresses=[
+            {
+                "address": created,
+                "hostname": "linked-two-scope",
+                "status": "static_dhcp",
+                "mac_address": new_mac,
+            }
+        ]
+    )
+    preview = await preview_address_import(
+        db_session, payload, subnet_id=subnet_id, strategy="overwrite"
+    )
+    assert len(preview.updates) == 1
+    details = preview.updates[0].details
+    assert details.get("dhcp_static_sync") is True, details
+    assert "dhcp_static_warning" not in details, details
+
+    result = await commit_address_import(
+        db_session, payload, current_user=user, subnet_id=subnet_id, strategy="overwrite"
+    )
+    await db_session.commit()
+    assert result.dhcp_synced == 1, result
+    assert result.dhcp_warnings == [], result
+    db_session.expire_all()
+    statics = await _statics(db_session)
+    assert len(statics) == 1
+    assert str(statics[0].mac_address) == new_mac
+
+
+async def _make_linked_row(
+    db_session: AsyncSession, headers: dict[str, str], subnet_id: uuid.UUID
+) -> str:
+    """Create a ``static_dhcp`` row through the service layer's own
+    fixture path: a row + linked reservation, via the sync itself."""
+    row = IPAddress(
+        subnet_id=subnet_id,
+        address="10.80.0.78",
+        status="static_dhcp",
+        hostname="linked-two-scope",
+        mac_address="00:c0:8f:88:5f:78",
+    )
+    db_session.add(row)
+    await db_session.flush()
+    from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+
+    sync = await sync_static_for_ipam_row(db_session, row)
+    assert sync.action == "create", sync
+    await db_session.commit()
+    return "10.80.0.78"

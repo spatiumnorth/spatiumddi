@@ -101,7 +101,19 @@ the formatter handles the rest.
   and the response / import result carries a `dhcp_static_warning`
   instead of silently skipping it; the import preview flags the
   same outcome. The frontend's chained `createStatic` calls are
-  gone.
+  gone. Follow-up from the QA walk (#1629): the sync now enforces
+  the acting user's `dhcp_static` permission (`write` to create
+  or update a reservation, `delete` to remove one — without it,
+  the warning above and no reservation change; GHSA-44ph);
+  bulk-edit runs the same per-row sync; an edit sending
+  `mac_address: null` on a `static_dhcp` row is a 422 instead of
+  quietly deleting its reservation; a save no longer overwrites
+  a reservation's description with the IPAM row's empty one; the
+  dialogs' dead DHCP Scope picker is removed; and the import
+  preview now matches commit for a linked row on a two-scope
+  subnet. **No backfill:** `static_dhcp` rows that predate this
+  sync get their reservation only when an operator re-saves the
+  row, or re-imports it with `overwrite`.
 
 - **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
   Hetzner retired the standalone DNS Console API, which now answers every

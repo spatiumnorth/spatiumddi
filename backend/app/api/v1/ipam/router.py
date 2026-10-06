@@ -7360,7 +7360,9 @@ async def create_address(
     # it never reaches the rendered Kea bundle. The server creates it here
     # (the frontend used to chain a second createStatic call to do this);
     # an ambiguous scope yields a warning on the response, not a guess.
-    dhcp_sync = await sync_static_for_ipam_row(db, ip, created_by_user_id=current_user.id)
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
 
     db.add(
         _audit(
@@ -7631,9 +7633,16 @@ async def update_address(
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
 
-    # MAC required if transitioning to static_dhcp
+    # MAC required if transitioning to static_dhcp. An explicit
+    # ``mac_address: null`` is a *clear*, not "unchanged" (#1629 walk):
+    # the Edit dialog sends null for a blanked MAC, and treating it as
+    # unchanged let the save through, deleted the linked reservation in
+    # the sync, and left the row at ``static_dhcp`` with no MAC.
     new_status = body.status or ip.status
-    new_mac = body.mac_address if body.mac_address is not None else ip.mac_address
+    if "mac_address" in body.model_fields_set:
+        new_mac = body.mac_address
+    else:
+        new_mac = ip.mac_address
     if new_status == "static_dhcp" and not new_mac:
         raise HTTPException(
             status_code=422,
@@ -7778,7 +7787,9 @@ async def update_address(
     # hostname change lands on the linked DHCPStaticAssignment, flipping
     # the row into ``static_dhcp`` creates one (sole matching scope only),
     # and flipping it away removes it. Ambiguity warns instead of guessing.
-    dhcp_sync = await sync_static_for_ipam_row(db, ip, created_by_user_id=current_user.id)
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
 
     db.add(
         _audit(
@@ -8974,7 +8985,9 @@ async def allocate_next_ip(
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     # #1628 — same server-side reservation sync as create_address.
-    dhcp_sync = await sync_static_for_ipam_row(db, ip, created_by_user_id=current_user.id)
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
 
     db.add(
         _audit(
@@ -9836,6 +9849,22 @@ async def bulk_edit_addresses(
                     new_value={**changes, "batch_id": str(batch_id)},
                 )
             )
+            # #1629 walk — bulk edit ran no reservation sync at all: rows
+            # bulk-set to ``static_dhcp`` got no reservation, and a linked
+            # row bulk-set away from it kept serving its reservation in
+            # Kea. Run the same per-row sync the single edit runs. The
+            # bulk response has no per-row warning field, so a sync
+            # warning (no grant / ambiguous scope / conflict) is logged
+            # with the address instead of surfaced.
+            dhcp_sync = await sync_static_for_ipam_row(
+                db, ip, created_by_user_id=current_user.id, user=current_user
+            )
+            if dhcp_sync.warning:
+                logger.warning(
+                    "ip_address_bulk_edit_dhcp_sync_warning",
+                    address=str(ip.address),
+                    warning=dhcp_sync.warning,
+                )
             updated += 1
 
     # Recompute utilization for every subnet whose status mix changed, plus
