@@ -1011,11 +1011,12 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     ``ValueError``.
 
     Secondary, stub and forward zones keep the kind they are given
-    (``forward`` when omitted, as before). IPAM's PTR lookup does not look at
-    the zone type, and those zones are not SpatiumDDI's to write into, so a
-    derived ``reverse`` would newly send PTR updates to a zone that refuses
-    them. Only one direction is enforced: kind "reverse" on a name outside
-    those trees is left to the operator, since IPAM never matches such a zone.
+    (``forward`` when omitted, as before). Those zones are not SpatiumDDI's to
+    write into, and IPAM writes no PTR into them whatever their kind (#1419):
+    the zone that owns a reverse name is the most specific one covering it, of
+    any type, and IPAM writes there only when it is a primary. Only one
+    direction is enforced: kind "reverse" on a name outside those trees is
+    left to the operator, since IPAM never matches such a zone.
     """
     if zone_type != "primary":
         return kind if kind is not None else "forward"
