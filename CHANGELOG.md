@@ -118,6 +118,16 @@ the formatter handles the rest.
   which told maintainers to run `make trivy IMAGE=gobgp`; the
   TRIVY_IMAGES spec is `looking-glass`.
 
+- **Edit webhook can remove a subscription's secret, and its hint says
+  what a blank field does (#1397).** The Rotate secret hint said
+  "clearing the field stores no secret (HMAC header omitted)", but the
+  field always opens empty and an empty field is sent as "keep", so
+  clearing it and leaving it alone sent the same request and the
+  console could not remove a secret at all. The dialog now offers
+  "Remove the stored secret" (deliveries then go unsigned, with no
+  `X-SpatiumDDI-Signature` header), and the hint says a blank field
+  keeps the secret and a typed one rotates it.
+
 - **The UniFi page says when SpatiumDDI writes to a controller
   (#1396).** It said "Read-only integration. … SpatiumDDI never writes
   to UniFi.", and its setup guide that SpatiumDDI "never writes back",
