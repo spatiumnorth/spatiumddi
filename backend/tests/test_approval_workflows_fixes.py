@@ -151,9 +151,14 @@ async def test_scoped_delegate_inline_delete_no_500(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     """A delegate the IPAM router gate admits via a scoped {delete,
-    address_set, <id>} grant (#103) can soft-delete inline — the factored
-    apply() must NOT run enforce_operation_permission (which would 403/500 a
-    delegate lacking the type-level {delete, subnet})."""
+    address_set, <id>} grant (#103) must get a clean 403 on a subnet delete,
+    never a 500 from the factored apply()'s permission re-check.
+
+    This used to assert 204: the inline soft-delete ran for a delegate with
+    no {delete, subnet} grant at all, which is the cross-type escalation
+    GHSA-6g57-4vj6-87mv closes. The per-type gate now refuses it before
+    apply() runs, so the 500 this test was written against can't occur
+    either."""
     await _enable_module(db_session, enabled=False)
     subnet = await _subnet(db_session)
     # ONLY an instance-scoped address_set delete grant — no {delete, subnet}.
@@ -170,11 +175,10 @@ async def test_scoped_delegate_inline_delete_no_500(
     )
 
     r = await client.delete(f"/api/v1/ipam/subnets/{subnet.id}", headers=_auth(token))
-    # Must not 500 (perm re-check) and must not 403 — the coarse gate admitted
-    # the delegate and the inline soft-delete runs.
-    assert r.status_code == 204, r.text
+    assert r.status_code == 403, r.text
+    assert "delete" in r.json()["detail"] and "subnet" in r.json()["detail"]
     await db_session.refresh(subnet)
-    assert subnet.deleted_at is not None
+    assert subnet.deleted_at is None
 
 
 # ── #8: apply() requires superadmin ALWAYS for zone / scope / group ────────────

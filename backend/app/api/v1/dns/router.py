@@ -1011,11 +1011,12 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     ``ValueError``.
 
     Secondary, stub and forward zones keep the kind they are given
-    (``forward`` when omitted, as before). IPAM's PTR lookup does not look at
-    the zone type, and those zones are not SpatiumDDI's to write into, so a
-    derived ``reverse`` would newly send PTR updates to a zone that refuses
-    them. Only one direction is enforced: kind "reverse" on a name outside
-    those trees is left to the operator, since IPAM never matches such a zone.
+    (``forward`` when omitted, as before). Those zones are not SpatiumDDI's to
+    write into, and IPAM writes no PTR into them whatever their kind (#1419):
+    the zone that owns a reverse name is the most specific one covering it, of
+    any type, and IPAM writes there only when it is a primary. Only one
+    direction is enforced: kind "reverse" on a name outside those trees is
+    left to the operator, since IPAM never matches such a zone.
     """
     if zone_type != "primary":
         return kind if kind is not None else "forward"
@@ -1746,6 +1747,11 @@ async def rotate_group_key(
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+    """Delete a DNS server group.
+
+    Refused (409) while the group holds servers or zones. Its zones already in
+    Trash are deleted with it, for good, with their records (#1399).
+    """
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
@@ -4706,7 +4712,7 @@ class PerServerZoneStateResponse(BaseModel):
     response_model=PerServerZoneStateResponse,
 )
 async def get_server_zone_state(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> PerServerZoneStateResponse:
     """Per-zone state from this server's perspective.
 
@@ -4721,9 +4727,12 @@ async def get_server_zone_state(
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
 
-    zones_res = await db.execute(
-        select(DNSZone).where(DNSZone.group_id == server.group_id).order_by(DNSZone.name)
-    )
+    zone_stmt = select(DNSZone).where(DNSZone.group_id == server.group_id)
+    # GHSA-46mq-mpwf-xxwv: a dns_zone-scoped token sees only its bound zones.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        zone_stmt = zone_stmt.where(DNSZone.id.in_(token_zone_ids))
+    zones_res = await db.execute(zone_stmt.order_by(DNSZone.name))
     zones = list(zones_res.scalars().all())
 
     state_res = await db.execute(
@@ -4801,7 +4810,7 @@ class PendingOpsResponse(BaseModel):
     response_model=PendingOpsResponse,
 )
 async def get_server_pending_ops(
-    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser, limit: int = 50
 ) -> PendingOpsResponse:
     """Pending / in-flight / recently-applied / failed record ops.
 
@@ -4816,18 +4825,32 @@ async def get_server_pending_ops(
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
 
+    op_filter = [DNSRecordOp.server_id == server_id]
+    # GHSA-46mq-mpwf-xxwv: a dns_zone-scoped token sees only its bound zones'
+    # ops. An op carries the zone's name, not its id, so map the bound ids to
+    # names within this server's group.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        bound_names = (
+            (
+                await db.execute(
+                    select(DNSZone.name).where(
+                        DNSZone.group_id == server.group_id, DNSZone.id.in_(token_zone_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        op_filter.append(DNSRecordOp.zone_name.in_(list(bound_names)))
+
     counts_res = await db.execute(
-        select(DNSRecordOp.state, func.count())
-        .where(DNSRecordOp.server_id == server_id)
-        .group_by(DNSRecordOp.state)
+        select(DNSRecordOp.state, func.count()).where(*op_filter).group_by(DNSRecordOp.state)
     )
     counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
 
     ops_res = await db.execute(
-        select(DNSRecordOp)
-        .where(DNSRecordOp.server_id == server_id)
-        .order_by(DNSRecordOp.created_at.desc())
-        .limit(limit)
+        select(DNSRecordOp).where(*op_filter).order_by(DNSRecordOp.created_at.desc()).limit(limit)
     )
     items = [
         PendingOpEntry(
@@ -5006,7 +5029,7 @@ async def update_zone(
     db: DB,
     current_user: SuperAdmin,
 ) -> ZoneResponse:
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
     changes = body.model_dump(exclude_none=True)
     # ``color`` is the one field on this schema where NULL is a meaningful
@@ -5316,9 +5339,9 @@ async def get_group_dynamic_update_caps(
     dependencies=[Depends(require_module("dns.dynamic_update_acl"))],
 )
 async def get_zone_update_acl(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> ZoneUpdateAclResponse:
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     driver_names = await _group_driver_names(db, group_id)
     caps = _effective_dynamic_update_caps(driver_names)
     entries = await _load_acl_out(db, zone.id)
@@ -5507,7 +5530,7 @@ async def replace_zone_update_acl(
     ``warnings``. Secrets never appear in the response — TSIG entries carry
     a ``tsig_key_name`` only.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
     driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
 
@@ -5925,7 +5948,7 @@ async def sign_zone_dnssec(
     ``dnssec_enabled`` flag flips synchronously so the UI reflects intent
     immediately.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "DNSSEC-sign")
     await _check_driver_gated_operation("dnssec_sign", group_id, db)
     zone.dnssec_enabled = True
@@ -5976,7 +5999,7 @@ async def unsign_zone_dnssec(
     pointing at the old DS record will see SERVFAIL on validating
     resolvers — this endpoint does NOT walk the parent zone for them.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
     await _flip_dnssec_off(db, zone)
     db.add(
@@ -6015,7 +6038,7 @@ async def rollover_zone_dnssec_key(
     op carrying the key tag; the agent runs the rollover and reports the new
     key set back on its next sync. The zone must already be signed.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "DNSSEC-rollover")
     if not zone.dnssec_enabled:
         raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
@@ -6671,7 +6694,7 @@ class GroupRecordResponse(BaseModel):
 async def list_group_records(
     group_id: uuid.UUID,
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     search: str | None = Query(
         None, description="substring over name / fqdn / value / type / zone"
     ),
@@ -6685,9 +6708,14 @@ async def list_group_records(
     """
     await _require_group(group_id, db)
 
-    zones = list(
-        (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars().all()
-    )
+    zone_stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    # GHSA-wr8j-6r46-pj7g: like list_zones, a dns_zone-scoped token sees only
+    # its bound zones' records, not every zone in the group. No-op (None) for
+    # sessions / unscoped / wildcard-grant tokens.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        zone_stmt = zone_stmt.where(DNSZone.id.in_(token_zone_ids))
+    zones = list((await db.execute(zone_stmt)).scalars().all())
     empty: Page[GroupRecordResponse] = Page(items=[], total=0, page=page, page_size=page_size)
     if not zones:
         return empty
@@ -7699,7 +7727,7 @@ async def import_zone_commit(
     Per-record changes are encoded in the ``new_value`` JSONB payload so
     per-record history is recoverable without generating N audit rows.
     """
-    zone = await _require_zone(group_id, zone_id, db)
+    zone = await _require_zone(group_id, zone_id, db, current_user)
     zone_name = _resolve_zone_name(body, zone)
 
     try:

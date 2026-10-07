@@ -26,10 +26,21 @@ spec:
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.api.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}
-      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      {{- $seccompType := include "spatiumddi.seccompProfileType" $ }}
+      {{- if or $seccompType .Values.api.applianceHostMounts.enabled }}
       securityContext:
+        {{- with $seccompType }}
         seccompProfile:
           type: {{ . }}
+        {{- end }}
+        {{- if .Values.api.applianceHostMounts.enabled }}
+        # GHSA-h2j9-qrg7-grfw — the host's release-state trigger directory
+        # is 1770 root:<hostGroupGid>, no longer world-writable, so the api
+        # (uid 1000) needs this gid to keep writing the slot-upgrade,
+        # rollback, reboot and maintenance triggers.
+        supplementalGroups:
+          - {{ .Values.api.applianceHostMounts.hostGroupGid }}
+        {{- end }}
       {{- end }}
       terminationGracePeriodSeconds: 30
       {{- if .Values.api.serviceAccount.enabled }}
