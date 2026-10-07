@@ -80,6 +80,7 @@ BOOTSTRAP_MANIFEST="{tmp_path}/spatium-bootstrap.yaml"
 ready=1
 date() {{ echo 2026-10-06T20:00:00+00:00; }}
 ip() {{ :; }}
+tighten_kubeconfig() {{ :; }}
 pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
