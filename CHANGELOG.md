@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Agent appliances keep their own kube API when the control plane
+  grows to two members (#1508).** The firewall renderer retired the
+  baked 6443 bootstrap sentinel on every node once the fleet's
+  control plane had two or more members. An agent appliance runs its
+  own single-node k3s and gets no scoped `kubeapi` rule, so that
+  sentinel was its pods' only path to their own API: promoting the
+  second control-plane node cut every agent off, and DNS / DHCP pods
+  on the agents stopped starting. The retire now applies only to a
+  node that is itself a control-plane member, in all three renderers.
+  **An agent already in this state does not heal on its own:** its
+  supervisor can no longer read cluster membership, so the #593
+  self-partition guard refuses the corrected ruleset. On each
+  affected agent, once:
+  `sudo mv /etc/nftables.d/00-spatium-k3s-bootstrap.nft.retired /etc/nftables.d/00-spatium-k3s-bootstrap.nft && sudo nft -f /etc/nftables.conf`.
+  The next heartbeat then applies the corrected body, which keeps the
+  sentinel.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —

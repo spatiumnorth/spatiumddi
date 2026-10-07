@@ -141,6 +141,15 @@ def test_bootstrap_directive_retire_multinode() -> None:
     assert "# spatium-bootstrap: keep" not in p.body
 
 
+
+def test_bootstrap_directive_keep_on_agent_in_multinode_fleet() -> None:
+    # #1508 — an agent appliance (no peers, no pod/service CIDRs) keeps the
+    # sentinel even when the fleet's control plane is multi-node: it has no
+    # scoped kubeapi rule, so the sentinel is its pods' path to 6443.
+    p = render_drop_in({"roles": ["dns-bind9", "dhcp"]}, [], cp_member_count=3)
+    assert "# spatium-bootstrap: keep" in p.body
+    assert "# spatium-bootstrap: retire" not in p.body
+
 # ── IPv6 family split (the v6 lockout fix) ───────────────────────────
 
 

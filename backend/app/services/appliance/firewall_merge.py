@@ -549,7 +549,12 @@ def compile_firewall_from_policies(
     lines.append("# for the operator-override surface that lands at the end of this file.")
     lines.append(f"# profile: {ctx.profile}")
     lines.append(f"# roles: {','.join(ctx.roles) if ctx.roles else '(idle)'}")
-    bootstrap_action = "retire" if ctx.cp_member_count >= 2 else "keep"
+    # #1508 — only a node that is itself in the multi-node control plane
+    # (``is_cp``) retires it. An agent appliance runs its own single-node
+    # k3s and gets no scoped kubeapi rule, so the sentinel is its pods' only
+    # path to their own 6443; retiring it there cut the agents off their
+    # own API the moment the fleet's control plane reached two members.
+    bootstrap_action = "retire" if ctx.cp_member_count >= 2 and ctx.is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — retire the baked Web-UI sentinel (00-spatium-webui.nft) once a
     # source scope is configured; its unconditional accept sorts earlier in

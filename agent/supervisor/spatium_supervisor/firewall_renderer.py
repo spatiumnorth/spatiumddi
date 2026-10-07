@@ -290,7 +290,9 @@ def render_drop_in(
     The header carries a ``# spatium-bootstrap: retire|keep`` directive
     the host-side reload runner reads to retire the baked 6443 bootstrap
     sentinel once the cluster is genuinely multi-node (#285 Phase 1b —
-    6443 then narrows to the scoped ``kubeapi`` rule below).
+    6443 then narrows to the scoped ``kubeapi`` rule below), and only on a
+    node that is itself a control-plane member (#1508: an agent appliance
+    keeps it, since it has no scoped ``kubeapi`` rule to fall back on).
 
     Every fragment is a bare ``proto dport N accept`` (or
     ``ip[6] saddr { ... } …``) since the include glob sits *inside*
@@ -335,7 +337,12 @@ def render_drop_in(
     # keep it (etcd is loopback-only; 6443 must stay LAN-reachable for the
     # node's own pods + a first promote/join). The runner restores a
     # retired sentinel if the cluster ever shrinks back to single-node.
-    bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
+    # #1508 — only a node that is itself in the multi-node control plane
+    # (``is_cp``) retires it. An agent appliance runs its own single-node
+    # k3s and gets no scoped kubeapi rule, so the sentinel is its pods' only
+    # path to their own 6443; retiring it there cut the agents off their
+    # own API the moment the fleet's control plane reached two members.
+    bootstrap_action = "retire" if cp_member_count >= 2 and is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — host-runner directive for the baked Web-UI sentinel
     # (00-spatium-webui.nft), which opens 80/443 from first boot so the

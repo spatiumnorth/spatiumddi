@@ -251,6 +251,36 @@ async def test_bundle_multinode_retire_directive(db_session) -> None:
     assert "# spatium-bootstrap: retire" in multi["firewall_conf"]
 
 
+def test_agent_keeps_bootstrap_sentinel_in_a_multinode_fleet_all_renderers() -> None:
+    """#1508 — the retire is for control-plane members only.
+
+    An agent appliance runs its own single-node k3s: no peers, no pod or
+    service CIDRs, so no scoped ``kubeapi`` rule. The bootstrap sentinel is
+    its pods' only path to their own 6443. Keyed on the fleet-wide
+    ``cp_member_count`` alone, every renderer retired it the moment the
+    control plane reached two members, and the agents lost their own API.
+    """
+    sup = _load_supervisor_renderer()
+    agent = {"role_assignment": {"roles": ["dns-bind9", "dhcp"]}, "cp_member_count": 3}
+    member = {
+        "role_assignment": {"roles": []},
+        "cluster_peer_cidrs": ["192.168.0.2/32"],
+        "pod_cidrs": ["10.42.0.0/16"],
+        "cp_member_count": 3,
+    }
+    renderers = [
+        lambda c: _call(compile_firewall_body, c),
+        _call_merge,
+    ]
+    if sup is not None:
+        renderers.append(lambda c: _call(sup.render_drop_in, c).body)
+    for render in renderers:
+        agent_body = render(agent)
+        assert "# spatium-bootstrap: keep" in agent_body
+        assert "# spatium-bootstrap: retire" not in agent_body
+        assert "# spatium-bootstrap: retire" in render(member)
+
+
 def test_web_ui_default_open_all_renderers() -> None:
     # #285 Phase 6 — with no scope set, EVERY renderer must emit the un-scoped
     # `tcp dport { 80, 443 } accept` (the base /etc/nftables.conf no longer
