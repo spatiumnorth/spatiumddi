@@ -1,0 +1,23 @@
+[Unit]
+Description=Re-publish the k3s join token whenever k3s writes it (#1509)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/1509
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# The boot-time run of spatiumddi-publish-k3s-token.service polls for the
+# token for 60 s only. On a fresh seed k3s's first start (firstboot, the
+# air-gap image import, Restart=always restarts) can take longer, and the
+# token then landed after the window with nothing left to publish it, so a
+# promote 409'd until the seed was rebooted. PathChanged fires on
+# close-after-write and on a rename into place, so the token is published
+# the moment k3s writes it, and again if it ever changes. systemd watches
+# the nearest existing parent until /var/lib/rancher/k3s/server exists.
+#
+# Deliberately not PathExists=: that is level-triggered and would restart
+# the oneshot every time it finishes while the file exists, until the
+# start limit trips and takes the unit down (the #999 lesson).
+PathChanged=/var/lib/rancher/k3s/server/token
+Unit=spatiumddi-publish-k3s-token.service
+
+[Install]
+WantedBy=multi-user.target

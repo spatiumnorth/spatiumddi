@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Promoting a second control-plane node no longer fails with 409 on a
+  fresh seed (#1509).** `spatiumddi-publish-k3s-token.service` copies
+  the k3s join token to the sidecar the supervisor reports, but ran
+  only once at boot and polled for the token for 60 s. On a fresh seed
+  k3s's first start (firstboot, the air-gap image import, its own
+  restarts) could take longer, the token landed after the window, and
+  nothing published it until a reboot, so the promote kept answering
+  "the control-plane seed hasn't reported its k3s join token". A new
+  `spatiumddi-publish-k3s-token.path` unit re-runs the service whenever
+  k3s writes the token, and again if it ever changes. On an affected
+  seed, `systemctl start spatiumddi-publish-k3s-token` (or a reboot)
+  publishes the token today.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —

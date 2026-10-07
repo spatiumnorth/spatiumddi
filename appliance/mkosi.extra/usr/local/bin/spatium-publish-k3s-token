@@ -10,10 +10,13 @@
 # heartbeat; the control plane's promote endpoint reads the primary's
 # token to hand to joiners.
 #
-# Runs After=k3s.service on every boot. The token is created by k3s
-# during server init, which can lag the service start, so we poll for
-# it briefly. Every k3s server in the cluster shares the same join
-# token, so publishing on each node is correct + harmless.
+# Runs After=k3s.service on every boot, and again whenever k3s writes the
+# token (spatiumddi-publish-k3s-token.path, #1509). The token is created by
+# k3s during server init, which can lag the service start, so the boot run
+# polls for it briefly; a token that lands after that window is published
+# by the .path unit instead of waiting for the next reboot. Every k3s
+# server in the cluster shares the same join token, so publishing on each
+# node is correct + harmless.
 set -uo pipefail
 
 TOKEN_FILE=/var/lib/rancher/k3s/server/token

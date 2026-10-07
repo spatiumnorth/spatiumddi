@@ -50,6 +50,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-cluster-restore.path \
             spatiumddi-etcd-evict.path \
             spatiumddi-publish-k3s-token.service \
+            spatiumddi-publish-k3s-token.path \
             k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
@@ -383,6 +384,7 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-evict"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.path"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user
