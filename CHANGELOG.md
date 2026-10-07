@@ -993,6 +993,21 @@ the formatter handles the rest.
 
 ### Security
 
+- **A failed backup run's audit row no longer carries the destination's
+  error text (#1617).** The `backup_target_run_failed` row is forwarded
+  as-is, to syslog, webhook and SMTP forward targets and as the
+  `system.backup_failed` event, and a driver's error text routinely names
+  where the backups live: the NFS server and export, the SMB share, the S3
+  bucket, the SCP host and path. `new_value.error` is gone; the row carries
+  a fixed `failure_category` instead (`unreachable`, `timeout`,
+  `permission_denied`, `auth_failed`, `no_space`, `not_found`,
+  `config_invalid`, `retention_locked`, `secret_unreadable`,
+  `archive_error`, `destination_error`, `unexpected`, and `run_died` for a
+  run the stale-run reaper stamped). The full text is unchanged on the
+  target (`last_run_error`, superadmin-only) and in the row's
+  `error_detail`, which no forwarder emits. A consumer that parsed
+  `new_value.error` should switch to `failure_category`.
+
 - **A cleared or replaced webhook secret no longer lives on in its
   old plaintext column, and a collector echoing part of a secret no
   longer leaks it into the log (GHSA-g9gv-9qp2-3qwm,
