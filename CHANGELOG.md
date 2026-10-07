@@ -25,7 +25,50 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **Alerts when a scheduled backup fails or stops running, on by
+  default (#1262).** A failed scheduled backup used to write an audit
+  row and nothing else, so on a default install a nightly backup could
+  fail for weeks unnoticed. Two new rules, seeded enabled, watch every
+  enabled backup target with a schedule. `backup_failed` (warning)
+  fires when the last finished run failed and resolves on the next
+  success. `backup_stale` (critical) fires when there has been no
+  successful run for N scheduled runs plus one hour (N on the rule,
+  default 2), counted from the last success but never from before the
+  schedule was set. It also catches a backup that stopped running at
+  all, including a run left `in_progress` by a dead process, which the
+  sweep skips from then on. A run in progress holds both events
+  instead of resolving them. Alert messages carry no destination
+  details or error text. New read-only copilot tool `get_backup_health`
+  (superadmin only) shows the same per-target state.
+
 ### Changed
+
+- **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
+  vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
+  go.mod pins the x/net, x/text and grpc versions the Looking Glass
+  Dockerfile used to force with `go get` overrides, so the overrides
+  are dropped and the build takes upstream's pins as-is. The
+  swagger-ui-dist files behind `/api/docs` were re-vendored
+  byte-for-byte from the 5.33.1 npm tarball.
+
+- **DHCP agent Services default to LoadBalancer, and a NodePort can
+  finally be pinned (#1549).** The DHCP agent Service defaulted to
+  `type: NodePort` with `port: 67` and no way to set `nodePort`, so
+  Kubernetes picked a random 30000–32767 node port — and a DHCP relay
+  (`ip helper-address`), which can only forward to UDP/67, got no
+  answer. The chart default is now `LoadBalancer`, so a relay points
+  at the LB address on UDP/67; `service.nodePort` is rendered when
+  set, giving a stable port for a relay that can forward to a
+  non-standard port (most, including `ip helper-address`, cannot);
+  and the chart, the
+  static `k8s/dhcp/` Service (now also LoadBalancer), and the docs
+  all say plainly that on a NodePort Service `port: 67` is the
+  in-cluster port, not the node-facing one. `hostNetwork: true`
+  remains the no-relay option. Existing installs that relied on the
+  NodePort default must set `service.type: NodePort` explicitly to
+  keep it.
 
 - **The weekly image scan also reports fixable MEDIUM and LOW findings,
   as an advisory (#1392).** The scheduled Trivy scan, like every gate,
@@ -57,6 +100,572 @@ the formatter handles the rest.
   next request. A supervisor too old to report its boot gets the request
   exactly once. Migration `199eb1562927`.
 
+- **A large blocklist feed no longer OOM-kills the worker, once an hour,
+  forever (#1466).** The feed refresh loaded every existing entry as an
+  ORM object and added one tracked object per new domain. On the
+  catalog's Hagezi Gambling feed (~578k domains) that peaked at about
+  2 GiB above baseline, over the worker's 1.4 GiB limit, so the list
+  never synced and every attempt killed a worker. Because the task was
+  acked late and requeued on worker loss, the killed refresh went back
+  to the broker and took down the next worker after the visibility
+  timeout, along with whatever that worker was running. The refresh now
+  diffs on domain columns and writes in batches of plain INSERT / DELETE
+  statements (about 135 MiB for the same feed), and the task is acked on
+  receipt, so a refresh that does take its worker down is lost rather
+  than redelivered. Also fixed on the way: a feed listing a domain the
+  operator had already added by hand failed the whole refresh on the
+  list's unique constraint; the manual entry is now kept and the feed's
+  copy skipped.
+
+- **An agent appliance keeps access to its own Kubernetes API once the
+  control plane is multi-node (#1508).** The firewall renderers retired the
+  6443 bootstrap sentinel on every node as soon as the fleet's control plane
+  had two members. An agent appliance runs its own single-node k3s and gets
+  no scoped `kubeapi` rule, so its pods (supervisor, DNS, DHCP) lost their
+  own API, and the self-partition guard then refused every corrected rule
+  set. The sentinel is now retired only on a control-plane member; agents
+  keep it. **Recovery for an agent already cut off on 2026.10.02-1** (it does
+  not heal by itself, because the guard can't read membership while the API
+  is blocked): on the agent, run
+  `mv /etc/nftables.d/00-spatium-k3s-bootstrap.nft.retired /etc/nftables.d/00-spatium-k3s-bootstrap.nft`
+  and `nft -f /etc/nftables.conf` once, after the control plane runs this
+  release. The next heartbeat then applies a rule set that keeps it. A
+  `firewall_extra` 6443 rule added as a workaround can be removed afterwards.
+
+- **The Teams webhook flavor sends an Adaptive Card for a Workflows
+  webhook (#1504).** It posted a legacy Office 365 `MessageCard`, and
+  the form asked for a `…webhook.office.com/webhookb2/…` URL, but
+  Microsoft retired that "Incoming Webhook" connector in May 2026, so
+  nothing reached the channel. A `teams` target now sends an Adaptive
+  Card 1.4 in the `{"type": "message", "attachments": […]}` envelope
+  the Workflows webhooks document (*Send webhook alerts to a channel*,
+  *When a Teams webhook request is received*); severity colours the
+  title, and a long digest is cut to stay under Teams' 28 KB message
+  limit. The form's label, placeholder and help text, and
+  OBSERVABILITY.md §5.1, now point at Workflows. The flavor value stays
+  `teams`, no migration. **An existing Teams target still on a
+  `webhook.office.com` URL needs a new Workflows URL**; a flow built
+  around the old MessageCard body must read `attachments` instead.
+  Note that a Workflows webhook answers 202 before the flow runs, so
+  **Test** succeeding does not prove the card was posted; the flow's
+  run history does.
+
+- **ACME DNS-01 puts the challenge into the public zone when an
+  internal split-horizon subzone also covers the name (#1454).** The
+  challenge zone was picked by longest suffix over every primary zone,
+  so an internal-only `home.example.com` won over the public
+  `example.com` and a public CA could never see the TXT. Zones in an
+  `external` group or served by a cloud DNS driver now go first;
+  internal zones are only used when nothing public covers the name.
+  `/preview` notes when an internal zone was skipped, and shows
+  `_acme-challenge.example.com` for `*.example.com` instead of
+  `_acme-challenge.*.example.com`.
+
+- **Feed-backed blocklists refresh on their update interval (#1467).**
+  `update_interval_hours` was stored and shown but never read, so a URL
+  list was fetched once and then only on a manual Refresh; lists created
+  through `POST /dns/blocklists` (not the catalog) weren't fetched at all.
+  A new hourly beat sweep (`dns-blocklist-refresh`) queues
+  `refresh_blocklist_feed` for every enabled URL list whose last sync is
+  at least `update_interval_hours` old, never-synced lists first, queued a
+  minute apart and at most 55 per sweep, so none is queued twice before it
+  has run. `0` stays manual-only. A failed fetch counts as a sync, so
+  a broken feed is retried once per interval; Refresh still retries at
+  once. The API now refuses an interval below 0 or above 8760 (422).
+
+- **A cloud or Windows DNS import no longer pushes the imported records
+  back to the server it read them from (#1456).** Importing a Cloudflare
+  account (or a Windows DNS server) into the group that holds that server
+  enqueued a `create` op per imported record, which the agentless path
+  applies at once: one create call per record to the provider the records
+  had just been read from. Cloudflare refused them as duplicates, leaving
+  a `failed` op per record; a provider that accepts duplicates would have
+  stored them twice. The preview now carries the server it pulled from
+  (`source_server_id`), and the commit skips the record ops when that
+  server is the zone's primary. A zone renamed on the way in, an import
+  into another provider's group, and records created after the import
+  still go out as before. The commit refuses a `source_server_id` that
+  isn't a server of the plan's own source. Failed ops left by an earlier
+  import are not cleaned up.
+
+- **Kubernetes, Docker, Tailscale, NetBird and Cloud syncs no longer fail
+  on an address another integration already mirrors (#1677).** Same gap
+  as Proxmox in #1622: the reconciler logged "owned by another
+  integration; not claiming" and then inserted its own row at that
+  address anyway, or moved one of its rows onto it. That hit
+  `uq_ip_address_subnet_address`, and nothing from that cluster, host,
+  tenant or endpoint synced, with no `last_sync_error`. A Kubernetes node
+  whose LAN address UniFi, OPNsense or Proxmox already mirrors was enough.
+  These mirrors now leave such an address to its owner and sync the rest.
+  The Kubernetes, Docker, Tailscale, NetBird and UniFi sweeps also roll
+  back after a failed target now, and no integration sweep reads the
+  target's name off the expired row any more: a failed flush used to end
+  the whole sweep with `PendingRollbackError`, so every target after the
+  broken one was skipped too.
+
+- **Cluster health reads the database from CNPG, not a pod count (#1387).**
+  A pod count cannot see how many instances CNPG wants: a replica join that
+  failed for good leaves only `Failed` Job pods, which are skipped, so a
+  cluster wanting three instances read 2/2 healthy indefinitely, and during
+  first bootstrap, before any instance pod exists, there was no database row
+  at all. The database row now reads the CNPG Cluster's `readyInstances` of
+  `spec.instances` (the check the rolling upgrade already makes), so those
+  read 2/3 degraded and 0/3 down. The Cluster is found from the
+  `cnpg.io/cluster` label on its pods. When it cannot be read (a 403, a
+  non-CNPG install) the pod count stands, and the row's new `source` field
+  (`cnpg` / `pods`) and its tooltip say which.
+
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
+- **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
+  as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
+  when the hostname already holds a CNAME, but the PTR was still written,
+  naming the alias: a reverse lookup led forward to the CNAME's target
+  instead of back to the address (RFC 1912 section 2.4 asks a PTR to name an
+  A record). The PTR is now skipped too, and one an address had before
+  being renamed onto the CNAME's name is retracted. Such a sync now reports
+  that it published nothing, so the DDNS path logs `ddns_skipped_cname`
+  rather than `ddns_applied`, and `ipam_dns_record_skipped_cname` is logged
+  at warning once per address, hostname and zone instead of on every lease
+  renewal.
+
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **At upgrade a timer
+  changes on the wire only where someone set it:** each timer still at
+  its old stored default (refresh 86400, retry 7200, expire 3600000,
+  minimum 3600, none of them ever served) is set to the value it serves
+  today (3600, 600, 86400, 300) by migration `ff32b91acad8`, and new
+  zones default to those values too, keeping the 5-minute negative TTL
+  a DDNS-driven estate relies on. A zone with an edited timer starts
+  serving it, under a new serial so its secondaries transfer it, and
+  reloads once. **A group switches to the zones' own timers only once
+  every BIND9 agent in it renders them:** until then, through an upgrade
+  (on a cluster, until its last DNS pod is replaced) or while an agent of
+  an older release stays in the group, it keeps serving
+  `3600 600 86400 300`, and the edited zones' serials move at the switch.
+  So no serial is ever served with two different SOAs, and no DNS change
+  is held back meanwhile. The zone API refuses a timer outside 0 to
+  2147483647, and a stored one BIND would refuse is served as before and
+  logged rather than taking the zone down. PowerDNS and Technitium
+  manage their own SOA and are unchanged.
+
+- **Imported `static_dhcp` IPAM records now get their Kea
+  reservation without a manual re-save (#1628).** Only the UI ever
+  created the DHCP reservation behind a reservation-style IPAM row —
+  the browser chained a second `createStatic` call after saving the
+  address — so rows created through the API or the address importer
+  sat in IPAM with a MAC but no `DHCPStaticAssignment`, and never
+  reached the rendered Kea bundle until each was opened and saved
+  by hand. The reservation is now synced server-side
+  (`sync_static_for_ipam_row`) whenever an IPAM row is created,
+  updated, allocated or imported at `status="static_dhcp"` with a
+  MAC: created on the subnet's sole matching scope, updated in
+  place, and removed when the row stops being a reservation. When
+  no reservation can be mirrored (no scope, several candidate
+  scopes, or a conflicting reservation) the write still succeeds
+  and the response / import result carries a `dhcp_static_warning`
+  instead of silently skipping it; the import preview flags the
+  same outcome. The frontend's chained `createStatic` calls are
+  gone. Follow-up from the QA walk (#1629): the sync now enforces
+  the acting user's `dhcp_static` permission (`write` to create
+  or update a reservation, `delete` to remove one — without it,
+  the warning above and no reservation change; GHSA-44ph);
+  bulk-edit runs the same per-row sync; an edit sending
+  `mac_address: null` on a `static_dhcp` row is a 422 instead of
+  quietly deleting its reservation; a save no longer overwrites
+  a reservation's description with the IPAM row's empty one; the
+  dialogs' dead DHCP Scope picker is removed; and the import
+  preview now matches commit for a linked row on a two-scope
+  subnet. **No backfill:** `static_dhcp` rows that predate this
+  sync get their reservation only when an operator re-saves the
+  row, or re-imports it with `overwrite`.
+
+- **A Technitium blocklist no longer delays zone changes by half an hour
+  (#1425).** On every structural apply (a zone created, deleted or
+  converted) the agent flushed Technitium's blocked set and re-added it
+  one `blocked/add` call per domain. Each of those calls rewrites
+  Technitium's zone file, so the cost grew roughly quadratically: a 16k
+  entry list took about 30 minutes per apply on a small node, during
+  which the new zones were not answered and nothing was blocked. The
+  agent now reads the live set with `blocked/export` and leaves it alone
+  when it already matches, which is the case for every structural apply
+  that did not change a blocklist. When it differs, the set is flushed
+  and written with `blocked/import`, 5,000 names per call, so a
+  16k-entry list takes a few seconds. The allowed set is handled the
+  same way. Reported by @stefanriegel.
+
+- **Cloud DNS servers no longer show unreachable while they work
+  (#1455).** The DNS health task asks a driver for `health_check()` and
+  otherwise sends a SOA query to the server's host and port. No driver
+  had one, so a Cloudflare server was probed as the host `cloudflare` on
+  port 443, which can never answer, and every cloud server (Cloudflare,
+  Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode,
+  Vultr) sat at `unreachable` while its zone list, imports and record
+  pulls succeeded. `CloudDNSDriverBase` now implements `health_check()`
+  on top of the existing credential `probe()`, so health is measured
+  against the provider API the control plane actually drives, and a
+  failure carries the provider's message into the `dns_health_checked`
+  log line. `technitium_api` inherits the same hook and is checked
+  through its HTTP API instead of a SOA query. A test pins the hook on
+  every credentialed agentless driver, so a new provider cannot fall
+  back to the SOA probe.
+
+- **Upgrading an appliance from 2026.09.04-1 can no longer replace
+  SECRET_KEY (#1448).** #1042 marked the chart's
+  `spatium-control-spatiumddi-app` Secret `helm.sh/resource-policy: keep`,
+  but Helm takes that policy from the release manifest it has stored, and
+  on the first upgrade from 2026.09.04-1 the stored manifest is
+  2026.09.04-1's, which has none. So if the new slot's first
+  `spatium-control` install failed for any reason, helm-controller's
+  uninstall deleted the Secret and the reinstall generated a new key, and
+  every credential encrypted at rest (the appliance CA key, certificates,
+  integration and SSO secrets) could no longer be read. firstboot now
+  copies `secret-key` and `metrics-token` into `spatium-control-app-keys`,
+  a Secret Helm does not own, before it releases the control chart, and
+  points the chart at it with `auth.existingSecret`; a fresh install
+  generates both values there. An existing `spatium-control-app-keys` is
+  never overwritten, and firstboot refuses to generate a key while the
+  chart's own Secret exists without one. When it cannot make sure the
+  Secret exists (the apiserver does not answer, or k3s never became
+  ready), the chart is released without `auth.existingSecret` and keeps
+  its own Secret as before, and firstboot tries again on the next boot.
+  One limit: an appliance upgraded straight from 2026.09.04-1 loses the
+  chart's own Secret on that upgrade (the stored manifest does not keep
+  it), so rolling it back to 2026.10.02-1 afterwards generates a new key.
+  Back up the Secret before such an upgrade, as the 2026.10.02-1 notes
+  already say, and back up `spatium-control-app-keys` from then on
+  (`docs/deployment/APPLIANCE.md`).
+
+- **The Hetzner DNS driver talks to the Hetzner Cloud API (#1376).**
+  Hetzner retired the standalone DNS Console API, which now answers every
+  call with a `301` redirect to the Cloud Console's web UI, so the driver
+  failed every probe, import and write with a bare "Hetzner API error:
+  HTTP 301" and no zone could be managed. It now drives
+  `api.hetzner.cloud/v1` with a Cloud **project** token
+  (`Authorization: Bearer`, Read & Write to apply changes). A token from
+  the old DNS Console does not work, so an existing Hetzner server needs
+  its token replaced. The Cloud API is RRset-oriented, so an op carrying
+  the resolved set (#783) is one `set_records` write and replaying it
+  converges; the per-value fallback uses `add_records` /
+  `remove_records` against the live set. Writes are asynchronous actions
+  and are now awaited, so a change the API rejects after accepting it is
+  reported as failed rather than applied. Action polling backs off from
+  1 s to 5 s to stay inside the API's 3600 requests per hour per project,
+  a write refused because another action is running on the zone is
+  retried, and hitting the rate limit says when it resets. TXT values are
+  quoted on write (split into strings of at most 255 bytes) and joined on
+  read, hostname targets are absolutised, and
+  secondary-mode zones (transferred from your own primaries) are no longer
+  offered for import, since they have no RRsets to manage. A redirect is
+  reported as such instead of as "HTTP 301". Contributed by
+  @containerguy.
+
+- **The looking-glass image reports its GoBGP version again
+  (follow-up to #1625).** `/etc/spatiumddi-versions` in the
+  gobgp image wrote `gobgp=` empty: `GOBGP_VERSION` is a global
+  build arg, and Docker only makes it available in a stage that
+  re-declares it — the runtime stage did not (pre-existing on
+  4.9.0 too). The runtime stage now re-declares `ARG
+  GOBGP_VERSION`. Also fixes the gobgp note in `versions.json`,
+  which told maintainers to run `make trivy IMAGE=gobgp`; the
+  TRIVY_IMAGES spec is `looking-glass`.
+
+- **IPAM's delete confirmations say the delete goes to Trash (#1398).**
+  #1152 fixed Edit subnet's Danger zone, but every other space, block
+  and subnet delete still called itself permanent: the tree's Delete…
+  and both bulk deletes ended on "Confirm Permanent Deletion — This
+  action cannot be undone — Delete permanently", the block view said
+  "Blocks are not restorable from Trash", and Edit Space and Edit Block
+  said the delete "permanently removes every … row" behind "a typed
+  confirm" that is a checkbox. All of these deletes go to Trash and
+  come back intact on restore. Each now says the object and what it
+  holds move to Trash, restorable for 30 days, after which the nightly
+  purge deletes them for good; "permanent" stays on the IP address
+  purges, the one IPAM delete that is.
+
+- **Edit webhook can remove a subscription's secret, and its hint says
+  what a blank field does (#1397).** The Rotate secret hint said
+  "clearing the field stores no secret (HMAC header omitted)", but the
+  field always opens empty and an empty field is sent as "keep", so
+  clearing it and leaving it alone sent the same request and the
+  console could not remove a secret at all. The dialog now offers
+  "Remove the stored secret" (deliveries then go unsigned, with no
+  `X-SpatiumDDI-Signature` header), and the hint says a blank field
+  keeps the secret and a typed one rotates it.
+
+- **The UniFi page says when SpatiumDDI writes to a controller
+  (#1396).** It said "Read-only integration. … SpatiumDDI never writes
+  to UniFi.", and its setup guide that SpatiumDDI "never writes back",
+  while the controllers it lists are also Active block sync's targets:
+  an armed one is pushed client blocks (L2 quarantine), with its own
+  write credentials. The page now says the mirror only reads and that
+  SpatiumDDI writes to a controller only when block sync is armed on
+  it; the setup guide's read-only advice is for the mirror's key.
+
+- **Console copy sends operators only to places that exist (#1395).**
+  Feature descriptions, AI tool descriptions, alert texts, API errors
+  and several notices told operators to turn things on under "Settings
+  → …" places the Settings page does not have: "Settings →
+  firewall_enabled", "Settings → acme_enabled", "Settings →
+  dnsbl_monitoring_enabled", "Settings → Import → DNS surface",
+  "Settings → AI → Tool Catalog", "Settings → Features", "Settings →
+  Backup", "Settings → Appliance → SNMP". Each now names where the
+  control is (Features & Integrations, Administration → Import,
+  Administration → AI Tool Catalog, Administration → DNS Blocklists,
+  Administration → Backup, Administration → API Tokens, Appliance →
+  Firewall, Appliance → Fleet), says that ACME is switched on by
+  registering an account, and says so plainly where the console has no
+  control at all (BGP monitoring, a provider's tool allowlist). A
+  frontend and a backend test hold every "Settings → …" path in the
+  console's and the API's copy against the Settings page's sections.
+
+- **A role's dialog shows the grants the role holds (#1394).** Roles →
+  View is the only place the console shows what a built-in role grants,
+  and it showed each grant through two selects offering fixed lists: a
+  stored action or resource type the lists did not name fell back to
+  their first option. Appliance Operator's one grant, admin on
+  appliance, read "admin · *", Change Approver showed no approve at
+  all, and nine of the twelve built-in roles read broader or different
+  grants than they hold. A custom role's Edit dialog showed the same
+  wrong values. Each select now also offers the value its row holds, so
+  every grant shows as stored.
+
+- **Delete Server Group no longer takes a group's live DHCP scopes with
+  it, and says what it does take (#1399).** The DHCP page's Delete
+  Server Group said "The group must be empty — move or delete its
+  servers first", but the server refused a group only while it held
+  servers: a group holding scopes was deleted, and every scope with its
+  pools and reservations went with it, none of them into Trash. A group
+  that still holds a scope is now refused (409) until its scopes are
+  deleted, by the API, the two-person approval queue and the Copilot
+  alike. The DHCP and DNS dialogs read what the group holds first:
+  while it holds servers or live scopes (zones), they say so and offer
+  no delete, so the console never sends one the server will refuse.
+  Scopes already in Trash still go with their group, for good: the
+  dialog and the approval preview say so, and the DNS dialog now says
+  the same of a group's zones in Trash, where it promised an empty
+  group too.
+
+- **A full restore no longer fails at random with "deadlock detected" while
+  the appliance is serving (#1444).** A full restore ends every other
+  database session once, then clears the schema and replays the archive in
+  one transaction (#1363), dropping the tables one at a time and holding
+  each lock to commit. The api, the worker and the agents reconnect at
+  once. A session that read a table the drops had not reached yet, and then
+  waited for one they had already dropped, closed a cycle when the drops
+  reached its table. When PostgreSQL rolled back the restore's side, the
+  restore answered 400 "deadlock detected" and restored nothing (3 of 50 QA
+  restores). Before it clears the schema, the restore now ends its own
+  role's sessions that came back and hold a table, then takes every table
+  in one `LOCK TABLE`, and tries again if a deadlock picks that attempt, so
+  the drops wait for nobody.
+
+- **IPAM writes PTRs only into a reverse zone it serves as primary
+  (#1419).** IPAM picked the zone for a PTR by kind and name alone, so a
+  conditional forwarder, a secondary or a stub named under in-addr.arpa or
+  ip6.arpa and stored as reverse (the importers store every such zone that
+  way, and so does an operator who picks Reverse lookup for one) took
+  IPAM's PTR records for the gateway and every host, and the record
+  updates went to a zone that cannot take them. The drift check found the
+  same zone and showed the subnet in sync, and the reverse-zone backfill
+  reported such a zone as created. The zone that owns an address's
+  reverse name is now the most specific zone covering it, whatever its
+  type: IPAM writes the PTR there only when that zone is a primary;
+  otherwise it writes none and queues nothing, and the drift check
+  expects none. A PTR an earlier release wrote into such a zone is
+  dropped, with no update sent, the next time IPAM syncs or deletes the
+  address.
+
+- **IPAM writes forward records only into a zone it serves as primary
+  (#1633).** A subnet could be bound to a conditional forwarder, a
+  secondary or a stub as its DNS zone, and an address could pick one as
+  its own zone or list one in its extra zones. IPAM wrote every host's
+  A/AAAA record and every alias into such a zone, and the record updates
+  went to a zone that cannot take them, so nobody served the record. The
+  drift check expected the record in that zone and showed the subnet in
+  sync. Such a zone still names the host (its FQDN, and the PTR IPAM
+  writes into a reverse zone it serves), but IPAM now writes no A/AAAA or
+  alias into it and queues nothing, the drift check expects none, and
+  adding an alias there answers 409 saying why. The same holds once a
+  zone in use is changed to a secondary. A record an earlier release
+  wrote into such a zone is dropped, with no update sent, the next time
+  IPAM syncs the address.
+
+- **Backup/restore concurrency guards, "latest" is a real backup,
+  and dead runs recover (#1574, #1571, #1515).** `latest/download`
+  and restore drills no longer pick a pre-restore safety dump (it
+  is encrypted with the public constant passphrase, not the
+  target's). Restore now holds a Postgres advisory lock for the
+  whole apply — two concurrent restores interleaved their schema
+  clear and replay — and Run Now / the schedule sweep claim a
+  target with one atomic conditional UPDATE instead of a
+  read-then-run check. Archive and safety-dump filenames carry a
+  random suffix; at one-second resolution two runs in the same
+  second overwrote each other, safety dump included. A backup run
+  whose process dies no longer strands its target `in_progress`
+  forever: the sweep (and Run Now) reap a run older than the health
+  module's two-hour presumption to `failed` with an audit row and a
+  fresh `next_run_at`, the runner stamps `failed` for ANY exception
+  rather than only the three typed ones, local-volume and WebDAV
+  drivers translate `OSError` / `httpx.InvalidURL` at their
+  boundary, and the SCP driver sets an SFTP channel timeout so a
+  stalled server cannot hang a run indefinitely.
+
+- **Selective restore validates before it pays for a safety dump, and
+  safety dumps no longer consume backup retention (#1575, #1574).**
+  A selective restore against a plain-format archive, or with unknown
+  section keys, was refused only after a full pre-restore safety dump
+  had been written and the connection pool disposed; both checks are
+  knowable from the parsed archive and now run before either cost.
+  On the local-volume path the same directory holds the
+  `pre-restore-*.zip` safety dumps, and retention counted them as
+  backups — each restore pushed a real backup out of a keep-last-N
+  window early, and keep-days deleted rollback copies on the backups'
+  schedule. Retention now splits the listing: backups follow the
+  target's policy, safety dumps keep their own last 3.
+
+- **A refused restore no longer blocks every later one as "already in
+  progress" (#1648).** The restore lock added for #1571 was taken on
+  the request's database session, which hands its connection back to
+  the pool at every commit, so the unlock ran on a different
+  connection and did nothing. The lock stayed on an idle pooled
+  connection: after one refused restore (a mistyped passphrase, an
+  invalid archive) the next could be refused with "another restore is
+  already in progress" until the api recycled that connection or
+  restarted. The same flaw could let a second restore in while one was
+  running, and the pool reset before the replay dropped the lock. The
+  lock now lives on a connection of its own for the whole restore,
+  which the restore spares when it ends the other sessions, and it is
+  released however the restore ends, a cancelled request included.
+
+- **A Proxmox sync no longer fails on an address another integration
+  already mirrors (#1622).** When a guest reported an IP that UniFi (or any
+  other integration, or a second Proxmox endpoint) already held in the
+  same subnet, the reconciler logged "owned by another integration" and
+  then inserted its own row anyway. The insert hit
+  `uq_ip_address_subnet_address`, the whole sweep rolled back, and the
+  endpoint never synced again, without a `last_sync_error` to show for
+  it. The reconciler now leaves such an address to its owner, and skips
+  moving one of its own rows onto an occupied address the same way.
+
+- **DNS agent LoadBalancer Services keep the client address and can
+  pin a VIP (#1548).** `dnsAgents.servers[].service` accepted a `type`
+  and nothing else, so the rendered LoadBalancer ran with the default
+  `externalTrafficPolicy: Cluster`: kube-proxy SNATed every query and
+  the DNS server saw node or CNI addresses instead of clients —
+  breaking per-client rate limits, query-log and RPZ attribution, and
+  client ACLs, the umbrella-chart twin of #1487 — and there was no way
+  to pin a stable resolver address. The Service now renders
+  `externalTrafficPolicy` (default `Local`; each server is a
+  single-replica StatefulSet, so the announcing node is the pod's node
+  anyway), `annotations` (including the MetalLB
+  `metallb.universe.tf/loadBalancerIPs` pin), `loadBalancerIP`,
+  `loadBalancerSourceRanges`, and `ipFamilyPolicy` / `ipFamilies` from
+  `server.service`. A new render check,
+  `chart-dns-agent-service.py`, fails any DNS agent LoadBalancer that
+  would SNAT its clients, and a dedicated render asserts the new
+  fields reach the Service.
+
+- **The umbrella chart refuses DNS encrypted-transport ports the
+  flavor cannot serve (#1553).** `dnsAgents.servers[].doqPort` was
+  rendered into the container ports and both Services for any flavor,
+  and `dotPort` / `dohPort` likewise for PowerDNS — but DoQ is
+  Technitium-only, and PowerDNS serves DoT/DoH only behind a dnsdist
+  front that has no Kubernetes deployment, so an operator mistake
+  produced a Service port forwarding to nothing instead of an error.
+  The render now fails with a message naming the server, the port and
+  the flavor, and the charts render check carries negative controls
+  for all three combinations.
+
+- **Integration mirrors no longer treat a failed, refused or partial
+  fetch as "empty" (#1555, #1556, #1559, #1560).** Four absence-delete
+  hazards of the same class: the UniFi client collapsed a wrong-shape
+  200 (proxy error page, envelope without `data`, `data: null`) to an
+  empty list for networks, clients and sites, and ignored in-band
+  legacy `meta.rc == "error"` failures, so one degraded response
+  deleted a site's — or the whole controller's — mirrored rows; it
+  now routes those reads through the shared `require_list` /
+  `require_keyed_list` guards and raises. The OPNsense mirror deleted
+  mirrored DHCP leases and reservations when a DHCP backend refused
+  the API user (403) while the reconciler merely warned; a refused
+  category's rows are now frozen for that pass (the all-404 absent-
+  backend case still deletes as before). The Proxmox mirror deleted
+  a running guest's addresses when its config fetch failed once, and
+  dropped stopped guests wholesale when their node was not online
+  with `include_stopped` armed; unreadable guests/nodes are now
+  counted on the reconcile summary and the address absence-delete
+  (and, for unread nodes, the subnet pass) is skipped for that pass.
+  The Kubernetes mirror read only the first 500 Services, Ingresses,
+  nodes and pods and pruned everything past page one; it now follows
+  the `metadata.continue` token to the end and raises — aborting the
+  reconcile — if paging fails midway.
+
+- **System alerts reach forward targets, compliance rules require a
+  classification, audit-forward targets are validated, and conformity
+  alerts survive the evaluator (#1576, #1578, #1580, #1581).**
+  Audit-chain-broken, schema-behind-head and cluster-upgrade-failed
+  alerts were created but never delivered to syslog/webhook/SMTP
+  targets; all three now deliver at creation time like the generic
+  evaluator does. A `compliance_change` rule could
+  be created without a classification and then never fire, warning on
+  every evaluator tick — create and update now reject that with 422
+  and the evaluator warns once per rule. Audit-forward targets are
+  validated per kind at save time (syslog host/port/facility ranges,
+  webhook URL, SMTP host/port/sender/recipient) instead of being
+  saved enabled and silently skipped. Conformity events are no longer
+  closed by the generic evaluator's auto-resolve passes; the
+  conformity engine owns them.
+
+- **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
+  dropped NFS connection no longer crashes the api (#1500).** The `nfs`
+  destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
+  the server's limit on NFSv3, but libnfs 5.0.2 (the `libnfs14` the image
+  ships) never learns the limit on NFSv4 and sends one 1 MiB WRITE. A
+  Synology DSM 7 export (limit 128 KiB) drops the connection on that, so
+  every v4 backup failed with "nfs_service failed" and left its `.part`
+  file behind, while v3 worked. Writes are now capped at the limit
+  libnfs negotiated, or at 64 KiB when it has none. Separately, after a
+  connection died mid-call, tearing down the libnfs context ran a
+  callback against a stack frame that no longer existed (a 5.0.2 bug,
+  fixed upstream in 5.0.3). The api died with SIGSEGV, and the target
+  was left `in_progress`, so its schedule stopped firing. A context
+  that still has requests queued at teardown is now leaked with its
+  socket closed instead of destroyed.
+
+- **A Technitium server that cannot be connected to is no longer reported
+  as refusing the zone transfer (#1470).** Drift and Sync with Servers
+  read a Technitium zone over AXFR, and the driver turned any error
+  containing "REFUSED" into "refused the zone transfer despite signing it
+  with the group key", including a TCP "Connection refused". On an
+  appliance whose Technitium answers only on the DNS VIP, nothing listens
+  on the node address, so every pull failed with a message that pointed
+  at the TSIG key on all servers. A connection failure now keeps the
+  message the AXFR helper already gives it ("could not be reached on
+  TCP/53 — check the address and firewall"); a real DNS REFUSED still
+  names the TSIG settings.
+
 - **More than one RADIUS / TACACS+ user can be auto-provisioned
   (#1290).** An external account with no email (RADIUS and TACACS+
   never report one, and neither does an LDAP entry without `mail` or an
@@ -78,6 +687,29 @@ the formatter handles the rest.
   warnings per 60 s tick, the bulk of its warnings on an appliance. The
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
+
+- **Editing a record's value on Cloudflare replaces it instead of adding
+  a second record (#1494).** The driver handled `update` by looking up
+  the Cloudflare row by the op's value, which is the NEW value and not
+  on Cloudflare yet, so the lookup missed and the "update is create on
+  miss" fallback added a second row next to the old one. For a DMARC
+  record that turned the domain's policy off, since two DMARC records
+  mean none. A create or update that carries its complete desired RRset
+  (every agentless op since #783) is now written as a set: rows that
+  match a member are kept, with the TTL corrected in place, missing
+  members are created, and the remaining rows are deleted last so the
+  name never goes empty. Values are compared in a normalised form (TXT
+  with or without quotes, host names with or without the trailing dot,
+  IPv6 notation), so an unchanged record is not posted again. If
+  Cloudflare still reports a value as a duplicate, nothing is deleted
+  and the op fails with that message. A delete stays a single-value
+  delete. A row added in the Cloudflare dashboard at the same name and
+  type is removed by the next create or update there, as with the
+  other drivers that write whole RRsets. Cloudflare's `proxied` flag
+  is preserved: a proxied row's TTL (always auto) is not "corrected",
+  every PUT carries the row's own flag, and a value replacing a
+  proxied record is created proxied, so a write never exposes the
+  origin address.
 
 - **A DHCP server can be taken out of its server group (#1458).**
   `PUT /dhcp/servers/{id}` built its changes with `exclude_none=True`, so
@@ -301,6 +933,20 @@ the formatter handles the rest.
   the template sets gets the DDNS inheritance it would get with no
   template.
 
+- **Applying a DDNS template to an existing subnet or block no longer
+  turns its DDNS off (#1421).** Apply (`POST /ipam/templates/{id}/apply`)
+  without `force` fills only the target's empty columns, and a stored
+  `ddns_enabled = false` or hostname policy is not empty, so a template
+  that turns DDNS on never wrote either one. Its DDNS lock still turned
+  the target's DDNS inheritance off, so a subnet that inherited DDNS (on,
+  say, from its block) was pinned to its own stored DDNS, which was off.
+  The lock now comes with all four of the template's DDNS values. That
+  overwrites nothing an operator set, because a carrier that inherits
+  DDNS ignores its own DDNS columns. A carrier with its own DDNS keeps
+  its values without `force`, as before. `fields_written`, and the
+  apply's audit row, now name `ddns_inherit_settings` when the apply
+  turns DDNS inheritance off.
+
 - **A custom field's Default Value is what the IPAM dialogs send, not
   only what they show (#1303).** Allocate IP, New Subnet and New IP Block
   showed a field's Default Value (Settings → Custom Fields) as its value,
@@ -451,6 +1097,342 @@ the formatter handles the rest.
 
 ### Security
 
+- **A failed backup run's audit row no longer carries the destination's
+  error text (#1617).** The `backup_target_run_failed` row is forwarded
+  as-is, to syslog, webhook and SMTP forward targets and as the
+  `system.backup_failed` event, and a driver's error text routinely names
+  where the backups live: the NFS server and export, the SMB share, the S3
+  bucket, the SCP host and path. `new_value.error` is gone; the row carries
+  a fixed `failure_category` instead (`unreachable`, `timeout`,
+  `permission_denied`, `auth_failed`, `no_space`, `not_found`,
+  `config_invalid`, `retention_locked`, `secret_unreadable`,
+  `archive_error`, `destination_error`, `unexpected`, and `run_died` for a
+  run the stale-run reaper stamped). The full text is unchanged on the
+  target (`last_run_error`, superadmin-only) and in the row's
+  `error_detail`, which no forwarder emits. A consumer that parsed
+  `new_value.error` should switch to `failure_category`.
+
+- **A cleared or replaced webhook secret no longer lives on in its
+  old plaintext column, and a collector echoing part of a secret no
+  longer leaks it into the log (GHSA-g9gv-9qp2-3qwm,
+  GHSA-5qf8-pqm4-58mj).** Follow-ups to #1506, found on its QA walk.
+  Writing a forward target's URL or `Authorization` header, or the
+  legacy pair through `PUT /api/v1/settings`, now also blanks the
+  matching pre-upgrade plaintext column in the same change, so the
+  old value does not stay readable in the database or in full
+  backups until the column is dropped. `redact()` for the
+  non-2xx `body_preview` now runs before the preview is truncated
+  to 200 characters, and also covers the bare header token, each
+  URL path segment and query value, and their JSON-escaped and
+  percent-encoded forms. An exclude-secrets restore's empty-bytea
+  encrypted URL is now treated as unset (`url_set`, the audit
+  snapshot, and the webhook-URL requirement), so a restored target
+  is reported unconfigured instead of silently not delivering.
+
+- **A resource-scoped API token is held to its subnet or zone on every
+  route keyed on one (GHSA-46mq-mpwf-xxwv).** A token restricted with
+  `resource_grants` passes the router permission gate on the resource type
+  alone, so each subnet-, address- or zone-keyed handler had to re-check the
+  instance itself, and many didn't. A token bound to one subnet or zone could
+  read another's reconciliation, DNS-sync preview and summary, aliases,
+  domains, network context, effective DNS / DHCP / custom fields, probe
+  policy, utilization history and zone update ACL, and a zone-scoped token
+  with write could update, DNSSEC-sign / unsign / roll over, edit the update
+  ACL of, or import into a zone it wasn't bound to. The check is now a
+  router-level dependency on the IPAM and DNS routers, so every route keyed
+  on `{subnet_id}`, `{address_id}` or `{zone_id}` refuses another instance
+  before its handler runs, and a test sweeps every such route so a new one
+  can't slip past. A server's zone-state and pending-ops lists now narrow to
+  the token's zones. Sessions and unscoped tokens are unaffected.
+
+- **Unauthenticated `/health/platform` requests can no longer deadlock the
+  api (GHSA-c58p-8cq9-g3gm).** Each request ran its own Celery `inspect ping`
+  in a thread, and the 3 s timeout abandoned the request but not the thread.
+  A burst of anonymous requests filled the broker connection pool with pings
+  that each held one connection while waiting for another, and the next task
+  dispatch on the event loop then waited forever, hanging every request
+  until the api was restarted. The ping is now single-flight with a 5 s
+  result cache, so concurrent callers share one broadcast and a hung ping is
+  joined rather than repeated. `broker_pool_limit` is set explicitly and an
+  exhausted broker pool now raises after 5 s instead of blocking forever. No
+  operator action.
+
+- **Every appliance now has its own SSH host keys; existing installs rotate
+  them once on upgrade (GHSA-vvh9-6gfw-wphp).** The host keys were generated
+  once, inside the image build container, and the installer copied them into
+  STATE, so every appliance installed from one release presented the same
+  keys and the private halves shipped in the public ISO. Anyone able to
+  intercept SSH traffic could impersonate any appliance of that release. The
+  image now ships no host keys, the installer no longer seeds them, and each
+  appliance generates its own on first boot. On the first boot after
+  upgrading, an appliance whose STATE still holds a build-time key
+  (recognised by its `root@<container id>` comment) replaces it, once; keys
+  generated on the appliance or installed by an operator are never touched.
+  **Expect one "REMOTE HOST IDENTIFICATION HAS CHANGED" warning per
+  appliance** after the upgrade: remove the old entry with
+  `ssh-keygen -R <host>` and verify the new fingerprint on the console
+  (`spatium-state info`) before accepting it.
+
+- **APT proxy URLs no longer hand their embedded credential to every
+  signed-in account (GHSA-j77h-pqg7-h2g4).** `GET /api/v1/settings` needs
+  only a login, and returned `apt_proxy_http` / `apt_proxy_https` exactly as
+  stored, so a `http://user:password@proxy:3128` credential was readable by
+  a Viewer. It now reads as `http://***@proxy:3128`, host kept, and the same
+  masking applies to the `find_apt_settings` Copilot tool, the settings log
+  line and the support bundle. Saving the form with the mask in place keeps
+  the stored credential. Operators who configured a proxy credential should
+  consider it exposed and rotate it.
+
+- **The audit chain no longer reports tampering on rows nobody edited
+  (GHSA-8288-8vg9-82gr, #1615).** Each audit row was hashed with its
+  `old_value` / `new_value` as Python had them, and verified against what
+  PostgreSQL's JSONB returned. JSONB rewrites some numbers (`1e16` comes back
+  as the integer `10000000000000000`, `-0.0` as `0.0`), so any user able to
+  put such a value in an audited payload, for example a `tags` or
+  `custom_fields` entry on a create, made `GET /audit/integrity`, the chain
+  alert and the restore drill report `row_hash_mismatch` for good. Payloads
+  are now converted to exactly what JSONB returns before hashing, and the
+  converted form is what is stored. `NaN` / `Infinity`, which JSONB rejects
+  (failing the audited change with it), are stored as strings. Chain breaks
+  now name the row's action and resource. Rows written before this fix
+  that carry such a value still report a break; they are not re-hashed.
+
+- **Operator Copilot and MCP tools now enforce the caller's permissions
+  (GHSA-4wrc-78rq-vgcg).** A tool ran with no authorization, so any
+  signed-in account, or a read-scoped API token bound to one DNS zone,
+  could read DNS, DHCP, IPAM and capture data its role does not grant by
+  calling the read tools over `POST /api/v1/ai/mcp`. Every tool now
+  declares the permission its REST equivalent requires, and the tool
+  registry checks it on every call from chat and MCP alike. List tools
+  narrow rows to the zones / subnets a resource-scoped token is bound to.
+  MCP now offers only the tools chat would (Tool Catalog, defaults and
+  feature modules) and lists only those the caller may call, and
+  `tls_cert_check` refuses loopback, link-local and metadata targets.
+  No operator action needed; MCP clients may see fewer tools.
+
+- **On the appliance, a local unprivileged account can no longer become
+  root through file permissions (GHSA-h2j9-qrg7-grfw).** Three modes
+  combined to allow it: the k3s cluster-admin kubeconfig was 0644, the
+  `release-state` directory every root host runner takes its triggers
+  from was 1777 (and the slot-upgrade sidecars 0666), and
+  `/etc/spatiumddi/.env` was 0644. The kubeconfig is now 0640 to a new
+  `spatium-host` group (gid 2770), set by a k3s drop-in; the directory is
+  1770 root:2770, enforced at every boot by systemd-tmpfiles and
+  firstboot; the sidecars are 0660; `.env` is 0600. The supervisor's uid
+  is pinned to 100 and it, the api pod and the installer's admin carry gid
+  2770, so they keep their access. Every runner now checks the trigger's
+  owner first and renames a foreign one aside instead of acting on it.
+  Existing appliances are repaired on their next boot; no operator action.
+
+- **A resource-scoped API token no longer sees zones, records or addresses
+  outside its grant through group record lists or search
+  (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
+  narrowed a `dns_zone`-scoped token to its bound zones, but
+  `GET /api/v1/dns/groups/{id}/records` returned every record of every zone
+  in the group, and global search (`GET /api/v1/search`, and the Copilot's
+  `global_search`, which runs the same engine) returned zones and records
+  outside the grant. Search had the same gap for subnet-scoped tokens and
+  addresses. The group record list now narrows to the token's zones, and the
+  search engine drops every zone, record, subnet, address, block and space
+  row outside the token's bound instances. Sessions and unscoped tokens are
+  unaffected.
+
+- **Webhook forward targets keep their URL and Authorization header
+  encrypted, and no longer show or log them (#1502).** For a Slack,
+  Discord or Teams target the incoming-webhook URL is the credential:
+  whoever has it can post into the channel. It sat in a plaintext
+  column (`audit_forward_target.url`), and so in every backup archive's
+  unencrypted database dump and in "exclude secrets" diagnostic
+  archives. The API returned it in full, and httpx logged it at INFO on
+  every delivery (`HTTP Request: POST <URL>`), which put it in the api
+  and worker logs and in an appliance support bundle. A generic
+  target's `Authorization` header was stored the same way. The legacy
+  single-webhook pair on `platform_settings` was also returned in
+  clear by `GET /settings`. All four values are now Fernet-encrypted
+  (`*_encrypted` columns, migration `e51ab0dede3e`, covered by the
+  cross-install backup rewrap). The API takes them write-only and
+  returns `url_set`, `auth_header_set` and a `url_display` that shows
+  only the scheme and host (`https://hooks.slack.com/…`). The httpx
+  request line for a webhook delivery shows only that host, and
+  delivery and save errors are redacted. The support-bundle scrubber
+  also recognises Slack, Discord and Teams webhook URLs and a SAS
+  `sig=` parameter, wherever else one is printed. The form uses
+  password inputs, shows the stored host, and keeps a field left blank
+  on edit.
+  **Behaviour changes:** `GET /settings/audit-forward-targets` no
+  longer has `url`, and `GET /settings` no longer has
+  `audit_forward_webhook_url` / `audit_forward_webhook_auth_header`
+  (each is replaced by the `*_set` / `*_display` fields). On
+  `PUT /settings/audit-forward-targets/{id}`, an omitted or `null`
+  `url` / `auth_header` now keeps the stored value, and `""` clears it.
+  Before, an omitted header was wiped, so editing a generic target in
+  the UI silently removed its header. **Upgrade notes:** the old
+  plaintext columns are kept, unread, for one release so a rolling
+  upgrade's old api pods keep working, and the next release drops them.
+  Until then they hold the pre-upgrade values, so a full archive still
+  carries those in clear, as every earlier archive does. Re-issuing the
+  webhook URL in Slack / Discord / Teams (and any collector token) once
+  the upgrade has finished, and pasting the new one in, is the only way
+  to retire a value that is already in an archive.
+
+- **Making someone a superadmin through a group needs the operator
+  step-up too (#1412).** #1355 covered the `is_superadmin` flag, but a
+  user is also a superadmin when one of their groups holds a role
+  carrying `*` / `*`, or a live `*` / `*` time-bound grant. A stolen
+  session could therefore still make an account it controls a superadmin
+  by adding it to such a group, giving such a role to its group, adding
+  `*` / `*` to a role its group already holds, or granting `*` / `*`
+  temporarily. Each of those now needs the step-up when, and only when,
+  it would make someone a superadmin who is not one; the check is on the
+  effect and runs before anything is written, and the audit row records
+  how many users it reached. Superadmin status here ignores whether the
+  account is enabled: before, a disabled role-only superadmin's password
+  could be reset with no step-up and the account re-enabled. The Groups,
+  Roles and time-bound grant dialogs ask for the step-up when the server
+  says it is needed (a 403 with `X-Stepup-Required`). The Users page's
+  Role column now shows a superadmin through a group's role, marked
+  "(role)", where it said "user". The Copilot's temporary-access proposal
+  refuses a `*` / `*` grant that would make superadmins, since a chat
+  Apply cannot ask for a password. An auth-provider group mapping into a
+  superadmin group needs it as well (#1476): it grants nothing until an
+  account from the external group signs in, so the check is on the target
+  group, and covers creating such a mapping, re-pointing one at such a
+  group and renaming its external group. The mapping editor now asks for
+  the step-up, and shows a failed save instead of saying nothing.
+  **Behaviour change:** an API client that makes such a group, role,
+  grant or mapping change must send `stepup_password` (or
+  `stepup_totp_code`).
+- **The older secret reveals count wrong answers like every other
+  step-up (#1413).** The #408 reveals (agent bootstrap keys, pairing
+  codes, appliance kubeconfig, SNMP community, block-sync and
+  firewall-feed secrets, the approvals break-glass) re-confirmed the
+  operator without the per-account wrong-answer budget the #1355 actions
+  spend, so a stolen session could guess the operator's password, or a
+  TOTP code, through any of them without limit. Each now spends the same
+  budget, refusals keep their own `*_reveal_denied` audit action, and the
+  pairing-code reveal is audited for the first time. Once the budget is
+  spent, every step-up answers 429 with `Retry-After` set to the time left
+  on the block, and the refusal is audited (`error_detail:
+  stepup_blocked`); both were missing (found by ddi-pg on #1414). The
+  budget check now lives in one place for the reveals, the #1355 actions
+  and the MFA endpoints alike, and a test fails any new reveal that checks
+  the operator outside it.
+- **The DHCP agent's external Service no longer publishes Kea's HA listener
+  (GHSA-73x3-7j9g-j7rr).** On Helm and raw-manifest installs, the per-server
+  NodePort Service listed TCP 8000 next to UDP 67. That port is the Kea HA
+  hook's peer listener: plain HTTP, no authentication, and it accepts the
+  commands HA peers send each other. It was latent while the listener never
+  bound (#1447); once it does, every node IP answered it. The external
+  Service now carries UDP 67 only. HA peers keep reaching each other
+  pod-to-pod, and the headless Service still lists 8000 for in-cluster DNS
+  names, so HA needs no change. Appliances were never affected: there the
+  DHCP pod uses host networking behind the appliance firewall. A new chart
+  gate (`chart-no-external-kea-ha.py`) fails CI if a NodePort or
+  LoadBalancer Service in front of a DHCP agent publishes 8000 again, on
+  every render and on the raw `k8s/dhcp` manifests.
+
+- **Logged tracebacks no longer include local variables
+  (GHSA-4mwf-qwqg-5fw7).** The api and worker rendered every unhandled
+  exception through structlog's `dict_tracebacks`, which attaches each
+  stack frame's local variables, so a failed restore wrote the backup
+  passphrase and the database password into the JSON log (and from there
+  to any forwarded log store). Exception rendering is now configured with
+  locals off, in both the JSON and console formats. The exception type,
+  message and frames (file, line, function) are still logged. Operators
+  who may have run a failing restore should rotate those credentials and
+  purge older logs.
+
+- **Regenerating MFA recovery codes no longer returns the account's TOTP
+  secret (GHSA-244w-8h9w-g58j).** `POST /api/v1/auth/mfa/recovery-codes/regenerate`
+  answered with the enrolment response model, so every regeneration
+  carried the existing `secret` and `otpauth_uri` alongside the new codes.
+  The UI reads only the codes, so nothing needed the seed, but anyone
+  holding a session and one live code could take it and keep minting
+  valid codes after the session was revoked. The endpoint now answers
+  with `{"recovery_codes": [...]}` only. Enrolment (`/mfa/enroll/begin`)
+  is unchanged, since that is where the secret is legitimately shown.
+  No operator action is needed; an account that may have been exposed
+  can disable and re-enrol MFA to rotate its secret.
+
+- **The pre-restore safety dump is no longer readable by other local users (GHSA-g996-3ph6-q3x8).**
+  `_write_pre_restore_safety_dump` created its directory and zip with
+  default modes, and the archive's secrets envelope uses a documented
+  constant passphrase, so anyone able to read the file could recover
+  `SECRET_KEY`. The directory is now created 0700 (and tightened if it
+  already existed looser) and the zip is created 0600 at open time, with
+  no window where it is group- or world-readable. Existing dumps keep
+  their old modes; the next restore tightens the directory.
+  Not yet changed: the constant passphrase itself, and pruning of old
+  dumps; both are follow-ups.
+
+- **Backup-target credentials no longer reach the audit log or error
+  messages (GHSA-m63g-667p-6qgw).** `PATCH /backup/targets/{id}` wrote
+  the raw request body into `audit_log.new_value` minus only the
+  passphrase, so a rotated S3 key, SCP password or key, Azure, GCS,
+  WebDAV, FTP, SMB or https_put credential landed in the audit table in
+  clear, readable by the Viewer role, forwarded to SIEM targets and
+  copied into every backup archive. The audit row now records only the
+  names of the config keys that changed. Separately, the https_put and
+  webdav drivers put the full destination URL, including a presigned
+  query string or `user:pass@`, into errors that reach
+  `last_run_error`, the audit log and the logs; they now show scheme,
+  host and path only. Operator action: rotate any backup-target
+  credential or presigned URL that was edited, or failed a run, on an
+  earlier release, since the audit table is append-only.
+
+- **Resolving an alert event and running an evaluation now require a
+  superadmin (GHSA-9m9r-w366-jj3v).** `POST /alerts/events/{id}/resolve` and
+  `POST /alerts/evaluate` only checked that the caller was signed in, so the
+  read-only Viewer role could dismiss a transition-once alert (registrar
+  change, hijack latch) for good, or trigger an evaluator pass that delivers
+  to the configured syslog / webhook / SMTP targets. Both now use the same
+  superadmin gate as the alert-rule writes, and a resolve writes an
+  `audit_log` row. Operators who relied on non-superadmin accounts resolving
+  alerts need to use a superadmin account.
+
+- **The IPv6 Router Advertisement config now loads, and nothing an IPAM
+  writer types can reach it as syntax (GHSA-6235-5gh6-4hr2).** The rendered
+  `radvd.conf` used `AdvMaxInterval`, which is not a radvd keyword
+  (`MaxRtrAdvInterval` is), so radvd rejected every config. Fixing the
+  keyword alone would have exposed a second problem: DNSSL search domains
+  (including the subnet `domain_name`, writable by any IPAM editor) and the
+  RA interface name were interpolated into the file unvalidated, so a crafted
+  value could inject a whole extra `interface` block. DNSSL entries and the
+  subnet `domain_name` must now be valid domain names (RFC 2181 labels, so
+  an underscore is still fine) and the interface a Linux interface name,
+  rejected with a 422 at the API and dropped again at render time (RDNSS and prefixes are
+  re-checked too). The DHCP agent now writes the new config to a staged file,
+  runs `radvd -c` on it and only then swaps it in, so a rejected config no
+  longer replaces the working one on disk. No operator action; existing
+  invalid values are skipped at render with a log line.
+
+- **An Address Set Editor scoped to one address set can no longer resize, merge, split, purge, DNS-sync or delete IPAM subnets, blocks and spaces it holds no grant on (GHSA-6g57-4vj6-87mv).**
+  The IPAM router's coarse gate admits any mutating request from a holder of an `address_set`
+  grant and ignores the grant's `resource_id`, so the structural routes beyond create and update,
+  which had no per-type check of their own, were open to such a delegate. A block resize
+  changed a block's CIDR for a user with no block permission. Every structural subnet, block and
+  space route (resize, split, merge, move, purge orphans, discover, DNS sync, reverse-zone
+  backfill, subnet domains, bulk edit, allocate-subnet, delete) and the IPAM import commit now
+  requires `write` (or `delete`) on the matching `subnet` / `ip_block` / `ip_space` type. Address
+  CRUD and its per-IP address-set gate are unchanged. No operator action is needed, but a role
+  that relied on the gap, such as write on one IPAM type only, must now hold the matching one.
+
+- **A backup passphrase hint may no longer contain the passphrase (#1498).**
+  The hint is stored in clear on purpose, so archives can be told apart
+  without the passphrase: in `manifest.json`, in the `secrets.enc`
+  header, in the API response, and, on edit, in the audit log. The field
+  sits directly under the passphrase input, and nothing stopped the
+  passphrase landing in it. Every archive then carried its own key next
+  to the ciphertext, and the append-only audit log kept a copy that
+  cannot be removed. Target create / update and create-and-download now
+  answer 422 when the hint contains the passphrase (case-insensitive).
+  A PATCH that changes only one half is checked against the stored
+  other half. A target saved before this keeps backing up, but its
+  archives are written without the hint (`backup_hint_contains_passphrase_dropped`).
+  The target form gains the help text the download form already had.
+  **If you are affected:** set a new passphrase and a new hint, take a
+  backup, and delete the older archives. The old passphrase stays in the
+  audit log, so do not reuse it.
 - **Actions that mint a credential need the operator step-up (#1355).**
   #408 made secret reveals ask for a password or authenticator code so a
   stolen session cannot read them, but a stolen session could still mint
@@ -463,8 +1445,7 @@ the formatter handles the rest.
   Wrong answers spend the per-account step-up budget (an omitted answer
   is refused without spending it), and each answered attempt is audited
   with the method used. Once the budget is spent the action answers 429
-  for 15 minutes; that refusal is not yet audited and carries no
-  `Retry-After` header (#1413). Resetting your own password through the admin path counts:
+  until the 15-minute window resets. Resetting your own password through the admin path counts:
   a stolen session would otherwise end up holding that password. **Behaviour changes:** API clients that
   create tokens, superadmins or a superadmin's password must send
   `stepup_password` (or `stepup_totp_code` for an SSO account), and an
@@ -598,6 +1579,26 @@ the formatter handles the rest.
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
   account has an empty email.
+- `e51ab0dede3e` — #1502, expand only: adds `url_encrypted` /
+  `auth_header_encrypted` to `audit_forward_target` and
+  `audit_forward_webhook_url_encrypted` /
+  `audit_forward_webhook_auth_header_encrypted` to `platform_settings`,
+  fills them from the plaintext columns with `encrypt_str` (so it needs
+  `SECRET_KEY`, like `b3c71e9a4d25`), and makes the plaintext columns
+  nullable. It does not drop them; the next release does. Downgrade
+  copies the current values back into the plaintext columns and drops
+  the encrypted ones.
+- `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
+  default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
+  the value the BIND9 agent has always served (3600, 600, 86400, 300),
+  timer by timer, so rendering the stored timers changes nothing on the
+  wire for a timer nobody set. Adds `dns_server.agent_renders_soa_timers`
+  (false) and `dns_server_group.serves_soa_timers` (true; false for every
+  group with a BIND9 agent, whose agents are the previous release's). It
+  moves no serial: a zone with other timers moves its serial when its
+  group switches to serving them. Downgrade moves the serial of each zone
+  whose group served its own timers (its SOA changes back) and drops the
+  two columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

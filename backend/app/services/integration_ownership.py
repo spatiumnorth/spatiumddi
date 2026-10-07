@@ -18,6 +18,13 @@ on any hand-written chain of these columns elsewhere in ``app/``.
 
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.ipam import IPAddress
+
 # Ownership FK → the integration's name, as block-sync targets and the
 # block-move blockers report it.
 INTEGRATION_OWNERSHIP: dict[str, str] = {
@@ -58,9 +65,29 @@ def owned_by_other_integration(row: object, own_fk: str) -> bool:
     return any(getattr(row, fk) is not None for fk in INTEGRATION_OWNERSHIP if fk != own_fk)
 
 
+async def address_taken(
+    db: AsyncSession, subnet_id: Any, address: str, *, exclude_id: Any = None
+) -> bool:
+    """True if a row already holds ``address`` in ``subnet_id``.
+
+    A mirror checks this before it inserts a row or moves one of its own
+    rows into ``subnet_id``. After its claim pass, a row still sitting
+    there belongs to another integration or another target of the same
+    one; writing next to it would hit ``uq_ip_address_subnet_address``
+    and roll back the whole sync (#1622, #1677).
+    """
+    stmt = select(IPAddress.id).where(
+        IPAddress.subnet_id == subnet_id, IPAddress.address == address
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(IPAddress.id != exclude_id)
+    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
+
+
 __all__ = [
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",
+    "address_taken",
     "owned_by_other_integration",
     "owning_integration",
 ]

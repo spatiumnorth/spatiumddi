@@ -11,6 +11,8 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_resource_permission
+from app.models.audit import AuditLog
+from app.models.auth import User
 from app.models.ipam import CustomFieldDefinition
 
 logger = structlog.get_logger(__name__)
@@ -105,6 +107,51 @@ class CustomFieldUpdate(BaseModel):
     description: str | None = None
 
 
+# ── Audit ──────────────────────────────────────────────────────────────────────
+
+
+def _snapshot(field: CustomFieldDefinition) -> dict:
+    """Audit snapshot of a custom field definition (no secrets live here)."""
+    return {
+        "resource_type": field.resource_type,
+        "name": field.name,
+        "label": field.label,
+        "field_type": field.field_type,
+        "options": field.options if isinstance(field.options, list) else None,
+        "is_required": field.is_required,
+        "is_searchable": field.is_searchable,
+        "default_value": field.default_value,
+        "display_order": field.display_order,
+        "description": field.description,
+    }
+
+
+def _audit(
+    db: DB,
+    *,
+    user: User,
+    action: str,
+    field: CustomFieldDefinition,
+    old_value: dict | None = None,
+    new_value: dict | None = None,
+    changed_fields: list[str] | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type="custom_field",
+            resource_id=str(field.id),
+            resource_display=field.name,
+            old_value=old_value,
+            new_value=new_value,
+            changed_fields=changed_fields,
+        )
+    )
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
@@ -159,6 +206,8 @@ async def create_custom_field(
         description=body.description,
     )
     db.add(field)
+    await db.flush()
+    _audit(db, user=current_user, action="create", field=field, new_value=_snapshot(field))
     await db.commit()
     await db.refresh(field)
     logger.info(
@@ -195,10 +244,20 @@ async def update_custom_field(
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")
 
+    old_value = _snapshot(field)
     changes = body.model_dump(exclude_none=True)
     for attr, value in changes.items():
         setattr(field, attr, value)
 
+    _audit(
+        db,
+        user=current_user,
+        action="update",
+        field=field,
+        old_value=old_value,
+        new_value=_snapshot(field),
+        changed_fields=sorted(changes),
+    )
     await db.commit()
     await db.refresh(field)
     logger.info(
@@ -218,6 +277,13 @@ async def delete_custom_field(
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")
 
+    _audit(
+        db,
+        user=current_user,
+        action="delete",
+        field=field,
+        old_value=_snapshot(field),
+    )
     await db.delete(field)
     await db.commit()
     logger.info("custom_field_deleted", user=current_user.username, id=str(field_id))
