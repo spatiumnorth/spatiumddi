@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Fleet reboot request reboots the appliance, or says why it did
+  not (#1446).** The control plane cleared `reboot_requested` 15 seconds
+  after it was stamped, assuming the supervisor had seen it by then. A
+  node with an upgrade staged does not long-poll, so its heartbeats
+  arrive a full interval apart: the first one after the request cleared
+  the flag and carried "no reboot" in its own reply, the supervisor
+  never saw the request, and the Fleet view showed it as done. Reported
+  by @stefanriegel on a control-plane member during a rolling upgrade.
+  The supervisor now reports its boot id on every heartbeat; the request
+  is delivered until a heartbeat arrives from a different boot, which is
+  the proof it landed, and is given up with a logged warning after 15
+  minutes. The supervisor writes the reboot trigger at most once per
+  boot, so a trigger left behind by a shutdown can no longer swallow the
+  next request. A supervisor too old to report its boot gets the request
+  exactly once. Migration `199eb1562927`.
+
 - **A large blocklist feed no longer OOM-kills the worker, once an hour,
   forever (#1466).** The feed refresh loaded every existing entry as an
   ORM object and added one tracked object per new domain. On the
@@ -1555,6 +1571,10 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
+- `199eb1562927` — #1446: `appliance.reboot_requested_boot_id`, a
+  nullable string. No backfill: NULL means the boot is not recorded yet.
+  Downgrade drops the column.
+
 - `61566a119901` — #1290: `ix_user_email` becomes a partial unique
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one
