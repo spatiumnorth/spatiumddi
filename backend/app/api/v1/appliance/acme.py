@@ -159,6 +159,9 @@ class ACMEDomainResolution(BaseModel):
     zone_name: str | None  # the managed zone that covers it (if any)
     record_name: str | None  # relative TXT label inside that zone
     driver: str | None  # bind9 / powerdns / cloudflare / route53 / ...
+    # Set when the choice is worth a second look, e.g. a more specific
+    # internal zone also covers the name and was skipped (#1454).
+    note: str | None = None
 
 
 class ACMEPreviewRequest(BaseModel):
@@ -340,7 +343,8 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
     """For each domain, report whether a SpatiumDDI-managed zone covers it
     (auto-solve, incl. cloud-hosted zones via the agentless drivers) or
     whether it needs the manual TXT fallback. Drives the Issue modal's
-    per-domain status table."""
+    per-domain status table. Read-only: nothing is written and no CA or
+    DNS provider is contacted."""
     from app.services.acme_client import dns01  # noqa: PLC0415
 
     out: list[ACMEDomainResolution] = []
@@ -349,6 +353,12 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
         if not domain:
             continue
         match = await dns01.resolve_managed(db, domain)
+        note = None
+        if match is not None and match.skipped_zone_name:
+            note = (
+                f"internal zone {match.skipped_zone_name} also covers this name; "
+                f"the TXT goes into the public zone {match.zone_name} instead"
+            )
         out.append(
             ACMEDomainResolution(
                 domain=domain,
@@ -357,6 +367,7 @@ async def preview_domains(body: ACMEPreviewRequest, db: DB) -> list[ACMEDomainRe
                 zone_name=match.zone_name if match else None,
                 record_name=match.record_name if match else None,
                 driver=match.driver if match else None,
+                note=note,
             )
         )
     return out

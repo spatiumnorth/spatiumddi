@@ -11846,6 +11846,8 @@ export interface ACMEDomainResolution {
   zone_name: string | null;
   record_name: string | null;
   driver: string | null;
+  // e.g. a more specific internal zone was skipped for a public one
+  note?: string | null;
 }
 
 // A manual TXT the operator must publish for an allow_manual order to
@@ -13488,6 +13490,9 @@ export interface ClusterWorkloadHealth {
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
   status: string;
+  /** #1387 — database row only: "cnpg" when ready / total are the CNPG
+   *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
+  source?: string | null;
 }
 
 /** The resolve probe's verdict (#985). */
