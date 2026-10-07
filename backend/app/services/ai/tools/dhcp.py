@@ -1287,6 +1287,8 @@ class PreviewReprovisionLeaseArgs(BaseModel):
 
 @register_tool(
     name="preview_reprovision_lease",
+    # Same gate as GET /dhcp/leases/{id}/reprovision/preview.
+    permission=("read", "dhcp_server"),
     description=(
         "Show what moving a device with a dynamic DHCPv4 lease (Kea) to a static "
         "address would do, WITHOUT doing it: the address picked (first free in "

@@ -485,6 +485,8 @@ async def propose_create_dhcp_static(
 
 @register_tool(
     name="propose_reprovision_lease",
+    # Superadmin, like the REST commit and the operation's apply step.
+    permission="superadmin",
     description=(
         "Prepare a proposal to move a device with a dynamic DHCPv4 lease (Kea) "
         "to a static address: a reservation for its MAC, A + PTR under the new "

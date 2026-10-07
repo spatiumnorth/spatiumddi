@@ -524,6 +524,31 @@ def test_mcp_registration_defaults() -> None:
     assert preview is not None and propose is not None
     assert preview.default_enabled is True
     assert propose.default_enabled is False
+    # Same gates as the REST preview (read on dhcp_server) and commit (superadmin).
+    assert preview.permission == ("read", "dhcp_server")
+    assert propose.permission == "superadmin"
+
+
+@pytest.mark.asyncio
+async def test_mcp_propose_needs_superadmin(db_session: AsyncSession) -> None:
+    import app.services.ai.tools.dhcp  # noqa: F401 — registers the tools
+    import app.services.ai.tools.proposals  # noqa: F401
+    from app.services.ai.tools.base import REGISTRY, ToolPermissionDenied
+
+    user, _ = await _operator(db_session)
+    s = await _setup(db_session)
+    lease_id = str(s["lease"].id)
+    await db_session.commit()
+
+    out = await REGISTRY.call(
+        "preview_reprovision_lease", {"lease_id": lease_id}, db=db_session, user=user
+    )
+    assert out["target_ip"] == "10.81.0.21"
+    with pytest.raises(ToolPermissionDenied):
+        await REGISTRY.call(
+            "propose_reprovision_lease", {"lease_id": lease_id}, db=db_session, user=user
+        )
+    assert (await db_session.execute(select(AIOperationProposal))).first() is None
 
 
 def test_routes_publish_a_typed_schema() -> None:
