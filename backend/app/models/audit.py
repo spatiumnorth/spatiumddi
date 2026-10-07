@@ -62,8 +62,11 @@ class AuditLog(Base):
     # Who
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     user_display_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # auth_source: local | ldap | oidc | system
-    auth_source: Mapped[str] = mapped_column(String(20), nullable=False, default="local")
+    # auth_source: ``local``, a fixed service source (``system``, ``acme``, ...),
+    # or the NAME of the provider an external sign-in went through, so it is as
+    # wide as ``auth_provider.name`` (#1337: it was 20, and a longer provider
+    # name broke every sign-in through that provider).
+    auth_source: Mapped[str] = mapped_column(String(255), nullable=False, default="local")
     source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
 

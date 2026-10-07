@@ -577,7 +577,13 @@ jobs:
             # Keep-a-Changelog section headers (`✨ Added`, `🔧 Changed`,
             # `🐛 Fixed`, `🔒 Security`, `🗃️ Migrations`, …). Idempotent
             # — re-running on already-transformed text is a no-op.
-            NOTES=$(printf '%s\n' "$NOTES" | python3 scripts/format_release_notes.py)
+            #
+            # GitHub refuses a release body over 125,000 characters, and
+            # the release is created only after every image is built and
+            # scanned. Notes over the formatter's limit come out condensed:
+            # each entry cut to its headline, linking the full text.
+            NOTES=$(printf '%s\n' "$NOTES" | python3 scripts/format_release_notes.py \
+              --full-notes-url "https://github.com/${GITHUB_REPOSITORY}/blob/${VERSION}/CHANGELOG.md")
           fi
 
           {

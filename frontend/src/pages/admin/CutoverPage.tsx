@@ -385,7 +385,7 @@ export function CutoverPage() {
       <div className="p-6">
         <div className="rounded-md border bg-muted/20 p-4 text-sm text-muted-foreground">
           The <strong>Windows cutover</strong> module is turned off. Enable{" "}
-          <code>{MODULE_ID}</code> under Settings → Features to use it.
+          <code>{MODULE_ID}</code> under Features & Integrations to use it.
         </div>
       </div>
     );
@@ -433,6 +433,9 @@ function PlanListView({
   });
 
   const plans = plansQ.data ?? [];
+  // A list that was never read is not an empty one to invite a first plan
+  // into; the error banner says why (#1343).
+  const unread = plansQ.isError && plans.length === 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -479,7 +482,7 @@ function PlanListView({
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" /> Loading plans…
             </div>
-          ) : plans.length === 0 ? (
+          ) : unread ? null : plans.length === 0 ? (
             <div className="rounded-md border bg-muted/20 p-4 text-sm text-muted-foreground">
               No cutover plans yet. Create one, point it at the Windows DNS /
               DHCP servers you are migrating away from and the SpatiumDDI groups

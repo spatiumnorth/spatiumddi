@@ -11,6 +11,7 @@ helm or a cluster.
 | File | What it tests |
 |---|---|
 | `test_chart_pod_posture.py` | `.github/scripts/chart-pod-posture.py` — the seccomp + PriorityClass gate on both charts (#983) |
+| `test_chart_webhooks_fail_open.py` | `.github/scripts/chart-webhooks-fail-open.py` — MetalLB's validating webhooks failing open, and the BGPPeer written at its CRD's storage version so no conversion webhook is needed mid-install (#1103) |
 | `test_cluster_join_failure_reason.py` | `spatium-cluster-join`'s failure-reason classifier (#590) |
 | `test_cluster_join_identity.py` | `spatium-cluster-join`'s cluster-identity wipe (#590) |
 | `test_firewall_webui_sentinel.py` | Web UI reachability before the supervisor exists (#769) |
@@ -21,6 +22,7 @@ helm or a cluster.
 | `test_grub_render.py` | `spatium-grub-render` renderer via `--print` (DRY-RUN) |
 | `test_host_migrate.py` | `spatium-host-migrate` orchestrator via a patched subprocess |
 | `test_host_runner_stdin_programs.py` | The three runners that piped data into a `python3 -` whose program came from a heredoc — the SSH source-CIDR allowlist failing OPEN, TLS-syslog CAs, image pruning (#1001) |
+| `test_host_trigger_permissions.py` | The local-account-to-root modes: k3s kubeconfig, the release-state trigger directory + sidecars, `.env`, and `spatiumddi-trigger-guard` executed against right- and wrong-owner triggers (GHSA-h2j9-qrg7-grfw) |
 | `test_install_done_gate.py` | The headless-install Done-screen gate |
 | `test_k3s_kubelet_eviction.py` | `config.yaml`'s kubelet args give the kubelet a `memory.available` eviction threshold beside k3s's restated disk floors, a short pressure-transition period and node reserves (#1124) |
 | `test_install_ntp_decline.py` | Blanking the installer's **Time source** really disabling NTP — the rendered on-target `chrony.conf` plus firstboot's explicit-decline sentinel (#1002) |

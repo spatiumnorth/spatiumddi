@@ -62,6 +62,13 @@ METALLB_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-metallb.tgz
 K3S_MANIFESTS_DIR=/var/lib/rancher/k3s/server/manifests
 BOOTSTRAP_MANIFEST="$K3S_MANIFESTS_DIR/spatium-bootstrap.yaml"
 CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
+# #1448 — the Secret that carries SECRET_KEY + the /metrics token, created by
+# ensure_app_key_secret and NOT owned by Helm, so no helm uninstall can delete
+# it. APP_KEY_STAMP records that it exists, for the one path that cannot ask
+# the apiserver (k3s never became ready).
+APP_KEY_SECRET=spatium-control-app-keys
+CHART_APP_SECRET=spatium-control-spatiumddi-app
+APP_KEY_STAMP=/var/lib/spatiumddi/app-key-secret.done
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
@@ -146,22 +153,76 @@ fi
 
 # ── Host-side state dirs ─────────────────────────────────────────────────────
 # /var/lib/spatiumddi/release-state — trigger files for slot upgrades,
-# host runner state sidecars. Sticky-bit world-write so the supervisor
-# pod (uid varies per image) can drop trigger files without us tracking
-# its in-pod uid.
+# host runner state sidecars. Every root ``spatiumddi-*.path`` runner acts
+# on a file dropped here, so the directory is NOT world-writable
+# (GHSA-h2j9-qrg7-grfw — it used to be 1777, which let any local account
+# drive root actions). 1770 root:$SPATIUM_HOST_GID: the supervisor's
+# pinned in-pod user and the api pod (supplementalGroups) carry that gid.
+# The sticky bit stays so the #786 semantics below are unchanged.
+# systemd-tmpfiles (spatium-release-state.conf) applies the same mode at
+# sysinit, before k3s; this is the belt to that, and what a test can see.
+SPATIUM_HOST_GID=2770
 mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
-chmod 1777 /var/lib/spatiumddi/release-state
+chgrp "$SPATIUM_HOST_GID" /var/lib/spatiumddi/release-state
+chmod 1770 /var/lib/spatiumddi/release-state
 # #786 — the slot-upgrade sidecars are written by the ROOT host runner but
 # must be resettable by the UNPRIVILEGED supervisor container. In a sticky
-# 1777 directory a non-owner can neither overwrite a root-owned 0644 file
-# nor unlink it, so every supervisor-side reset of a failed upgrade
-# silently no-op'd. The runner now publishes them 0666; backfill any that
-# predate that so an upgraded appliance is repaired on its first boot.
+# directory a non-owner can neither overwrite a root-owned 0644 file nor
+# unlink it, so every supervisor-side reset of a failed upgrade silently
+# no-op'd. The runner publishes them group-writable to $SPATIUM_HOST_GID
+# (they were 0666 before GHSA-h2j9-qrg7-grfw); re-mode any that predate
+# that so an upgraded appliance is repaired on its first boot.
 for _sc in /var/lib/spatiumddi/release-state/slot-upgrade-pending.state \
            /var/lib/spatiumddi/release-state/slot-upgrade.progress; do
-    [ -e "$_sc" ] && chmod 0666 "$_sc" 2>/dev/null || true
+    if [ -e "$_sc" ]; then
+        chgrp "$SPATIUM_HOST_GID" "$_sc" 2>/dev/null || true
+        chmod 0660 "$_sc" 2>/dev/null || true
+    fi
 done
 chmod 0755 /var/log/spatiumddi
+
+# The named group behind $SPATIUM_HOST_GID. Nothing on the host needs the
+# NAME to enforce anything (every chgrp above is numeric), but the
+# installer's admin account (uid 1000) is added to it so it keeps reading
+# the k3s kubeconfig without sudo — that file is 0640 root:$SPATIUM_HOST_GID
+# now (config.yaml.d/spatium-kubeconfig.yaml), not 0644. /etc/group is in
+# the /etc overlay, so this runs on every boot to reach existing installs.
+# Best-effort: a gid already taken by another group is left alone.
+if ! getent group "$SPATIUM_HOST_GID" >/dev/null 2>&1; then
+    groupadd -g "$SPATIUM_HOST_GID" spatium-host 2>/dev/null \
+        || echo "WARN: could not create group spatium-host (gid $SPATIUM_HOST_GID)"
+fi
+_admin_user=$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)
+_host_group=$(getent group "$SPATIUM_HOST_GID" 2>/dev/null | cut -d: -f1 || true)
+if [ -n "$_admin_user" ] && [ -n "$_host_group" ] \
+        && ! id -nG "$_admin_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$_host_group"; then
+    usermod -aG "$_host_group" "$_admin_user" 2>/dev/null || true
+fi
+# The cluster-admin kubeconfig: 0640 root:$SPATIUM_HOST_GID, never 0644.
+# k3s applies config.yaml.d/spatium-kubeconfig.yaml itself whenever it
+# (re)writes the file. Two gaps that leaves, both closed here:
+#   * the drop-in ships in the image's /etc, and an existing install's
+#     /etc overlay upper may hold an OPAQUE config.yaml.d (created by the
+#     installer before the image had one), which hides it. Copy it into
+#     the merged view if it is not visible there — a no-op otherwise, so
+#     it never copies up a file the image would later want to change;
+#   * the k3s that wrote the current file may have started before the
+#     drop-in was readable. Re-mode it now, and again once k3s is ready
+#     (tighten_kubeconfig below), by which point k3s has written it.
+_KC_DROPIN=/etc/rancher/k3s/config.yaml.d/spatium-kubeconfig.yaml
+_KC_DROPIN_IMAGE=/usr/lib/etc.image/rancher/k3s/config.yaml.d/spatium-kubeconfig.yaml
+if [ ! -f "$_KC_DROPIN" ] && [ -f "$_KC_DROPIN_IMAGE" ]; then
+    mkdir -p "$(dirname "$_KC_DROPIN")" \
+        && install -m 0644 "$_KC_DROPIN_IMAGE" "$_KC_DROPIN" \
+        || echo "WARN: could not install $_KC_DROPIN"
+fi
+tighten_kubeconfig() {
+    if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+        chgrp "$SPATIUM_HOST_GID" /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+        chmod 0640 /etc/rancher/k3s/k3s.yaml 2>/dev/null || true
+    fi
+}
+tighten_kubeconfig
 
 # /var/lib/spatiumddi/slot-images — OS A/B upgrade images uploaded /
 # imported through the api before the host-side slot-upgrade runner
@@ -360,6 +421,9 @@ if [ ! -f "$ENV_FILE" ]; then
             AGENT_GROUP_VAL="default"
             ;;
     esac
+    # Created 0600 BEFORE anything is written into it, so the secrets
+    # below are never readable by another account, not even briefly.
+    install -m 0600 /dev/null "$ENV_FILE"
     cat > "$ENV_FILE" <<EOF
 # Auto-generated by spatiumddi-firstboot on $(date -Iseconds).
 # Sourced by the spatium-supervisor pod entrypoint at startup.
@@ -379,10 +443,16 @@ APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
 APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
 APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
 EOF
-    # Mode 644 so the supervisor pod's unprivileged user (uid varies
-    # per image) can read the file through the hostPath bind mount
-    # at /etc/spatiumddi-host/.env.
-    chmod 644 "$ENV_FILE"
+fi
+# GHSA-h2j9-qrg7-grfw — 0600 root, on EVERY boot so an appliance whose
+# .env was written 0644 is repaired. It holds POSTGRES_PASSWORD,
+# SECRET_KEY, CREDENTIAL_ENCRYPTION_KEY, the agent PSKs and the pairing
+# code. It used to be 0644 "so the supervisor's unprivileged user can read
+# it"; that user never does — the supervisor entrypoint reads it as root
+# before su-exec, and the api's diagnostics bundle already reports an
+# unreadable file instead of failing.
+if [ -f "$ENV_FILE" ]; then
+    chmod 0600 "$ENV_FILE" || echo "WARN: could not chmod 0600 $ENV_FILE"
 fi
 
 # ── Every boot: reconcile SPATIUMDDI_VERSION + APPLIANCE_VERSION ─────────────
@@ -904,30 +974,35 @@ spec:
   chartContent: ${chart_b64}
   targetNamespace: spatium
   createNamespace: false
-  # #1042 — failurePolicy is deliberately LEFT AT THE CRD DEFAULT ('reinstall').
+  # #1299 — a failed release is UPGRADED again ('retry'), never uninstalled.
   #
-  # The first cut of this fix set 'abort', on the reasoning that a clean
-  # uninstall of a release owning SECRET_KEY is too destructive to self-heal
-  # into. Review measured the cost and it is worse than the disease:
-  # spatiumddi-helm-stuck-recover only acts on a HelmChart carrying a
-  # 'Failed' condition, and only after a 600 s latch, on a 5 min tick. A
-  # release left 'pending-upgrade' by the slot reboot — i.e. exactly the
-  # scenario #1042 was found in — may never set 'Failed' at all, so 'abort'
-  # risks an INDEFINITE outage with no API and no UI, where 'reinstall'
-  # recovers in seconds.
+  # #1042/#1044 kept the CRD default ('reinstall') and relied on the app
+  # Secret's 'helm.sh/resource-policy: keep' to carry SECRET_KEY through the
+  # uninstall half. But 'helm uninstall' keeps only what the release's LAST
+  # stored revision annotates, and after a slot rollback to a release older
+  # than #1044 that revision is the old chart's, which has no 'keep': the
+  # reinstall deleted the Secret, the install's 'lookup' found nothing, and
+  # 'randAlphaNum 64' minted a new SECRET_KEY, orphaning everything
+  # encrypted at rest (#1042's consequences, again). 'abort' was rejected in
+  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.7
+  # and klipper-helm v0.13.3, from k3s v1.36.4+k3s1) does not wait: it runs
+  # 'helm upgrade' on a failed release, and deletes nothing.
   #
-  # What made 'reinstall' dangerous was never the reinstall: it was that the
-  # app Secret lacked 'helm.sh/resource-policy: keep', so the uninstall half
-  # DELETED it and the install half minted a new SECRET_KEY. With the
-  # annotation (charts/spatiumddi/templates/secret.yaml) the Secret survives
-  # the uninstall and the reinstall's 'lookup' finds the same key — the same
-  # mechanism that carried the Postgres and Redis secrets through the very
-  # same event. A reinstall is disruptive and self-healing; it is no longer
-  # lossy, which is the property that actually mattered.
+  # A HelmChartConfig's failurePolicy overrides this one, and its CRD
+  # default is 'reinstall', so pin_control_failure_policy sets 'retry' there
+  # too. That is the half that governs the appliance; see it for the path.
+  failurePolicy: retry
   valuesContent: |
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #1448 — SECRET_KEY lives in a Secret this chart does not own
+    # (ensure_app_key_secret creates it), so no helm uninstall can delete it.
+    # Both lines carry the marker: _strip_control_app_secret removes them if
+    # that Secret could not be ensured, and the chart then keeps managing its
+    # own ${CHART_APP_SECRET} as before.
+    auth:  # spatium:app-key-secret
+      existingSecret: "${APP_KEY_SECRET}"  # spatium:app-key-secret
     # #272 Phase 1 — gate every control-plane workload onto nodes
     # carrying ``spatium.io/role-control-plane=true``. Install-time
     # bakes the label for full-stack + frontend-core variants (see
@@ -1410,6 +1485,67 @@ _strip_control_priority_class() {
     sed -i -E 's/^([[:space:]]*)priorityClassName: "spatium-control-plane"$/\1priorityClassName: ""/' "$1"
 }
 
+# #1299 — pin 'failurePolicy: retry' on the control release's HelmChartConfig.
+#
+# This is the policy helm-controller applies: a HelmChartConfig's failurePolicy
+# overrides its HelmChart's, and the CRD defaults it to 'reinstall', so the
+# HelmChartConfig the supervisor creates (valuesContent only) has meant
+# 'reinstall' whatever _render_control_helmchart says.
+#
+# It is also the half that survives a slot switch. The HelmChart is rewritten
+# by whichever slot boots, and its job runs before this script places its own
+# (place_deferred_control_manifest waits for the CNPG webhook). On the forward
+# boot after a rollback to 2026.09.04-1, helm-controller re-ran the HelmChart
+# the old release had left (its chart, whose app Secret has no 'keep') with
+# this release's klipper-helm; that upgrade failed, the job helm-controller
+# then re-created found the release 'failed' and, under 'reinstall',
+# uninstalled it. Helm keeps only what the last stored revision annotates, so
+# the app Secret was deleted and the install minted a new SECRET_KEY.
+#
+# Nothing an older release runs rewrites a HelmChartConfig's failurePolicy:
+# its supervisor and api only merge-patch valuesContent. So once this release
+# has booted, the job for a stale HelmChart runs under 'retry' as well, on
+# either slot. An older helm-controller hands 'retry' to a klipper-helm that
+# knows only 'reinstall', which treats it as 'abort': a failed control release
+# on such a rolled-back slot waits for an operator instead of being
+# reinstalled, which is what keeps SECRET_KEY.
+#
+# Idempotent, quick, never fatal: an apiserver that does not answer leaves it
+# for the next boot. Inert on a node that does not carry the control chart.
+pin_control_failure_policy() {
+    [ -f "${CONTROL_MANIFEST}.deferred" ] || [ -f "$CONTROL_MANIFEST" ] || return 0
+    local cur
+    if ! cur=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get helmchartconfig spatium-control --ignore-not-found \
+            -o 'jsonpath={.metadata.name}/{.spec.failurePolicy}' 2>/dev/null); then
+        echo "WARN: could not read HelmChartConfig kube-system/spatium-control; failurePolicy not pinned this boot." >&2
+        return 0
+    fi
+    case "$cur" in
+        spatium-control/retry)
+            return 0
+            ;;
+        "")
+            if printf '%s\n' "apiVersion: helm.cattle.io/v1" "kind: HelmChartConfig" \
+                    "metadata:" "  name: spatium-control" "  namespace: kube-system" \
+                    "spec:" "  failurePolicy: retry" \
+                    | /usr/local/bin/k3s kubectl --request-timeout=10s create -f - >/dev/null 2>&1; then
+                echo "Pinned failurePolicy retry on HelmChartConfig kube-system/spatium-control (created)."
+                return 0
+            fi
+            # Raced the supervisor's create: fall through to the patch.
+            ;;
+    esac
+    if /usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            patch helmchartconfig spatium-control \
+            --type merge -p '{"spec":{"failurePolicy":"retry"}}' >/dev/null 2>&1; then
+        echo "Pinned failurePolicy retry on HelmChartConfig kube-system/spatium-control (was '${cur#*/}')."
+    else
+        echo "WARN: could not pin failurePolicy on HelmChartConfig kube-system/spatium-control; retried next boot." >&2
+    fi
+    return 0
+}
+
 release_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
@@ -1649,6 +1785,79 @@ reassert_control_plane_class() {
         >/dev/null 2>&1 || true
 }
 
+# #1448 — keep SECRET_KEY out of Helm's hands.
+#
+# The chart's own Secret (${CHART_APP_SECRET}) is deleted by a helm uninstall
+# unless the STORED release manifest marks it ``keep``, and 2026.09.04-1's does
+# not (#1042 added it later). So on the first upgrade from that release, a
+# failed first ``spatium-control`` install on the new slot made helm-controller
+# uninstall with the old manifest, delete the Secret, and mint a new key on the
+# reinstall: every credential encrypted at rest became unreadable (#1445).
+#
+# This copies secret-key (and metrics-token, generated when the source lacks it,
+# as 2026.09.04-1's does) into ${APP_KEY_SECRET}, which carries no Helm
+# ownership metadata, BEFORE the control chart that points at it is released.
+# A fresh install, with neither Secret, generates both values here.
+#
+# It NEVER overwrites: an existing ${APP_KEY_SECRET} is the key, full stop. And
+# it never generates a key while the chart's own Secret exists without one; that
+# is refused, because a new key there is the bug this exists to prevent.
+# Returns non-zero when it could not make sure the Secret exists; the caller
+# then strips ``auth.existingSecret`` so the chart keeps its own Secret.
+ensure_app_key_secret() {
+    local kc="/usr/local/bin/k3s kubectl -n spatium"
+    # Initialised: this script runs under ``set -u``, where a bare ``local
+    # token`` is unset and the metrics-token check below would abort it.
+    local found="" key="" token=""
+    found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+    if [ -n "$found" ]; then
+        date -Iseconds > "$APP_KEY_STAMP"
+        return 0
+    fi
+    found=$($kc get secret "$CHART_APP_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+    if [ -n "$found" ]; then
+        key=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null) || return 1
+        token=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.metrics-token}' 2>/dev/null) || return 1
+        if [ -z "$key" ]; then
+            echo "WARN: ${CHART_APP_SECRET} exists but carries no secret-key; not generating one (#1448)." >&2
+            return 1
+        fi
+        echo "Copying SECRET_KEY from ${CHART_APP_SECRET} into ${APP_KEY_SECRET} (#1448)"
+    else
+        echo "Generating SECRET_KEY into ${APP_KEY_SECRET} (fresh install, #1448)"
+        key=$(openssl rand -hex 32 | tr -d '\n' | base64 | tr -d '\n')
+    fi
+    [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
+    # Values go through stdin as base64, never argv, so they never show in a
+    # process listing. ``create`` (not ``apply``) fails if the Secret appeared
+    # meanwhile, so a race can only ever keep the existing key.
+    if ! printf '%s\n' \
+        "apiVersion: v1" \
+        "kind: Secret" \
+        "metadata:" \
+        "  name: ${APP_KEY_SECRET}" \
+        "  namespace: spatium" \
+        "  labels:" \
+        "    app.kubernetes.io/name: spatiumddi" \
+        "    app.kubernetes.io/component: app-keys" \
+        "type: Opaque" \
+        "data:" \
+        "  secret-key: ${key}" \
+        "  metrics-token: ${token}" \
+        | $kc create -f - >/dev/null 2>&1; then
+        found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
+        [ -n "$found" ] || return 1
+    fi
+    # Read it back: the copy must be byte-identical to the source key.
+    [ "$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null)" = "$key" ] \
+        || { echo "WARN: ${APP_KEY_SECRET} read back with a different secret-key (#1448)." >&2; return 1; }
+    date -Iseconds > "$APP_KEY_STAMP"
+}
+
+_strip_control_app_secret() {
+    sed -i '/# spatium:app-key-secret$/d' "$1"
+}
+
 place_deferred_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
@@ -1666,6 +1875,11 @@ place_deferred_control_manifest() {
         echo "CNPG webhook ready — applying control chart."
     else
         echo "WARN: CNPG webhook not ready after 4 min — applying control chart anyway (helm-controller retries)." >&2
+    fi
+    if ! ensure_app_key_secret; then
+        echo "WARN: could not ensure ${APP_KEY_SECRET}; releasing the control chart with its own" >&2
+        echo "      ${CHART_APP_SECRET} as before (#1448). Retried on the next boot." >&2
+        _strip_control_app_secret "$deferred"
     fi
     release_control_manifest
 }
@@ -1687,9 +1901,12 @@ for _ in $(seq 1 60); do
     sleep 5
 done
 if [ "$ready" = 1 ]; then
+    tighten_kubeconfig
     date -Iseconds > "$STAMP"
     IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
+    # #1299 — first, while this boot's control chart is still held back.
+    pin_control_failure_policy
     place_deferred_tls_manifest
     reassert_control_plane_class || true
     place_deferred_control_manifest
@@ -1723,6 +1940,13 @@ if [ -f "$TLS_CERT_MANIFEST_DEFERRED" ] && ! node_is_cluster_member; then
     mv -f "$TLS_CERT_MANIFEST_DEFERRED" "$TLS_CERT_MANIFEST"
     chmod 0600 "$TLS_CERT_MANIFEST"
     echo "      placed the staged TLS Secret manifest anyway ($TLS_CERT_MANIFEST)." >&2
+fi
+# #1448 — no apiserver, so ensure_app_key_secret cannot run. Point the chart at
+# the key Secret only if an earlier boot confirmed it exists; otherwise keep the
+# chart on its own Secret, since releasing ``auth.existingSecret`` without the
+# copy is exactly the path that loses the key.
+if [ -f "${CONTROL_MANIFEST}.deferred" ] && [ ! -f "$APP_KEY_STAMP" ]; then
+    _strip_control_app_secret "${CONTROL_MANIFEST}.deferred"
 fi
 release_control_manifest || true
 exit 1

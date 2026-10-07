@@ -41,8 +41,9 @@ cp .env.example .env
 # SECRET_KEY: openssl rand -hex 32  (the api refuses to boot without a real one)
 nano .env
 
-# Build images
-docker compose build
+# Fetch the release images (docker-compose.yml pins pre-built images from
+# ghcr.io; it has no build: sections, so `docker compose build` does nothing)
+docker compose pull
 
 # Run database migrations
 docker compose run --rm migrate
@@ -177,12 +178,9 @@ See [`docs/features/ACME.md`](../features/ACME.md) for the full ACME provider sp
 
 ## 6. PostgreSQL High Availability (Docker Compose)
 
-For single-server deployments, the default single PostgreSQL container is sufficient. For HA:
+The Compose stack runs one PostgreSQL container, and **Compose HA is not supported in 1.0**. For a highly available database, run the OS appliance's multi-node control plane ([Topology 7](TOPOLOGIES.md#topology-7--appliance-multi-node-control-plane-ha-272)) or Kubernetes with CloudNativePG (see `k8s/README.md`).
 
-- **Patroni + etcd + HAProxy**: See `k8s/ha/postgres-docker-compose.yaml`
-- Connect your `.env` `DATABASE_URL` to HAProxy port 5000 (primary) instead of the `postgres` container
-
-For multi-server deployments, use Kubernetes with CloudNativePG (see `k8s/README.md`).
+The repo's `k8s/ha/postgres-docker-compose.yaml` is **not a working HA path**. Layered on this stack, Patroni never starts, the overlay renames the project onto empty volumes, its network does not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing `.env` at HAProxy changes nothing. The file's header lists the details. Making Compose HA real is tracked in [#137](https://github.com/spatiumnorth/spatiumddi/issues/137).
 
 ---
 
@@ -201,18 +199,29 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 > **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
 
 ```bash
-# Pull latest code
+# Refresh docker-compose.yml and .env.example for any new fields
 git pull
 
-# Rebuild images
-docker compose build
+# Fetch the new images. This is the step that upgrades: the compose file
+# pins pre-built images, so `docker compose build` rebuilds nothing, and
+# without a pull `up` keeps running the images already on the host.
+docker compose pull
 
 # Run new migrations (safe to run — Alembic is idempotent)
 docker compose run --rm migrate
 
-# Restart services with zero-downtime rolling update
-docker compose up -d --force-recreate api worker beat frontend
+# Recreate every service whose image changed
+docker compose up -d
 ```
+
+`docker compose pull` and `docker compose up -d` act only on the profiles that
+are active. If you enable the DNS / DHCP / Looking Glass containers through
+`COMPOSE_PROFILES` in `.env`, they are upgraded with the rest. If you start
+them with `--profile` on the command line instead, pass the same `--profile`
+flags to both `pull` and `up -d`, or those containers keep running the old
+images against the newly migrated control plane.
+To upgrade to a specific release rather than the newest, set
+`SPATIUMDDI_VERSION` in `.env` first; see the README's *Upgrading* section.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
 
@@ -312,7 +321,7 @@ gunzip -c postgres-only-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -
 
 ### Redis backup
 
-Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. There's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping — so a Redis backup is generally not needed. For point-in-time disaster recovery, copy the `redis_data` volume alongside the SpatiumDDI archive.
+The Compose Redis runs **without AOF persistence** (`redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru`): at most Redis's default periodic RDB snapshots land in the `redis_data` volume, so a Redis restart can lose queued Celery tasks and cached state. That is by design: there's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping, throttle counters — so a Redis backup is not needed. Cached state is rebuilt and periodic tasks fire again on the next beat tick; a one-off task that was queued but not yet run when Redis restarted (a manual backup run, an ACME order, a scan) is lost and has to be started again. (The Helm chart does run Redis with `--appendonly yes`.)
 
 ---
 

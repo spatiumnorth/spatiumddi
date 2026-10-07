@@ -657,7 +657,7 @@ _CLUSTER_JOIN_MAX_ATTEMPTS = 3
 # #590 — "this terminal verdict has already been delivered" marker.
 #
 # The .state sidecar is written by the ROOT host runner and lives in a
-# 1777-sticky dir, so this unprivileged supervisor cannot delete it — it
+# sticky dir, so this unprivileged supervisor cannot delete it — it
 # would otherwise keep re-reporting a stale ``failed`` from a previous
 # episode. Now that the backend CLEARS the desired-state on a reported
 # ``failed`` (instead of re-firing the join forever), a stale re-report
@@ -907,10 +907,10 @@ def apply_clear_upgrade_command() -> bool:
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
-    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
-    # this file is root-owned (the host runner writes it); a non-owner can
-    # never unlink it, but the runner now publishes it 0666 so an in-place
-    # write succeeds. An empty object reads as "no progress" to every
+    # OVERWRITE rather than unlink. release-state is sticky (1770 root:2770)
+    # and this file is root-owned (the host runner writes it); a non-owner
+    # can never unlink it, but the runner publishes it 0660 to gid 2770,
+    # which this process carries, so an in-place write succeeds. An empty object reads as "no progress" to every
     # consumer, which is what a cleared upgrade should show.
     try:
         if _SLOT_UPGRADE_PROGRESS.exists():
@@ -1093,8 +1093,9 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     The host-config trigger files can carry decrypted secrets — the SNMP
     community, APT private-mirror passwords + GPG armour (#155), the syslog
     forwarding CA material (#156), the SSH config (#157), and the k3s join
-    token (#272) — and they land in the 1777-sticky ``release-state`` dir
-    that any unprivileged host user can list. A plain ``write_text`` then
+    token (#272) — and they land in the shared ``release-state`` dir, which
+    every host account could list while it was 1777 (GHSA-h2j9-qrg7-grfw)
+    and the api pod still can. A plain ``write_text`` then
     ``chmod(0o600)`` left a window where the file existed at the umask
     default (typically 0644, world-readable) before the chmod landed, so a
     local user could race-open the ``.new`` temp and read the secret.
@@ -1155,7 +1156,7 @@ def _fire_host_config(
         tmp = trigger_file.with_suffix(".new")
         # The payload can carry decrypted secrets (SNMP community, APT
         # GPG armour + private-mirror passwords #155, syslog CA #156, the
-        # SSH config #157) and lands in the 1777-sticky release-state dir.
+        # SSH config #157) and lands in the shared, sticky release-state dir.
         # Create it owner-only atomically — see _write_owner_only — so no
         # window exists where another unprivileged host user could read it.
         _write_owner_only(tmp, payload)
@@ -1804,7 +1805,7 @@ def maybe_fire_cluster_join(
         )
         # The join token is a control-plane-admin-equivalent secret; write
         # it owner-only atomically (see _write_owner_only) so it can't be
-        # read by another unprivileged user out of the 1777-sticky dir.
+        # read by another writer of the shared, sticky release-state dir.
         _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
     except OSError:
@@ -3871,6 +3872,21 @@ def read_node_ip() -> str | None:
         if addr.get("type") == "InternalIP" and addr.get("address"):
             return str(addr["address"])
     return None
+
+
+def is_control_plane_member() -> bool:
+    """True when this node is part of the control-plane k3s cluster: installed
+    as a control-plane seed, or an appliance promoted into it whose join the
+    host runner has reported ready.
+
+    The one definition, shared by the heartbeat (which switches to the
+    in-cluster api Service on a member) and the role chart values (whose agents
+    must switch with it, #1281), so the two cannot disagree about a node.
+    """
+    if detect_appliance_variant() == "control-plane":
+        return True
+    join_state, _ = read_cluster_join_state()
+    return join_state == "ready"
 
 
 # ── Issue #285 Phase 1 — fleet-firewall prerequisites ────────────────

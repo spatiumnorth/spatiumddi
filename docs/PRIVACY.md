@@ -27,14 +27,13 @@ profiling, the Operator Copilot's LLM provider, Let's Encrypt,
 blocklist feeds, cloud DNS / integration mirrors, the whois and RBL
 tools) are off until you configure them,
 and the table below lists exactly what each one sends and to whom.
-
 There is no telemetry endpoint to opt out of, because there is no
 telemetry endpoint. That is a design constraint, not a current state:
 [CLAUDE.md](https://github.com/spatiumnorth/spatiumddi/blob/main/CLAUDE.md)
 non-negotiable #17 forbids adding one, and a CI test
 (`backend/tests/test_outbound_hosts_documented.py`) fails the build
-when a hostname appears in the backend that is not documented on this
-page.
+when a hostname appears in the backend or the agents that is not
+documented on this page.
 
 ---
 
@@ -46,7 +45,7 @@ page.
 | Crash / error reporting | None. Errors go to your structured logs and the in-app diagnostics table. No Sentry, no Bugsnag, no third-party error sink. |
 | Accounts / registration / licensing | None. SpatiumDDI has no account system of its own, no activation, no entitlement check, and no trial timer. Apache 2.0, run it. |
 | Your DDI data | Never leaves your PostgreSQL unless you configure something that sends it (an integration to your own controller, a backup target you own, an alert webhook you point somewhere). |
-| Web UI tracking | The frontend loads no external script, font, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. |
+| Web UI tracking | The frontend loads no external script, font, image, or CDN asset. `frontend/index.html` pulls exactly one file: the app bundle from your own server. (Until #1353 the MFA enrolment screen fetched its QR code from `api.qrserver.com`, sending the TOTP secret with it; see §8.) One exception, on one page: the API reference at `/api/redoc` shows ReDoc's "API docs by Redocly" footer logo, an image your browser fetches from `cdn.redoc.ly` when you open that page, carrying nothing but your IP address and the usual browser headers (the Content-Security-Policy allows it there and nowhere else). Blocked or air-gapped, the page loses only the logo. |
 | Docs site tracking | `www.spatiumddi.com` is a static Jekyll site with no analytics tag, no tracker pixel, and no third-party font or CDN include. |
 
 ## 2. The one connection that is on by default
@@ -78,8 +77,9 @@ product degrades — you simply do not get the "update available" pill.
 
 ## 3. Every outbound connection, in full
 
-This table is normative. A hostname that appears in `backend/app` and
-not here fails CI (see §8).
+This table is normative. A hostname that appears in `backend/app` or
+in an agent package under `agent/` — or a public IP address in an agent
+package — and not here fails CI (see §8).
 
 ### 3.1 Enabled by default
 
@@ -113,7 +113,7 @@ nothing here runs on a schedule.
 | `api.openai.com`, `generativelanguage.googleapis.com`, Azure OpenAI (`<your-resource>.openai.azure.com`), Anthropic | Operator Copilot | off; no provider is configured out of the box | **Sends prompts and tool results** — which can include hostnames, subnets and record data — to whichever provider you point it at. Can be fully on-prem: Ollama, vLLM and LocalAI all work through the `openai_compat` driver, in which case nothing leaves your network. |
 | `acme-v02.api.letsencrypt.org`, `acme-staging-v02.api.letsencrypt.org`, or any ACME directory you name | Embedded ACME client (#438) | off | A standard ACME order: the domains you are requesting a certificate for. Those names end up in public Certificate Transparency logs — that is how public CAs work, not something SpatiumDDI adds. |
 | Blocklist feed hosts (Hagezi, OISD, AdGuard, urlhaus, phishing.army, … — the catalogue is `backend/app/data/dns_blocklist_catalog.json`) | RPZ blocking lists | off per list | Nothing — an HTTPS download of the list, once per refresh interval, per list you subscribed to. |
-| `api.cloudflare.com`, `dns.hetzner.com`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
+| `api.cloudflare.com`, `api.hetzner.cloud`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
 | `api.meraki.com`, `api.netbird.io`, `api.tailscale.com`, `login.tailscale.com`, `api.ui.com` | Vendor-hosted integration mirrors (Meraki, NetBird, Tailscale, UniFi cloud) | off; one target row each | Read-only API calls with your credentials to your own tenant. Self-hosted integrations (Proxmox, OPNsense, PAN-OS, FortiGate, Kubernetes, Docker, …) reach only the address you type. |
 | `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment | off (`bgp.*` feature modules) | The ASN or prefix being enriched. |
 | Your alert / notification endpoints (Slack webhook, generic webhook, SMTP relay) | Alerting | off until a channel is configured | The alert payload, to the URL or relay you entered. |
@@ -137,10 +137,45 @@ network the way Debian hosts do:
 None of this is SpatiumDDI-specific traffic and none of it carries
 your DDI data.
 
+### 3.5 DNS and DHCP servers SpatiumDDI runs
+
+The connections above are made by the control plane or the appliance
+host. The DNS and DHCP service containers otherwise reach the control
+plane and the addresses you configure on them (forwarders, failover
+peers, DDNS targets) — plus whatever answering your clients' queries
+needs, since they are DNS servers: a recursive BIND9 group with no
+forwarders resolves from the root servers, as any recursive resolver
+does. SpatiumDDI picks no upstream for them.
+
+**PowerDNS ALIAS records** resolve their targets at query time through
+the group's own forwarders, over plain DNS (port 53): the list you set
+under the group's server options, which a PowerDNS group otherwise does
+not use. With no forwarders, or with forwarders over TLS, HTTPS or QUIC
+(which PowerDNS's `resolver=` cannot speak, and which SpatiumDDI will not
+downgrade to plaintext), ALIAS expansion is off and the API refuses a new
+ALIAS record. Builds before #1353 rendered `resolver=1.1.1.1,8.8.8.8`
+into every PowerDNS server instead, sending ALIAS targets to Cloudflare
+and Google; an upgrade replaces it. A PowerDNS group that already serves
+ALIAS records and has no forwarders stops expanding them (A and AAAA
+queries for those names get no answer) until you set forwarders.
+
+PowerDNS's own **security-status polling** (a TXT query for
+`auth-<version>.security-status.secpoll.powerdns.com`, which names the
+version you run) is turned off: SpatiumDDI renders an empty
+`security-poll-suffix`. Builds before #1353 sent it from every
+PowerDNS server at startup and periodically; the setting takes effect
+the next time the PowerDNS container starts, which an upgrade does.
+The optional **dnsdist front** (Docker Compose only) has the same
+feature, also on by default, querying
+`dnsdist-<version>.security-status.secpoll.powerdns.com` through the
+container's system resolver; its entrypoint now writes an empty
+`setSecurityPollSuffix("")`, which turns it off from the next restart.
+
 ## 4. Air-gapped operation
 
-Every feature works with all of the above blocked. That is not a
-claim about the happy path — it is non-negotiable #5 in the project's
+Every feature works with all of the above blocked. Builds before #1353
+were the exception: a PowerDNS server group needed a route to `1.1.1.1` /
+`8.8.8.8` to start (§3.5). This is not a claim about the happy path — it is non-negotiable #5 in the project's
 own build rules: **DNS and DHCP service containers cache their
 last-known-good config locally and keep serving when the control plane
 is unreachable**, and by the same logic nothing in the control plane
@@ -214,38 +249,72 @@ SpatiumDDI is built to be delegated without handing over everything:
 ## 8. Keeping this page true
 
 A privacy statement rots the first time somebody adds a convenience
-fetch. Two guards keep this one honest:
+fetch. Three guards keep this one honest:
 
 * **`backend/tests/test_outbound_hosts_documented.py`** walks
-  `backend/app` for hostname literals and asserts every one of them
-  appears on this page. A new outbound host fails CI until it is
-  documented here, with its default and its payload. Editing this file
-  runs that suite (it is a declared carve-out in
+  `backend/app` and the four shipped agent packages
+  (`agent/{dns,dhcp,looking-glass,supervisor}/spatium_*`) for hostname
+  literals, and the agent packages for public IP addresses in string
+  values, and asserts every one of them appears on this page. A new
+  outbound host fails CI until it is documented here, with its default
+  and its payload. Editing this file or an agent package runs that
+  suite (both are declared carve-outs in
   `.github/scripts/ci-backend-must-run.txt`).
+* **`frontend/src/lib/outbound-hosts.test.ts`** does the same for the
+  Web UI: every hostname in a string literal, template or JSX text under
+  `frontend/src`, in `frontend/index.html`, and in the web tier's
+  `frontend/default.conf.template` (its Content-Security-Policy), must
+  appear on this page.
+  It matches every host rather than only `src=` / `fetch(` uses, because
+  a URL built into a variable and handed to an `<img>` later is
+  indistinguishable from a link by syntax. That is exactly how the MFA
+  enrolment screen sent each user's TOTP secret, inside the `otpauth://`
+  URI, to `api.qrserver.com` to draw its QR code, from the release that
+  added MFA (2026.05.05-1) until #400's Content-Security-Policy began
+  blocking the request in 2026.06.13-1. The code is now drawn in the
+  browser. If your account enrolled MFA on a release in that range,
+  disable and re-enrol it to get a secret nobody else has seen. The test
+  runs in the Frontend Lint job, which runs on every pull request,
+  including one that only edits this page.
 * **CLAUDE.md non-negotiable #17** — *No telemetry.* Never add an
   outbound connection that is not operator-configured and documented
   here; anything default-on needs an issue and a decision, not a PR.
 
-The guard covers Python source under `backend/app`. Two things it
-cannot see, and which therefore need a human: hostname literals in the
-appliance's **shell** scripts under
+The guard covers Python source under `backend/app` and the agent
+packages; the agents' `tests/` directories are not shipped and are not
+scanned. It looks for IP addresses in the agents only: in the backend
+they are almost all example addresses in tool descriptions, and the
+hardcoded PowerDNS resolvers in §3.5, which this page once missed,
+are IP addresses in agent code, which a hostname scan cannot see.
+Its hostname scan reads hosts out of `http://` and `https://` URLs, so
+a hostname written bare (a resolver name, a `tls://` endpoint) is not
+seen either. The things it cannot see, and which therefore need a
+human: hostname literals in the appliance's **shell** scripts under
 `appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
-§3.4.1's rows were written by hand and the next `curl` added to the
-installer will pass CI with nothing to catch it; hosts assembled at
-runtime from operator input (which is the point — those are *your*
-endpoints); and the feed catalogues in `backend/app/data/`, whose
-entries are all opt-in downloads covered by the blocklist row above.
+§3.4's rows were written by hand and the next `curl` added to the
+installer will pass CI with nothing to catch it; the same for the
+agent images' entrypoints and config files under `agent/*/images/`;
+connections a bundled daemon (BIND9, PowerDNS, dnsdist, Technitium,
+Kea, GoBGP) makes on its own built-in defaults, which appear in no
+SpatiumDDI source at all; hosts assembled at runtime from operator
+input (which is the point — those are *your* endpoints); public IP
+addresses in the backend; and the feed catalogues in
+`backend/app/data/`, whose entries are all opt-in downloads covered by
+the blocklist row above.
 
 If you find a connection this page does not describe, that is a bug —
 please [open an issue](https://github.com/spatiumnorth/spatiumddi/issues/new).
 
 ## Appendix — hostnames in the source that are not connections
 
-The guard in §8 matches text, so these appear in `backend/app` and are
-listed here to keep the check honest. **None of them is contacted.**
+The guard in §8 matches text, so these appear in `backend/app` or an
+agent package and are listed here to keep the check honest. **None of
+them is contacted.**
 
 **Documentation and homepage links** (shown in the UI or written in a
-comment, never fetched): `www.spatiumddi.com` (the ACME
+comment, never fetched): `github.com` (issue links in agent docstrings —
+the installer's SSH-key fetch in §3.4 is a separate use),
+`www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
@@ -269,6 +338,21 @@ Nexus or internal receiver), `my-resource.openai.azure.com`,
 `pdns.internal`, `tdns.internal`,
 `api.meraki.cn` (named in a docstring as the regional shard a
 China-based operator would enter).
+
+**In the Web UI** (`frontend/src`, checked by the second guard in §8),
+none of them loaded by the browser: links in help text
+(`en.wikipedia.org`, the timezone list; `docs.docker.com`;
+`app.netbird.io` and `unifi.ui.com`, where to find an API key); example
+values in placeholders (`automation.example.com`, `boot.example`,
+`cloud.example.org`, `collector.example.com`, `example.com`,
+`idp.example.com`, `k8s.example.com`, `login.example.com`,
+`netbird.example.com`, `netbox.internal`, `proxy.internal`, and the
+URL shapes of a public calendar feed and of chat webhooks:
+`calendar.google.com`, `hooks.slack.com`, `discord.com`); and two form
+presets the control plane contacts only once you save a provider with
+them, as your own endpoint: `login.microsoftonline.com` (the Entra ID
+OIDC discovery URL) and `host.docker.internal` (a local Ollama for the
+Copilot).
 
 **In-cluster addresses**, which never leave the node:
 `spatium-control-spatiumddi-api.spatium.svc.cluster.local` — the

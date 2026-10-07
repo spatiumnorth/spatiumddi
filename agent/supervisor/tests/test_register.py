@@ -8,9 +8,12 @@ import httpx
 import pytest
 
 from spatium_supervisor.identity import load_or_generate
+from spatium_supervisor import register as register_mod
 from spatium_supervisor.register import (
+    RegisterCodeRejected,
     RegisterDisabled,
     RegisterFatal,
+    RegisterThrottled,
     register,
 )
 
@@ -164,3 +167,65 @@ def test_register_422_raises_fatal(tmp_path: Path) -> None:
             client=_client_for(handler),
             backoff_seconds=0,
         )
+
+
+# ── #1356: the control plane budgets registration attempts ─────────────────
+
+
+def _kwargs(tmp_path: Path, handler) -> dict:
+    identity, _ = load_or_generate(tmp_path)
+    return dict(
+        control_plane_url="https://ddi.example.com",
+        pairing_code="12345678",
+        identity=identity,
+        hostname="x",
+        supervisor_version="dev",
+        client=_client_for(handler),
+        backoff_seconds=0,
+    )
+
+
+def test_register_429_stops_the_round_without_retrying(tmp_path: Path) -> None:
+    """Retrying every couple of seconds cannot beat a 15-minute window."""
+    calls = {"n": 0}
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "900"}, json={})
+
+    with pytest.raises(RegisterThrottled):
+        register(**_kwargs(tmp_path, handler))
+    assert calls["n"] == 1
+
+
+def test_register_403_is_a_rejected_code(tmp_path: Path) -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={})
+
+    with pytest.raises(RegisterCodeRejected):
+        register(**_kwargs(tmp_path, handler))
+    assert issubclass(RegisterCodeRejected, RegisterFatal)
+
+
+def test_register_503_honours_a_capped_retry_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(register_mod.time, "sleep", slept.append)
+    responses = iter(
+        [
+            httpx.Response(503, headers={"Retry-After": "60"}, text="paused"),
+            httpx.Response(503, headers={"Retry-After": "nonsense"}, text="paused"),
+            httpx.Response(
+                200,
+                json={
+                    "appliance_id": "11111111-2222-3333-4444-555555555555",
+                    "state": "pending_approval",
+                    "public_key_fingerprint": "fp",
+                    "session_token": "tok",
+                },
+            ),
+        ]
+    )
+    register(**_kwargs(tmp_path, lambda _req: next(responses)))
+    assert slept == [register_mod._MAX_RETRY_AFTER_S, 0]

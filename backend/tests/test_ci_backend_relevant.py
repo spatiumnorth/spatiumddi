@@ -53,12 +53,23 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_openapi_export.py": "scripts/export_openapi.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",
     "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
-    "test_outbound_hosts_documented.py": "docs/PRIVACY.md",
+    # #1353 — the outbound-host guard scans the four shipped agent packages
+    # as well as backend/app, so an agent-only PR adding a host must run it.
+    "test_outbound_hosts_documented.py": (
+        "docs/PRIVACY.md",
+        "agent/dhcp/spatium_dhcp_agent/",
+        "agent/dns/spatium_dns_agent/",
+        "agent/looking-glass/spatium_lg_agent/",
+        "agent/supervisor/spatium_supervisor/",
+        # ...and checks each scanned package is a carve-out in the manifest.
+        ".github/scripts/ci-backend-must-run.txt",
+    ),
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
+    "test_format_release_notes.py": "scripts/format_release_notes.py",
     "test_release_tags_script.py": ".github/scripts/release-tags.sh",
     "test_trivy_scan_script.py": ("scripts/trivy-scan.sh", "Makefile"),
     "test_trivy_scheduled_report.py": ".github/workflows/trivy-scheduled.yml",
@@ -148,6 +159,14 @@ def test_backend_paths_run_the_suite(path: str) -> None:
             "test_appliance_firewall_render.py imports this by path",
         ),
         (
+            "agent/dns/spatium_dns_agent/drivers/powerdns.py",
+            "test_outbound_hosts_documented.py scans the shipped agent packages (#1353)",
+        ),
+        (
+            "agent/looking-glass/spatium_lg_agent/rib.py",
+            "test_outbound_hosts_documented.py scans the shipped agent packages (#1353)",
+        ),
+        (
             ".github/scripts/ci-backend-relevant.sh",
             "the gate itself — an edit must run the suite that pins it",
         ),
@@ -208,9 +227,12 @@ def test_known_irrelevant_paths_skip_the_suite(path: str) -> None:
         ".github/workflows/release.yml",
         ".github/workflows/docs-publish.yml",
         ".github/dependabot.yml",
-        "agent/dns/spatium_dns_agent/sync.py",
         "agent/dhcp/images/kea/Dockerfile",
-        "agent/looking-glass/spatium_lg_agent/rib.py",
+        # An agent's own tests are not shipped, so the outbound-host guard
+        # (#1353) does not scan them and they stay denied.
+        "agent/dns/tests/test_sync.py",
+        "agent/looking-glass/tests/test_tls_verify.py",
+        "agent/dns/README.md",
         "appliance/mkosi.conf",
         "appliance/mkosi.extra/etc/motd",
     ],

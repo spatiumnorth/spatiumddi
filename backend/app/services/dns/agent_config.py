@@ -22,7 +22,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
@@ -51,12 +51,15 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.named_conf_validation import (
+    UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
     order_acls_for_render,
+    split_zone_forwarders,
     validate_acl_name,
     validate_address_match_list,
+    validate_update_acl_entry,
 )
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -64,7 +67,15 @@ from app.services.dns.pool_geo import (
     records_for_view,
     view_renders_zone,
 )
-from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.powerdns_alias import alias_resolver
+from app.services.dns.record_ops import (
+    QUEUED_OP_STATES,
+    RRSET_KEY_CHUNK,
+    op_rrset_key,
+    rrset_match_where,
+    supersede,
+)
+from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
@@ -191,6 +202,76 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         return sorted(prepared, key=lambda a: a["name"])
 
 
+def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A zone's dynamic-update ACL with every unrenderable entry removed (#1357).
+
+    ``name_pattern`` and ``record_types`` reach the agent's ``update-policy``
+    rule verbatim, and were unvalidated before #1357 — so, as with the named
+    ACLs above, a row stored before that would make BIND refuse the whole
+    group's config on the next render. Such an entry is left out, loudly.
+
+    How it is left out depends on the action, because ``update-policy`` is
+    first-match. Dropping a bad ``grant`` only ever removes permission.
+    Dropping a bad ``deny`` would let the grants BELOW it match updates it
+    was refusing, so a bad ``deny`` drops every entry after it as well: what
+    remains is a prefix of the operator's policy, which can only grant less
+    than the whole of it did.
+    """
+    kept: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        if entry.get("match_kind") != "tsig_key" or not entry.get("tsig_key_name"):
+            # Never reaches an ``update-policy`` rule (the agent skips it), so
+            # its fields cannot break the config — and dropping a ``deny``
+            # here would take every valid entry after it down for nothing.
+            kept.append(entry)
+            continue
+        # The agent renders the name only for a scope that carries one; a
+        # value left over on a ``zonesub`` entry is never written.
+        scope = entry.get("name_scope")
+        pattern = entry.get("name_pattern") if scope in UPDATE_POLICY_NAMED_SCOPES else None
+        try:
+            # Validity only: a renderable row ships as stored, so a bundle
+            # that was fine before #1357 keeps its ETag.
+            validate_update_acl_entry(scope, pattern, entry.get("record_types"))
+        except ViewValidationError as exc:
+            deny = entry.get("action") == "deny"
+            logger.warning(
+                "dns_update_acl_entry_dropped_unrenderable",
+                zone_id=str(zone_id),
+                action=entry.get("action"),
+                field=exc.field,
+                value=exc.value,
+                error=str(exc),
+                entries_after_dropped=(len(entries) - index - 1) if deny else 0,
+            )
+            if deny:
+                break
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _safe_zone_forwarders(zone: Any) -> list[str]:
+    """A BIND9 zone's forwarders with every unrenderable entry removed (#1357).
+
+    The BIND9 agent renders them into ``forwarders { … };`` and they were
+    unvalidated before #1357 (an import or an old row could carry a
+    hostname). A bad entry is dropped, loudly, rather than making BIND refuse
+    the whole group's config; a forward zone left with none is skipped by
+    the agent, as it always has been.
+    """
+    kept, dropped = split_zone_forwarders(list(getattr(zone, "forwarders", []) or []))
+    for value, error in dropped:
+        logger.warning(
+            "dns_zone_forwarder_dropped_unrenderable",
+            zone=getattr(zone, "name", None),
+            zone_id=str(getattr(zone, "id", "")),
+            value=value,
+            error=error,
+        )
+    return kept
+
+
 @dataclass(frozen=True)
 class RenderedBody:
     """The bundle minus its per-poll parts (#1111).
@@ -289,6 +370,10 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
                     "record_types": acl.record_types,
                 }
             )
+        update_acls_by_zone = {
+            zone_id: _safe_update_acl(zone_id, entries)
+            for zone_id, entries in update_acls_by_zone.items()
+        }
 
     # Every record of every zone in ONE query, as column rows rather than
     # ORM instances. This was one ``select(DNSRecord)`` per zone inside the
@@ -368,6 +453,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         pol = dnssec_policies_by_id.get(pid)
         return pol.name if pol is not None else None
 
+    # #1171 — whether the group's zones go out with their own SOA timers or the
+    # literal every BIND9 agent of an older release writes (``soa_timers``).
+    serves_soa_timers = bool(
+        await db.scalar(
+            select(DNSServerGroup.serves_soa_timers).where(DNSServerGroup.id == server.group_id)
+        )
+    )
+
     zone_payload: list[dict[str, Any]] = []
     for z in zones:
         base_zp: dict[str, Any] = {
@@ -384,7 +477,11 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # authoritative serial the agent renders from.
             "serial": getattr(z, "last_serial", 0),
             # Forward-zone-only fields (ignored by the agent for other types).
-            "forwarders": list(getattr(z, "forwarders", []) or []),
+            "forwarders": (
+                _safe_zone_forwarders(z)
+                if server.driver == "bind9" and getattr(z, "zone_type", None) == "forward"
+                else list(getattr(z, "forwarders", []) or [])
+            ),
             "forward_only": bool(getattr(z, "forward_only", True)),
             # Secondary / stub primaries (issue #336). The agent renders these
             # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
@@ -413,6 +510,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
             "primary_ns": getattr(z, "primary_ns", "") or "",
             "admin_email": getattr(z, "admin_email", "") or "",
+            # #1171 — the zone's SOA timers. Stored, editable, exported and in
+            # the control plane's own zone template, never shipped, so the
+            # BIND9 agent wrote 3600/600/86400/300 into every zone's SOA. Like
+            # the apex above they are structural (zones_structural keeps them),
+            # so an edit re-renders the zone. That literal instead while a
+            # BIND9 agent of the group still writes it, so the group serves
+            # one SOA per serial (``soa_timers.served_soa_timers``).
+            **served_soa_timers(z, serves_soa_timers),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
@@ -462,12 +567,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
     tsig_keys: list[dict[str, Any]] = []
-    if grp and grp.tsig_key_name and grp.tsig_key_secret:
+    if (group_key := legacy_group_key(grp)) is not None:
         tsig_keys.append(
             {
-                "name": grp.tsig_key_name,
-                "secret": grp.tsig_key_secret,
-                "algorithm": grp.tsig_key_algorithm,
+                "name": group_key.name,
+                "secret": group_key.secret,
+                "algorithm": group_key.algorithm,
             }
         )
 
@@ -573,6 +678,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if server.driver == "powerdns":
+        # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
+        # forwarders, or "" for ALIAS off. Never a built-in public resolver.
+        # PowerDNS-only, so no other driver's structural etag moves with it.
+        options_block["alias_resolver"] = alias_resolver(
+            getattr(opts, "forwarders", []) if opts else [],
+            getattr(opts, "forward_transport", "do53") if opts else "do53",
+        )
     # Built from the unified descriptor list so operator split-horizon
     # views (issue #24), synthesized geo views + the geo catch-all
     # (issue #530) all render. Already ordered low→high so the rendered
@@ -601,7 +714,8 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # no legacy key ships none, and its views render as before. The secret rides
     # the bundle body under the same trust model as ``tsig_keys``, and
     # ``views`` is structural, so a group-key rotation re-renders the views.
-    group_key = legacy_group_key(grp)
+    # ``group_key`` is the legacy key resolved for ``tsig_keys`` above; it is
+    # not re-read here, so the secret is decrypted once per render.
     if group_key is not None:
         for view_entry in views_block:
             vkey = view_transfer_key(group_key, view_entry["name"])
@@ -1010,8 +1124,11 @@ async def page_pending_ops(
     with the gate in place a secondary's ops sat in ``state=pending``
     forever. Marked ``in_flight`` on dispatch so the same op doesn't re-ship
     on every long-poll cycle until the agent's next heartbeat acks it; a
-    failure ack resets it to pending (attempt++), and after 5 failures it
-    becomes ``failed`` and stays out.
+    failure ack returns it to pending with a backoff, and after
+    ``MAX_OP_ATTEMPTS`` it becomes ``failed`` (#1232). One never acknowledged
+    is returned to the retry path by the heartbeat
+    (``record_ops.reset_unacknowledged_ops``), and an op backing off is
+    retired (``superseded``) once a newer op for its RRset ships.
 
     One PAGE of the queue, never the whole backlog: the agent applies a page
     and acks it on its next heartbeat; the page it was shipped is
@@ -1038,8 +1155,14 @@ async def page_pending_ops(
     """
     if server.maintenance_mode:
         return [], 0
+    now = datetime.now(UTC)
     batch = max(1, int(settings.dns_agent_ops_batch))
-    conds: list[Any] = [DNSRecordOp.server_id == server.id, DNSRecordOp.state == "pending"]
+    conds: list[Any] = [
+        DNSRecordOp.server_id == server.id,
+        DNSRecordOp.state == "pending",
+        # #1232 — an op backing off after a failed attempt waits its turn.
+        or_(DNSRecordOp.next_attempt_at.is_(None), DNSRecordOp.next_attempt_at <= now),
+    ]
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
@@ -1055,6 +1178,7 @@ async def page_pending_ops(
         remaining = int((await db.execute(select(func.count()).where(*conds))).scalar_one()) - len(
             ops_to_dispatch
         )
+    await _supersede_backed_off_ops(db, server, ops_to_dispatch, now)
     page: list[dict[str, Any]] = []
     for op in ops_to_dispatch:
         page.append(
@@ -1064,12 +1188,62 @@ async def page_pending_ops(
                 "op": op.op,
                 "record": op.record,
                 "target_serial": op.target_serial,
+                # #1232 — which dispatch this is; the agent echoes it in its
+                # ack, so a late ack for an earlier dispatch is not charged
+                # to this one.
+                "dispatch": op.attempts,
             }
         )
         op.state = "in_flight"
+        # The dispatch time: the stale-``in_flight`` reset measures from it.
+        op.updated_at = now
     if ops_to_dispatch:
         await db.flush()
     return page, remaining
+
+
+async def _supersede_backed_off_ops(
+    db: AsyncSession, server: DNSServer, shipping: list[DNSRecordOp], now: datetime
+) -> None:
+    """Retire an op waiting out a backoff once a newer op for its RRset ships.
+
+    Every op carries the whole desired RRset (#773), so the newer op delivers
+    the older one's change; left alone, the older op would retry after it and
+    put the RRset back the way it was. Only ops still backing off are
+    candidates — anything older and ready ships ahead in the same page — and
+    only those for an RRset in this page, matched in SQL: a bulk backlog that
+    failed can leave hundreds of thousands of ops backing off, and loading
+    them on every page is what paging exists to avoid. Strictly older only;
+    ops queued by one transaction share ``created_at``.
+    """
+    newest: dict[tuple[str, str, str], DNSRecordOp] = {}
+    for op in shipping:
+        key = op_rrset_key(op)
+        if key is not None:
+            newest[key] = op  # the page is oldest-first; the last one wins
+    if not newest:
+        return
+    keys = sorted(newest)
+    for i in range(0, len(keys), RRSET_KEY_CHUNK):
+        waiting = (
+            (
+                await db.execute(
+                    select(DNSRecordOp).where(
+                        DNSRecordOp.server_id == server.id,
+                        DNSRecordOp.state == "pending",
+                        DNSRecordOp.next_attempt_at > now,
+                        rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for op in waiting:
+            key = op_rrset_key(op)
+            successor = newest.get(key) if key is not None else None
+            if successor is not None and successor.created_at > op.created_at:
+                supersede(op, successor.id, now)
 
 
 def compose_bundle(

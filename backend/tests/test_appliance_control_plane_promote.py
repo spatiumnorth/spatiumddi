@@ -902,3 +902,181 @@ async def test_replace_accepts_a_failed_joiner_whose_retry_is_still_pending(
     # Replace ends the pending retry: no desired role, no join coordinates left behind.
     assert stuck.desired_cluster_role is None
     assert stuck.desired_k3s_server_url is None
+
+
+# ── promote while an eviction is pending (#1284) ─────────────────────
+
+
+async def test_promote_refused_while_the_row_is_still_being_evicted(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Replace clears the row's roles at once, so a guard reading only the
+    roles let a promote through while the seed was still evicting the row.
+    Until the seed confirms, it removes every etcd member named
+    `<hostname>-<8 hex>` on each heartbeat: the node would join, become a
+    voter and lose its member on the seed's next tick."""
+    token = await _admin(db_session)
+    await _seed(db_session)
+    await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    joiner = await _appliance(
+        db_session,
+        "m2",
+        appliance_variant="appliance",
+        cluster_join_state="failed",
+        cluster_join_reason="could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380",
+        node_ip="10.0.0.3",
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{joiner.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/promote",
+        json={"appliance_ids": [str(joiner.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "still being evicted" in resp.text
+    await db_session.refresh(joiner)
+    assert joiner.desired_cluster_role is None
+    assert joiner.evict_requested is True
+    assert joiner.cluster_join_state == "evicting"
+
+
+@pytest.mark.parametrize("hostname", ["m3", "M3"])
+async def test_promote_refused_for_a_box_sharing_a_hostname_being_evicted(
+    db_session: AsyncSession, client: AsyncClient, hostname: str
+) -> None:
+    """A replacement box installed under the dead node's hostname is a row of
+    its own, but the seed matches etcd members by hostname: promoted while the
+    old row is still evicting, its new member would be removed as the old
+    one's. Compared case-blind, so a variant spelling is held too."""
+    token = await _admin(db_session)
+    await _seed(db_session)
+    await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    await _appliance(
+        db_session,
+        "m3",
+        appliance_variant="appliance",
+        cluster_join_state="evicting",
+        evict_requested=True,
+        node_ip="10.0.0.3",
+    )
+    fresh = await _appliance(
+        db_session, hostname, appliance_variant="appliance", node_ip="10.0.0.9"
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/promote",
+        json={"appliance_ids": [str(fresh.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "still being evicted" in resp.text
+    await db_session.refresh(fresh)
+    assert fresh.desired_cluster_role is None
+    assert fresh.cluster_join_state is None
+
+
+async def test_a_settled_eviction_can_be_promoted_again(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The guard ends with the eviction. Once the row reads `left` the same
+    node can be promoted again (why Replace accepts a failed joiner), and so
+    can a box under the same hostname: the seed ends its late-arrival watch on
+    a name it is asked to join."""
+    token = await _admin(db_session)
+    await _seed(db_session)
+    await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    evicted = await _appliance(
+        db_session,
+        "m2",
+        appliance_variant="appliance",
+        cluster_join_state="left",
+        evict_requested=False,
+        node_ip="10.0.0.3",
+    )
+    await _appliance(
+        db_session,
+        "m4",
+        appliance_variant="appliance",
+        cluster_join_state="left",
+        evict_requested=False,
+        node_ip="10.0.0.4",
+    )
+    namesake = await _appliance(db_session, "m4", appliance_variant="appliance", node_ip="10.0.0.9")
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/promote",
+        json={"appliance_ids": [str(evicted.id), str(namesake.id)]},
+        headers=_hdr(token),
+    )
+    # seed + m1 + two promoted would be four: the count guard, not the
+    # eviction guard, must be what answers.
+    assert resp.status_code == 422, resp.text
+    assert "ODD" in resp.text
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/promote",
+        json={"appliance_ids": [str(evicted.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(evicted)
+    assert evicted.desired_cluster_role == "member"
+    assert evicted.cluster_join_state == "joining"
+
+
+# ── #1543: nothing reshapes the cluster mid-upgrade ──────────────────────────
+
+_GUARDED = (
+    "promote_control_plane",
+    "demote_control_plane",
+    "replace_control_plane_member",
+    "restore_etcd_snapshot",
+    "schedule_appliance_upgrade",
+    "schedule_appliance_set_next_boot",
+    "schedule_appliance_set_default_slot",
+)
+
+
+def test_every_cluster_reshaping_handler_checks_for_an_upgrade_in_flight() -> None:
+    """``assert_no_upgrade_in_flight`` existed for exactly these paths, and
+    only backup and factory reset called it."""
+    import inspect
+
+    from app.api.v1.appliance import supervisor
+
+    missing = [
+        name
+        for name in _GUARDED
+        if "assert_no_upgrade_in_flight(" not in inspect.getsource(getattr(supervisor, name))
+    ]
+    assert missing == []
+
+
+async def test_demote_refused_mid_upgrade(db_session: AsyncSession, client: AsyncClient) -> None:
+    from app.models.system_upgrade import SystemUpgradeRun
+
+    token = await _admin(db_session)
+    await _seed(db_session)
+    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER)
+    m2 = await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER)
+    db_session.add(SystemUpgradeRun(kind="rolling", state="running", target_version="2026.10.06-1"))
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/demote",
+        json={"appliance_ids": [str(m1.id), str(m2.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "rolling upgrade" in resp.text
+    await db_session.refresh(m1)
+    assert m1.cluster_join_state != "leaving"

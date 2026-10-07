@@ -38,6 +38,8 @@ import ipaddress
 import re
 from typing import Any
 
+from app.core.dns_names import MAX_NAME_LEN, validate_fqdn
+
 __all__ = [
     "ADDRESS_MATCH_LIST_OPTIONS",
     "BUILTIN_ACLS",
@@ -46,12 +48,17 @@ __all__ = [
     "AclCycleError",
     "ViewValidationError",
     "is_name_reference",
+    "UPDATE_POLICY_NAMED_SCOPES",
+    "UPDATE_POLICY_RR_TYPES",
     "key_reference",
     "order_acls_for_render",
+    "split_zone_forwarders",
     "validate_acl_name",
     "validate_address_match_list",
     "validate_server_option",
+    "validate_update_acl_entry",
     "validate_view_name",
+    "validate_zone_forwarders",
 ]
 
 
@@ -634,3 +641,259 @@ def key_reference(element: str) -> str | None:
     if match is None:
         return None
     return match.group(1).strip('"') or None
+
+
+# ── zone forwarders (issue #1357) ────────────────────────────────────────
+
+# ``<ip> port <n>`` — BIND's own spelling. The BIND9 agent splits zone
+# forwarders on ``@`` and emits anything without one verbatim, so this form
+# rendered correctly over Do53 and a row may carry it; it is normalised to
+# the ``ip@port`` wire shape rather than refused.
+_FORWARDER_PORT_WORD_RE = re.compile(r"^(\S+)\s+port\s+(\S+)$", re.IGNORECASE)
+
+
+def validate_zone_forwarders(elements: list[str] | None, *, field: str = "forwarders") -> list[str]:
+    """Validate a forward zone's forwarders on a BIND9 group (#1357).
+
+    The BIND9 agent renders each entry into the zone's ``forwarders { … };``
+    as an address and optional port, so anything else is a statement BIND
+    refuses — and a refused statement fails the whole group's config, not
+    the one zone. Same grammar as the group's forwarders (#1244): ``ip`` or
+    ``ip@port``; ``ip port <n>`` is accepted, and every entry is returned
+    in the canonical ``ip[@port]`` spelling.
+
+    Only for BIND9: a Technitium forward zone may legitimately carry a
+    hostname or a DoH URL here (#1316), so the caller decides by driver.
+    """
+    spelled_out = []
+    for element in elements or []:
+        raw = (element or "").strip()
+        spelled = _FORWARDER_PORT_WORD_RE.match(raw)
+        spelled_out.append(f"{spelled.group(1)}@{spelled.group(2)}" if spelled else raw)
+    cleaned = _validate_forwarders(spelled_out, field=field)
+    # The agent strips around the ``@`` anyway; store the canonical spelling.
+    return ["@".join(part.strip() for part in c.split("@", 1)) for c in cleaned]
+
+
+def split_zone_forwarders(
+    elements: list[str] | None, *, field: str = "forwarders"
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Partition stored forwarders into renderable and not (#1357).
+
+    For values that were never checked on write — a row stored before
+    #1357, or an importer's output — where refusing the whole list is not
+    an option. Returns ``(kept, dropped)``: the renderable entries in
+    canonical ``ip[@port]`` form, and ``(value, reason)`` for each other.
+    """
+    kept: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    for element in elements or []:
+        try:
+            kept.extend(validate_zone_forwarders([element], field=field))
+        except ViewValidationError as exc:
+            dropped.append((element, str(exc)))
+    return kept, dropped
+
+
+# ── dynamic-update ACL entries (issue #1357) ─────────────────────────────
+#
+# A fine-grained ACL entry renders as one ``update-policy`` rule:
+#
+#     <grant|deny> <key> <ruletype> [<name>] [<types>];
+#
+# with ``name_pattern`` and every ``record_types`` element interpolated
+# verbatim by the BIND9 agent. An unknown type mnemonic or a malformed name
+# is a statement BIND refuses, and that fails the whole group's config.
+
+#: Record-type mnemonics BIND 9.20 accepts in an ``update-policy`` type list.
+#: A superset of what SpatiumDDI can author (``VALID_RECORD_TYPES`` minus the
+#: PowerDNS-only ``ALIAS`` / ``LUA``, which BIND does not know), because the
+#: point of a per-type grant is to cover what DDNS clients write — ``DHCID``
+#: above all, which Kea's D2 writes beside every A / PTR. ``ANY`` is BIND's
+#: "every type except NSEC / NSEC3 / RRSIG". Pinned by a test against the
+#: authoring set so a newly authorable type cannot be ungrantable.
+UPDATE_POLICY_RR_TYPES = frozenset(
+    {
+        "A",
+        "A6",
+        "AAAA",
+        "AFSDB",
+        "AMTRELAY",
+        "ANY",
+        "APL",
+        "ATMA",
+        "AVC",
+        "CAA",
+        "CDNSKEY",
+        "CDS",
+        "CERT",
+        "CNAME",
+        "CSYNC",
+        "DHCID",
+        "DLV",
+        "DNAME",
+        "DNSKEY",
+        "DOA",
+        "DS",
+        "EID",
+        "EUI48",
+        "EUI64",
+        "GPOS",
+        "HINFO",
+        "HIP",
+        "HTTPS",
+        "IPSECKEY",
+        "ISDN",
+        "KEY",
+        "KX",
+        "L32",
+        "L64",
+        "LOC",
+        "LP",
+        "MB",
+        "MD",
+        "MF",
+        "MG",
+        "MINFO",
+        "MR",
+        "MX",
+        "NAPTR",
+        "NID",
+        "NIMLOC",
+        "NINFO",
+        "NS",
+        "NSAP",
+        "NSAP-PTR",
+        "NSEC",
+        "NSEC3",
+        "NSEC3PARAM",
+        "NULL",
+        "NXT",
+        "OPENPGPKEY",
+        "PTR",
+        "PX",
+        "RESINFO",
+        "RKEY",
+        "RP",
+        "RRSIG",
+        "RT",
+        "SIG",
+        "SINK",
+        "SMIMEA",
+        "SOA",
+        "SPF",
+        "SRV",
+        "SSHFP",
+        "SVCB",
+        "TA",
+        "TALINK",
+        "TLSA",
+        "TXT",
+        "UID",
+        "UINFO",
+        "UNSPEC",
+        "URI",
+        "WALLET",
+        "WKS",
+        "X25",
+        "ZONEMD",
+    }
+)
+
+# ``A(5)`` — BIND 9.18+ caps how many records of that type a rule permits at
+# the name. ``TYPE65280`` — RFC 3597's generic spelling for a type with no
+# mnemonic. Both are accepted; the mnemonic must still be known.
+_RR_TYPE_TOKEN_RE = re.compile(r"^([A-Z][A-Z0-9-]*)(\(\d{1,5}\))?$")
+_GENERIC_TYPE_RE = re.compile(r"^TYPE(\d{1,5})$")
+
+#: Ruletypes whose rule carries a name field (the agent renders it).
+UPDATE_POLICY_NAMED_SCOPES = frozenset({"self", "subdomain", "name", "wildcard"})
+
+
+def _validate_rr_type(token: str, *, field: str) -> str:
+    candidate = (token or "").strip().upper()
+    match = _RR_TYPE_TOKEN_RE.match(candidate)
+    mnemonic = match.group(1) if match else ""
+    generic = _GENERIC_TYPE_RE.match(mnemonic)
+    if match and (
+        mnemonic in UPDATE_POLICY_RR_TYPES or (generic and 0 < int(generic.group(1)) <= 65535)
+    ):
+        return candidate
+    raise ViewValidationError(
+        f"'{token}' is not a DNS record type BIND accepts in update-policy "
+        "(a mnemonic such as A, AAAA, PTR, TXT, DHCID or ANY; TYPE<n>; "
+        "optionally with a count, e.g. A(5)).",
+        field=field,
+        value=token,
+    )
+
+
+def _validate_update_policy_name(pattern: str, *, name_scope: str | None, field: str) -> str:
+    raw = (pattern or "").strip()
+    # ``self`` ignores the name field; BIND documents "the identity" or "."
+    # there, and ``*`` is the long-standing idiom. A scope that does not
+    # render the name at all (``zonesub`` / unset) gets the same latitude,
+    # since a value left over from switching scope in the form is harmless.
+    lenient = name_scope in (None, "zonesub", "self")
+    if lenient and raw in (".", "*"):
+        return raw
+    body = raw
+    prefix = ""
+    if raw.startswith("*.") and (lenient or name_scope == "wildcard"):
+        body, prefix = raw[2:], "*."
+    try:
+        normalised = validate_fqdn(body, field=field)
+    except ValueError as exc:
+        expected = (
+            "a DNS name, optionally starting with '*.'"
+            if name_scope == "wildcard"
+            else "a DNS name"
+        )
+        raise ViewValidationError(
+            f"'{pattern}' is not {expected} ({exc}). It is rendered into the "
+            f"zone's update-policy rule as the {name_scope or 'zonesub'} name.",
+            field=field,
+            value=pattern,
+        ) from exc
+    # ``validate_fqdn`` capped the BODY at 253; the ``*.`` prefix still has to
+    # fit, or BIND refuses the name and the column (String(255)) overflows.
+    if len(prefix + normalised) > MAX_NAME_LEN:
+        raise ViewValidationError(
+            f"'{pattern}' is longer than {MAX_NAME_LEN} characters, the most a "
+            "DNS name can carry.",
+            field=field,
+            value=pattern,
+        )
+    # Keep the operator's absolute-name dot: named.conf treats both spellings
+    # as absolute, and the form's own placeholder carries one.
+    return prefix + normalised + ("." if raw.endswith(".") else "")
+
+
+def validate_update_acl_entry(
+    name_scope: str | None,
+    name_pattern: str | None,
+    record_types: list[str] | None,
+) -> tuple[str | None, list[str] | None]:
+    """Validate one dynamic-update ACL entry's rendered fields (#1357).
+
+    Returns ``(name_pattern, record_types)`` cleaned: the pattern stripped
+    and lower-cased (a blank one becomes ``None``), each type stripped and
+    upper-cased with blanks dropped (an empty list becomes ``None``).
+    Raises :class:`ViewValidationError` naming the offending element.
+
+    Whether a scope that takes a name actually HAS one is the driver's
+    check (``DNSDriver.validate_update_acl``), because a coarse-only
+    backend refuses the scope outright; this is only about what reaches
+    ``named.conf``.
+    """
+    pattern = (name_pattern or "").strip() or None
+    if pattern is not None:
+        pattern = _validate_update_policy_name(pattern, name_scope=name_scope, field="name_pattern")
+    types: list[str] | None = None
+    if record_types is not None:
+        types = [
+            _validate_rr_type(t, field="record_types")
+            for t in record_types
+            if t is not None and str(t).strip()
+        ] or None
+    return pattern, types

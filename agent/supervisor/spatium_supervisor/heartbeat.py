@@ -43,7 +43,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state, approval_state, firewall_peer_audit, watchdog
+from . import appliance_state, approval_state, etcd_evict, firewall_peer_audit, watchdog
 from . import cp_tls
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
@@ -126,10 +126,7 @@ def _is_control_plane_member() -> bool:
         that was promoted into the control plane and whose host
         runner has reported the join completed.
     """
-    if appliance_state.detect_appliance_variant() == "control-plane":
-        return True
-    join_state, _ = appliance_state.read_cluster_join_state()
-    return join_state == "ready"
+    return appliance_state.is_control_plane_member()
 
 
 def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
@@ -320,10 +317,17 @@ _cached_role_health: dict[str, Any] = {}
 _PEER_DRIFT_INTERVAL_S = 300.0  # 5 minutes
 _last_peer_drift_at: float = 0.0
 
-# #272 Phase 9 — k8s Node names this seed has successfully evicted but
-# the backend hasn't yet confirmed cleared. Reported on each heartbeat
-# request; pruned once the backend drops the name from its evict list.
+# #272 Phase 9 — names this seed has evicted but the backend hasn't yet
+# confirmed cleared. Reported on each heartbeat request; pruned once the
+# backend drops the name from its evict list. #1284 — "evicted" means the
+# node's etcd member is gone (etcd_evict), not only its k8s Node.
 _evicted_pending: set[str] = set()
+# #1284 — names whose k8s Node this seed already deleted (or found absent),
+# still waiting for etcd to drop the member; and why, per name, reported as
+# ``evict_pending`` so the row shows it.
+_nodes_deleted: set[str] = set()
+_evict_reasons: dict[str, str] = {}
+_etcd_evictions = etcd_evict.EtcdEvictions()
 
 # #1058 — hostnames whose stranded CNPG claims the reclaim still owes (a
 # deferral: the instance was the primary, or the Cluster named none). Handed
@@ -333,7 +337,8 @@ _stranded_pending: set[str] = set()
 
 
 class _ReplaceHold:
-    """#1059 — the CloudNativePG size hold a dead-node replace arms.
+    """#1059 — the CloudNativePG size hold a dead-node replace arms (and,
+    #1313, the size the whole release renders: see :func:`_release_size`).
 
     ``/fleet/control-plane/{id}/replace`` drops the replaced row from the
     committed control-plane count at once and asks the seed to evict its
@@ -390,6 +395,29 @@ class _ReplaceHold:
 
 
 _replace_hold = _ReplaceHold()
+
+
+def _release_size(cp_size: int, hold: str, cnpg_instances: int) -> int:
+    """#1313 — the control-plane size the spatium-control release renders.
+
+    ``cp_size``, except while #1059's hold is armed (``hold`` is its reason):
+    then the size the CNPG Cluster is held at (``cnpg_instances``, the count
+    ``patch_cnpg_instances`` left on it), never below ``cp_size``. A replace
+    is never a scale-down by intent (see :class:`_ReplaceHold`), so it must
+    not re-size the release either. Re-sizing it to the short count changed
+    every pod template that carries ``REDIS_URL`` (api, worker, beat: it lists
+    one sentinel per replica) and cut the api from 3 replicas to 2 on the
+    eviction tick, before the dead node's pods were gone. They can still read
+    Ready then: a replace soon after the death deletes the Node before the
+    node controller marks it NotReady, and PodGC removes its pods about a
+    minute later. So the Deployment counted the dead replica as available
+    and retired both live ones, and the api answered nothing for a minute.
+    The promote then rolled everything back to 3. Held, a replace renders
+    nothing new; the dead node's replicas wait Pending for the replacement,
+    as its CNPG instance does."""
+    if hold:
+        return max(cp_size, cnpg_instances)
+    return cp_size
 
 
 def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[str]:
@@ -677,10 +705,13 @@ def heartbeat_once(
         # as port_conflicts does; None is reserved for "an old supervisor didn't
         # report", which must leave the stored value untouched.
         "firewall_state": appliance_state.read_firewall_state() or {},
-        # #272 Phase 9 — report the k8s Nodes this seed evicted on prior
-        # ticks so the backend clears their ``evict_requested`` flag +
-        # settles them to ``left``. Empty on non-seed / nothing-evicted.
+        # #272 Phase 9 — report the nodes this seed evicted on prior ticks
+        # so the backend clears their ``evict_requested`` flag + settles them
+        # to ``left``. Empty on non-seed / nothing-evicted. #1284 — only once
+        # etcd no longer lists the node; ``evict_pending`` says why the rest
+        # are still waiting.
         "evicted_node_names": sorted(_evicted_pending),
+        "evict_pending": dict(_evict_reasons),
     }
     # #170 Wave D follow-up — surface the outcome of the previous
     # heartbeat's compose-lifecycle apply. Empty / None on the first
@@ -1067,36 +1098,13 @@ def heartbeat_once(
         ml_bgp_peers = body_out.get("desired_metallb_bgp_peers") or []
         ml_bgp_advertisements = body_out.get("desired_metallb_bgp_advertisements") or []
 
-        # The api / worker memory limits and worker concurrency ride along,
-        # sized from this node's RAM (k8s_api.control_plane_resources) — the
-        # chart's BYO-cluster defaults gave way before the VM did on the
-        # appliance, and a kubectl patch never survived a k3s restart.
-        cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
-            cp_size,
-            str(ml_vip),
-            web_ui_allowed_cidrs=list(web_ui_cidrs),
-            mem_total_mib=k8s_api.node_memory_mib(),
-        )
-        if cp_changed:
-            log.info(
-                "supervisor.heartbeat.control_plane_overrides_applied",
-                size=cp_size,
-                vip=ml_vip,
-            )
-        elif cp_err:
-            log.warning(
-                "supervisor.heartbeat.control_plane_overrides_failed",
-                error=cp_err,
-                size=cp_size,
-            )
-
         # #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep``
-        # (so a failed-release recovery can't wipe the DB), which also
-        # makes the helm-controller skip patching its spec on upgrade. The
-        # HelmChartConfig above scales api/worker/frontend/redis but the
-        # kept Cluster stays at its initial instance count, so scale it
-        # directly here (a merge-patch isn't a Helm op → keep doesn't
-        # apply). Idempotent — only patches on a real size change.
+        # (so a failed-release recovery can't wipe the DB), and the seed
+        # sizes it directly here. Idempotent — only patches on a real size
+        # change. It runs BEFORE the HelmChartConfig below (#1313): Helm
+        # re-applies the kept Cluster on every upgrade and may not force a
+        # field this patch wrote, so the chart must render the count this
+        # patch leaves, not one it has not written.
         #
         # #1059 — never DOWN while a dead node is being replaced. The replace
         # endpoint drops the replaced row from the committed count at once,
@@ -1133,6 +1141,56 @@ def heartbeat_once(
                 error=pg_scale.error,
                 size=cp_size,
             )
+
+        # The api / worker memory limits and worker concurrency ride along,
+        # sized from this node's RAM (k8s_api.control_plane_resources) — the
+        # chart's BYO-cluster defaults gave way before the VM did on the
+        # appliance, and a kubectl patch never survived a k3s restart.
+        #
+        # #1313 — CNPG's instance count is the one the patch above left on
+        # the Cluster, not cp_size. While #1059's hold keeps the Cluster at
+        # 3 during a replace, cp_size is 2, and rendering 2 made the
+        # helm-controller's apply conflict with the patch's field on every
+        # attempt: the upgrade failed, its recovery uninstalled the release
+        # (api, worker, beat, frontend), and each reinstall failed the same
+        # way until the replacement was promoted. A tick that could not read
+        # the Cluster at all does not know that count, so it leaves the
+        # release as it is; the next tick retries.
+        #
+        # #1313 — and while the hold is armed the rest of the release keeps
+        # that size too (_release_size): a replace re-sizes nothing, so it
+        # neither rolls the api nor scales it down beside a dead replica.
+        cnpg_instances = pg_scale.spec_after(cp_size)
+        if cnpg_instances is None:
+            log.warning(
+                "supervisor.heartbeat.control_plane_overrides_deferred",
+                reason="the CNPG Cluster could not be read",
+                error=pg_scale.error,
+                size=cp_size,
+            )
+        else:
+            release_size = _release_size(cp_size, hold, cnpg_instances)
+            cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
+                release_size,
+                str(ml_vip),
+                web_ui_allowed_cidrs=list(web_ui_cidrs),
+                mem_total_mib=k8s_api.node_memory_mib(),
+                cnpg_instances=cnpg_instances,
+            )
+            if cp_changed:
+                log.info(
+                    "supervisor.heartbeat.control_plane_overrides_applied",
+                    size=release_size,
+                    committed=cp_size,
+                    cnpg_instances=cnpg_instances,
+                    vip=ml_vip,
+                )
+            elif cp_err:
+                log.warning(
+                    "supervisor.heartbeat.control_plane_overrides_failed",
+                    error=cp_err,
+                    size=cp_size,
+                )
 
         bs_changed, bs_err = k8s_api.apply_metallb_overrides(
             metallb_enabled=ml_enabled,
@@ -1173,20 +1231,28 @@ def heartbeat_once(
 
         # #272 Phase 9 — dead-node replacement. The seed deletes each k8s
         # Node the backend flagged for eviction (deleting the Node makes
-        # k3s drop the etcd member); newly-deleted names are stashed in
-        # ``_evicted_pending`` and reported on the next heartbeat so the
-        # backend clears the flag. Prune the stash to whatever the
-        # backend still lists as pending (everything else is confirmed).
-        evict_names = body_out.get("evict_node_names") or []
+        # k3s drop the etcd member).
+        #
+        # #1284 — the Node is not the member. A node can be an etcd voter
+        # with no Node (a failed joiner whose own re-join made it a voter,
+        # then died before its Node registered): the DELETE answers 404,
+        # which delete_node counts as success, and k3s has no Node to remove
+        # the member through. So a deleted (or absent) Node only hands the
+        # name to etcd_evict, whose host runner removes the node's etcd
+        # member and reports what etcd lists. A name is stashed in
+        # ``_evicted_pending`` (reported next heartbeat, so the backend
+        # settles the row ``left``) only once etcd no longer has it.
+        evict_names = [str(n) for n in (body_out.get("evict_node_names") or [])]
+        evict_addresses = body_out.get("evict_node_addresses") or {}
         evicted_now: list[str] = []
         for name in evict_names:
-            if name in _evicted_pending:
+            if name in _evicted_pending or name in _nodes_deleted:
                 continue
-            ok, evict_err = k8s_api.delete_node(str(name))
+            ok, evict_err = k8s_api.delete_node(name)
             if ok:
-                _evicted_pending.add(str(name))
-                evicted_now.append(str(name))
-                log.info("supervisor.heartbeat.node_evicted", node=name)
+                _nodes_deleted.add(name)
+                evicted_now.append(name)
+                log.info("supervisor.heartbeat.node_deleted", node=name)
                 # #590 — the deleted node strands any local-path Redis PVC
                 # provisioned on it (node-affine PV): the replacement
                 # replica sits Pending forever and its missing sentinel
@@ -1212,7 +1278,26 @@ def heartbeat_once(
                 log.warning(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
                 )
-        _evicted_pending.intersection_update({str(n) for n in evict_names})
+        confirmed, reasons = _etcd_evictions.tick(
+            {
+                n: [str(a) for a in (evict_addresses.get(n) or [])]
+                for n in evict_names
+                if n in _nodes_deleted and n not in _evicted_pending
+            },
+            # A node promoted again after its eviction is wanted: its new
+            # etcd member is not a late arrival of the evicted one.
+            wanted=[str(n) for n in (body_out.get("join_node_names") or [])],
+        )
+        for name in confirmed:
+            _evicted_pending.add(name)
+            log.info("supervisor.heartbeat.node_evicted", node=name)
+        for name, reason in reasons.items():
+            if _evict_reasons.get(name) != reason:
+                log.info("supervisor.heartbeat.node_evict_pending", node=name, reason=reason)
+        _evict_reasons.clear()
+        _evict_reasons.update(reasons)
+        _evicted_pending.intersection_update(set(evict_names))
+        _nodes_deleted.intersection_update(set(evict_names))
 
         # #1058 — the deleted Node strands the CloudNativePG instance claim
         # provisioned on it exactly as it strands Redis's, and the operator
@@ -1387,8 +1472,7 @@ def heartbeat_once(
         # subprocess below if the supervisor crashed mid-write.
         # #555 — owner-only (0600) at creation: role-compose.env carries
         # DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap PSKs, and a plain
-        # write_text lands it at the umask default (0644, world-readable in
-        # the 1777 release-state dir) before any chmod. Reuse the shared
+        # write_text lands it at the umask default (0644) before any chmod. Reuse the shared
         # O_NOFOLLOW+0600 writer.
         tmp = env_path.with_suffix(".tmp")
         appliance_state._write_owner_only(tmp, rendered)

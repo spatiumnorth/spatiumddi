@@ -24,11 +24,12 @@ DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 # Upper bound on the page NUMBER. ``page_size`` was bounded from the start and
 # ``page`` was not, which left every list endpoint one query parameter away from
-# a 500: the offset is ``(page - 1) * page_size``, SQL ``OFFSET`` is a bigint,
+# an error: the offset is ``(page - 1) * page_size``, SQL ``OFFSET`` is a bigint,
 # and a large enough ``page`` overflows it before Postgres ever sees a row.
 # Measured on a live appliance at DEFAULT_PAGE_SIZE — page 92233720368547759
 # gives offset 9223372036854775800 and returns 200; page 92233720368547760
-# gives 9223372036854775900, past 2**63-1, and returns 500.
+# gives 9223372036854775900, past 2**63-1, and returned a 500 at the time
+# (the global DBAPIError handler now answers 422, still not a useful reply).
 #
 # A million pages is past any real client (a million pages of MAX_PAGE_SIZE is
 # a billion rows) while leaving the largest reachable offset — 10**9 — nine

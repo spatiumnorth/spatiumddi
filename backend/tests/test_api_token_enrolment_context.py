@@ -133,7 +133,9 @@ async def test_does_not_shadow_the_token_by_id_route(
     it second would make the UUID param swallow it and 422 the literal."""
     _, headers = await _user(db_session)
     created = await client.post(
-        "/api/v1/api-tokens", headers=headers, json={"name": "enrol-route-test"}
+        "/api/v1/api-tokens",
+        headers=headers,
+        json={"name": "enrol-route-test", "stepup_password": "x"},
     )
     assert created.status_code == 201
     token_id = created.json()["id"]

@@ -7,7 +7,7 @@ k8s/
 ├── base/              # Core application manifests (namespace, API, worker, frontend, migrations)
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
-├── ha/                # High-availability add-ons (PostgreSQL Patroni/CloudNativePG, Redis Sentinel)
+├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
 └── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
 ```
 
@@ -28,8 +28,10 @@ kubectl apply -f k8s/dhcp/service-dhcp.yaml
 
 DHCPv4 requires broadcast reception on the client LAN. In most clusters you
 either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
-only.
+(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
+manifests use that LoadBalancer Service: on a `NodePort` Service the
+declared `port: 67` is in-cluster only and the node-facing port is a
+random 30000–32767 pick, which a relay cannot target.
 
 
 ## Quick Start (single-node / dev)
@@ -134,15 +136,15 @@ The operator creates two Services automatically:
 - `postgres-primary` → always points to the current primary (read/write)
 - `postgres-replica` → load-balances across read replicas
 
-### PostgreSQL HA — Patroni (Docker Compose)
+### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
-For Docker Compose HA deployments, use the Patroni-based setup:
-
-```bash
-docker compose -f docker-compose.yml -f k8s/ha/postgres-docker-compose.yaml up -d
-```
-
-Set `DATABASE_URL` to point at HAProxy port 5000 instead of the single `postgres` container.
+`ha/postgres-docker-compose.yaml` does **not** work. Patroni never starts,
+the overlay renames the compose project onto empty volumes, its network does
+not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing
+`.env` at HAProxy changes nothing. Don't run it against an existing install.
+The file's header lists the details, and
+[#137](https://github.com/spatiumnorth/spatiumddi/issues/137) tracks making
+Compose HA real. Use CloudNativePG (above) or the OS appliance for HA.
 
 ### Redis HA — Sentinel (K8s)
 
@@ -412,6 +414,8 @@ kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --tim
 ```
 
 Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart's pre-upgrade hook re-runs the migrate job; the `alembic upgrade head` invocation honours the same DATABASE_URL the api uses.
+
+The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under the api pod's `/var/lib/spatiumddi/backups/` (passphrase is the literal string `pre-restore-safety`). For that path to survive pod recycle, mount it as a `PersistentVolumeClaim` on both the api and worker deployments — see Backup below.
 

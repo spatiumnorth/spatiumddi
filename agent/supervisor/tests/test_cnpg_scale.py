@@ -1,8 +1,9 @@
 """#272 — patch_cnpg_instances directly scales the CNPG Cluster CR.
 
-The Cluster carries ``helm.sh/resource-policy: keep`` so the helm-controller
-won't patch its spec on upgrade; the supervisor scales it out of band with a
-merge-patch. These tests pin the GET-then-PATCH contract: idempotent on a
+The Cluster carries ``helm.sh/resource-policy: keep`` (so a failed-release
+recovery can't delete it), and the supervisor sizes it directly with a
+merge-patch; the chart renders the count that patch leaves
+(``test_cnpg_instances_rendered``, #1313). These tests pin the GET-then-PATCH contract: idempotent on a
 matching size, a real PATCH on a change, a quiet no-op when the Cluster
 isn't up yet (404), and the ``< 1`` guard.
 """

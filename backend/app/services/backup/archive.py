@@ -4,7 +4,7 @@ Layout (matches the spec in the issue body):
 
 .. code-block:: text
 
-    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip
+    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip
     ├── manifest.json     # version, schema head, hostname, created_at
     ├── database.sql      # pg_dump --format=plain
     ├── secrets.enc       # passphrase-wrapped SECRET_KEY + metadata
@@ -31,6 +31,7 @@ import asyncio
 import io
 import json
 import os
+import secrets
 import socket
 import tempfile
 import zipfile
@@ -44,7 +45,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.services.backup.crypto import encrypt_secrets
+from app.services.backup.crypto import encrypt_secrets, hint_reveals_passphrase
 
 logger = structlog.get_logger(__name__)
 
@@ -141,13 +142,11 @@ async def _run_pg_dump(out_path: Path, *, snapshot_id: str | None = None) -> Non
         "--no-owner",
         "--no-privileges",
         "--quote-all-identifiers",
-        # ``--clean`` / ``--if-exists`` belong on the *restore*
-        # side now (``pg_restore --clean --if-exists``) — the
-        # custom-format archive carries the schema + data; the
-        # restore path adds the DROP/CREATE preamble at apply
-        # time. We omit them here so the dump is reusable for
-        # selective restore (which doesn't want the global
-        # cleanup).
+        # No ``--clean`` / ``--if-exists``: a full restore clears
+        # the whole schema itself before replaying (#1363 — the
+        # archive's own DROPs never reached tables a later
+        # migration added), and selective restore must not carry
+        # a global cleanup at all.
         f"--file={out_path}",
     ]
     if snapshot_id:
@@ -297,6 +296,7 @@ def _scrub_dump_text(dump_text: str) -> str:
 
     from app.services.backup.rewrap import (  # noqa: PLC0415
         JSONB_ENCRYPTED_FIELDS,
+        LEGACY_PLAINTEXT_SECRET_COLUMNS,
         _jsonb_secret_sites,
         redactable_columns,
     )
@@ -317,6 +317,11 @@ def _scrub_dump_text(dump_text: str) -> str:
     for table, _pk, enc_col in redactable_columns():
         bare = table.strip('"')
         by_table.setdefault(bare, set()).add(enc_col)
+    # Plaintext leftovers of an expand/contract move (#1364): text, not
+    # bytea, so they are written as NULL rather than an empty bytea.
+    null_by_table: dict[str, set[str]] = {}
+    for table, column in LEGACY_PLAINTEXT_SECRET_COLUMNS:
+        null_by_table.setdefault(table, set()).add(column)
 
     # ``COPY "public"."foo" ("a", "b", ...) FROM stdin;`` — we use
     # ``--quote-all-identifiers`` on the dump, so every name is
@@ -325,6 +330,7 @@ def _scrub_dump_text(dump_text: str) -> str:
     out: list[str] = []
     in_copy_table: str | None = None
     cols_to_scrub: list[int] = []
+    cols_to_null: list[int] = []
     jsonb_cols: list[tuple[int, Any]] = []
 
     for line in dump_text.splitlines(keepends=False):
@@ -335,17 +341,20 @@ def _scrub_dump_text(dump_text: str) -> str:
                 cols_list = [c.strip().strip('"') for c in m.group(2).split(",")]
                 scrub_set = by_table.get(table, set())
                 cols_to_scrub = [i for i, c in enumerate(cols_list) if c in scrub_set]
+                null_set = null_by_table.get(table, set())
+                cols_to_null = [i for i, c in enumerate(cols_list) if c in null_set]
                 jsonb_cols = [
                     (i, spec)
                     for i, c in enumerate(cols_list)
                     if (spec := jsonb_by_table.get(table, {}).get(c)) is not None
                 ]
-                if cols_to_scrub or jsonb_cols:
+                if cols_to_scrub or cols_to_null or jsonb_cols:
                     in_copy_table = table
             out.append(line)
         elif line == r"\.":
             in_copy_table = None
             cols_to_scrub = []
+            cols_to_null = []
             jsonb_cols = []
             out.append(line)
         else:
@@ -353,6 +362,9 @@ def _scrub_dump_text(dump_text: str) -> str:
             for i in cols_to_scrub:
                 if i < len(parts) and parts[i] != r"\N":
                     parts[i] = r"\\x"
+            for i in cols_to_null:
+                if i < len(parts):
+                    parts[i] = r"\N"
             for idx, spec in jsonb_cols:
                 if not (0 <= idx < len(parts)):
                     continue
@@ -413,7 +425,7 @@ async def build_backup_archive(
 
     Caller (the API endpoint) streams the bytes back to the
     operator. Filename pattern:
-    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip``.
+    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip``.
 
     ``exclude_secrets`` (Phase 3 diagnostic mode): every
     Fernet-encrypted column + every ``__enc__:`` JSONB field is
@@ -429,6 +441,13 @@ async def build_backup_archive(
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
+    if hint_reveals_passphrase(passphrase, passphrase_hint):
+        # The write paths refuse this; a target saved before they did
+        # can still hold it. Dropped rather than raised so the schedule
+        # keeps producing backups — the hint is a convenience, the
+        # backup is not. Never log the hint itself.
+        logger.warning("backup_hint_contains_passphrase_dropped")
+        passphrase_hint = None
     schema_head = await _read_alembic_head(db)
     hostname = socket.gethostname()
     created_at = datetime.now(UTC)
@@ -527,7 +546,13 @@ async def build_backup_archive(
         "".join(c if c.isalnum() or c in "-_" else "-" for c in hostname).strip("-") or "spatiumddi"
     )
     timestamp = created_at.strftime("%Y%m%d-%H%M%S")
-    filename = f"spatiumddi-backup-{safe_host}-{timestamp}.zip"
+    # One-second resolution alone collided (#1571): two runs in the
+    # same second — two targets sharing a destination, or a manual
+    # run racing the schedule — wrote the SAME filename with
+    # different passphrases, and the survivor would not decrypt with
+    # the overwritten target's passphrase while both runs reported
+    # success. A short random suffix makes each name unique.
+    filename = f"spatiumddi-backup-{safe_host}-{timestamp}-{secrets.token_hex(3)}.zip"
     logger.info(
         "backup_archive_built",
         bytes=len(archive_bytes),

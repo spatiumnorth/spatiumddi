@@ -1,6 +1,6 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-28):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **PXE / iPXE provisioning profiles** (issue #51) and **passive DHCP fingerprinting** (Phase 2 device profiling) have since shipped — see §17 and §18. **Still deferred:** Option 82 (relay agent info) class matching, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
+> **Implementation status:** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **PXE / iPXE provisioning profiles** (issue #51) and **passive DHCP fingerprinting** (Phase 2 device profiling) have since shipped — see §17 and §18. **Still deferred:** Option 82 (relay agent info) class matching, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 
@@ -93,7 +93,7 @@ DHCPScope
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
   ddns_enabled: bool
-  ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
+  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -140,6 +140,11 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
+
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
@@ -464,13 +469,21 @@ reservation requires a **superadmin**.
 1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
    reachable from a free-range gap row or the subnet context menu).
 2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
-   This reveals the **DHCP Scope** picker.
-3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
-   below), and set the hostname. If no scope exists for the subnet yet, the
-   picker offers a **Create a scope** button that opens the scope modal inline.
+3. Enter the **MAC address** (required — see caveat below) and set the
+   hostname. There is no scope picker: the server puts the reservation on
+   the subnet's sole matching-family scope itself. If no scope exists for
+   the subnet yet, the modal says so and offers a **Create a scope** button
+   that opens the scope modal inline.
 4. Click **Allocate**. IPAM creates the address row with
-   `IPAddress.status = static_dhcp` and mirrors it into the scope as a
-   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   `IPAddress.status = static_dhcp` and the server syncs a
+   `DHCPStaticAssignment` behind it in the same request
+   (`sync_static_for_ipam_row`, #1628) — no second call from the browser.
+
+The same sync runs on **Edit**, on **bulk-edit**, and in the **address
+importer**: flipping a row into `static_dhcp` creates its reservation,
+changing its MAC / hostname updates the reservation in place, and flipping
+it away (or clearing the reservation state) removes the reservation. A save
+never overwrites a reservation's description with the IPAM row's empty one.
 
 Either way, the Kea agent picks up the new `ConfigBundle` (a group wake fires +
 the ETag shifts) and renders the host reservation within seconds. The **Static
@@ -482,18 +495,25 @@ Assignments** tab lists every reservation across the group's scopes.
   `static_dhcp` address without a `mac_address` returns **422**
   (`mac_address is required when status is 'static_dhcp'`) from both the
   `create` and `next-address` endpoints, so **nothing is created** — neither the
-  IPAM row nor the reservation.
-- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
-  the reservation.** If no DHCP scope is selected (e.g. none exists for the
-  subnet yet), the IPAM address is created but the mirror to Kea is **not
-  attempted** — this is the real "I set it static but nothing happened" trap.
-  Create a scope first (see the prerequisite above).
-- **Editing an existing IPAM row to `static_dhcp` does not create a reservation.**
-  Flipping an *existing* IP to `static_dhcp` via **Edit** (or bulk-edit) updates
-  the IPAM row but does **not** mirror it to Kea. Add the reservation from the
-  DHCP **Static Assignments** tab, or delete and re-allocate via the IPAM flow.
-- **Creating a static currently requires a superadmin.** A non-superadmin who
-  allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
+  IPAM row nor the reservation. The same 422 answers an edit that sends
+  `mac_address: null` for a row that is (or is becoming) `static_dhcp`.
+- **`static_dhcp` with a MAC but no unambiguous scope creates the IPAM row and
+  warns.** If no DHCP scope serves the subnet, or several scopes match, the
+  IPAM address is created but no reservation is — the server does not guess —
+  and the response (or import result) carries a `dhcp_static_warning` saying
+  so instead of silently skipping it. Create exactly one scope for the
+  subnet, then re-save the row.
+- **The sync needs the `dhcp_static` permission.** Creating or updating a
+  reservation through IPAM requires the acting user's `write` grant on
+  `dhcp_static`; removing one requires `delete` — the same grants the DHCP
+  statics endpoints enforce. Without the grant the IPAM write still succeeds
+  but the reservation is left untouched and the response carries the
+  permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
+  still requires a superadmin, as above.
+- **No backfill for rows from before the server-side sync.** A `static_dhcp`
+  row created before #1628 that never got its reservation is not repaired
+  in the background: it gets one the next time it is saved, or when it is
+  re-imported with `overwrite`.
 
 ### Troubleshooting — reservations render empty in Kea
 
@@ -506,8 +526,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
   `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's Static Assignments
   tab. If it's absent, distinguish two cases: the allocation was
   **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
-  it **succeeded without mirroring** (a MAC was given but no scope was selected,
-  or a non-superadmin hit 403 on the mirror call). See the caveats above.
+  it **succeeded without mirroring** (a MAC was given but there was no scope —
+  or several — or the acting user lacked the `dhcp_static` grant; the response
+  carried a `dhcp_static_warning` naming which). See the caveats above.
 - **The scope is inactive.** Only `is_active = true` scopes (and the statics
   under them) are assembled into the config bundle — a disabled scope silently
   drops every reservation it holds.
@@ -639,6 +660,20 @@ The row is released to `available` (not `allocated`): a leftover `allocated` row
 is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
+
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
 
 ### Known gap — Windows scope sync (issue #620)
 
@@ -1459,8 +1494,11 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Hostname sync mode must be one of the configured values.** Mode
   picker is validated against `VALID_SYNC_MODES`; reserved / internal
   modes are not selectable from the API. `422`.
-- **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
-  of the documented values (see §13). Pydantic validator.
+- **DDNS hostname policy enum.** `ddns_hostname_policy` must be one of
+  `client`, `server_name`, `derived` or `none`, on create and on update
+  (#1308). An edit checks the policy only when it changes it, so a value
+  stored before update checked it does not block an unrelated edit.
+  `422`.
 - **A field must not be set twice, under both its names, to different
   values.** Two scope fields are accepted under two names: `enabled`
   (what the response emits) is the same column as `is_active` (what

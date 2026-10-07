@@ -128,7 +128,7 @@ The software makes no outbound connection you did not configure, with one except
 | 🔐 | **DNSSEC** | BIND9 inline-signing (BIND owns + auto-rotates keys) + **PowerDNS and Technitium online sign / unsign** from the zone page · reusable `dnssec-policy` library — KSK + ZSK algorithm / size / lifetime, **NSEC or NSEC3** (iterations · salt length · opt-out) · per-zone public key state + **DS export** to hand to the parent-zone registrar · manual + automatic rollover · SpatiumDDI never holds private key material — the signer owns and rotates it |
 | 🔀 | **DNS Views (split-horizon)** | per-view zone + record rendering on BIND9 — `view_id IS NULL` records shared across views, scoped records render only in their view, RPZ / blocklists replicate into each view block |
 | ⚖️ | **GSLB-lite + GeoDNS steering** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member · **topology-aware steering** — a per-member serving scope (client CIDRs and/or Site) renders as BIND9 geo views composed over split-horizon, evaluated before operator views with a union fallback so a scoped-only pool never blackholes |
-| 🔄 | **DHCP** | Kea container · agentless FortiGate cloud DHCP driver (FortiOS REST, no agent) · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library · **PXE / iPXE provisioning profiles** — per-architecture boot-file selection (BIOS · UEFI x64 / ia32 / arm64 · iPXE chainload) rendered as Kea client classes, one reusable profile assigned per scope · DHCPv6 stateful / stateless / SLAAC modes · DHCPv6 prefix delegation (IA_PD / pd-pools + RFC 6603 excluded-prefix) · DUID host reservations · per-subnet relay-agent addresses · **IPv6 Router Advertisements** (radvd rendered per RA-enabled scope + rogue-RA passive sniffer) · fingerbank device-class on the lease list (filterable) · rogue-DHCP detection (opt-in active probe → unexpected-responder alert + allowlist) · **fingerprint-driven device policies** — compile chosen fingerbank device classes into a real Kea client class with its own option set and lease time, bindable from a pool's class restriction (NAC-lite, no 802.1X, no switch config); ambiguous signatures are excluded by default, counted and listed, because a request list of `1,3,6,15` comes from a doorbell and a rack server alike |
+| 🔄 | **DHCP** | Kea container · agentless FortiGate cloud DHCP driver (FortiOS REST, no agent) · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library · **PXE / iPXE provisioning profiles** — per-architecture boot-file selection (BIOS · UEFI x64 / ia32 / arm64 · iPXE chainload) rendered as Kea client classes, one reusable profile assigned per scope · DHCPv6 stateful / stateless / SLAAC modes · DHCPv6 prefix delegation (IA_PD / pd-pools + RFC 6603 excluded-prefix) · DUID host reservations · DHCPv6 leases mirrored into IPAM and DDNS, keyed on DUID + IAID · **Windows DHCP failover** — relationships observed per server, uncoordinated serving of one scope by two Windows servers refused, and relationships created / edited / replicated from SpatiumDDI · per-subnet relay-agent addresses · **IPv6 Router Advertisements** (radvd rendered per RA-enabled scope + rogue-RA passive sniffer) · fingerbank device-class on the lease list (filterable) · rogue-DHCP detection (opt-in active probe → unexpected-responder alert + allowlist) · **fingerprint-driven device policies** — compile chosen fingerbank device classes into a real Kea client class with its own option set and lease time, bindable from a pool's class restriction (NAC-lite, no 802.1X, no switch config); ambiguous signatures are excluded by default, counted and listed, because a request list of `1,3,6,15` comes from a doorbell and a rack server alike |
 | 🪟 | **Windows DNS + DHCP** | agentless — RFC 2136 + WinRM, no software on the DC |
 | 🧩 | **Agentless Technitium** | already run Technitium? Point SpatiumDDI at it — paste an API URL + permanent bearer token and the control plane drives its HTTP API directly, nothing deployed. Zone + record CRUD and topology pull; DNSSEC / forwarders / blocklists stay in Technitium's own console. Coexists with the agent-managed container driver — a group is single-driver, so a mixed estate is one group each |
 | ☁️ | **Cloud DNS** | agentless first-class drivers — Cloudflare · Route 53 · Azure DNS · Google Cloud DNS · DigitalOcean · Hetzner · Linode · Vultr · import-existing-zones · client-side multi-value RRset disambiguation |
@@ -157,6 +157,7 @@ The software makes no outbound connection you did not configure, with one except
 | 🛤 | **WAN circuits** | carrier-supplied logical pipe (provider + transport class + bandwidth + endpoints + term + cost) · 9 transport classes including AWS DX / Azure ER / GCP Interconnect cross-connects · soft-deletable (`status='decom'` is operator-visible end-of-life) · alerts for term-expiring + status-changed |
 | 📦 | **Service catalog** | bundles VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / Overlay into a customer-deliverable · `mpls_l3vpn` + `sdwan` + `custom` kinds in v1 · kind-aware `/summary` endpoint with L3VPN canonical shape · alerts for term-expiring + resource-orphaned |
 | 🌐 | **SD-WAN overlays** | vendor-neutral overlay topology + routing-policy intent · 6 kinds (sdwan / ipsec / wireguard / dmvpn / vxlan-evpn / gre) · ordered preferred-circuit chain per site · 33 well-known SaaS apps in the catalog · pure read-only `/simulate` what-if when circuits go down · SVG circular-layout topology view |
+| 🚑 | **E911 dispatchable location** (`network.e911`) | SpatiumDDI as a Location Information Server: given a phone's IP, MAC or LLDP chassis + port, answer *which room is this device in, right now?* from the leases, switch FDB and LLDP data IPAM already collects · Emergency Response Locations as the 31 separate RFC 5139 civic elements, bound to a switch port / subnet / VLAN / device at a fixed precedence · a stale precise answer is refused in favour of a fresh coarse one, and every answer carries its confidence · HELD (RFC 5985) + PIDF-LO for phones and PBXs that already speak it · DHCP options 99 / 123 · civic CSV + LLDP-MED snippets · a location *source* only — no call routing, no ALI upload ([docs](docs/features/E911.md)) |
 
 ### 🏭 Vertical network awareness
 
@@ -165,7 +166,8 @@ Four IP-native domains a generic IPAM doesn't speak. Each is a
 the DDI primitives already here — not a protocol implementation. All
 four are read-only by construction: SpatiumDDI records what the estate
 *is*, and never reads or writes a device object, a control tag, or a
-study. Default-on, individually togglable.
+study. Off on a fresh install, individually togglable under Settings →
+Features.
 
 | | Domain | What it models |
 |---|---|---|
@@ -268,7 +270,7 @@ doesn't own.
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended)) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO for amd64 and arm64, installable onto a RAID1 mirror (beta — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso-recommended)) |
 
 ---
 
@@ -710,7 +712,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Ownership** — `list_customers`, `list_sites`, `list_providers`, `get_customer_summary` (per-customer rollup of subnets / blocks / spaces / circuits / services / ASNs / zones / domains / overlays in one call)
   - **Admin** — `list_users`, `list_groups`, `list_roles` (superadmin-gated inline; the orchestrator returns an error dict for non-admins)
   - **Appliance fleet config** — `find_snmp_settings`, `find_ntp_settings`, `find_pairing_codes`. All three superadmin-gated; pairing codes also redact the cleartext code + sha256 hash, only the last two digits ever leave the database. No `propose_*` write companions by design — the create response for a pairing code carries the cleartext code, which we don't want in chat transcripts
-  - **Backup + factory-reset** — `list_backup_targets` (every configured destination with last-run state, schedule, retention; `config` blob deliberately omitted so destination credentials stay out of the LLM context), `list_backup_archives_at_target` (calls the driver's `list_archives` so the result matches the Backup admin Archives drawer), `find_backup_audit_history` (windowed timeline of backup_created / target-run-success/failed / backup_restored / factory_reset_performed audit rows). All three superadmin-gated. **No `propose_*` writes by design** — restore + factory-reset are password-gated + confirm-phrase-gated, an LLM intermediary in "should I restore?" adds friction without value
+  - **Backup + factory-reset** — `list_backup_targets` (every configured destination with last-run state, schedule, retention; `config` blob deliberately omitted so destination credentials stay out of the LLM context), `list_backup_archives_at_target` (calls the driver's `list_archives` so the result matches the Backup admin Archives drawer), `find_backup_audit_history` (windowed timeline of backup_created / target-run-success/failed / backup_restored / factory_reset_performed audit rows), `get_backup_health` (per scheduled target: ok / failed / stale / stuck, the same decision as the `backup_failed` / `backup_stale` alerts). All superadmin-gated. **No `propose_*` writes by design** — restore + factory-reset are password-gated + confirm-phrase-gated, an LLM intermediary in "should I restore?" adds friction without value
   - **Integration mirrors** — `list_kubernetes_targets`, `list_docker_targets`, `list_proxmox_targets`, `list_tailscale_targets`, `list_netbird_targets`, `list_unifi_targets`, `list_cloud_targets`, `list_opnsense_targets`, `list_panos_targets`, `list_fortinet_targets`, `list_meraki_targets` (each tagged with the matching `integrations.*` module so disabling the integration removes the tool in lock-step with the sidebar entry; credentials never enter the response)
   - **Firewall objects, block sync + feeds** — `find_firewall_objects` / `count_firewall_objects` (vendor-neutral over the Palo Alto / Fortinet / Meraki shadow-IPAM store, filterable by `source_kind`), `find_network_blocks` / `count_network_blocks`, `list_firewall_feeds`, and the default-disabled `propose_create_network_block` write proposal. Gated on the `security.block_sync` / `security.firewall_feeds` modules; write-scoped target credentials never enter the response
   - **Ops, observability + audit** — `list_alerts`, `list_alert_rules`, `get_audit_history`, `audit_walk` (paginated chronology), `current_state` (platform health snapshot), `query_dns_query_log`, `query_dhcp_activity_log`, `query_logs`, `get_dns_query_rate` / `get_dhcp_lease_rate` (24-bucket timeseries), `global_search`, `lookup_whois_asn` / `lookup_whois_domain` / `lookup_whois_ip`, `tls_cert_check`, `find_nonconforming_names` (audit pre-existing hostnames / record owners / zone names against the DNS standards), `help_write_permission`, `find_agents_with_config_failures` (which DNS / DHCP / looking-glass agents rejected their last config and reverted — the one state where `status`, the health check and `last_seen_at` all read normal while the saved config is live nowhere), `find_branding_settings`, `get_support_bundle_preview` (default **off** — a broad read), `propose_create_alert_rule`, `propose_archive_session`
@@ -937,7 +939,7 @@ Operators get a real Kubernetes node without managing one.
 
 1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox /
    VMware / Hyper-V / QEMU), or `dd` it to a USB stick for
-   bare metal. **amd64** (arm64 ISO is planned).
+   bare metal. **amd64** or **arm64** (UEFI only).
 
    **Hard floor (installer refuses below this): 32 GiB disk** —
    the A/B atomic-upgrade layout needs two 8 GiB OS slots that
@@ -1195,7 +1197,7 @@ cp .env.example .env
 #   POSTGRES_PASSWORD=<set this>
 #   SECRET_KEY=$(openssl rand -hex 32)
 #   DNS_AGENT_KEY=$(openssl rand -hex 32)   # needed if running the DNS container
-docker compose build
+docker compose pull
 docker compose run --rm migrate
 docker compose up -d
 ```
@@ -1386,8 +1388,8 @@ EOF
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
-- Kubernetes 1.31+ with Helm 3, **or**
-- Ubuntu 22.04 / Debian 12 / Alpine 3.20+ for bare metal
+- Kubernetes with Helm: CI tests the charts on Kubernetes 1.36 with Helm 4 (k3s 1.36 on the appliance); the umbrella chart declares `kubeVersion: >=1.31`, **or**
+- The SpatiumDDI OS appliance on bare metal or a VM (see [APPLIANCE.md](docs/deployment/APPLIANCE.md)); running directly on a host OS without Docker is planned, not implemented
 
 ---
 
@@ -1409,6 +1411,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | Document | Description |
 |---|---|
 | [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
+| [Changelog](CHANGELOG.md) | What changed in each release, including upgrade notes |
 | [Architecture](docs/ARCHITECTURE.md) | System topology, control plane / data plane split, agent contract, HA design |
 | [Data Model](docs/DATA_MODEL.md) | Database models grouped by domain, key relationships, shared conventions |
 | [REST API](docs/API.md) | API conventions — pagination, filtering, error format, auth, versioning |
@@ -1431,7 +1434,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
 | [Docker Compose](docs/deployment/DOCKER.md) | Compose setup, ports, first-time setup, TLS, HA, password reset |
 | [Kubernetes](docs/deployment/KUBERNETES.md) | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA |
-| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance |
+| [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, OS appliance (the Compose Patroni overlay is unsupported in 1.0) |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
 | [Third-Party Components](docs/THIRD_PARTY.md) | Every bundled engine, library and OS package — license, artifact it ships in, and why it's there |
@@ -1474,6 +1477,8 @@ Thanks to everyone who has opened a pull request against SpatiumDDI.
 | <img src="https://github.com/tristanbob.png" width="48" alt=""> | [@tristanbob](https://github.com/tristanbob) | `authlib.jose` → `joserfc` migration, pairing-code prune fix |
 | <img src="https://github.com/Cmonnich.png" width="48" alt=""> | [@Cmonnich](https://github.com/Cmonnich) | Technitium DNS driver |
 | <img src="https://github.com/waza-ari.png" width="48" alt=""> | [@waza-ari](https://github.com/waza-ari) | Agentless FortiGate cloud DHCP driver |
+| <img src="https://github.com/stefanriegel.png" width="48" alt=""> | [@stefanriegel](https://github.com/stefanriegel) | Multi-node appliance field testing and fixes: Technitium zone types and blocklists, cloud DNS health, DHCP server groups, blocklist feed memory, alert evaluator |
+| <img src="https://github.com/containerguy.png" width="48" alt=""> | [@containerguy](https://github.com/containerguy) | Hetzner DNS driver on the Hetzner Cloud API |
 
 Opened a PR and not listed? That is an oversight, not a judgement — please
 say so on the [issue tracker](https://github.com/spatiumnorth/spatiumddi/issues)

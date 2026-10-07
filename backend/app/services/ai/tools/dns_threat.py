@@ -53,6 +53,7 @@ class FindSuspiciousDNSClientsArgs(BaseModel):
 
 @register_tool(
     name="find_suspicious_dns_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients whose query behaviour scores as tunneling / "
         "exfiltration (issue #699). DNS tunneling hides payload in the "
@@ -147,6 +148,7 @@ class DNSThreatSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_dns_threat_summary",
+    permission=("read", "server"),
     description=(
         "One-shot rollup of DNS tunneling analytics over a trailing "
         "window (issue #699): how many client windows were scored, how "
@@ -193,6 +195,7 @@ class FindDNSThreatMutesArgs(BaseModel):
 
 @register_tool(
     name="find_dns_threat_mutes",
+    permission=("read", "server"),
     description=(
         "List DNS clients an operator has reviewed and muted, with the "
         "reason, who muted them and when it expires. Use before "
@@ -256,6 +259,7 @@ class FindBeaconingClientsArgs(BaseModel):
 
 @register_tool(
     name="find_beaconing_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients querying one name on a metronomic cadence — "
         "the rhythm of a C2 callback (issue #699). Each row carries the "
@@ -335,6 +339,7 @@ class FindDGAClientsArgs(BaseModel):
 
 @register_tool(
     name="find_dga_clients",
+    permission=("read", "server"),
     description=(
         "Find DNS clients that queried a crop of algorithmically-"
         "generated domain names — how malware locates its "
@@ -408,6 +413,7 @@ class FindRPZOffendersArgs(BaseModel):
 
 @register_tool(
     name="find_rpz_offenders",
+    permission=("read", "server"),
     description=(
         "Find which clients keep reaching for domains the blocklists "
         "block (issue #699). This is ground truth, NOT a heuristic — "
@@ -455,6 +461,7 @@ async def find_rpz_offenders(
 
 @register_tool(
     name="get_rpz_block_summary",
+    permission=("read", "server"),
     description=(
         "Blocklist activity rollup: how many lookups were blocked, how "
         "many distinct clients and names, which feeds fired, and the "
@@ -503,6 +510,7 @@ class FindRPZHitsArgs(BaseModel):
 
 @register_tool(
     name="find_rpz_hits",
+    permission=("read", "server"),
     description=(
         "The INDIVIDUAL blocked lookups, newest first — not a rollup "
         "(issue #914). find_rpz_offenders says a client has N blocked "

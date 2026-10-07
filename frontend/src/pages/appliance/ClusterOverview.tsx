@@ -1092,7 +1092,24 @@ export function WorkloadHealth({
                     {w.restarts}
                   </span>
                 )}
-                <span className="tabular-nums text-foreground">
+                {w.jobs_running > 0 && (
+                  <span
+                    className="text-amber-600 dark:text-amber-400"
+                    title={`${w.jobs_running} job${w.jobs_running === 1 ? "" : "s"} still running (e.g. a database replica joining) — not counted in ready / total`}
+                  >
+                    +{w.jobs_running} job{w.jobs_running === 1 ? "" : "s"}
+                  </span>
+                )}
+                <span
+                  className="tabular-nums text-foreground"
+                  title={
+                    w.source === "cnpg"
+                      ? `ready ${w.ready} of ${w.total} wanted (from the CNPG Cluster)`
+                      : w.source === "pods"
+                        ? "pod count: the CNPG Cluster could not be read"
+                        : undefined
+                  }
+                >
                   {w.ready}/{w.total}
                 </span>
               </div>

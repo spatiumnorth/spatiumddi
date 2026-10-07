@@ -472,6 +472,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_schema_behind_head_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
+    # Record the schema head this release runs at (#1227), so a later
+    # rollback to it can be checked before the switch rather than after.
+    # Only once the schema is at head; never blocks startup.
+    try:
+        from app.services.upgrades.schema_rollback import record_this_release  # noqa: PLC0415
+
+        await record_this_release()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("release_schema_head_record_failed", error=str(exc))
     # cluster-upgrade-failed alert rule — singleton, enabled by default
     # (issue #296 Phase F). Fires when the rolling-upgrade orchestrator
     # flips a SystemUpgradeRun to ``state='failed'``.
@@ -548,6 +557,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_bundle_render_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
+    # #1232 — a DNS record change an agent gave up on after every retry.
+    # Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_record_op_failed_alert_rule,
+        )
+
+        await seed_dns_record_op_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
@@ -680,6 +699,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_restore_drill_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("restore_drill_alert_rule_seed_skipped", reason=str(exc))
+    # Scheduled-backup failed / stale alert rules (#1262), ENABLED. Silent
+    # until a backup target has a schedule.
+    try:
+        from app.services.alerts import seed_backup_alert_rules  # noqa: PLC0415
+
+        await seed_backup_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("backup_alert_rules_seed_skipped", reason=str(exc))
     try:
         from app.services.alerts import seed_dns_tunneling_alert_rule  # noqa: PLC0415
 
@@ -923,8 +950,9 @@ def create_app() -> FastAPI:
         # error (#865). Without this the header is present on the wire but
         # the JS layer can't read it under CORS — for a cross-origin
         # frontend the feature would silently degrade to the dead end it
-        # fixes.
-        expose_headers=["X-Total-Count", "X-Adoption-Required"],
+        # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
+        # step-up, so a dialog can prompt and resubmit (#1412).
+        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given

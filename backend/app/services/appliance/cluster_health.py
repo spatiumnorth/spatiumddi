@@ -657,6 +657,66 @@ def cluster_unavailable(detail: str) -> dict[str, Any]:
     return _unavailable(detail)
 
 
+def _apply_cnpg_instances(
+    workloads: list[dict[str, Any]],
+    clusters: set[tuple[str, str]],
+    components: set[str],
+) -> None:
+    """Take the database row's verdict from CNPG, not a pod count (#1387).
+
+    A pod count cannot see what CNPG wants. A join Job that failed for good
+    leaves only ``Failed`` pods, which are skipped, so a cluster that wants
+    three instances read 2/2 healthy indefinitely; and during first
+    bootstrap, while ``-initdb`` runs and no instance pod exists, there was
+    no database row at all. So for one CNPG Cluster the row reads
+    ``status.readyInstances`` of ``spec.instances`` (the check the rolling
+    upgrade already makes, ``safety.check_cnpg_instances_ready``), and
+    ``source`` says which. When the Cluster cannot be read (a 403, a non-CNPG
+    install, or more than one Cluster) the pod rollup stands, marked
+    ``source: "pods"``.
+    """
+    # The component CNPG's pods roll up under (``database`` from CNPG's own
+    # app.kubernetes.io/component label), not a hard-coded name.
+    if len(components) != 1:
+        return
+    comp = next(iter(components))
+    row = next((w for w in workloads if w["component"] == comp), None)
+    if row is not None:
+        row["source"] = "pods"
+    if len(clusters) != 1:
+        return
+    name, namespace = next(iter(clusters))
+    try:
+        status_code, body = k8s.get_cnpg_cluster(name, namespace=namespace or None)
+    except k8s.KubeapiUnavailableError:
+        return
+    if status_code != 200 or not body:
+        return
+    wanted = int((body.get("spec") or {}).get("instances") or 0)
+    if wanted <= 0:
+        return
+    ready = int((body.get("status") or {}).get("readyInstances") or 0)
+    if row is None:
+        row = {
+            "component": comp,
+            "kind": "Cluster",
+            "ready": 0,
+            "total": 0,
+            "restarts": 0,
+            "jobs_running": 0,
+        }
+        workloads.append(row)
+    row["ready"] = min(ready, wanted)
+    row["total"] = wanted
+    row["source"] = "cnpg"
+    if ready >= wanted and not row.get("jobs_running"):
+        row["status"] = "healthy"
+    elif ready > 0:
+        row["status"] = "degraded"
+    else:
+        row["status"] = "down"
+
+
 def get_cluster_health() -> dict[str, Any]:
     """Gather a full cluster-health snapshot. Synchronous (stdlib kubeapi).
 
@@ -803,11 +863,22 @@ def get_cluster_health() -> dict[str, Any]:
     pods_running = 0
     pod_rows: list[dict[str, Any]] = []
     rollup: dict[str, dict[str, Any]] = {}
+    # Job pods still running per component (#1213): a CNPG
+    # ``postgresql-N-join`` pod means an instance is still being created.
+    jobs_running: dict[str, int] = {}
+    # #1387 — the CNPG Clusters behind the database pods, from the label CNPG
+    # puts on every pod it runs (instances, and its initdb / join Jobs).
+    cnpg_clusters: set[tuple[str, str]] = set()
+    cnpg_components: set[str] = set()
     for p in pods_raw:
         meta = p.get("metadata") or {}
         status = p.get("status") or {}
         ns = meta.get("namespace") or ""
         name = meta.get("name") or "?"
+        cnpg_name = (meta.get("labels") or {}).get("cnpg.io/cluster")
+        if cnpg_name:
+            cnpg_clusters.add((str(cnpg_name), ns))
+            cnpg_components.add(_pod_component(p))
         phase = status.get("phase") or "Unknown"
         pods_by_phase[phase] = pods_by_phase.get(phase, 0) + 1
         if phase == "Running":
@@ -833,8 +904,14 @@ def get_cluster_health() -> dict[str, Any]:
         }
         pod_rows.append(row)
 
-        # Workload rollup — skip done Job pods (helm-install Completed etc.).
-        if terminal and owner == "Job":
+        # Workload rollup — Job pods are not serving instances, so none of
+        # them count toward a workload's ready / total (#1213). A running one
+        # used to: CNPG's join pod read as a third ready database pod while
+        # CNPG itself reported two instances, "Creating a new replica". A
+        # Job still running instead keeps its component off "healthy" below.
+        if owner == "Job":
+            if not terminal:
+                jobs_running[comp] = jobs_running.get(comp, 0) + 1
             continue
         agg = rollup.setdefault(
             comp,
@@ -850,13 +927,17 @@ def get_cluster_health() -> dict[str, Any]:
 
     workloads: list[dict[str, Any]] = []
     for comp, agg in rollup.items():
-        if agg["ready"] == agg["total"] and agg["total"] > 0:
+        # Carried on the row so a "degraded" at ready == total says why,
+        # rather than reading as 2/2 and degraded with no explanation.
+        n_jobs = jobs_running.get(comp, 0)
+        if agg["ready"] == agg["total"] and agg["total"] > 0 and not n_jobs:
             wstatus = "healthy"
         elif agg["ready"] > 0:
             wstatus = "degraded"
         else:
             wstatus = "down"
-        workloads.append({**agg, "status": wstatus})
+        workloads.append({**agg, "jobs_running": n_jobs, "status": wstatus})
+    _apply_cnpg_instances(workloads, cnpg_clusters, cnpg_components)
     workloads.sort(
         key=lambda w: (
             (

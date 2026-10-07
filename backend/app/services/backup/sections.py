@@ -477,8 +477,9 @@ SECTIONS: tuple[Section, ...] = (
         key="platform_internal",
         label="Platform internals (alembic head / reference caches)",
         description=(
-            "Schema-version pin (``alembic_version``), the IEEE OUI "
-            "vendor cache, and the refreshed IANA TLD list. These ride "
+            "Schema-version pin (``alembic_version``) and the schema head "
+            "each release ran at, the IEEE OUI vendor cache, and the "
+            "refreshed IANA TLD list. These ride "
             "along with every restore — selective restore can't deselect "
             "them."
         ),
@@ -489,7 +490,16 @@ SECTIONS: tuple[Section, ...] = (
         # the meantime — but it is still restored rather than dropped, or
         # a restore would silently roll an install back to the bundled
         # list and relabel any zone on a recently-delegated TLD.
-        tables=("alembic_version", "oui_vendor", "tld_registry_snapshot"),
+        # release_schema_head (#1227) records which schema head each release
+        # ran at. It is a fact about ``alembic_version``'s history, so it
+        # travels with it: restored without it, the rollback guard would
+        # read every release as unknown on the restored install.
+        tables=(
+            "alembic_version",
+            "oui_vendor",
+            "tld_registry_snapshot",
+            "release_schema_head",
+        ),
         selectable=False,
     ),
 )

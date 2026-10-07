@@ -276,6 +276,17 @@ async def apply_ddns_for_lease(
     published = await _sync_dns_record(
         db, ipam_row, subnet, zone_id=override_zone_id, action="create", ttl=eff.ttl
     )
+    if not published and getattr(ipam_row, "_dns_skipped_cname", False):
+        # #1493 — the hostname already holds a CNAME, so no A / AAAA (and no
+        # PTR naming the alias) was written. The router logged the clash at
+        # warning once; every renewal re-runs this, so say it at debug here.
+        logger.debug(
+            "ddns_skipped_cname",
+            subnet_id=str(subnet.id),
+            ip=str(ipam_row.address),
+            hostname=hostname,
+        )
+        return False
     if not published:
         # spatiumddi#1065 — the sync found no forward zone (no primary, no
         # extras) and enqueued nothing. This used to log ``ddns_applied``

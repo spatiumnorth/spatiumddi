@@ -70,13 +70,12 @@ spec:
             # #292 / #409 — in-cluster API Service over HTTP by default;
             # prefer the supervisor-supplied external controlPlaneUrl when
             # set (Application appliance with its own k3s — no in-cluster
-            # control Service), skipping TLS verify on that self-signed
-            # path. See dns-bind9.yaml for the full rationale.
+            # control Service), verified against the supervisor's pinned
+            # certificate (#1281). See dns-bind9.yaml for the full rationale.
             - name: CONTROL_PLANE_URL
               value: {{ .Values.dnsPowerdns.controlPlaneUrl | default .Values.dnsPowerdns.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
             {{- if .Values.dnsPowerdns.controlPlaneUrl }}
-            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
-              value: "1"
+            {{- include "spatiumddi-appliance.cpPin.env" . | nindent 12 }}
             {{- end }}
             - name: DNS_AGENT_KEY
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
@@ -131,6 +130,9 @@ spec:
               mountPath: /var/lib/spatium-dns-agent
             - name: data
               mountPath: /var/lib/powerdns
+            {{- if .Values.dnsPowerdns.controlPlaneUrl }}
+            {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
+            {{- end }}
       # NOTE: the dnsdist front (#146 Phase 2) is docker-compose-only for now.
       # On k8s/appliance, pdns runs hostNetwork on :53, which makes a clean
       # in-pod dnsdist front non-trivial (the front needs its own :53). A
@@ -139,6 +141,9 @@ spec:
       # #292 — per-node hostPath (not shared PVC, not emptyDir); see
       # dns-bind9.yaml for the rationale.
       volumes:
+        {{- if .Values.dnsPowerdns.controlPlaneUrl }}
+        {{- include "spatiumddi-appliance.cpPin.volume" . | nindent 8 }}
+        {{- end }}
         - name: agent-state
           hostPath:
             path: /var/lib/spatiumddi/agents/dns-powerdns/state

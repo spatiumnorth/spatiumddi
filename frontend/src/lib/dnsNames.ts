@@ -102,3 +102,18 @@ export function fqdnError(name: string): string | null {
   if (body.length > MAX_NAME_LEN) return `exceeds ${MAX_NAME_LEN} characters`;
   return null;
 }
+
+/**
+ * The lookup kind of a zone named `name` (#1310): `reverse` for a name under
+ * `in-addr.arpa` / `ip6.arpa`, `forward` for every other. Mirror of
+ * `zone_kind_for_name` (`app/services/dns/name_scope.py`): for a primary zone
+ * the API takes an omitted kind from the name the same way and refuses
+ * `forward` for a reverse-lookup name, since IPAM publishes PTR records only
+ * into reverse zones. Label-wise, like the server: `notin-addr.arpa` is
+ * forward.
+ */
+export function zoneKindForName(name: string): "forward" | "reverse" {
+  const labels = name.trim().toLowerCase().split(".").filter(Boolean);
+  const tree = labels.slice(-2).join(".");
+  return tree === "in-addr.arpa" || tree === "ip6.arpa" ? "reverse" : "forward";
+}

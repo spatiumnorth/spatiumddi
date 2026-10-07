@@ -260,6 +260,11 @@ api:
     # which actually lives at ``/var/lib/spatiumddi/release-state/...``
     # on the appliance's filesystem.
     releaseStateDir: /var/lib/spatiumddi/release-state
+    # GHSA-h2j9-qrg7-grfw — the gid that owns releaseStateDir (mode 1770,
+    # set by spatiumddi-firstboot + a tmpfiles.d entry). Added to the api
+    # pod's supplementalGroups so it can write triggers there. Must match
+    # SPATIUM_HOST_GID in appliance/…/spatiumddi-firstboot.
+    hostGroupGid: 2770
     hostLogDir: /var/log/spatiumddi
     hostEtcDir: /etc/spatiumddi
     # #386 — host dir backing the api's upgrade-image store
@@ -859,6 +864,18 @@ dnsAgents:
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
     #   service: { type: LoadBalancer }
+    #   # LoadBalancer Services keep the client address by default
+    #   # (externalTrafficPolicy: Local — each server is a single-replica
+    #   # StatefulSet, so the announcing node is the pod's node anyway);
+    #   # set externalTrafficPolicy: Cluster to opt out. The remaining
+    #   # fields are rendered when set (#1548):
+    #   # service:
+    #   #   annotations:
+    #   #     metallb.universe.tf/address-pool: default
+    #   #     metallb.universe.tf/loadBalancerIPs: 10.0.0.53
+    #   #   loadBalancerIP: 10.0.0.53
+    #   #   loadBalancerSourceRanges: [192.0.2.0/24]
+    #   #   ipFamilyPolicy: PreferDualStack  # + ipFamilies: [IPv4, IPv6]
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
@@ -899,8 +916,22 @@ dhcpAgents:
     #   role: primary
     #   group: default
     #   storage: { agentState: 1Gi, keaState: 2Gi }
-    #   service: { type: NodePort }
-    #   hostNetwork: false       # true required for L2 DHCP broadcast (no relay)
+    #   hostNetwork: false       # true binds the node's UDP/67 directly:
+    #                            # broadcast clients work with no relay,
+    #                            # and a relay reaches the node on 67
+    #   service: { type: LoadBalancer }
+    #                            # the default. A DHCP relay (ip
+    #                            # helper-address) can only forward to
+    #                            # UDP/67, so without hostNetwork point it
+    #                            # at the LoadBalancer address. A pinned
+    #                            # NodePort (service: { type: NodePort,
+    #                            # nodePort: 30067 }) only helps a relay
+    #                            # that can forward to a non-standard
+    #                            # port. On a NodePort Service the
+    #                            # `port: 67` is in-cluster only; the
+    #                            # node-facing port is the nodePort, which
+    #                            # Kubernetes picks at random (30000–32767)
+    #                            # when it is not pinned.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
