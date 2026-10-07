@@ -531,7 +531,9 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
         logger.warning(
             "audit_forward_webhook_non2xx",
             status=resp.status_code,
-            body_preview=redact(resp.text[:200], url, auth_header),
+            # Redact BEFORE truncating (GHSA-5qf8-pqm4-58mj): a secret
+            # straddling the 200-char cut is no longer an exact match.
+            body_preview=redact(resp.text, url, auth_header)[:200],
         )
         raise httpx.HTTPStatusError(
             f"webhook answered HTTP {resp.status_code}",

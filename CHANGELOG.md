@@ -84,6 +84,89 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Kubernetes, Docker, Tailscale, NetBird and Cloud syncs no longer fail
+  on an address another integration already mirrors (#1677).** Same gap
+  as Proxmox in #1622: the reconciler logged "owned by another
+  integration; not claiming" and then inserted its own row at that
+  address anyway, or moved one of its rows onto it. That hit
+  `uq_ip_address_subnet_address`, and nothing from that cluster, host,
+  tenant or endpoint synced, with no `last_sync_error`. A Kubernetes node
+  whose LAN address UniFi, OPNsense or Proxmox already mirrors was enough.
+  These mirrors now leave such an address to its owner and sync the rest.
+  The Kubernetes, Docker, Tailscale, NetBird and UniFi sweeps also roll
+  back after a failed target now, and no integration sweep reads the
+  target's name off the expired row any more: a failed flush used to end
+  the whole sweep with `PendingRollbackError`, so every target after the
+  broken one was skipped too.
+
+- **Cluster health reads the database from CNPG, not a pod count (#1387).**
+  A pod count cannot see how many instances CNPG wants: a replica join that
+  failed for good leaves only `Failed` Job pods, which are skipped, so a
+  cluster wanting three instances read 2/2 healthy indefinitely, and during
+  first bootstrap, before any instance pod exists, there was no database row
+  at all. The database row now reads the CNPG Cluster's `readyInstances` of
+  `spec.instances` (the check the rolling upgrade already makes), so those
+  read 2/3 degraded and 0/3 down. The Cluster is found from the
+  `cnpg.io/cluster` label on its pods. When it cannot be read (a 403, a
+  non-CNPG install) the pod count stands, and the row's new `source` field
+  (`cnpg` / `pods`) and its tooltip say which.
+
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
+- **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
+  as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
+  when the hostname already holds a CNAME, but the PTR was still written,
+  naming the alias: a reverse lookup led forward to the CNAME's target
+  instead of back to the address (RFC 1912 section 2.4 asks a PTR to name an
+  A record). The PTR is now skipped too, and one an address had before
+  being renamed onto the CNAME's name is retracted. Such a sync now reports
+  that it published nothing, so the DDNS path logs `ddns_skipped_cname`
+  rather than `ddns_applied`, and `ipam_dns_record_skipped_cname` is logged
+  at warning once per address, hostname and zone instead of on every lease
+  renewal.
+
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **At upgrade a timer
+  changes on the wire only where someone set it:** each timer still at
+  its old stored default (refresh 86400, retry 7200, expire 3600000,
+  minimum 3600, none of them ever served) is set to the value it serves
+  today (3600, 600, 86400, 300) by migration `ff32b91acad8`, and new
+  zones default to those values too, keeping the 5-minute negative TTL
+  a DDNS-driven estate relies on. A zone with an edited timer starts
+  serving it, under a new serial so its secondaries transfer it, and
+  reloads once. **A group switches to the zones' own timers only once
+  every BIND9 agent in it renders them:** until then, through an upgrade
+  (on a cluster, until its last DNS pod is replaced) or while an agent of
+  an older release stays in the group, it keeps serving
+  `3600 600 86400 300`, and the edited zones' serials move at the switch.
+  So no serial is ever served with two different SOAs, and no DNS change
+  is held back meanwhile. The zone API refuses a timer outside 0 to
+  2147483647, and a stored one BIND would refuse is served as before and
+  logged rather than taking the zone down. PowerDNS and Technitium
+  manage their own SOA and are unchanged.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —
@@ -311,6 +394,21 @@ the formatter handles the rest.
   dropped, with no update sent, the next time IPAM syncs or deletes the
   address.
 
+- **IPAM writes forward records only into a zone it serves as primary
+  (#1633).** A subnet could be bound to a conditional forwarder, a
+  secondary or a stub as its DNS zone, and an address could pick one as
+  its own zone or list one in its extra zones. IPAM wrote every host's
+  A/AAAA record and every alias into such a zone, and the record updates
+  went to a zone that cannot take them, so nobody served the record. The
+  drift check expected the record in that zone and showed the subnet in
+  sync. Such a zone still names the host (its FQDN, and the PTR IPAM
+  writes into a reverse zone it serves), but IPAM now writes no A/AAAA or
+  alias into it and queues nothing, the drift check expects none, and
+  adding an alias there answers 409 saying why. The same holds once a
+  zone in use is changed to a secondary. A record an earlier release
+  wrote into such a zone is dropped, with no update sent, the next time
+  IPAM syncs the address.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
@@ -343,6 +441,20 @@ the formatter handles the rest.
   window early, and keep-days deleted rollback copies on the backups'
   schedule. Retention now splits the listing: backups follow the
   target's policy, safety dumps keep their own last 3.
+
+- **A refused restore no longer blocks every later one as "already in
+  progress" (#1648).** The restore lock added for #1571 was taken on
+  the request's database session, which hands its connection back to
+  the pool at every commit, so the unlock ran on a different
+  connection and did nothing. The lock stayed on an idle pooled
+  connection: after one refused restore (a mistyped passphrase, an
+  invalid archive) the next could be refused with "another restore is
+  already in progress" until the api recycled that connection or
+  restarted. The same flaw could let a second restore in while one was
+  running, and the pool reset before the replay dropped the lock. The
+  lock now lives on a connection of its own for the whole restore,
+  which the restore spares when it ends the other sessions, and it is
+  released however the restore ends, a cancelled request included.
 
 - **A Proxmox sync no longer fails on an address another integration
   already mirrors (#1622).** When a guest reported an IP that UniFi (or any
@@ -896,6 +1008,39 @@ the formatter handles the rest.
   `error_detail`, which no forwarder emits. A consumer that parsed
   `new_value.error` should switch to `failure_category`.
 
+- **A cleared or replaced webhook secret no longer lives on in its
+  old plaintext column, and a collector echoing part of a secret no
+  longer leaks it into the log (GHSA-g9gv-9qp2-3qwm,
+  GHSA-5qf8-pqm4-58mj).** Follow-ups to #1506, found on its QA walk.
+  Writing a forward target's URL or `Authorization` header, or the
+  legacy pair through `PUT /api/v1/settings`, now also blanks the
+  matching pre-upgrade plaintext column in the same change, so the
+  old value does not stay readable in the database or in full
+  backups until the column is dropped. `redact()` for the
+  non-2xx `body_preview` now runs before the preview is truncated
+  to 200 characters, and also covers the bare header token, each
+  URL path segment and query value, and their JSON-escaped and
+  percent-encoded forms. An exclude-secrets restore's empty-bytea
+  encrypted URL is now treated as unset (`url_set`, the audit
+  snapshot, and the webhook-URL requirement), so a restored target
+  is reported unconfigured instead of silently not delivering.
+
+- **A resource-scoped API token is held to its subnet or zone on every
+  route keyed on one (GHSA-46mq-mpwf-xxwv).** A token restricted with
+  `resource_grants` passes the router permission gate on the resource type
+  alone, so each subnet-, address- or zone-keyed handler had to re-check the
+  instance itself, and many didn't. A token bound to one subnet or zone could
+  read another's reconciliation, DNS-sync preview and summary, aliases,
+  domains, network context, effective DNS / DHCP / custom fields, probe
+  policy, utilization history and zone update ACL, and a zone-scoped token
+  with write could update, DNSSEC-sign / unsign / roll over, edit the update
+  ACL of, or import into a zone it wasn't bound to. The check is now a
+  router-level dependency on the IPAM and DNS routers, so every route keyed
+  on `{subnet_id}`, `{address_id}` or `{zone_id}` refuses another instance
+  before its handler runs, and a test sweeps every such route so a new one
+  can't slip past. A server's zone-state and pending-ops lists now narrow to
+  the token's zones. Sessions and unscoped tokens are unaffected.
+
 - **Unauthenticated `/health/platform` requests can no longer deadlock the
   api (GHSA-c58p-8cq9-g3gm).** Each request ran its own Celery `inspect ping`
   in a thread, and the 3 s timeout abandoned the request but not the thread.
@@ -1335,6 +1480,17 @@ the formatter handles the rest.
   nullable. It does not drop them; the next release does. Downgrade
   copies the current values back into the plaintext columns and drops
   the encrypted ones.
+- `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
+  default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
+  the value the BIND9 agent has always served (3600, 600, 86400, 300),
+  timer by timer, so rendering the stored timers changes nothing on the
+  wire for a timer nobody set. Adds `dns_server.agent_renders_soa_timers`
+  (false) and `dns_server_group.serves_soa_timers` (true; false for every
+  group with a BIND9 agent, whose agents are the previous release's). It
+  moves no serial: a zone with other timers moves its serial when its
+  group switches to serving them. Downgrade moves the serial of each zone
+  whose group served its own timers (its SOA changes back) and drops the
+  two columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

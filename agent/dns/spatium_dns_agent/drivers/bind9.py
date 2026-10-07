@@ -809,6 +809,36 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
 
 
+# The SOA timers in wire order, each with the value every zone was served with
+# before the control plane shipped them (#1171). A bundle from a control plane
+# that sends none renders exactly the bytes it did before.
+_SOA_TIMERS = (("refresh", 3600), ("retry", 600), ("expire", 86400), ("minimum", 300))
+# RFC 2181 section 8's TTL ceiling, and the zone API's (int4) column's.
+_SOA_TIMER_MAX = 2**31 - 1
+
+
+def _soa_timers(zone: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """``REFRESH RETRY EXPIRE MINIMUM`` for a zone's SOA, and a note for each
+    value that could not be used (issue #1171).
+
+    The zone's own timers are written. One the bundle does not carry (an older
+    control plane) is served as every zone was before they shipped; one it
+    carries that BIND would refuse — anything but a whole number of seconds
+    from 0 to 2^31-1 — is served the same way and noted, rather than making
+    named refuse the zone, and with it the group's whole config."""
+    values: list[str] = []
+    notes: list[tuple[str, str]] = []
+    for key, before in _SOA_TIMERS:
+        value = zone.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SOA_TIMER_MAX:
+            values.append(str(value))
+            continue
+        if value is not None:
+            notes.append(("unusable_timer", f"{key}={value!r}"))
+        values.append(str(before))
+    return " ".join(values), tuple(notes)
+
+
 _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
     "placeholder": (
         "bind9_zone_apex_ns_is_loopback",
@@ -843,6 +873,16 @@ _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
         (
             "The zone's Primary NS or Admin Email is not a usable domain name "
             "and was ignored."
+        ),
+    ),
+    "unusable_timer": (
+        "bind9_zone_soa_timer_unusable",
+        (
+            "A zone's SOA refresh, retry, expire or minimum is not a whole "
+            "number of seconds from 0 to 2147483647, and BIND would refuse the "
+            "zone over it. It was served with the value every zone carried "
+            "before the timers were rendered (3600/600/86400/300) instead. Fix "
+            "the zone's timers."
         ),
     ),
 }
@@ -1667,15 +1707,20 @@ class Bind9Driver(DriverBase):
         # 127.0.0.1`` is left only for a zone that names no name server —
         # BIND will not load a zone without one — and is logged when served.
         apex = _zone_apex(zone)
+        timers, timer_notes = _soa_timers(zone)
         lines = [
             f"$TTL {ttl}",
-            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} 3600 600 86400 300 )",
+            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} {timers} )",
             *(f"@ IN NS {ns}" for ns in apex.ns),
         ]
         if apex.placeholder_glue:
             lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
         for rec in zone.get("records", []) or []:
-            rec_ttl = rec.get("ttl") or ttl
+            # A record's own TTL wins, 0 included (#1382): 0 is how an operator
+            # says "do not cache this" through a cut-over, and ``or`` served it
+            # with the zone's TTL. Only a record with no TTL of its own takes
+            # the zone's, as on the RFC 2136 path (apply_record_op).
+            rec_ttl = ttl if rec.get("ttl") is None else rec["ttl"]
             name_field = rec.get("name") or "@"
             rtype = rec["type"].upper()
             value = rec["value"]
@@ -1696,7 +1741,7 @@ class Bind9Driver(DriverBase):
                 value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
-        return apex.notes
+        return apex.notes + timer_notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file.
