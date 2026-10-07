@@ -9784,6 +9784,7 @@ function BlocklistModal({
               <input
                 type="number"
                 min={0}
+                max={8760}
                 className={inputCls}
                 value={updateHours}
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
