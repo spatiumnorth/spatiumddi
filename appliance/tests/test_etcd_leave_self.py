@@ -58,6 +58,7 @@ def _run(
     *,
     joined: bool = True,
     survivor_frozen: bool = False,
+    survivor_down: bool = False,
     refuse: bool = False,
     local_unreadable: bool = False,
 ) -> tuple[int, list[str], bool, str]:
@@ -74,7 +75,9 @@ def _run(
     local = tmp_path / "local.json"
     local.write_text(json.dumps({"members": members, "unreadable": local_unreadable}))
     survivor = tmp_path / "survivor.json"
-    survivor.write_text(json.dumps({"members": members, "frozen": survivor_frozen}))
+    survivor.write_text(
+        json.dumps({"members": members, "frozen": survivor_frozen, "unreadable": survivor_down})
+    )
     fake = tmp_path / "fake.py"
     fake.write_text(FAKE)
     stopped = tmp_path / "k3s-stopped"
@@ -124,11 +127,22 @@ def test_a_node_that_joined_nobody_has_nothing_to_remove(tmp_path: Path) -> None
 
 
 def test_unconfirmed_removal_is_a_failure(tmp_path: Path) -> None:
-    # The survivor still lists the member: the caller must not wipe.
+    # The survivor answers and still lists the member: the caller must not wipe.
     rc, _, stopped, log = _run(tmp_path, survivor_frozen=True)
     assert rc == 1
     assert stopped
     assert "did not confirm" in log
+
+
+def test_an_unreachable_survivor_does_not_refuse_an_accepted_removal(tmp_path: Path) -> None:
+    """etcd accepted the removal, so the member is gone. Refusing because the
+    survivor could not be asked restarted k3s, which rejoined the node as a
+    new member and left the control plane on two voters (ddi-pg, #1659)."""
+    rc, removed, stopped, log = _run(tmp_path, survivor_down=True)
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    assert "could not be reached" in log
 
 
 def test_a_refused_removal_leaves_k3s_running(tmp_path: Path) -> None:

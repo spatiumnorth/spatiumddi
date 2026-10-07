@@ -426,10 +426,19 @@ def own_members(members: list[dict]) -> list[dict]:
 
 
 def leave_self() -> int:
-    """0: this node's etcd member is gone, a survivor says so, and k3s is
-    stopped. 2: this node joined nobody, so there is no member to remove.
-    1: the removal is not confirmed; k3s may be stopped, and the caller must
-    restart it and must not wipe this node."""
+    """0: this node's etcd member is gone and k3s is stopped. 2: this node
+    joined nobody, so there is no member to remove. 1: the removal did not
+    happen, or a survivor still lists the member; k3s may be stopped, and the
+    caller must restart it and must not wipe this node.
+
+    etcd answering the MemberRemove is the removal: a member change is
+    committed through raft, so an accepted one already has the quorum's
+    agreement. The survivor is asked as well, but only a survivor that
+    answers and still lists the member refuses the leave. One that cannot be
+    reached in the window does not: refusing there restarts k3s on a node
+    whose member is already gone, which deletes its etcd data and rejoins it
+    as a NEW member, leaving the seed alone for minutes and the control plane
+    on two voters (found by ddi-pg's walk of #1659)."""
     server = survivor_url()
     if not server:
         log("leave-self: no server: in the join drop-in; not a joined member, nothing to remove")
@@ -448,9 +457,11 @@ def leave_self() -> int:
     subprocess.run(["sh", "-c", STOP_K3S_CMD], capture_output=True, timeout=120, check=False)
     deadline = time.monotonic() + LEAVE_CONFIRM_S
     why = "no answer yet"
+    answered = False
     while True:
         try:
             still = own_members(list_members(url=server, cmd=SURVIVOR_MEMBERS_CMD))
+            answered = True
             if not still:
                 log(f"leave-self: {server} no longer lists this node's etcd member")
                 return 0
@@ -458,6 +469,11 @@ def leave_self() -> int:
         except Exception as exc:  # noqa: BLE001 — a survivor mid-failover; retried
             why = f"unreadable: {exc}"
         if time.monotonic() >= deadline:
+            if not answered:
+                log(f"leave-self: etcd accepted the removal; {server} could not be reached "
+                    f"to confirm it within {LEAVE_CONFIRM_S:.0f} s ({why}); going on, "
+                    "since the member is already gone"[:400])
+                return 0
             log(f"leave-self: {server} did not confirm the removal within "
                 f"{LEAVE_CONFIRM_S:.0f} s ({why})"[:400])
             return 1

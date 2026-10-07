@@ -94,9 +94,14 @@ the formatter handles the rest.
   fault tolerance, and a demoted node could not be promoted again under
   its hostname. Now the leave runner removes the node's own etcd member
   while it still votes (`spatium-etcd-evict --leave-self`), stops k3s,
-  and resets the node only once the node it joined confirms the member
-  is gone; an unconfirmed removal fails the leave and leaves the node a
-  working member. Its `left` report then hands the row to the seed's
+  and resets the node once the removal is done. etcd accepting the
+  removal is the removal (a member change commits through the quorum);
+  the node it joined is asked too, and only a survivor that answers and
+  still lists the member refuses the leave, leaving the node a working
+  member. A survivor that cannot be reached does not: refusing there
+  restarted k3s on a node whose member was already gone, which rejoined
+  it as a new member and left the control plane on two voters. Its
+  `left` report then hands the row to the seed's
   eviction (the path Replace uses), which deletes the stale Node and
   confirms etcd agrees before the row settles `left`. This does not
   clean up ghost voters an earlier demote already left behind: a
