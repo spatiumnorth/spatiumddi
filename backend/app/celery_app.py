@@ -1,4 +1,5 @@
 import contextvars
+import functools
 import importlib
 import sys
 from collections.abc import Mapping
@@ -17,6 +18,50 @@ from celery.signals import (
 )
 
 from app.config import settings
+
+# ── Broker connection pool bounds (GHSA-c58p-8cq9-g3gm) ─────────────────
+#
+# Every ``.delay()`` and every ``inspect`` broadcast checks a connection out
+# of kombu's per-process pool, and both Celery and kombu acquire with
+# ``block=True`` and NO timeout — there is no Celery setting for one. A
+# broadcast holds one connection while it acquires a second for its
+# producer, so enough concurrent holders exhaust the pool and every later
+# acquire waits forever; in the api that wait ran on the event loop and hung
+# the whole process until restart. The limit is pinned explicitly (it is
+# kombu's default of 10, now a decision rather than an accident) and an
+# exhausted pool raises ``kombu.exceptions.LimitExceeded`` after
+# ``BROKER_POOL_ACQUIRE_TIMEOUT_S`` instead of blocking.
+BROKER_POOL_LIMIT = 10
+BROKER_POOL_ACQUIRE_TIMEOUT_S = 5.0
+
+
+def _install_pool_acquire_timeout() -> None:
+    """Give kombu's blocking pool acquires a default timeout.
+
+    ``kombu.resource.Resource.acquire`` is the one method both the
+    connection pool and the producer pool acquire through. Only a call that
+    would block forever (``block=True, timeout=None``) is changed; an
+    explicit timeout or a non-blocking acquire passes through untouched.
+    Idempotent, so a re-import does not wrap twice.
+    """
+    from kombu.resource import Resource  # noqa: PLC0415
+
+    original = Resource.acquire
+    if getattr(original, "_spatium_acquire_timeout", False):
+        return
+
+    @functools.wraps(original)
+    def acquire(self: Any, block: bool = False, timeout: float | None = None) -> Any:
+        if block and timeout is None:
+            # Read at call time so the bound stays a single module constant.
+            timeout = BROKER_POOL_ACQUIRE_TIMEOUT_S
+        return original(self, block=block, timeout=timeout)
+
+    acquire._spatium_acquire_timeout = True  # type: ignore[attr-defined]
+    Resource.acquire = acquire  # type: ignore[method-assign]
+
+
+_install_pool_acquire_timeout()
 
 celery_app = Celery(
     "spatiumddi",
@@ -101,6 +146,7 @@ celery_app.conf.update(
     task_acks_late=True,  # Required for idempotency — task not acked until complete
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    broker_pool_limit=BROKER_POOL_LIMIT,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},

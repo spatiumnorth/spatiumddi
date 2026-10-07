@@ -99,6 +99,7 @@ async def _persist_proposal(
 
 @register_tool(
     name="propose_create_ip_address",
+    permission=("write", "ip_address"),
     description=(
         "Prepare an IP-address allocation proposal. The operator must "
         "explicitly click Apply (or you must call apply_proposal with "
@@ -140,6 +141,7 @@ async def propose_create_ip_address(
 
 @register_tool(
     name="propose_allocate_subnet",
+    permission=("write", "subnet"),
     description=(
         "Prepare a proposal to carve the next free child subnet of a "
         "given prefix length out of an IP block (e.g. 'allocate a /24 "
@@ -181,6 +183,7 @@ async def propose_allocate_subnet(
 
 @register_tool(
     name="propose_run_nmap_scan",
+    permission=("write", "manage_nmap_scans"),
     module="tools.nmap",
     description=(
         "Prepare an nmap scan proposal. The operator must explicitly "
@@ -225,6 +228,7 @@ async def propose_run_nmap_scan(
 
 @register_tool(
     name="propose_wake_host",
+    permission=("read", "use_network_tools"),
     description=(
         "Prepare a Wake-on-LAN proposal for an IP. The operator must "
         "click Apply to actually send the magic packet — WoL touches the "
@@ -308,6 +312,7 @@ async def _propose_via(
 
 @register_tool(
     name="propose_create_address_set",
+    permission=("admin", "address_set"),
     description=(
         "Prepare an address-set creation proposal. Operator must click "
         "Approve in the chat drawer to apply. An address set is a named, "
@@ -338,6 +343,7 @@ async def propose_create_address_set(
 
 @register_tool(
     name="propose_create_dns_record",
+    permission=("write", "dns_record"),
     description=(
         "Prepare a DNS record creation proposal. Operator must click "
         "Approve in the chat drawer to apply — DNS edits propagate to "
@@ -364,6 +370,7 @@ async def propose_create_dns_record(
 
 @register_tool(
     name="propose_create_dns_zone",
+    permission=("write", "dns_zone"),
     description=(
         "Prepare a new DNS zone proposal. Pass name (FQDN — trailing "
         "dot added automatically) plus either group_id (UUID of the "
@@ -392,6 +399,7 @@ async def propose_create_dns_zone(
 
 @register_tool(
     name="propose_create_multicast_group",
+    permission=("write", "multicast"),
     description=(
         "Prepare a multicast group registry entry. Pass space_id "
         "(UUID of the parent IPSpace), address (must be inside "
@@ -419,6 +427,7 @@ async def propose_create_multicast_group(
 
 @register_tool(
     name="propose_allocate_multicast_group",
+    permission=("write", "multicast"),
     description=(
         "Prepare a bulk multicast-group allocation proposal — stamps "
         "N sequential addresses with a name template in one shot. "
@@ -450,6 +459,7 @@ async def propose_allocate_multicast_group(
 
 @register_tool(
     name="propose_create_dhcp_static",
+    permission=("write", "dhcp_static"),
     description=(
         "Prepare a DHCP static reservation proposal. Operator must "
         "click Approve to apply — the reservation propagates to the "
@@ -521,6 +531,7 @@ async def propose_reprovision_lease(
 
 @register_tool(
     name="propose_create_alert_rule",
+    permission="superadmin",
     description=(
         "Prepare a subnet-utilization alert rule proposal. Pass name, "
         "threshold_percent (1-100), severity (info / warning / "
@@ -546,6 +557,7 @@ async def propose_create_alert_rule(
 
 @register_tool(
     name="propose_archive_session",
+    permission="self",
     description=(
         "Prepare a chat-session archive proposal. Hides the named "
         "session from the History panel's default view without "
@@ -600,6 +612,7 @@ from app.services.ai.operations_writes import (  # noqa: E402
 
 @register_tool(
     name="propose_create_conformity_policy",
+    permission=("admin", "conformity"),
     description=(
         "Prepare a custom conformity policy. Pass name, target_kind "
         "(platform/subnet/ip_address/dns_zone/dhcp_scope), check_kind "
@@ -622,6 +635,7 @@ async def propose_create_conformity_policy(
 
 @register_tool(
     name="propose_update_conformity_policy",
+    permission=("admin", "conformity"),
     description=(
         "Prepare a conformity-policy update. Pass policy_id plus the "
         "fields to change. Built-in policies only accept enabled / "
@@ -644,6 +658,7 @@ async def propose_update_conformity_policy(
 
 @register_tool(
     name="propose_evaluate_conformity_policy",
+    permission=("admin", "conformity"),
     description=(
         "Prepare an on-demand conformity evaluation. Pass policy_id; "
         "apply runs the check now and returns the pass/fail rollup. Use "
@@ -668,6 +683,7 @@ async def propose_evaluate_conformity_policy(
 
 @register_tool(
     name="propose_create_webhook",
+    permission="superadmin",
     description=(
         "Prepare a typed-event webhook subscription. Pass name + url "
         "(https recommended); optional event_types filter. A signing "
@@ -687,6 +703,7 @@ async def propose_create_webhook(
 
 @register_tool(
     name="propose_update_webhook",
+    permission="superadmin",
     description=(
         "Prepare a webhook-subscription update. Pass subscription_id plus "
         "the fields to change (name / url / enabled / event_types / "
@@ -706,6 +723,7 @@ async def propose_update_webhook(
 
 @register_tool(
     name="propose_test_webhook",
+    permission="superadmin",
     description=(
         "Prepare a webhook test. Pass subscription_id; apply pushes a "
         "synthetic test.ping through the real signing + delivery path "
@@ -728,6 +746,7 @@ async def propose_test_webhook(
 
 @register_tool(
     name="propose_sign_zone_dnssec",
+    permission=("write", "dns_zone"),
     description=(
         "Prepare a DNSSEC-signing proposal for a zone. Pass group_id + "
         "zone_id; optional policy_id. BIND9 / PowerDNS only. Operator "
@@ -748,6 +767,7 @@ async def propose_sign_zone_dnssec(
 
 @register_tool(
     name="propose_unsign_zone_dnssec",
+    permission=("write", "dns_zone"),
     description=(
         "Prepare a DNSSEC-unsign proposal. Pass group_id + zone_id. "
         "Clears keys + DS; validating resolvers SERVFAIL until the "
@@ -770,6 +790,7 @@ async def propose_unsign_zone_dnssec(
 
 @register_tool(
     name="propose_create_multicast_domain",
+    permission=("write", "multicast"),
     description=(
         "Prepare a multicast PIM domain. Pass name + pim_mode "
         "(sparse/dense/ssm/bidir/none); optional vrf_id, rendezvous "
@@ -789,6 +810,7 @@ async def propose_create_multicast_domain(
 
 @register_tool(
     name="propose_update_multicast_domain",
+    permission=("write", "multicast"),
     description=(
         "Prepare a multicast-domain update. Pass domain_id plus the "
         "fields to change (name / pim_mode / rendezvous point / "
@@ -808,6 +830,7 @@ async def propose_update_multicast_domain(
 
 @register_tool(
     name="propose_delete_multicast_domain",
+    permission=("delete", "multicast"),
     description=(
         "Prepare a multicast-domain deletion. Pass domain_id. Groups "
         "that reference it have their domain link cleared (not deleted). "
@@ -830,6 +853,7 @@ async def propose_delete_multicast_domain(
 
 @register_tool(
     name="propose_update_snmp_settings",
+    permission="superadmin",
     description=(
         "Prepare an SNMP host-config update. Pass enabled + version "
         "(v2c/v3); optional community (stored encrypted), "
@@ -849,6 +873,7 @@ async def propose_update_snmp_settings(
 
 @register_tool(
     name="propose_update_ntp_settings",
+    permission="superadmin",
     description=(
         "Prepare an NTP / chrony host-config update. Pass source_mode "
         "(pool/servers/mixed); optional pool_servers, allow_clients, "
@@ -867,6 +892,7 @@ async def propose_update_ntp_settings(
 
 @register_tool(
     name="propose_update_syslog_settings",
+    permission="superadmin",
     description=(
         "Prepare an rsyslog forwarding host-config update. Pass enabled "
         "+ optional targets (each host/port/protocol (udp/tcp/tls)/format "
@@ -893,6 +919,7 @@ async def propose_update_syslog_settings(
 
 @register_tool(
     name="propose_commit_dns_import",
+    permission="superadmin",
     description=(
         "Prepare a DNS config import from a live source. source must be "
         "'windows_dns' (pass server_id of a registered windows_dns "
@@ -915,6 +942,7 @@ async def propose_commit_dns_import(
 
 @register_tool(
     name="propose_commit_dhcp_import",
+    permission="superadmin",
     description=(
         "Prepare a DHCP config import from a live Windows DHCP server. "
         "Pass source='windows_dhcp', server_id, target_group_id; "
@@ -939,6 +967,7 @@ async def propose_commit_dhcp_import(
 
 @register_tool(
     name="propose_commit_netbox_import",
+    permission="superadmin",
     description=(
         "Prepare a one-shot NetBox import into IPAM. Pass base_url + "
         "token (+ verify_tls, space_strategy 'per_vrf'/'single', optional "
@@ -964,6 +993,7 @@ async def propose_commit_netbox_import(
 
 @register_tool(
     name="propose_acknowledge_device",
+    permission=("write", "ip_address"),
     description=(
         "Prepare a proposal to acknowledge (dismiss) a new-device sighting so it "
         "stops raising the new_mac_seen alert. Pass the sighting_id from "
@@ -984,6 +1014,7 @@ async def propose_acknowledge_device(
 
 @register_tool(
     name="propose_allowlist_mac",
+    permission=("write", "ip_address"),
     description=(
         "Prepare a proposal to add a MAC (or OUI prefix like '00:50:56' for a "
         "whole vendor) to the trusted allowlist so it never raises a new-device "
@@ -1004,6 +1035,7 @@ async def propose_allowlist_mac(
 
 @register_tool(
     name="propose_block_mac",
+    permission=("write", "dhcp_mac_block"),
     description=(
         "Prepare a proposal to block a MAC from getting a DHCP lease (creates a "
         "dhcp_mac_block in one or every server group) — arpwatch with teeth. Pass "

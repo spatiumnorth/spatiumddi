@@ -35,6 +35,8 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import Subnet
 from app.services.ai.tools.base import register_tool
+from app.services.ipam.probe_policy import check_probe_target
+from app.services.nettools.schemas import is_blocked_target
 
 # ── current_state ───────────────────────────────────────────────────
 
@@ -50,6 +52,7 @@ class CurrentStateArgs(BaseModel):
 
 @register_tool(
     name="current_state",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Single-shot 'what's broken right now?' rollup. Returns open "
         "alert counts by severity, top-N highest-utilisation subnets, "
@@ -202,6 +205,7 @@ class AuditWalkArgs(BaseModel):
 
 @register_tool(
     name="audit_walk",
+    permission=("read", "audit_log"),
     description=(
         "Walk the audit log with operator-friendly filters — answers "
         "'who changed X last week?' / 'what did user Y do?' / 'show me "
@@ -278,10 +282,42 @@ class TlsCertCheckArgs(BaseModel):
         return v
 
 
-def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
+def _resolve_allowed(host: str, port: int) -> tuple[str | None, str | None]:
+    """Resolve ``host`` and apply the network tools' SSRF denylist
+    (loopback / link-local / cloud-metadata) to EVERY address it maps to.
+
+    Returns ``(connect_ip, None)`` on success or ``(None, reason)`` when the
+    target is refused. The caller connects to the returned address rather
+    than re-resolving, so a name cannot be rebound into a blocked range
+    between this check and the connect. An unresolvable name is not refused
+    here — ``(None, None)`` lets the connect report the resolver error.
+    """
+    if is_blocked_target(host):
+        return (
+            None,
+            f"target {host!r} is in a blocked range (loopback / link-local / cloud-metadata)",
+        )
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError):
+        return None, None
+    addrs = [str(info[4][0]) for info in infos]
+    for addr in addrs:
+        if is_blocked_target(addr):
+            return None, (
+                f"target {host!r} resolves to {addr}, which is in a blocked range "
+                "(loopback / link-local / cloud-metadata)"
+            )
+    return (addrs[0] if addrs else None), None
+
+
+def _fetch_cert_sync(
+    host: str, port: int, timeout: float, connect_ip: str | None = None
+) -> dict[str, Any]:
     """Blocking SSL fetch — runs in a thread to keep the event loop
     free. Returns the parsed cert dict (binary form decoded by
-    ``ssl.SSLSocket.getpeercert``)."""
+    ``ssl.SSLSocket.getpeercert``). Connects to ``connect_ip`` when given
+    (the address the SSRF check approved), sending ``host`` as SNI."""
     ctx = ssl.create_default_context()
     # We want the cert even when it's expired or self-signed — the
     # tool's whole job is to surface those problems. Accept any chain.
@@ -298,7 +334,7 @@ def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
     # broken.
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    with socket.create_connection((connect_ip or host, port), timeout=timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
             der = tls_sock.getpeercert(binary_form=True)
             tls_version = tls_sock.version()
@@ -403,6 +439,7 @@ def _parse_x509_date(value: str | None) -> datetime | None:
 
 @register_tool(
     name="tls_cert_check",
+    permission=("read", "use_network_tools"),
     description=(
         "Fetch the TLS certificate served by host:port and report the "
         "subject, issuer, SANs, validity window, and days-until-expiry. "
@@ -416,13 +453,26 @@ def _parse_x509_date(value: str | None) -> datetime | None:
     default_enabled=False,
 )
 async def tls_cert_check(
-    db: AsyncSession,  # noqa: ARG001
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: TlsCertCheckArgs,
 ) -> dict[str, Any]:
     timeout = 10.0
+    # Same guards the network tools apply (GHSA-4wrc-78rq-vgcg): the SSRF
+    # denylist, checked against every resolved address, and the
+    # fragile-device do-not-probe scopes (#722).
+    connect_ip, blocked = await asyncio.to_thread(_resolve_allowed, args.host, args.port)
+    if blocked is not None:
+        return {"host": args.host, "port": args.port, "error": f"{blocked}; refused"}
+    verdict = await check_probe_target(db, args.host)
+    if verdict.blocked:
+        return {
+            "host": args.host,
+            "port": args.port,
+            "error": verdict.message(action="TLS probing"),
+        }
     try:
-        info = await asyncio.to_thread(_fetch_cert_sync, args.host, args.port, timeout)
+        info = await asyncio.to_thread(_fetch_cert_sync, args.host, args.port, timeout, connect_ip)
     except (TimeoutError, OSError, ssl.SSLError) as exc:
         return {
             "host": args.host,
@@ -512,6 +562,7 @@ class HelpWritePermissionArgs(BaseModel):
 
 @register_tool(
     name="help_write_permission",
+    permission="authenticated",
     description=(
         "Build the RBAC permission JSON to paste into a Role's "
         "``permissions`` list. Validates the action and resource_type "

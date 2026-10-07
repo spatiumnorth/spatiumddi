@@ -62,6 +62,7 @@ class FindDICOMAEsArgs(BaseModel):
 
 @register_tool(
     name="find_dicom_aes",
+    permission=("read", "dicom_ae"),
     description=(
         "List DICOM Application Entities with their AE Title, host, port, "
         "role and device class. Use this to answer 'which device holds AE "
@@ -142,6 +143,7 @@ class CountDICOMAEsArgs(BaseModel):
 
 @register_tool(
     name="count_dicom_aes",
+    permission=("read", "dicom_ae"),
     description=(
         "Count DICOM Application Entities with a breakdown of unbound "
         "reservations, plaintext (non-TLS) endpoints, and how many are "
@@ -195,6 +197,7 @@ class FindDICOMPeersArgs(BaseModel):
 
 @register_tool(
     name="find_dicom_peers",
+    permission=("read", "dicom_ae"),
     description=(
         "List configured DICOM associations as directed AE→AE edges with "
         "the services each carries. Use this to answer 'what talks to this "
