@@ -108,7 +108,9 @@ def _newest_mtime(d: Path) -> float:
         try:
             newest = max(newest, p.stat().st_mtime)
         except OSError:
-            pass
+            # containerd may finish (rename away) a write between iterdir and
+            # stat; a vanished file is not part of the ingest any more.
+            continue
     return newest
 
 
