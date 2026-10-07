@@ -11846,6 +11846,8 @@ export interface ACMEDomainResolution {
   zone_name: string | null;
   record_name: string | null;
   driver: string | null;
+  // e.g. a more specific internal zone was skipped for a public one
+  note?: string | null;
 }
 
 // A manual TXT the operator must publish for an allow_manual order to
