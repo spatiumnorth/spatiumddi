@@ -84,6 +84,41 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **At upgrade a timer
+  changes on the wire only where someone set it:** each timer still at
+  its old stored default (refresh 86400, retry 7200, expire 3600000,
+  minimum 3600, none of them ever served) is set to the value it serves
+  today (3600, 600, 86400, 300) by migration `ff32b91acad8`, and new
+  zones default to those values too, keeping the 5-minute negative TTL
+  a DDNS-driven estate relies on. A zone with an edited timer starts
+  serving it, under a new serial so its secondaries transfer it, and
+  reloads once. **A group switches to the zones' own timers only once
+  every BIND9 agent in it renders them:** until then, through an upgrade
+  (on a cluster, until its last DNS pod is replaced) or while an agent of
+  an older release stays in the group, it keeps serving
+  `3600 600 86400 300`, and the edited zones' serials move at the switch.
+  So no serial is ever served with two different SOAs, and no DNS change
+  is held back meanwhile. The zone API refuses a timer outside 0 to
+  2147483647, and a stored one BIND would refuse is served as before and
+  logged rather than taking the zone down. PowerDNS and Technitium
+  manage their own SOA and are unchanged.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —
@@ -1353,6 +1388,17 @@ the formatter handles the rest.
   nullable. It does not drop them; the next release does. Downgrade
   copies the current values back into the plaintext columns and drops
   the encrypted ones.
+- `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
+  default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
+  the value the BIND9 agent has always served (3600, 600, 86400, 300),
+  timer by timer, so rendering the stored timers changes nothing on the
+  wire for a timer nobody set. Adds `dns_server.agent_renders_soa_timers`
+  (false) and `dns_server_group.serves_soa_timers` (true; false for every
+  group with a BIND9 agent, whose agents are the previous release's). It
+  moves no serial: a zone with other timers moves its serial when its
+  group switches to serving them. Downgrade moves the serial of each zone
+  whose group served its own timers (its SOA changes back) and drops the
+  two columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
