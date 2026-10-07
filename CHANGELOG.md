@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Demoting control-plane members no longer costs the seed its quorum
+  (#1541).** A demoted node reset itself to a fresh single-node seed
+  without leaving etcd, and nobody removed its member or its k8s Node
+  from the seed. From three members the odd-count rule allows only one
+  demote, of both non-seed members, so the seed was left with three
+  voters, two of them gone for good: it lost quorum and its control
+  plane wedged. From five, the cluster kept two ghost voters and no
+  fault tolerance, and a demoted node could not be promoted again under
+  its hostname. Now the leave runner removes the node's own etcd member
+  while it still votes (`spatium-etcd-evict --leave-self`), stops k3s,
+  and resets the node only once the node it joined confirms the member
+  is gone; an unconfirmed removal fails the leave and leaves the node a
+  working member. Its `left` report then hands the row to the seed's
+  eviction (the path Replace uses), which deletes the stale Node and
+  confirms etcd agrees before the row settles `left`. This does not
+  clean up ghost voters an earlier demote already left behind: a
+  cluster that lost quorum to one needs the etcd restore path, and one
+  that kept it (five down to three) still carries them until they are
+  removed by hand.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —
