@@ -827,3 +827,5 @@ backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:d
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:52
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:53
 backend/alembic/versions/fe6715916c27_add_dhcp_default_options_to_platform_.py:drop_column:54
+backend/alembic/versions/ff32b91acad8_zone_soa_timers_served_defaults.py:drop_column:163
+backend/alembic/versions/ff32b91acad8_zone_soa_timers_served_defaults.py:drop_column:164
