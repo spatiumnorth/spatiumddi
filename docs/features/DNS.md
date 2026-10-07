@@ -1023,7 +1023,9 @@ and by an hourly sweep once its **Update interval** has passed since the last
 sync (`update_interval_hours`, default 24; `0` = manual only, at most 8760).
 A failed fetch counts as a sync too, so a broken feed is retried once per
 interval rather than every hour; Refresh retries it at once. Lists that come
-due together are queued a minute apart.
+due together are queued a minute apart, at most 55 per sweep so each has run
+before the next sweep looks again; any beyond that go in the next hour,
+longest-overdue first.
 
 #### Do feed entries block subdomains?
 

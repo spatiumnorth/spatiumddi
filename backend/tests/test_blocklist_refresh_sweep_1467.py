@@ -102,6 +102,43 @@ async def test_the_sweep_queues_each_due_list_staggered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_tick_queues_no_more_than_fit_before_the_next_one() -> None:
+    """A list still on its countdown at the next tick would be queued twice."""
+    calls: list[tuple[list[str], int]] = []
+
+    def fake_apply_async(*, args: list[str], countdown: int) -> None:
+        calls.append((args, countdown))
+
+    ids = [f"l{i}" for i in range(sweep.MAX_PER_TICK + 15)]
+
+    async def fake_due(_db: object, _now: datetime) -> list[str]:
+        return ids
+
+    async def enabled(_db: object, _key: str) -> bool:
+        return True
+
+    with (
+        patch.object(sweep, "due_blocklist_ids", fake_due),
+        patch.object(sweep, "is_module_enabled", enabled),
+        patch("app.tasks.dns.refresh_blocklist_feed.apply_async", side_effect=fake_apply_async),
+    ):
+        queued = await sweep._dispatch_due_async()  # noqa: SLF001
+
+    assert queued == sweep.MAX_PER_TICK
+    # Longest-overdue first: the ones left over are the most recently synced.
+    assert [c[0][0] for c in calls] == ids[: sweep.MAX_PER_TICK]
+    # The last one starts with time to finish before the next tick.
+    assert max(c[1] for c in calls) + 300 <= sweep.SWEEP_PERIOD_SECONDS
+
+
+def test_the_tick_cap_matches_the_beat_period() -> None:
+    from app.celery_app import celery_app
+
+    entry = celery_app.conf.beat_schedule["dns-blocklist-refresh"]
+    assert entry["schedule"].run_every.total_seconds() == sweep.SWEEP_PERIOD_SECONDS
+
+
+@pytest.mark.asyncio
 async def test_the_sweep_does_nothing_with_dns_switched_off() -> None:
     async def disabled(_db: object, _key: str) -> bool:
         return False

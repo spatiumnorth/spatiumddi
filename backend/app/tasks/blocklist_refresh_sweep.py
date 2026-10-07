@@ -9,7 +9,11 @@ old. ``0`` keeps a list manual-only, as the field always documented.
 ``last_synced_at`` is stamped on a failed fetch too, so a broken feed is
 retried once per interval rather than on every tick; the Refresh button is
 still there for an immediate retry. Due lists are queued a minute apart so
-several large feeds don't all parse at once on one worker.
+several large feeds don't all parse at once on one worker, and a tick queues
+no more than fit before the next one: ``last_synced_at`` only moves when a
+refresh has run, so a list still waiting on its countdown at the next tick
+would be queued again and parsed twice (#1466's memory spike). The rest wait
+for the next tick, longest-overdue first.
 """
 
 from __future__ import annotations
@@ -31,6 +35,11 @@ logger = structlog.get_logger(__name__)
 
 # Gap between two refreshes queued by the same sweep.
 STAGGER_SECONDS = 60
+# Beat period of ``dns-blocklist-refresh`` (celery_app beat_schedule).
+SWEEP_PERIOD_SECONDS = 3600
+# Every refresh a tick queues must have run before the next tick, with room
+# for the last one to finish: 55 lists at the 60 s stagger.
+MAX_PER_TICK = (SWEEP_PERIOD_SECONDS - 300) // STAGGER_SECONDS
 
 
 async def due_blocklist_ids(db: AsyncSession, now: datetime) -> list[str]:
@@ -75,6 +84,8 @@ async def _dispatch_due_async() -> int:
     finally:
         await engine.dispose()
 
+    deferred = max(0, len(ids) - MAX_PER_TICK)
+    ids = ids[:MAX_PER_TICK]
     queued = 0
     for i, list_id in enumerate(ids):
         try:
@@ -83,8 +94,8 @@ async def _dispatch_due_async() -> int:
         except Exception as exc:  # noqa: BLE001 — broker down? the next tick retries
             logger.warning("blocklist_refresh_enqueue_failed", list_id=list_id, error=str(exc))
             break
-    if queued:
-        logger.info("blocklist_refresh_dispatched", queued=queued)
+    if queued or deferred:
+        logger.info("blocklist_refresh_dispatched", queued=queued, deferred=deferred)
     return queued
 
 

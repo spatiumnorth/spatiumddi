@@ -91,7 +91,8 @@ the formatter handles the rest.
   A new hourly beat sweep (`dns-blocklist-refresh`) queues
   `refresh_blocklist_feed` for every enabled URL list whose last sync is
   at least `update_interval_hours` old, never-synced lists first, queued a
-  minute apart. `0` stays manual-only. A failed fetch counts as a sync, so
+  minute apart and at most 55 per sweep, so none is queued twice before it
+  has run. `0` stays manual-only. A failed fetch counts as a sync, so
   a broken feed is retried once per interval; Refresh still retries at
   once. The API now refuses an interval below 0 or above 8760 (422).
 
