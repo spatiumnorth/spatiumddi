@@ -58,10 +58,16 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.static_ipam import sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.dns.reverse_zone import cidrs_overlap
+from app.services.dns.sync_check import (
+    ipam_authors_zone,
+    reverse_owner_candidates,
+    reverse_owner_key,
+)
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -140,17 +146,20 @@ router = APIRouter(
 )
 
 
-def _require_type_write(current_user: User, resource_type: str) -> None:
+def _require_type_write(current_user: User, resource_type: str, action: str = "write") -> None:
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
-    create + update). The router-level gate admits an any-of grant over the
-    whole IPAM surface — including peripheral types like ``nat_mapping`` and
-    ``custom_field`` — so without this a ``write:nat_mapping`` grant could
-    create or mutate core structure it holds no write on (#508). Superadmin and
-    wildcard grants pass via ``user_has_permission``."""
-    if not user_has_permission(current_user, "write", resource_type):
+    create, update, resize, split, merge, move, purge, DNS sync, delete). The
+    router-level gate admits an any-of grant over the whole IPAM surface —
+    including peripheral types like ``nat_mapping`` and ``custom_field`` — and,
+    for mutating methods, ANY ``address_set`` grant with its ``resource_id``
+    ignored, so without this a ``write:nat_mapping`` grant or a set-scoped
+    delegate could mutate core structure it holds no permission on (#508).
+    ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
+    Superadmin and wildcard grants pass via ``user_has_permission``."""
+    if not user_has_permission(current_user, action, resource_type):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'write' on '{resource_type}'",
+            detail=f"Permission denied: need '{action}' on '{resource_type}'",
         )
 
 
@@ -609,11 +618,13 @@ def _dynamic_pool_warning(
     """Build the 'inside a dynamic DHCP pool' soft-collision warning (#631).
 
     In-pool allocation is allowed but flagged: the DHCP server owns the range
-    and will lease it on ``DISCOVER``, and a bare IPAM row — even
-    ``status="static_dhcp"`` — does not create a ``DHCPStaticAssignment`` (the
-    mirror only flows reservation → IPAM), so nothing tells the server to stop
-    handing the address out. The operator confirms via ``force=True`` and is
-    reminded to also pin a matching static reservation on the scope.
+    and will lease it on ``DISCOVER``. A bare IPAM row at
+    ``status="static_dhcp"`` now creates its ``DHCPStaticAssignment``
+    server-side when the subnet has exactly one matching DHCP scope
+    (#1628), but an ordinary in-pool row has no reservation behind it, so
+    nothing tells the server to stop handing the address out. The operator
+    confirms via ``force=True`` and is reminded to also pin a matching
+    static reservation on the scope.
     """
     pool_start = pool_end = None
     for start, end in ranges:
@@ -1014,6 +1025,11 @@ async def _resolve_reverse_zone(
     group whose name is a suffix of the IP's reverse_pointer.
 
     "Effective" is load-bearing here — see ``_resolve_effective_dns``.
+
+    Only a zone IPAM authors (a primary) is returned (#1419). The zone that
+    owns the IP's reverse name is the most specific one that covers it,
+    whatever its type: when that is a forwarder, a secondary or a stub,
+    another server owns the name and there is no zone to write the PTR into.
     """
     rev_pointer = ip_addr.reverse_pointer + "."
     # 1. Subnet-linked reverse zone
@@ -1024,7 +1040,7 @@ async def _resolve_reverse_zone(
         )
     )
     z = res.scalar_one_or_none()
-    if z and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
+    if z and ipam_authors_zone(z) and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
         return z
     # 2. Walk effective DNS group(s) for the subnet — inheritance-aware.
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
@@ -1047,10 +1063,11 @@ async def _resolve_reverse_zone(
         .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
         .where(
             DNSZone.group_id.in_(effective_group_ids),
-            DNSZone.kind == "reverse",
+            reverse_owner_candidates(),
         )
     )
-    # Choose the longest matching suffix (most specific)
+    # Choose the longest matching suffix (most specific); the PTR is written
+    # only if that zone is one IPAM authors (#1419).
     best: DNSZone | None = None
     for z, linked_space_id, linked_network in res.all():
         zname = z.name.rstrip(".") + "."
@@ -1075,9 +1092,9 @@ async def _resolve_reverse_zone(
                     "IP space; PTR would leak across tenants (#844)",
                 )
                 continue
-            if best is None or len(z.name) > len(best.name):
+            if best is None or reverse_owner_key(z) > reverse_owner_key(best):
                 best = z
-    return best
+    return best if best is not None and ipam_authors_zone(best) else None
 
 
 # When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
@@ -1358,7 +1375,10 @@ async def _sync_dns_record(
         records = list(result.scalars().all())
         for record in records:
             zone = record.zone
-            if zone is not None:
+            # #1419 — a zone IPAM does not author (a release before the fix
+            # wrote PTRs into forwarders, secondaries and stubs) never took
+            # the record: drop the row, queue no op it would refuse.
+            if zone is not None and ipam_authors_zone(zone):
                 await _enqueue_dns_op(
                     db,
                     zone,
@@ -1697,7 +1717,7 @@ async def _sync_dns_record(
         )
         for rec in stale_ptrs:
             old_zone = await db.get(DNSZone, rec.zone_id)
-            if old_zone is not None:
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db, old_zone, "delete", rec.name, "PTR", rec.value, rec.ttl, record_id=rec.id
                 )
@@ -1711,7 +1731,34 @@ async def _sync_dns_record(
         return True
     rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
     if rev_zone is None:
-        return True  # No reverse zone covers this IP — quietly skip the PTR
+        # No zone IPAM authors covers this IP — skip the PTR. A PTR in a
+        # primary zone is left alone, as before; one a release before #1419
+        # wrote into a forwarder, a secondary or a stub is dropped, with no
+        # op: such a zone never took it. That write stamped the IP's
+        # ``reverse_zone_id``, so an IP without one has nothing to drop.
+        if ip.reverse_zone_id is None:
+            return True
+        unauthored = (
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+                    .where(
+                        DNSRecord.ip_address_id == ip.id,
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.record_type == "PTR",
+                        DNSZone.zone_type != "primary",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rec in unauthored:
+            if ip.reverse_zone_id == rec.zone_id:
+                ip.reverse_zone_id = None
+            await db.delete(rec)
+        return True
 
     rev_pointer_full = ip_obj.reverse_pointer + "."
     rev_zone_name = rev_zone.name.rstrip(".") + "."
@@ -1750,7 +1797,7 @@ async def _sync_dns_record(
         for record in existing_ptr:
             if record.zone_id != rev_zone.id:
                 old_zone = await db.get(DNSZone, record.zone_id)
-                if old_zone is not None:
+                if old_zone is not None and ipam_authors_zone(old_zone):
                     await _enqueue_dns_op(
                         db,
                         old_zone,
@@ -2810,6 +2857,12 @@ class IPAddressResponse(BaseModel):
     dns_record_id: uuid.UUID | None = None
     dhcp_lease_id: str | None = None
     static_assignment_id: str | None = None
+    # #1628 — set transiently by the create / update handlers when the row
+    # is a ``static_dhcp`` reservation the server could NOT mirror into a
+    # DHCPStaticAssignment (no scope, several candidate scopes, or a
+    # conflicting reservation). Not a column; ``None`` when the reservation
+    # is in step (or the row is not a reservation at all).
+    dhcp_static_warning: str | None = None
     # True when this IPAM row was auto-created by the DHCP lease-pull task
     # mirroring a dynamic lease. Surfaced so the UI can suppress the per-IP
     # edit/delete actions — the row reflects server state, not user intent,
@@ -3168,6 +3221,7 @@ async def delete_space(
     with a pending change-request instead of executing. Module-off / no
     policy → executes inline via ``operation.apply`` exactly as before.
     """
+    _require_type_write(current_user, "ip_space", "delete")
     op = get_operation("delete_space")
     assert op is not None  # registered at import
     args = DeleteSpaceArgs(space_id=space_id, permanent=permanent)
@@ -3622,6 +3676,7 @@ async def delete_block(
     and a ``delete:ip_block`` policy matches, returns ``202`` with a pending
     change-request; otherwise executes inline via ``operation.apply``.
     """
+    _require_type_write(current_user, "ip_block", "delete")
     op = get_operation("delete_block")
     assert op is not None  # registered at import
     args = DeleteBlockArgs(block_id=block_id, permanent=permanent)
@@ -4521,6 +4576,7 @@ async def allocate_subnet(
     invalid ``prefix_len`` (≤ the block's own prefix, or > the family max) or a
     ``network`` that isn't an in-block, correctly-sized child.
     """
+    _require_type_write(current_user, "subnet")
     # Lock the parent block row so concurrent allocate-subnet calls on the
     # same block serialize: the second waits until the first commits, then
     # recomputes free space and picks the next free CIDR.
@@ -4829,6 +4885,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
     toggle — an operator can sweep on demand even with the scheduled
     sweep off.
     """
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -5569,6 +5626,7 @@ async def delete_subnet(
     approved replay takes the identical branch). Otherwise executes inline via
     ``operation.apply`` — same logic, side effects, audit, and 204 as before.
     """
+    _require_type_write(current_user, "subnet", "delete")
     op = get_operation("delete_subnet")
     assert op is not None  # registered at import
     args = DeleteSubnetArgs(subnet_id=subnet_id, force=force, permanent=permanent)
@@ -5691,6 +5749,7 @@ async def resize_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetResizePreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.resize import preview_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
@@ -5739,6 +5798,7 @@ async def resize_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetResizeCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.resize import ResizeError, commit_subnet_resize
 
     subnet = await db.get(Subnet, subnet_id)
@@ -5807,6 +5867,7 @@ async def resize_block_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockResizePreviewResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.resize import preview_block_resize
 
     block = await db.get(IPBlock, block_id)
@@ -5838,6 +5899,7 @@ async def resize_block_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockResizeCommitResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.resize import ResizeError, commit_block_resize
 
     block = await db.get(IPBlock, block_id)
@@ -5940,6 +6002,7 @@ async def move_block_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockMovePreviewResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.block_move import BlockMoveError, preview_move
 
     block = await db.get(IPBlock, block_id)
@@ -5979,6 +6042,7 @@ async def move_block_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> BlockMoveCommitResponse:
+    _require_type_write(current_user, "ip_block")
     from app.services.ipam.block_move import BlockMoveError, commit_move
 
     block = await db.get(IPBlock, block_id)
@@ -6197,6 +6261,7 @@ async def split_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> SplitSubnetPreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_split import preview_subnet_split
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6235,6 +6300,7 @@ async def split_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> SplitSubnetCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_split import SplitError, commit_subnet_split
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6323,6 +6389,7 @@ async def merge_subnet_preview(
     current_user: CurrentUser,
     db: DB,
 ) -> MergeSubnetPreviewResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_merge import preview_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6349,6 +6416,7 @@ async def merge_subnet_commit(
     current_user: CurrentUser,
     db: DB,
 ) -> MergeSubnetCommitResponse:
+    _require_type_write(current_user, "subnet")
     from app.services.ipam.subnet_merge import MergeError, commit_subnet_merge
 
     subnet = await db.get(Subnet, subnet_id)
@@ -6723,6 +6791,7 @@ async def dns_sync_commit(
 ) -> DnsSyncCommitResponse:
     """Apply the user-selected drift actions for one subnet. Anything not
     listed is skipped."""
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -6787,6 +6856,7 @@ async def dns_sync_commit_block(
     current_user: CurrentUser,
     db: DB,
 ) -> DnsSyncCommitResponse:
+    _require_type_write(current_user, "ip_block")
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="Block not found")
@@ -6845,6 +6915,7 @@ async def dns_sync_commit_space(
     current_user: CurrentUser,
     db: DB,
 ) -> DnsSyncCommitResponse:
+    _require_type_write(current_user, "ip_space")
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
@@ -6925,6 +6996,7 @@ async def _backfill_reverse_zones(
 async def backfill_reverse_zones_subnet(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "subnet")
     s = await db.get(Subnet, subnet_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -6940,6 +7012,7 @@ async def backfill_reverse_zones_subnet(
 async def backfill_reverse_zones_block(
     block_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "ip_block")
     # Walk the block subtree (block + descendant blocks' subnets)
     block_ids: set[uuid.UUID] = {block_id}
     pending = [block_id]
@@ -6963,6 +7036,7 @@ async def backfill_reverse_zones_block(
 async def backfill_reverse_zones_space(
     space_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> BackfillReverseZonesResponse:
+    _require_type_write(current_user, "ip_space")
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=404, detail="Space not found")
@@ -7347,6 +7421,14 @@ async def create_address(
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
+    # #1628 — a ``static_dhcp`` row must own a real DHCPStaticAssignment or
+    # it never reaches the rendered Kea bundle. The server creates it here
+    # (the frontend used to chain a second createStatic call to do this);
+    # an ambiguous scope yields a warning on the response, not a guess.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -7362,6 +7444,7 @@ async def create_address(
     await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     logger.info(
         "ip_address_created", ip_id=str(ip.id), address=body.address, subnet_id=str(subnet_id)
     )
@@ -7615,9 +7698,16 @@ async def update_address(
             detail=(f"No write permission on subnet or any address set covering {ip.address}"),
         )
 
-    # MAC required if transitioning to static_dhcp
+    # MAC required if transitioning to static_dhcp. An explicit
+    # ``mac_address: null`` is a *clear*, not "unchanged" (#1629 walk):
+    # the Edit dialog sends null for a blanked MAC, and treating it as
+    # unchanged let the save through, deleted the linked reservation in
+    # the sync, and left the row at ``static_dhcp`` with no MAC.
     new_status = body.status or ip.status
-    new_mac = body.mac_address if body.mac_address is not None else ip.mac_address
+    if "mac_address" in body.model_fields_set:
+        new_mac = body.mac_address
+    else:
+        new_mac = ip.mac_address
     if new_status == "static_dhcp" and not new_mac:
         raise HTTPException(
             status_code=422,
@@ -7758,6 +7848,14 @@ async def update_address(
     elif subnet and restoring:
         await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
 
+    # #1628 — keep the DHCP reservation in step with the row: a MAC /
+    # hostname change lands on the linked DHCPStaticAssignment, flipping
+    # the row into ``static_dhcp`` creates one (sole matching scope only),
+    # and flipping it away removes it. Ambiguity warns instead of guessing.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -7781,6 +7879,7 @@ async def update_address(
 
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     return ip
 
 
@@ -8120,9 +8219,14 @@ async def delete_address(
     # the DB row lingers with a null ip_address_id. Push the delete through
     # the write-through first — if Windows refuses, we raise 502 before
     # committing and no drift is introduced.
-    statics_res = await db.execute(
-        select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == address_id)
-    )
+    # #1628 — a reservation created from the IPAM side is also linked from
+    # the row (``static_assignment_id``); match it even if its forward
+    # link (``ip_address_id``) was never stamped.
+    _static_conds: list[Any] = [DHCPStaticAssignment.ip_address_id == address_id]
+    if ip.static_assignment_id:
+        with contextlib.suppress(ValueError, TypeError):
+            _static_conds.append(DHCPStaticAssignment.id == uuid.UUID(str(ip.static_assignment_id)))
+    statics_res = await db.execute(select(DHCPStaticAssignment).where(or_(*_static_conds)))
     statics_rows = list(statics_res.scalars().all())
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
@@ -8193,6 +8297,7 @@ async def purge_orphans(
     side filter) and passes the chosen ids here. We scope by subnet so a stale UI
     can't purge rows from a different subnet.
     """
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -8945,6 +9050,11 @@ async def allocate_next_ip(
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
+    # #1628 — same server-side reservation sync as create_address.
+    dhcp_sync = await sync_static_for_ipam_row(
+        db, ip, created_by_user_id=current_user.id, user=current_user
+    )
+
     db.add(
         _audit(
             current_user,
@@ -8963,6 +9073,7 @@ async def allocate_next_ip(
     await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
+    ip.dhcp_static_warning = dhcp_sync.warning
     logger.info(
         "ip_allocated",
         ip_id=str(ip.id),
@@ -9050,6 +9161,7 @@ async def add_subnet_domain(
     current_user: CurrentUser,
     db: DB,
 ) -> SubnetDomainResponse:
+    _require_type_write(current_user, "subnet")
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -9125,6 +9237,7 @@ async def remove_subnet_domain(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
+    _require_type_write(current_user, "subnet")
     sd = await db.get(SubnetDomain, domain_id)
     if sd is None or sd.subnet_id != subnet_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet domain not found")
@@ -9193,6 +9306,7 @@ async def bulk_edit_subnets(
     All mutations happen in a single transaction; one audit row per
     successfully-updated subnet shares a `batch_id` in `new_value`.
     """
+    _require_type_write(current_user, "subnet")
     changes = body.changes.model_dump(exclude_none=True)
     if not changes:
         raise HTTPException(
@@ -9804,6 +9918,22 @@ async def bulk_edit_addresses(
                     new_value={**changes, "batch_id": str(batch_id)},
                 )
             )
+            # #1629 walk — bulk edit ran no reservation sync at all: rows
+            # bulk-set to ``static_dhcp`` got no reservation, and a linked
+            # row bulk-set away from it kept serving its reservation in
+            # Kea. Run the same per-row sync the single edit runs. The
+            # bulk response has no per-row warning field, so a sync
+            # warning (no grant / ambiguous scope / conflict) is logged
+            # with the address instead of surfaced.
+            dhcp_sync = await sync_static_for_ipam_row(
+                db, ip, created_by_user_id=current_user.id, user=current_user
+            )
+            if dhcp_sync.warning:
+                logger.warning(
+                    "ip_address_bulk_edit_dhcp_sync_warning",
+                    address=str(ip.address),
+                    warning=dhcp_sync.warning,
+                )
             updated += 1
 
     # Recompute utilization for every subnet whose status mix changed, plus

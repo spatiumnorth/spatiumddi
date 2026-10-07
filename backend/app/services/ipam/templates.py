@@ -73,6 +73,15 @@ _TEMPLATE_FIELDS_COMMON: tuple[str, ...] = (
     "ddns_ttl",
 )
 
+# The DDNS columns ``ddns_inherit_settings`` switches on and off as one:
+# with inheritance off, ``resolve_effective_ddns`` reads all four of them.
+_DDNS_FIELDS: tuple[str, ...] = (
+    "ddns_enabled",
+    "ddns_hostname_policy",
+    "ddns_domain_override",
+    "ddns_ttl",
+)
+
 
 def _is_empty(value: Any) -> bool:
     """Treat None / empty dict / empty list / empty string as fillable."""
@@ -140,20 +149,52 @@ def _ddns_fields_set_by(template: IPAMTemplate) -> list[str]:
     return fields
 
 
-def _apply_ddns_lock(target: Any, template: IPAMTemplate, *, force: bool) -> None:
-    """When the template stamps any DDNS column, also flip the target's
-    ``ddns_inherit_settings=False`` so the stamped values actually
-    take effect. Only relevant for IPBlock + Subnet — the IPSpace
-    DDNS columns don't have an inherit flag.
+def _locks_ddns(target: Any, template: IPAMTemplate) -> bool:
+    """Whether applying ``template`` turns ``target``'s DDNS inheritance off.
+
+    A template that sets DDNS locks its DDNS config in: the target stops
+    inheriting so the template's values take effect. With inheritance off the
+    target resolves all four of its own DDNS columns together
+    (``resolve_effective_ddns``), so the lock comes with all four of the
+    template's values. A lock that came with only the columns ``force=False``
+    could fill pinned the target to its own stored DDNS, defaults included: a
+    template that turned DDNS on turned it off (#1421). Writing all four
+    overwrites nothing an operator set, because an inheriting target ignores
+    its own DDNS columns. A target that already has its own DDNS has no lock
+    to turn, and keeps its non-empty values unless ``force`` is set. Only
+    relevant for IPBlock + Subnet — the IPSpace DDNS columns don't have an
+    inherit flag.
     """
-    if not hasattr(target, "ddns_inherit_settings"):
-        return
-    template_writes_ddns = bool(_ddns_fields_set_by(template))
-    if template_writes_ddns and (force or target.ddns_inherit_settings):
-        target.ddns_inherit_settings = False
+    return bool(getattr(target, "ddns_inherit_settings", False)) and bool(
+        _ddns_fields_set_by(template)
+    )
 
 
 # ── Apply to existing carriers ────────────────────────────────────────
+
+
+def _apply_to_carrier(
+    template: IPAMTemplate, target: IPBlock | Subnet, *, force: bool
+) -> list[str]:
+    """Stamp ``template`` onto an existing block or subnet per the apply
+    policy. Returns the column names that were actually written, the DDNS
+    lock's ``ddns_inherit_settings`` included. Caller commits.
+    """
+    lock_ddns = _locks_ddns(target, template)
+    written: list[str] = []
+    for field in _TEMPLATE_FIELDS_COMMON:
+        stamp_always = force or (lock_ddns and field in _DDNS_FIELDS)
+        if _stamp(target, field, getattr(template, field), force=stamp_always):
+            written.append(field)
+    if _stamp_dns_group_ids(target, template.dns_group_id, force=force):
+        written.append("dns_group_ids")
+    if _stamp_dhcp_group(target, template.dhcp_group_id, force=force):
+        written.append("dhcp_server_group_id")
+    if lock_ddns:
+        target.ddns_inherit_settings = False
+        written.append("ddns_inherit_settings")
+    target.applied_template_id = template.id
+    return written
 
 
 def apply_template_to_block(
@@ -169,17 +210,7 @@ def apply_template_to_block(
         raise TemplateError(
             f"Template {template.name!r} applies to {template.applies_to!r}, not 'block'."
         )
-    written: list[str] = []
-    for field in _TEMPLATE_FIELDS_COMMON:
-        if _stamp(block, field, getattr(template, field), force=force):
-            written.append(field)
-    if _stamp_dns_group_ids(block, template.dns_group_id, force=force):
-        written.append("dns_group_ids")
-    if _stamp_dhcp_group(block, template.dhcp_group_id, force=force):
-        written.append("dhcp_server_group_id")
-    _apply_ddns_lock(block, template, force=force)
-    block.applied_template_id = template.id
-    return written
+    return _apply_to_carrier(template, block, force=force)
 
 
 def apply_template_to_subnet(
@@ -192,17 +223,7 @@ def apply_template_to_subnet(
         raise TemplateError(
             f"Template {template.name!r} applies to {template.applies_to!r}, not 'subnet'."
         )
-    written: list[str] = []
-    for field in _TEMPLATE_FIELDS_COMMON:
-        if _stamp(subnet, field, getattr(template, field), force=force):
-            written.append(field)
-    if _stamp_dns_group_ids(subnet, template.dns_group_id, force=force):
-        written.append("dns_group_ids")
-    if _stamp_dhcp_group(subnet, template.dhcp_group_id, force=force):
-        written.append("dhcp_server_group_id")
-    _apply_ddns_lock(subnet, template, force=force)
-    subnet.applied_template_id = template.id
-    return written
+    return _apply_to_carrier(template, subnet, force=force)
 
 
 # ── Pre-fill on create ────────────────────────────────────────────────

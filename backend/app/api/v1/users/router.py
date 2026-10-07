@@ -7,13 +7,11 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
@@ -33,6 +31,7 @@ from app.services.password_policy import (
 from app.services.password_policy import (
     validate as validate_password_policy,
 )
+from app.services.superadmin_grant import holds_superadmin, loaded_user_holds_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -66,6 +65,8 @@ class UserResponse(BaseModel):
     # #1355 — the flag OR a wildcard role. Resetting such an account's
     # password needs the caller's step-up, and the UI reads this to ask for
     # it (the flag alone misses a local user in a Superadmin-role group).
+    # Regardless of ``is_active`` (#1412): a disabled role-only superadmin is
+    # still one for the reset, and for the Role column.
     is_effective_superadmin: bool = False
 
     model_config = {"from_attributes": True}
@@ -93,10 +94,7 @@ class UserResponse(BaseModel):
             cols["locked"] = is_user_locked(data)
             # ``groups`` is selectin-loaded; never trigger an async lazy load
             # from this sync validator if a path skipped it.
-            if "groups" in sa_inspect(data).unloaded:
-                cols["is_effective_superadmin"] = bool(data.is_superadmin)
-            else:
-                cols["is_effective_superadmin"] = is_effective_superadmin(data)
+            cols["is_effective_superadmin"] = loaded_user_holds_superadmin(data)
             return cols
         return data
 
@@ -406,13 +404,14 @@ async def reset_password(
     # policy via the admin path.
     method = None
     # A superadmin's password passes every step-up, so choosing it for them
-    # needs one (#1355). Effective superadmin: the flag or a wildcard role.
-    # The role path reads ``user.groups``: load it explicitly, since a row
-    # already in this session's identity map may not have it yet. No
-    # exemption for the caller's own account: a stolen session resetting its
-    # own password would end up holding the password every step-up asks for.
-    await db.refresh(user, ["groups"])
-    if is_effective_superadmin(user):
+    # needs one (#1355). Superadmin by any path: the flag, a ``*`` / ``*``
+    # role or a live ``*`` / ``*`` grant, and judged regardless of
+    # ``is_active`` (#1412). ``is_effective_superadmin`` answers False for a
+    # disabled role-only superadmin, so a stolen session could disable one,
+    # reset its password here with no step-up, and re-enable it. No exemption
+    # for the caller's own account: a stolen session resetting its own
+    # password would end up holding the password every step-up asks for.
+    if await holds_superadmin(db, user.id):
         method = await require_operator_stepup(
             db,
             current_user,

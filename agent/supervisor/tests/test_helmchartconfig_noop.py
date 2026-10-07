@@ -272,6 +272,8 @@ def _render_firstboot_control_values() -> dict:
         set -euo pipefail
         {fn.group(0)}
         SPATIUMDDI_VERSION=0.0.0-test
+        APP_KEY_SECRET=spatium-control-app-keys
+        CHART_APP_SECRET=spatium-control-spatiumddi-app
         DNS_AGENT_KEY_VAL=x
         DHCP_AGENT_KEY_VAL=x
         LG_AGENT_KEY_VAL=x
