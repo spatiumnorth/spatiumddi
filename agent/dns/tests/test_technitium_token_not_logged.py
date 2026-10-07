@@ -17,6 +17,7 @@ import pytest
 
 from spatium_dns_agent.drivers import technitium
 from spatium_dns_agent.drivers.technitium import TechnitiumDriver
+from spatium_dns_agent import log as log_module
 from spatium_dns_agent.log import configure_logging
 
 
@@ -48,10 +49,24 @@ def test_create_token_sends_the_password_in_a_form_body(
     assert seen[0]["data"]["pass"] == password
 
 
-def test_agent_logging_keeps_httpx_request_lines_out() -> None:
-    configure_logging("INFO")
-    for name in ("httpx", "httpcore"):
-        # The level set on the logger itself, not the effective one: under
-        # pytest the root already has handlers, so basicConfig leaves it at
-        # WARNING and an effective-level check would pass without the fix.
-        assert logging.getLogger(name).level >= logging.WARNING, name
+def test_agent_logging_keeps_httpx_request_lines_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # configure_logging also reconfigures structlog process-wide, which would
+    # break later tests that capture structlog output; stub those two calls
+    # and restore the httpx levels, so only what this test checks changes.
+    monkeypatch.setattr(log_module.structlog, "configure", lambda **_kw: None)
+    monkeypatch.setattr(
+        log_module.structlog.contextvars, "bind_contextvars", lambda **_kw: None
+    )
+    saved = {n: logging.getLogger(n).level for n in ("httpx", "httpcore")}
+    try:
+        configure_logging("INFO")
+        for name in ("httpx", "httpcore"):
+            # The level set on the logger itself, not the effective one: under
+            # pytest the root already has handlers, so basicConfig leaves it at
+            # WARNING and an effective-level check would pass without the fix.
+            assert logging.getLogger(name).level >= logging.WARNING, name
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
