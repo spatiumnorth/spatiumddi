@@ -20,6 +20,7 @@ from .admin_pusher import push_rendered_config
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
+    PHASE_RELOAD,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -87,6 +88,11 @@ class SyncLoop:
         # ``apply_status`` is what the heartbeat reports upward.
         self._quarantine = Quarantine(self.cfg.state_dir)
         self.apply_status = ApplyStatus()
+        # True while the live bundle applied with zones the daemon refused
+        # (see ``_report_refused_zones``). Those zones stay refused until the
+        # next structural apply, so a record-op-only poll must not read the
+        # degraded verdict as stale and clear it.
+        self._zones_refused = False
         self.heartbeat.config_apply = self.apply_status
 
         # Preload cached bundle (offline-operation guarantee)
@@ -120,6 +126,10 @@ class SyncLoop:
                 self.driver.apply_config(bundle)
                 self._current_structural_etag = bundle.get("structural_etag")
                 if not booting_from_previous:
+                    # Zones the daemon refused are reported, not reverted —
+                    # see ``_report_refused_zones`` — and the bundle is still
+                    # committed: everything else in it is being served.
+                    self._report_refused_zones(etag)
                     # #882 — ``current`` demonstrably works, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
                     # ``previous``: committing there would copy the still-bad
@@ -326,9 +336,11 @@ class SyncLoop:
             if self._quarantine.blocks(etag):
                 log.info("sync_skipping_quarantined_bundle", etag=etag)
                 self._current_etag = etag
+                self._return_unapplied_ops(bundle, "the bundle carrying it is quarantined")
                 return
             if not self._apply_with_revert(bundle, etag):
                 self._current_etag = etag
+                self._return_unapplied_ops(bundle, "the structural apply failed")
                 return
             self._current_structural_etag = new_structural
             log.info("structural_reload_applied", structural_etag=new_structural)
@@ -393,7 +405,11 @@ class SyncLoop:
         # running. Clear a stale ``reverted`` verdict: the operator's fix has
         # landed and leaving the chip up would report a divergence that no
         # longer exists.
-        if self._quarantine.etag is None and not self.apply_status.healthy:
+        if (
+            self._quarantine.etag is None
+            and not self.apply_status.healthy
+            and not self._zones_refused
+        ):
             self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
             self.heartbeat.config_apply = self.apply_status
             log.info("config_apply_recovered", etag=etag)
@@ -446,7 +462,12 @@ class SyncLoop:
             return False
 
         self._quarantine.clear()
+        # Committed even when some zones were refused: the bundle IS what is
+        # being served, as far as the daemon allows, and the last-known-good
+        # must not lag behind it.
         commit_config(self.cfg.state_dir, etag)
+        if self._report_refused_zones(etag):
+            return True
         self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
         self.heartbeat.config_apply = self.apply_status
         if self.heartbeat.daemon_status.get("status") == "degraded":
@@ -454,6 +475,69 @@ class SyncLoop:
             # leaving it would make a recovered server look broken forever.
             self.heartbeat.daemon_status = {"status": "ok"}
         return True
+
+    def _report_refused_zones(self, etag: str | None) -> bool:
+        """Report an apply that landed with some zones refused. True if so.
+
+        PowerDNS takes zones one at a time, so it can accept most of a bundle
+        and refuse a few zones' data (see ``DriverBase.refused_zones``). That
+        is neither ``ok`` — those zones are not served — nor a reason to
+        revert: re-applying the last-known-good cannot make the daemon accept
+        data it refused, and it would undo the zones it did accept.
+
+        #882's vocabulary has no "partial" status, and the control plane
+        ignores one it does not know, so this reports ``reverted``: the
+        status whose meaning — "the daemon is healthy and serving, but not
+        everything the operator saved" — is the honest one here, and whose
+        severity (warning) and ``agent_config_rejected`` alert fit. Unlike a
+        real revert, ``etag`` is the NEW bundle (it is live) and so is
+        ``failed_etag``; the error names each refused zone with the daemon's
+        own reason.
+        """
+        fn = getattr(self.driver, "refused_zones", None)
+        refused = [str(z) for z in (fn() if callable(fn) else [])]
+        if not refused:
+            self._zones_refused = False
+            return False
+        error = truncate_error(
+            f"the daemon refused {len(refused)} zone(s); every other zone is served: "
+            + "; ".join(refused)
+        )
+        self._zones_refused = True
+        self.apply_status = ApplyStatus(
+            status=STATUS_REVERTED,
+            etag=etag,
+            failed_etag=etag,
+            phase=PHASE_RELOAD,
+            error=error,
+        )
+        self.heartbeat.config_apply = self.apply_status
+        # The ``config_apply_`` prefix is load-bearing (#1067): the control
+        # plane reads it as an apply verdict, not as a daemon that is down.
+        self.heartbeat.daemon_status = {
+            **self.heartbeat.daemon_status,
+            "status": "degraded",
+            "reason": f"config_apply_{STATUS_REVERTED}: {error}",
+        }
+        log.warning("sync_apply_zones_refused", etag=etag, count=len(refused), zones=refused[:5])
+        return True
+
+    def _return_unapplied_ops(self, bundle: dict[str, Any], reason: str) -> None:
+        """NACK every record op in ``bundle``: none of them was applied.
+
+        The control plane marked them ``in_flight`` when it shipped this
+        bundle, and an op that is never acked sits there until the 5-minute
+        unacknowledged reset — and a delete that sits there is a name still
+        answering. An error ack puts each op straight back on the retry path
+        (``apply_acks`` → ``fail_attempts``), so it is re-sent once the apply
+        works again. It costs one of the op's retry attempts, which is the
+        truth: this attempt did not apply it.
+        """
+        ops = [op for op in bundle.get("pending_record_ops") or [] if op.get("op_id")]
+        for op in ops:
+            self.heartbeat.pending_acks.append(_ack(op, "error", f"not applied: {reason}"))
+        if ops:
+            log.warning("record_ops_returned_unapplied", count=len(ops), reason=reason)
 
     def _handle_apply_failure(
         self,
@@ -470,6 +554,8 @@ class SyncLoop:
             daemon_disturbed=daemon_disturbed,
         )
         self._quarantine.record(etag, truncate_error(f"{phase or 'apply'}: {cause}"))
+        # The failure verdict below supersedes any partial-refusal one.
+        self._zones_refused = False
 
         prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
         if prev_bundle is None:

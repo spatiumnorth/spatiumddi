@@ -148,6 +148,99 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{name.rstrip('.')}.{zone}"
 
 
+# Rdata that is, or ends in, a domain name. PowerDNS compares those
+# case-insensitively and treats a trailing dot as implied, so two records whose
+# targets differ only that way are the same record to it (#1379).
+_NAME_RDATA_TYPES = frozenset({"ALIAS", "CNAME", "DNAME", "MX", "NS", "PTR", "SRV"})
+
+
+def _content_key(rtype: str, content: str) -> str:
+    """What PowerDNS would consider the same record content, for dedupe.
+
+    Deliberately conservative: only addresses and name-shaped rdata are
+    normalised. Free text (TXT, CAA values, …) is compared as written, since
+    folding case there could merge two records PowerDNS keeps apart and
+    silently drop one of them.
+    """
+    text = " ".join(content.split())
+    if rtype in ("A", "AAAA"):
+        try:
+            return ipaddress.ip_address(text).compressed
+        except ValueError:
+            return text
+    if rtype in _NAME_RDATA_TYPES:
+        return text.lower().rstrip(".")
+    return text
+
+
+def _dedupe_contents(rtype: str, contents: list[str]) -> list[str]:
+    """``contents`` with repeats dropped, first spelling kept (#1379).
+
+    PowerDNS refuses a whole rrset — and so the whole zone PATCH — that
+    carries the same record twice ("Duplicate record in RRset"). The control
+    plane can legitimately ship one: a manual A record and the A record IPAM
+    generates for the same address are two rows with one value. Both are the
+    same answer, so serving it once is exactly what was asked for.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for content in contents:
+        key = _content_key(rtype, content)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(content)
+    return out
+
+
+# Never deleted by the reconcile's absent-rrset sweep (#1380). The apex SOA
+# and NS are the zone's own skeleton — PowerDNS creates them with the zone and
+# serving the zone without them is not a smaller zone but a broken one — and
+# the DNSSEC types are PowerDNS's to manage, not the bundle's.
+_APEX_KEPT_TYPES = frozenset({"SOA", "NS"})
+_DNSSEC_RRSET_TYPES = frozenset(
+    {"CDNSKEY", "CDS", "DNSKEY", "NSEC", "NSEC3", "NSEC3PARAM", "RRSIG"}
+)
+
+# HTTP statuses with which PowerDNS refuses a zone's DATA (a CNAME beside
+# other records, a malformed record, a duplicate in an rrset). Anything else —
+# a 5xx, an auth failure, a dropped connection — says nothing about the zone
+# and fails the whole apply as before.
+_ZONE_REFUSAL_STATUSES = frozenset({400, 409, 422})
+
+
+def _absent_rrsets(
+    zone_name: str, desired: list[dict[str, Any]], current: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """``DELETE`` changes for rrsets PowerDNS holds and the bundle no longer
+    does (#1380).
+
+    The reconcile used to REPLACE only the rrsets the bundle carried, so a
+    record deleted while its op never reached the agent (a views group,
+    where ops are retired by the render, or an op skipped by a failed apply)
+    stayed live for good. Names are compared case-insensitively.
+    """
+    apex = zone_name.rstrip(".").lower() + "."
+    wanted = {(str(rs["name"]).lower(), str(rs["type"]).upper()) for rs in desired}
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for rs in current.get("rrsets") or []:
+        if not isinstance(rs, dict):
+            continue
+        name = str(rs.get("name") or "")
+        rtype = str(rs.get("type") or "").upper()
+        key = (name.lower(), rtype)
+        if not name or not rtype or key in wanted or key in seen:
+            continue
+        if rtype in _DNSSEC_RRSET_TYPES:
+            continue
+        if key[0] == apex and rtype in _APEX_KEPT_TYPES:
+            continue
+        seen.add(key)
+        out.append({"name": name, "type": rtype, "changetype": "DELETE"})
+    return out
+
+
 def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
     """Build the zones.json payload entry for an RFC 9432 catalog zone.
 
@@ -502,7 +595,12 @@ class PowerDNSDriver(DriverBase):
                 if e.get("match_kind") == "tsig_key"
                 and e.get("tsig_key_name") in bundle_keys
             ]
-            rrsets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            # Keyed case-insensitively, as PowerDNS compares names: ``Host``
+            # and ``host`` are one rrset to it, and two rrsets for one name
+            # and type in a single PATCH are refused. The first spelling seen
+            # is the one sent.
+            rrsets: dict[tuple[str, str], list[str]] = {}
+            rrset_names: dict[tuple[str, str], str] = {}
             # Each rrset's TTL from its own records (#1225). This path used to
             # stamp the ZONE TTL on every rrset, so each structural reconcile
             # (agent start, any structural change) REPLACEd every rrset at the
@@ -514,16 +612,33 @@ class PowerDNSDriver(DriverBase):
             for rec in zone.get("records") or []:
                 qname = _qualified_name(zname, rec.get("name") or "@")
                 rtype = rec["type"].upper()
-                rrsets.setdefault((qname, rtype), []).append(
-                    {
-                        "content": _record_content(rec),
-                        "disabled": False,
-                    }
-                )
+                key = (qname.lower(), rtype)
+                rrset_names.setdefault(key, qname)
+                rrsets.setdefault(key, []).append(_record_content(rec))
                 # Absence, not falsiness: a TTL of 0 is legal ("do not cache").
+                # A duplicate's TTL still counts towards the rrset's lowest,
+                # so dropping the repeat below never raises the served TTL.
                 rec_ttl = rec.get("ttl")
-                rrset_ttls.setdefault((qname, rtype), []).append(
+                rrset_ttls.setdefault(key, []).append(
                     default_ttl if rec_ttl is None else int(rec_ttl)
+                )
+            deduped: dict[tuple[str, str], list[str]] = {}
+            duplicates: list[str] = []
+            for key, contents in rrsets.items():
+                deduped[key] = _dedupe_contents(key[1], contents)
+                if len(deduped[key]) != len(contents):
+                    duplicates.append(f"{rrset_names[key]} {key[1]}")
+            if duplicates:
+                # Info, not warning: a manual record beside the identical one
+                # IPAM generates is ordinary seed data, and this fires on
+                # every render.
+                log.info(
+                    "powerdns_rrset_duplicates_dropped",
+                    zone=zname,
+                    count=len(duplicates),
+                    sample=sorted(duplicates)[:5],
+                    detail="identical records at one name and type are served once; "
+                    "PowerDNS refuses an rrset that repeats a record",
                 )
             mixed = sorted(k for k, ttls in rrset_ttls.items() if len(set(ttls)) > 1)
             if mixed:
@@ -550,12 +665,14 @@ class PowerDNSDriver(DriverBase):
                     "serial": zone.get("serial") or 1,
                     "rrsets": [
                         {
-                            "name": qname,
-                            "type": rtype,
-                            "ttl": min(rrset_ttls[(qname, rtype)]),
-                            "records": rrs,
+                            "name": rrset_names[key],
+                            "type": key[1],
+                            "ttl": min(rrset_ttls[key]),
+                            "records": [
+                                {"content": content, "disabled": False} for content in contents
+                            ],
                         }
-                        for (qname, rtype), rrs in sorted(rrsets.items())
+                        for key, contents in sorted(deduped.items())
                     ],
                     # Dynamic-update ACL (issue #641) — applied as zone
                     # metadata by the reconciler. Empty list = disabled.
@@ -754,7 +871,8 @@ class PowerDNSDriver(DriverBase):
         # NOT advance ``_current_structural_etag``, so the next
         # bundle (or the next 304 retry) re-runs the apply. Silent
         # failure here used to lose every record on cold-boot when
-        # the timing race fired.
+        # the timing race fired. A zone whose data PowerDNS refuses does NOT
+        # raise: it lands in ``refused_zones()`` for the sync loop to report.
         self._reconcile_zones(api_key, payload)
 
     def daemon_restarting(self) -> bool:
@@ -919,12 +1037,14 @@ class PowerDNSDriver(DriverBase):
                     "type": rtype,
                     "ttl": int(ttl if _rrset_ttl is None else _rrset_ttl),
                     "changetype": "REPLACE",
+                    # Deduped for the same reason as the full render
+                    # (#1379): one repeated member refuses the whole rrset.
                     "records": [
-                        {
-                            "content": _record_content({**m, "type": rtype}),
-                            "disabled": False,
-                        }
-                        for m in rrset_members
+                        {"content": content, "disabled": False}
+                        for content in _dedupe_contents(
+                            rtype,
+                            [_record_content({**m, "type": rtype}) for m in rrset_members],
+                        )
                     ],
                 }
             else:
@@ -1459,21 +1579,32 @@ class PowerDNSDriver(DriverBase):
 
     def _reconcile_zones(self, api_key: str, payload: list[dict[str, Any]]) -> None:
         """Idempotently bring the local PowerDNS zone set in line with
-        ``payload``. Phase 1 reconciliation is per-zone create-or-update.
-        Zones present in PowerDNS that aren't in the bundle are NOT
-        deleted yet — that's a control-plane safety call (operators
-        should explicitly delete a zone, not have it disappear because
-        a sync glitched). Phase 2 wires the explicit-delete signal
-        from the bundle.
+        ``payload``: per-zone create-or-update. Zones present in PowerDNS
+        that aren't in the bundle are NOT deleted — that's a control-plane
+        safety call (operators should explicitly delete a zone, not have it
+        disappear because a sync glitched). Within a zone the bundle IS the
+        whole truth: an rrset PowerDNS holds and the bundle no longer does is
+        deleted in the same PATCH (#1380), except the apex SOA / NS and the
+        DNSSEC types, and except in a zone that accepts RFC 2136 updates,
+        whose clients write records the bundle never carries.
 
-        Every zone is attempted, so one PowerDNS rejects does not strand
-        the rest, and then any failure raises (#1225). A create or patch
-        PowerDNS refused used to be logged and skipped, so #882's apply
-        status reported ``ok`` for a zone that was never served and the
-        bundle was committed as last-known-good.
+        Every zone is attempted and the verdict is per zone. A zone whose
+        DATA PowerDNS refuses (400 / 409 / 422 — a CNAME beside other
+        records, a malformed record) is left as it was and recorded with
+        PowerDNS's reason in ``refused_zones()``; the apply still succeeds,
+        so every zone PowerDNS accepted is served and nothing is rolled back.
+        Rolling back could not help: the last-known-good bundle usually
+        carries the same refused data, so it used to keep the whole server
+        ``revert_failed`` over one zone.
+
+        Anything that is not a verdict on a zone's data — the zone listing,
+        a zone that cannot be read back, a 5xx, a dropped connection, the
+        dynamic-update ACL or TSIG keys — still fails the whole apply (#1225).
         """
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
         failures: list[str] = []
+        refused: list[str] = []
+        self._refused_zones = ()
         # TSIG keys already imported this pass. A group key is referenced by
         # every zone that grants it, so importing it per zone cost two calls
         # per zone and repeated one refusal once per zone, filling the
@@ -1492,8 +1623,6 @@ class PowerDNSDriver(DriverBase):
             # Compared case-insensitively, as DNS names are: PowerDNS stores a
             # zone lowercased, so an exact match missed ``Case.Test.`` on every
             # reconcile after the first and re-POSTed it, which answers 409.
-            # That used to be skipped silently (the zone's records then never
-            # updated through this path); now it would fail every apply.
             # Verified against a real pdns, which also accepts either case in
             # the PATCH URL.
             existing_names = {
@@ -1515,21 +1644,40 @@ class PowerDNSDriver(DriverBase):
                         json=create_body,
                     )
                     if resp.status_code >= 400:
-                        log.error(
-                            "powerdns_zone_create_failed",
-                            zone=zone_name,
-                            status=resp.status_code,
-                            body=resp.text[:200],
-                        )
-                        failures.append(
-                            f"{zone_name} create: HTTP {resp.status_code} {_pdns_error(resp)}"
-                        )
+                        self._zone_not_applied(zone_name, "create", resp, refused, failures)
                         continue
                     log.info("powerdns_zone_created", zone=zone_name)
                 else:
-                    # Update — PATCH /zones/{zone} with REPLACE rrsets.
-                    rrsets = []
-                    for rs in zone_payload.get("rrsets") or []:
+                    # Update — PATCH /zones/{zone}: DELETE what the bundle
+                    # dropped, then REPLACE every rrset it carries. One PATCH,
+                    # which PowerDNS applies as one transaction.
+                    desired = zone_payload.get("rrsets") or []
+                    rrsets: list[dict[str, Any]] = []
+                    if zone_payload.get("update_acl"):
+                        # RFC 2136 clients write straight into this zone, and
+                        # their records are not in the bundle; sweeping
+                        # absent rrsets here would delete every one of them.
+                        log.debug("powerdns_absent_rrset_sweep_skipped_dynamic", zone=zone_name)
+                    else:
+                        resp = client.get(f"{_PDNS_API_BASE}/zones/{zone_name}", headers=headers)
+                        try:
+                            current = resp.json() if resp.status_code == 200 else None
+                        except ValueError:
+                            current = None
+                        if not isinstance(current, dict):
+                            log.error(
+                                "powerdns_zone_read_failed",
+                                zone=zone_name,
+                                status=resp.status_code,
+                                body=resp.text[:200],
+                            )
+                            failures.append(
+                                f"{zone_name} read: HTTP {resp.status_code} {_pdns_error(resp)}"
+                            )
+                            continue
+                        rrsets.extend(_absent_rrsets(zone_name, desired, current))
+                    deleted = len(rrsets)
+                    for rs in desired:
                         rrsets.append(
                             {
                                 "name": rs["name"],
@@ -1539,7 +1687,7 @@ class PowerDNSDriver(DriverBase):
                                 "records": rs.get("records") or [],
                             }
                         )
-                    # An empty rrset list still falls through to the
+                    # An empty change list still falls through to the
                     # dynamic-update metadata below — a DDNS-only zone may
                     # have no control-plane-managed records yet (issue #641).
                     if rrsets:
@@ -1549,21 +1697,13 @@ class PowerDNSDriver(DriverBase):
                             json={"rrsets": rrsets},
                         )
                         if resp.status_code >= 400:
-                            log.error(
-                                "powerdns_zone_patch_failed",
-                                zone=zone_name,
-                                status=resp.status_code,
-                                body=resp.text[:200],
-                            )
-                            failures.append(
-                                f"{zone_name} update: HTTP {resp.status_code} "
-                                f"{_pdns_error(resp)}"
-                            )
+                            self._zone_not_applied(zone_name, "update", resp, refused, failures)
                             continue
                         log.info(
                             "powerdns_zone_reconciled",
                             zone=zone_name,
-                            rrset_count=len(rrsets),
+                            rrset_count=len(rrsets) - deleted,
+                            deleted=deleted,
                         )
 
                 # Dynamic-update (RFC 2136) ACL metadata (issue #641).
@@ -1585,11 +1725,42 @@ class PowerDNSDriver(DriverBase):
                 # bulk reconcile of a LUA-bearing zone. The global
                 # knob makes the per-zone PUT unnecessary.
 
-        if failures:
-            more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
-            raise RuntimeError(
-                "PowerDNS did not accept every zone: " + "; ".join(failures[:5]) + more
+        self._refused_zones = tuple(refused)
+        if refused:
+            log.warning(
+                "powerdns_zones_refused",
+                count=len(refused),
+                zones=refused[:5],
+                detail="every other zone is served; a refused zone keeps what "
+                "PowerDNS already held for it",
             )
+        if failures:
+            problems = failures + [f"refused {r}" for r in refused]
+            more = f" (and {len(problems) - 5} more)" if len(problems) > 5 else ""
+            raise RuntimeError(
+                "PowerDNS did not accept every zone: " + "; ".join(problems[:5]) + more
+            )
+
+    @staticmethod
+    def _zone_not_applied(
+        zone_name: str,
+        action: str,
+        resp: httpx.Response,
+        refused: list[str],
+        failures: list[str],
+    ) -> None:
+        """Sort a refused create / PATCH into a per-zone refusal of its data
+        or a failure of the apply (see ``_ZONE_REFUSAL_STATUSES``)."""
+        log.error(
+            f"powerdns_zone_{action}_failed",
+            zone=zone_name,
+            status=resp.status_code,
+            body=resp.text[:200],
+        )
+        if resp.status_code in _ZONE_REFUSAL_STATUSES:
+            refused.append(f"{zone_name} {action}: HTTP {resp.status_code} {_pdns_error(resp)}")
+        else:
+            failures.append(f"{zone_name} {action}: HTTP {resp.status_code} {_pdns_error(resp)}")
 
     # ── Dynamic-update ACLs (issue #641) ───────────────────────────────────
 

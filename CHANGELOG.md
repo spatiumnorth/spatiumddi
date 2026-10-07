@@ -1803,32 +1803,56 @@ feature modules than before; existing installs are not changed
 
 ### Fixed
 
-- **PowerDNS serves each record's configured TTL, and a zone it refuses
-  fails the apply (#1225).** The PowerDNS agent's full reconcile, which
-  runs on every agent start and every structural change, stamped the
-  ZONE's TTL on every rrset, so after a restart every record was served at
-  the zone default: measured against a real PowerDNS, records configured
-  at 60 s, 86400 s and 0 all answered 3600, while the incremental
-  record-op path honoured them. Each rrset now carries its records' TTL; a
-  record with none inherits the zone's, 0 stays 0, and records at one name
-  and type that disagree resolve to the lowest, the same rule the control
-  plane applies to the rrset it ships with a record op, so against a current
-  control plane the two paths agree. (A pre-#773 control plane sends ops
-  without that rrset, and the op path's own fallback for a record with no
-  TTL is still 3600.) Zone names are now matched case-insensitively:
-  PowerDNS stores them lowercased, so a zone configured as `Case.Test` was
-  re-created on every reconcile after the first, answered 409, and was
-  skipped, which left its records unreconciled. Separately,
-  a zone PowerDNS refused to create or patch was logged and skipped, so
-  #882's apply status reported `ok` for a zone that was never served (also
-  measured: a CNAME beside other data at one name, refused with 422,
-  reported OK). The reconcile still attempts every zone, then fails the
-  apply with PowerDNS's own reason, so the revert and the
-  `agent_config_rejected` alert fire. The same goes for three more silent
-  paths: a failed zone listing (which used to treat every existing zone as
-  new), an unreadable rendered payload, and dynamic-update ACL metadata or
-  TSIG keys PowerDNS refused, where a failed CLEAR left a zone accepting
-  updates the operator had turned off.
+- **PowerDNS serves each record's configured TTL, reports the zones it
+  refuses, and stops serving records that were deleted (#1225, #1379,
+  #1380).** The PowerDNS agent's full reconcile, which runs on every agent
+  start and every structural change, stamped the ZONE's TTL on every rrset,
+  so after a restart every record was served at the zone default: measured
+  against a real PowerDNS, records configured at 60 s, 86400 s and 0 all
+  answered 3600, while the incremental record-op path honoured them. Each
+  rrset now carries its records' TTL; a record with none inherits the
+  zone's, 0 stays 0, and records at one name and type that disagree resolve
+  to the lowest, the same rule the control plane applies to the rrset it
+  ships with a record op, so against a current control plane the two paths
+  agree. (A pre-#773 control plane sends ops without that rrset, and the op
+  path's own fallback for a record with no TTL is still 3600.) Zone names
+  are now matched case-insensitively: PowerDNS stores them lowercased, so a
+  zone configured as `Case.Test` was re-created on every reconcile after
+  the first, answered 409, and was skipped, which left its records
+  unreconciled.
+
+  A zone PowerDNS refused to create or patch was logged and skipped, so
+  #882's apply status reported `ok` for a zone that was never served. The
+  verdict is now per zone: every zone PowerDNS accepts is served, and the
+  refused ones are reported with PowerDNS's own reason as a degraded apply
+  (status `reverted`, the warning-level #882 status, so
+  `agent_config_rejected` fires as a warning). It is not rolled back,
+  because the last-known-good usually carries the same refused data: on
+  ddi-pg one refused zone kept the whole server `revert_failed`. Record
+  ops keep draining for every other zone. A failure that says nothing about
+  a zone's data still fails the whole apply and reverts as before: a failed
+  zone listing (which used to treat every existing zone as new), a zone
+  that cannot be read back, a 5xx, an unreadable rendered payload, and
+  dynamic-update ACL metadata or TSIG keys PowerDNS refused, where a failed
+  CLEAR left a zone accepting updates the operator had turned off. Record
+  ops shipped with a bundle whose apply failed are now returned to the
+  control plane as not applied, so they are retried; they used to sit
+  `in_flight` unacked, and a delete among them kept answering after the
+  server recovered.
+
+  Identical records at one name and type are sent once (#1379). A manual A
+  record beside the identical IPAM-generated one made PowerDNS refuse the
+  whole zone ("Duplicate record in RRset"), so seed data alone left a zone
+  unserved. Names and name-shaped values compare case-insensitively and
+  without the trailing dot; the lowest TTL still wins.
+
+  The reconcile now deletes rrsets the bundle no longer carries (#1380). It
+  used to replace only what the bundle had, so in a DNS group with views,
+  where a record change is a full render and the op is never sent, a
+  deleted record stayed live on PowerDNS. The apex SOA and NS and the
+  DNSSEC record types are never deleted, and zones that accept RFC 2136
+  updates are not swept, since their clients write records the bundle does
+  not carry.
 
 - **The version-pin check now sees the Alpine-packaged daemons, and
   no longer reports a pin as behind when it is ahead (#1240).**
