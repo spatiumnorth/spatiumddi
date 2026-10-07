@@ -1,6 +1,6 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-28):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **PXE / iPXE provisioning profiles** (issue #51) and **passive DHCP fingerprinting** (Phase 2 device profiling) have since shipped — see §17 and §18. **Still deferred:** Option 82 (relay agent info) class matching, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
+> **Implementation status:** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Group-centric Kea HA shipped** (`2026.04.21-2`) — load-balanced or hot-standby pairs with self-healing peer-IP drift, supervised daemons, and live `status-get` reporting. **Scope authoring helpers (`2026.04.28-2`):** 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row, plus named group-scoped option templates (e.g. "VoIP phones", "PXE BIOS clients") with a one-click "Apply template…" picker on the scope create / edit modal. **PXE / iPXE provisioning profiles** (issue #51) and **passive DHCP fingerprinting** (Phase 2 device profiling) have since shipped — see §17 and §18. **Still deferred:** Option 82 (relay agent info) class matching, lease histogram by hour, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 
@@ -90,11 +90,10 @@ DHCPScope
     "domain-search": ["internal.example.com", "example.com"],
     "tftp-server-name": "10.0.0.10",   -- for PXE
     "bootfile-name": "pxelinux.0",
-    "vendor-class-identifier": "...",
-    custom_options: { "176": "..." }   -- vendor-specific options by code
+    "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
   ddns_enabled: bool
-  ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
+  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -102,6 +101,92 @@ DHCPScope
   ra_other_flag: bool                -- intended RA O-flag (router-side intent)
   last_pushed_at: timestamp
 ```
+
+#### Which options are accepted (#1228)
+
+Every options map is checked when saved. That covers scope options, pool
+and reservation `options_override`, option templates, client classes and
+device policies. A write Kea could not load is a `422` naming the option.
+The check exists because one bad value makes Kea reject the **whole**
+config for the server group, not just that option. A name the renderer
+does not know was silently dropped by the agent.
+
+| Key | Value |
+|---|---|
+| `routers`, `dns-servers`, `ntp-servers`, `tftp-server-address` | IPv4 addresses, as a list or a comma-separated string |
+| `broadcast-address` | one IPv4 address |
+| `domain-name` / `domain-search` | an FQDN / a list of FQDNs |
+| `tftp-server-name`, `bootfile-name` | a non-blank string with no control characters |
+| `mtu` | an integer from 68 to 65535 |
+| `time-offset` | a signed 32-bit integer |
+| `code:NN` | a raw DHCPv4 code, for the codes SpatiumDDI ships an `option-def` for: 43, 123, 132, 150, 160, 161, 176 and 242. Binary codes (43, 123) take plain even-length hex, with no `0x` and no `:` separators. Kea rejects both forms. Not accepted on a Windows group |
+| `opt-NN` | the Windows spelling, and the importer's for an option it does not canonicalise. Only the Windows driver reads it, so only the code range is checked. Accepted only on a group whose servers are all Windows |
+
+Which raw spelling a scope accepts depends on its group's servers,
+because each driver silently drops the other's: Kea and FortiGate read
+`code:NN` and skip `opt-NN`; Windows reads `opt-NN` and skips `code:NN`.
+So on scope options, and on option templates (which are applied to
+scopes), `opt-NN` is refused on a group with no Windows server (including
+a group with no servers yet) and `code:NN` on a Windows group, each naming
+the spelling to use instead. A group that mixes Windows with Kea or
+FortiGate takes neither, because one side would drop it: use a named
+option or split the group. (Adding a server that would mix Kea and Windows
+has been refused since #1110; a FortiGate + Windows group can still be
+assembled.)
+
+Pool and reservation overrides, client classes and device policies are
+rendered by Kea and FortiGate only, never by Windows, so they always take
+`code:NN`, whatever else is in the group.
+
+An option stored before this check (an imported `opt-NN` on a Kea group,
+say) stays editable as long as it is left unchanged.
+
+**A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
+SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
+a group with a Windows member is refused, and so is creating or moving a
+Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
+
+DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
+`domain-search` and `bootfile-name`. They refuse options with no DHCPv6
+equivalent and all raw codes. A client class renders into the DHCPv4
+config always, and into the DHCPv6 config when the group has v6 scopes, so
+its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
+refused, because Dhcp4 would reject it.
+Raw `option_data` is refused: it is for internal producers such as the
+E911 location options (#972).
+
+`domain-name-servers`, `interface-mtu` and `boot-file-name` are stored as
+their canonical names. The custom-options editor sends a catalogue name
+(`vendor-encapsulated-options`) with its code. It is stored as `code:43`,
+the form that can be delivered, and read back under code 43.
+
+**Existing rows are not re-checked** unless a write changes the option,
+so a scope saved before this check stays editable. Applying an option
+template checks the merged result against the scope's address family.
+The value rules were measured against `kea-dhcp4 -t` (Kea 3.0.3).
+
+**VoIP phone profiles (#1294)** follow the same rules, with one difference.
+A phone option names its **code**, and the code decides what is delivered.
+The name beside it is only a label. A code SpatiumDDI has a canonical name
+for (66, 150) renders under that name. Any other code renders as `code:NN`.
+Profiles used to render the catalogue name (`polycom-config-url`), which the
+agent does not know and dropped, so option 160 never reached a phone. A
+name that contradicts its code, or a code listed twice, is a `422`. That
+covers both SpatiumDDI's own names and the VoIP catalogue's, so
+`polycom-config-url` left on the editor's default code 66 is refused. A row
+stored before this check whose name contradicts its code keeps the delivery
+it had: under the name when the agent knew it, and not at all otherwise.
+
+Enabling a profile checks every option, not only the changed ones. It also
+refuses the starter pack's `CHANGE-ME` placeholders, which the pack seeds
+into every option of the profiles it creates disabled. A changed option on
+an enabled profile may not be a placeholder either. A profile stored
+before these checks is rendered without any option Kea cannot load, with a
+`dhcp_phone_option_dropped_invalid` warning in the api log. Before, one such
+option would have rejected the group's whole config. `vendor_class_match` is
+placed inside a Kea string literal, so a `'` or a control character in it
+is refused, and a stored profile containing one is left out of the render. The match is measured in
+bytes, so a non-ASCII vendor string can match.
 
 #### Dynamic-lease DNS drift (`dns_track_dynamic_leases`)
 
@@ -384,13 +469,21 @@ reservation requires a **superadmin**.
 1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
    reachable from a free-range gap row or the subnet context menu).
 2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
-   This reveals the **DHCP Scope** picker.
-3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
-   below), and set the hostname. If no scope exists for the subnet yet, the
-   picker offers a **Create a scope** button that opens the scope modal inline.
+3. Enter the **MAC address** (required — see caveat below) and set the
+   hostname. There is no scope picker: the server puts the reservation on
+   the subnet's sole matching-family scope itself. If no scope exists for
+   the subnet yet, the modal says so and offers a **Create a scope** button
+   that opens the scope modal inline.
 4. Click **Allocate**. IPAM creates the address row with
-   `IPAddress.status = static_dhcp` and mirrors it into the scope as a
-   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   `IPAddress.status = static_dhcp` and the server syncs a
+   `DHCPStaticAssignment` behind it in the same request
+   (`sync_static_for_ipam_row`, #1628) — no second call from the browser.
+
+The same sync runs on **Edit**, on **bulk-edit**, and in the **address
+importer**: flipping a row into `static_dhcp` creates its reservation,
+changing its MAC / hostname updates the reservation in place, and flipping
+it away (or clearing the reservation state) removes the reservation. A save
+never overwrites a reservation's description with the IPAM row's empty one.
 
 Either way, the Kea agent picks up the new `ConfigBundle` (a group wake fires +
 the ETag shifts) and renders the host reservation within seconds. The **Static
@@ -402,18 +495,25 @@ Assignments** tab lists every reservation across the group's scopes.
   `static_dhcp` address without a `mac_address` returns **422**
   (`mac_address is required when status is 'static_dhcp'`) from both the
   `create` and `next-address` endpoints, so **nothing is created** — neither the
-  IPAM row nor the reservation.
-- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
-  the reservation.** If no DHCP scope is selected (e.g. none exists for the
-  subnet yet), the IPAM address is created but the mirror to Kea is **not
-  attempted** — this is the real "I set it static but nothing happened" trap.
-  Create a scope first (see the prerequisite above).
-- **Editing an existing IPAM row to `static_dhcp` does not create a reservation.**
-  Flipping an *existing* IP to `static_dhcp` via **Edit** (or bulk-edit) updates
-  the IPAM row but does **not** mirror it to Kea. Add the reservation from the
-  DHCP **Static Assignments** tab, or delete and re-allocate via the IPAM flow.
-- **Creating a static currently requires a superadmin.** A non-superadmin who
-  allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
+  IPAM row nor the reservation. The same 422 answers an edit that sends
+  `mac_address: null` for a row that is (or is becoming) `static_dhcp`.
+- **`static_dhcp` with a MAC but no unambiguous scope creates the IPAM row and
+  warns.** If no DHCP scope serves the subnet, or several scopes match, the
+  IPAM address is created but no reservation is — the server does not guess —
+  and the response (or import result) carries a `dhcp_static_warning` saying
+  so instead of silently skipping it. Create exactly one scope for the
+  subnet, then re-save the row.
+- **The sync needs the `dhcp_static` permission.** Creating or updating a
+  reservation through IPAM requires the acting user's `write` grant on
+  `dhcp_static`; removing one requires `delete` — the same grants the DHCP
+  statics endpoints enforce. Without the grant the IPAM write still succeeds
+  but the reservation is left untouched and the response carries the
+  permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
+  still requires a superadmin, as above.
+- **No backfill for rows from before the server-side sync.** A `static_dhcp`
+  row created before #1628 that never got its reservation is not repaired
+  in the background: it gets one the next time it is saved, or when it is
+  re-imported with `overwrite`.
 
 ### Troubleshooting — reservations render empty in Kea
 
@@ -426,8 +526,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
   `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's Static Assignments
   tab. If it's absent, distinguish two cases: the allocation was
   **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
-  it **succeeded without mirroring** (a MAC was given but no scope was selected,
-  or a non-superadmin hit 403 on the mirror call). See the caveats above.
+  it **succeeded without mirroring** (a MAC was given but there was no scope —
+  or several — or the acting user lacked the `dhcp_static` grant; the response
+  carried a `dhcp_static_warning` naming which). See the caveats above.
 - **The scope is inactive.** Only `is_active = true` scopes (and the statics
   under them) are assembled into the config bundle — a disabled scope silently
   drops every reservation it holds.
@@ -559,6 +660,20 @@ The row is released to `available` (not `allocated`): a leftover `allocated` row
 is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
+
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
 
 ### Known gap — Windows scope sync (issue #620)
 
@@ -1178,6 +1293,8 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 
 When two DHCP server containers serve the same pool, they must not hand the same IP to different MACs. SpatiumDDI solves this by treating a **`DHCPServerGroup` with two Kea members as an implicit HA pair** — HA tuning lives on the group, per-peer URL lives on each server, and Kea's `libdhcp_ha.so` hook is rendered on every member's config. There is no separate "failover channel" row any more (that was removed in 2026.04.22-1 when scopes moved to the group).
 
+> **HA covers DHCPv4 only (#1238).** The agent renders `libdhcp_ha.so` into the `Dhcp4` config alone; `Dhcp6` loads `libdhcp_lease_cmds.so` and nothing else, and the HA state the UI shows is read from the DHCPv4 daemon. A DHCPv6 scope on a group with two or more Kea members is served by **each member on its own**: pools are not split, leases are not shared, and two members can hand the same address to different clients. The UI marks an enabled stateful scope like that `v6: no HA` (a `stateless` or `slaac` scope hands out no address, so it is not flagged) and says so in the scope form, and every HA pill reads `HA v4: <state>`. Until DHCPv6 HA lands ([#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258)), serve DHCPv6 from a group with one Kea member.
+
 ### Data model
 
 - HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
@@ -1220,7 +1337,7 @@ The `libdhcp_lease_cmds.so` hook is a hard prerequisite for HA and is loaded unc
 
 A fourth thread in the agent (`HAStatusPoller`, `agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `status-get` against the local Kea control socket every ~15 s with small jitter and POSTs the result to `POST /api/v1/dhcp/agents/ha-status`. Kea 2.6 folded HA state into the generic `status-get` response under `arguments.high-availability[0].ha-servers.local.state`; the extractor also accepts pre-2.6 `ha-status-get` shapes for forward-compat. The control plane stores the state on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. The poller self-disables when the most recent bundle carried no `failover` block, so standalone servers don't spam Kea with commands that return an error.
 
-Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer. The group detail view shows the same pill inline per-server so you can see HA state without drilling into each server page; use the Refresh button there after changing HA mode to repaint without waiting for the 30 s React Query poll.
+Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA v4: <state>` pill; the `v4` is there because this is the DHCPv4 daemon's state and says nothing about DHCPv6. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer. The group detail view shows the same pill inline per-server so you can see HA state without drilling into each server page; use the Refresh button there after changing HA mode to repaint without waiting for the 30 s React Query poll.
 
 ### Peer IP drift self-healing
 
@@ -1377,8 +1494,11 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Hostname sync mode must be one of the configured values.** Mode
   picker is validated against `VALID_SYNC_MODES`; reserved / internal
   modes are not selectable from the API. `422`.
-- **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
-  of the documented values (see §13). Pydantic validator.
+- **DDNS hostname policy enum.** `ddns_hostname_policy` must be one of
+  `client`, `server_name`, `derived` or `none`, on create and on update
+  (#1308). An edit checks the policy only when it changes it, so a value
+  stored before update checked it does not block an unrelated edit.
+  `422`.
 - **A field must not be set twice, under both its names, to different
   values.** Two scope fields are accepted under two names: `enabled`
   (what the response emits) is the same column as `is_active` (what
@@ -1466,19 +1586,22 @@ rule here has been surfaced to an operator, not just silently logged.
 
 ### Kea HA (on a server group)
 
-- **At most 2 Kea members in a group.** `libdhcp_ha.so` only supports
-  pairs; adding a third Kea member makes the config ambiguous.
-  Validation is a deferred follow-up (see `CLAUDE.md`), not enforced
-  at the CRUD layer today.
+- **HA covers DHCPv4 only.** A DHCPv6 scope on a group with two or
+  more Kea members is served by every member independently, with no
+  lease coordination; the UI flags an enabled stateful one `v6: no HA`. DHCPv6 HA is
+  [#1258](https://github.com/spatiumnorth/spatiumddi/issues/1258).
+- **Two HA partners.** `libdhcp_ha.so` pairs two servers; a third or
+  later Kea member renders as a `backup` peer (#332), which receives
+  lease updates but takes no part in the heartbeat.
 - **Group mode enum.** `mode` must be `standalone`, `hot-standby`, or
   `load-balancing`. Enforced at `backend/app/api/v1/dhcp/server_groups.py`.
 - **HA rendering requires both peers' URLs.** If either Kea member in
   a 2-member group has an empty `ha_peer_url`, the config bundle
   drops the `failover` block and neither peer loads the HA hook —
   silent fall-through to "not-yet-configured" state.
-- **Mixed driver groups are OK.** A group can contain Windows DHCP
-  servers alongside Kea; only Kea members participate in the HA
-  rendering path.
+- **Mixed driver groups are refused (#1110).** Creating or moving a
+  server into a group that already has the other driver is a `422`:
+  Kea HA cannot coordinate with Windows failover. See §14.
 
 ### Client classes
 

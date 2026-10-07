@@ -39,7 +39,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
 | `docs/THIRD_PARTY.md` | Catalogue of every bundled/shipped third-party component — engine, library, OS package — with license, the artifact it ships in, and the rationale. Operator-facing companion to the root `NOTICE` (which stays authoritative for license text). **When you add a shipped component, update BOTH** — and if you add a version pin, `versions.json` too (see below) |
 | `versions.json` | Root manifest of every version pin **neither Dependabot nor a lockfile owns** — Helm, chart `values.yaml`, Dockerfile `ARG`s, action `with:` inputs, CI script defaults, the appliance bake arrays. One entry per component: the canonical `version`, every file carrying a copy (with an exact occurrence count where the copies must be exhaustive), the `upstream` to check it against, and — for pins deliberately behind — a `hold` field carrying the reason. `scripts/lint_versions.py` fails CI when a file and the manifest disagree, so a bump is one edit plus whatever the lint reports ([#975](https://github.com/spatiumnorth/spatiumddi/issues/975)) |
-| `docs/PRIVACY.md` | The privacy statement — no telemetry, no analytics, no phone-home — plus the **normative table of every outbound connection** the backend can make, its default, and what it sends. `backend/tests/test_outbound_hosts_documented.py` fails CI when a hostname literal in `backend/app` is absent from it. **When you add an outbound call, update this page in the same PR** (see non-negotiable #17) |
+| `docs/PRIVACY.md` | The privacy statement — no telemetry, no analytics, no phone-home — plus the **normative table of every outbound connection** the backend can make, its default, and what it sends. `backend/tests/test_outbound_hosts_documented.py` fails CI when a hostname literal in `backend/app` or a shipped agent package (`agent/*/spatium_*`), or a public IP literal in an agent package, is absent from it. **When you add an outbound call, update this page in the same PR** (see non-negotiable #17) |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), Technitium, encrypted transports (DoT / DoH / DoQ), DNS threat analytics, sync-with-servers reconciliation |
@@ -57,11 +57,11 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
 | `docs/deployment/KUBERNETES.md` | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA (see also `k8s/README.md` + `charts/spatiumddi/README.md`) |
-| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance (no Ansible playbooks; that path is planned, not implemented) |
+| `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, OS appliance; the Compose Patroni overlay is documented as non-functional in 1.0 (#1236, real Compose HA is #137). No Ansible playbooks; that path is planned, not implemented |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
-| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
+| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, and a Patroni Compose overlay that does not work (#1236) |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
 | `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Technitium (agent-managed + agentless `technitium_api`) + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
@@ -156,7 +156,7 @@ These rules apply to every file Claude Code generates. No exceptions.
 15. **New integrations show up on the Dashboard — both surfaces**: When adding an integration mirror (Kubernetes / Docker / Proxmox / Tailscale / UniFi shape — read-only pull reconciler with per-target rows), wire it into BOTH dashboard surfaces: (1) the `IntegrationsPanel` inside the IPAM tab on `frontend/src/pages/DashboardPage.tsx` — add the `useQuery` gated on the `integration_*_enabled` flag, thread `enabled` + row list through props, extend column-count + grid cn() case, add a panel block following the existing icon + name + count + view-all + per-row `IntegrationRow` pattern; (2) the dedicated **Integrations dashboard tab** at `backend/app/api/v1/dashboards/integrations.py` — append a target query, add a `_build_panel(...)` entry to the `panels` list, register the new resource_type string in `_INTEGRATION_RESOURCE_TYPES` so reconciler error-audit rows surface in the recent-errors list, and extend the frontend `IntegrationDashboardKind` union in `lib/api.ts`. Both surfaces are operator-facing health rollups; missing either one means a new integration is invisible somewhere it should be obvious
 16. **Per-role node-label gating for every new workload**: Every new top-level workload (Deployment / StatefulSet / DaemonSet) added to `charts/spatiumddi/` or `charts/spatiumddi-appliance/` gates scheduling on a per-role node label (`spatium.io/role-<service>=true`), not on chart-render `values.<svc>.enabled` toggles. The `nodeSelector` block merges `global.nodeSelector` (the umbrella `spatium.io/role=appliance` gate) AND a per-role label. Labels are stamped by two paths that already exist: install-time bake in `appliance/mkosi.extra/usr/local/bin/spatium-install`'s `config.yaml.d/spatium-roles.yaml` drop-in for `full-stack` / `control-only` variants; dynamic apply via the supervisor's `kubectl label` (`agent/supervisor/spatium_supervisor/k8s_api.py`) for `application` variants on role-assignment changes. `enabled: false` values stay as a global suppression knob; the per-role label is the source of truth for *which* node a workload lands on. Reference pattern: `charts/spatiumddi-appliance/templates/{dns-bind9,dhcp-kea}.yaml`. Without this, multi-node HA (#272) silently schedules control-plane workloads on DNS-only nodes — invisible misplacement that won't surface until the first node loss.
 
-17. **No telemetry.** SpatiumDDI has no phone-home, no usage analytics, no crash reporting, and no project-controlled endpoint — and there is never to be one. Never add an outbound connection that is not operator-configured and documented in [`docs/PRIVACY.md`](docs/PRIVACY.md) with its default and its payload; a hostname literal in `backend/app` that is absent from that page fails CI (`backend/tests/test_outbound_hosts_documented.py`). Anything **default-on** needs an issue and a decision, not a PR: today exactly one connection is enabled out of the box (the daily anonymous GitHub release check), the README and the Settings copy both say so in those words, and a second one makes both false at once
+17. **No telemetry.** SpatiumDDI has no phone-home, no usage analytics, no crash reporting, and no project-controlled endpoint — and there is never to be one. Never add an outbound connection that is not operator-configured and documented in [`docs/PRIVACY.md`](docs/PRIVACY.md) with its default and its payload; a hostname literal in `backend/app` or a shipped agent package, or a public IP literal in an agent package, that is absent from that page fails CI (`backend/tests/test_outbound_hosts_documented.py`). Anything **default-on** needs an issue and a decision, not a PR: today exactly one connection is enabled out of the box (the daily anonymous GitHub release check), the README and the Settings copy both say so in those words, and a second one makes both false at once
 
 ---
 
@@ -845,7 +845,7 @@ suggestion, free-space treemap.
   window.
 
 - ✅ [**Zone name scope — classify zones by TLD against the IANA root list**](https://github.com/spatiumnorth/spatiumddi/issues/986)
-  — `validate_fqdn` said a zone name was *syntactically* a domain and stopped,
+  — shipped `2026.10.02-1`: `validate_fqdn` said a zone name was *syntactically* a domain and stopped,
   so `corp.example.com`, `ad.contoso.local`, `lab` and `acme.lan` rendered
   identically — while the first is a name the public internet resolves, the
   second collides with mDNS, and the last two sit on TLDs nobody has
@@ -980,9 +980,9 @@ suggestion, free-space treemap.
   55/60 are DHCPv4 codes, and the v6 branch of both renderers builds its class
   list from generic client classes alone. **Deferred:** auto-creating the
   quarantine pool, DHCPv6, and rules keyed on fingerbank device *name*.
-- 🟡 [**Windows DHCP failover relationships — two Windows members of one group no longer serve a scope uncoordinated**](https://github.com/spatiumnorth/spatiumddi/issues/1110)
-  — **implemented in full (unreleased); only live verification against a
-  real failover pair remains.** The write-through sent every scope / pool /
+- ✅ [**Windows DHCP failover relationships — two Windows members of one group no longer serve a scope uncoordinated**](https://github.com/spatiumnorth/spatiumddi/issues/1110)
+  — **shipped `2026.10.02-1`; only live verification against a real
+  failover pair remains.** The write-through sent every scope / pool /
   reservation write to EVERY Windows member of a group, create-or-update,
   so a new scope landed on both servers and an edit to a scope one server
   held CREATED it on the other: two DHCP servers, one range, no
@@ -1049,7 +1049,7 @@ suggestion, free-space treemap.
   transport had the same missing-library problem CredSSP had and is no
   longer offered — see #1128 below.
 - ⬜ [**Kerberos WinRM transport for Windows DNS / DHCP**](https://github.com/spatiumnorth/spatiumddi/issues/1128)
-  — **removed, not built** (unreleased): the forms offered `kerberos` while
+  — **removed, not built** (in `2026.10.02-1`): the forms offered `kerberos` while
   the images carried no GSSAPI stack, so it failed on every call. The API now
   refuses it at save (`drivers/_winrm.validate_transport`, shared by the DNS
   and DHCP credential inputs; `SUPPORTED_TRANSPORTS` is ntlm / credssp /
@@ -1171,7 +1171,7 @@ suggestion, free-space treemap.
   into `named.conf` unvalidated — a third instance of the #876/#899
   class, used deliberately here as the E2E fault-injection lever.
 - ✅ [**Agents spool and replay what they collect during a control-plane outage**](https://github.com/spatiumnorth/spatiumddi/issues/1077)
-  — the *reporting* half of non-negotiable #5 (unreleased). Every shipper
+  — shipped `2026.10.02-1`: the *reporting* half of non-negotiable #5. Every shipper
   used to drop a batch the control plane refused, from in-memory buffers an
   agent restart emptied, so a maintenance window lost its query logs, DHCP
   activity, metrics and — the correctness hole — Kea lease events, the only
@@ -1277,7 +1277,7 @@ suggestion, free-space treemap.
 - ✅ [**Active session viewer + force-logout**](https://github.com/spatiumnorth/spatiumddi/issues/72) — shipped `2026.05.07-1`: live JWT registry the operator can browse and revoke from — access tokens carry a `jti`, and `user_session` gains `auth_source` / `last_seen_at` / `revoked` + a `(revoked, expires_at)` index. Migration `c8e4f7a91d36`.
 - ✅ [**Internal cert + secret expiry monitoring**](https://github.com/spatiumnorth/spatiumddi/issues/76) — shipped `2026.06.11-1`: one `secret_expiring` alert rule that fires per internal credential expiring within `threshold_days` — supervisor mTLS certs (`appliance.cert_expires_at`) + API tokens (`api_token.expires_at`). Extended in `2026.06.19-1` to cover the Let's Encrypt Web-UI cert (#438).
 - ✅ [**Privacy statement — no telemetry, no analytics, your data stays in your install**](https://github.com/spatiumnorth/spatiumddi/issues/976)
-  — SpatiumDDI has been privacy-first by construction since the first commit
+  — shipped `2026.10.02-1`: SpatiumDDI has been privacy-first by construction since the first commit
   and said so **nowhere**, so an operator evaluating a platform that will hold
   every hostname, lease and subnet they own had to infer it from the absence of
   a settings page. Now [`docs/PRIVACY.md`](docs/PRIVACY.md) (short form in the
@@ -1313,7 +1313,7 @@ suggestion, free-space treemap.
   has to present exactly once without writing it anywhere it protects.
 
 - 🟡 [**E911 dispatchable location — SpatiumDDI as a Location Information Server**](https://github.com/spatiumnorth/spatiumddi/issues/972)
-  — **Phases 1a–3 shipped.** Given a phone's IP, MAC or LLDP
+  — **Phases 1a–3 shipped `2026.10.02-1`.** Given a phone's IP, MAC or LLDP
   chassis+port, answer "which room is this device in, right now?" as a
   dispatchable location. Every input was already in the database, collected for
   IPAM, and nothing joined them: `dhcp_lease` / `ip_mac_history` for IP↔MAC,
@@ -1845,8 +1845,10 @@ suggestion, free-space treemap.
   runs once a subnet passes 80% utilisation, and was found by the manual
   `attr-defined` sweep instead.
   No migration, no new endpoint, no MCP change.
-- 🟡 [**Agent-managed BIND9 AXFR fails PeerBadKey on operator-key-only groups**](https://github.com/spatiumnorth/spatiumddi/issues/920)
-  — **not reproduced; one real latent defect in that path fixed, and the
+- ✅ [**Agent-managed BIND9 AXFR fails PeerBadKey on operator-key-only groups**](https://github.com/spatiumnorth/spatiumddi/issues/920)
+  — **shipped `2026.10.02-1`**, closed by #1133: drift and Sync with Servers now
+  read each zone from the view that holds it. The earlier pass:
+  **not reproduced; one real latent defect in that path fixed, and the
   regression case the issue asks for added.** The reported shape — a group
   whose only TSIG material is an operator `DNSTSIGKey`, on a registered
   agent — was built live and verified end to end: the bundle carries operator
@@ -1869,12 +1871,12 @@ suggestion, free-space treemap.
   holds a stale key set, which is precisely the "apply ok + BADKEY"
   contradiction the issue reports. `live_axfr_check.py` had been working
   around it by rewriting the path; it now asserts on it, and gains the
-  operator-key-only case #920 asks for. **Still open:** the reported failure
+  operator-key-only case #920 asks for. **Left open by that pass:** the reported failure
   itself, which needs `rndc tsig-list` (or the effective `named.conf` plus
   includes) from an affected node to say what named actually loaded.
 
 - ✅ [**Kea drops relayed DHCP requests before it reads them under CPU pressure**](https://github.com/spatiumnorth/spatiumddi/issues/980)
-  — a QA report whose *observation* was exact and whose three proposed fixes
+  — shipped `2026.10.02-1`: a QA report whose *observation* was exact and whose three proposed fixes
   were all wrong, in ways only measurement could show. Reproduced against a
   live kea-dhcp4 3.0.3 rather than reasoned about.
   **The counter the issue asked us to report does not move.** It proposed
@@ -1979,7 +1981,7 @@ suggestion, free-space treemap.
   skewed worker clock. No migration, no new endpoint, no MCP change.
 
 - ✅ [**Appliance role chart never installed since #988 — two Helm releases both claimed the PriorityClasses**](https://github.com/spatiumnorth/spatiumddi/issues/992)
-  — the appliance chart is installed **twice per appliance**, under two
+  — shipped `2026.10.02-1`: the appliance chart is installed **twice per appliance**, under two
   release names, and #988's cluster-scoped PriorityClasses were rendered by
   both. Helm stamps `meta.helm.sh/release-name` on everything it creates and
   refuses an install *whole* when it meets an object owned by another
@@ -2010,7 +2012,7 @@ suggestion, free-space treemap.
   `agent/supervisor/tests/test_role_chart_values.py` pins the Python the
   shell script mirrors. No migration.
 - ✅ [**Direct kubelet transport (#990) was firewalled shut on every appliance**](https://github.com/spatiumnorth/spatiumddi/issues/993)
-  — the supervisor's `input` chain is `policy drop` and opened 10250 to
+  — shipped `2026.10.02-1`: the supervisor's `input` chain is `policy drop` and opened 10250 to
   *cluster peers* only, an empty set on a single node, so the rule was not
   emitted at all. A non-hostNetwork api pod reaching its own node's IP
   enters via `cni0` with a pod-CIDR source and traverses INPUT like any LAN
@@ -2040,7 +2042,7 @@ suggestion, free-space treemap.
   `_policy_from_orm` sorts, so an out-of-order entry makes an unseeded DB
   render different bytes from a seeded one.
 - ✅ [**Boot cosmetics — a failed console unit and a Warning event on every healthy first boot**](https://github.com/spatiumnorth/spatiumddi/issues/994)
-  — both make `systemctl --failed` and the events feed lie about a healthy
+  — shipped `2026.10.02-1`: both make `systemctl --failed` and the events feed lie about a healthy
   node, which is how operators learn to skim past the one that matters.
   `spatium-console@ttyS0` exits 75 when there is no serial device (the
   kernel cmdline carries `console=ttyS0` on every install; most VMs have no
@@ -2060,7 +2062,7 @@ suggestion, free-space treemap.
   one layer down. Ordering by filename is no answer either: k3s reconciles
   each Addon's contents asynchronously, so lexical order guarantees nothing.
 - ✅ [**DNS zone detail clipped its own primary action — eleven header buttons in one row**](https://github.com/spatiumnorth/spatiumddi/issues/996)
-  — at ~1,460 px with the sidebar open, `+ Add Record` rendered as a `+`
+  — shipped `2026.10.02-1`: at ~1,460 px with the sidebar open, `+ Add Record` rendered as a `+`
   sliver at the right edge. Folded into `Data ▾` / `Zone ▾` behind a new
   shared `HeaderMenu` (`components/ui/header-menu.tsx`), leaving the shape
   every detail page should read as: `Refresh`, at most two menus, one
@@ -2092,7 +2094,7 @@ suggestion, free-space treemap.
   that `focusItem(0, -1)` lands on the *last* item rather than the first.
 
 - ✅ [**Installer wizard review — 28 fixes in five phases**](https://github.com/spatiumnorth/spatiumddi/issues/995)
-  — a review of `spatium-install` (2,723 lines, 19 screens) prompted by a
+  — shipped `2026.10.02-1`: a review of `spatium-install` (2,723 lines, 19 screens) prompted by a
   fresh install of the #988 ISO. **All five phases landed.** The two items
   that cannot ship without image work — a RAID1 or multipath *install*,
   needing `mdadm` / `multipath-tools` / initramfs changes `mkosi.conf` does
@@ -2268,7 +2270,7 @@ suggestion, free-space treemap.
   to be fixed first, since it modelled an `lsblk` that does not exist.
 
 - ✅ [**Three host runners discard their piped input — `python3 -` reads the program from stdin**](https://github.com/spatiumnorth/spatiumddi/issues/1001)
-  — one bug, three call sites, and the blast radius was decided entirely by
+  — shipped `2026.10.02-1`: one bug, three call sites, and the blast radius was decided entirely by
   whichever `except` clause each site happened to have. `python3 -` means
   *read the program from stdin*, so `printf … | python3 - … <<'PYEOF'` has the
   pipe and the heredoc both claiming fd 0; under bash the heredoc, being the
@@ -2331,7 +2333,7 @@ suggestion, free-space treemap.
   without the note moving with it.
 
 - ✅ [**Blanking the installer's Time source did not disable NTP**](https://github.com/spatiumnorth/spatiumddi/issues/1002)
-  — Debian's `/etc/chrony/chrony.conf` carries its own `pool` directive and
+  — shipped `2026.10.02-1`: Debian's `/etc/chrony/chrony.conf` carries its own `pool` directive and
   `sourcedir` is additive, so removing the installer's sources file left the
   appliance synchronising against the public Debian pool. Four surfaces said
   "none", including `docs/PRIVACY.md`, which is normative for
@@ -2364,7 +2366,7 @@ suggestion, free-space treemap.
   wrong surfaces was prose, and prose is what nothing checks.
 
 - ✅ [**Change Password accepted a password the server then refused**](https://github.com/spatiumnorth/spatiumddi/issues/1004)
-  — two minimums were in play on the forced first-login screen, a hardcoded 8
+  — shipped `2026.10.02-1`: two minimums were in play on the forced first-login screen, a hardcoded 8
   and the configured 12, and the page reported neither honestly.
   The rule list and the submit gate were computed **separately**: the list
   evaluated five rows, the button checked only the confirm-field mismatch. So
@@ -2394,7 +2396,7 @@ suggestion, free-space treemap.
   the "policy has not loaded" case was asserting nothing until the test failed.
 
 - ✅ [**Every control-plane first boot wrote a second helm revision**](https://github.com/spatiumnorth/spatiumddi/issues/1005)
-  — helm-controller MERGES a `HelmChartConfig` on top of the same-named
+  — shipped `2026.10.02-1`: helm-controller MERGES a `HelmChartConfig` on top of the same-named
   `HelmChart`, and since #1003 item 4 firstboot renders the same sizing the
   supervisor computes. So the first heartbeat created a CR carrying nothing
   the Chart did not already say: no Deployment changed, but helm recorded
@@ -2423,7 +2425,7 @@ suggestion, free-space treemap.
   restoring the second revision. Its failure message names the offending keys.
 
 - ✅ [**SSH source-CIDR allowlist was dead code on port 22**](https://github.com/spatiumnorth/spatiumddi/issues/1009)
-  — the second of the two independent reasons the allowlist did nothing, and
+  — shipped `2026.10.02-1`: the second of the two independent reasons the allowlist did nothing, and
   the one #1001 deliberately left. `/etc/nftables.conf` opened
   `tcp dport 22` unconditionally in its management floor, *above* the
   `include "/etc/nftables.d/*.nft"` glob, and nftables is first-match-wins —
@@ -2501,8 +2503,8 @@ suggestion, free-space treemap.
   only question worth asking); no new feature module (#14 — it extends an
   existing resource).
 
-- 🟡 [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
-  install support**](https://github.com/spatiumnorth/spatiumddi/issues/999) — split out
+- ✅ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
+  install support**](https://github.com/spatiumnorth/spatiumddi/issues/999) — shipped `2026.10.02-1`. Split out
   of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the
   **ordering is the design point**: monitoring first, install support last.
   **Part A (monitoring) shipped** — `read_storage_health()` in the supervisor,
@@ -2523,7 +2525,7 @@ suggestion, free-space treemap.
   #395 first-boot re-render overwrote a working `grub.cfg` with the ARRAY's
   UUID — install, boot once, unbootable. Plus `esp-sync`'s missing `-t` and a
   host runner that did not claim its request (level-triggered `PathExistsGlob`
-  → start-limit → the path unit itself dead). **Still open: a
+  → start-limit → the path unit itself dead). **Not yet verified: a
   slot-upgrade-then-check-both-ESPs test, and C3 (multipath) has never been run
   against a real SAN.**
   A mirrored root with no degraded-array alarm is a mirror that silently becomes a
@@ -2549,7 +2551,7 @@ suggestion, free-space treemap.
   path**, or the mirror boots the old kernel off the surviving disk after an upgrade.
 
 - ✅ [**Alert forwarding filtered — and rendered — against keys alert payloads never carry**](https://github.com/spatiumnorth/spatiumddi/issues/1031)
-  — three payload shapes go through one delivery path, and only one of them was
+  — shipped `2026.10.02-1`: three payload shapes go through one delivery path, and only one of them was
   handled. Audit rows carry `result` + `timestamp`; alert events and the AI digest
   carry `severity` + `fired_at`. Everything downstream read the audit keys
   unconditionally, so alerts were mishandled **four ways at once**. The filed bug:
@@ -2597,7 +2599,7 @@ suggestion, free-space treemap.
 
 - ✅ [**Three build-guard defects that each made a guard useless in its own way**](https://github.com/spatiumnorth/spatiumddi/issues/1028)
   ([#1029](https://github.com/spatiumnorth/spatiumddi/issues/1029),
-  [#1030](https://github.com/spatiumnorth/spatiumddi/issues/1030)) — all three found
+  [#1030](https://github.com/spatiumnorth/spatiumddi/issues/1030)) — shipped `2026.10.02-1`: all three found
   while cutting the #999 ISO, and they share a lesson the repo has now recorded four
   times: **a guard that evaluates nothing looks exactly like one that passed.**
   **(#1028)** `appliance-verify-arch` probed with
@@ -2668,7 +2670,7 @@ suggestion, free-space treemap.
   unlike stamping "now", does not make the image permanently stale on every later run.
 
 - ✅ [**Appliance ISO + upgrade image for arm64 — with an architecture gate on the slot-upgrade path first**](https://github.com/spatiumnorth/spatiumddi/issues/1026)
-  — three parts, and the ordering is the issue's own: **part 1 (the gate) shipped
+  — shipped `2026.10.02-1`: three parts, and the ordering is the issue's own: **part 1 (the gate) shipped
   alone**, before any arm64 artifact exists, because it is a correctness fix on the
   x86-64 fleet that already exists rather than a prerequisite for one that does not.
   `appliance_upgrade_image` carried no architecture, and the catalogue,
@@ -2769,7 +2771,7 @@ SpatiumDDI uses **CalVer**: `YYYY.MM.DD-N` where N is the release number for tha
 - Git tags and Docker image tags follow this scheme exactly
 - Release is triggered by pushing a tag (see `.github/workflows/release.yml`). It publishes nothing until three gates pass ([#1226](https://github.com/spatiumnorth/spatiumddi/issues/1226)): the tag is a release tag on `main` and `ci.yml` passed on that commit (it waits up to an hour for a running CI); every image is built once, pushed by digest, and both architectures pass Trivy + `trivy-gate.sh` before that digest is tagged; and `:latest` moves last, all images or none, only after the GitHub release exists. The tag decisions (validity, previous release, whether it becomes latest) live in `scripts/release_version.py`, on top of `backend/app/core/versions.py`'s ordering, and rank only tags on `main` with a published release (`.github/scripts/release-tags.sh`). The shipped image list is `.github/images.json`, shared by `release.yml`, `nightly.yml` and `scripts/lint_image_upgrades.py`
 
-**Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer until that lands. After it, every SemVer version must compare newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so never compare versions as strings; use the shared helper that #1182 introduces.
+**Switching to SemVer at 1.0.0** ([#1182](https://github.com/spatiumnorth/spatiumddi/issues/1182)). Releases stay CalVer up to and including the **bridge** (the last CalVer release); from 1.0.0 they are `MAJOR.MINOR.PATCH`, with candidates tagged `1.0.0-rc.N` and published as GitHub pre-releases. Every SemVer release is newer than every CalVer one (`1.0.0` > `2026.09.04-1`), so **never compare versions as strings**: use `backend/app/core/versions.py` (`parse_release`, `includes_release`, `upgrade_direction`), its frontend mirror `frontend/src/lib/versions.ts` (keep the two in step; `versions.test.ts` runs the same cases), and, for tag decisions in CI, `scripts/release_version.py`. A build that is not a release (`dev`, `latest`, a nightly's `0.0.0-nightly-YYYYMMDD+sha`, a `0.x` placeholder) is an *unknown* version, never an old one. The bridge must ship before `1.0.0` is tagged: every "is this newer?" decision runs in the version being upgraded *from*, so only the bridge and later can see that 1.0.0 is newer. Every CalVer Helm chart is a SemVer pre-release, so a helm command for one needs an explicit `--version`.
 
 ---
 

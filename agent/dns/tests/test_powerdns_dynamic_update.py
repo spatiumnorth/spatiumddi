@@ -43,6 +43,28 @@ def test_render_conf_enables_dnsupdate(tmp_path: Path) -> None:
     assert "dnsupdate=yes" in conf
 
 
+def test_render_conf_turns_off_security_polling(tmp_path: Path) -> None:
+    """PowerDNS's secpoll phones secpoll.powerdns.com with its version; an
+    empty suffix turns it off (#1353, non-negotiable #17). An absent line
+    keeps PowerDNS's default, which is ON, so the line must be there."""
+    for alias_resolver in ("1.1.1.1,8.8.8.8", ""):
+        conf = PowerDNSDriver(state_dir=tmp_path)._render_conf(
+            api_key="k", log_level=4, alias_resolver=alias_resolver
+        )
+        assert "security-poll-suffix=" in conf.splitlines()
+
+
+def test_dnsdist_front_turns_off_security_polling() -> None:
+    """The dnsdist front secpolls too, on by default (#1353). Its base config
+    is built by the image entrypoint rather than the agent, so pin the line
+    there: build_conf must emit an empty ``setSecurityPollSuffix``."""
+    entrypoint = (
+        Path(__file__).resolve().parents[1] / "images" / "dnsdist" / "entrypoint.sh"
+    ).read_text()
+    build_conf = entrypoint.split("build_conf() {", 1)[1].split("\n}\n", 1)[0]
+    assert """echo 'setSecurityPollSuffix("")'""" in build_conf
+
+
 def test_apply_dynamic_update_sets_metadata(tmp_path: Path) -> None:
     d = PowerDNSDriver(state_dir=tmp_path)
     c = _FakeClient()

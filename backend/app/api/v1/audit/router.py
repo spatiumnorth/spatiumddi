@@ -7,6 +7,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB
+from app.core.content_disposition import content_disposition
 from app.core.permissions import require_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
@@ -128,7 +129,7 @@ async def export_change_report_pdf(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": content_disposition(fname)},
     )
 
 
@@ -141,6 +142,9 @@ class ChainBreakResponse(BaseModel):
     expected_hash: str
     actual_hash: str
     reason: str
+    action: str
+    resource_type: str
+    resource_id: str
 
 
 class IntegrityResponse(BaseModel):
@@ -186,6 +190,9 @@ async def get_audit_integrity(
                 expected_hash=b.expected_hash,
                 actual_hash=b.actual_hash,
                 reason=b.reason,
+                action=b.action,
+                resource_type=b.resource_type,
+                resource_id=b.resource_id,
             )
             for b in result.breaks
         ],

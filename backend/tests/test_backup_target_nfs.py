@@ -25,17 +25,20 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import os
 
 import pytest
 
-from app.services.backup.targets import DESTINATIONS, get_destination
-from app.services.backup.targets.base import DestinationConfigError
+from app.services.backup.targets import DESTINATIONS, get_destination, libnfs_client
+from app.services.backup.targets.base import DestinationConfigError, InvalidArchiveNameError
 from app.services.backup.targets.libnfs_client import (
+    NfsConnection,
     NfsError,
     _NfsDirent,
     _NfsStat64,
     _NfsUrl,
     build_url,
+    connect,
 )
 from app.services.backup.targets.nfs import (
     _PART_SUFFIX,
@@ -123,6 +126,169 @@ def test_build_url_omits_uid_when_unset():
     assert "uid=" not in build_url(server="h", export="/e")
 
 
+# ── write sizing and teardown, against a stubbed libnfs ───────────────
+
+
+class _FakeLib:
+    """Stands in for the ``ctypes.CDLL``. Records the WRITE spans the
+    client issues and whether the context was destroyed. Each test sets
+    the server limit and the queue state.
+    """
+
+    def __init__(self, *, writemax: int = 0, queued: int = 0, fd: int = -1) -> None:
+        self.writemax = writemax
+        self.queued = queued
+        self.fd = fd
+        self.spans: list[tuple[int, int, bytes]] = []
+        self.destroyed = False
+        self._url = _NfsUrl(b"nas", b"/e", None)
+
+    # NfsConnection.write
+    def nfs_get_writemax(self, ctx):
+        return self.writemax
+
+    def nfs_open(self, ctx, path, flags, handle):
+        return 0
+
+    def nfs_pwrite(self, ctx, fh, offset, count, buf):
+        self.spans.append((offset, count, ctypes.string_at(buf.value, count)))
+        return count
+
+    def nfs_close(self, ctx, fh):
+        return 0
+
+    def nfs_get_error(self, ctx):
+        return b""
+
+    # connect
+    def nfs_init_context(self):
+        return 1
+
+    def nfs_set_timeout(self, ctx, ms):
+        pass
+
+    def nfs_set_tcp_syncnt(self, ctx, n):
+        pass
+
+    def nfs_parse_url_dir(self, ctx, url):
+        return ctypes.pointer(self._url)
+
+    def nfs_mount(self, ctx, server, path):
+        return 0
+
+    def nfs_destroy_url(self, url):
+        pass
+
+    def nfs_queue_length(self, ctx):
+        return self.queued
+
+    def nfs_get_fd(self, ctx):
+        return self.fd
+
+    def nfs_destroy_context(self, ctx):
+        self.destroyed = True
+
+
+def _write_through(lib: _FakeLib, data: bytes) -> list[tuple[int, int, bytes]]:
+    NfsConnection(lib, ctypes.c_void_p(1), describe="nas:/e").write("/a.zip.part", data)  # type: ignore[arg-type]
+    return lib.spans
+
+
+def _assert_reassembles(spans, data: bytes) -> None:
+    offset = 0
+    for at, count, payload in spans:
+        assert at == offset
+        assert payload == data[offset : offset + count]
+        offset += count
+    assert offset == len(data)
+
+
+def test_v4_write_stays_under_the_server_limit_when_libnfs_does_not_know_it():
+    """libnfs 5.0.2 leaves ``writemax`` at 0 on NFSv4 and sends each
+    ``nfs_pwrite`` as one WRITE. A Synology DSM 7 export (limit 128 KiB)
+    dropped the connection on every 1 MiB WRITE, so every v4 backup
+    failed. With no negotiated limit, writes must go out in small pieces.
+    """
+    data = os.urandom(300 * 1024 + 7)
+    spans = _write_through(_FakeLib(writemax=0), data)
+    assert max(count for _, count, _ in spans) <= 64 * 1024
+    _assert_reassembles(spans, data)
+
+
+@pytest.mark.parametrize(
+    "writemax, expected",
+    [
+        (32 * 1024, 32 * 1024),  # a server smaller than the v4 fallback
+        (128 * 1024, 128 * 1024),  # the v3 FSINFO wtmax of the Synology above
+        (4 * 1024 * 1024, 1024 * 1024),  # never above the per-call bound
+    ],
+)
+def test_write_uses_the_limit_libnfs_negotiated(writemax, expected):
+    data = os.urandom(3 * 1024 * 1024 + 11)
+    spans = _write_through(_FakeLib(writemax=writemax), data)
+    assert max(count for _, count, _ in spans) == expected
+    _assert_reassembles(spans, data)
+
+
+def test_a_dead_session_is_not_destroyed_but_its_socket_is_closed(monkeypatch):
+    """libnfs 5.0.2 leaves a request queued when the connection dies
+    under a sync call, with callback data on a stack frame that is gone.
+    ``nfs_destroy_context`` runs that callback, and the api pod died with
+    SIGSEGV right after a failed v4 write. A queued request at teardown
+    means exactly that state, so the context must be left alone (leaked)
+    and only its socket closed.
+    """
+    sock, other = os.pipe()
+    os.close(other)
+    lib = _FakeLib(queued=2, fd=sock)
+    monkeypatch.setattr(libnfs_client, "_LIB", lib)
+    try:
+        with pytest.raises(NfsError):
+            with connect(server="nas", export="/e"):
+                raise NfsError("write failed: nfs_service failed", errno=errno.EIO)
+        assert not lib.destroyed, "destroying a dead libnfs 5.0.2 session segfaults"
+        with pytest.raises(OSError):
+            os.fstat(sock)  # closed, so a failed run does not leak a socket
+    finally:
+        try:
+            os.close(sock)
+        except OSError:
+            pass
+
+
+def test_a_healthy_session_is_destroyed(monkeypatch):
+    lib = _FakeLib(queued=0)
+    monkeypatch.setattr(libnfs_client, "_LIB", lib)
+    with connect(server="nas", export="/e"):
+        pass
+    assert lib.destroyed
+
+
+def test_the_new_prototypes_are_declared(monkeypatch):
+    """Same rule as every other binding in ``_load``: an undeclared
+    restype is ``c_int``, which would truncate the uint64 ``writemax``.
+    """
+
+    class _Fn:
+        pass
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.fns: dict[str, _Fn] = {}
+
+        def __getattr__(self, name: str) -> _Fn:
+            return self.fns.setdefault(name, _Fn())
+
+    rec = _Recorder()
+    monkeypatch.setattr(libnfs_client.ctypes, "CDLL", lambda _name: rec)
+    libnfs_client._load()
+    assert rec.nfs_get_writemax.restype is ctypes.c_uint64
+    assert rec.nfs_get_writemax.argtypes == [ctypes.c_void_p]
+    for name in ("nfs_queue_length", "nfs_get_fd"):
+        assert getattr(rec, name).restype is ctypes.c_int, name
+        assert getattr(rec, name).argtypes == [ctypes.c_void_p], name
+
+
 # ── path composition ──────────────────────────────────────────────────
 
 
@@ -138,12 +304,14 @@ def test_remote_path_without_a_subdirectory():
     assert _remote_path(cfg) == "/"
 
 
-def test_remote_path_strips_separators_from_the_filename():
+def test_remote_path_refuses_a_filename_that_is_not_one_component():
     # The same defence every other driver applies: an operator-supplied
-    # filename must not escape the configured directory.
+    # filename must not escape the configured directory. Refused rather
+    # than stripped since #1243 — stripping let ``..`` through unchanged.
     cfg = {"server": "h", "export": "/e", "path": "archives"}
-    assert _remote_path(cfg, "../../etc/passwd") == "/archives/passwd"
-    assert _remote_path(cfg, "/abs/path/x.zip") == "/archives/x.zip"
+    for bad in ("../../etc/passwd", "/abs/path/x.zip", ".."):
+        with pytest.raises(InvalidArchiveNameError):
+            _remote_path(cfg, bad)
 
 
 def test_part_suffix_is_invisible_to_the_archive_regex():

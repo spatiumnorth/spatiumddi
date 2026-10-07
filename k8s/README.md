@@ -7,7 +7,7 @@ k8s/
 ├── base/              # Core application manifests (namespace, API, worker, frontend, migrations)
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
-├── ha/                # High-availability add-ons (PostgreSQL Patroni/CloudNativePG, Redis Sentinel)
+├── ha/                # High-availability add-ons (CloudNativePG, Redis Sentinel; the Patroni Compose overlay does not work, #1236)
 └── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
 ```
 
@@ -28,8 +28,10 @@ kubectl apply -f k8s/dhcp/service-dhcp.yaml
 
 DHCPv4 requires broadcast reception on the client LAN. In most clusters you
 either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
-only.
+(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
+manifests use that LoadBalancer Service: on a `NodePort` Service the
+declared `port: 67` is in-cluster only and the node-facing port is a
+random 30000–32767 pick, which a relay cannot target.
 
 
 ## Quick Start (single-node / dev)
@@ -44,6 +46,10 @@ kubectl create secret generic spatiumddi-secrets \
   -n spatiumddi
 # metrics-token is the bearer token /metrics accepts (#1159). It's optional:
 # without it, only API tokens can scrape.
+# secret-key must be a real key: the api refuses to boot on a placeholder or
+# anything under 32 characters (#1222). k8s/base/secrets.yaml.example shows
+# the shape but is not applied by `kubectl apply -f k8s/base/`. Replacing the
+# key of an install that has data: see "Rotating SECRET_KEY" below.
 
 # 2. Deploy a standalone PostgreSQL (not HA — for dev/test only)
 kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
@@ -62,6 +68,57 @@ kubectl apply -f k8s/base/worker.yaml
 kubectl apply -f k8s/base/frontend.yaml
 ```
 
+## Rotating SECRET_KEY
+
+Needed when the install has been running on the old `k8s/base/secrets.yaml`
+placeholder (`CHANGEME-generate-with-openssl-rand-hex-32`): from #1222 the api
+refuses to boot on it, so an upgrade crash-loops with an error pointing here.
+Also how to rotate a key you suspect has leaked.
+
+`SECRET_KEY` signs session tokens (everyone just signs in again) and is the
+source of the key every stored credential is encrypted with, so those have to
+be re-encrypted for the new key before the api reads them:
+
+```bash
+NS=spatiumddi
+kubectl -n $NS scale deploy/api deploy/worker deploy/beat --replicas=0
+
+# Keep the key being replaced in its own secret, then write a new one. The
+# `&&` matters: if the old-key secret already exists, a rotation is in
+# progress and generating ANOTHER new key would strand whatever the Job has
+# already moved. Re-apply the Job instead.
+kubectl -n $NS get secret spatiumddi-secrets -o jsonpath='{.data.secret-key}' \
+  | base64 -d \
+  | kubectl -n $NS create secret generic spatiumddi-old-secret-key \
+      --from-file=secret-key=/dev/stdin \
+  && kubectl -n $NS patch secret spatiumddi-secrets --type merge \
+      -p "{\"stringData\":{\"secret-key\":\"$(openssl rand -hex 32)\"}}"
+
+# Re-encrypt every stored credential from the old key to the new one.
+kubectl apply -f k8s/ops/rotate-secret-key-job.yaml
+kubectl -n $NS wait --for=condition=complete job/spatiumddi-rotate-secret-key --timeout=300s
+kubectl -n $NS logs job/spatiumddi-rotate-secret-key
+```
+
+Only when the log ends with `Done.`, clean up and scale back up. Until then
+`spatiumddi-old-secret-key` is the only copy of the old key, and every stored
+credential is unreadable without it:
+
+```bash
+NS=spatiumddi
+kubectl -n $NS delete job/spatiumddi-rotate-secret-key secret/spatiumddi-old-secret-key
+kubectl -n $NS scale deploy/api deploy/worker --replicas=2
+kubectl -n $NS scale deploy/beat --replicas=1
+```
+
+The log reports how many values were re-encrypted; the rotation also writes an
+audit row. If the Job fails, its log says why: fix it, delete the Job (keep
+`spatiumddi-old-secret-key`) and apply it again. That is safe, because values
+already under the new key are skipped. After moving off a
+placeholder, review API tokens, users and the audit log, as anyone who knew the
+placeholder could have signed requests as any user. The Helm chart generates
+its own key and needs none of this.
+
 ## High Availability (production)
 
 ### PostgreSQL HA — CloudNativePG (recommended for K8s)
@@ -79,15 +136,15 @@ The operator creates two Services automatically:
 - `postgres-primary` → always points to the current primary (read/write)
 - `postgres-replica` → load-balances across read replicas
 
-### PostgreSQL HA — Patroni (Docker Compose)
+### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
-For Docker Compose HA deployments, use the Patroni-based setup:
-
-```bash
-docker compose -f docker-compose.yml -f k8s/ha/postgres-docker-compose.yaml up -d
-```
-
-Set `DATABASE_URL` to point at HAProxy port 5000 instead of the single `postgres` container.
+`ha/postgres-docker-compose.yaml` does **not** work. Patroni never starts,
+the overlay renames the compose project onto empty volumes, its network does
+not exist, and `docker-compose.yml` hardcodes `DATABASE_URL`, so pointing
+`.env` at HAProxy changes nothing. Don't run it against an existing install.
+The file's header lists the details, and
+[#137](https://github.com/spatiumnorth/spatiumddi/issues/137) tracks making
+Compose HA real. Use CloudNativePG (above) or the OS appliance for HA.
 
 ### Redis HA — Sentinel (K8s)
 
@@ -357,6 +414,8 @@ kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --tim
 ```
 
 Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart's pre-upgrade hook re-runs the migrate job; the `alembic upgrade head` invocation honours the same DATABASE_URL the api uses.
+
+The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 
 If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under the api pod's `/var/lib/spatiumddi/backups/` (passphrase is the literal string `pre-restore-safety`). For that path to survive pod recycle, mount it as a `PersistentVolumeClaim` on both the api and worker deployments — see Backup below.
 

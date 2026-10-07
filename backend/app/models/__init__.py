@@ -145,6 +145,7 @@ from app.models.ownership import Customer, Provider, Site
 from app.models.panos import FirewallObject, PANOSFirewall
 from app.models.pcap import PacketCapture
 from app.models.proxmox import ProxmoxNode
+from app.models.release_schema import ReleaseSchemaHead
 from app.models.saved_view import SavedView
 from app.models.settings import BrandingAsset, PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
@@ -288,6 +289,7 @@ __all__ = [
     "OPNsenseRouter",
     "PANOSFirewall",
     "ProxmoxNode",
+    "ReleaseSchemaHead",
     "SystemUpgradeRun",
     "TailscaleTenant",
     "UnifiController",

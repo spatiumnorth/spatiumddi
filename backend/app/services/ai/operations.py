@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import bind_check_names_error
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -1977,6 +1978,12 @@ async def _preview_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> PreviewResult:
     from app.models.dns import DNSRecord, DNSZone  # local import — avoid cycle
+    from app.services.dns.cname_conflict import (
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
 
     rtype = args.record_type.strip().upper()
     if rtype not in _DNS_RECORD_TYPES:
@@ -2008,6 +2015,19 @@ async def _preview_create_dns_record(
     name = args.name.strip()
     if not name:
         return PreviewResult(ok=False, detail="name is required (use ``@`` for apex).")
+
+    # #1378 — never propose what the group's BIND would refuse; apply
+    # refuses it too.
+    owner = zone.name if name == "@" else f"{name}.{zone.name}"
+    names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
+    if names_err is not None:
+        return PreviewResult(ok=False, detail=names_err)
+    # #1381 — nor a CNAME beside other data; apply refuses it too.
+    if rtype == "CNAME" and is_apex(name):
+        return PreviewResult(ok=False, detail=APEX_CNAME_DETAIL)
+    clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
+    if clash is not None:
+        return PreviewResult(ok=False, detail=describe_cname_conflict(rtype, owner, clash))
 
     # Surface a heads-up if a row with the same (zone, name, type, value)
     # already exists; preview doesn't reject — operator may want a parallel
@@ -2046,6 +2066,13 @@ async def _apply_create_dns_record(
     from app.api.v1.dhcp._audit import write_audit  # local import to avoid cycle
     from app.core.agent_wake import dns_group_channel, publish_wake
     from app.models.dns import DNSRecord, DNSZone
+    from app.services.dns.cname_conflict import (
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
+    from app.services.dns.record_identity import describe_identical, find_identical_record
     from app.services.dns.record_ops import enqueue_record_op
     from app.services.dns.serial import bump_zone_serial
 
@@ -2071,6 +2098,32 @@ async def _apply_create_dns_record(
         if name in ("@", "")
         else f"{name}.{zone.name}".rstrip(".") + ("." if zone.name.endswith(".") else "")
     )
+
+    # #1378 — the same check-names refusal as the REST create path.
+    names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
+    if names_err is not None:
+        raise ValueError(names_err)
+
+    # #1230 — never store the same RR twice; see app.services.dns.record_identity.
+    existing = await find_identical_record(
+        db,
+        zone.id,
+        view_id=None,
+        name=name,
+        record_type=rtype,
+        value=args.value,
+        priority=args.priority,
+        weight=args.weight if rtype == "SRV" else None,
+        port=args.port if rtype == "SRV" else None,
+    )
+    if existing is not None:
+        raise ValueError(describe_identical(existing))
+    # #1381 — a CNAME stands alone at its name, as on the REST path.
+    if rtype == "CNAME" and is_apex(name):
+        raise ValueError(APEX_CNAME_DETAIL)
+    clash = await find_cname_conflict(db, zone.id, view_id=None, name=name, record_type=rtype)
+    if clash is not None:
+        raise ValueError(describe_cname_conflict(rtype, fqdn, clash))
 
     row = DNSRecord(
         zone_id=zone.id,
@@ -2288,9 +2341,14 @@ class CreateDNSZoneArgs(BaseModel):
         default="primary",
         description="Zone type — ``primary``, ``secondary``, ``forward``, or ``stub``.",
     )
-    kind: str = Field(
-        default="forward",
-        description="``forward`` (a normal name → record zone) or ``reverse`` (PTR zone).",
+    kind: str | None = Field(
+        default=None,
+        description=(
+            "``forward`` (a normal name → record zone) or ``reverse`` (PTR zone). "
+            "Omit it to take it from the name: a primary zone under in-addr.arpa / "
+            "ip6.arpa is ``reverse`` (and cannot be ``forward``); any other zone "
+            "defaults to ``forward``."
+        ),
     )
     primary_ns: str = Field(
         default="",
@@ -2405,7 +2463,7 @@ async def _resolve_group_for_zone(
 async def _preview_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> PreviewResult:
-    from app.api.v1.dns.router import VALID_ZONE_TYPES  # noqa: PLC0415
+    from app.api.v1.dns.router import VALID_ZONE_TYPES, resolved_zone_kind  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
 
     name = _normalize_zone_name(args.name)
@@ -2416,6 +2474,12 @@ async def _preview_create_dns_zone(
         return PreviewResult(
             ok=False, detail=f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}."
         )
+
+    # #1310 — the kind follows the name, as on the REST create.
+    try:
+        kind = resolved_zone_kind(name, args.kind, args.zone_type)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
 
     if args.driver_hint is not None and args.driver_hint not in _DNS_DRIVER_HINTS:
         return PreviewResult(
@@ -2453,7 +2517,7 @@ async def _preview_create_dns_zone(
 
     parts = [f"Create zone `{name}` in group `{grp.name}`"]
     parts.append(f"drivers={sorted(drivers) or ['(none)']}")
-    parts.append(f"type={args.zone_type}/{args.kind}")
+    parts.append(f"type={args.zone_type}/{kind}")
     if args.dnssec_enabled:
         # #811: create now enqueues the ``dnssec_sign`` op itself, so the
         # preview no longer has to warn about a flag-only zone. BIND9
@@ -2476,6 +2540,7 @@ async def _preview_create_dns_zone(
 async def _apply_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> dict[str, Any]:
+    from app.api.v1.dns.router import resolved_zone_kind  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dns import DNSZone  # noqa: PLC0415
 
@@ -2484,6 +2549,8 @@ async def _apply_create_dns_zone(
     enforce_operation_permission(user, _OPERATIONS["create_dns_zone"])
 
     name = _normalize_zone_name(args.name)
+    # #1310 — re-checked at apply, like the driver gate below.
+    kind = resolved_zone_kind(name, args.kind, args.zone_type)
     grp, drivers, err = await _resolve_group_for_zone(
         db, group_id=args.group_id, driver_hint=args.driver_hint
     )
@@ -2501,7 +2568,7 @@ async def _apply_create_dns_zone(
         group_id=grp.id,
         name=name,
         zone_type=args.zone_type,
-        kind=args.kind,
+        kind=kind,
         ttl=args.ttl,
         primary_ns=args.primary_ns,
         admin_email=args.admin_email,
@@ -2533,7 +2600,7 @@ async def _apply_create_dns_zone(
                 "group_id": str(grp.id),
                 "group": grp.name,
                 "zone_type": args.zone_type,
-                "kind": args.kind,
+                "kind": kind,
                 "dnssec_enabled": args.dnssec_enabled,
                 "driver_hint": args.driver_hint,
                 "via": "ai_proposal",
@@ -2554,7 +2621,7 @@ async def _apply_create_dns_zone(
         "group_id": str(grp.id),
         "name": name,
         "zone_type": args.zone_type,
-        "kind": args.kind,
+        "kind": kind,
         "dnssec_enabled": args.dnssec_enabled,
     }
 
@@ -3792,6 +3859,34 @@ class GrantTemporaryAccessArgs(BaseModel):
     )
 
 
+_GRANT_MAKES_SUPERADMIN = (
+    "This grant would make {n} member(s) of the group superadmins, and that needs "
+    "your password or authenticator code, which a chat Apply cannot ask for "
+    "(#1412). Grant it from Groups → Time-bound grants instead."
+)
+
+
+async def _grant_makes_superadmins(
+    db: AsyncSession, group_id: UUID, args: GrantTemporaryAccessArgs
+) -> int:
+    """How many users a ``*`` / ``*`` grant would make superadmins (#1412)."""
+    from app.services.superadmin_grant import (  # noqa: PLC0415
+        newly_superadmin,
+        permissions_grant_superadmin,
+    )
+
+    requested = [
+        {
+            "action": args.action,
+            "resource_type": args.resource_type,
+            "resource_id": (args.resource_id or "").strip() or None,
+        }
+    ]
+    if not permissions_grant_superadmin(requested):
+        return 0
+    return len(await newly_superadmin(db, lambda m: m.granted_groups.add(group_id)))
+
+
 async def _preview_grant_temporary_access(
     db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
 ) -> PreviewResult:
@@ -3813,6 +3908,9 @@ async def _preview_grant_temporary_access(
     group = await db.get(Group, gid)
     if group is None:
         return PreviewResult(ok=False, detail=f"No group with id {args.group_id}.")
+    granted = await _grant_makes_superadmins(db, gid, args)
+    if granted:
+        return PreviewResult(ok=False, detail=_GRANT_MAKES_SUPERADMIN.format(n=granted))
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     scope = f"/{args.resource_id}" if args.resource_id else " (any instance)"
     preview_text = (
@@ -3836,6 +3934,10 @@ async def _apply_grant_temporary_access(
     group = await db.get(Group, UUID(args.group_id))
     if group is None:
         raise ValueError(f"No group with id {args.group_id}.")
+    # Re-checked at apply: membership can change between preview and Apply.
+    granted = await _grant_makes_superadmins(db, group.id, args)
+    if granted:
+        raise ValueError(_GRANT_MAKES_SUPERADMIN.format(n=granted))
     resource_id = (args.resource_id or "").strip() or None
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     grant = TimeBoundGrant(

@@ -340,7 +340,7 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
      ${SPATIUMDDI_VERSION:-dev}`` wiring on the helm path.
      Precedence: operator-pinned ``image.tag`` wins (e.g. for a
      manual rollback) → chart-packaged ``.Chart.AppVersion`` (the
-     CalVer tag the release workflow stamps via
+     release tag the release workflow stamps via
      ``helm package --app-version``) → falls through to the
      api's own ``"dev"`` fallback in ``app/config.py``. Same
      resolution chain as the existing ``spatiumddi.image``
@@ -506,13 +506,26 @@ URL comes from commonEnv.
       # order-independent across branched heads.
       HEADS=$(alembic heads 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
       echo "this image's alembic head(s): ${HEADS:-<none>}"
+      EXPLAINED=
       while :; do
-        CUR=$(alembic current 2>/dev/null | awk '{print $1}' | sort | tr '\n' ',')
+        OUT=$(alembic current 2>/dev/null)
+        # Revision lines only: a failure prints a multi-line explanation.
+        CUR=$(printf '%s\n' "$OUT" | awk '$1 ~ /^[0-9a-f]+$/ {print $1}' | sort | tr '\n' ',')
         if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
           echo "alembic at head ($CUR)"
           break
         fi
-        echo "waiting for alembic to reach head; current=${CUR:-<unreachable/empty>}"
+        # #1227 — a database a NEWER release migrated never reaches this
+        # image's head, so this loop cannot end on its own. env.py names the
+        # cause; say it here too, once, where the operator is looking.
+        # (The migrate Job that also says it is deleted by its TTL.)
+        if [ -z "$EXPLAINED" ] && printf '%s' "$OUT" | grep -q "NEWER SpatiumDDI release"; then
+          printf '%s\n' "$OUT"
+          EXPLAINED=1
+        fi
+        LABEL=${CUR:-<unreachable/empty>}
+        [ -n "$EXPLAINED" ] && LABEL="<written by a newer release, see above>"
+        echo "waiting for alembic to reach head; current=$LABEL"
         sleep 3
       done
   env:

@@ -8,6 +8,7 @@ import {
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
+import { optionsFromMap, optionsToMap } from "./dhcpOptionKeys";
 
 export function CreateOptionTemplateModal({
   template,
@@ -25,23 +26,13 @@ export function CreateOptionTemplateModal({
   const [addressFamily, setAddressFamily] = useState<"ipv4" | "ipv6">(
     template?.address_family ?? "ipv4",
   );
-  const initialOptions: DHCPOption[] = template?.options
-    ? Object.entries(template.options).map(([n, value]) => ({
-        code: 0,
-        name: n,
-        value: value as string | string[],
-      }))
-    : [];
+  const initialOptions: DHCPOption[] = optionsFromMap(template?.options);
   const [options, setOptions] = useState<DHCPOption[]>(initialOptions);
   const [error, setError] = useState("");
 
   const mut = useMutation({
     mutationFn: () => {
-      const optionsDict: Record<string, string | string[]> = {};
-      for (const opt of options) {
-        const key = opt.name || `option-${opt.code}`;
-        optionsDict[key] = opt.value;
-      }
+      const optionsDict = optionsToMap(options);
       const data: DHCPOptionTemplateWrite = {
         name,
         description,

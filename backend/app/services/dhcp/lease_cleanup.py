@@ -147,6 +147,57 @@ async def peer_holds_active_lease(db: AsyncSession, lease: DHCPLease, *, now: da
     return res.first() is not None
 
 
+async def another_client_holds_address(
+    db: AsyncSession, lease: DHCPLease, *, now: datetime
+) -> bool:
+    """Does another lease ON THE SAME SERVER still hold ``lease``'s address? (#1318)
+
+    A server reports one lease row per address and client, so once an
+    address has moved from one client to the next the server has two rows
+    for it: the old client's, ended, and the new client's, active. The IPAM
+    mirror and the DDNS records belong to the address, so an event that ends
+    the OLD client's lease must not take them from the new one.
+
+    That event arrives late every time the agent replays its lease file. It
+    re-reads the whole file on every start, so the old client's grant and
+    release of the address are delivered again after the address has changed
+    hands. The release used to delete the new client's mirror, and the
+    address was missing from IPAM until the replay reached the new client's
+    own grant.
+
+    A row counts only while it is ``active`` and not past its expiry, the
+    rule :func:`peer_holds_active_lease` applies to the other servers of the
+    group.
+    """
+    res = await db.execute(
+        select(DHCPLease.id)
+        .where(
+            DHCPLease.server_id == lease.server_id,
+            DHCPLease.ip_address == lease.ip_address,
+            DHCPLease.id != lease.id,
+            DHCPLease.state == "active",
+            or_(DHCPLease.expires_at.is_(None), DHCPLease.expires_at > now),
+        )
+        .limit(1)
+    )
+    return res.first() is not None
+
+
+async def address_still_held(db: AsyncSession, lease: DHCPLease, *, now: datetime) -> bool:
+    """Does anything besides ``lease`` still hold its address?
+
+    Either a partner server of the group (:func:`peer_holds_active_lease`,
+    #1110) or another client on the same server
+    (:func:`another_client_holds_address`, #1318). The IPAM mirror and its
+    DDNS records belong to the address, so every path that tears them down
+    when a lease ends asks this one question: the lease-event release, the
+    expiry sweep and :func:`purge_lease`.
+    """
+    return await peer_holds_active_lease(db, lease, now=now) or await another_client_holds_address(
+        db, lease, now=now
+    )
+
+
 async def purge_lease(
     db: AsyncSession,
     lease: DHCPLease,
@@ -169,10 +220,10 @@ async def purge_lease(
          the delete),
       6. delete the lease row.
 
-    Steps 2–4 are skipped while another server in the group still holds an
-    active lease on the address (``peer_holds_active_lease``, #1110): the
-    mirror and its DNS records belong to the address, not to this server's
-    copy of the lease. ``spare_if_peer_holds=False`` is for callers removing
+    Steps 2–4 are skipped while anything else still holds an active lease on
+    the address (``address_still_held``): another server in the group
+    (#1110), or another client on this server (#1318). The mirror and its
+    DNS records belong to the address, not to this copy of the lease. ``spare_if_peer_holds=False`` is for callers removing
     every copy at once — scope deletion — where the peer that would spare
     the mirror is itself being deleted in the same call; the mirror has to
     go, and relying on the order of deletes and autoflush to get there
@@ -185,11 +236,7 @@ async def purge_lease(
     sid = await _resolve_lease_subnet_id(db, lease) if subnet_id is _UNSET else subnet_id
 
     mirror_removed = False
-    if (
-        sid is not None
-        and spare_if_peer_holds
-        and await peer_holds_active_lease(db, lease, now=now)
-    ):
+    if sid is not None and spare_if_peer_holds and await address_still_held(db, lease, now=now):
         logger.info(
             "dhcp_purge_lease_mirror_kept_peer_holds",
             ip=str(lease.ip_address),
@@ -260,6 +307,8 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
 
 
 __all__ = [
+    "address_still_held",
+    "another_client_holds_address",
     "delete_leases_for_scope",
     "peer_holds_active_lease",
     "purge_lease",

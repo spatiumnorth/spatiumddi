@@ -3,9 +3,13 @@
 
 Two shapes:
 
-* **Full restore** (no ``sections``) — hard overwrite. Replay the
-  archive over every table via ``pg_restore --clean`` (custom-format
-  archives) or ``psql`` (Phase 1 plain dumps).
+* **Full restore** (no ``sections``) — hard overwrite. Clear the schema,
+  then replay the archive's script (``pg_restore``'s output for a
+  custom-format archive, the dump itself for a Phase 1 plain one) through
+  ``psql``, both in one transaction. Clearing first is what makes an
+  archive older than this install restorable at all: ``pg_restore
+  --clean`` dropped only what the archive contained, so the tables later
+  migrations added survived and broke the replay (#1363).
 * **Selective restore** (``sections`` given) — TRUNCATE CASCADE + a
   data-only reload, over the **FK-cascade closure** of the selected
   sections' tables. The closure matters because CASCADE empties every
@@ -28,8 +32,9 @@ Safety rails:
   archive this build cannot migrate forward is refused with the
   database still intact. ``allow_newer_schema`` overrides it for the
   A/B-rollback case.
-* The data replay itself is atomic — ``--single-transaction`` on both
-  the psql and pg_restore paths. What is *not* atomic is the restore as
+* The data replay itself is atomic — clearing and replay run in one
+  ``psql --single-transaction``, and a ``pg_restore`` that fails part way
+  never lets psql reach end of input and commit. What is *not* atomic is the restore as
   a whole: the post-replay secret rewrap walks 65 columns/fields
   committing one at a time, so it can leave a half-migrated credential
   store. That is reported rather than hidden — see ``RewrapOutcome``'s
@@ -40,17 +45,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import structlog
 
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
+    _pg_subprocess_env,
     build_backup_archive,
     extract_archive_members,
 )
@@ -77,9 +86,9 @@ CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
 SUPPORTED_FORMAT_VERSIONS = {1, 2}
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
-# Either binary can run a while on a hefty install; same envelope
-# as pg_dump so the matched-pair runs are bounded together.
-_PSQL_TIMEOUT_SECONDS = 30 * 60
+# A replay can run a while on a hefty install; same envelope as pg_dump so
+# the matched-pair runs are bounded together. Since #1363 a full restore runs
+# pg_restore feeding psql, and the whole replay shares this one deadline.
 _PG_RESTORE_TIMEOUT_SECONDS = 30 * 60
 
 
@@ -121,6 +130,11 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
     which is fine — psql itself opens a brand-new connection on the
     next call.
 
+    It spares one other: the connection holding the restore lock
+    (#1648). Ending it would release the lock in the middle of the
+    replay and let a second restore in (#1571). It holds no table, so
+    it is in nobody's way.
+
     Failures here are logged but non-fatal; if the pool drops are
     enough on their own (no other connections present) the replay
     proceeds normally.
@@ -128,7 +142,8 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
     full_env = {**os.environ, **pg_env}
     sql = (
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-        "WHERE datname = current_database() AND pid <> pg_backend_pid();"
+        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+        f"AND pid NOT IN ({_RESTORE_LOCK_HOLDERS_SQL});"
     )
     proc = await asyncio.create_subprocess_exec(
         "psql",
@@ -153,79 +168,413 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
         )
 
 
-async def _run_psql(sql_path: Path, db_url: str) -> None:
+# #1363 — a full restore must land on a schema holding exactly what the
+# archive carries. ``pg_restore --clean`` drops only the objects the ARCHIVE
+# contains, so every table a later migration added survived the replay with
+# its constraints. An archive older than ``dns_agent_bundle`` (every
+# 2026.09.04-1 archive) then failed outright: ``--clean`` could not drop
+# ``dns_server_pkey`` while ``dns_agent_bundle_server_id_fkey`` depended on
+# it, and the single transaction rolled back to a 400. A newer table with no
+# such key survived instead, and stopped the post-restore ``alembic upgrade``
+# on "already exists" — the drift branch #1233 had to tighten, entered by a
+# path that has nothing to do with a stale ``alembic_version``.
+#
+# So this runs first, in the SAME transaction as the replay: a failed replay
+# rolls the clearing back with it and the database is untouched. It drops
+# every table, view, sequence, standalone type and routine in ``public``
+# except an extension's members — ``CREATE EXTENSION IF NOT EXISTS`` in the
+# dump is then a no-op, and no extension needs re-creating (pg_trgm, #879, is
+# optional and may not be creatable by this role). Backups dump the whole
+# database with no exclusions, so nothing dropped here is lost: the archive
+# recreates everything that should exist. Names are captured as text up
+# front, because a CASCADE drop removes later rows' objects and a regclass of
+# a dropped oid renders as a bare number.
+#
+# Before that block, ``_LOCK_PUBLIC_TABLES_SQL`` takes every table at once. The
+# drops lock as they go, and every lock is held to the end of the transaction,
+# while the appliance keeps working: the api, worker and agents reconnect the
+# moment ``_terminate_other_db_connections`` has run. A session that read a
+# table the drops had not reached yet and then waited for one they had already
+# dropped closed a cycle when the drops reached the table it held, and
+# PostgreSQL aborted the replay: "deadlock detected" at the clearing block's
+# last line, a 400, nothing restored. So the lock block first ends the sessions
+# of this role that came back and hold one of the tables, then takes every
+# table in one ``LOCK TABLE``, inside a subtransaction: if a session that
+# slipped in between still closes a cycle and PostgreSQL picks this side, only
+# the attempt is rolled back, and it is tried again. Waits on anything else
+# (autovacuum, which the deadlock check cancels after ``deadlock_timeout``; a
+# long reader of another role) are waited out, as the drops always did.
+_LOCK_PUBLIC_TABLES_SQL = """\
+DO $lock$
+DECLARE
+    tables text;
+    attempts integer := 0;
+BEGIN
+    -- Tables only: a LOCK on a view also locks whatever the view reads, wherever
+    -- it lives, and a sequence cannot be LOCKed. The product has no views, and
+    -- its sequences are only used through their tables' INSERTs.
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ' ORDER BY c.relname)
+    INTO tables
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      );
+    IF tables IS NULL THEN
+        RETURN;
+    END IF;
+    LOOP
+        -- Only this role's sessions: ending another role's (a superuser's) is
+        -- refused with an ERROR, which would end the restore instead.
+        PERFORM pg_terminate_backend(h.pid, 1000)
+        FROM (
+            SELECT DISTINCT l.pid
+            FROM pg_locks l
+            JOIN pg_class c ON c.oid = l.relation
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.granted
+              AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND n.nspname = 'public'
+              AND l.pid <> pg_backend_pid()
+              AND a.usename = current_user
+        ) h;
+        BEGIN
+            EXECUTE 'LOCK TABLE ' || tables || ' IN ACCESS EXCLUSIVE MODE';
+            RETURN;
+        EXCEPTION WHEN deadlock_detected THEN
+            -- The attempt's locks went with its subtransaction.
+            attempts := attempts + 1;
+            IF attempts >= 10 THEN
+                RAISE;
+            END IF;
+        END;
+    END LOOP;
+END
+$lock$;
+"""
+
+_DROP_PUBLIC_SCHEMA_SQL = """\
+DO $clear$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I', n.nspname, c.relname) AS obj,
+               CASE c.relkind
+                   WHEN 'v' THEN 'VIEW'
+                   WHEN 'm' THEN 'MATERIALIZED VIEW'
+                   WHEN 'f' THEN 'FOREIGN TABLE'
+                   WHEN 'S' THEN 'SEQUENCE'
+                   ELSE 'TABLE'
+               END AS kind
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind IN ('r', 'p', 'f', 'm', 'v', 'S')
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+          )
+        -- Tables first; whatever they take with them is skipped by IF EXISTS.
+        ORDER BY CASE c.relkind WHEN 'r' THEN 0 WHEN 'p' THEN 0 ELSE 1 END, c.relname
+    LOOP
+        EXECUTE format('DROP %s IF EXISTS %s CASCADE', r.kind, r.obj);
+    END LOOP;
+
+    FOR r IN
+        SELECT format('%I.%I', n.nspname, t.typname) AS obj
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public'
+          -- Not 'm': a multirange is internal to its range, which drops it.
+          -- Dropping one directly is an ERROR, not a no-op, in any order.
+          AND (
+              t.typtype IN ('e', 'd', 'r')
+              OR (t.typtype = 'c' AND EXISTS (
+                  SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'
+              ))
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+          )
+    LOOP
+        EXECUTE format('DROP TYPE IF EXISTS %s CASCADE', r.obj);
+    END LOOP;
+
+    FOR r IN
+        SELECT format('%I.%I(%s)', n.nspname, p.proname,
+                      pg_get_function_identity_arguments(p.oid)) AS obj
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+          )
+    LOOP
+        EXECUTE format('DROP ROUTINE IF EXISTS %s CASCADE', r.obj);
+    END LOOP;
+END
+$clear$;
+"""
+
+_CLEAR_PUBLIC_SCHEMA_SQL = (
+    # One NOTICE per cascaded constraint would otherwise bury the error, if any.
+    "SET client_min_messages = warning;\n"
+    + _LOCK_PUBLIC_TABLES_SQL
+    + _DROP_PUBLIC_SCHEMA_SQL
+)
+
+_REPLAY_CHUNK_BYTES = 64 * 1024
+
+
+def _error_excerpt(stderr: str, limit: int = 1500) -> str:
+    """psql's stderr from its first ``ERROR`` line, which is the reason;
+    anything before it is notices and warnings."""
+    idx = stderr.find("ERROR:")
+    if idx != -1:
+        stderr = stderr[stderr.rfind("\n", 0, idx) + 1 :]
+    return stderr[:limit]
+
+
+async def _script_chunks(script: bytes | Path):
+    """Yield a plain dump in chunks: from memory when the caller already
+    holds it (the archive's bytes, which restore has just unzipped), else
+    from disk without blocking the loop."""
+    if isinstance(script, bytes):
+        view = memoryview(script)
+        for start in range(0, len(view), _REPLAY_CHUNK_BYTES):
+            yield bytes(view[start : start + _REPLAY_CHUNK_BYTES])
+        return
+    with script.open("rb") as fh:
+        while chunk := await asyncio.to_thread(fh.read, _REPLAY_CHUNK_BYTES):
+            yield chunk
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    """Kill ``proc`` if it is running, and reap it.
+
+    Its stdout is drained first: ``Process.wait()`` returns only once every
+    pipe has closed, and a killed producer's stdout still holds output
+    nobody will read, so without the drain the wait never returns.
+    """
+    if proc.returncode is None:
+        proc.kill()
+    if proc.stdout is not None:
+        await proc.stdout.read()
+    await proc.wait()
+
+
+async def _saw_token(stream: asyncio.StreamReader, token: bytes) -> bool:
+    """Drain ``stream`` to EOF; True when ``token`` appeared in it.
+
+    Keeps only a token-sized tail between reads, so a script that prints a
+    lot (one row per ``setval``) costs no memory.
+    """
+    seen, tail = False, b""
+    while chunk := await stream.read(_REPLAY_CHUNK_BYTES):
+        window = tail + chunk
+        seen = seen or token in window
+        tail = window[-len(token) :]
+    return seen
+
+
+async def _replay_clean(source, db_url: str, *, producer=None) -> None:
+    r"""Clear the schema and replay a SQL script, in ONE transaction (#1363).
+
+    ``source`` yields the script's bytes: a plain dump read from disk, or
+    ``pg_restore``'s script output for a custom-format archive (``producer``
+    is that process, so its failure can be told apart). Everything reaches
+    ``psql --single-transaction`` through stdin as one script, prefixed by
+    :data:`_CLEAR_PUBLIC_SCHEMA_SQL` — one ``-f -`` rather than several
+    ``-f`` files, because only psql 15+ wraps several in one transaction.
+
+    The script is streamed, not staged: an install's dump can be larger than
+    the api pod's scratch space. The cost of streaming is that psql reaching
+    end of input COMMITS, so a producer that dies half way through must
+    never let it get there. When the producer fails, psql is killed with its
+    stdin still open — the server then sees the connection drop mid
+    transaction and rolls everything back, the clearing included.
+
+    Success is psql ACKNOWLEDGING the end of the script, not just exiting 0:
+    a per-run token is ``\echo``-ed after the last statement, and only its
+    appearance on stdout proves psql read everything. Handing every byte to
+    the pipe proves nothing, since psql can leave early with exit 0 (a
+    ``\q``) while a small script still fits in the pipe.
+    """
     pg_env, _dbname = _pg_env_from_url(db_url)
-    # Kick every other connection first so the DROP / TRUNCATE in
-    # the dump's --clean preamble doesn't deadlock against the
-    # worker / beat / dns-bind9 / dhcp-kea / frontend SSE polls.
     await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
-    cmd = [
+    psql = await asyncio.create_subprocess_exec(
         "psql",
+        "--quiet",
+        "--no-psqlrc",
         "--set=ON_ERROR_STOP=1",
         "--single-transaction",
-        f"--file={sql_path}",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=full_env,
+        "--file=-",
+        env=_pg_subprocess_env(pg_env),
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdin, stdout, stderr = psql.stdin, psql.stdout, psql.stderr
+    assert stdin is not None and stdout is not None and stderr is not None
+    token = f"spatium-replay-complete-{secrets.token_hex(16)}".encode("ascii")
+    acknowledged = asyncio.ensure_future(_saw_token(stdout, token))
+    psql_stderr = asyncio.ensure_future(stderr.read())
+    producer_stderr = (
+        asyncio.ensure_future(producer.stderr.read())
+        if producer is not None and producer.stderr is not None
+        else None
+    )
+
+    async def kill_all() -> None:
+        # psql's stdout already has its reader (the acknowledgement task), so
+        # it is drained through that rather than by ``_stop``: two readers
+        # on one stream is an error.
+        if psql.returncode is None:
+            psql.kill()
+        # Waits for the reader to hit EOF without re-raising anything it
+        # failed with: cleanup must not replace the error being reported.
+        await asyncio.wait({acknowledged})
+        await psql.wait()
+        if producer is not None:
+            await _stop(producer)
+
+    def psql_gone() -> bool:
+        return psql.returncode is not None or stdin.is_closing()
+
+    async def copy() -> bool:
+        """Stream the script into psql; False when psql stopped reading.
+
+        Checked per chunk rather than left to the write: once psql exits,
+        asyncio's pipe transport DISCARDS further writes and ``drain()`` does
+        not raise, so a loop waiting for an exception would pump the rest of
+        the dump into nothing before reporting the error.
+        """
+        try:
+            stdin.write(_CLEAR_PUBLIC_SCHEMA_SQL.encode("utf-8"))
+            await stdin.drain()
+            async for chunk in source:
+                if psql_gone():
+                    return False
+                stdin.write(chunk)
+                await stdin.drain()
+            # On its own line: the script need not end with a newline.
+            stdin.write(b"\n\\echo " + token + b"\n")
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return not psql_gone()
+
+    # Set once psql has been given end of input: from then on it may be
+    # committing, so a timeout can no longer promise nothing was applied.
+    eof_sent = False
+    delivered = False
+    saw_end = False
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_PSQL_TIMEOUT_SECONDS)
+        # One deadline for the whole replay, not one per step.
+        async with asyncio.timeout(_PG_RESTORE_TIMEOUT_SECONDS):
+            delivered = await copy()
+            if not delivered:
+                # psql stopped reading, which only an error does. Stop the
+                # producer now: left running it blocks on a full pipe nobody
+                # drains. psql's own error is the one to report.
+                if producer is not None:
+                    await _stop(producer)
+            elif producer is not None:
+                await producer.wait()
+                if producer.returncode != 0:
+                    # psql has not seen end of input, so it has not committed;
+                    # the handler below kills it.
+                    err = (
+                        (await producer_stderr).decode(errors="replace")[:1500]
+                        if producer_stderr is not None
+                        else ""
+                    )
+                    raise BackupRestoreError(
+                        f"pg_restore failed (exit {producer.returncode}): {err}; "
+                        "nothing was applied"
+                    )
+            if delivered:
+                # End of input: psql COMMITs, or rolls back on an error in the
+                # final statements.
+                stdin.close()
+                eof_sent = True
+            await psql.wait()
+            saw_end = await acknowledged
     except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError(f"psql exceeded {_PSQL_TIMEOUT_SECONDS}s timeout") from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"psql failed (exit {proc.returncode}): {msg}")
+        await kill_all()
+        outcome = (
+            "the outcome is unknown — psql may have committed before it was stopped"
+            if eof_sent
+            else "nothing was applied"
+        )
+        raise BackupRestoreError(
+            f"restore replay exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout; {outcome}"
+        ) from exc
+    except BaseException:
+        await kill_all()
+        raise
+    if psql.returncode == 0 and not saw_end:
+        # psql left before the end of the script yet reported success (a
+        # ``\q`` in it, say). With --single-transaction that commits what it
+        # read, so this must not read as a completed restore.
+        raise BackupRestoreError(
+            "replay stopped before the end of the archive (psql exited 0 without "
+            "reading all of it); the database may hold a partial restore"
+        )
+    if psql.returncode != 0:
+        err = _error_excerpt((await psql_stderr).decode(errors="replace"))
+        raise BackupRestoreError(
+            f"replay failed (psql exit {psql.returncode}): {err}; nothing was applied"
+        )
+
+
+async def _run_psql(script: bytes | Path, db_url: str) -> None:
+    """Replay a plain-format (Phase 1) dump over a cleared schema (#1363)."""
+    await _replay_clean(_script_chunks(script), db_url)
 
 
 async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
-    """Replay a ``--format=custom`` archive via pg_restore (Phase
-    2+). ``--clean --if-exists`` ensures the destination's
-    matching objects get dropped before recreate; ``--no-owner``
-    + ``--no-acl`` strip role/grant clauses (matched to pg_dump's
-    flags); ``--single-transaction`` makes the whole replay
-    atomic. ``--exit-on-error`` so the first failure aborts
-    instead of the default behaviour of trying to keep going.
+    """Replay a ``--format=custom`` archive (Phase 2+) over a cleared schema.
+
+    ``pg_restore`` turns the archive into its SQL script (``--file=-``), and
+    :func:`_replay_clean` applies it after clearing the schema, in one
+    transaction (#1363). ``--clean`` is gone: everything it would drop is
+    already gone, and it never dropped what mattered — the tables the archive
+    does not contain. ``--no-owner`` + ``--no-acl`` strip role/grant clauses
+    (matched to pg_dump's flags).
     """
-    pg_env, dbname = _pg_env_from_url(db_url)
-    await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
-    cmd = [
+    producer = await asyncio.create_subprocess_exec(
         "pg_restore",
-        "--dbname",
-        dbname,
-        "--clean",
-        "--if-exists",
         "--no-owner",
         "--no-acl",
-        "--single-transaction",
-        "--exit-on-error",
+        "--file=-",
         str(dump_path),
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=full_env,
+        # Script mode never connects, so it gets no connection credentials.
+        env=_pg_subprocess_env({}),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    stdout = producer.stdout
+    assert stdout is not None
+
+    async def script():
+        while chunk := await stdout.read(_REPLAY_CHUNK_BYTES):
+            yield chunk
+
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_PG_RESTORE_TIMEOUT_SECONDS
-        )
-    except TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise BackupRestoreError(
-            f"pg_restore exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout"
-        ) from exc
-    if proc.returncode != 0:
-        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
-        raise BackupRestoreError(f"pg_restore failed (exit {proc.returncode}): {msg}")
+        await _replay_clean(script(), db_url, producer=producer)
+    finally:
+        # _replay_clean reaps the producer on every path it owns; this covers
+        # a failure before it gets that far (terminating connections, starting
+        # psql), which would otherwise leave pg_restore blocked on a full pipe.
+        await _stop(producer)
 
 
 async def _truncate_tables(tables: list[str], db_url: str) -> None:
@@ -328,9 +677,14 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
     archive use that constant. The intent is "let the operator roll
     back via a SQL replay if Phase 1a's hard-overwrite was a
     mistake," not "long-term forensic vault."
+
+    Because that passphrase is public, filesystem permissions are the
+    only protection for the SECRET_KEY inside: the directory is 0700
+    (tightened if it already existed looser) and the file is created
+    0600 up front, never written world-readable and chmod'd after.
     """
     try:
-        PRE_RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+        PRE_RESTORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     except (PermissionError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dir_unavailable",
@@ -338,15 +692,34 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
             error=str(exc),
         )
         return None
+    try:
+        os.chmod(PRE_RESTORE_DIR, 0o700)
+    except OSError as exc:
+        # A directory this process doesn't own (a root-owned volume shared
+        # through fsGroup) can't be tightened. That must not cost the
+        # operator the rollback copy: the file below is still created 0600.
+        logger.warning(
+            "pre_restore_safety_dir_chmod_failed",
+            path=str(PRE_RESTORE_DIR),
+            error=str(exc),
+        )
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}.zip"
+    # Random suffix + O_EXCL (#1571): the name had one-second
+    # resolution and was written with an overwriting write, so two
+    # restores in the same second overwrote the FIRST rollback copy
+    # with the second — destroying exactly the copy the first
+    # restore might need. O_EXCL makes a residual collision fail
+    # this dump (soft-fail path below) instead of overwriting.
+    out_path = PRE_RESTORE_DIR / f"pre-restore-{timestamp}-{secrets.token_hex(3)}.zip"
     try:
         archive_bytes, _filename = await build_backup_archive(
             db,
             passphrase="pre-restore-safety",
             passphrase_hint="auto pre-restore safety dump (issue #117 Phase 1a)",
         )
-        out_path.write_bytes(archive_bytes)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(archive_bytes)
     except (BackupArchiveError, OSError) as exc:
         logger.warning(
             "pre_restore_safety_dump_failed",
@@ -415,7 +788,94 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-async def apply_backup_restore(
+#: Session-level Postgres advisory lock serialising restores (#1571).
+#: Neither restore endpoint took any lock, so two concurrent restores
+#: interleaved their schema clear and replay — each replaying over
+#: the other's half-cleared schema. Fixed key (this is a whole-install
+#: operation, there is only ever one restore at a time), derived from
+#: a label rather than hand-picked so it cannot collide with the
+#: crc32-based per-resource keys elsewhere by accident.
+_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+
+#: The backend holding the restore lock, if any: the running restore's own
+#: lock connection, which ``_terminate_other_db_connections`` must not end
+#: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
+#: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
+#: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
+_RESTORE_LOCK_HOLDERS_SQL = (
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND pid IS NOT NULL AND objsubid = 1 "
+    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
+    """Restore under the install-wide advisory lock (#1571).
+
+    ``pg_try_advisory_lock`` is non-blocking on purpose: a second
+    restore is refused immediately with an operator-readable error
+    rather than queued behind a replay that disposes the connection
+    pool mid-flight.
+
+    The lock is session-level, so it belongs to the connection that
+    took it. That is a connection of its own, opened here and held for
+    the whole restore (#1648). It used to be ``db``'s, but a session
+    hands its connection back to the pool at every commit, and the rest
+    of the restore ran on whatever connection it checked out next. With
+    others idle in the pool that was a different one, where the unlock
+    found nothing to release: the lock stayed behind on an idle pooled
+    connection and refused every later restore as "already in
+    progress", a second restore whose session checked out the holder got
+    in while the first ran, and Phase 4's pool dispose dropped the lock
+    before the replay. Nothing in the restore can take this connection
+    away: it is not in the pool Phase 4 disposes, and
+    ``_terminate_other_db_connections`` spares the lock's holder.
+    Ending it releases the lock on every path, a cancelled request
+    included, and a process that dies mid-restore releases it with its
+    connection — it cannot wedge restores the way a row-based mutex
+    could.
+    """
+    if db is None:  # unit tests drive the phases with stubs
+        return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+    # asyncpg takes ``postgresql://``, not SQLAlchemy's dialect URL (as the
+    # rewrap does); the bounds are the app engine's (``app.db``).
+    lock_conn = await asyncpg.connect(
+        dsn=db_url.replace("postgresql+asyncpg://", "postgresql://", 1),
+        timeout=5,
+        command_timeout=30,
+        server_settings={"application_name": "spatiumddi-restore-lock"},
+    )
+    try:
+        if not await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", _RESTORE_LOCK_KEY):
+            raise BackupRestoreError(
+                "another restore is already in progress on this install — "
+                "wait for it to finish before starting a second one"
+            )
+        try:
+            return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+        finally:
+            try:
+                released = await lock_conn.fetchval(
+                    "SELECT pg_advisory_unlock($1)", _RESTORE_LOCK_KEY
+                )
+            except Exception:  # noqa: BLE001 — ending the connection releases it anyway
+                logger.warning("backup_restore_advisory_unlock_failed", exc_info=True)
+            else:
+                if not released:
+                    # Only if this connection lost the lock mid-restore, so
+                    # the restore it guarded may not have run alone.
+                    logger.error("backup_restore_advisory_lock_lost")
+    finally:
+        # terminate(), not close(): close() awaits the server's goodbye, and
+        # a request cancelled again meanwhile (an anyio cancel scope cancels
+        # at every await) leaves the socket open, and the lock on it.
+        # terminate() drops the socket at once; the server ends the session,
+        # and the lock with it if the unlock never ran.
+        lock_conn.terminate()
+
+
+async def _apply_backup_restore_inner(
     db,
     *,
     archive_bytes: bytes,
@@ -525,6 +985,30 @@ async def apply_backup_restore(
             "the archive's head, or expect /health/ready to fail."
         )
 
+    # Phase 2c (#1575): selective-restore shape checks. Both refusals
+    # below are knowable from the parsed archive + the caller's section
+    # list alone, so they run HERE — before the Phase 3 safety dump
+    # writes a full-size archive to disk and Phase 4 disposes the
+    # connection pool. They used to sit in Phase 5, after both, so every
+    # invalid selective attempt paid for a safety dump and a pool cycle
+    # and got refused anyway.
+    selective = bool(sections)
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore needs an archive whose database dump is in "
+            "pg_dump's custom format (dump_format=custom). This archive is "
+            "plain SQL — only full restore is supported."
+        )
+    if selective:
+        from app.services.backup.sections import SECTIONS_BY_KEY  # noqa: PLC0415
+
+        unknown_sections = [k for k in sections or [] if k not in SECTIONS_BY_KEY]
+        if unknown_sections:
+            raise BackupRestoreError(
+                f"unknown section keys: {unknown_sections}. Call GET /backup/sections "
+                "for the catalog."
+            )
+
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
     # mounted volume in dev compose, e.g.) we proceed with a logged
@@ -534,12 +1018,13 @@ async def apply_backup_restore(
 
     # Phase 4: dispose of SQLAlchemy's connection pool. psql opens
     # its own connection, and leaving the async pool busy stalls
-    # the TRUNCATE / DROP statements emitted by pg_dump --clean —
-    # we'd deadlock against the worker / beat / agents reading at
-    # the same time. ``engine.dispose()`` closes every pooled
+    # the replay's DROP / TRUNCATE statements (the schema clearing
+    # of a full restore, the TRUNCATE of a selective one) — we'd
+    # deadlock against the worker / beat / agents reading at the
+    # same time. ``engine.dispose()`` closes every pooled
     # connection cleanly so the pool comes back empty after the
-    # restore. ``_terminate_other_db_connections`` (called from
-    # ``_run_psql`` below) then kicks anything still attached
+    # restore. ``_terminate_other_db_connections`` (called by each
+    # replay helper below) then kicks anything still attached
     # via the worker / beat / agent containers' own engines.
     from app.db import engine as global_engine  # noqa: PLC0415
 
@@ -553,17 +1038,12 @@ async def apply_backup_restore(
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.
-    selective = bool(sections)
+    # ``selective`` and the two selective-shape refusals (plain format,
+    # unknown section keys) are decided in Phase 2c, before the safety
+    # dump and the pool disposal (#1575).
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
-
-    if selective and dump_format != "custom":
-        raise BackupRestoreError(
-            "selective restore needs an archive whose database dump is in "
-            "pg_dump's custom format (dump_format=custom). This archive is "
-            "plain SQL — only full restore is supported."
-        )
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -571,18 +1051,11 @@ async def apply_backup_restore(
             # restore module's import graph for callers that don't
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
-                SECTIONS_BY_KEY,
                 cascade_closure,
                 tables_for_sections,
             )
 
             requested = list(sections or [])
-            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
-            if unknown:
-                raise BackupRestoreError(
-                    f"unknown section keys: {unknown}. Call GET /backup/sections "
-                    "for the catalog."
-                )
             # ``platform_internal`` (alembic_version + oui_vendor)
             # always rides along — the schema head pin + the OUI
             # cache are install-state, not user-data, and a
@@ -629,9 +1102,9 @@ async def apply_backup_restore(
             dump_path.write_bytes(db_bytes)
             await _run_pg_restore(dump_path, db_url)
         else:
-            sql_path = Path(tmpdir) / "database.sql"
-            sql_path.write_bytes(db_bytes)
-            await _run_psql(sql_path, db_url)
+            # Streamed from the bytes already in memory: staging them on
+            # disk only to read them back cost a full write of the dump.
+            await _run_psql(db_bytes, db_url)
 
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer

@@ -43,9 +43,13 @@ class ListDHCPServersArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_servers",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, driver, operational status, and HA state."
+        "includes name, group, driver, operational status, and HA state. "
+        "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
+        "and DHCPv6 scopes on an HA group are served by each member "
+        "independently, with no lease coordination."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -92,6 +96,7 @@ class ListDHCPScopesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_scopes",
+    permission=("read", "dhcp_scope"),
     description=(
         "List DHCP scopes (subnets where DHCP serves leases). Filter "
         "by server group or name / CIDR substring."
@@ -187,6 +192,7 @@ class FindDHCPLeasesArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_leases",
+    permission=("read", "dhcp_server"),
     description=(
         "Find DHCP leases. Filterable by server, scope, MAC, IP, DHCPv6 "
         "DUID, hostname substring, state, or fingerbank device class. "
@@ -278,6 +284,7 @@ class ListServerGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_server_groups",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
@@ -349,6 +356,7 @@ class ListDHCPPoolsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_pools",
+    permission=("read", "dhcp_pool"),
     description=(
         "List DHCP pools — IP ranges within a scope, classified as "
         "dynamic (lease pool), excluded (skip during allocation), or "
@@ -409,6 +417,7 @@ class ListDHCPStaticsArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_statics",
+    permission=("read", "dhcp_static"),
     description=(
         "List DHCP static reservations (MAC → IP). Filterable by "
         "scope, MAC, IP, or hostname substring. Each row carries id, "
@@ -466,6 +475,7 @@ class ListDHCPClientClassesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_client_classes",
+    permission=("read", "dhcp_client_class"),
     description=(
         "List DHCP client classes — group-scoped expressions used "
         "for conditional option delivery. Each row carries id, "
@@ -516,6 +526,7 @@ class ListDHCPOptionTemplatesArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_option_templates",
+    permission=("read", "dhcp_option_template"),
     description=(
         "List DHCP option templates — reusable named bundles of "
         "option-code → value pairs scoped per server group. Apply "
@@ -566,6 +577,7 @@ class ListPXEProfilesArgs(BaseModel):
 
 @register_tool(
     name="list_pxe_profiles",
+    permission=("read", "dhcp_scope"),
     description=(
         "List PXE / iPXE provisioning profiles — group-scoped, "
         "operator-pickable per scope via DHCPScope.pxe_profile_id. "
@@ -627,6 +639,7 @@ class ListPhoneProfilesArgs(BaseModel):
 
 @register_tool(
     name="list_phone_profiles",
+    permission=("read", "dhcp_scope"),
     description=(
         "List VoIP phone provisioning profiles — group-scoped, attached "
         "to scopes via the dhcp_phone_profile_scope join. Each row "
@@ -713,6 +726,7 @@ class ListDHCPMACBlocksArgs(BaseModel):
 
 @register_tool(
     name="list_dhcp_mac_blocks",
+    permission=("read", "dhcp_mac_block"),
     description=(
         "List blocked MAC addresses — group-global, applies to "
         "every scope in the group. Each row carries id, group_id, "
@@ -765,6 +779,7 @@ class FindDHCPPoolOccupancyArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_pool_occupancy",
+    permission=("read", "dhcp_pool"),
     description=(
         "Live occupancy of dynamic DHCP pools — assigned vs total addresses, "
         "free count, and occupancy percent, computed from active leases inside "
@@ -848,6 +863,7 @@ class FindDHCPFailoverRelationshipsArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_failover_relationships",
+    permission=("read", "dhcp_server"),
     description=(
         "Windows DHCP failover relationships as each Windows server reports "
         "them (Get-DhcpServerv4Failover): name, mode (LoadBalance / "
@@ -917,6 +933,7 @@ class FindDHCPRespondersArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_responders",
+    permission=("read", "dhcp_server"),
     description=(
         "List DHCP servers the active rogue-detection probe has observed "
         "answering on managed segments (issue #370). Each row carries the "
@@ -965,6 +982,7 @@ class FindDHCPServerStatsArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_server_stats",
+    permission=("read", "dhcp_server"),
     description=(
         "Summarize a DHCP server's recent traffic: active lease count and "
         "per-message-type totals (discover/offer/request/ack/nak/decline/"
@@ -1085,6 +1103,7 @@ class FindDHCPLeaseHistoryArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_lease_history",
+    permission=("read", "dhcp_server"),
     description=(
         "Expired / released DHCP leases across every server — 'has this MAC "
         "EVER had a lease here?', which find_dhcp_leases cannot answer "
@@ -1162,6 +1181,7 @@ class ListDevicePoliciesArgs(BaseModel):
 
 @register_tool(
     name="find_dhcp_device_policies",
+    permission=("read", "dhcp_client_class"),
     description=(
         "List fingerprint-driven DHCP device policies (issue #700) — the rules "
         "that give devices of a given fingerbank class (Printer, IoT, game "
@@ -1208,6 +1228,7 @@ class PreviewDevicePolicyArgs(BaseModel):
 
 @register_tool(
     name="preview_dhcp_device_policy",
+    permission=("read", "dhcp_client_class"),
     description=(
         "Compile one fingerprint-driven DHCP device policy and report exactly "
         "what it matches: the Kea expression, how many observed signatures went "

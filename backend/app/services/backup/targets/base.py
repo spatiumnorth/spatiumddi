@@ -20,12 +20,12 @@ of every driver into the router.
 
 from __future__ import annotations
 
-import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 #: The archive names SpatiumDDI writes. Every driver filters its listing
 #: with this so a destination shared with unrelated files stays clean.
@@ -33,18 +33,59 @@ from typing import Any
 #: Shared rather than copied per driver: a change to the naming scheme that
 #: missed one file would make that destination's retention sweep and
 #: ``latest/download`` silently blind, with no error anywhere.
-ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
+#:
+#: The middle excludes path separators and control characters (#1243) so
+#: the listing can never offer a name :func:`safe_filename` then refuses —
+#: an object-store key under a nested "directory"
+#: (``spatiumddi-backup-x/y.zip``) would otherwise be listed, picked as
+#: ``latest``, counted by retention, and fail every download / delete.
+ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-)[^/\\\x00-\x1f\x7f]*\.zip$")
+
+#: Prefix of the pre-restore safety dumps ``restore`` writes into the
+#: same directory a local-volume target is usually pointed at.
+PRE_RESTORE_PREFIX = "pre-restore-"
+
+#: How many safety dumps retention keeps. They are rollback copies,
+#: not backups: they get their OWN small allowance (#1574) so they
+#: neither consume the target's configured keep count nor pile up
+#: without bound.
+PRE_RESTORE_KEEP_LAST_N = 3
+
+
+def is_pre_restore_archive(filename: str) -> bool:
+    """True for a pre-restore safety dump, as opposed to a real backup
+    archive. The two share a listing (and, on the recommended
+    local-volume path, a directory) but not a passphrase, a retention
+    policy, or a meaning for "latest" (#1574)."""
+    return filename.startswith(PRE_RESTORE_PREFIX)
 
 
 def safe_filename(filename: str) -> str:
-    """Strip path separators from an operator-supplied filename.
+    """Return *filename* if it is one plain path component, else refuse it.
 
     This is the defence that stops a crafted archive name escaping the
     configured directory / prefix / collection, so it lives in one place
     rather than being re-inlined per driver — hardening it in one copy
-    while three others stayed as they were is the failure worth avoiding.
+    while others stayed as they were is the failure worth avoiding.
+
+    It REFUSES rather than strips (#1243). The old ``os.path.basename``
+    stripped separators and let ``..`` through unchanged, because
+    ``basename("..") == ".."`` — and ``..`` is not a name inside the
+    collection, it is the collection's parent. On WebDAV ``urljoin`` turns
+    it into the parent collection's URL, so deleting an archive called
+    ``..`` sent a recursive ``DELETE`` one level up. Stripping is also the
+    wrong shape in itself: ``a/b.zip`` quietly became ``b.zip``, an
+    archive the caller never named.
     """
-    return os.path.basename(filename)
+    if (
+        not filename
+        or filename in (".", "..")
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename)
+    ):
+        raise InvalidArchiveNameError(f"invalid archive name {filename!r}")
+    return filename
 
 
 class BackupDestinationError(Exception):
@@ -57,6 +98,17 @@ class DestinationConfigError(BackupDestinationError):
     """The ``config`` blob is malformed for this destination kind
     (missing a required field, type mismatch, etc.). 422-shaped on
     the API side."""
+
+
+class InvalidArchiveNameError(BackupDestinationError):
+    """The archive name is not a single plain path component (#1243).
+
+    Raised by :func:`safe_filename` before anything reaches the
+    destination. A subclass so every existing ``except
+    BackupDestinationError`` still catches it; the API layer catches it
+    first and answers 422, since the name is the caller's mistake, not
+    the destination failing.
+    """
 
 
 class RetentionLockedError(BackupDestinationError):
@@ -120,6 +172,40 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+
+
+def safe_url(url: str) -> str:
+    """``scheme://host[:port]/path`` only, for error messages.
+
+    A receiver URL can carry its credential in the query string (a
+    presigned ``X-Amz-Signature``) or in userinfo (``user:pass@``), and an
+    error message reaches ``last_run_error``, the audit log and the logs.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port:
+            host += f":{parts.port}"
+    except ValueError:
+        return "<unparseable url>"
+    if not parts.scheme or not host:
+        return "<unparseable url>"
+    return f"{parts.scheme}://{host}{parts.path}"
+
+
+def scrub_url(text: str, *urls: str) -> str:
+    """``text`` with each full URL in ``urls`` replaced by :func:`safe_url`
+    — for a library exception message that echoes the URL it was given."""
+    for url in urls:
+        if url:
+            text = text.replace(url, safe_url(url))
+            # a caller may have appended a trailing slash to what the
+            # library echoed back
+            if url.endswith("/"):
+                text = text.replace(url.rstrip("/"), safe_url(url).rstrip("/"))
+    return text
 
 
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:

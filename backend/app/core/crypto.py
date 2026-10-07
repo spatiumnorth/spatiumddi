@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import sys
+from datetime import UTC, datetime
 from functools import lru_cache
 
 import structlog
@@ -33,13 +34,13 @@ def _fernet() -> Fernet:
             # Explicit key is malformed. Falling through to the derived key
             # would encrypt with a DIFFERENT key than the operator intended,
             # silently orphaning every secret written with the (broken) key.
-            # Make it loud — and a hard error under STRICT_SECRET_KEY so a
-            # production boot can't quietly mis-key its secrets.
+            # So it is a hard error (#1222), unless the operator opted into
+            # ALLOW_INSECURE_SECRET_KEY for local development.
             msg = (
                 "CREDENTIAL_ENCRYPTION_KEY is set but not a valid Fernet key "
                 f"({exc!r}). Generate one with `Fernet.generate_key()`."
             )
-            if settings.strict_secret_key:
+            if not settings.allow_insecure_secret_key:
                 raise ValueError(msg) from exc
             logger.error("credential_encryption_key_invalid", error=str(exc))
             print(f"WARNING: {msg} Falling back to a SECRET_KEY-derived key.", file=sys.stderr)
@@ -56,6 +57,16 @@ def _fernet() -> Fernet:
 
 def encrypt_str(plaintext: str) -> bytes:
     return _fernet().encrypt(plaintext.encode())
+
+
+def encrypted_at(token: bytes) -> datetime:
+    """When ``token`` was encrypted. A Fernet token carries its own creation
+    time (verified with the signature), so a caller can tell how old a value
+    is without a column for it. ``ValueError`` if the token is not ours."""
+    try:
+        return datetime.fromtimestamp(_fernet().extract_timestamp(token), UTC)
+    except InvalidToken as exc:
+        raise ValueError("encrypted value could not be verified") from exc
 
 
 def decrypt_str(token: bytes) -> str:

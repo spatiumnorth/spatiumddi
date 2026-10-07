@@ -104,7 +104,7 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError } from "@/lib/dnsNames";
+import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -341,7 +341,7 @@ const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
     {
       key: "api_token",
       label: "API token",
-      placeholder: "Hetzner DNS API token",
+      placeholder: "Hetzner Cloud API token",
       secret: true,
     },
   ],
@@ -515,16 +515,20 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
         {driver === "hetzner" && (
           <div>
             <p>
-              Open the{" "}
+              In the{" "}
               <span className="font-medium text-foreground">
-                Hetzner DNS Console
-              </span>{" "}
-              (dns.hetzner.com) and go to{" "}
-              <span className="font-medium text-foreground">
-                API tokens → Create access token
+                Hetzner Console
               </span>
-              . This is a DNS-specific token (separate from the Hetzner Cloud
-              API). Paste it above.
+              , open the project that holds your DNS zones and go to{" "}
+              <span className="font-medium text-foreground">
+                Security → API tokens → Generate API token
+              </span>{" "}
+              with{" "}
+              <span className="font-medium text-foreground">
+                Read &amp; Write
+              </span>{" "}
+              permission (read-only is enough to list and import). Paste it
+              above. Tokens from the retired DNS Console no longer work.
             </p>
           </div>
         )}
@@ -555,6 +559,91 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
         )}
       </div>
     </details>
+  );
+}
+
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live zones (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop and its reason shows in the dialog. What a delete still takes
+ *  is the group's zones already in Trash, for good. */
+function DeleteDNSGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DNSServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const zonesQ = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || zonesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const zones = zonesQ.data?.length ?? 0;
+  if (servers || zones) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      zones ? `${zones} zone${zones === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First move or delete {servers + zones === 1 ? "it" : "them"}.
+            {zones > 0 &&
+              " A deleted zone goes to Trash; deleting the group then deletes its zones in Trash for good, with their records."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <ConfirmDestroyModal
+      title={title}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
+      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
   );
 }
 
@@ -1014,6 +1103,23 @@ function GroupModal({
     group?.is_public_facing ?? false,
   );
   const [error, setError] = useState("");
+  const [confirmRotate, setConfirmRotate] = useState(false);
+  const [rotated, setRotated] = useState(false);
+
+  const rotateMut = useMutation({
+    mutationFn: (id: string) => dnsApi.rotateGroupTsigKey(id),
+    onSuccess: () => {
+      setConfirmRotate(false);
+      setRotated(true);
+      // A failed earlier attempt left its message under the form.
+      setError("");
+      qc.invalidateQueries({ queryKey: ["dns-groups"] });
+    },
+    onError: (e: ApiError) => {
+      setConfirmRotate(false);
+      setError(formatApiError(e));
+    },
+  });
 
   const mut = useMutation({
     mutationFn: (d: Partial<DNSServerGroup>) =>
@@ -1146,6 +1252,33 @@ function GroupModal({
           )}
         </div>
 
+        {group && (
+          <div className="rounded border bg-muted/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="min-w-0 text-sm font-medium">
+                Group TSIG key
+              </span>
+              <button
+                type="button"
+                onClick={() => setConfirmRotate(true)}
+                className="shrink-0 rounded-md border px-2.5 py-1 text-xs hover:bg-muted"
+              >
+                Rotate…
+              </button>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              The key this group&apos;s agents sign dynamic updates with, and
+              that its BIND9 servers allow zone transfers to. Rotate it if a
+              database or backup copy may have been read.
+            </p>
+            {rotated && (
+              <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                Rotated. Agents pick up the new key on their next config sync.
+              </p>
+            )}
+          </div>
+        )}
+
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
@@ -1153,6 +1286,29 @@ function GroupModal({
           label={group ? "Save" : "Create"}
         />
       </form>
+      {group && confirmRotate && (
+        <ConfirmModal
+          open
+          title="Rotate the group TSIG key?"
+          confirmLabel="Rotate key"
+          loading={rotateMut.isPending}
+          onClose={() => setConfirmRotate(false)}
+          onConfirm={() => rotateMut.mutate(group.id)}
+          message={
+            <div className="space-y-2 text-sm">
+              <p>
+                A new secret replaces the current one, under the same key name.
+                Every agent in the group re-renders its config with it on the
+                next sync.
+              </p>
+              <p>
+                A dynamic update signed with the old secret in that window is
+                refused and retried. Nothing outside SpatiumDDI uses this key.
+              </p>
+            </div>
+          }
+        />
+      )}
     </Modal>
   );
 }
@@ -2337,7 +2493,7 @@ function DnssecCard({
 
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
-function ZoneModal({
+export function ZoneModal({
   groupId,
   views,
   zone,
@@ -2355,7 +2511,18 @@ function ZoneModal({
     zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
   );
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
-  const [kind, setKind] = useState(zone?.kind ?? "forward");
+  // #1310 — on create, a primary zone's Kind follows its name until the
+  // operator picks one. A name under in-addr.arpa / ip6.arpa is a
+  // reverse-lookup zone, and IPAM publishes PTR records only into kind
+  // "reverse" zones, so the old fixed "forward" default left such a zone
+  // without a single PTR. Secondary, stub and forward zones keep that
+  // default, as the API does: IPAM cannot write into them. An existing
+  // zone shows the kind it is stored with.
+  const [pickedKind, setPickedKind] = useState<string | null>(
+    zone?.kind ?? null,
+  );
+  const kind =
+    pickedKind ?? (zoneType === "primary" ? zoneKindForName(name) : "forward");
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
@@ -2510,7 +2677,7 @@ function ZoneModal({
             <select
               className={inputCls}
               value={kind}
-              onChange={(e) => setKind(e.target.value)}
+              onChange={(e) => setPickedKind(e.target.value)}
             >
               <option value="forward">Forward lookup</option>
               <option value="reverse">Reverse lookup</option>
@@ -3170,7 +3337,8 @@ function MoveZoneModal({
     !!preview &&
     (preview.name_collision ||
       preview.dnssec_unsupported_drivers.length > 0 ||
-      preview.acl_names_lost.length > 0);
+      preview.acl_names_lost.length > 0 ||
+      preview.key_names_lost.length > 0);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3214,8 +3382,8 @@ function MoveZoneModal({
                 would land in. Rename or delete it first.
               </div>
             )}
-            {/* Two blockers no acknowledgement can waive — neither leaves a
-                state the operator could inspect and fix afterwards. */}
+            {/* Blockers no acknowledgement can waive — none leaves a state
+                the operator could inspect and fix afterwards. */}
             {preview.dnssec_unsupported_drivers.length > 0 && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 This zone is DNSSEC-signed and{" "}
@@ -3235,6 +3403,17 @@ function MoveZoneModal({
                 <code>named.conf</code>, which BIND rejects whole &mdash; the
                 entire target group would stop converging, not just this zone.
                 Create ACLs with those names there first.
+              </div>
+            )}
+            {preview.key_names_lost.length > 0 && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                This zone names TSIG key(s){" "}
+                <code>{preview.key_names_lost.join(", ")}</code> that{" "}
+                <strong>{preview.target_group_name}</strong> does not define.
+                Moving it would leave an undefined symbol in that group&rsquo;s{" "}
+                <code>named.conf</code>, which BIND rejects whole &mdash; the
+                entire target group would stop converging, not just this zone.
+                Create keys with those names there first.
               </div>
             )}
 
@@ -4668,6 +4847,7 @@ function ZoneDetailView({
             deleteZone.reset();
           }}
           isPending={deleteZone.isPending}
+          error={deleteZone.isError ? formatApiError(deleteZone.error) : null}
           notice={deleteNotice}
         />
       )}
@@ -5217,6 +5397,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           serverName={pausePrompt.name}
           serverKind="DNS"
           isPending={pauseMut.isPending}
+          error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
           onConfirm={(reason) => {
             pauseInFlightFor.current = pausePrompt.id;
             pauseMut.mutate(
@@ -5224,7 +5405,10 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               { onSuccess: () => setPausePrompt(null) },
             );
           }}
-          onCancel={() => setPausePrompt(null)}
+          onCancel={() => {
+            setPausePrompt(null);
+            pauseMut.reset();
+          }}
         />
       )}
       {confirmDeleteServer && (
@@ -8291,16 +8475,49 @@ function ZonesTab({
     });
   }
 
+  // #1344 — every zone is its own DELETE, so every result is read. A
+  // refused or failed delete leaves its zone in place: the dialog stays
+  // open and says why, with only those zones still selected. A delete the
+  // two-person approval queue took (#62) has not happened yet either; that
+  // is said above the zones once the dialog closes.
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
+  const [bulkDeleteNotice, setBulkDeleteNotice] = useState<string | null>(null);
   const bulkDeleteZones = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.allSettled(
-        ids.map((id) => dnsApi.deleteZone(group.id, id)),
-      );
-    },
-    onSuccess: () => {
+    mutationFn: (ids: string[]) =>
+      Promise.allSettled(ids.map((id) => dnsApi.deleteZone(group.id, id))),
+    onSuccess: (results, ids) => {
       qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
-      setSelected(new Set());
-      setConfirmBulkDelete(false);
+      const failed = ids.filter((_, i) => results[i].status === "rejected");
+      const queued = results.filter(
+        (r) => r.status === "fulfilled" && handleApprovalQueued(r.value),
+      ).length;
+      if (queued > 0) {
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        setBulkDeleteNotice(
+          queued === ids.length
+            ? APPROVAL_QUEUED_MESSAGE
+            : `${queued} of ${ids.length} zones: ${APPROVAL_QUEUED_MESSAGE}`,
+        );
+      }
+      setSelected(new Set(failed));
+      if (failed.length === 0) {
+        setConfirmBulkDelete(false);
+        return;
+      }
+      const reasons = [
+        ...new Set(
+          results.flatMap((r) =>
+            r.status === "rejected" ? [formatApiError(r.reason)] : [],
+          ),
+        ),
+      ];
+      const what =
+        failed.length < ids.length
+          ? `${failed.length} of ${ids.length} zones were not deleted`
+          : ids.length === 1
+            ? "The zone was not deleted"
+            : `None of the ${ids.length} zones were deleted`;
+      setBulkDeleteError(`${what}: ${reasons.join("; ")}`);
     },
   });
 
@@ -8577,6 +8794,17 @@ function ZonesTab({
         </div>
       )}
 
+      {bulkDeleteNotice && (
+        <div className="mb-2 flex items-center justify-between rounded-md border bg-amber-50 px-3 py-1.5 text-xs dark:bg-amber-900/10">
+          <span>{bulkDeleteNotice}</span>
+          <button
+            onClick={() => setBulkDeleteNotice(null)}
+            className="rounded-md border px-2 py-1 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {isFetching && zones.length === 0 && (
         <p className="text-sm text-muted-foreground">Loading…</p>
       )}
@@ -8655,8 +8883,16 @@ function ZonesTab({
           }
           checkLabel={`I understand ${selected.size} zone${selected.size === 1 ? "" : "s"} and all their records will be permanently deleted.`}
           isPending={bulkDeleteZones.isPending}
-          onClose={() => setConfirmBulkDelete(false)}
-          onConfirm={() => bulkDeleteZones.mutate(Array.from(selected))}
+          error={bulkDeleteError}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkDeleteError(null);
+          }}
+          onConfirm={() => {
+            setBulkDeleteError(null);
+            setBulkDeleteNotice(null);
+            bulkDeleteZones.mutate(Array.from(selected));
+          }}
         />
       )}
     </div>
@@ -9548,6 +9784,7 @@ function BlocklistModal({
               <input
                 type="number"
                 min={0}
+                max={8760}
                 className={inputCls}
                 value={updateHours}
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
@@ -11089,10 +11326,8 @@ export function DNSPage() {
         <GroupModal group={editGroup} onClose={() => setEditGroup(null)} />
       )}
       {confirmDeleteGroup && (
-        <ConfirmDestroyModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${confirmDeleteGroup.name}"? The group must be empty — move or delete its servers and zones first.`}
-          checkLabel={`I understand the group "${confirmDeleteGroup.name}" will be deleted.`}
+        <DeleteDNSGroupModal
+          group={confirmDeleteGroup}
           onConfirm={() => deleteGroup.mutate(confirmDeleteGroup.id)}
           onClose={() => {
             setConfirmDeleteGroup(null);

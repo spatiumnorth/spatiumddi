@@ -22,7 +22,7 @@ This module reuses the framework-agnostic
    where a one-shot startup check would miss a later divergence.
 3. **Opt-in strict mode** — ``STRICT_SCHEMA_CHECK=true`` makes the
    ``task_prerun`` gate ``Reject(requeue=True)`` tasks while the schema
-   is behind (mirrors ``STRICT_SECRET_KEY``). Default off so a
+   is behind. Default off so a
    transient mid-rollout window doesn't hard-stop the worker.
 
 Because the check compares packaged migration files against the DB's
@@ -275,6 +275,21 @@ async def _async_check_and_alert() -> dict:
             },
         )
         db.add(evt)
+        await db.flush()
+        # #1576 — deliver to forward targets; the generic evaluator
+        # skips externally-driven rule types, so without this the
+        # event only ever showed in-app.
+        try:
+            from app.services import alerts as alert_service  # noqa: PLC0415
+            from app.services import audit_forward  # noqa: PLC0415
+
+            targets = await audit_forward._load_targets()  # noqa: SLF001
+            ds, dw, dm = await alert_service._deliver(rule, evt, targets)  # noqa: SLF001
+            evt.delivered_syslog = ds
+            evt.delivered_webhook = dw
+            evt.delivered_smtp = dm
+        except Exception as exc:  # noqa: BLE001 — delivery must not lose the alert
+            logger.warning("schema_behind_head_delivery_failed", error=str(exc))
         await db.commit()
         return {"ok": False, "detail": result.detail}
 

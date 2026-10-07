@@ -359,9 +359,20 @@ A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS
 
 The archive is the unit operators move around — single-file, easy to ship over SCP / drop into S3 / download to a laptop.
 
+#### What an archive exposes
+
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftovers until the next release:** two of those were stored in clear until this release, and their old columns are kept, unread, for one release so a rolling upgrade's old pods keep working. They still hold the pre-upgrade values:
+
+- The group TSIG key (#1364, `dns_server_group.tsig_key_secret`). That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
+- Webhook forward targets (#1502, `audit_forward_target.url` / `auth_header`, and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header`). A Slack, Discord or Teams incoming-webhook URL lets anyone who has it post into that channel. Re-issue the URL in the chat platform (and any collector token) once the upgrade has finished, paste the new one into the target, and the leftover copy is dead. That is also the only way to retire a URL that is already in an older archive.
+
+An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
+
+So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
+
 #### Passphrase rules
 
-Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
+Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one. The hint is **not** secret: it is written in clear into `manifest.json` and the `secrets.enc` header of every archive, returned by the API, and recorded in the audit log when a target is edited. So a hint that contains the passphrase is refused with a 422 on every path that sets one (target create / update, create-and-download), compared case-insensitively. A target saved before that check existed keeps backing up, but its archives are written without the hint (logged as `backup_hint_contains_passphrase_dropped`); re-save it with a new passphrase and hint, because the old pair is already in its earlier archives and in the audit log.
 
 The passphrase is **not** the destination's auth credential — every destination type has its own credential fields (S3 keys, SCP password / private key, Azure account key, etc.) which are Fernet-encrypted at rest in the `backup_target.config` JSONB.
 
@@ -397,10 +408,10 @@ squash.
 **NFS has no authentication, and the form says so.** AUTH_SYS is the only
 security flavour v1 supports: the client asserts a uid and the server believes
 it. A passing connection test therefore says nothing about who *else* on the
-network can read the export. Archives are encrypted with the target passphrase,
-so what an unrestricted export exposes is the metadata — archive names, sizes,
-and how often you back up — not the contents. Restrict the export to the control
-plane's address on the server side, and set the destination's `uid` / `gid` to an
+network can read the export, and an archive's database dump is not encrypted
+(see [What an archive exposes](#what-an-archive-exposes)), so an unrestricted
+export exposes the contents of every archive on it. Restrict the export to the
+control plane's address on the server side, and set the destination's `uid` / `gid` to an
 identity the export grants write access (with the usual `root_squash` default,
 presenting uid 0 gets mapped to `nobody` and every write fails; the driver
 detects that errno and names squash as the likely cause rather than reporting a
@@ -502,8 +513,13 @@ a single file at 4 GiB, so an estate whose archive outgrows that would fail
 mid-run, at the end of a long backup, on a destination that had worked for
 months. A disk with no filesystem UUID is refused too — there would be nothing
 stable to mount it by, since the kernel device name is reassigned on the next
-plug. Archives are already encrypted with the target passphrase, so LUKS on the
-disk is your choice, not a requirement.
+plug. An encrypted disk is refused for the same reason as any other filesystem:
+a LUKS container reports as `crypto_LUKS`, and the appliance carries no
+`cryptsetup` to unlock it. So the archives on a removable disk sit there in the
+clear, and an archive's database dump is not encrypted (see
+[What an archive exposes](#what-an-archive-exposes)) — treat the disk as a copy
+of the install: keep it physically secured, and if it has to leave the building,
+use a destination that encrypts at rest instead.
 
 On a multi-node cluster the **Kubernetes node** field on the destination is
 filled in for you from the fleet — the disk is plugged into one machine, and
@@ -598,8 +614,11 @@ Three things make this a least-privilege pull rather than a full API key:
   strong `ETag`. A poller that already has the newest archive gets a `304` and
   the destination is not read at all — without this, a nightly poller
   re-downloads a multi-GB archive every run.
-* **The archive is encrypted with the target passphrase**, which the puller
-  never needs and should not have. It fetches ciphertext.
+* **The puller never needs the target passphrase**, and should not have it:
+  without it the stored credentials in the archive stay encrypted. The rest of
+  the database dump is readable (see
+  [What an archive exposes](#what-an-archive-exposes)), so protect the token and
+  wherever the puller writes the archive as you would the install itself.
 
 Two limits: a **destination must exist** — for a pull-only deployment make a
 `local_volume` target the staging destination, because a `GET` that triggers a
@@ -619,6 +638,10 @@ Each target carries:
 | `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
 
 Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+
+Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
+
+A failed run also writes a `backup_target_run_failed` audit row, which audit forwarding and the `system.backup_failed` event send on. It carries a fixed `failure_category` (`unreachable`, `timeout`, `permission_denied`, `auth_failed`, `no_space`, `not_found`, `config_invalid`, …) rather than the driver's error text, which often names the destination (#1617). The full text is still shown under the target in the backup targets list (`last_run_error`, superadmin-only).
 
 #### Manual triggers
 
@@ -640,10 +663,11 @@ Same code path is hit whether the archive comes from an upload or a destination 
 
 1. **Pre-flight.** Validates archive shape, manifest `format_version` (1 or 2 currently), passphrase. The passphrase verify happens **before** any destructive step so a wrong passphrase is rejected up front.
 2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump.
-3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so psql's `--clean` doesn't deadlock against the worker / beat / agents.
+3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so the replay's drops don't deadlock against the worker / beat / agents.
 4. **Data replay.**
-   - Phase 2+ archives (`dump_format: custom`) → `pg_restore --clean --if-exists --no-owner --no-acl --single-transaction --exit-on-error`.
-   - Phase 1 archives (plain SQL) → `psql --single-transaction --set=ON_ERROR_STOP=1`.
+   - Full restore: the schema is **cleared, then the archive replayed, in one transaction** (#1363). `psql --single-transaction --set=ON_ERROR_STOP=1` reads one script on stdin: first a block that drops every table, view, sequence, standalone type and routine in `public` (extension members excepted), then the archive's SQL. For a Phase 2+ archive (`dump_format: custom`) that SQL is `pg_restore --no-owner --no-acl --file=-`'s output, streamed rather than staged on disk. For a Phase 1 archive (plain SQL) it is the dump itself. If `pg_restore` fails part way, psql is killed before it reaches end of input, so it never commits. A replay counts as complete only when psql acknowledges the end of the script: a per-run token is `\echo`-ed after the archive's last statement, so a psql that left early with exit 0 is reported as a partial restore, not a success. Any failure before psql is given end of input (a bad statement, a `pg_restore` error, a timeout) rolls back and leaves the database exactly as it was. The one exception is a timeout after end of input, while psql may be committing. It is reported as an unknown outcome, not as a rollback, so check the database (or restore the pre-restore safety dump) before relying on it.
+
+     The clearing is what makes an archive **older than this install** restorable. The replay used to be `pg_restore --clean --if-exists`, and `--clean` drops only the objects the archive contains. Every table a later migration had added survived with its constraints. An archive from before `dns_agent_bundle` (every 2026.09.04-1 archive) then failed with a 400: `--clean` could not drop `dns_server_pkey` while `dns_agent_bundle_server_id_fkey` depended on it. A surviving table with no such dependency failed later instead, stopping the upgrade below on "already exists". Backups dump the whole database with no exclusions, so clearing loses nothing the archive does not recreate.
    - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` followed by `pg_restore --data-only --disable-triggers --table=…`, over the **FK-cascade closure** of the selected sections' tables rather than the selection alone. `platform_internal` (alembic_version + oui_vendor) always rides along.
 
      The closure matters because `CASCADE` empties every table holding a foreign key into a truncated one, transitively — catalogued or not, ticked or not. Restoring only the ticked tables therefore *deleted* the difference: measured against the shipped catalog, selecting `auth` cascaded into 130 tables and refilled 11 (#781). `cascade_closure()` in `app/services/backup/sections.py` derives that reach from mapped metadata (the FK graph is what Postgres actually walks; a hand-maintained copy is one migration away from being wrong), and everything it reaches is restored from the same archive so the operation ends consistent. This is deliberately *wider* than what the operator ticked — the alternative was never "narrower", it was "emptied". The response's `cascade_widened_tables` lists exactly which tables were pulled in, and a warning repeats it in prose.
@@ -651,7 +675,21 @@ Same code path is hit whether the archive comes from an upload or a destination 
      Worth knowing for anyone revisiting this: classifying the unclassified tables — the fix originally sketched on #781 — would **not** have solved it, because `CASCADE` reaches them regardless of whether a section claims them. Classification only decides what an operator can *tick*.
 5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. An archive whose head is **not in this install's chain** — i.e. taken on a newer build — is **refused up front, before any data is replayed**, so a database this build cannot migrate is never written (#781); the operator is told to upgrade SpatiumDDI here first.
 
-   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code, which the api's strict schema-head readiness gate rejects. The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+   That refusal is overridable with `allow_newer_schema=true`. It exists for the A/B-rollback case: an operator who rolled back *because* the newer build broke would otherwise be told to upgrade into the build they just escaped. The override also covers a subtler trap — `_is_ancestor` returns False on **any** exception, so a forked, squashed or renamed revision is indistinguishable from a genuinely newer one. It is superadmin-only (like every restore), recorded on the audit row, and the response leads with a warning that `alembic_version` may now be ahead of the running code, which the api's strict schema-head readiness gate rejects. The head is taken from the manifest, falling back to the copy inside `secrets.enc`, so an archive that never recorded one in its manifest is still checked. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `auto_recovered` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+
+   **Drift recovery.** An upgrade that stops on an object that *already exists* is the signature of a stale `alembic_version`: the archive was taken while that row lagged the schema, so the dump carries a schema already at head beneath a version that says otherwise. The restore then runs `alembic stamp head` and reports `auto_recovered` — but only after checking that every table and column this build's models declare is present in the restored database. The signature alone is not proof (#1233): any revision that meets one object it would create fails the same way, and since migrations commit one revision at a time (#1204), the revisions before it stay applied and those after it never ran. Stamping head on the signature would record that partially migrated schema as current, and it would fail later somewhere unrelated to the restore. When anything is missing, or the check cannot run, the restore reports `failed`, names the missing tables and columns, and leaves `alembic_version` at the last revision that committed, so a manual `alembic upgrade head` resumes from there. The check is deliberately one-directional and covers tables and columns only; a revision after the failing one that changes only data, indexes, constraints or types is not visible to it.
+
+   **Running the upgrade by hand.** A `failed` upgrade asks for `alembic upgrade head` once whatever blocked it is fixed. It runs in the api container, which carries `alembic.ini` and the database URL:
+
+   | Deployment | Command |
+   |---|---|
+   | Docker Compose | `docker compose exec api alembic upgrade head` |
+   | Appliance (k3s) | `sudo k3s kubectl -n spatium exec deploy/spatium-control-spatiumddi-api -c api -- alembic upgrade head` |
+   | Helm | `kubectl -n <namespace> exec deploy/<api deployment> -c api -- alembic upgrade head` |
+
+   On Helm, look the deployment up by its labels rather than working out its name, which `fullnameOverride`, `nameOverride` and the release name all change: `kubectl -n <namespace> get deploy -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=api` prints it. With the defaults it is `<release>-spatiumddi-api` (`ddi-spatiumddi-api` for the documented `helm install ddi …`).
+
+   `alembic current` in place of `upgrade head` shows the revision the database is at. The api stays out of service (`/health/ready` is not ready) until the schema reaches head.
 6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column in the schema plus every JSONB-embedded Fernet string (`backup_target.config`'s `__enc__:` fields, and on `platform_settings` the SNMPv3 passphrases, syslog TLS CA bundles, APT GPG keys and private-mirror passwords); decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator does not have to copy the recovered `SECRET_KEY` into the destination's `.env` manually.
 
    Both lists in `app/services/backup/rewrap.py` are deliberately explicit rather than auto-discovered, so that adding an encrypted field is a review decision — and both are guarded, because "explicit" only works if drift is caught. It wasn't: the column list had silently drifted to 21 of 47 columns (#781). Everything a list misses stays encrypted under the *source* install's key, which surfaces only on first use of the affected credential. On the appliance this is the default case, not an edge case — `spatiumddi-firstboot` mints a fresh `SECRET_KEY` on every install, so every restore onto reimaged hardware is a cross-install restore.
@@ -1041,9 +1079,13 @@ Other notable areas on the model (each a small cluster of columns): integration 
 
 ### Current Version Display
 
-The current application version is displayed in the UI header bar and on the System Admin → About page. The version string follows **CalVer** format: `YYYY.MM.DD-N` where N is the release number for that date (starting at 1).
+The current application version is displayed in the UI header bar and on the System Admin → About page. Releases up to the bridge are **CalVer**, `YYYY.MM.DD-N`, where N is the release number for that date (starting at 1). From 1.0.0 they are **SemVer**, `MAJOR.MINOR.PATCH`, with release candidates tagged `1.0.0-rc.N` (#1182).
 
-Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day)
+Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day), `1.0.0-rc.1`, `1.0.0`, `1.0.1`
+
+Every SemVer release is newer than every CalVer one, and versions are never compared as strings (`"1.0.0" > "2026.09.04-1"` and `"1.0.10" > "1.0.9"` are both false as strings): the update check, the upgrade preflight and the Fleet gates all go through `app/core/versions.py`, mirrored for the UI in `frontend/src/lib/versions.ts`. A build that is not a release (`dev`, `latest`, a nightly's `0.0.0-nightly-YYYYMMDD+sha`, a `0.x` placeholder) is an *unknown* version, never an old one.
+
+**Upgrade to the bridge before 1.0.0.** Everything that decides whether a version is newer runs in the version being upgraded *from*, so an install older than the bridge is never offered 1.0.0 and its preflight refuses it. The 1.0.0 release notes name the bridge release.
 
 The version is injected at build time and exposed via:
 - UI header (e.g., `v2026.04.13-1`)
@@ -1052,7 +1094,7 @@ The version is injected at build time and exposed via:
 ### GitHub Release Check
 
 When `github_release_check_enabled` is true, SpatiumDDI periodically polls the GitHub Releases API for the latest release tag. If a newer version is available:
-- A banner appears in the admin UI: "SpatiumDDI 2026.05.01-1 is available — view changelog"
+- A banner appears in the admin UI: "SpatiumDDI 1.0.1 is available — view changelog"
 - A notification is sent to configured notification channels if `notify_on_new_release` is enabled
 - Superadmins can dismiss the banner or snooze for N days
 

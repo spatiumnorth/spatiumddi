@@ -53,14 +53,14 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
-from app.services.dns.named_conf_validation import is_name_reference
+from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     count_queued_zone_ops,
     sweep_zone_ops,
 )
-from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 
 logger = structlog.get_logger(__name__)
 
@@ -179,6 +179,10 @@ class ZoneMovePlan:
     #: and the group stops converging (the #882 / #899 failure).
     acl_names_remapped: list[str] = field(default_factory=list)
     acl_names_lost: list[str] = field(default_factory=list)
+    #: TSIG keys cited as ``key <name>`` in those same lists (#1316). A
+    #: ``key {}`` is group-scoped too, so a key the target does not define
+    #: is the same undefined symbol and the same whole-group failure.
+    key_names_lost: list[str] = field(default_factory=list)
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -393,6 +397,13 @@ async def assemble_move_plan(
         .all()
     }
 
+    _scan_key_references(
+        plan,
+        zone,
+        await group_key_names(db, zone.group_id),
+        await group_key_names(db, target_group.id),
+    )
+
     plan.pools_repointed = await _count(db, DNSPool, DNSPool.zone_id == zone.id)
     plan.zone_state_rows = await _count(
         db, DNSServerZoneState, DNSServerZoneState.zone_id == zone.id
@@ -460,6 +471,20 @@ def _scan_acl_references(
             plan.acl_names_remapped.append(name)
         else:
             plan.acl_names_lost.append(name)
+
+
+def _scan_key_references(
+    plan: ZoneMovePlan, zone: DNSZone, source_keys: frozenset[str], target_keys: frozenset[str]
+) -> None:
+    cited = {
+        name
+        for values in (zone.allow_query, zone.allow_transfer, zone.also_notify)
+        for element in values or []
+        if (name := key_reference(str(element)))
+    }
+    # As with ACL names, only a key the SOURCE defines is something the
+    # move breaks; an undefined one is already broken.
+    plan.key_names_lost = sorted(n for n in cited if n in source_keys and n not in target_keys)
 
 
 async def _count_pending_ops(db: AsyncSession, zone: DNSZone) -> int:
@@ -535,6 +560,15 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             f"Create ACLs with the same names in the target first."
         )
 
+    if plan.key_names_lost:
+        plan.warnings.append(
+            f"The zone's address-match lists name TSIG key(s) that do not exist in the target "
+            f"group ({', '.join(plan.key_names_lost)}). A key is defined per group, so the "
+            f"target's named.conf would carry an undefined symbol — BIND rejects the file "
+            f"whole, which stops the WHOLE target group converging, not just this zone. "
+            f"Create keys with the same names in the target first."
+        )
+
     if plan.acme_accounts:
         plan.warnings.append(
             f"{plan.acme_accounts} ACME DNS-01 delegation account(s) use this zone. Their TXT "
@@ -607,7 +641,7 @@ async def commit_move(
 
     plan = await assemble_move_plan(db, zone, target_group)
 
-    # Two hard refusals that no acknowledgement can waive, because neither
+    # Hard refusals that no acknowledgement can waive, because none of them
     # produces a state the operator could inspect and fix afterwards.
     if plan.dnssec_unsupported_drivers:
         raise ZoneMoveError(
@@ -623,6 +657,15 @@ async def commit_move(
             f"({', '.join(plan.acl_names_lost)}). Moving it would leave an undefined symbol in "
             f"the target's named.conf, which BIND rejects whole — the entire target group "
             f"would stop converging, not just this zone. Create ACLs with those names in "
+            f"'{target_group.name}' first.",
+            status_code=422,
+        )
+    if plan.key_names_lost:
+        raise ZoneMoveError(
+            f"The zone names TSIG key(s) the target group does not define "
+            f"({', '.join(plan.key_names_lost)}). Moving it would leave an undefined symbol in "
+            f"the target's named.conf, which BIND rejects whole — the entire target group "
+            f"would stop converging, not just this zone. Create keys with those names in "
             f"'{target_group.name}' first.",
             status_code=422,
         )

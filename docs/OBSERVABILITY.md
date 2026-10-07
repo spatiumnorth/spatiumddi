@@ -137,7 +137,17 @@ All services use `structlog` configured to emit **newline-delimited JSON** (NDJS
 | `level` | `debug`, `info`, `warning`, `error`, `critical` |
 | `service` | `api`, `worker`, `beat`, `agent`, `dhcp`, `dns` |
 | `instance` | Hostname or pod name |
-| `request_id` | UUID, passed through as `X-Request-ID` header |
+| `request_id` | In the api, a UUID generated for every request, never the caller's (it is stored in the tamper-evident `audit_log.request_id`, so a caller must not choose it). In the worker, the Celery task id, bound for the length of the task. Absent on lines logged outside a request or task |
+| `client_request_id` | The caller's own `X-Request-ID`, when it sent one of 1–64 characters of `A-Z a-z 0-9 . _ : -`. The response echoes it back as `X-Request-ID`; without one, the response carries `request_id` |
+
+The worker and beat log through the same pipeline as the api (#1246),
+including Celery's own stdlib lines (`Task … received` / `succeeded`), so
+one filter on `service` / `request_id` covers all three. The effective
+level is the more verbose of `--loglevel` and `LOG_LEVEL`, and `--logfile`
+receives the JSON lines. A worker running an embedded scheduler (`-B`) logs
+as `service=worker`; its scheduler lines carry `logger=celery.beat`. The one
+plain-text exception is Celery's startup banner, printed once before logging
+is configured.
 
 ### Sensitive Data Rules (enforced by linting)
 - **Never log**: passwords, tokens, API keys, full credentials
@@ -371,7 +381,7 @@ AuditLog
   timestamp (timestamptz, indexed)
   user_id (FK → User)
   user_display_name: str    -- denormalized for historical record
-  auth_source: str          -- local / ldap / oidc
+  auth_source: str          -- local, a service source (system, acme, ...), or the name of the provider an external sign-in went through (up to 255, #1337)
   source_ip: inet
   user_agent: str
   action: enum(create, update, delete, login, logout, sync, permission_change, ...)
@@ -381,7 +391,8 @@ AuditLog
   old_value: JSONB          -- full previous state (null for create)
   new_value: JSONB          -- full new state (null for delete)
   changed_fields: str[]     -- list of field names that changed (for updates)
-  request_id: str           -- correlates to application log
+  request_id: str           -- the request_id of the log lines that made the change:
+                            --   the API request, or the Celery task id (#1245)
   result: enum(success, denied, error)
   error_detail: str (nullable)
 ```
@@ -426,9 +437,28 @@ don't serialize the queue.
 - **HTTP webhook** — `httpx.AsyncClient`, 5 s timeout,
   `Content-Type: application/json`, optional `Authorization`
   header sent verbatim. The `webhook_flavor` column picks between
-  generic JSON, **Slack** (`mrkdwn` block), **Teams**
-  (`MessageCard`), and **Discord** (`embed`) so chat-channel
-  delivery doesn't need a separate adapter.
+  generic JSON, **Slack** (`mrkdwn` block), **Teams** (Adaptive
+  Card 1.4 in a `{"type": "message", "attachments": […]}` envelope),
+  and **Discord** (`embed`) so chat-channel delivery doesn't need a
+  separate adapter. For Teams, create the URL with the **Workflows**
+  app in the channel (template *Send webhook alerts to a channel*, or
+  a flow that starts with *When a Teams webhook request is received*);
+  the old Office 365 "Incoming Webhook" connector
+  (`…webhook.office.com/webhookb2/…`) has been retired and no longer
+  delivers (#1504). A Workflows webhook answers `202 Accepted` before
+  the flow runs, so **Test** reports success even when the flow then
+  fails to post the card; check the flow's run history in Power
+  Automate if nothing appears in the channel. For the chat flavors the
+  URL is the credential (anyone holding it can post into the
+  channel), so the URL and the header are **write-only secrets**
+  (#1502): Fernet-encrypted at rest (`url_encrypted`,
+  `auth_header_encrypted`), never returned by the API, which shows
+  `url_set` / `auth_header_set` and a `url_display` of scheme and
+  host only (`https://hooks.slack.com/…`). On update, an omitted or
+  `null` field keeps the stored value and `""` clears it. httpx's own
+  `HTTP Request: POST …` log line for a delivery shows only that
+  host, and delivery errors are redacted before they are logged or
+  returned by **Test**.
 - **SMTP email** — stdlib `smtplib` driven through
   `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
   plaintext, optional auth (Fernet-encrypted password at rest).
@@ -517,6 +547,11 @@ are preserved and migrated into one `audit_forward_target` row apiece
 on upgrade. When the targets table is empty the service falls back to
 those flat columns so existing installs keep forwarding without
 operator intervention. They are slated for removal in a future release.
+The legacy webhook's URL and header get the same write-only treatment
+as a target's (#1502): `audit_forward_webhook_url_encrypted` /
+`audit_forward_webhook_auth_header_encrypted`, and `GET /settings`
+returns `audit_forward_webhook_url_set` / `_url_display` /
+`audit_forward_webhook_auth_header_set` instead of the values.
 
 **Known gap.** Celery-scheduled audits (e.g. the lease-pull
 housekeeping row) may not forward — Celery wraps the task body in
@@ -982,6 +1017,8 @@ Rule types shipped today:
 | `cluster_dns_degraded` | The k3s cluster's DNS (CoreDNS) is down, thinner than the appliance targets, co-located on one node, or not answering (#985). Subject is the **cluster** — CoreDNS is cluster-scoped, and which node a replica sits on is already in the message. Every pod resolves `*.svc.cluster.local` through it (the api reaches Postgres and Redis that way), so a failure here surfaces later as unrelated components failing to start. Reads the same cluster-health snapshot the Cluster → Overview card renders, so there is no new collector and no new RBAC. **Warning** when fewer replicas are ready than `ensure_coredns_ha` targets (`min(nodes, 2)`), or when the ready replicas share a node — two replicas on one node is not HA, and Kubernetes never rebalances running pods (#633). **Critical** when no replica is ready, or when the live resolve probe fails. The probe is the load-bearing half: replica counts say the pods exist, the probe says the path works, and `ready 2 / spread ok / probe failed` is a real and distinct state pointing at kube-proxy or the CNI rather than at CoreDNS. It needs no RBAC (it is a DNS query from the pod) and therefore runs even in the **worker**, whose ServiceAccount deliberately cannot list pods cluster-wide — so the rule still fires there on a probe failure, and the worker is a genuine second vantage rather than a claimed one. A replica view that cannot be read is UNKNOWN and holds open events rather than resolving them; null is never treated as zero. Seeded **enabled**, and inert off the appliance. |
 | `appliance_storage_degraded` | An appliance's software RAID (md) array or multipath map has lost redundancy (#999 Part A). Subject is the **appliance**. The supervisor reads `/proc/mdstat` + `/sys/block` out of the host through its privileged / `hostPID` window and folds the reading into the same `cluster_health` JSONB the #402 host partitions ride, so there is no new heartbeat field, no column and no migration. **Severity keys off redundancy remaining, never off the state string** — `2 of 3` in a three-way mirror and `1 of 2` in a pair both report `degraded`, and only the second has nothing left to lose. **Critical** when an array is down to the members it needs to serve at all, when it has failed outright, or when a multipath map has no paths at all. A map with exactly ONE path is deliberately **not** alarmed on: nothing knows whether it ever had more, and the installer explicitly permits installing to a single-path LUN — so a count-based alarm there would be critical forever, turn the console verdict red forever, and be clearable by no action, which is how an alarm gets muted before the night it matters. The count is on every screen for an operator who knows what it should be. **Warning** when redundancy is reduced but a further loss is survivable, or when some SCSI paths report a fault while others remain. A **scrub or resync on an intact array is deliberately not an event** — it is shown on all three screens with its progress, and nothing more. #999 asked for it as "informational, auto-clears", which would be right if `info` were quiet BY DEFAULT; it is not, because `min_severity` is nullable and NULL forwards everything — so on a stock install an `info` event notifies exactly like a critical one. (#999 originally gave a second reason that no longer holds: delivery filtered `min_severity` against `payload["result"]`, a key alert payloads never carry, so a target with a threshold received *nothing* and `info` could not be muted at all. #1031 fixed that. What has not changed is the default, and a finding that is quiet only for operators who went and configured it is not quiet.) Debian runs `checkarray` monthly by cron, so that row would mail every operator with an array, every month, about their array working correctly, which is how an alarm gets muted before the night it matters. The rebuild that DOES matter never reaches that branch anyway: an array with a member out of sync reports `degraded` and is classified on redundancy like any other. An assembled array that will not report its member count is a **warning**, one that failed to *assemble* (`array_state=inactive`) is **critical** whatever its member count says, and an IMSM/DDF metadata `container` is skipped entirely — it is permanently inactive on a healthy box and would raise an alert nothing could clear. A reading that **disappears** is not a recovery either: an appliance with an open event and no current reading is re-matched at its existing severity, so an A/B rollback to a pre-#999 supervisor holds the alarm instead of resolving it. **Multipath is under-sensitive by construction and says so**: the only per-path signal available without the device-mapper ioctl is the path's SCSI `device/state`, which stays `running` when multipathd's checker fails a path, so a map that has quietly lost half its paths produces no finding — which is why every surface renders a finding-less multipath map in a NEUTRAL style rather than the green an md array earns. Revoked appliances are skipped; so are supervisors too old to report storage, because no `storage` key is UNKNOWN and not a clean bill of health. Classified by one function (`services/appliance/storage_health.evaluate_storage`) shared with the `find_appliance_storage` copilot tool and both dashboard surfaces, so a chip cannot read "clean" while the alert reads "degraded". Seeded **enabled** — it is silent on an appliance with no arrays, which is every appliance until somebody builds one. |
 | `agent_spool_trimmed` | A DNS or DHCP agent's durable push spool (#1077) hit its size cap (`AGENT_SPOOL_MAX_BYTES`, default 256 MiB) during a control-plane outage and discarded its **oldest** queued batches — part of the outage's logs, metrics or lease events will never arrive. Subject is `agent` with a `dns_server:<id>` / `dhcp_server:<id>` subject id, the same shape as `agent_config_rejected`. Reads the `spool_status` the heartbeat stored; no probing. Fires while the reported `last_trim_at` is within the last 24 h and auto-resolves after that (trim counters are cumulative, so there is no "recovered" report to key off). **Critical** when `lease_events` were among the streams trimmed — Kea lease events are the only way the control plane learns about agent-managed leases, so a trimmed one is a lease with no IPAM mirror and no DDNS record until the client renews or the agent's lease snapshot reconciles it; **warning** otherwise. NULL (an agent too old to report a spool, or an agentless driver) never matches. Seeded **enabled**. |
+| `backup_failed` | The last finished run of an enabled backup target with a schedule failed (#1262). Subject is the **backup target**. Auto-resolves when its next run succeeds. A run in progress neither opens nor resolves it, so a target failing every night holds one event. The message leaves out the run's error text, because driver errors can name hosts, paths or buckets and alert payloads leave the install; the error is on the Backup page and in the audit log. Manual-only and disabled targets are not watched. Severity **warning**. Seeded **enabled**. |
+| `backup_stale` | An enabled backup target with a schedule has had no successful run within N scheduled runs plus one hour (#1262). N is `threshold_percent`, used as a count, default 2. Counted from the last success (`last_run_at` when the last run succeeded, otherwise the newest `backup_target_run_success` audit row), but never from before the schedule was set or changed, so a new schedule gets its first run first. Catches backups that stopped running at all: worker or beat down, or a run left `in_progress` by a dead process, which the sweep then skips for good. A run in progress for less than two hours holds the event; an older one counts as no run. Severity **critical**. Seeded **enabled**. Same decision as the `get_backup_health` copilot tool. |
 
 Admin UI lives at `/admin/alerts` — rules CRUD + live events viewer
 (15 s refetch) + per-event `Resolve` to manually silence a known-

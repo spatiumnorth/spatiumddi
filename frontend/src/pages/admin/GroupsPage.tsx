@@ -13,6 +13,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
 
 const inputCls =
@@ -128,6 +130,11 @@ function GroupModal({
   const [roleIds, setRoleIds] = useState<string[]>(group?.role_ids ?? []);
   const [userIds, setUserIds] = useState<string[]>(group?.user_ids ?? []);
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -136,6 +143,7 @@ function GroupModal({
         description,
         role_ids: roleIds,
         user_ids: userIds,
+        ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
       };
       return group
         ? groupsApi.update(group.id, payload as InternalGroupUpdate)
@@ -146,6 +154,11 @@ function GroupModal({
       onClose();
     },
     onError: (err: unknown) => {
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: unknown } } })?.response?.data
           ?.detail ?? "Failed to save group";
@@ -207,6 +220,15 @@ function GroupModal({
           </div>
         </div>
 
+        {needsStepUp && (
+          <StepUpSection
+            reason="This change makes one or more members superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -220,7 +242,11 @@ function GroupModal({
               setError(null);
               mutation.mutate();
             }}
-            disabled={!name || mutation.isPending}
+            disabled={
+              !name ||
+              mutation.isPending ||
+              (needsStepUp && !stepPassword && !stepTotp)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}

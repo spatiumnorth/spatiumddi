@@ -65,14 +65,20 @@ set -uo pipefail
 # back out of the freshly-rsynced $MOUNT copy to label the grub
 # menuentries; one parser so the backtitle and the boot menu can never
 # disagree about which build this is.
-_appliance_version_from() {
-    local f="$1" v=""
+#
+# _release_field is that parser, for any KEY="value" line of the stamp;
+# the clock check reads BUILD_TIME through it too (#1182).
+_release_field() {
+    local f="$1" key="$2" v=""
     if [ -r "$f" ]; then
-        v=$(awk -F= '/^APPLIANCE_VERSION=/{
+        v=$(awk -F= -v key="$key" '$1 == key {
             gsub(/^"|"$|^'"'"'|'"'"'$/, "", $2); print $2; exit
         }' "$f" 2>/dev/null || true)
     fi
     printf '%s' "$v"
+}
+_appliance_version_from() {
+    _release_field "$1" APPLIANCE_VERSION
 }
 _INSTALLER_VERSION="$(_appliance_version_from /etc/spatiumddi/appliance-release)"
 BACKTITLE="SpatiumDDI Appliance Installer ${_INSTALLER_VERSION:-unknown}"
@@ -449,20 +455,24 @@ Press OK to begin, or Cancel to drop to a shell."
 # to be resized.
 
 # ISO build date as YYYY-MM-DD, or "" when it cannot be derived. Used
-# only for the clock check.
+# only for the clock check. Takes the release stamp's path (tests).
+#
+# Read from BUILD_TIME, which the build writes beside APPLIANCE_VERSION,
+# and not from the version: that stopped being a date at 1.0.0 (#1182), and
+# was never one on a dev build. Both CI and ``make appliance-stamp-dev``
+# write BUILD_TIME; a stamp without it (one written by hand, or by an older
+# build) falls back to the file's own mtime, which mkosi sets at build time
+# and nothing on the live ISO rewrites.
 _iso_build_date() {
-    local v
-    v="$(_appliance_version_from /etc/spatiumddi/appliance-release)"
-    # CalVer: YYYY.MM.DD-N. A dev build (dev-<sha>) carries no date, so
-    # fall back to the release file's own mtime — which mkosi stamps at
-    # build time and nothing on the live ISO rewrites.
-    case "$v" in
-        [0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*)
-            printf '%s' "${v%%-*}" | tr '.' '-'
+    local t
+    t="$(_release_field "${1:-/etc/spatiumddi/appliance-release}" BUILD_TIME)"
+    case "$t" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*)
+            printf '%s' "${t:0:10}"
             return 0
             ;;
     esac
-    date -r /etc/spatiumddi/appliance-release +%Y-%m-%d 2>/dev/null || true
+    date -r "${1:-/etc/spatiumddi/appliance-release}" +%Y-%m-%d 2>/dev/null || true
 }
 
 preflight() {
@@ -4509,6 +4519,7 @@ EOF
             --exclude="/var/lib/spatiumddi/swapfile" \
             --exclude="/etc/spatiumddi/.env" \
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+            --exclude="/etc/ssh/ssh_host_*" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" 2>> "$INSTALL_LOG" \
             | { _last=-1
@@ -4627,33 +4638,26 @@ EOF
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
 
-        # Issue #276 — SSH host keys + machine config are seeded into
-        # the STATE partition, which spatium-etc-render copies into
-        # /etc on every boot BEFORE sshd / k3s start. STATE survives
-        # both an OS slot swap AND a /var factory reset, so the host
-        # key + hostname stay stable forever. Strip the keys out of
-        # /etc.image (the overlay LOWER) so a future slot image's
-        # mkosi-built keys can never shadow the operator's. (Supersedes
-        # the #272 Phase 1 bandaid that parked keys in
-        # /var/persist/etc/ssh — STATE is the authoritative home now.)
+        # Issue #276 — machine config is seeded into the STATE partition,
+        # which spatium-etc-render copies into /etc on every boot BEFORE
+        # sshd / k3s start. STATE survives both an OS slot swap AND a /var
+        # factory reset, so the host key + hostname stay stable forever.
+        #
+        # GHSA-vvh9-6gfw-wphp — SSH host keys are NOT seeded from the
+        # image any more. They used to be copied from /etc.image, i.e. the
+        # keys generated once in the build container, so every install of
+        # a release shared them. The image ships none now (mkosi.finalize)
+        # and the rsync above excludes the live session's throwaway set;
+        # spatium-etc-render generates this appliance's own on first boot
+        # and persists them here. Keys STATE already holds from a previous
+        # install are left untouched (#995 item 25 — STATE is not
+        # reformatted on a reinstall, and replacing them would give every
+        # client that knew this appliance a host-key-changed warning).
+        # The rm is belt and braces: nothing key-shaped may sit in the
+        # overlay lower, where it would shadow STATE's.
         STATE_MNT="$MOUNT/var/lib/spatium-state"
         mkdir -p "$STATE_MNT/ssh"
-        for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
-                 "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
-            [ -f "$k" ] || continue
-            # #995 item 25 — never overwrite a key STATE already holds.
-            # STATE is not reformatted on a reinstall, so this loop would
-            # otherwise copy the NEW image's freshly-generated host keys
-            # over the preserved ones and every client that knew this
-            # appliance would get REMOTE HOST IDENTIFICATION HAS CHANGED —
-            # the one thing keeping STATE is for.
-            if [ -e "$STATE_MNT/ssh/$(basename "$k")" ]; then
-                rm -f "$k"
-                continue
-            fi
-            cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
-            rm -f "$k"
-        done
+        rm -f "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_* "$MOUNT/etc/ssh/"ssh_host_*
 
         # spatium-config.yaml — the operator-authoritative machine
         # config the render service reads. Flat ``key: value`` shape

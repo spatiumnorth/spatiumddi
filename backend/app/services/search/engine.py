@@ -11,7 +11,11 @@ from __future__ import annotations
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.permissions import (
+    is_effective_superadmin,
+    token_scoped_resource_ids,
+    user_has_permission,
+)
 from app.models.auth import User
 from app.services.feature_modules import get_enabled_modules
 from app.services.search.providers import PROVIDERS, SearchProvider
@@ -39,6 +43,46 @@ async def visible_providers(db: AsyncSession, user: User) -> list[SearchProvider
     return [
         p for p in PROVIDERS if (p.module is None or p.module in enabled) and _may_read(user, p)
     ]
+
+
+# Result type -> (token resource type, the result field naming that resource).
+# A resource-scoped API token (#374) passes the provider gate above on a type
+# match alone, so each emitted row must also fall inside the token's bound
+# instances, exactly as the REST list routes narrow (GHSA-wr8j-6r46-pj7g).
+# Records are scoped by their zone and addresses by their subnet, matching
+# how the zone / subnet routes enforce those tokens.
+_TOKEN_SCOPE_FIELD: dict[str, tuple[str, str]] = {
+    "dns_zone": ("dns_zone", "id"),
+    "dns_record": ("dns_zone", "dns_zone_id"),
+    "subnet": ("subnet", "id"),
+    "ip_address": ("subnet", "subnet_id"),
+    "block": ("ip_block", "id"),
+    "space": ("ip_space", "id"),
+}
+
+
+def _narrow_to_token_scope(user: User, results: list[SearchResult]) -> list[SearchResult]:
+    """Drop rows outside a resource-scoped token's bound instances.
+
+    A no-op for sessions and unscoped tokens: ``token_scoped_resource_ids``
+    returns ``None`` for them, and for a wildcard grant on the type.
+    """
+    bound: dict[str, set[str] | None] = {
+        rtype: token_scoped_resource_ids(user, rtype)
+        for rtype in {rt for rt, _field in _TOKEN_SCOPE_FIELD.values()}
+    }
+    if all(ids is None for ids in bound.values()):
+        return results
+    kept: list[SearchResult] = []
+    for r in results:
+        scope = _TOKEN_SCOPE_FIELD.get(r.type)
+        if scope is not None:
+            rtype, field = scope
+            ids = bound[rtype]
+            if ids is not None and str(getattr(r, field, None) or "") not in ids:
+                continue
+        kept.append(r)
+    return kept
 
 
 def _emitted_types(providers: list[SearchProvider]) -> set[str]:
@@ -109,6 +153,7 @@ async def execute(
     results = [
         r for r in results if r.type in allowed_types and (wanted is None or r.type in wanted)
     ]
+    results = _narrow_to_token_scope(user, results)
 
     # De-duplicate. The same row can arrive from a direct column match and
     # from the custom-field pass; keep the higher-scoring copy, preferring

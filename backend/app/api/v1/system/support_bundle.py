@@ -35,6 +35,7 @@ from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
+from app.core.content_disposition import content_disposition
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
@@ -177,7 +178,7 @@ async def download_support_bundle(
         content=result.archive,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{result.filename}"',
+            "Content-Disposition": content_disposition(result.filename),
             "Content-Length": str(len(result.archive)),
         },
     )

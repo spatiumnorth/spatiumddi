@@ -246,6 +246,42 @@ def test_preflight_catches_a_clock_behind_the_build_date():
     assert "BEFORE this image was built" in fn
 
 
+def _iso_build_date(tmp_path, stamp: str) -> str:
+    release = tmp_path / "appliance-release"
+    release.write_text(stamp)
+    script = (
+        extract_fn("_release_field")
+        + "\n"
+        + extract_fn("_iso_build_date")
+        + f"\n_iso_build_date {str(release)!r}\n"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["2026.11.03-1", "1.0.0", "1.0.0-rc.1", "dev-abc1234-9f2e", "0.0.0-nightly-20261110+abc"],
+)
+def test_the_build_date_comes_from_build_time_not_the_version(tmp_path, version):
+    """#1182: it was parsed out of a CalVer version, so from 1.0.0 on the
+    clock check would have fallen back to the file's mtime on every
+    release ISO."""
+    stamp = (
+        f'APPLIANCE_VERSION="{version}"\n'
+        'BUILD_TIME="2026-11-10T04:12:33+00:00"\n'
+        'GIT_SHA="abc"\n'
+    )
+    assert _iso_build_date(tmp_path, stamp) == "2026-11-10"
+
+
+def test_a_stamp_without_build_time_falls_back_to_its_mtime(tmp_path):
+    """A stamp written by hand or by an older build carries no BUILD_TIME;
+    the file's mtime is the build."""
+    got = _iso_build_date(tmp_path, 'APPLIANCE_VERSION="dev"\n')
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", got), got
+
+
 def test_preflight_is_informational_not_a_gate():
     """The one hard refusal is the disk size floor, which pick_disk owns.
     A screen that refused on RAM would stop an operator who knows their

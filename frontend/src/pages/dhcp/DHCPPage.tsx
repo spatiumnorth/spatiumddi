@@ -48,6 +48,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { Modal } from "@/components/ui/modal";
 import { Pager } from "@/components/ui/pager";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -77,7 +78,8 @@ import {
   servingByScopeId,
   useGroupFailover,
 } from "./windowsFailover";
-import { DeleteConfirmModal, StatusDot } from "./_shared";
+import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
+import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
   CHANGE_REQUEST_QUERY_KEY,
@@ -1049,15 +1051,9 @@ function GroupServersList({
                       {s.ha_state && (
                         <span
                           className="inline-flex items-center rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                          title={
-                            s.ha_last_heartbeat_at
-                              ? `Last HA heartbeat ${new Date(
-                                  s.ha_last_heartbeat_at,
-                                ).toLocaleString()}`
-                              : "No HA heartbeat received yet"
-                          }
+                          title={haPillTitle(s.ha_last_heartbeat_at)}
                         >
-                          HA: {s.ha_state}
+                          HA v4: {s.ha_state}
                         </span>
                       )}
                       {s.maintenance_mode && (
@@ -1154,6 +1150,7 @@ function GroupServersList({
           serverName={pausePrompt.name}
           serverKind="DHCP"
           isPending={pauseMut.isPending}
+          error={pauseMut.isError ? formatApiError(pauseMut.error) : null}
           onConfirm={(reason) => {
             pauseMutId.current = pausePrompt.id;
             pauseMut.mutate(
@@ -1161,7 +1158,10 @@ function GroupServersList({
               { onSuccess: () => setPausePrompt(null) },
             );
           }}
-          onCancel={() => setPausePrompt(null)}
+          onCancel={() => {
+            setPausePrompt(null);
+            pauseMut.reset();
+          }}
         />
       )}
     </div>
@@ -1276,6 +1276,13 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
   const { data: failover } = useGroupFailover(groupId || undefined);
   const servingById = servingByScopeId(failover);
   const showServing = (failover?.windows_member_count ?? 0) > 0;
+  // #1238 — HA is DHCPv4 only, so a v6 scope on a multi-Kea group is
+  // served uncoordinated by every member. Same cached list the sidebar reads.
+  const { data: groups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+  });
+  const group = groups.find((g) => g.id === groupId);
   const allScopes: (DHCPScope & { subnet_network?: string })[] =
     groupScopes.map((sc) => ({
       ...sc,
@@ -1373,7 +1380,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2 font-mono text-xs">
                           {sc.subnet_network ?? "—"}
                         </td>
-                        <td className="px-3 py-2">{sc.name}</td>
+                        <td className="px-3 py-2">
+                          <span className="inline-flex flex-wrap items-center gap-1.5">
+                            {sc.name}
+                            {group && v6ScopeLacksHa(sc, group) && (
+                              <V6NoHaTag
+                                keaMemberCount={group.kea_member_count}
+                              />
+                            )}
+                          </span>
+                        </td>
                         <td className="px-3 py-2">
                           {sc.enabled ? "yes" : "no"}
                         </td>
@@ -2846,13 +2862,7 @@ function ServerDetailView({
               </span>
               {server.ha_state && (
                 <span
-                  title={
-                    server.ha_last_heartbeat_at
-                      ? `Last HA heartbeat ${new Date(
-                          server.ha_last_heartbeat_at,
-                        ).toLocaleString()}`
-                      : "No HA heartbeat received yet"
-                  }
+                  title={haPillTitle(server.ha_last_heartbeat_at)}
                   className={cn(
                     "rounded-full px-2 py-0.5 text-xs font-medium",
                     server.ha_state === "partner-down" ||
@@ -2866,7 +2876,7 @@ function ServerDetailView({
                         : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
                   )}
                 >
-                  HA: {server.ha_state}
+                  HA v4: {server.ha_state}
                 </span>
               )}
               {!server.agent_approved && !server.is_agentless && (
@@ -3091,6 +3101,97 @@ function ServerDetailView({
   );
 }
 
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live scopes (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no Delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop (a list read before another tab added a scope, the API, the
+ *  approval queue) and its reason shows in the dialog. What a delete still
+ *  takes is the group's scopes already in Trash, for good. */
+function DeleteServerGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DHCPServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dhcp-servers", group.id],
+    queryFn: () => dhcpApi.listServers(group.id),
+  });
+  const scopesQ = useQuery({
+    queryKey: ["dhcp-scopes-group", group.id],
+    queryFn: () => dhcpApi.listScopesByGroup(group.id),
+  });
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || scopesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const scopes = scopesQ.data?.length ?? 0;
+  if (servers || scopes) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      scopes ? `${scopes} scope${scopes === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    const first = [
+      servers ? "move or delete its servers" : "",
+      scopes ? "delete its scopes" : "",
+    ]
+      .filter(Boolean)
+      .join(", and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First {first}.
+            {scopes > 0 &&
+              " A deleted scope goes to Trash; deleting the group then deletes its scopes in Trash for good, with their pools and reservations."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <DeleteConfirmModal
+      title={title}
+      description={`Permanently delete group "${group.name}"? Scopes of this group already in Trash are deleted with it, with their pools and reservations, and can no longer be restored.`}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Page shell
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3283,9 +3384,8 @@ export function DHCPPage() {
         />
       )}
       {delGroup && (
-        <DeleteConfirmModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${delGroup.name}"? The group must be empty — move or delete its servers first.`}
+        <DeleteServerGroupModal
+          group={delGroup}
           onConfirm={() => deleteGroupMut.mutate(delGroup.id)}
           onClose={() => {
             setDelGroup(null);
@@ -3314,8 +3414,16 @@ export function DHCPPage() {
           title="Delete DHCP Server"
           description={`Remove server "${delServer.name}"? Its scopes remain but will be unassigned.`}
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
-          onClose={() => setDelServer(null)}
+          onClose={() => {
+            setDelServer(null);
+            deleteServerMut.reset();
+          }}
           isPending={deleteServerMut.isPending}
+          error={
+            deleteServerMut.isError
+              ? formatApiError(deleteServerMut.error)
+              : null
+          }
         />
       )}
       {modalServer && (

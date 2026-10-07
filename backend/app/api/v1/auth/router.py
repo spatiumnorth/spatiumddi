@@ -6,6 +6,7 @@ import secrets as py_secrets
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from urllib.parse import urlencode
 
 import structlog
@@ -17,6 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select, update
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import refuse_if_stepup_blocked
 from app.config import settings
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
@@ -32,6 +34,9 @@ from app.core.auth.saml import (
     build_authorize_url as saml_authorize_url,
 )
 from app.core.auth.saml import (
+    claim_assertion as saml_claim_assertion,
+)
+from app.core.auth.saml import (
     consume_assertion as saml_consume_assertion,
 )
 from app.core.auth.tacacs import TACACSServiceError, authenticate_tacacs
@@ -40,7 +45,12 @@ from app.core.auth.user_sync import (
     ExternalSyncRejected,
     sync_external_user,
 )
-from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
+from app.core.auth_throttle import (
+    login_rate_limited,
+    mfa_challenge_consume,
+    record_stepup_password_failure,
+    refund_stepup_attempt,
+)
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
@@ -66,10 +76,13 @@ from app.services.account_lockout import (
     register_success,
 )
 from app.services.mfa import (
+    PENDING_ENROLMENT_TTL,
+    clear_pending_enrolment,
     consume_recovery_code,
     decrypt_secret,
     encrypt_recovery_codes,
     encrypt_secret,
+    enrolment_pending,
     generate_recovery_codes,
     generate_secret,
     otpauth_uri,
@@ -86,6 +99,13 @@ from app.services.password_policy import (
 )
 from app.services.password_policy import (
     validate as validate_password_policy,
+)
+from app.services.reauth import (
+    MFA_ENROL_SIGN_IN_WINDOW,
+    ReauthOutcome,
+    reverify_for_mfa_enrolment,
+    sign_in_is_recent,
+    uses_local_password,
 )
 
 logger = structlog.get_logger(__name__)
@@ -218,10 +238,11 @@ class PasswordPolicyResponse(BaseModel):
 
 def _client_ip(request: Request) -> str | None:
     # Auth-surface source IP: the per-IP login throttle (#4) gates on this,
-    # and it also lands in the login audit rows + ``last_login_ip``. Use the
-    # spoofing-resistant value (X-Real-IP, not the forgeable
-    # X-Forwarded-For-derived peer) so neither the throttle nor the audit
-    # trail can be evaded / poisoned by a client-supplied header (#626).
+    # and it also lands in the login audit rows + ``last_login_ip``. The
+    # spoofing-resistant value: X-Real-IP only from a trusted proxy peer,
+    # otherwise the TCP peer itself (#626, #1221), so neither the throttle
+    # nor the audit trail can be evaded or poisoned by a client-supplied
+    # header.
     return get_trusted_client_ip(request)
 
 
@@ -306,7 +327,7 @@ async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) 
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
-        force_password_change=user.force_password_change,
+        force_password_change=user.password_change_required,
     )
 
 
@@ -428,6 +449,12 @@ async def _try_external_password_login(
     if not providers:
         return None
 
+    # A provider that authenticated the password but whose subject is not
+    # the account holding this username (#1235). That account may belong to
+    # a lower-priority provider, which must still get its turn: stopping
+    # here would lock out the owner whenever a higher-priority provider also
+    # knows the same username and password.
+    refused_as_not_owner = False
     for provider in providers:
         dispatch = _PASSWORD_AUTH_DISPATCH.get(provider.type)
         if dispatch is None:
@@ -501,7 +528,18 @@ async def _try_external_password_login(
                 username,
                 reason=exc.reason,
                 auth_source=provider.name,
+                user=exc.user,
             )
+            if exc.reason == "account_disabled":
+                # Same answer the local path gives a disabled account. The
+                # directory has just accepted the password, so this reveals
+                # nothing a wrong password would not.
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled"
+                ) from exc
+            if exc.reason in {"username_collision", "account_link_required"}:
+                refused_as_not_owner = True
+                continue
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials",
@@ -509,6 +547,9 @@ async def _try_external_password_login(
 
         return await _issue_tokens(db, request, user, auth_source=provider.name)
 
+    if refused_as_not_owner:
+        # Already audited per provider above; no generic ``no_match`` row.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     return None
 
 
@@ -765,7 +806,14 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         source_ip=session.source_ip,
         user_agent=session.user_agent,
         auth_source=session.auth_source,
-        created_at=now,
+        # The SIGN-IN time, carried across rotations rather than restamped
+        # (#1241). A refresh is not a sign-in: it proves only possession of
+        # the refresh cookie, which is exactly what a hijacked session has.
+        # MFA enrolment asks an external user for a recent sign-in, and
+        # restamping here would let any stolen session refresh its way into
+        # looking recent. It is also what the session viewer means by
+        # "created" — when that person signed in.
+        created_at=session.created_at,
         last_seen_at=now,
         expires_at=now + timedelta(days=settings.refresh_token_expire_days),
     )
@@ -778,7 +826,7 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
     logger.info("token_refreshed", user_id=str(user.id))
     return RefreshResponse(
         access_token=access_token,
-        force_password_change=user.force_password_change,
+        force_password_change=user.password_change_required,
     )
 
 
@@ -805,9 +853,10 @@ def _current_session_jti(request: Request) -> str | None:
     incoming Authorization header, so the self-service change-password
     path can spare the caller's own session when it revokes the rest.
 
-    Returns None for API-token auth, legacy (no-jti) tokens, or anything
-    that fails to decode — in which case we simply revoke every session,
-    which is the safe direction (the caller just has to log in again)."""
+    Returns None for API-token auth, or anything that fails to decode
+    (including a token with no ``jti``, #1222) — in which case we simply
+    revoke every session, which is the safe direction (the caller just has
+    to log in again)."""
     header = request.headers.get("authorization") or ""
     scheme, _, raw = header.partition(" ")
     if scheme.lower() != "bearer" or not raw:
@@ -865,6 +914,9 @@ async def change_password(
     current_user.force_password_change = False
     current_user.password_changed_at = datetime.now(UTC)
     current_user.password_history_encrypted = new_history
+    # #1354 — a started MFA enrolment does not survive a password change: it
+    # may have been started by whoever made the change necessary.
+    enrolment_dropped = clear_pending_enrolment(current_user)
 
     # SECURITY (#400 / M3): a password change must revoke every other
     # outstanding session + refresh token for this user. Without this a
@@ -889,7 +941,8 @@ async def change_password(
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
-        changed_fields=["hashed_password", "force_password_change", "password_changed_at"],
+        changed_fields=["hashed_password", "force_password_change", "password_changed_at"]
+        + (["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else []),
         result="success",
     )
     db.add(audit)
@@ -900,6 +953,8 @@ async def change_password(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
     _clear_refresh_cookie(response)
+    # #1354 — signing out abandons a started MFA enrolment.
+    enrolment_dropped = clear_pending_enrolment(current_user)
     await db.execute(
         update(UserSession)
         .where(UserSession.user_id == current_user.id, UserSession.revoked.is_(False))
@@ -913,6 +968,9 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
+        changed_fields=(
+            ["totp_secret_encrypted", "recovery_codes_encrypted"] if enrolment_dropped else None
+        ),
         result="success",
     )
     db.add(audit)
@@ -937,7 +995,7 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
         email=current_user.email,
         display_name=current_user.display_name,
         is_superadmin=is_effective_superadmin(current_user),
-        force_password_change=current_user.force_password_change,
+        force_password_change=current_user.password_change_required,
         auth_source=current_user.auth_source,
     )
 
@@ -1002,9 +1060,25 @@ async def get_my_permissions(current_user: CurrentUser) -> MyPermissionsResponse
 # endpoint accepts either ``code`` or ``recovery_code``.
 
 
+class MfaEnrolBeginRequest(BaseModel):
+    """The enrolment step-up (#1241). Local users send their current
+    password; external-auth users send nothing and must have signed in
+    recently instead (see ``reverify_for_mfa_enrolment``)."""
+
+    password: str | None = None
+
+
 class MfaEnrolBeginResponse(BaseModel):
     secret: str
     otpauth_uri: str
+    recovery_codes: list[str]
+
+
+class MfaRecoveryCodesResponse(BaseModel):
+    """Regenerate's answer: the new codes and nothing else. The TOTP secret
+    must never be returned after enrolment — one live code plus a session
+    would otherwise hand over the second factor for good."""
+
     recovery_codes: list[str]
 
 
@@ -1026,24 +1100,60 @@ class MfaStatusResponse(BaseModel):
     enabled: bool
     enrolment_pending: bool
     recovery_codes_remaining: int
+    #: What starting an enrolment asks for (#1241): ``password`` for a local
+    #: account, ``recent_sign_in`` for an external-auth one.
+    enrol_requires: Literal["password", "recent_sign_in"]
+    #: For ``recent_sign_in``: whether this session's sign-in is still recent
+    #: enough. False means sign out and back in first. Always true for
+    #: ``password``, which does not depend on it.
+    enrol_sign_in_recent: bool
+    #: How recent that sign-in must be, in minutes — so the UI states the
+    #: server's window rather than a copy of it.
+    enrol_sign_in_window_minutes: int
+
+
+def _enrol_window_minutes() -> int:
+    return int(MFA_ENROL_SIGN_IN_WINDOW.total_seconds() // 60)
 
 
 @router.get("/mfa/status", response_model=MfaStatusResponse)
-async def mfa_status(current_user: CurrentUser) -> MfaStatusResponse:
+async def mfa_status(current_user: CurrentUser, request: Request) -> MfaStatusResponse:
     """Surface current MFA state for the Settings panel. ``enrolment_pending``
     is True when the operator has called ``begin`` but not ``verify`` —
     handy for the UI to render a "Resume enrolment" affordance."""
+    local = uses_local_password(current_user)
     return MfaStatusResponse(
         enabled=current_user.totp_enabled,
-        enrolment_pending=(
-            not current_user.totp_enabled and current_user.totp_secret_encrypted is not None
-        ),
+        enrolment_pending=enrolment_pending(current_user),
         recovery_codes_remaining=remaining_recovery_codes(current_user.recovery_codes_encrypted),
+        enrol_requires="password" if local else "recent_sign_in",
+        enrol_sign_in_recent=local
+        or sign_in_is_recent(getattr(request.state, "signed_in_at", None)),
+        enrol_sign_in_window_minutes=_enrol_window_minutes(),
+    )
+
+
+async def _refuse_if_stepup_blocked(user: User, *, claim: bool = False) -> None:
+    """The shared step-up budget gate (``app.api.stepup``), with the MFA
+    wording for its 503. Kept as a wrapper so every MFA endpoint keeps one
+    call site; the budget logic itself lives once, in the shared module."""
+    await refuse_if_stepup_blocked(
+        user,
+        claim=claim,
+        unavailable_detail=(
+            "Two-factor settings can't be changed right now because the "
+            "attempt limiter is unavailable. Try again in a minute."
+        ),
     )
 
 
 @router.post("/mfa/enroll/begin", response_model=MfaEnrolBeginResponse)
-async def mfa_enroll_begin(current_user: CurrentUser, db: DB) -> MfaEnrolBeginResponse:
+async def mfa_enroll_begin(
+    current_user: CurrentUser,
+    request: Request,
+    db: DB,
+    body: MfaEnrolBeginRequest | None = None,
+) -> MfaEnrolBeginResponse:
     """Mint a candidate TOTP secret + recovery codes. Persists the secret
     on the user row encrypted (so /verify can compare without taking it
     over the wire twice) but leaves ``totp_enabled`` false.
@@ -1053,13 +1163,59 @@ async def mfa_enroll_begin(current_user: CurrentUser, db: DB) -> MfaEnrolBeginRe
 
     #408 — open to every auth source (was local-only). An external-auth
     (OIDC / SAML / LDAP / …) superadmin needs TOTP to re-confirm sensitive
-    reveals, since they have no local password; the authenticated session
-    is the enrolment auth (begin only mints a candidate secret)."""
+    reveals, since they have no local password.
+
+    #1241 — begin needs a step-up, not just a session: a local user's
+    password, or an external user's recent sign-in. It is the step that
+    decides whose authenticator the account trusts from then on, and a
+    hijacked session used to be enough to make it the attacker's. The gate
+    sits on begin because begin is the only place the secret is handed
+    out; verify can only complete an enrolment whose secret the caller
+    already holds."""
     if current_user.totp_enabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MFA is already enabled — disable it first to re-enrol",
         )
+    await _refuse_if_stepup_blocked(current_user)
+    outcome = reverify_for_mfa_enrolment(
+        current_user,
+        password=body.password if body else None,
+        signed_in_at=getattr(request.state, "signed_in_at", None),
+    )
+    if outcome is ReauthOutcome.BAD_CREDENTIAL:
+        await record_stepup_password_failure(current_user.id)
+    if outcome is not ReauthOutcome.OK:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                source_ip=_client_ip(request),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
+                action="mfa.enrol_begin",
+                resource_type="user",
+                resource_id=str(current_user.id),
+                resource_display=current_user.username,
+                result="denied",
+                error_detail=outcome.value,
+            )
+        )
+        await db.commit()
+        if outcome is ReauthOutcome.SIGN_IN_TOO_OLD:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Setting up two-factor authentication needs a recent sign-in. "
+                    f"Sign out, sign in again, and start within {_enrol_window_minutes()} "
+                    "minutes."
+                ),
+            )
+        # 403, not 401, like the reveal step-ups: the SPA's axios interceptor
+        # reads any 401 off a non-login path as an expired access token, so
+        # a mistyped password would rotate the session and resubmit it —
+        # two ``denied`` audit rows and two bcrypt checks per typo.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Incorrect password")
     secret = generate_secret()
     codes = generate_recovery_codes()
     current_user.totp_secret_encrypted = encrypt_secret(secret)
@@ -1083,7 +1239,18 @@ async def mfa_enroll_verify(
     this succeeds ``totp_enabled`` stays false and login skips the MFA
     gate. On success we audit-log and the next ``/login`` will MFA-gate.
 
-    #408 — open to every auth source (was local-only)."""
+    #408 — open to every auth source (was local-only).
+
+    #1354 — a wrong code spends the same fail-closed step-up budget as begin,
+    disable and regenerate, and an enrolment more than
+    ``PENDING_ENROLMENT_TTL`` old is discarded instead of verified. Without
+    either, an abandoned enrolment stayed open to unlimited 6-digit guesses
+    from any of the user's sessions, and a hit turned MFA on with a secret
+    the user never saw. The attempt is claimed atomically before the code is
+    checked, so a burst of concurrent guesses cannot all slip past a
+    read-then-count budget. A wrong code is 403, not 401: the SPA reads any
+    401 as an expired token and resubmits, which would spend two attempts on
+    one typo (#1371)."""
     if current_user.totp_enabled:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA already enabled")
     if current_user.totp_secret_encrypted is None:
@@ -1091,9 +1258,39 @@ async def mfa_enroll_verify(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No enrolment in progress — call /mfa/enroll/begin first",
         )
+    if not enrolment_pending(current_user):
+        clear_pending_enrolment(current_user)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                source_ip=_client_ip(request),
+                user_agent=clean_user_agent(request.headers.get("user-agent")),
+                action="mfa.enrol_expired",
+                resource_type="user",
+                resource_id=str(current_user.id),
+                resource_display=current_user.username,
+                changed_fields=["totp_secret_encrypted", "recovery_codes_encrypted"],
+                result="success",
+            )
+        )
+        await db.commit()
+        minutes = int(PENDING_ENROLMENT_TTL.total_seconds() // 60)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"This enrolment expired: it has to be completed within {minutes} "
+                "minutes. Start again."
+            ),
+        )
+    # Claimed, not just checked: the attempt is spent before the code is
+    # compared and given back below only if the code was right.
+    await _refuse_if_stepup_blocked(current_user, claim=True)
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid TOTP code")
+    await refund_stepup_attempt(current_user.id)
     current_user.totp_enabled = True
     db.add(
         AuditLog(
@@ -1126,13 +1323,17 @@ async def mfa_disable(
         )
     # Password is required + checked ONLY for local accounts (which have
     # one). External-auth accounts re-confirm with the TOTP code alone.
-    if current_user.auth_source == "local" and current_user.hashed_password:
+    await _refuse_if_stepup_blocked(current_user)
+    if uses_local_password(current_user):
+        assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
+            await record_stepup_password_failure(current_user.id)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
             )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
+        await record_stepup_password_failure(current_user.id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
     current_user.totp_enabled = False
     current_user.totp_secret_encrypted = None
@@ -1156,11 +1357,11 @@ async def mfa_disable(
 
 @router.post(
     "/mfa/recovery-codes/regenerate",
-    response_model=MfaEnrolBeginResponse,
+    response_model=MfaRecoveryCodesResponse,
 )
 async def mfa_regenerate_recovery_codes(
     body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
-) -> MfaEnrolBeginResponse:
+) -> MfaRecoveryCodesResponse:
     """Replace the recovery-code list. Same two-factor reauth as
     ``/disable``. Returns the new codes ONCE — operator must record them.
     The existing ``secret`` is kept so the authenticator app entry stays
@@ -1171,13 +1372,17 @@ async def mfa_regenerate_recovery_codes(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
         )
-    if current_user.auth_source == "local" and current_user.hashed_password:
+    await _refuse_if_stepup_blocked(current_user)
+    if uses_local_password(current_user):
+        assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
+            await record_stepup_password_failure(current_user.id)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
             )
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
+        await record_stepup_password_failure(current_user.id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
     codes = generate_recovery_codes()
     current_user.recovery_codes_encrypted = encrypt_recovery_codes(codes)
@@ -1196,11 +1401,7 @@ async def mfa_regenerate_recovery_codes(
         )
     )
     await db.commit()
-    return MfaEnrolBeginResponse(
-        secret=secret,
-        otpauth_uri=otpauth_uri(secret, current_user.username),
-        recovery_codes=codes,
-    )
+    return MfaRecoveryCodesResponse(recovery_codes=codes)
 
 
 # ── OIDC / SAML redirect flow ────────────────────────────────────────────────
@@ -1323,6 +1524,8 @@ _LOGIN_ERROR_REASONS = frozenset(
         "saml_state_mismatch",
         "saml_assertion_rejected",
         "saml_rejected",
+        # Either redirect flow, for an account an admin disabled (#1242)
+        "account_disabled",
         # Fallback
         "unknown",
     }
@@ -1420,7 +1623,7 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
 
     relay_state = py_secrets.token_urlsafe(32)
     try:
-        authorize_url = saml_authorize_url(cfg, base, relay_state)
+        authorize_url, request_id = saml_authorize_url(cfg, base, relay_state)
     except Exception as exc:  # noqa: BLE001 — python3-saml surfaces plain Exception
         logger.warning("saml_authorize_build_error", provider=provider.name, error=str(exc))
         return _login_error_redirect("saml_build_failed")
@@ -1429,6 +1632,8 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
         {
             "provider_id": str(provider.id),
             "relay_state": relay_state,
+            # The AuthnRequest this flow sent: the Response must answer it (#1335).
+            "request_id": request_id,
             "exp": int(datetime.now(UTC).timestamp()) + _SAML_FLOW_TTL,
         }
     )
@@ -1505,7 +1710,10 @@ async def oidc_callback(
             result.username or result.external_id,
             reason=exc.reason,
             auth_source=provider.name,
+            user=exc.user,
         )
+        if exc.reason == "account_disabled":
+            return _login_error_redirect("account_disabled")
         return _login_error_redirect("oidc_rejected")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
@@ -1563,12 +1771,29 @@ async def saml_callback(
         return _login_error_redirect("saml_state_mismatch")
     if RelayState != flow.get("relay_state"):
         return _login_error_redirect("saml_state_mismatch")
+    # A flow that kept no AuthnRequest ID (started before #1335's fix) cannot
+    # tell its own Response from another flow's, so it starts again.
+    request_id = flow.get("request_id")
+    if not request_id:
+        return _login_error_redirect("saml_state_invalid")
 
     try:
         cfg = SAMLConfig.from_provider(provider, base)
+        # The Response must answer this flow's AuthnRequest, and its Assertion
+        # signs in once (#1335). Bound to its request, a Response lifted from
+        # one browser's sign-in does not sign in through another's; spent on
+        # first use, it does not sign in twice through its own.
         consumed = saml_consume_assertion(
-            cfg, base, {"SAMLResponse": SAMLResponse, "RelayState": RelayState}
+            cfg,
+            base,
+            {"SAMLResponse": SAMLResponse, "RelayState": RelayState},
+            request_id=request_id,
         )
+        if not await saml_claim_assertion(consumed):
+            raise SAMLServiceError(
+                f"SAML response rejected: assertion {consumed.assertion_id} has "
+                "already been used to sign in"
+            )
     except SAMLServiceError as exc:
         logger.warning("saml_assertion_rejected", provider=provider.name, error=str(exc))
         db.add(
@@ -1597,7 +1822,10 @@ async def saml_callback(
             consumed.result.username or consumed.result.external_id,
             reason=exc.reason,
             auth_source=provider.name,
+            user=exc.user,
         )
+        if exc.reason == "account_disabled":
+            return _login_error_redirect("account_disabled")
         return _login_error_redirect("saml_rejected")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)

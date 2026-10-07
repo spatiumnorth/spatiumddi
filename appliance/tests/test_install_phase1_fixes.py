@@ -326,7 +326,10 @@ def test_the_version_is_parsed_in_exactly_one_place():
     """do_install reads the same value back out of the rsynced copy to
     label the grub menuentries; two awk blocks could disagree about which
     build this is."""
-    assert CODE.count("APPLIANCE_VERSION=/{") == 1, "one awk parse, not several"
+    # One awk parse of the stamp (#1182 generalised it to any key, so the
+    # clock check's BUILD_TIME goes through the same reader).
+    assert CODE.count("awk -F= -v key=") == 1, "one awk parse, not several"
+    assert CODE.count("_release_field() {") == 1
     assert CODE.count("_appliance_version_from() {") == 1
     # Nobody reads the release file except through the helper.
     #
@@ -339,6 +342,7 @@ def test_the_version_is_parsed_in_exactly_one_place():
         for ln in joined.splitlines()
         if "spatiumddi/appliance-release" in ln
         and "_appliance_version_from" not in ln
+        and "_release_field" not in ln
         and "date -r" not in ln  # the mtime fallback, which wants the path itself
     ]
     assert not direct, direct

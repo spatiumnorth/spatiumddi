@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import io
 import os
-import re
 import stat as stat_mod
 from datetime import UTC, datetime
 from typing import Any
@@ -53,16 +52,17 @@ from typing import Any
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
 
 logger = structlog.get_logger(__name__)
 
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
 
 _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 
@@ -73,6 +73,20 @@ _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 # build_backup_archive timeout).
 _SSH_CONNECT_TIMEOUT = 30
 _SSH_BANNER_TIMEOUT = 30
+# Per-operation ceiling on the SFTP channel (#1515). connect / banner /
+# auth timeouts were set, but the channel itself had none, so a server
+# that stalls mid-transfer hung the backup run indefinitely — the
+# runner's row sat ``in_progress`` with no process-level bound at all.
+_SFTP_CHANNEL_TIMEOUT = 300
+
+
+def _open_sftp(client):  # type: ignore[no-untyped-def]
+    """Open the SFTP subsystem with a channel timeout set (#1515)."""
+    sftp = client.open_sftp()
+    channel = sftp.get_channel()
+    if channel is not None:
+        channel.settimeout(_SFTP_CHANNEL_TIMEOUT)
+    return sftp
 
 
 class ScpDestination(BackupDestination):
@@ -260,14 +274,14 @@ class ScpDestination(BackupDestination):
         filename: str,
         archive_bytes: bytes,
     ) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
         tmp = remote + ".tmp"
 
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
@@ -294,7 +308,7 @@ class ScpDestination(BackupDestination):
         def _do() -> list[ArchiveListing]:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     entries = sftp.listdir_attr(remote_path)
                 except FileNotFoundError as exc:
@@ -311,7 +325,7 @@ class ScpDestination(BackupDestination):
             for attr in entries:
                 if attr.st_mode is None or stat_mod.S_ISDIR(attr.st_mode):
                     continue
-                if not _ARCHIVE_NAME_RE.match(attr.filename):
+                if not ARCHIVE_NAME_RE.match(attr.filename):
                     continue
                 if not attr.st_mtime or not attr.st_size:
                     continue
@@ -328,13 +342,13 @@ class ScpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> bytes:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
                         return fh.read()
@@ -350,13 +364,13 @@ class ScpDestination(BackupDestination):
         return await asyncio.to_thread(_do)
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
-        safe = os.path.basename(filename)
+        safe = safe_filename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
 
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     sftp.remove(remote)
                 except FileNotFoundError:
@@ -385,7 +399,7 @@ class ScpDestination(BackupDestination):
             except BackupDestinationError as exc:
                 return {"ok": False, "error": str(exc)}
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     # Sanity-check the path exists + is a directory.
                     stat = sftp.stat(remote_path)

@@ -66,3 +66,51 @@ Returns the bare type string, or nothing when disabled.
 {{- $t -}}
 {{- end -}}
 
+
+{{/*
+#1281 — an agent given the EXTERNAL control-plane URL (an off-cluster
+appliance) verifies it against the certificate its supervisor pinned, in
+place of the SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 these pods used to set. That
+connection carries the platform-wide agent key out and the DNS / DHCP
+configuration back, so an unverified one handed both to anyone on the path.
+
+The supervisor pins the certificate on first contact and re-pins a rotated
+one only when the appliance CA vouches for it (``cp_tls``, #1219). Its tls/
+directory holds only public material: the pin, its own client certificate
+and the CA chain; the private key lives in identity/, which is not mounted.
+The DIRECTORY is mounted, not the file: the supervisor replaces the pin
+atomically (a new inode), which a single-file bind mount would never see.
+``type: Directory`` rather than DirectoryOrCreate, so kubelet never creates
+it root-owned ahead of the supervisor; the pod waits until it exists. The
+agent reads the file on every client build and fails closed while it is
+absent. The one exception is ``controlPlaneTls.insecureSkipVerify``, which the
+supervisor sets only when it was itself started with the skip (see
+values.yaml): a supervisor that does not verify pins nothing. Paths match ``cp_tls.PIN_FILENAME`` + the supervisor's STATE_DIR
+(pinned by agent/supervisor/tests/test_role_pod_pinned_tls.py).
+*/}}
+{{- define "spatiumddi-appliance.cpPin.env" -}}
+{{- if (.Values.controlPlaneTls).insecureSkipVerify }}
+- name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+  value: "1"
+{{- else }}
+- name: TLS_PINNED_CERTS_PATH
+  value: /var/lib/spatium-cp-tls/control-plane.pem
+{{- end }}
+{{- end -}}
+
+{{- define "spatiumddi-appliance.cpPin.mount" -}}
+{{- if not (.Values.controlPlaneTls).insecureSkipVerify }}
+- name: cp-tls-pin
+  mountPath: /var/lib/spatium-cp-tls
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "spatiumddi-appliance.cpPin.volume" -}}
+{{- if not (.Values.controlPlaneTls).insecureSkipVerify }}
+- name: cp-tls-pin
+  hostPath:
+    path: {{ printf "%s/tls" .Values.supervisor.hostMounts.stateDir }}
+    type: Directory
+{{- end }}
+{{- end -}}

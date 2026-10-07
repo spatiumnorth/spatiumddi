@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
   rolesApi,
   type AppRole,
   type PermissionEntry,
@@ -10,9 +11,14 @@ import {
 } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
-// Mirror of docs/PERMISSIONS.md — keep these in sync.
+// What a new grant row offers: a mirror of docs/PERMISSIONS.md, keep these in
+// sync. A role can hold more than these lists name — the built-in roles do
+// (`approve`, `appliance`, `change_request`, …) — so each select also offers
+// the value its row holds (`withHeld`), and shows it (#1394).
 const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
 const RESOURCE_TYPES = [
   "*",
@@ -41,6 +47,14 @@ const RESOURCE_TYPES = [
   "settings",
   "api_token",
 ] as const;
+
+/** A list's options plus the value a grant holds, when the list does not
+ * name it. A controlled select whose value is not among its options shows
+ * the first option instead, so a role's dialog showed `admin · *` for its
+ * `admin · appliance` grant (#1394). */
+function withHeld(list: readonly string[], held: string): string[] {
+  return list.includes(held) ? [...list] : [...list, held];
+}
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -110,7 +124,7 @@ function PermissionEditor({
             value={p.action}
             onChange={(e) => update(idx, { action: e.target.value })}
           >
-            {ACTIONS.map((a) => (
+            {withHeld(ACTIONS, p.action).map((a) => (
               <option key={a}>{a}</option>
             ))}
           </select>
@@ -119,7 +133,7 @@ function PermissionEditor({
             value={p.resource_type}
             onChange={(e) => update(idx, { resource_type: e.target.value })}
           >
-            {RESOURCE_TYPES.map((t) => (
+            {withHeld(RESOURCE_TYPES, p.resource_type).map((t) => (
               <option key={t}>{t}</option>
             ))}
           </select>
@@ -157,6 +171,11 @@ function RoleModal({
     role?.permissions ?? [],
   );
   const [error, setError] = useState<string | null>(null);
+  // #1412 — shown once the server says this change makes someone a
+  // superadmin; the dialog cannot work that out itself.
+  const [needsStepUp, setNeedsStepUp] = useState(false);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -166,7 +185,10 @@ function RoleModal({
         permissions,
       };
       return role
-        ? rolesApi.update(role.id, payload as RoleUpdate)
+        ? rolesApi.update(role.id, {
+            ...(payload as RoleUpdate),
+            ...(needsStepUp ? stepUpBody(stepPassword, stepTotp) : {}),
+          })
         : rolesApi.create(payload as RoleCreate);
     },
     onSuccess: () => {
@@ -174,6 +196,11 @@ function RoleModal({
       onClose();
     },
     onError: (err: unknown) => {
+      if (isStepUpRequired(err)) {
+        setNeedsStepUp(true);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: unknown } } })?.response?.data
           ?.detail ?? "Failed to save role";
@@ -216,6 +243,15 @@ function RoleModal({
         <fieldset disabled={readOnly} className="disabled:opacity-60">
           <PermissionEditor value={permissions} onChange={setPermissions} />
         </fieldset>
+        {needsStepUp && (
+          <StepUpSection
+            reason="This change makes members of the groups holding this role superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -230,7 +266,11 @@ function RoleModal({
                 setError(null);
                 mutation.mutate();
               }}
-              disabled={!name || mutation.isPending}
+              disabled={
+                !name ||
+                mutation.isPending ||
+                (needsStepUp && !stepPassword && !stepTotp)
+              }
               className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {mutation.isPending ? "Saving…" : "Save"}
@@ -318,6 +358,12 @@ function DeleteModal({
           Any groups referencing it will lose those permissions. This cannot be
           undone.
         </p>
+        {/* A refused or failed delete says so; the dialog stays (#1344). */}
+        {mutation.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

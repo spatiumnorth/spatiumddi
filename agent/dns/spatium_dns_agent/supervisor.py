@@ -94,6 +94,11 @@ def _select_driver(cfg: AgentConfig) -> DriverBase:
 
 
 def run(cfg: AgentConfig) -> int:
+    # Every start, so it cannot scroll out of view (#1220).
+    tls_warning = cfg.tls_warning()
+    if tls_warning:
+        log.warning("control_plane_tls", detail=tls_warning)
+
     # Bootstrap / token
     _agent_id, token = ensure_token(cfg)
     token_ref = [token]
@@ -203,8 +208,9 @@ def run(cfg: AgentConfig) -> int:
     # liveness probes (tcp :53 — the appliance chart's, and the umbrella
     # chart's since #1056) still bound the wait if no bundle ever comes.
     daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
-    # The deferred wait can only ever begin here — ``daemon_launched()`` never
-    # goes back to False — so it is measured from the loop's start (a breath
+    # The deferred wait can only ever begin here — ``daemon_launched()`` goes
+    # back to False only inside a driver's own restart, which the loop skips
+    # (#1402) — so it is measured from the loop's start (a breath
     # after ``start_daemon`` deferred), not from the tick that first noticed
     # it: the re-log then reads 1, 2, 4, 8 … s, the schedule's own numbers.
     loop_started = time.monotonic()
@@ -222,7 +228,13 @@ def run(cfg: AgentConfig) -> int:
         # with exit 2 and a dns_agent_thread_died in its log).
         if stopping.is_set():
             break
-        if cfg.driver in daemon_managed_drivers:
+        # #1402 — no verdict while the driver restarts its own daemon (PowerDNS
+        # re-reading a changed pdns.conf): mid-restart the old daemon is gone
+        # while ``daemon_pid`` still names it, then ``daemon_pid`` is cleared
+        # before the new spawn, and those read as a death and as a deferred
+        # start. The restart is bounded (stop timeout, spawn wait, API wait),
+        # and a daemon it fails to bring up is judged on the next tick.
+        if cfg.driver in daemon_managed_drivers and not driver.daemon_restarting():
             if driver.daemon_running():
                 if waiting:
                     log.info(
@@ -249,9 +261,17 @@ def run(cfg: AgentConfig) -> int:
                 # that lands inside ``daemon_running()`` (a rollout that took
                 # named first) arrives here with the daemon gone and the stop
                 # already requested. A stop is a stop, whenever it lands.
-                if not stopping.is_set():
+                # The restart check above ran before these reads, so a restart
+                # can have begun since (the old pid is what died) or finished
+                # since (a new daemon is up). Ask again before calling it a
+                # death.
+                if not stopping.is_set() and not (
+                    driver.daemon_restarting() or driver.daemon_running()
+                ):
                     log.error("dns_daemon_exited", driver=cfg.driver)
                     return 2
+            elif driver.daemon_restarting():
+                pass  # ``daemon_pid`` cleared mid-restart: not a deferred start
             else:
                 if not waiting:
                     waiting = True

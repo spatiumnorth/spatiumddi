@@ -39,8 +39,9 @@ export function QrCode({
   // `buildQrMatrix` throws when the payload exceeds what a QR code can hold
   // (qrcode-generator: "code length overflow"). Letting that escape a render
   // unwinds to the app-level ErrorBoundary and takes the whole page with it —
-  // and this component's one caller is the reveal-once token modal, so a
-  // crash there loses a credential that can never be shown again.
+  // and its callers are reveal-once screens (the API token, the MFA
+  // enrolment secret), so a crash there loses a credential that can never be
+  // shown again.
   const result = useMemo(() => {
     try {
       return { matrix: buildQrMatrix(value, level) };

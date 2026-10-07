@@ -11,9 +11,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
-from app.core.security import decode_access_token, hash_api_token
+from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.db import AsyncSessionLocal, get_db
-from app.models.auth import APIToken, User, UserSession
+from app.models.auth import APIToken, User
 from app.services.api_token_scopes import scope_matches_request
 
 logger = structlog.get_logger(__name__)
@@ -157,7 +157,7 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     # reset (or whose password expires) must not be a bypass around the
     # interactive lockout. Same recovery allowlist (the recovery endpoints
     # are session-only, so in practice this just 403s the token).
-    if user.force_password_change and not _path_in_recovery_allowlist(request.url.path):
+    if user.password_change_required and not _path_in_recovery_allowlist(request.url.path):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Password change required before continuing",
@@ -205,22 +205,26 @@ async def get_current_user(
             detail="Invalid or expired token",
         )
 
-    # Issue #72 — session viewer / force-logout. Tokens minted after
-    # the session-viewer landing carry a ``jti`` claim that maps to a
-    # ``UserSession`` row. We reject if that row is revoked or expired,
-    # which is the force-logout effect: the superadmin flips
-    # ``revoked``, every in-flight access token using that jti starts
-    # 401-ing on the next request. Tokens without a ``jti`` (legacy or
-    # in-flight at deploy time) are allowed through — they expire on
-    # their own short TTL.
-    jti = payload.get("jti")
-    if jti is not None:
-        session = await db.get(UserSession, jti)
-        if session is None or session.revoked or session.expires_at <= datetime.now(UTC):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session revoked or expired",
-            )
+    # Issue #72 — session viewer / force-logout. Every access token carries
+    # a ``jti`` claim that maps to a ``UserSession`` row. We reject if that
+    # row is revoked or expired, which is the force-logout effect: the
+    # superadmin flips ``revoked``, every in-flight access token using that
+    # jti starts 401-ing on the next request. A token with no ``jti`` has
+    # already been refused by ``decode_access_token`` (#1222); the test
+    # suite alone lets one through. The session must also belong to the
+    # token's ``sub`` (``live_access_session``).
+    try:
+        session = await live_access_session(db, payload)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session revoked or expired",
+        )
+    if session is not None:
+        # When this session's user actually signed in — a refresh keeps it
+        # (#1241). MFA enrolment reads it to ask an external-auth user, who
+        # has no local password to re-enter, for a recent sign-in instead.
+        request.state.signed_in_at = session.created_at
         # Bump ``last_seen_at`` no more than once per minute per
         # session — gives the admin viewer a recent timestamp without
         # a write on every authenticated request.
@@ -249,7 +253,7 @@ async def get_current_user(
     # it here closes both the "must change" and the "password expired" cases.
     # We reject every request EXCEPT the password-recovery allowlist so the
     # user can still rotate their password and log out — anything else 403s.
-    if user.force_password_change and not _path_in_recovery_allowlist(request.url.path):
+    if user.password_change_required and not _path_in_recovery_allowlist(request.url.path):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Password change required before continuing",

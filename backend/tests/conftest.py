@@ -82,6 +82,11 @@ _TEST_DATABASE_URL = _per_worker_url(_BASE_TEST_DATABASE_URL, _WORKER)
 # set; in xdist mode it swaps to the worker-suffixed name.
 os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
 
+# Tests boot on whatever SECRET_KEY the environment has, the .env.example
+# placeholder included, which the app otherwise refuses (#1222). setdefault,
+# so an explicit ALLOW_INSECURE_SECRET_KEY=false still wins.
+os.environ.setdefault("ALLOW_INSECURE_SECRET_KEY", "true")
+
 import asyncpg  # noqa: E402  — must follow the DATABASE_URL override above
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
@@ -94,8 +99,13 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
 )
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+import app.core.security as _security  # noqa: E402
 from app.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
+
+# Test fixtures mint access tokens with no session row; production refuses
+# those (#1222). test_secret_key_hardening.py turns this back off to prove it.
+_security.ACCEPT_ACCESS_TOKENS_WITHOUT_SESSION = True
 from app.models.base import Base  # noqa: E402
 
 # NullPool: open a fresh asyncpg connection on every checkout and drop it on
@@ -167,6 +177,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     couldn't see. Individual suites used to opt in to a local reset
     fixture; doing it globally fixes the whole class.
     """
+    from app.api import health
     from app.core import maintenance_mode
     from app.services import feature_modules
     from app.services.appliance import cluster_health
@@ -183,11 +194,14 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # stubbed verdict outlives the per-test TRUNCATE and would answer for
     # unrelated tests.
     cluster_health.invalidate_probe_cache()
+    # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
+    health.invalidate_worker_ping_cache()
     yield
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
+    health.invalidate_worker_ping_cache()
 
 
 @pytest.fixture(autouse=True)

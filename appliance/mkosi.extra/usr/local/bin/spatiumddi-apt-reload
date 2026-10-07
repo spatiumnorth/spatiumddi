@@ -100,15 +100,32 @@ except (OSError, ValueError):
     data = {}
 u = data.get("unattended") or {}
 enabled = "1" if u.get("enabled", True) else "0"
-origins = [str(o) for o in (u.get("origins") or []) if str(o).strip()]
-blocklist = [str(b) for b in (u.get("blocklist") or []) if str(b).strip()]
+
+
+def representable(kind: str, values) -> list:
+    # apt.conf has NO escape syntax inside a double-quoted string (#1384,
+    # verified against apt-config): a backslash is kept literally and a
+    # double quote ends the string. So values are written verbatim — doubling
+    # a backslash would hand unattended-upgrades a different regex than the
+    # one the operator saved — and a value carrying a quote or a control
+    # character (both refused by the API) is dropped with a warning rather
+    # than rendered into a file apt-config would reject whole.
+    out = []
+    for v in values:
+        s = str(v)
+        if not s.strip():
+            continue
+        if '"' in s or any(ord(c) < 0x20 or ord(c) == 0x7F for c in s):
+            print(f"  ! WARN: dropping {kind} entry {s!r}: apt.conf cannot express it")
+            continue
+        out.append(s)
+    return out
+
+
+origins = representable("allowed-origins", u.get("origins") or [])
+blocklist = representable("package-blacklist", u.get("blocklist") or [])
 auto_reboot = "true" if u.get("automatic_reboot") else "false"
 reboot_time = (str(u.get("reboot_time") or "02:00").strip() or "02:00")
-
-
-def esc(s: str) -> str:
-    # apt.conf double-quoted string: escape backslash then quote.
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 with open(timer_path, "w", encoding="utf-8") as fh:
@@ -118,13 +135,13 @@ with open(timer_path, "w", encoding="utf-8") as fh:
 
 lines = ["// Managed by SpatiumDDI — Settings → Appliance → APT (#164)."]
 lines.append("Unattended-Upgrade::Allowed-Origins {")
-lines += [f'    "{esc(o)}";' for o in origins]
+lines += [f'    "{o}";' for o in origins]
 lines.append("};")
 lines.append("Unattended-Upgrade::Package-Blacklist {")
-lines += [f'    "{esc(b)}";' for b in blocklist]
+lines += [f'    "{b}";' for b in blocklist]
 lines.append("};")
 lines.append(f'Unattended-Upgrade::Automatic-Reboot "{auto_reboot}";')
-lines.append(f'Unattended-Upgrade::Automatic-Reboot-Time "{esc(reboot_time)}";')
+lines.append(f'Unattended-Upgrade::Automatic-Reboot-Time "{reboot_time}";')
 with open(policy_path, "w", encoding="utf-8") as fh:
     fh.write("\n".join(lines) + "\n")
 PYEOF

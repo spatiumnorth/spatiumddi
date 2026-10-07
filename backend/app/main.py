@@ -1,4 +1,5 @@
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -18,6 +19,7 @@ from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
+from app.core.request_meta import TrustedProxyMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -470,6 +472,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_schema_behind_head_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
+    # Record the schema head this release runs at (#1227), so a later
+    # rollback to it can be checked before the switch rather than after.
+    # Only once the schema is at head; never blocks startup.
+    try:
+        from app.services.upgrades.schema_rollback import record_this_release  # noqa: PLC0415
+
+        await record_this_release()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("release_schema_head_record_failed", error=str(exc))
     # cluster-upgrade-failed alert rule — singleton, enabled by default
     # (issue #296 Phase F). Fires when the rolling-upgrade orchestrator
     # flips a SystemUpgradeRun to ``state='failed'``.
@@ -546,6 +557,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_bundle_render_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_bundle_render_failed_alert_rule_seed_skipped", reason=str(exc))
+    # #1232 — a DNS record change an agent gave up on after every retry.
+    # Singleton, ENABLED by default. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dns_record_op_failed_alert_rule,
+        )
+
+        await seed_dns_record_op_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
@@ -678,6 +699,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_restore_drill_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("restore_drill_alert_rule_seed_skipped", reason=str(exc))
+    # Scheduled-backup failed / stale alert rules (#1262), ENABLED. Silent
+    # until a backup target has a schedule.
+    try:
+        from app.services.alerts import seed_backup_alert_rules  # noqa: PLC0415
+
+        await seed_backup_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("backup_alert_rules_seed_skipped", reason=str(exc))
     try:
         from app.services.alerts import seed_dns_tunneling_alert_rule  # noqa: PLC0415
 
@@ -800,23 +829,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("shutdown", service="api")
 
 
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _client_request_id(value: str | None) -> str | None:
+    """A caller's ``X-Request-ID``, when it is safe to log and echo.
+
+    Only a short id of plain characters is kept — it goes into every log
+    line and back out as a response header — and anything else is dropped
+    rather than truncated, since a truncated id would no longer match the
+    caller's. ``fullmatch``, not ``match``: ``$`` also matches before a
+    trailing newline.
+    """
+    if value and _REQUEST_ID_RE.fullmatch(value):
+        return value
+    return None
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Attach a request_id to structlog context for every request."""
+    """Attach a request_id to structlog context for every request.
+
+    ``request_id`` is ALWAYS generated here. It is what the log lines, the
+    Diagnostics row and ``audit_log.request_id`` carry (#1245), and the audit
+    column sits inside the tamper-evidence hash: an id the caller chose would
+    let a caller make its audit rows claim another request's id. A caller's
+    own ``X-Request-ID`` is kept as ``client_request_id`` on the log lines,
+    which is how a report quoting it finds the ``request_id``, and it is what
+    the response echoes back, so a caller still gets its own id (#1201).
+    """
 
     async def dispatch(self, request: Request, call_next: object) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        client_request_id = _client_request_id(request.headers.get("X-Request-ID"))
         # For the unhandled-exception handler (#1201): it runs in Starlette's
         # ServerErrorMiddleware, outside this one, so neither the header set
         # below nor this frame's locals reach its response. ``request.state``
         # lives on the ASGI scope, which that handler's Request shares.
         request.state.request_id = request_id
+        request.state.client_request_id = client_request_id
         structlog.contextvars.clear_contextvars()
-        structlog.contextvars.bind_contextvars(
-            request_id=request_id,
-            service="api",
-        )
+        structlog.contextvars.bind_contextvars(request_id=request_id, service="api")
+        if client_request_id:
+            structlog.contextvars.bind_contextvars(client_request_id=client_request_id)
         response: Response = await call_next(request)  # type: ignore[arg-type]
-        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Request-ID"] = client_request_id or request_id
         return response
 
 
@@ -894,8 +950,9 @@ def create_app() -> FastAPI:
         # error (#865). Without this the header is present on the wire but
         # the JS layer can't read it under CORS — for a cross-origin
         # frontend the feature would silently degrade to the dead end it
-        # fixes.
-        expose_headers=["X-Total-Count", "X-Adoption-Required"],
+        # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
+        # step-up, so a dialog can prompt and resubmit (#1412).
+        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
@@ -910,6 +967,14 @@ def create_app() -> FastAPI:
         TrustedHostMiddleware,
         allowed_hosts=settings.trusted_hosts_list,
     )
+
+    # #1221 — resolve the client address and scheme from X-Real-IP /
+    # X-Forwarded-Proto ONLY when the TCP peer is a trusted proxy. Added after
+    # TrustedHost so it runs outermost: everything below (request id, the
+    # login throttle, audit rows, the refresh cookie's Secure flag) sees the
+    # resolved values. uvicorn runs with --no-proxy-headers for this to see
+    # the real peer (backend/Dockerfile).
+    app.add_middleware(TrustedProxyMiddleware, trusted=settings.trusted_proxy_networks)
 
     # Routes
     app.include_router(health_router)
@@ -1211,8 +1276,14 @@ def create_app() -> FastAPI:
         # sent (#1201): this used to read the request header alone, so a
         # client that sent none got a 500 with no X-Request-ID and a log line
         # and Diagnostics row carrying ``request_id: null``.
-        request_id = getattr(request.state, "request_id", None) or request.headers.get(
-            "X-Request-ID"
+        #
+        # When the exception came from a middleware OUTSIDE that one, nothing
+        # is on ``request.state``: generate the id here rather than adopting
+        # the raw header, which is unvalidated — a long one would fail the
+        # Diagnostics row's 64-character column and lose the record.
+        request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+        echo_id = getattr(request.state, "client_request_id", None) or _client_request_id(
+            request.headers.get("X-Request-ID")
         )
         try:
             sanitised_headers = {
@@ -1252,7 +1323,7 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal Server Error"},
-            headers={"X-Request-ID": request_id} if request_id else None,
+            headers={"X-Request-ID": echo_id or request_id},
         )
 
     # The 422 the document declares is not the only 422 the API returns.

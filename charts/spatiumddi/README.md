@@ -7,10 +7,12 @@ StatefulSets.
 
 - **Chart type:** application
 - **Registry:** `oci://ghcr.io/spatiumnorth/charts/spatiumddi`
-- **Versioning:** Each SpatiumDDI release tag (CalVer `YYYY.MM.DD-N`)
-  publishes a chart version with leading zeroes stripped so it's a
-  valid SemVer 2 identifier — e.g. tag `2026.04.20-1` →
-  chart version `2026.4.20-1`.
+- **Versioning:** Each SpatiumDDI release tag publishes a chart version.
+  A CalVer tag (`YYYY.MM.DD-N`, up to the bridge release) has its
+  leading zeroes stripped so it's a valid SemVer 2 identifier — e.g. tag
+  `2026.04.20-1` → chart version `2026.4.20-1`. A SemVer tag (from
+  1.0.0) is the chart version unchanged. Every CalVer chart is a SemVer
+  pre-release, so Helm finds it only with an explicit `--version`.
 
 ## TL;DR
 
@@ -276,6 +278,10 @@ subcharts verbatim — any option those charts accept works here. See:
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `storage.dnsState` (or `storage.keaState`), `service.type`,
+`service.nodePort` (DHCP only; pins the node-facing port of a NodePort
+DHCP Service, which is otherwise random. Only useful for a relay that can
+forward to a non-standard port: most, including `ip helper-address`, send
+to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
 `hostNetwork` (DHCP only), and `resources`.
 
 ## Upgrade

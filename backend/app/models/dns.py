@@ -115,9 +115,13 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # TSIG key shared by all servers in this group, used to authenticate
     # RFC 2136 dynamic updates from the agent over loopback. Auto-generated
-    # on first server registration.
+    # on first server registration. The BIND9 agent grants it allow-update
+    # and allow-transfer on every primary zone the group serves, so the
+    # secret is Fernet-encrypted like every other credential (#1364); read
+    # and write it through ``group_tsig_secret`` / ``set_group_tsig_secret``
+    # in ``app.services.dns.tsig``.
     tsig_key_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tsig_key_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tsig_key_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     tsig_key_algorithm: Mapped[str] = mapped_column(
         String(50), nullable=False, default="hmac-sha256"
     )
@@ -145,6 +149,16 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # default; existing groups stay unaffected.
     is_public_facing: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    # #1171 — the group's bundles carry each zone's own SOA timers. False while
+    # any BIND9 agent of the group writes the literal 3600 600 86400 300 (an
+    # older release): the bundles then carry that literal, so every agent
+    # serves one SOA under each serial. ``services.dns.soa_timers`` switches it
+    # and moves the serial of each zone whose timers differ, in one
+    # transaction.
+    serves_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
     )
 
     servers: Mapped[list["DNSServer"]] = relationship(
@@ -236,6 +250,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #1171 — this server's agent writes each zone's own SOA timers into its
+    # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
+    # register or heartbeat. False for an agent of an older release, which
+    # writes 3600 600 86400 300 for every zone. A group serves the zones' own
+    # timers only while every BIND9 agent in it does
+    # (``services.dns.soa_timers``).
+    agent_renders_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -442,6 +465,10 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     """Per-record mutation queued for an agent to apply via RFC 2136."""
 
     __tablename__ = "dns_record_op"
+    # #1232 — the successor lookup (``record_ops._successors``) and the page
+    # query both read a server's ops from a point in time onward; the table
+    # is never pruned, so without this they scan every op the server ever had.
+    __table_args__ = (Index("ix_dns_record_op_server_created", "server_id", "created_at"),)
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -463,6 +490,17 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1232 — a failed attempt returns the op to ``pending`` with this set to
+    # when it may ship again (exponential backoff); NULL = ship now. Before,
+    # every retry went out on the next heartbeat and a ~2.5 min daemon outage
+    # used all of them.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1232 — state ``superseded``: a newer op for the same RRset exists, and
+    # because every op carries the WHOLE desired RRset (#773) the newer one
+    # already delivers this op's change. Retrying this one after it would
+    # revert the newer state. Points at that newer op so a waiter (ACME
+    # DNS-01) can follow the chain to the op that actually carries the change.
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # #1111 — the transaction that queued the op (``pg_current_xact_id()``).
     # ``created_at`` is that transaction's START, so it cannot say whether
     # the op had committed before a render read its records; visibility of
@@ -581,7 +619,7 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     gss_tsig_realm: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gss_tsig_principal: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    # Notify — yes | no | explicit | master-only
+    # Notify — yes | no | explicit | master-only | primary-only
     notify_enabled: Mapped[str] = mapped_column(String(20), nullable=False, default="yes")
     also_notify: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     allow_notify: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -852,6 +890,18 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+# The SOA timers a zone gets when none are given: REFRESH, RETRY, EXPIRE and
+# MINIMUM (the negative-cache TTL). They are what the BIND9 agent served for
+# every zone before it rendered the stored ones (#1171), so a new zone serves
+# what every zone always has. The old defaults (86400 / 7200 / 3600000 / 3600)
+# were stored but never served, and a one-hour negative TTL is long for a DDI:
+# a name looked up before its DDNS record exists stays NXDOMAIN for the hour.
+ZONE_DEFAULT_REFRESH = 3600
+ZONE_DEFAULT_RETRY = 600
+ZONE_DEFAULT_EXPIRE = 86400
+ZONE_DEFAULT_MINIMUM = 300
+
+
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
 
@@ -882,10 +932,10 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     # SOA fields
     ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
-    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
-    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=7200)
-    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=3600000)
-    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_REFRESH)
+    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_RETRY)
+    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_EXPIRE)
+    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_MINIMUM)
     primary_ns: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     admin_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 

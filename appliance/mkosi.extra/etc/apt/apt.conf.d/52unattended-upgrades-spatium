@@ -3,12 +3,25 @@
 // drop-in adds the appliance-specific policy on top so distro
 // updates to 50 don't get clobbered.
 
-// Only the security pocket — no major version upgrades. Kernel
-// updates ARE allowed in the security pocket but they need a
-// reboot to take effect (the appliance dashboard will surface
-// /var/run/reboot-required once Phase 6 fleet-management lands).
+// Only the security pocket — no major version upgrades.
 Unattended-Upgrade::Origins-Pattern {
     "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+
+// No kernels (#1249). Each slot boots /boot/vmlinuz and /boot/initrd.img,
+// symlinks the slot-image build and the installer point at the image's own
+// kernel. A new-ABI kernel package installed in place does not move them
+// (Debian links in /, not /boot), so it would never boot: it would only take
+// space in a fixed-size slot. A revision of the slot's own ABI is worse: it
+// overwrites the vmlinuz-<ver> they point at and rebuilds the initrd on the
+// device, so the slot boots a kernel its image never shipped. Kernels arrive
+// with slot images instead. A prefix,
+// because unattended-upgrades matches these as regexes from the start of
+// the name: linux-image-amd64 / -arm64 / -rpi-2712 and the versioned
+// packages. apt merges this list with the operator's blocklist in
+// 50unattended-upgrades (#164), so neither replaces the other.
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image-";
 };
 
 // No mail — the appliance has no MTA and we don't want operators

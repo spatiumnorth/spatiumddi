@@ -13,14 +13,18 @@ from app.services.backup.targets.azure_blob import AzureBlobDestination
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     DESTINATIONS,
+    PRE_RESTORE_KEEP_LAST_N,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     DestinationConfigError,
+    InvalidArchiveNameError,
     RetentionLockedError,
     UnsupportedOperationError,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
+    safe_filename,
 )
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.gcs import GcsDestination
@@ -60,6 +64,7 @@ __all__ = [
     "BackupDestinationError",
     "UnsupportedOperationError",
     "DestinationConfigError",
+    "InvalidArchiveNameError",
     "RetentionLockedError",
     "AzureBlobDestination",
     "FtpDestination",
@@ -72,12 +77,15 @@ __all__ = [
     "SmbDestination",
     "WebDAVDestination",
     "DESTINATIONS",
+    "PRE_RESTORE_KEEP_LAST_N",
     "REDACTED_SENTINEL",
     "SecretFieldError",
     "decrypt_config_secrets",
     "encrypt_config_secrets",
     "get_destination",
+    "is_pre_restore_archive",
     "list_destination_kinds",
     "merge_config_for_update",
     "redact_config_secrets",
+    "safe_filename",
 ]

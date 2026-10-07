@@ -152,6 +152,17 @@ RUN useradd --no-create-home --shell /bin/false app \
     && chown -R app:app /var/lib/spatiumddi
 
 COPY --from=builder /install /usr/local
+
+# The base image's pip is removed (#1392): nothing at runtime runs it, and
+# it is not a Debian package, so ``apt-get upgrade`` can never patch it and
+# every scan at default severity reports its CVEs. A production image also
+# has no business carrying a package installer. The ``dev`` stage below puts
+# it back with ``ensurepip``. This runs AFTER the builder COPY, and asserts,
+# so a dependency that ever pulls pip in transitively cannot quietly put it
+# back into /usr/local.
+RUN python -m pip uninstall -y --root-user-action=ignore pip \
+    && ! python -c "import pip" 2>/dev/null
+
 COPY --chown=app:app . .
 
 USER app
@@ -161,14 +172,15 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
 
-# --proxy-headers + --forwarded-allow-ips=* makes uvicorn honor
-# X-Forwarded-For / X-Forwarded-Proto when populating request.client
-# and request.url.scheme. Required so the audit log captures the real
-# end-user IP rather than the frontend nginx container's IP. The
-# wildcard is safe here because the api container is only reachable
-# from inside the compose / k8s network — the frontend nginx is the
-# only entity talking to it, and nginx is under our control.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --no-proxy-headers: uvicorn must NOT rewrite request.client /
+# request.url.scheme from forwarding headers itself. It used to, with
+# --forwarded-allow-ips=* (#626), which let any caller that reached the
+# api directly choose its own address (#1221). The app's
+# TrustedProxyMiddleware (app/core/request_meta.py) needs the real TCP
+# peer, and applies X-Real-IP / X-Forwarded-Proto only when that peer is
+# in TRUSTED_PROXY_CIDRS, so audit rows still record the end user's IP
+# behind nginx rather than the nginx container's.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]
 
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────
@@ -190,7 +202,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 # writes), then switch back to ``app`` so the runtime CMD stays unchanged.
 FROM runtime AS dev
 USER root
-RUN pip install --no-cache-dir --root-user-action=ignore \
+# The runtime stage removed pip (#1392); ``--default-pip`` restores the plain
+# ``pip`` command too, which ``make ci-backend-lint`` execs into this image.
+RUN python -m ensurepip --default-pip \
+    && python -m pip install --no-cache-dir --root-user-action=ignore \
         "pytest>=8.3.0" \
         "pytest-asyncio>=0.24.0" \
         "pytest-cov>=6.0.0" \

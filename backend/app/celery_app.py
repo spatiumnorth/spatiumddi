@@ -1,9 +1,67 @@
+import contextvars
+import functools
 import importlib
+import sys
+from collections.abc import Mapping
+from typing import Any
 
+import structlog
 from celery import Celery
 from celery.schedules import crontab, schedule
+from celery.signals import (
+    beat_init,
+    setup_logging,
+    task_failure,
+    task_postrun,
+    task_prerun,
+    worker_init,
+)
 
 from app.config import settings
+
+# ── Broker connection pool bounds (GHSA-c58p-8cq9-g3gm) ─────────────────
+#
+# Every ``.delay()`` and every ``inspect`` broadcast checks a connection out
+# of kombu's per-process pool, and both Celery and kombu acquire with
+# ``block=True`` and NO timeout — there is no Celery setting for one. A
+# broadcast holds one connection while it acquires a second for its
+# producer, so enough concurrent holders exhaust the pool and every later
+# acquire waits forever; in the api that wait ran on the event loop and hung
+# the whole process until restart. The limit is pinned explicitly (it is
+# kombu's default of 10, now a decision rather than an accident) and an
+# exhausted pool raises ``kombu.exceptions.LimitExceeded`` after
+# ``BROKER_POOL_ACQUIRE_TIMEOUT_S`` instead of blocking.
+BROKER_POOL_LIMIT = 10
+BROKER_POOL_ACQUIRE_TIMEOUT_S = 5.0
+
+
+def _install_pool_acquire_timeout() -> None:
+    """Give kombu's blocking pool acquires a default timeout.
+
+    ``kombu.resource.Resource.acquire`` is the one method both the
+    connection pool and the producer pool acquire through. Only a call that
+    would block forever (``block=True, timeout=None``) is changed; an
+    explicit timeout or a non-blocking acquire passes through untouched.
+    Idempotent, so a re-import does not wrap twice.
+    """
+    from kombu.resource import Resource  # noqa: PLC0415
+
+    original = Resource.acquire
+    if getattr(original, "_spatium_acquire_timeout", False):
+        return
+
+    @functools.wraps(original)
+    def acquire(self: Any, block: bool = False, timeout: float | None = None) -> Any:
+        if block and timeout is None:
+            # Read at call time so the bound stays a single module constant.
+            timeout = BROKER_POOL_ACQUIRE_TIMEOUT_S
+        return original(self, block=block, timeout=timeout)
+
+    acquire._spatium_acquire_timeout = True  # type: ignore[attr-defined]
+    Resource.acquire = acquire  # type: ignore[method-assign]
+
+
+_install_pool_acquire_timeout()
 
 celery_app = Celery(
     "spatiumddi",
@@ -13,6 +71,7 @@ celery_app = Celery(
         "app.tasks.ipam_dns_sync",
         "app.tasks.ipam_utilization_recount",
         "app.tasks.dns",
+        "app.tasks.blocklist_refresh_sweep",
         "app.tasks.dns_pull",
         "app.tasks.looking_glass",
         "app.tasks.dhcp_health",
@@ -88,10 +147,12 @@ celery_app.conf.update(
     task_acks_late=True,  # Required for idempotency — task not acked until complete
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    broker_pool_limit=BROKER_POOL_LIMIT,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+        "app.tasks.blocklist_refresh_sweep.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
@@ -201,6 +262,13 @@ celery_app.conf.update(
         "lg-route-reresolve-sweep": {
             "task": "app.tasks.looking_glass.reresolve_route_links",
             "schedule": schedule(run_every=300.0),
+        },
+        # Every hour, queue a feed refresh for each enabled URL blocklist
+        # whose ``update_interval_hours`` has elapsed since its last sync
+        # (#1467). 0 = manual only. Hourly is the granularity, as for OUI.
+        "dns-blocklist-refresh": {
+            "task": "app.tasks.blocklist_refresh_sweep.dispatch_due_blocklists",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
@@ -751,8 +819,8 @@ if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
 # uncaught task exception lands in the ``internal_error`` table so
 # operators can review crashes without tailing ``docker compose logs
 # worker``. ``task_revoked`` and ``task_unknown`` are deliberately
-# *not* hooked — those are operational signals, not bugs.
-from celery.signals import task_failure  # noqa: E402
+# *not* hooked — those are operational signals, not bugs. The handler,
+# ``_capture_task_failure``, is below the init-signal handlers.
 
 # Schema-at-head signal registration (issue #565). ``app.tasks.
 # schema_check`` connects ``worker_ready`` / ``beat_init`` /
@@ -763,8 +831,6 @@ from celery.signals import task_failure  # noqa: E402
 # Use import_module (not a bound ``import … as _x``) so static analysis
 # doesn't flag a side-effect-only import as unused.
 importlib.import_module("app.tasks.schema_check")
-
-from celery.signals import beat_init, worker_init  # noqa: E402
 
 
 @worker_init.connect
@@ -832,3 +898,95 @@ def _capture_task_failure(
         request_id=task_id,
         context=context,
     )
+
+
+# ── Structured logging in the worker and beat (issue #1246) ─────────────
+#
+# ``configure_logging`` used to run only in the api's lifespan, so worker
+# and beat output was Celery's plain text plus structlog's dev console
+# renderer, with no ``service`` and no ``request_id`` — non-negotiable #7.
+
+#: ``celery`` global options that take a value, so the token after them is
+#: not the subcommand. Every other ``-x`` / ``--x`` / ``--x=v`` is a flag.
+_CELERY_VALUE_OPTIONS = frozenset(
+    {"-A", "--app", "-b", "--broker", "--result-backend", "--loader", "--config", "--workdir"}
+)
+
+
+def _celery_service(argv: list[str] | None = None) -> str:
+    """``beat`` or ``worker``, from the ``celery -A app.celery_app <cmd>``
+    command line. ``setup_logging`` fires in both before either's own init
+    signal, and does not say which one it is.
+
+    Decided by the SUBCOMMAND, not by any token equal to ``beat``: a queue
+    named ``beat`` (``worker -Q beat``) is still a worker. A worker running
+    an embedded scheduler (``worker -B``) is one process and logs as
+    ``worker``; its scheduler lines are told apart by ``logger=celery.beat``.
+    """
+    tokens = (argv if argv is not None else sys.argv)[1:]
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        if token in _CELERY_VALUE_OPTIONS:
+            skip = True
+            continue
+        if token.startswith("-"):
+            continue
+        return "beat" if token == "beat" else "worker"
+    return "worker"
+
+
+@setup_logging.connect
+def _configure_structured_logging(
+    loglevel: int | str | None = None, logfile: str | None = None, **_: object
+) -> None:
+    """Connecting ANY receiver to ``setup_logging`` stops Celery installing
+    its own root handler and redirecting stdout into it — which is what
+    would otherwise wrap every structlog JSON line in a second, plain-text
+    Celery record.
+
+    That also means Celery no longer applies ``--loglevel`` / ``--logfile``
+    itself, so both are passed through: the level is the more verbose of
+    ``--loglevel`` and ``LOG_LEVEL`` (so ``--loglevel=debug`` still turns
+    debugging on), and ``--logfile`` receives the JSON lines.
+    """
+    importlib.import_module("app.log").configure_logging(
+        service=_celery_service(), level=loglevel, logfile=logfile or None
+    )
+
+
+#: The context tokens each running task's ``request_id`` / ``task`` binding
+#: replaced, keyed by task id, so postrun can restore rather than clear.
+_TASK_CONTEXT_TOKENS: dict[str, Mapping[str, contextvars.Token[Any]]] = {}
+
+
+@task_prerun.connect
+def _bind_task_request_id(
+    task_id: str | None = None, task: object | None = None, **_: object
+) -> None:
+    """The task id is the worker's ``request_id``: every line the task logs,
+    and every audit row it writes (#1245), carries it, so a scheduled
+    change can be traced from the audit log to the worker's output. The
+    ``task_failure`` hook above already files diagnostics under it."""
+    tokens = structlog.contextvars.bind_contextvars(
+        request_id=task_id, task=getattr(task, "name", None)
+    )
+    if task_id is not None:
+        _TASK_CONTEXT_TOKENS[task_id] = tokens
+
+
+@task_postrun.connect
+def _unbind_task_request_id(task_id: str | None = None, **_: object) -> None:
+    """Put back what the task's binding replaced.
+
+    Restored, not cleared: a task applied eagerly (``.apply()``, or
+    ``task_always_eager``) runs inside an API request or another task, and
+    clearing would leave the rest of that caller logging — and writing audit
+    rows — with no ``request_id``. In a prefork child with nothing bound
+    before, restoring IS clearing, so the next task still starts clean.
+    """
+    tokens = _TASK_CONTEXT_TOKENS.pop(task_id, None) if task_id is not None else None
+    if tokens:
+        structlog.contextvars.reset_contextvars(**tokens)

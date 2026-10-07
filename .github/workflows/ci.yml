@@ -346,6 +346,10 @@ jobs:
       - name: Run migrations
         env:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
+          # #1364 — b3c71e9a4d25 encrypts with the install's credential key,
+          # so importing app.core.crypto builds Settings, which refuses the
+          # placeholder SECRET_KEY. Same value as the test step below.
+          SECRET_KEY: ci-test-secret-key-not-for-production
         run: alembic upgrade head
 
       - name: Run tests (shard ${{ matrix.shard }} of 12)
@@ -636,7 +640,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        agent: [dhcp, dns, supervisor]
+        # looking-glass joined with #1220, its first tests: the agent had
+        # none, so its TLS handling had never run under CI.
+        agent: [dhcp, dns, supervisor, looking-glass]
     defaults:
       run:
         working-directory: agent/${{ matrix.agent }}

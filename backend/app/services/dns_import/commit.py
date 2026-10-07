@@ -17,18 +17,25 @@ partial-success state cleanly.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import contains_control_chars
+from app.drivers.dns import is_agentless
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServerGroup, DNSView, DNSZone
-from app.services.dns.record_ops import enqueue_record_ops_bulk, record_op_payload
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
+from app.services.dns.named_conf_validation import split_zone_forwarders
+from app.services.dns.record_ops import (
+    enqueue_record_ops_bulk,
+    record_op_payload,
+    resolve_primary_server,
+)
 
 from .canonical import (
     ConflictAction,
@@ -37,6 +44,8 @@ from .canonical import (
     ImportSource,
     ZoneConflict,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -257,6 +266,7 @@ async def _create_zone_at(
     overwrote_records: int,
     audit_action: str,
     audit_extra: dict[str, Any] | None = None,
+    source_server_id: uuid.UUID | None = None,
 ) -> CommitZoneResult:
     """Build the DNSZone + DNSRecord rows + audit log for one parsed
     zone and commit them in one transaction.
@@ -310,7 +320,31 @@ async def _create_zone_at(
     # importer always creates the zone fresh (overwrites delete + recreate),
     # so ``last_serial`` was just seeded from the parsed SOA and already
     # describes the state these records belong to.
-    if record_rows:
+    #
+    # #1456 — the exception is a live pull from an agentless server (cloud,
+    # Windows DNS) landing in a zone whose primary IS that server: the
+    # records were just read from it, so a create op would only push them
+    # back (a provider refuses the duplicate at best, stores it at worst).
+    # A renamed zone is not on that server under its new name, so it still
+    # gets its ops.
+    pushed_back_to_source = False
+    if (
+        record_rows
+        and source_server_id is not None
+        and target_name == _normalize_fqdn(parsed.name).lower()
+    ):
+        primary = await resolve_primary_server(db, zone)
+        pushed_back_to_source = (
+            primary is not None and primary.id == source_server_id and is_agentless(primary.driver)
+        )
+    if pushed_back_to_source:
+        logger.info(
+            "dns_import_record_ops_skipped",
+            zone=target_name,
+            records=records_created,
+            reason="records were pulled from the zone's primary",
+        )
+    elif record_rows:
         await db.flush()  # populate record PKs before snapshotting payloads
         await enqueue_record_ops_bulk(
             db,
@@ -410,6 +444,7 @@ async def _commit_one_zone(
     has_conflict: bool,
     current_user: User,
     now: datetime,
+    source_server_id: uuid.UUID | None = None,
 ) -> CommitZoneResult:
     """Apply one parsed zone with the operator-supplied action.
 
@@ -466,6 +501,7 @@ async def _commit_one_zone(
             source=source,
             current_user=current_user,
             now=now,
+            source_server_id=source_server_id,
             overwrote_records=0,
             audit_action="create",
             audit_extra=audit_extra,
@@ -484,6 +520,7 @@ async def _commit_one_zone(
                 source=source,
                 current_user=current_user,
                 now=now,
+                source_server_id=source_server_id,
                 overwrote_records=0,
                 audit_action="create",
             )
@@ -505,6 +542,7 @@ async def _commit_one_zone(
                 source=source,
                 current_user=current_user,
                 now=now,
+                source_server_id=source_server_id,
                 overwrote_records=0,
                 audit_action="create",
             )
@@ -518,6 +556,7 @@ async def _commit_one_zone(
             source=source,
             current_user=current_user,
             now=now,
+            source_server_id=source_server_id,
             overwrote_records=records_deleted,
             audit_action="update",
         )
@@ -536,6 +575,7 @@ async def _commit_one_zone(
         source=source,
         current_user=current_user,
         now=now,
+        source_server_id=source_server_id,
         overwrote_records=0,
         audit_action="create",
     )
@@ -589,10 +629,36 @@ async def commit_import(
     )
     conflicting = {c.zone_name for c in fresh_conflicts}
 
+    # #1357 — a BIND9 group renders a forward zone's forwarders as
+    # ``ip[ port n]``; an imported entry it cannot (a hostname, a DoH URL, a
+    # ``tls`` clause naming a definition that was not imported) would be
+    # dropped at render with only a log line. Drop it here instead and say
+    # so in the result. No servers yet reads as BIND9, as the API does.
+    drivers = set(
+        (
+            await db.execute(
+                select(DNSServer.driver).where(DNSServer.group_id == target_group_id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    bind9_target = not drivers or "bind9" in drivers
+    warnings = list(preview.warnings)
+
     now = datetime.now(UTC)
     results: list[CommitZoneResult] = []
 
     for parsed in preview.zones:
+        if bind9_target and parsed.forwarders:
+            kept, dropped = split_zone_forwarders(parsed.forwarders)
+            if dropped:
+                warnings.append(
+                    f"Zone {parsed.name!r}: dropped forwarder(s) "
+                    f"{', '.join(repr(v) for v, _ in dropped)} — a BIND9 group "
+                    "forwards to an IP address with an optional port only"
+                )
+            parsed = replace(parsed, forwarders=kept)
         target_name = _normalize_fqdn(parsed.name).lower()
         # Operator entry keyed by either the parsed name (preferred,
         # what the UI hands back) or the normalized form.
@@ -616,6 +682,7 @@ async def commit_import(
                 has_conflict=has_conflict,
                 current_user=current_user,
                 now=now,
+                source_server_id=preview.source_server_id,
             )
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
             await db.rollback()
@@ -629,5 +696,5 @@ async def commit_import(
     return CommitResult(
         target_group_id=target_group_id,
         zones=results,
-        warnings=list(preview.warnings),
+        warnings=warnings,
     )

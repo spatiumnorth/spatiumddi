@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFil
 from fastapi.responses import Response
 
 from app.api.deps import DB, CurrentUser
+from app.core.content_disposition import content_disposition
 from app.core.permissions import user_has_permission
 from app.core.responses import PdfResponse
 from app.services.ipam.address_set_gate import (
@@ -85,6 +86,14 @@ async def import_commit(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
+    # The import creates / updates blocks and subnets, so the coarse router
+    # gate (which also admits any address_set grant) is not enough.
+    for rtype in ("ip_block", "subnet"):
+        if not user_has_permission(current_user, "write", rtype):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: need 'write' on '{rtype}'",
+            )
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     result = await commit_import(
@@ -162,6 +171,7 @@ async def import_addresses_preview(
         payload,
         subnet_id=subnet_id,
         strategy=strategy,
+        current_user=current_user,
     )
     logger.info(
         "ipam_address_import_preview",
@@ -273,7 +283,7 @@ async def export_pdf_endpoint(
     return Response(
         content=data,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 
@@ -308,5 +318,5 @@ async def export_endpoint(
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )

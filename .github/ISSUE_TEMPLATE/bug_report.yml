@@ -11,14 +11,29 @@ body:
       value: |
         Thanks for reporting a bug. Please fill in as much as you can — it saves a round trip.
 
+        🔒 **Found a security vulnerability?** Don't file it here: issues are public.
+        Report it privately through
+        [GitHub Security Advisories](https://github.com/spatiumnorth/spatiumddi/security/advisories/new)
+        instead (see [SECURITY.md](https://github.com/spatiumnorth/spatiumddi/blob/main/SECURITY.md)).
+
+        Have a question rather than a bug? Ask in
+        [Discussions](https://github.com/spatiumnorth/spatiumddi/discussions).
+
   - type: input
     id: version
     attributes:
       label: SpatiumDDI version
-      description: "Git tag, image tag, or short commit SHA"
-      placeholder: "e.g. 2026.04.16-1 or ghcr.io/spatiumnorth/api:2026.04.16-2"
+      description: "Shown at the bottom of the sidebar, or returned by `GET /api/v1/version`. An image tag or short commit SHA also works."
+      placeholder: "e.g. 2026.11.03-1, 1.0.0 or ghcr.io/spatiumnorth/spatiumddi-api:1.0.0"
     validations:
       required: true
+
+  - type: input
+    id: regression
+    attributes:
+      label: Did this work in an earlier version?
+      description: If so, the last version you know worked. Leave blank if it never worked or you don't know.
+      placeholder: "e.g. worked in 2026.09.04-1"
 
   - type: dropdown
     id: deployment
@@ -28,11 +43,20 @@ body:
         - Docker Compose
         - Kubernetes (Helm)
         - Kubernetes (manifests)
-        - Bare metal / systemd
         - OS appliance
         - Local dev (make dev)
+        - Other
     validations:
       required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - amd64 (x86-64)
+        - arm64
+        - Don't know
 
   - type: dropdown
     id: area
@@ -42,14 +66,55 @@ body:
         - IPAM
         - DNS
         - DHCP
+        - Discovery (sweeps, SNMP, LLDP, nmap)
         - Auth (local / LDAP / OIDC / SAML / RADIUS / TACACS+)
         - Permissions / RBAC
-        - Audit / Observability
+        - Alerts / notifications / audit forwarding
+        - Audit log / observability
+        - Backup / restore
+        - Reporting / dashboards
+        - Integrations (Kubernetes, Proxmox, firewalls, cloud, …)
+        - Operator Copilot / MCP
+        - Appliance (OS, install, upgrade, Fleet)
+        - Deployment (Compose / Helm / manifests)
         - Frontend / UI
         - API
         - Migrations / DB
         - Docs
         - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: DNS / DHCP server involved
+      description: For DNS or DHCP bugs, which server software. Pick "Not applicable" otherwise.
+      options:
+        - Not applicable
+        - BIND9
+        - PowerDNS
+        - Technitium (agent-managed)
+        - Technitium (agentless API)
+        - Windows DNS
+        - Cloud DNS (Route 53 / Azure / Cloudflare / Google / other)
+        - Kea DHCP
+        - Kea DHCP (HA pair)
+        - Windows DHCP
+        - Several / other
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: The worst thing this causes. It helps us set the priority.
+      options:
+        - Data loss or corruption
+        - Wrong answers (DNS, DHCP leases or IPAM state are incorrect)
+        - A service is down (DNS / DHCP stops answering, or the UI or API is unusable)
+        - Install or upgrade fails or never finishes
+        - A feature doesn't work, but there is a workaround
+        - Cosmetic / minor annoyance
     validations:
       required: true
 
@@ -83,7 +148,7 @@ body:
     id: logs
     attributes:
       label: Relevant logs / tracebacks
-      description: API, worker, or browser console logs. Please redact secrets.
+      description: API, worker, agent or browser console logs. Please redact secrets.
       render: shell
 
   - type: markdown
@@ -117,7 +182,7 @@ body:
     id: env
     attributes:
       label: Environment details
-      description: PostgreSQL version, Redis version, reverse proxy, auth provider type, etc.
+      description: PostgreSQL version, Redis version, reverse proxy, auth provider type, node count, etc.
 
   - type: checkboxes
     id: checks
@@ -125,6 +190,8 @@ body:
       label: Pre-submission checks
       options:
         - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: This is not a security vulnerability (those go to Security Advisories, linked above)
           required: true
         - label: I am running a recent SpatiumDDI release (within the last ~2 releases)
           required: false

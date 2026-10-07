@@ -453,7 +453,8 @@ the reference topologies are in
 - **PostgreSQL HA = CloudNativePG.** The operator-managed `Cluster` CR
   is the permanent appliance default (`postgresql.kind=cnpg`); instances
   scale with the committed member count (1 → 3/5/7, primary + streaming
-  replicas + automatic failover). The CNPG **operator** pod itself is
+  replicas + automatic failover). Replication is asynchronous, so a
+  failover can lose the last few commits (RPO > 0). The CNPG **operator** pod itself is
   pinned to a small Burstable footprint (`cnpg.resources`: 50m/128Mi
   requests, 500m/512Mi limits) so it isn't the first thing kubelet OOM-
   kills when the all-in-one control node gets tight — an unbounded
@@ -531,15 +532,6 @@ state on its heartbeat:
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
-  **Known issue — setting a VIP does not work today
-  ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).** The
-  plumbing above is correct and the override reaches the cluster, but the
-  MetalLB install itself then fails permanently: Helm 4 orders the
-  validating webhooks ahead of the pool CRs, and each klipper-helm retry
-  runs `helm uninstall` first — deleting the controller that backs the
-  webhook — so no `IPAddressPool` is ever created and the frontend Service
-  stays `<pending>`. Leave the VIP unset until this is fixed; see
-  [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets
@@ -1550,7 +1542,7 @@ tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
 - nftables base-config strip — `/etc/nftables.conf` currently has hardcoded DNS / DHCP / HTTP "belt-and-braces" rules from the pre-#170 5-role world; on Application appliances the supervisor's drop-in should be the sole source of truth so the operator can verify role-driven rules are actually being enforced.
 - Per-appliance scoped agent keys — current implementation passes the platform-wide global `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`; a per-appliance scoped key would limit blast radius if a supervisor cert ever leaked.
 - Host-OS config plane (#155–#166) — **APT sources / proxy / GPG keys + private-mirror auth landed in 2026.06.19-1 (#155)** via `platform_settings.apt_*` → `apt_bundle` heartbeat → the `spatiumddi-apt-reload` host runner (staged `apt-get update` validate-before-swap), joining the already-shipped SNMP / NTP / SSH / resolver / syslog planes. Still pending on the same `ConfigBundle long-poll → trigger-file → host runner` pattern: static routes and the remaining #156–#166 surfaces.
-- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist globs), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
+- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist entries: Python regular expressions matched from the start of the package name, not globs, and refused at save when they do not compile, #1384), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
 
 ---
 
@@ -1731,13 +1723,13 @@ Hybrid BIOS + UEFI boot via grub (`Bootable=yes`, `Bootloader=grub`,
 ### Future build pipeline (Phases 2–5)
 
 ```
-trigger: tag push (CalVer)
+trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
   ↓
 1. Reuse the existing image-build workflows
-   - ghcr.io/spatiumnorth/spatiumddi-api:<calver>
-   - ghcr.io/spatiumnorth/spatiumddi-frontend:<calver>
-   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<calver>
-   - ghcr.io/spatiumnorth/dhcp-kea:<calver>
+   - ghcr.io/spatiumnorth/spatiumddi-api:<release tag>
+   - ghcr.io/spatiumnorth/spatiumddi-frontend:<release tag>
+   - ghcr.io/spatiumnorth/dns-{bind9,powerdns,technitium}:<release tag>
+   - ghcr.io/spatiumnorth/dhcp-kea:<release tag>
   ↓
 2. Build appliance images via the builder container
    - Phase 1: amd64 qcow2 (all-in-one)
@@ -2496,7 +2488,7 @@ OS. The `/appliance` Releases card lists recent GitHub releases;
 operator clicks Apply, the api pod writes a trigger file the
 host-side `spatiumddi-release-update.path` unit watches, the
 runner PATCHes each HelmChart CR's `spec.set.image.tag` with the
-new CalVer tag. helm-controller picks up the change and runs
+new release tag. helm-controller picks up the change and runs
 `helm upgrade` against the chart in `/usr/lib/spatiumddi/charts/`
 — which pulls images from the local containerd image store (already
 loaded from `/usr/lib/spatiumddi/images/*.tar.zst` at firstboot).
@@ -2579,8 +2571,10 @@ introduced by an upgrade don't clobber operator-created ones.
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken): no commit happens. Next reboot reverts to the
-   previous `saved_entry` automatically. Worst case is one
-   wasted reboot.
+   previous `saved_entry` automatically. If the new slot's
+   migrate step had already run, the reverted release cannot
+   start on the migrated database: see
+   [Rolling back](#rolling-back-the-database-stays-on-var-1227).
 
 **CLI access (for emergency / scripted upgrades):**
 
@@ -2639,6 +2633,102 @@ baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
 
+### Rolling back: the database stays on `/var` (#1227)
+
+A slot swap replaces the root filesystem. PostgreSQL lives on the
+persistent `/var`, so it does not go back with the slot. An upgrade's
+migrate step moves the schema forward, and the release you left cannot
+run on that schema afterwards. Alembic cannot migrate backwards from a
+revision it has never heard of. Its migrate Job fails with
+`Can't locate revision`, its api / worker / beat wait for migrate
+forever, and on a single node the newer release's api keeps serving
+behind the older UI. Nothing retries.
+
+**What is checked before you go back.** Every path that moves a
+control-plane node to an older release first compares the database's
+schema revision with the one that release was built with:
+
+- `POST /api/v1/appliance/slot-upgrade/rollback`;
+- **Fleet → set next boot / set default** onto the other slot
+  (`/appliances/{id}/set-next-boot`, `/set-default-slot`);
+- **Fleet → Schedule OS upgrade** with an image older than the one
+  running (`/appliances/{id}/upgrade`).
+
+When the older release cannot run on the database, the request is
+refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
+naming both revisions. The Fleet UI shows that as a confirmation. To go
+ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
+that if you will restore a copy of the database from before the
+upgrade. Data-plane appliances are never checked, because their release
+does not touch the database. Pointing a node at the slot it already
+runs, which commits a trial boot, is not checked either.
+
+The revision each release was built with comes from two places.
+`backend/app/data/release_schema_heads.json` is generated from the
+release tags by `scripts/release_schema_heads.py`, and for a release it
+lists it is the answer. Every release also records its own when it
+starts, once the schema is at its head, in the `release_schema_head`
+table, which is what covers nightly and dev builds no tag names. An api
+records the booted slot's version only when that slot is its own
+release: after a rollback to a slot whose release cannot migrate, the
+newer release's api keeps running there, and recording the older
+version against its own head would let the next rollback to it through.
+A release in neither, such as an older nightly, is reported as `unknown`, and the
+switch goes ahead: refusing on "don't know" would block every rollback
+on an install that never recorded anything.
+
+**What is not covered.** The trial-boot auto-revert (step 8 above)
+happens on the host with no operator involved, so nothing can refuse
+it. No database snapshot is taken before an upgrade yet, so there is
+nothing to restore automatically. The rolling-upgrade preflight's
+`pre_upgrade_backup` row warns when no backup target has succeeded in
+the last 24 hours. Run one before starting.
+
+**Coming from 2026.09.04-1 or earlier: do not go back to it.** Take a
+backup before the upgrade. 2026.10.02-1 adds 22 migrations that
+2026.09.04-1 cannot run on, and 2026.09.04-1 predates both the check
+above and the clearer migrate error, so a trial-boot revert or a
+Compose / Helm redeploy of it leaves the control plane down with only
+`Can't locate revision` to go on. Its chart also lacks the #1042 fix,
+so a reinstall during the rollback can mint a new `SECRET_KEY` and
+leave every credential encrypted at rest unreadable. If you must go
+back, restore the pre-upgrade backup together with the older release.
+
+**Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
+firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
+`spatium` namespace, a Secret no Helm release owns, and points the
+control chart at it with `auth.existingSecret`. A failed install and the
+helm-controller's uninstall can therefore no longer delete it. On the
+first boot of that release it copies the key from the chart's own
+`spatium-control-spatiumddi-app`; it never overwrites an existing
+`spatium-control-app-keys`, and never generates a key while the chart's
+Secret exists without one. That is the Secret to back up:
+
+```bash
+kubectl -n spatium get secret spatium-control-app-keys -o yaml > app-keys.yaml
+```
+
+An appliance upgraded straight from 2026.09.04-1 loses
+`spatium-control-spatiumddi-app` on that upgrade, because the stored
+2026.09.04-1 manifest does not keep it. Going back to 2026.10.02-1 from
+there makes that chart generate a new key, so don't; if you must, restore
+the pre-upgrade backup together with it, as above.
+
+**If an appliance is already stuck.** The older release's
+`wait-for-migrate` init container prints the cause once, including
+`The database was migrated by a NEWER SpatiumDDI release`, then keeps
+logging `current=<written by a newer release, see above>`:
+
+```bash
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
+```
+
+Re-applying the newer release recovers it. Its migrate step finds
+nothing to do, and every workload rolls out:
+`POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
+**Schedule OS upgrade** in the Fleet UI. The only other way out is to
+restore a pre-upgrade copy of the database by hand.
+
 ### 5c. Phase 8f fleet upgrade orchestration
 
 The Phase 8b/8c machinery covers one appliance at a time —
@@ -2667,7 +2757,7 @@ drives upgrades for all of them from a single screen.
   pending operator-set desired version.
 * Clicking **Upgrade** on an appliance row opens a release picker
   (same `applianceReleasesApi.list` source as the per-box UI).
-  The picked CalVer tag is written to that agent's
+  The picked release tag is written to that agent's
   `desired_appliance_version` + `desired_slot_image_url` columns.
 * The agent's next ConfigBundle long-poll picks it up via the new
   `fleet_upgrade` block on the bundle. The agent's
@@ -2697,6 +2787,7 @@ picker plus a pre-filled copy-paste command:
   # Kubernetes:
   helm upgrade spatiumddi-dns-bind9 \
     oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+    --version 2026.5.12-2 \
     --set image.tag=2026.05.12-2 \
     --reuse-values
   ```
@@ -2878,8 +2969,12 @@ so a first-time operator never gets stuck looking for the upload.
 **Flow (operator-facing):**
 
 1. Operator opens `/appliance` → **Rolling Upgrade**.
-2. Types the **Target version (CalVer)**. Tab refuses any tag that
-   doesn't match `YYYY.MM.DD-N` (preflight's `version_path` check).
+2. Types the **Target version**: a release tag, CalVer (`YYYY.MM.DD-N`)
+   up to the bridge or SemVer (`1.0.0`) from 1.0.0 on. Preflight's
+   `version_path` check fails a tag that is not a release, and a target
+   that is not newer than the running release (SemVer → CalVer is
+   backward). A build that is not a release (`dev`, a nightly) is
+   unknown and only warns (#1182).
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict`, `replication_lag`, `disk_headroom`,
@@ -2988,7 +3083,7 @@ you — the `etcd_snapshot_freshness` row warns when the newest snapshot
 the seed has reported is older than the cron interval, or when there is
 none — but it can only report; taking one is still a manual step, and
 nothing can tell preflight whether a given target crosses a Kubernetes
-minor (the target is a CalVer tag; the k3s it bakes is not known until
+minor (the target is a release tag; the k3s it bakes is not known until
 the image boots). Read the release notes.
 
 Same-minor bumps are unaffected — revert the slot and you are done.
@@ -3015,7 +3110,7 @@ Same-minor bumps are unaffected — revert the slot and you are done.
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):
      a. Fleet → Upgrade images → Upload .raw.xz + paste the SHA-256 +
-        type the CalVer tag → Upload. Bytes stream through the api
+        type the release tag → Upload. Bytes stream through the api
         to the mirror PVC. (Connected installs can skip steps 1-2 and
         use the "Pick from GitHub Releases" tab here instead.)
      b. Rolling Upgrade → type 2026.06.01-1 → leave source as
@@ -3138,6 +3233,75 @@ installer wizard offers two methods at the **Bootstrap method** prompt:
 > even though the cluster is healthy on the survivors. Configure the VIP
 > on the control plane under **Appliance → Network & Host**.
 
+### How the appliance trusts the control plane's certificate (#1219)
+
+The supervisor verifies the control plane's TLS certificate on every
+connection, including a control plane with a self-signed certificate, without
+the operator installing a CA anywhere:
+
+1. **First contact pins the certificate.** When the supervisor first reaches
+   an `https://` control-plane URL (registration), it records the certificate
+   the server presented and from then on trusts exactly that certificate. The
+   check is in the TLS handshake, so nothing (no session token, no agent key)
+   is sent to a server that does not hold the pinned key. The hostname does
+   not have to match, so an IP works. The supervisor logs the fingerprint as
+   `supervisor.tls.pinned_on_first_contact`; it should match the one shown
+   under **Appliance → TLS** on the control plane. If it does not, something
+   intercepted the connection.
+2. **Rotation goes through the appliance CA.** The Web UI certificate changes
+   in normal operation: a self-signed one is re-minted when a member joins or
+   the VIP changes, an operator uploads one, ACME renews one. When the
+   supervisor meets a new certificate it fetches
+   `GET /api/v1/appliance/supervisor/tls-pins`, the list of certificates the
+   control plane serves signed by the appliance CA (whose certificate the
+   supervisor received on approval), and re-pins only if the new certificate
+   is on it. Otherwise it keeps the old pin and logs
+   `supervisor.tls.certificate_not_vouched`.
+3. **Once approved, the first-contact pin is checked.** When the CA arrives,
+   the supervisor checks that the certificate it pinned at first contact is on
+   the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.
+
+An `http://` control-plane URL (acceptable for labs, per the installer) is
+probed once with a bare `GET /` to learn the `https://` it redirects to; that
+certificate is pinned, and every real request goes straight to the `https://`
+target. So the pairing code and the session token never cross the network in
+cleartext, even when the URL was typed as `http://`.
+Re-pairing with `spatium-pair` forgets the pinned certificate and the CA, so
+an appliance moved to a rebuilt or different control plane pins the new one
+on its next contact.
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` still turns verification off, with a
+warning; the appliance chart no longer sets it (before #1219 it did,
+unconditionally, and nothing was pinned in its place).
+
+**Limit, stated plainly.** Trust on first use is as good as the first
+contact. An attacker on the path at pairing time who also substitutes the CA
+certificate the supervisor receives at approval is not caught automatically;
+comparing the logged fingerprint with **Appliance → TLS** is the check.
+
+**The role pods use the same pin (#1281).** On an off-cluster appliance the
+DNS, DHCP and looking-glass pods reach the control plane at the same external
+URL, sending the agent key and receiving their DNS / DHCP configuration over
+it. They used to skip verification there. The chart now mounts the
+supervisor's `tls/` directory read-only (`/var/persist/spatium-supervisor/tls`,
+which holds only public material; the private key is in `identity/`) and sets
+`TLS_PINNED_CERTS_PATH` to the pin in it. The agent trusts exactly the
+certificates in that file, with no hostname check, the same way the
+supervisor does, and reads it on every connection, so a certificate the
+supervisor re-pins reaches the agents without a restart. Until the supervisor
+has pinned, every request fails and the agent logs
+`control_plane_pin_unavailable`; it does not fall back to skipping. The one
+exception is a supervisor started by hand with
+`SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`: it pins nothing, so it renders its
+agents with the skip too (`controlPlaneTls.insecureSkipVerify`), and they warn
+about it on every start. On a
+control-plane member, including an appliance promoted into the control plane,
+the agents are not given the external URL at all: they use the in-cluster api
+Service, as the member's supervisor does. The pin cannot serve there, because
+a member's supervisor heartbeats in-cluster and so never re-pins, while a
+member joining re-mints the Web UI certificate. An `http://` URL carries no
+certificate to verify; the supervisor upgrades its own traffic to the
+`https://` target, but the role agents do not yet.
+
 ### Pairing code (recommended) — issue #169
 
 The control-plane operator generates a short-lived 8-digit code on
@@ -3158,8 +3322,15 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    per-role ``deployment_kind`` coupling was dropped under #170
    Wave A3 — roles are assigned post-approval from the Fleet tab,
    not baked into the code). Pick ephemeral (single-use, default
-   15 min expiry) or persistent (multi-claim, optional ``max_claims``),
-   then click **Generate code**.
+   15 min expiry) or persistent (multi-claim, optional ``max_claims``,
+   30-day expiry by default; ``0`` means never, and the dialog warns),
+   then click **Generate code**. A persistent code minted before this
+   default existed never expired; the upgrade gives it an expiry 30 days
+   after the upgrade, so re-mint it if it must outlive that. Registration is throttled (#1356): ten
+   wrong codes from one address, or a hundred across the install, in 15
+   minutes refuse further attempts with ``429`` until the window passes.
+   A right code doesn't count, so a fleet rollout behind one NAT address
+   is never throttled.
 3. The 8 digits appear in a large monospace box with a live
    countdown + copy button. Write them down or copy them to a
    second device.

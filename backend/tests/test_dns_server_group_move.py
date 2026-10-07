@@ -24,6 +24,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import (
@@ -33,6 +34,7 @@ from app.models.dns import (
     DNSServerZoneState,
     DNSZone,
 )
+from app.services.dns.tsig import group_tsig_secret
 
 
 async def _superadmin(db: AsyncSession, username: str = "root934") -> str:
@@ -306,7 +308,7 @@ async def test_move_generates_a_tsig_key_for_a_ui_created_target_group(
     token = await _superadmin(db_session)
     default = await _group(db_session, "default")
     target = await _group(db_session, "internal resolvers")
-    assert target.tsig_key_secret is None
+    assert group_tsig_secret(target) is None
     srv = await _server(db_session, default, "ns1")
 
     resp = await client.put(
@@ -317,7 +319,7 @@ async def test_move_generates_a_tsig_key_for_a_ui_created_target_group(
     assert resp.status_code == 200, resp.text
 
     await db_session.refresh(target)
-    assert target.tsig_key_secret
+    assert group_tsig_secret(target)
     assert target.tsig_key_algorithm == "hmac-sha256"
     # Spaces are not legal in a BIND key name.
     assert target.tsig_key_name == "spatium-internal-resolvers"
@@ -335,7 +337,7 @@ async def test_move_leaves_an_existing_target_tsig_key_alone(
         db_session,
         "internal",
         tsig_key_name="spatium-internal",
-        tsig_key_secret="Zm9vYmFy",
+        tsig_key_secret_encrypted=encrypt_str("Zm9vYmFy"),
         tsig_key_algorithm="hmac-sha256",
     )
     srv = await _server(db_session, default, "ns1")
@@ -348,7 +350,7 @@ async def test_move_leaves_an_existing_target_tsig_key_alone(
     assert resp.status_code == 200, resp.text
 
     await db_session.refresh(target)
-    assert target.tsig_key_secret == "Zm9vYmFy"
+    assert group_tsig_secret(target) == "Zm9vYmFy"
 
 
 # ── Primary bookkeeping, both sides ─────────────────────────────────────────

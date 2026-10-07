@@ -29,7 +29,7 @@ import structlog
 
 import dataclasses
 
-from . import appliance_state, approval_state
+from . import appliance_state, approval_state, cp_tls
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
 from .heartbeat import _effective_control_plane_url, heartbeat_once
@@ -45,44 +45,14 @@ from .identity import (
 )
 from .log import configure_logging
 from .nettools_proxy import start_nettool_thread
-from .register import RegisterDisabled, RegisterFatal, register
+from .register import (
+    RegisterCodeRejected,
+    RegisterDisabled,
+    RegisterFatal,
+    RegisterThrottled,
+    register,
+)
 from .state import ensure_layout
-
-
-def _build_http_client(
-    skip_tls_verify: bool,
-    *,
-    log: structlog.stdlib.BoundLogger | None = None,
-) -> httpx.Client:
-    """Wave A2's client doesn't yet use mTLS (cert lands in B1). Honour
-    SPATIUM_INSECURE_SKIP_TLS_VERIFY=1 so dev appliances pointed at a
-    self-signed control plane still register.
-
-    Issue #234 — when the opt-out is set, log a prominent WARNING on
-    every build (de-duped via a function attribute so spam stays
-    bounded). The pre-#234 behaviour was a silent ``verify=False``
-    with no log surface, so a misset env on a production appliance
-    disabled TLS verification across every heartbeat with no
-    operator-visible indicator.
-    """
-    if skip_tls_verify and not getattr(_build_http_client, "_warned", False):
-        _build_http_client._warned = True  # type: ignore[attr-defined]
-        (log or structlog.get_logger(__name__)).warning(
-            "supervisor.tls_verify_disabled",
-            reason="SPATIUM_INSECURE_SKIP_TLS_VERIFY=1",
-            hint=(
-                "Control-plane TLS verification is DISABLED for the "
-                "lifetime of this supervisor process. Intended only for "
-                "dev appliances pointed at a self-signed control plane; "
-                "set the env to 0 / unset on production deployments."
-            ),
-        )
-    # #272 Phase 1 — follow_redirects=True so an operator-typed
-    # http:// CONTROL_PLANE_URL doesn't 301-loop against the nginx
-    # http→https redirect on the appliance frontend. POST redirects
-    # are followed verbatim (httpx preserves the method on 301/302
-    # by default for non-safe methods unless explicitly disabled).
-    return httpx.Client(verify=not skip_tls_verify, follow_redirects=True)
 
 
 def _self_bootstrap_or_skip(
@@ -258,13 +228,10 @@ def _maybe_register(
         log.warning("supervisor.register.skipped", reason="no bootstrap_pairing_code")
         return cfg
 
-    skip_tls = os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     try:
-        with _build_http_client(skip_tls_verify=skip_tls, log=log) as client:
+        # #1219 — verified against the control plane's pinned certificate;
+        # on first contact this is where the pin is taken.
+        with cp_tls.client(cfg.state_dir, cfg.control_plane_url) as client:
             result = register(
                 control_plane_url=cfg.control_plane_url,
                 pairing_code=cfg.bootstrap_pairing_code,
@@ -281,8 +248,35 @@ def _maybe_register(
     except RegisterDisabled as exc:
         log.warning("supervisor.register.disabled", reason=str(exc))
         return cfg
+    except RegisterThrottled as exc:
+        # #1356 — the main loop calls us again on its next tick.
+        log.warning("supervisor.register.throttled", reason=str(exc))
+        return cfg
+    except RegisterCodeRejected as exc:
+        # #1356 — drop the dead code instead of re-presenting it every tick:
+        # each retry spends one of this address's registration attempts, so
+        # a box stuck on a dead code would keep the address throttled for
+        # every appliance pairing from behind it. A remote appliance waits
+        # for the operator to hand it a new code (spatium-pair restarts us);
+        # the control-plane node clears the URL too, so the next tick mints a
+        # fresh self-bootstrap code (e.g. its 10-minute one expired while the
+        # control plane was refusing attempts).
+        log.error("supervisor.register.code_rejected", reason=str(exc))
+        if appliance_state.detect_appliance_variant() == "control-plane":
+            return dataclasses.replace(
+                cfg, bootstrap_pairing_code="", control_plane_url=""
+            )
+        return dataclasses.replace(cfg, bootstrap_pairing_code="")
     except RegisterFatal as exc:
         log.error("supervisor.register.fatal", reason=str(exc))
+        # A certificate that changed before approval is re-pinned here, or
+        # registration would retry against the old pin forever.
+        if cp_tls.is_verification_failure(exc):
+            cp_tls.try_repin(cfg.state_dir, cfg.control_plane_url)
+        return cfg
+    except OSError as exc:  # ssl.SSLError is an OSError
+        # First contact could not reach the control plane to take a pin.
+        log.warning("supervisor.register.unreachable", error=str(exc))
         return cfg
 
     import uuid
@@ -395,11 +389,6 @@ def main() -> int:
     # (upgrade / reboot triggers). Only fires when register has
     # produced an appliance_id; otherwise we keep idling so a re-pair
     # from a fresh code can still land.
-    skip_tls = os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     # #170 Wave E — external watchdog liveness anchor. The host-side
     # ``spatiumddi-supervisor-watchdog.timer`` reads this file's
     # mtime every 2 min and force-restarts the supervisor container
@@ -445,7 +434,7 @@ def main() -> int:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
             try:
-                with _build_http_client(skip_tls_verify=skip_tls, log=log) as client:
+                with cp_tls.client(cfg.state_dir, effective_url) as client:
                     held = heartbeat_once(
                         cfg=cfg,
                         appliance_id=appliance_id,
@@ -458,6 +447,12 @@ def main() -> int:
                 # Never let a heartbeat exception kill the supervisor —
                 # the loop is the supervisor's sole liveness signal.
                 log.warning("supervisor.heartbeat.crashed", error=str(exc))
+            # #1219 — once approved (the CA has arrived), confirm the
+            # certificate pinned at first contact is one the CA vouches for.
+            try:
+                cp_tls.check_pin_vouched_once(cfg.state_dir, effective_url)
+            except Exception as exc:  # noqa: BLE001 — a diagnostic, never fatal
+                log.warning("supervisor.tls.vouch_check_crashed", error=str(exc))
         else:
             log.info(
                 "supervisor.heartbeat.skipped",

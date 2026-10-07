@@ -809,6 +809,36 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
     return ZoneApex(mname, rname, apex_ns, placeholder_glue, tuple(notes))
 
 
+# The SOA timers in wire order, each with the value every zone was served with
+# before the control plane shipped them (#1171). A bundle from a control plane
+# that sends none renders exactly the bytes it did before.
+_SOA_TIMERS = (("refresh", 3600), ("retry", 600), ("expire", 86400), ("minimum", 300))
+# RFC 2181 section 8's TTL ceiling, and the zone API's (int4) column's.
+_SOA_TIMER_MAX = 2**31 - 1
+
+
+def _soa_timers(zone: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """``REFRESH RETRY EXPIRE MINIMUM`` for a zone's SOA, and a note for each
+    value that could not be used (issue #1171).
+
+    The zone's own timers are written. One the bundle does not carry (an older
+    control plane) is served as every zone was before they shipped; one it
+    carries that BIND would refuse — anything but a whole number of seconds
+    from 0 to 2^31-1 — is served the same way and noted, rather than making
+    named refuse the zone, and with it the group's whole config."""
+    values: list[str] = []
+    notes: list[tuple[str, str]] = []
+    for key, before in _SOA_TIMERS:
+        value = zone.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SOA_TIMER_MAX:
+            values.append(str(value))
+            continue
+        if value is not None:
+            notes.append(("unusable_timer", f"{key}={value!r}"))
+        values.append(str(before))
+    return " ".join(values), tuple(notes)
+
+
 _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
     "placeholder": (
         "bind9_zone_apex_ns_is_loopback",
@@ -843,6 +873,16 @@ _APEX_NOTE_LOG: dict[str, tuple[str, str]] = {
         (
             "The zone's Primary NS or Admin Email is not a usable domain name "
             "and was ignored."
+        ),
+    ),
+    "unusable_timer": (
+        "bind9_zone_soa_timer_unusable",
+        (
+            "A zone's SOA refresh, retry, expire or minimum is not a whole "
+            "number of seconds from 0 to 2147483647, and BIND would refuse the "
+            "zone over it. It was served with the value every zone carried "
+            "before the timers were rendered (3600/600/86400/300) instead. Fix "
+            "the zone's timers."
         ),
     ),
 }
@@ -962,6 +1002,165 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
         block += "};\n"
         out += block
     return out
+
+
+# How long ``swap_and_reload`` waits for named to report that it loaded the
+# zones it was just told to load (#1224, #1239). ``rndc reload <zone>`` only
+# QUEUES the load and exits 0 even for a file named cannot parse, so the
+# verdict has to be read back afterwards. Generous, because a large zone
+# (an RPZ feed runs to a million records) takes real time to load and a
+# timeout here reverts a config that was fine.
+_ZONE_LOAD_TIMEOUT_S = 60.0
+_ZONE_LOAD_POLL_S = 0.5
+# How long a freshly started named has to answer ``rndc status``. A daemon
+# that exits in this window refused its config; one still alive but silent
+# at the end is logged and trusted, since the failure worth catching is the
+# exit and a slow first zone load is not one.
+_NAMED_START_TIMEOUT_S = 30.0
+# After SIGHUP (the no-rndc fallback) there is no channel to ask named
+# whether it took the config; this is how long it gets to fall over.
+_SIGHUP_SETTLE_S = 1.0
+# Per-call bound on the rndc queries those loops make (see ``_rndc_run``).
+_RNDC_QUERY_TIMEOUT_S = 10.0
+
+
+def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
+    """``(zone_name, view_name)`` for every ``*.db`` under ``root/zones``.
+
+    The layout ``render()`` writes: ``zones/<view>/<zone>.db`` under
+    split-horizon, ``zones/<zone>.db`` without views. Every primary, RPZ and
+    catalog zone file lands there. A secondary or stub zone's file lands
+    there too, but only in the LIVE tree and only once named has transferred
+    it: the render never writes one, so a staged tree holds none, while an
+    enumeration of the live tree can include them. That is harmless to the
+    callers (their serial is whatever named just wrote), but do not assume
+    every entry here is a zone we rendered.
+    """
+    zones = root / "zones"
+    out: list[tuple[str, str | None]] = []
+    try:
+        entries = sorted(zones.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_dir():
+            for zf in sorted(entry.glob("*.db")):
+                out.append((zf.name[: -len(".db")], entry.name))
+        elif entry.name.endswith(".db"):
+            out.append((entry.name[: -len(".db")], None))
+    return out
+
+
+def _zone_rel(zname: str, view: str | None) -> str:
+    return f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
+
+
+def _zone_label(zname: str, view: str | None) -> str:
+    return f"{zname} (view {view})" if view else zname
+
+
+def _zones_differing(new_root: Path, old_root: Path) -> set[tuple[str, str | None]] | None:
+    """Zones under ``new_root`` whose file is new or differs from ``old_root``.
+
+    ``None`` means "cannot tell, treat every zone as changed": no old tree,
+    or a read error. The empty set is a real answer and must stay distinct.
+    """
+    if not old_root.exists():
+        return None
+    changed: set[tuple[str, str | None]] = set()
+    try:
+        for zname, view in _zone_views_under(new_root):
+            rel = _zone_rel(zname, view)
+            old_p = old_root / rel
+            if not old_p.exists() or (new_root / rel).read_bytes() != old_p.read_bytes():
+                changed.add((zname, view))
+    except OSError:
+        return None
+    return changed
+
+
+def _soa_serial(path: Path) -> int | None:
+    """The SOA serial in a zone file, or None if there is none to read.
+
+    Tolerates both shapes the file can take: ours
+    (``@ IN SOA mname rname ( 42 3600 ... )``) and the one named writes
+    back on ``freeze`` (owner and TTL spelled out, the serial on its own
+    line with a ``; serial`` comment).
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"\bSOA\b(.*)", text, re.DOTALL)
+    if not m:
+        return None
+    body = re.sub(r";[^\n]*", " ", m.group(1)[:600]).replace("(", " ").replace(")", " ")
+    tokens = body.split()
+    if len(tokens) < 3 or not tokens[2].isdigit():
+        return None
+    return int(tokens[2])
+
+
+def _serial_at_least(got: int, want: int) -> bool:
+    """RFC 1982 serial comparison: ``got`` is ``want`` or later."""
+    return got == want or 0 < (got - want) % 2**32 < 2**31
+
+
+def _zonestatus_serial(out: str) -> int | None:
+    """The zone's serial from ``rndc zonestatus`` output.
+
+    An inline-signed zone prints ``serial:`` (the raw zone, which is what we
+    render) and then ``signed serial:``; take the first.
+    """
+    for line in out.splitlines():
+        key, _, value = line.strip().partition(":")
+        if key == "serial" and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
+def _first_line(*texts: str | None, skip_warnings: bool = False) -> str:
+    """The first non-blank line across ``texts``.
+
+    ``skip_warnings`` passes over ``warning`` lines first: ``named-checkzone``
+    prints warnings (a non-terminal wildcard, say) ahead of the error that
+    actually refused the zone, and reporting the warning as the reason sends
+    the operator after the wrong record. Falls back to the first line when
+    every line is a warning.
+    """
+    lines = [
+        line.strip()
+        for text in texts
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if skip_warnings:
+        for line in lines:
+            if "warning" not in line.lower():
+                return line
+    return lines[0] if lines else "no output"
+
+
+def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
+    """Run one ``rndc`` query with a bound on how long it may take.
+
+    rndc's own default timeout is 60 s, and the verification loops check
+    their deadlines only between calls, so an unbounded call against a
+    wedged or still-loading named could hold an apply for a minute per zone.
+    A call that times out reads as a non-answer (rc 1), which the loops
+    already treat as "not yet".
+    """
+    try:
+        res = subprocess.run(
+            [*base, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RNDC_QUERY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return 1, "", f"rndc {args[0]} timed out after {_RNDC_QUERY_TIMEOUT_S:g}s"
+    return res.returncode, res.stdout or "", res.stderr or ""
 
 
 class Bind9Driver(DriverBase):
@@ -1508,15 +1707,20 @@ class Bind9Driver(DriverBase):
         # 127.0.0.1`` is left only for a zone that names no name server —
         # BIND will not load a zone without one — and is logged when served.
         apex = _zone_apex(zone)
+        timers, timer_notes = _soa_timers(zone)
         lines = [
             f"$TTL {ttl}",
-            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} 3600 600 86400 300 )",
+            f"@ IN SOA {apex.soa_mname} {apex.soa_rname} ( {serial} {timers} )",
             *(f"@ IN NS {ns}" for ns in apex.ns),
         ]
         if apex.placeholder_glue:
             lines.append(f"{_PLACEHOLDER_NS_LABEL} IN A {_PLACEHOLDER_NS_ADDRESS}")
         for rec in zone.get("records", []) or []:
-            rec_ttl = rec.get("ttl") or ttl
+            # A record's own TTL wins, 0 included (#1382): 0 is how an operator
+            # says "do not cache this" through a cut-over, and ``or`` served it
+            # with the zone's TTL. Only a record with no TTL of its own takes
+            # the zone's, as on the RFC 2136 path (apply_record_op).
+            rec_ttl = ttl if rec.get("ttl") is None else rec["ttl"]
             name_field = rec.get("name") or "@"
             rtype = rec["type"].upper()
             value = rec["value"]
@@ -1537,7 +1741,7 @@ class Bind9Driver(DriverBase):
                 value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
             lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
-        return apex.notes
+        return apex.notes + timer_notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file.
@@ -1672,9 +1876,14 @@ class Bind9Driver(DriverBase):
     def validate(self) -> None:
         new_dir = self.state_dir / "rendered.new"
         conf = new_dir / "named.conf"
+        # Fail closed (#1224). Skipping validation because the checker is
+        # missing used to report the apply as validated, and commit it as
+        # last-known-good, on the strength of no check at all.
         if not shutil.which("named-checkconf"):
-            log.warning("named_checkconf_missing_skipping")
-            return
+            raise RuntimeError(
+                "named-checkconf is not installed, so the config cannot be "
+                "validated; refusing to apply it unchecked"
+            )
         res = subprocess.run(
             ["named-checkconf", str(conf)],
             capture_output=True,
@@ -1695,8 +1904,81 @@ class Bind9Driver(DriverBase):
             # disagree about which stream diagnostics belong on.
             detail = (res.stdout or "").strip() or (res.stderr or "").strip()
             raise RuntimeError(f"named-checkconf failed: {detail or 'no output'}")
+        self._check_zone_files(new_dir)
+
+    def _check_zone_files(self, new_dir: Path) -> None:
+        """``named-checkzone`` every zone file this render added or changed (#1224).
+
+        ``named-checkconf`` never reads zone files, so a zone named cannot
+        load used to pass validation. named then kept serving the OLD copy of
+        an existing zone and answered SERVFAIL for a new one, while the
+        apply reported OK and was committed as last-known-good.
+
+        Not ``named-checkconf -z``: the rendered conf names zone files by
+        absolute path under the LIVE tree, so it would test the files already
+        being served rather than these. And not every zone: a views group
+        re-renders on every record change, and loading a million-record RPZ
+        each time is the load amplification ``_changed_zones`` exists to
+        avoid. A zone whose bytes did not change is the one named already
+        loaded.
+
+        The flags keep the checker from being stricter than named, which
+        would refuse zones named loads. ``-k fail`` is named's default
+        ``check-names`` for a primary zone. ``-i none`` matches the rendered
+        ``check-integrity no``, and it matters for a second reason: the
+        default ``full`` mode RESOLVES out-of-zone MX, SRV and NS targets
+        over the network, an outbound query from a validation step (and a
+        hang on an air-gapped box). What both still refuse, verified against
+        BIND 9.20: an unparseable record, and an in-zone NS name with no
+        address, which named will not load even with ``check-integrity no``.
+        """
+        live = self.state_dir / self.rendered_dir_name
+        changed = _zones_differing(new_dir, live)
+        targets = [
+            zv for zv in _zone_views_under(new_dir) if changed is None or zv in changed
+        ]
+        if not targets:
+            return
+        if not shutil.which("named-checkzone"):
+            raise RuntimeError(
+                "named-checkzone is not installed, so the zone files cannot be "
+                "validated; refusing to apply them unchecked"
+            )
+        failures: list[str] = []
+        for zname, view in targets:
+            res = subprocess.run(
+                [
+                    "named-checkzone",
+                    "-i",
+                    "none",
+                    "-k",
+                    "fail",
+                    zname,
+                    str(new_dir / _zone_rel(zname, view)),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=300,
+            )
+            if res.returncode != 0:
+                detail = _first_line(
+                    res.stdout, res.stderr, skip_warnings=True
+                ).replace(f"{new_dir}/", "")
+                failures.append(f"{_zone_label(zname, view)}: {detail}")
+        if failures:
+            more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
+            raise RuntimeError(
+                "zone file rejected by named-checkzone: " + "; ".join(failures[:5]) + more
+            )
 
     def swap_and_reload(self) -> None:
+        """Put the staged tree live and confirm named is serving it.
+
+        Every way this can fail raises, so the #882 revert puts the previous
+        config back and the failure is reported, instead of the apply being
+        recorded as OK and committed as last-known-good (#1224, #1239).
+        """
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / self.rendered_dir_name
         backup = self.state_dir / "rendered.prev"
@@ -1712,10 +1994,12 @@ class Bind9Driver(DriverBase):
         # and the K8s readiness probe (tcpSocket: 53) never passes.
         if not self.daemon_running():
             self.start_daemon()
+            if self._await_named_started():
+                self._verify_zones_loaded(self._rndc_base(), None)
             return
-        # Signal daemon. Try rndc first; if it isn't configured (no rndc.key),
-        # fall back to SIGHUP which named handles as a config + zone reload.
-        rndc_ok = False
+        # Signal daemon. Try rndc first; if the control channel cannot be
+        # reached, fall back to SIGHUP, which named handles as a config +
+        # zone reload.
         if shutil.which("rndc"):
             base = self._rndc_base()
             # ``reconfig`` picks up config changes and zones that were ADDED or
@@ -1738,31 +2022,181 @@ class Bind9Driver(DriverBase):
             res = subprocess.run(
                 [*base, "reconfig"], capture_output=True, text=True, check=False
             )
-            rndc_ok = res.returncode == 0
-            if not rndc_ok:
-                log.warning(
-                    "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
-                )
-            else:
-                self._reload_rendered_zones(base, self._changed_zones(backup))
+            if res.returncode == 0:
+                changed = self._changed_zones(backup)
+                before = self._serving_serials(base, changed)
+                self._reload_rendered_zones(base, changed)
                 self._sync_response_log_runtime(base)
-        if not rndc_ok and self.daemon_pid:
-            # Degraded path: SIGHUP is a config + zone reload, and like a
-            # plain reload it does NOT re-read a dynamic zone's file — and
-            # without rndc there is no freeze/thaw to force it. So on this
-            # path the split-horizon record-propagation fix above does not
-            # apply and re-rendered record changes may not be served until
-            # named restarts. Log it as such rather than as a clean apply.
-            try:
-                os.kill(self.daemon_pid, signal.SIGHUP)
-                log.warning(
-                    "named_sighup_sent_record_propagation_degraded",
-                    pid=self.daemon_pid,
-                    note="SIGHUP does not re-read dynamic zone files; "
-                    "rendered record changes may not be served",
+                self._verify_zones_loaded(base, changed, before)
+                return
+            error = _first_line(res.stderr, res.stdout)
+            # "rndc: 'reconfig' failed: TLS error" is named ANSWERING, and
+            # refusing: a config ``named-checkconf`` passed but named cannot
+            # run (an unreadable cert or key, a port already in use). named
+            # keeps the old config. SIGHUP would be refused for the same
+            # reason while this reported success (#1239), so it is the apply
+            # failing. Only a channel that cannot be reached at all ("connect
+            # failed", bad key) falls through to SIGHUP.
+            if "'reconfig' failed:" in error:
+                raise RuntimeError(f"named rejected the new config: {error}")
+            log.warning("rndc_failed_falling_back_to_sighup", stderr=error)
+        self._sighup_reload()
+
+    def _sighup_reload(self) -> None:
+        """The no-rndc fallback. Degraded, and cannot be verified.
+
+        SIGHUP is a config + zone reload, and like a plain reload it does NOT
+        re-read a dynamic zone's file — and without rndc there is no
+        freeze/thaw to force it. So on this path the split-horizon
+        record-propagation fix does not apply and re-rendered record changes
+        may not be served until named restarts. Nor is there a channel to
+        ask named whether it took the config. What can be checked is that
+        the signal was delivered and named survived it.
+        """
+        if not self.daemon_pid:
+            raise RuntimeError("named is not running, so there is nothing to reload")
+        try:
+            os.kill(self.daemon_pid, signal.SIGHUP)
+        except OSError as e:
+            raise RuntimeError(f"could not signal named (pid {self.daemon_pid}): {e}") from e
+        log.warning(
+            "named_sighup_sent_record_propagation_degraded",
+            pid=self.daemon_pid,
+            note="SIGHUP does not re-read dynamic zone files; "
+            "rendered record changes may not be served",
+        )
+        time.sleep(_SIGHUP_SETTLE_S)
+        if not self.daemon_running():
+            raise RuntimeError("named exited after being told to reload")
+
+    def _await_named_started(self) -> bool:
+        """Wait for a just-started named to answer, or to die (#1239).
+
+        Raises if it exits: that is named refusing its config (or a port it
+        cannot bind), and it used to be logged as ``named_started``. Returns
+        True once ``rndc status`` answers, so the caller can go on to check
+        the zones; False when it cannot tell (no rndc, or still silent at the
+        timeout), which is logged and trusted.
+        """
+        rndc = shutil.which("rndc")
+        base = self._rndc_base()
+        started = time.monotonic()
+        while True:
+            if not self.daemon_running():
+                raise RuntimeError(
+                    "named exited during startup, so it refused this config; "
+                    "its log has the reason"
                 )
-            except OSError as e:
-                log.error("named_sighup_failed", error=str(e))
+            if rndc:
+                rc, _out, _err = _rndc_run(base, "status")
+                if rc == 0:
+                    return True
+            elif time.monotonic() - started >= _SIGHUP_SETTLE_S:
+                log.warning("named_start_unverified_no_rndc", pid=self.daemon_pid)
+                return False
+            if time.monotonic() - started >= _NAMED_START_TIMEOUT_S:
+                log.warning(
+                    "named_start_unconfirmed",
+                    pid=self.daemon_pid,
+                    timeout_s=_NAMED_START_TIMEOUT_S,
+                )
+                return False
+            time.sleep(0.25)
+
+    def _serving_serials(
+        self, base: list[str], only: set[tuple[str, str | None]] | None
+    ) -> dict[tuple[str, str | None], int | None]:
+        """Each zone's serial as named serves it, BEFORE the reload.
+
+        What ``_verify_zones_loaded`` needs to tell "named loaded a file
+        whose serial was later still" from "named is still on the old zone,
+        which happened to be ahead". A zone named does not serve yet (a new
+        one) reads ``None``.
+        """
+        if not shutil.which("rndc"):
+            return {}
+        live = self.state_dir / self.rendered_dir_name
+        out: dict[tuple[str, str | None], int | None] = {}
+        for zname, view in _zone_views_under(live):
+            if only is not None and (zname, view) not in only:
+                continue
+            rc, stdout, _err = _rndc_run(
+                base, "zonestatus", zname, *(["in", view] if view else [])
+            )
+            out[(zname, view)] = _zonestatus_serial(stdout) if rc == 0 else None
+        return out
+
+    def _verify_zones_loaded(
+        self,
+        base: list[str],
+        only: set[tuple[str, str | None]] | None,
+        before: dict[tuple[str, str | None], int | None] | None = None,
+    ) -> None:
+        """Confirm named is serving what was just rendered (#1224, #1239).
+
+        ``rndc reload <zone>`` queues the load and exits 0 whatever happens
+        next; verified against BIND 9.20, a zone file named cannot parse
+        still answers "zone reload queued". A failed load leaves the zone on
+        its OLD serial, and a new zone that failed says "zone not loaded".
+        So ask each zone for its serial until it matches the file, or give
+        up at ``_ZONE_LOAD_TIMEOUT_S`` and raise.
+
+        The expected serial is read from the file NOW, after the reload, not
+        from the render: ``freeze`` writes named's in-memory zone back over a
+        journal-dirty file first (see ``_reload_rendered_zones``), and that
+        is the copy named loads. A serial later than the file's is accepted
+        too, since an RFC 2136 update can land in between, but only if it
+        MOVED from what named served before the reload (``before``): a zone
+        whose in-memory serial was already ahead of the file, and still
+        reads that same serial, may never have loaded the file at all.
+
+        An RPZ's serial never moves (its SOA is fixed at 1), so its content
+        is covered by the pre-swap ``named-checkzone`` rather than here.
+        """
+        if not shutil.which("rndc"):
+            return
+        live = self.state_dir / self.rendered_dir_name
+        pending = {
+            zv: _soa_serial(live / _zone_rel(*zv))
+            for zv in _zone_views_under(live)
+            if only is None or zv in only
+        }
+        total = len(pending)
+        why: dict[tuple[str, str | None], str] = {}
+        deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
+        while pending:
+            for (zname, view), want in list(pending.items()):
+                rc, out, err = _rndc_run(
+                    base, "zonestatus", zname, *(["in", view] if view else [])
+                )
+                if rc != 0:
+                    why[(zname, view)] = _first_line(err, out)
+                    continue
+                got = _zonestatus_serial(out)
+                prior = (before or {}).get((zname, view))
+                loaded = (
+                    want is None
+                    or got == want
+                    or (
+                        got is not None
+                        and _serial_at_least(got, want)
+                        and (prior is None or got != prior)
+                    )
+                )
+                if loaded:
+                    del pending[(zname, view)]
+                else:
+                    why[(zname, view)] = f"serving serial {got}, file has {want}"
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(_ZONE_LOAD_POLL_S)
+        if pending:
+            listed = [f"{_zone_label(*zv)}: {why.get(zv, 'no answer')}" for zv in pending]
+            more = f" (and {len(listed) - 5} more)" if len(listed) > 5 else ""
+            raise RuntimeError(
+                "named did not load the new zone files: " + "; ".join(listed[:5]) + more
+            )
+        log.info("bind9_zones_verified", zones=total, selective=only is not None)
 
     def _sync_response_log_runtime(self, base: list[str]) -> None:
         """Assert named's runtime response-logging state after a reconfig.
@@ -1823,19 +2257,7 @@ class Bind9Driver(DriverBase):
         ``rendered/zones/<zone>.db`` without views, which is exactly the
         ``file_prefix`` contract ``_zone_stanza`` writes.
         """
-        root = self.state_dir / self.rendered_dir_name / "zones"
-        out: list[tuple[str, str | None]] = []
-        try:
-            entries = sorted(root.iterdir())
-        except OSError:
-            return out
-        for entry in entries:
-            if entry.is_dir():
-                for zf in sorted(entry.glob("*.db")):
-                    out.append((zf.name[: -len(".db")], entry.name))
-            elif entry.name.endswith(".db"):
-                out.append((entry.name[: -len(".db")], None))
-        return out
+        return _zone_views_under(self.state_dir / self.rendered_dir_name)
 
     def _changed_zones(self, prev_dir: Path) -> set[tuple[str, str | None]] | None:
         """Which rendered zones differ from the previous render.
@@ -1853,19 +2275,7 @@ class Bind9Driver(DriverBase):
         Comparing the rendered bytes costs one read per zone and collapses it to
         the zones that actually moved.
         """
-        if not prev_dir.exists():
-            return None
-        changed: set[tuple[str, str | None]] = set()
-        try:
-            for zname, view in self.rendered_zone_views():
-                rel = f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
-                new_p = self.state_dir / self.rendered_dir_name / rel
-                old_p = prev_dir / rel
-                if not old_p.exists() or new_p.read_bytes() != old_p.read_bytes():
-                    changed.add((zname, view))
-        except OSError:
-            return None
-        return changed
+        return _zones_differing(self.state_dir / self.rendered_dir_name, prev_dir)
 
     def _reload_rendered_zones(
         self,
@@ -1885,8 +2295,10 @@ class Bind9Driver(DriverBase):
         sequence is correct for both.
 
         Best-effort by design: a zone that will not reload must not stop the
-        rest from reloading, and it is already reported through the daemon's
-        own status channel.
+        rest from reloading. Whether each one actually loaded is decided
+        afterwards by ``_verify_zones_loaded`` (#1224): ``rndc reload``
+        exits 0 even for a file named cannot parse, so the return code here
+        says nothing about the load.
 
         Two known subtleties, recorded so nobody chases them as bugs:
 
@@ -1902,11 +2314,11 @@ class Bind9Driver(DriverBase):
           each time. Harmless: flat structural renders are infrequent.
         * **DNSSEC inline-signed zones.** ``freeze``/``thaw`` semantics for
           inline-signed dynamic zones vary across BIND versions (older ones
-          refuse, or do not re-read the raw zone on thaw). A failure here
-          only logs ``bind9_zone_reload_failed`` — for a signed zone that is
-          the same "rendered but never served" symptom this fix removes for
-          unsigned ones. Untested interaction; if it bites, the fix likely
-          belongs next to the ``inline-signing`` rendering, not here.
+          refuse, or do not re-read the raw zone on thaw). On BIND 9.20 it
+          works: verified 2026-09-29, an edited inline-signed zone reloaded
+          through freeze/reload/thaw and served the new record, with
+          ``zonestatus`` reporting the raw serial first and the signed one
+          after (which ``_zonestatus_serial`` relies on).
         """
         all_zones = self.rendered_zone_views()
         targets = all_zones if only is None else [z for z in all_zones if z in only]
@@ -2216,7 +2628,17 @@ class Bind9Driver(DriverBase):
             self.daemon_pid = subprocess.Popen(
                 ["named", "-f", "-c", str(conf_path)]
             ).pid
-            wait_for_daemon("named", self.daemon_pid)
+            alive = wait_for_daemon("named", self.daemon_pid)
+        # ``wait_for_daemon`` also answers False on its visibility timeout (a
+        # child still pre-``execve``, i.e. alive), so a False alone is not an
+        # exit; ask whether the process is actually gone before saying so.
+        if not alive and not self.daemon_running():
+            # A zombie reads back as "named" too, so this used to log
+            # ``named_started`` for a daemon that had already exited (#1239).
+            # Logged, not raised: at boot the supervisor's liveness poll owns
+            # the exit, and from ``swap_and_reload`` the caller checks.
+            log.error("named_exited_during_startup", pid=self.daemon_pid)
+            return
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:

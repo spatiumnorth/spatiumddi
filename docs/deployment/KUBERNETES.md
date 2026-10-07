@@ -42,8 +42,15 @@ the rationale is in [`Chart.yaml`](https://github.com/spatiumnorth/spatiumddi/bl
 
 The chart is published as an OCI artifact to
 `oci://ghcr.io/spatiumnorth/charts/spatiumddi`. Chart versions track the
-SpatiumDDI CalVer release tag with leading zeroes stripped so it's a valid
-SemVer 2 identifier (tag `2026.04.20-1` → chart version `2026.4.20-1`).
+SpatiumDDI release tag. A CalVer tag has its leading zeroes stripped so it's
+a valid SemVer 2 identifier (tag `2026.04.20-1` → chart version
+`2026.4.20-1`); a SemVer tag from 1.0.0 on is the chart version unchanged.
+
+**Always pass `--version` for a CalVer chart.** The `-N` makes every CalVer
+chart a SemVer pre-release, and Helm's unversioned lookup skips
+pre-releases, so without `--version` Helm reports *Could not locate a
+version matching provided version string*. `1.0.0` is the first chart Helm
+resolves as the latest on its own (#1182).
 
 ### Prerequisites
 
@@ -233,11 +240,16 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 [`k8s/README.md` → How servers register](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
-> `hostNetwork: true`, or front it with a DHCP relay (option 82). The static
-> manifests under `k8s/dhcp/` expose UDP/67 via `NodePort` for lab use only.
+> `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
+> at a LoadBalancer Service on UDP/67. The static manifests under
+> `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
+> declared `port: 67` is in-cluster only, and the node-facing port is a
+> random 30000–32767 pick. Pinning it (`service.nodePort` in the chart)
+> only helps a relay that can forward to a non-standard port; most,
+> including `ip helper-address`, send to UDP/67 only.
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
-`hostNetwork`, `resources`) are documented in the
+`service.nodePort`, `hostNetwork`, `resources`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---
@@ -310,8 +322,15 @@ references for non-Helm installs.
 ### PostgreSQL — CloudNativePG
 
 Set `postgresql.kind: cnpg` to render a CloudNativePG `Cluster` CR (a
-primary + sync/async replicas with automatic failover) instead of the
-single-node StatefulSet:
+primary + streaming replicas with automatic failover) instead of the
+single-node StatefulSet.
+
+Replication is **asynchronous**: the `Cluster` sets no
+`postgresql.synchronous`, so a commit returns before a replica has it, and a
+failover can lose the last few commits (RPO > 0). That trades a small window
+of possible loss for write latency that does not depend on a replica. If you
+need zero data loss on failover, configure synchronous replication on the
+`Cluster` yourself and accept the latency.
 
 ```yaml
 postgresql:

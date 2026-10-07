@@ -23,8 +23,22 @@
 # run the suite that would otherwise silently start misclassifying.
 appliance/mkosi.extra/usr/local/bin/
 
-# test_appliance_firewall_render.py imports the renderer by path.
+# test_appliance_firewall_render.py imports the renderer by path, and
+# test_outbound_hosts_documented.py (#1353) scans this package for outbound
+# hosts — as it does the three below.
 agent/supervisor/spatium_supervisor/
+
+# test_outbound_hosts_documented.py (#1353) scans every shipped agent package
+# for hostname and public-IP literals and requires each in docs/PRIVACY.md.
+# #976 scanned backend/app only, and the connection it then missed was in
+# agent code — PowerDNS's hardcoded ALIAS resolvers. Without these an
+# agent-only PR adding an outbound host would go green without the guard.
+# The agents' tests/ directories are not shipped, not scanned, and stay
+# denied. A new agent package fails test_every_agent_package_is_scanned
+# until it is added both there and here.
+agent/dhcp/spatium_dhcp_agent/
+agent/dns/spatium_dns_agent/
+agent/looking-glass/spatium_lg_agent/
 
 # test_dhcp_packet_loss.py (#980) pins the agent's metric column names
 # against the ingest model's fields. That model does not forbid extra keys —
@@ -71,6 +85,20 @@ scripts/lint_image_upgrades.py
 # published, the previous release across the CalVer → SemVer switch, and
 # whether a tag becomes :latest.
 scripts/release_version.py
+
+# test_format_release_notes.py loads the release-body formatter and pins the
+# two ways it can break a release: notes over GitHub's 125,000-character body
+# limit fail the publish step after every image is built, so they must come
+# out condensed under it; and a bullet's wrapped line starting with an issue
+# number must not be taken for a heading.
+scripts/format_release_notes.py
+
+# test_trivy_scan_script.py (#1272) runs the `make trivy` loop against a
+# stubbed docker and pins that a scan which never ran reads as SCAN FAILED,
+# never as FINDINGS — and reads the Makefile to pin that the target still
+# calls it, with the DB cache outside the checkout.
+scripts/trivy-scan.sh
+Makefile
 
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —

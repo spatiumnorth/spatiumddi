@@ -36,6 +36,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns.tsig import group_tsig_secret
 
 
 async def _superadmin(db: AsyncSession, username: str = "root935") -> str:
@@ -697,7 +698,7 @@ async def test_target_group_gets_a_tsig_key(client: AsyncClient, db_session: Asy
     token = await _superadmin(db_session)
     src = await _group(db_session, "src")
     dst = await _group(db_session, "dst")
-    assert dst.tsig_key_secret is None
+    assert group_tsig_secret(dst) is None
     zone = await _zone(db_session, src)
 
     resp = await _commit(client, token, zone, dst)
@@ -705,7 +706,7 @@ async def test_target_group_gets_a_tsig_key(client: AsyncClient, db_session: Asy
     assert resp.json()["target_tsig_key_generated"] is True
 
     await db_session.refresh(dst)
-    assert dst.tsig_key_secret
+    assert group_tsig_secret(dst)
 
 
 @pytest.mark.asyncio
@@ -1032,3 +1033,54 @@ async def test_soft_deleted_records_have_their_view_remapped_too(
         )
     ).scalar_one()
     assert row.view_id == dst_internal.id, "a soft-deleted row must not keep a stale view"
+
+
+@pytest.mark.asyncio
+async def test_tsig_key_reference_the_target_lacks_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A ``key <name>`` element is the same undefined-symbol failure as an
+    ACL name when the target defines no such key (#1316) — and so is the
+    ``key`` in an ``also-notify`` entry."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    for name in ("xfer", "notif"):
+        db_session.add(
+            DNSTSIGKey(group_id=src.id, name=name, algorithm="hmac-sha256", secret_encrypted=b"x")
+        )
+    await db_session.flush()
+    zone = await _zone(
+        db_session,
+        src,
+        allow_transfer=["key xfer"],
+        also_notify=["192.0.2.1 key notif"],
+    )
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["key_names_lost"] == ["notif", "xfer"]
+
+    resp = await _commit(client, token, zone, dst)
+    assert resp.status_code == 422
+    assert "xfer" in resp.json()["detail"]
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_tsig_key_present_in_the_target_is_fine(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    for g in (src, dst):
+        db_session.add(
+            DNSTSIGKey(group_id=g.id, name="xfer", algorithm="hmac-sha256", secret_encrypted=b"x")
+        )
+    await db_session.flush()
+    zone = await _zone(db_session, src, allow_transfer=["!key xfer"])
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["key_names_lost"] == []
+    assert (await _commit(client, token, zone, dst)).status_code == 200

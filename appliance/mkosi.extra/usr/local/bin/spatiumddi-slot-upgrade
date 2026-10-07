@@ -39,14 +39,18 @@ TRIGGER="${SPATIUM_SLOT_TRIGGER:-/var/lib/spatiumddi/release-state/slot-upgrade-
 PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrade.progress}"
 
 # The supervisor container runs unprivileged (``su-exec spatium``) while
-# these sidecars are written by THIS script as root, into a mode-1777
-# (sticky) directory. A non-owner therefore gets EACCES overwriting a
-# root-owned 0644 file and EPERM unlinking it — so every supervisor-side
-# reset of a failed upgrade silently no-op'd (#786). Publish them 0666 so
-# an in-place overwrite works. Content is non-secret state the api already
-# republishes to the operator; the sticky bit still stops unlink-by-others.
+# these sidecars are written by THIS script as root, into a sticky
+# directory. A non-owner therefore gets EACCES overwriting a root-owned
+# 0644 file and EPERM unlinking it — so every supervisor-side reset of a
+# failed upgrade silently no-op'd (#786). Publish them group-writable to
+# the spatium-host gid the supervisor and api carry, so an in-place
+# overwrite works; the sticky bit still stops unlink-by-others. They were
+# 0666 until GHSA-h2j9-qrg7-grfw, which let any local account forge the
+# upgrade status the Fleet UI shows.
+SIDECAR_GID="${SPATIUM_HOST_GID:-2770}"
 publish_sidecar() {  # $1 = path
-    chmod 0666 "$1" 2>/dev/null || true
+    chgrp "$SIDECAR_GID" "$1" 2>/dev/null || true
+    chmod 0660 "$1" 2>/dev/null || true
 }
 LOG_DIR="${SPATIUM_SLOT_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/slot-upgrade.log"
@@ -285,6 +289,12 @@ else
     # a different image, not retry this one.
     if [ "$apply_rc" -eq 5 ]; then
         fail "apply refused: the image is built for a different CPU architecture than this node (rc=5) — the active slot is untouched; fetch the image for this node's architecture"
+    # rc=6 is #1216: the image download was cut short and the retries did
+    # not recover it. Named separately because it is neither a bad image
+    # nor a bad disk — nothing was written, and retrying the upgrade once
+    # the path to the image is stable again is the whole remedy.
+    elif [ "$apply_rc" -eq 6 ]; then
+        fail "apply failed: the image download was interrupted and did not complete after retries (rc=6) — nothing was written to the inactive slot; retry the upgrade (see slot-upgrade.log)"
     else
         fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write / architecture)"
     fi

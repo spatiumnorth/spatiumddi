@@ -203,6 +203,10 @@ def render_pdns_conf(
             "# who turn these on will need the matching control-plane",
             "# wiring (Phase 2/3).",
             "expand-alias=no",
+            # No security-status polling: it phones secpoll.powerdns.com
+            # with the version, an outbound connection nobody configured
+            # (non-negotiable #17, #1353). Mirrors the agent's renderer.
+            "security-poll-suffix=",
             # RFC 2136 dynamic updates (issue #641). Enabled globally; per-zone
             # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata gates
             # actual acceptance, so this is a no-op for zones without an ACL.

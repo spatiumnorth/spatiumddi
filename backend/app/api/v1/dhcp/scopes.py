@@ -17,18 +17,28 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.dns_names import validate_fqdn
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.option_validation import (
+    RAW_CODES_KEA,
+    RAW_CODES_NONE,
+    RAW_CODES_WINDOWS,
+    changes_raw_code,
+    normalize_options,
+    option_key_code,
+    validate_options,
+)
+from app.services.dhcp.radvd import validate_ra_interface
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -56,92 +66,70 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
 
-_CODE_TO_NAME: dict[int, str] = {
-    2: "time-offset",
-    3: "routers",
-    6: "dns-servers",
-    15: "domain-name",
-    26: "mtu",
-    28: "broadcast-address",
-    42: "ntp-servers",
-    66: "tftp-server-name",
-    67: "bootfile-name",
-    119: "domain-search",
-    150: "tftp-server-address",
-}
+async def group_raw_codes(db: AsyncSession, group_id: Any) -> str:
+    """The raw option-code spelling ``group_id``'s servers read (#1296).
 
-
-# Legacy / alternate option names that collapse onto a canonical name.
-# The frontend historically sent option 6 as the IANA name
-# ``domain-name-servers`` while the canonical stored vocabulary (and the
-# Kea driver's option-name map) is ``dns-servers`` (#583). Normalise on
-# write so new rows store canonically, and recognise the alias on read so
-# already-persisted rows still resolve to code 6 in ``_scope_to_response``
-# rather than falling through to code 0 / the custom-options bucket.
-_OPTION_NAME_ALIASES: dict[str, str] = {"domain-name-servers": "dns-servers"}
-
-
-def validate_domain_options(
-    opts: dict[str, Any], *, previous: dict[str, Any] | None = None
-) -> None:
-    """Validate the FQDN-valued DHCP options (issue #597); raise 422 on a bad one.
-
-    ``domain-name`` (option 15) is a single FQDN; ``domain-search``
-    (option 119) is a list of FQDNs. Both render straight into the Kea
-    config, so a malformed value would break it or ship a bad search suffix.
-    Empty / whitespace-only entries are rejected too (a blank search suffix
-    is meaningless). A value identical to ``previous`` is skipped, so an
-    update that merely round-trips a grandfathered value doesn't block the
-    edit (validate-on-*change*, matching the issue's report-don't-break stance).
+    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate read
+    ``code:NN`` and drop ``opt-NN``. A group with no servers yet follows Kea:
+    a Windows scope cannot exist without a Windows server to write it to.
     """
-    prev = previous or {}
+    if group_id is None:
+        return RAW_CODES_KEA
+    drivers = set(
+        (await db.execute(select(DHCPServer.driver).where(DHCPServer.server_group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    if "windows_dhcp" not in drivers:
+        return RAW_CODES_KEA
+    return RAW_CODES_WINDOWS if drivers == {"windows_dhcp"} else RAW_CODES_NONE
+
+
+async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
+    """Whether ``group_id`` has a Windows DHCP member (#1480)."""
+    if group_id is None:
+        return False
+    return bool(
+        await db.scalar(
+            select(DHCPServer.id)
+            .where(DHCPServer.server_group_id == group_id, DHCPServer.driver == "windows_dhcp")
+            .limit(1)
+        )
+    )
+
+
+async def validate_dhcp_options(
+    db: AsyncSession,
+    opts: dict[str, Any],
+    *,
+    group_id: Any,
+    address_family: str = "ipv4",
+    previous: dict[str, Any] | None = None,
+) -> None:
+    """422 naming the first option the group's servers cannot serve (#1228).
+
+    Covers names and values; the FQDN checks #597 added live in the same
+    validator now. Keys unchanged from ``previous`` are skipped, so an edit
+    that round-trips a grandfathered option is not blocked by it.
+
+    The raw option-code spelling is checked against ``group_id``'s drivers
+    (#1296). Pass ``group_id`` only for options a Windows server renders:
+    scope options, and option templates (applied to scopes). Pool and
+    reservation overrides, client classes and device policies are rendered by
+    Kea / FortiGate alone, so those callers pass ``None`` and get the Kea
+    rule even on a group with Windows members.
+    """
+    # The drivers only matter to a changed raw-code key; skip the query for
+    # the common all-named-options write.
+    raw_codes = (
+        await group_raw_codes(db, group_id) if changes_raw_code(opts, previous) else RAW_CODES_KEA
+    )
     try:
-        dn = opts.get("domain-name")
-        if isinstance(dn, str) and dn != prev.get("domain-name"):
-            if not dn.strip():
-                raise ValueError("domain-name option must not be blank")
-            validate_fqdn(dn, field="domain-name option")
-        ds = opts.get("domain-search")
-        if isinstance(ds, list) and ds != prev.get("domain-search"):
-            for d in ds:
-                if not str(d).strip():
-                    raise ValueError("domain-search option contains a blank entry")
-                validate_fqdn(str(d), field="domain-search option")
+        validate_options(
+            opts, address_family=address_family, previous=previous, raw_codes=raw_codes
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-def _normalize_options(raw: Any) -> dict[str, Any]:
-    """Normalize option shape (name aliases, list→dict). Does NOT validate —
-    callers run ``validate_domain_options`` so the create/update paths can
-    apply different only-on-change gating."""
-    if raw is None:
-        return {}
-    if isinstance(raw, dict):
-        return {_OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in raw.items()}
-    if isinstance(raw, list):
-        out: dict[str, Any] = {}
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            code = entry.get("code")
-            # #856 — the conditional binds looser than ``or``, so the previous
-            # ``entry.get("name") or _CODE_TO_NAME.get(int(code)) if code else None``
-            # evaluated as ``(name or lookup) if code else None``: an entry
-            # identified by NAME with no ``code`` was silently discarded rather
-            # than used as-is. Resolve the two independently.
-            name = entry.get("name")
-            if not name and code:
-                try:
-                    name = _CODE_TO_NAME.get(int(code)) or f"option-{code}"
-                except (TypeError, ValueError):
-                    name = None
-            if not name:
-                continue
-            name = _OPTION_NAME_ALIASES.get(name, name)
-            out[name] = entry.get("value")
-        return out
-    return {}
 
 
 def _normalize_sync_mode(v: str | None) -> str:
@@ -159,6 +147,16 @@ def _normalize_sync_mode(v: str | None) -> str:
         return "on_static_only"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
+
+
+def _check_hostname_policy(v: str | None) -> str:
+    """The one vocabulary for a scope's DDNS hostname policy, on create and on
+    update (#1308). Blank means the model default, ``client``."""
+    if v in (None, ""):
+        return "client"
+    if v not in VALID_HOSTNAME_POLICIES:
+        raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
+    return v
 
 
 # Fields the scope write models accept under two names, as
@@ -370,13 +368,13 @@ class ScopeCreate(BaseModel):
     @field_validator("ddns_hostname_policy")
     @classmethod
     def _h(cls, v: str | None) -> str | None:
-        if v in (None, ""):
-            return "client"
-        if v not in VALID_HOSTNAME_POLICIES:
-            raise ValueError(
-                f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}"
-            )
-        return v
+        return _check_hostname_policy(v)
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str) -> str:
+        v = (v or "").strip()
+        return validate_ra_interface(v) if v else ""
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -455,6 +453,14 @@ class ScopeUpdate(BaseModel):
         )
         return self
 
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_ra_interface(v) if v else ""
+
     @field_validator("v6_address_mode")
     @classmethod
     def _v6mode(cls, v: str | None) -> str | None:
@@ -470,14 +476,6 @@ class ScopeUpdate(BaseModel):
         if v is None:
             return None
         return _validate_relay_addresses(v)
-
-
-_NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
-# Existing rows may still be stored under the legacy alias (#583); map it
-# to code 6 on readback so the DNS Servers field populates on edit.
-for _alias, _canon in _OPTION_NAME_ALIASES.items():
-    if _canon in _NAME_TO_CODE:
-        _NAME_TO_CODE[_alias] = _NAME_TO_CODE[_canon]
 
 
 class ScopeResponse(BaseModel):
@@ -535,7 +533,11 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
     opts: list[dict[str, Any]] = []
     if isinstance(raw, dict):
         for name, val in raw.items():
-            opts.append({"code": _NAME_TO_CODE.get(name, 0), "name": name, "value": val})
+            # Legacy aliases (#583) resolve to their code so the field
+            # populates on edit, and a raw ``code:43`` / ``opt-43`` reads back
+            # under its own number rather than "0" (#1228).
+            code = option_key_code(name) or 0
+            opts.append({"code": code, "name": name, "value": val})
     elif isinstance(raw, list):
         opts = list(raw)
     return ScopeResponse(
@@ -726,8 +728,23 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
-    _create_options = _normalize_options(body.options)
-    validate_domain_options(_create_options)  # always validate on create (#597)
+    if address_family == "ipv6" and await _group_has_windows(db, group_id):
+        # #1480 — the Windows write path speaks DHCPv4 only (Add-/Set-
+        # DhcpServerv4Scope, Set-DhcpServerv4OptionValue), so a v6 scope on a
+        # group with a Windows member would be handed to v4 cmdlets: a 502,
+        # or a scope that exists here and on no Windows server.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This group has a Windows DHCP server, and SpatiumDDI manages Windows "
+                "DHCP over DHCPv4 only. Put DHCPv6 scopes in a group without Windows "
+                "members."
+            ),
+        )
+    _create_options = normalize_options(body.options)
+    await validate_dhcp_options(
+        db, _create_options, group_id=group_id, address_family=address_family
+    )
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -871,13 +888,34 @@ async def update_scope(
             status_code=422,
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
+    # #1308 — the same vocabulary as create: the scope dialog offered
+    # ``ipam`` / ``generate``, which create refused with a 422 and this path
+    # stored. Only a CHANGED policy is checked, the way options are (#597,
+    # #1228): the dialog sends the stored policy back with every save, so one
+    # written before this check must not block an unrelated edit.
+    if (
+        "ddns_hostname_policy" in changes
+        and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
+    ):
+        try:
+            changes["ddns_hostname_policy"] = _check_hostname_policy(
+                changes["ddns_hostname_policy"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
-        normalized = _normalize_options(changes["options"])
-        # Validate only domain options that CHANGED from the stored value
-        # (issue #597 review) — the scope form round-trips the full options
-        # dict, so re-validating an unchanged grandfathered value would block
-        # an unrelated edit.
-        validate_domain_options(normalized, previous=scope.options or {})
+        normalized = normalize_options(changes["options"])
+        # Validate only options that CHANGED from the stored value (#597
+        # review, #1228) — the scope form round-trips the full options dict,
+        # so re-validating an unchanged grandfathered value would block an
+        # unrelated edit.
+        await validate_dhcp_options(
+            db,
+            normalized,
+            group_id=scope.group_id,
+            address_family=scope.address_family or "ipv4",
+            previous=scope.options or {},
+        )
         changes["options"] = normalized
     # ``clear_pxe_profile=True`` is the explicit detach signal — Pydantic
     # collapses missing + null on ``pxe_profile_id`` so we need a

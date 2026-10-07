@@ -17,13 +17,15 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pyotp
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
-from app.models.auth import User
+from app.models.auth import User, UserSession
 from app.services.mfa import encrypt_secret, generate_secret
 from app.services.reauth import ReauthOutcome, reverify_operator
 
@@ -105,7 +107,19 @@ async def _sso_superadmin(db: AsyncSession, username: str = "ssoadmin") -> tuple
     user.groups = []
     db.add(user)
     await db.flush()
-    return user, create_access_token(str(user.id))
+    # A real session, signed in just now: MFA enrolment asks an external
+    # user for a recent sign-in (#1241), which a jti-less token lacks.
+    now = datetime.now(UTC)
+    session = UserSession(
+        user_id=user.id,
+        refresh_token_hash=f"test-{user.id}",
+        auth_source="oidc",
+        created_at=now,
+        expires_at=now + timedelta(days=1),
+    )
+    db.add(session)
+    await db.flush()
+    return user, create_access_token(str(user.id), jti=str(session.id))
 
 
 async def _local_superadmin(
@@ -125,9 +139,14 @@ async def _local_superadmin(
     return user, create_access_token(str(user.id))
 
 
-async def _enrol_mfa(client: AsyncClient, headers: dict[str, str]) -> str:
-    """Enrol TOTP via begin + verify; return the secret for code generation."""
-    begin = await client.post("/api/v1/auth/mfa/enroll/begin", headers=headers)
+async def _enrol_mfa(
+    client: AsyncClient, headers: dict[str, str], password: str | None = None
+) -> str:
+    """Enrol TOTP via begin + verify; return the secret for code generation.
+    A local account sends its password with begin (#1241)."""
+    begin = await client.post(
+        "/api/v1/auth/mfa/enroll/begin", headers=headers, json={"password": password}
+    )
     assert begin.status_code == 200, begin.text
     secret = begin.json()["secret"]
     verify = await client.post(
@@ -226,7 +245,7 @@ async def test_local_user_disable_still_requires_password(
     _, token = await _local_superadmin(db_session, username="localdisable")
     await db_session.commit()
     headers = {"Authorization": f"Bearer {token}"}
-    secret = await _enrol_mfa(client, headers)
+    secret = await _enrol_mfa(client, headers, password="password123")
 
     # TOTP only, no password → rejected.
     no_pw = await client.post(

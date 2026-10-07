@@ -428,7 +428,7 @@ function PhoneProfileEditorModal({
                   <tr className="border-b">
                     <th className="px-2 py-1.5 text-left font-medium">Code</th>
                     <th className="px-2 py-1.5 text-left font-medium">
-                      Kea name
+                      Name (label)
                     </th>
                     <th className="px-2 py-1.5 text-left font-medium">Value</th>
                     <th className="px-2 py-1.5"></th>

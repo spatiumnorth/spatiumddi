@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -43,15 +44,17 @@ import {
   type SupervisorCapabilities,
   type AvailableUpgradeImage,
   type UpgradeImage,
+  type SchemaRollbackCheck,
   formatApiError,
 } from "@/lib/api";
+import { schemaRollbackRefusal } from "@/lib/schema-rollback";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
-import { releaseVerdict } from "@/lib/versions";
+import { releaseVerdict, upgradeDirection } from "@/lib/versions";
 import {
   formatEta,
   formatMdLevel,
@@ -59,6 +62,7 @@ import {
   storageChipClass,
   storageSeverityClass,
 } from "@/lib/storage-health";
+import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
 import { AptTab } from "./AptTab";
@@ -537,7 +541,10 @@ function ClusterMembershipModal({
   // mid-join. ``isControlPlaneRow`` keys off the install variant, so a
   // control-plane node is excluded even before it's formally designated
   // primary (cluster_role is null until the first promote) — you can't
-  // promote a control plane to a control plane.
+  // promote a control plane to a control plane. #1284 — nor a node whose
+  // eviction is still pending, or one sharing its hostname: the seed removes
+  // etcd members under that name until the eviction settles.
+  const evicting = hostnamesBeingEvicted(rows);
   const eligible = rows
     .filter(
       (r) =>
@@ -545,7 +552,8 @@ function ClusterMembershipModal({
         r.deployment_kind === "appliance" &&
         !isControlPlaneRow(r) &&
         !r.cluster_role &&
-        r.desired_cluster_role !== "member",
+        r.desired_cluster_role !== "member" &&
+        !heldByEviction(r, evicting),
     )
     .sort(byHostname);
 
@@ -2509,6 +2517,12 @@ function ApplianceDrilldownModal({
   const caps = row.capabilities ?? {};
   const badge = stateBadge(row.state);
   const Icon = badge.Icon;
+  // #1311 — tools.pcap ships disabled, and its API 404s while it is. The
+  // page itself would open and only fail on Run, so the button says so
+  // here instead. ``ready`` first: ``enabled`` is optimistically true
+  // while the module list loads, which would flash the button live.
+  const featureModules = useFeatureModules();
+  const pcapOn = featureModules.ready && featureModules.enabled("tools.pcap");
 
   return (
     <Modal title={`Appliance · ${row.hostname}`} onClose={onClose} wide>
@@ -2535,17 +2549,41 @@ function ApplianceDrilldownModal({
                 : ""}
             </span>
           )}
-          {row.state === "approved" && (
+          {row.state === "approved" &&
             // #59 — capture on this appliance's real NICs. Lands on the
             // Packet Capture tool prefilled with this appliance as vantage.
-            // (404s gracefully if the tools.pcap module is off.)
-            <Link
-              to={`/tools/pcap?vantage=appliance&appliance=${row.id}`}
-              className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-accent"
-            >
-              <Activity className="h-3 w-3" /> Packet capture
-            </Link>
-          )}
+            // Disabled rather than hidden when the module is off (#1311), so
+            // the capability stays discoverable and says where to turn it on.
+            (pcapOn ? (
+              <Link
+                to={`/tools/pcap?vantage=appliance&appliance=${row.id}`}
+                className="ml-auto inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs hover:bg-accent"
+              >
+                <Activity className="h-3 w-3" /> Packet capture
+              </Link>
+            ) : (
+              <span className="ml-auto inline-flex items-center gap-2">
+                <span
+                  aria-disabled="true"
+                  title={
+                    featureModules.ready
+                      ? "Packet capture is turned off. Enable it under Features & Integrations → Tools."
+                      : undefined
+                  }
+                  className="inline-flex cursor-not-allowed items-center gap-1 rounded-md border px-2 py-0.5 text-xs opacity-50"
+                >
+                  <Activity className="h-3 w-3" /> Packet capture
+                </span>
+                {featureModules.ready && (
+                  <Link
+                    to="/admin/features"
+                    className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  >
+                    Turned off — enable in Features
+                  </Link>
+                )}
+              </span>
+            ))}
         </div>
 
         <div>
@@ -5624,6 +5662,13 @@ function ApplianceOsUpgradeSection({
   const [imageUrl, setImageUrl] = useState("");
   const [slotImageId, setSlotImageId] = useState<string>("");
   const [rebootConfirm, setRebootConfirm] = useState(false);
+  // #1227 — a slot action or downgrade the server refused because the
+  // release it moves to cannot run on the database. Held so the operator
+  // can read why and retry with the acknowledgement.
+  const [schemaRefusal, setSchemaRefusal] = useState<{
+    check: SchemaRollbackCheck;
+    proceed: () => void;
+  } | null>(null);
 
   const isApplianceHost =
     row.deployment_kind === "appliance" || row.deployment_kind === null;
@@ -5675,14 +5720,23 @@ function ApplianceOsUpgradeSection({
   }
 
   const scheduleUpgrade = useMutation({
-    mutationFn: () =>
+    mutationFn: (acknowledge: boolean) =>
       applianceApprovalApi.scheduleUpgrade(
         row.id,
         tag.trim(),
         sourceKind === "url"
           ? { kind: "url", url: imageUrl.trim() }
           : { kind: "uploaded", slot_image_id: slotImageId },
+        acknowledge,
       ),
+    onError: (err) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => scheduleUpgrade.mutate(true),
+        });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setTag("");
@@ -5690,20 +5744,47 @@ function ApplianceOsUpgradeSection({
       setSlotImageId("");
     },
   });
+  // #1182 — which way the typed target moves this node. Never blocked: this
+  // form is also how an operator rolls a node back by hand. But a backward
+  // move boots older code against a database the newer release may already
+  // have migrated (#1227), so say so before it is sent.
+  const direction = upgradeDirection(row.installed_appliance_version, tag);
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  type SlotVars = { slot: "slot_a" | "slot_b"; acknowledge: boolean };
   const setNextBoot = useMutation({
-    mutationFn: (slot: "slot_a" | "slot_b") =>
-      applianceApprovalApi.setNextBootSlot(row.id, slot),
+    mutationFn: ({ slot, acknowledge }: SlotVars) =>
+      applianceApprovalApi.setNextBootSlot(row.id, slot, acknowledge),
+    onError: (err, { slot }) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => setNextBoot.mutate({ slot, acknowledge: true }),
+        });
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
   const setDefault = useMutation({
-    mutationFn: (slot: "slot_a" | "slot_b") =>
-      applianceApprovalApi.setDefaultSlot(row.id, slot),
+    mutationFn: ({ slot, acknowledge }: SlotVars) =>
+      applianceApprovalApi.setDefaultSlot(row.id, slot, acknowledge),
+    onError: (err, { slot }) => {
+      const check = schemaRollbackRefusal(err);
+      if (check)
+        setSchemaRefusal({
+          check,
+          proceed: () => setDefault.mutate({ slot, acknowledge: true }),
+        });
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  // The refusal is shown in its own modal; repeating it inline as an error
+  // would read as a failure the operator still has to deal with.
+  const slotError = [setNextBoot.error, setDefault.error].find(
+    (e) => e && !schemaRollbackRefusal(e),
+  );
   const reboot = useMutation({
     mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
     onSuccess: () => {
@@ -5761,21 +5842,25 @@ function ApplianceOsUpgradeSection({
               key={slot}
               row={row}
               slot={slot}
-              onSetNextBoot={() => setNextBoot.mutate(slot)}
-              onSetDefault={() => setDefault.mutate(slot)}
+              onSetNextBoot={() =>
+                setNextBoot.mutate({ slot, acknowledge: false })
+              }
+              onSetDefault={() =>
+                setDefault.mutate({ slot, acknowledge: false })
+              }
               busyNextBoot={
-                setNextBoot.isPending && setNextBoot.variables === slot
+                setNextBoot.isPending && setNextBoot.variables?.slot === slot
               }
               busyDefault={
-                setDefault.isPending && setDefault.variables === slot
+                setDefault.isPending && setDefault.variables?.slot === slot
               }
             />
           ))}
         </div>
       )}
-      {(setNextBoot.error || setDefault.error) && (
+      {slotError && (
         <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
-          {((setNextBoot.error ?? setDefault.error) as Error).message}
+          {formatApiError(slotError)}
         </p>
       )}
 
@@ -5876,7 +5961,7 @@ function ApplianceOsUpgradeSection({
               <input
                 value={tag}
                 onChange={(e) => setTag(e.target.value)}
-                placeholder="target version (e.g. 2026.06.01-1)"
+                placeholder="target version (e.g. 1.0.0)"
                 className="flex-1 rounded-md border bg-background px-2 py-1 text-xs"
               />
               <input
@@ -5887,10 +5972,28 @@ function ApplianceOsUpgradeSection({
               />
             </div>
           )}
+          {(direction === "backward" || direction === "same") && (
+            <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
+              {direction === "backward" ? (
+                <>
+                  <strong>{tag.trim()}</strong> is older than the installed{" "}
+                  <strong>{row.installed_appliance_version}</strong>: this is a
+                  rollback, not an upgrade. The older release boots against a
+                  database the newer one may already have migrated.
+                </>
+              ) : (
+                <>
+                  This node already runs <strong>{tag.trim()}</strong>. It will
+                  re-write the inactive slot with the same release and reboot
+                  into it.
+                </>
+              )}
+            </p>
+          )}
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => scheduleUpgrade.mutate()}
+              onClick={() => scheduleUpgrade.mutate(false)}
               disabled={
                 !tag.trim() ||
                 scheduleUpgrade.isPending ||
@@ -5904,13 +6007,16 @@ function ApplianceOsUpgradeSection({
               ) : (
                 <HardDrive className="h-3.5 w-3.5" />
               )}
-              Schedule OS upgrade
+              {direction === "backward"
+                ? "Schedule rollback"
+                : "Schedule OS upgrade"}
             </button>
-            {scheduleUpgrade.error && (
-              <span className="text-xs text-rose-700 dark:text-rose-300">
-                {formatApiError(scheduleUpgrade.error)}
-              </span>
-            )}
+            {scheduleUpgrade.error &&
+              !schemaRollbackRefusal(scheduleUpgrade.error) && (
+                <span className="text-xs text-rose-700 dark:text-rose-300">
+                  {formatApiError(scheduleUpgrade.error)}
+                </span>
+              )}
           </div>
           <p className="text-[11px] text-muted-foreground">
             Stamps <code>desired_appliance_version</code> on the appliance row.
@@ -5969,6 +6075,45 @@ function ApplianceOsUpgradeSection({
           onConfirm={() => reboot.mutate()}
           onClose={() => setRebootConfirm(false)}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
+        />
+      )}
+
+      {schemaRefusal && (
+        <ConfirmModal
+          open
+          title={`${schemaRefusal.check.target_version ?? "That release"} cannot run on this database`}
+          message={
+            <>
+              <p className="text-sm">{schemaRefusal.check.message}</p>
+              <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 text-xs">
+                <dt className="text-muted-foreground">Database is at</dt>
+                <dd className="break-all font-mono">
+                  {schemaRefusal.check.database_revision ?? "unknown"}
+                </dd>
+                <dt className="text-muted-foreground">
+                  {schemaRefusal.check.target_version} was built with
+                </dt>
+                <dd className="break-all font-mono">
+                  {schemaRefusal.check.target_head ?? "unknown"}
+                </dd>
+              </dl>
+              <p className="mt-2 text-xs text-muted-foreground">
+                The database stays on <code>/var</code> when the slot changes.
+                Proceed only if you will restore a copy of the database taken
+                before the upgrade; otherwise the control plane on{" "}
+                <strong>{row.hostname}</strong> will not start.
+              </p>
+            </>
+          }
+          confirmLabel="Proceed anyway"
+          tone="destructive"
+          onConfirm={() => {
+            const { proceed } = schemaRefusal;
+            setSchemaRefusal(null);
+            proceed();
+          }}
+          onClose={() => setSchemaRefusal(null)}
+          requireCheckboxLabel="I will restore a pre-upgrade copy of the database"
         />
       )}
     </div>

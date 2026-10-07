@@ -10,10 +10,12 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
+from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
+from app.models.auth_provider import AuthProvider
 from app.models.settings import PlatformSettings
 from app.services.account_lockout import (
     is_locked as is_user_locked,
@@ -21,6 +23,7 @@ from app.services.account_lockout import (
 from app.services.account_lockout import (
     unlock as unlock_user,
 )
+from app.services.mfa import clear_pending_enrolment
 from app.services.password_policy import (
     PasswordPolicy,
     push_history,
@@ -28,6 +31,7 @@ from app.services.password_policy import (
 from app.services.password_policy import (
     validate as validate_password_policy,
 )
+from app.services.superadmin_grant import holds_superadmin, loaded_user_holds_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -45,6 +49,10 @@ class UserResponse(BaseModel):
     is_superadmin: bool
     force_password_change: bool
     auth_source: str
+    # The provider an external account belongs to (#1235); null for a local
+    # account, and for an external one not attributed to a provider, which
+    # cannot sign in until it is linked (POST /users/{id}/link-provider).
+    auth_provider_id: str | None = None
     # Real ``datetime``s (#907); see the audit router for why.
     last_login_at: datetime | None = None
     # Lockout state (issue #71). ``locked`` mirrors the live time
@@ -54,6 +62,12 @@ class UserResponse(BaseModel):
     failed_login_count: int = 0
     failed_login_locked_until: datetime | None = None
     locked: bool = False
+    # #1355 — the flag OR a wildcard role. Resetting such an account's
+    # password needs the caller's step-up, and the UI reads this to ask for
+    # it (the flag alone misses a local user in a Superadmin-role group).
+    # Regardless of ``is_active`` (#1412): a disabled role-only superadmin is
+    # still one for the reset, and for the Role column.
+    is_effective_superadmin: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -61,6 +75,11 @@ class UserResponse(BaseModel):
     @classmethod
     def coerce_id(cls, v: object) -> str:
         return str(v)
+
+    @field_validator("auth_provider_id", mode="before")
+    @classmethod
+    def coerce_provider_id(cls, v: object) -> str | None:
+        return None if v is None else str(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -73,6 +92,9 @@ class UserResponse(BaseModel):
                 c.name: getattr(data, c.name) for c in data.__table__.columns
             }
             cols["locked"] = is_user_locked(data)
+            # ``groups`` is selectin-loaded; never trigger an async lazy load
+            # from this sync validator if a path skipped it.
+            cols["is_effective_superadmin"] = loaded_user_holds_superadmin(data)
             return cols
         return data
 
@@ -101,6 +123,12 @@ class CreateUserRequest(BaseModel):
     password: str
     is_superadmin: bool = False
     force_password_change: bool = True
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("password")
     @classmethod
@@ -142,6 +170,12 @@ class UpdateUserRequest(BaseModel):
     is_active: bool | None = None
     is_superadmin: bool | None = None
     force_password_change: bool | None = None
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("email")
     @classmethod
@@ -149,8 +183,18 @@ class UpdateUserRequest(BaseModel):
         return None if v is None else _validate_email(v)
 
 
+class LinkProviderRequest(BaseModel):
+    auth_provider_id: uuid.UUID
+
+
 class ResetPasswordRequest(BaseModel):
     new_password: str
+    # #1355 — the caller's own step-up (password, or authenticator code for
+    # an account without one). Required to create or promote a superadmin,
+    # or to reset a superadmin's password: each hands out a credential that
+    # passes every later step-up.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("new_password")
     @classmethod
@@ -220,6 +264,18 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             detail="Username or email already in use",
         )
 
+    method = None
+    if body.is_superadmin:
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="create",
+            resource_type="user",
+            resource_id=body.username,
+            resource_display=f"superadmin {body.username}",
+        )
     policy, hashed = await _enforce_policy(db, body.password)
     history = push_history(hashed, None, policy.history_count)
     user = User(
@@ -236,7 +292,10 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
     )
     db.add(user)
     await db.flush()
-    db.add(_audit(current_user, "create", str(user.id), f"Created user {body.username}"))
+    audit = _audit(current_user, "create", str(user.id), f"Created user {body.username}")
+    if method:
+        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    db.add(audit)
     await db.commit()
     await db.refresh(user)
     logger.info("user_created", username=body.username, by=current_user.username)
@@ -269,6 +328,32 @@ async def update_user(
             detail="Cannot remove your own superadmin status",
         )
 
+    # #1242 — an external account has no local password, so the flag would
+    # lock it out of everything until an admin cleared it again. Clearing it
+    # stays allowed, which is how a row set before this check gets tidied
+    # up. Refused before any field is touched, so a 400 changes nothing.
+    if body.force_password_change and user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{user.username}' signs in through {user.auth_source}; its password is "
+                "managed by the identity provider, so it cannot be required to change it here."
+            ),
+        )
+
+    method = None
+    if body.is_superadmin and not user.is_superadmin:
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="update",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=f"promote {user.username} to superadmin",
+        )
+
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
@@ -280,7 +365,10 @@ async def update_user(
     if body.force_password_change is not None:
         user.force_password_change = body.force_password_change
 
-    db.add(_audit(current_user, "update", str(user.id), f"Updated user {user.username}"))
+    audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
+    if method:
+        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    db.add(audit)
     await db.commit()
     await db.refresh(user)
     return user
@@ -297,11 +385,43 @@ async def reset_password(
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.auth_source != "local":
+        # #1242 — a local password on an external account is never used to
+        # sign in (login goes to the provider), and the reset also sets
+        # ``force_password_change``, which would lock the account out.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{user.username}' signs in through {user.auth_source}; reset the password "
+                "in the identity provider. To end its sessions here, disable the account or "
+                "revoke them from Sessions."
+            ),
+        )
 
     # Admin reset bypasses history (an admin reset is by definition out
     # of band — the user's prior choices are not in scope) but still
     # honours the complexity rules so an operator can't side-step the
     # policy via the admin path.
+    method = None
+    # A superadmin's password passes every step-up, so choosing it for them
+    # needs one (#1355). Superadmin by any path: the flag, a ``*`` / ``*``
+    # role or a live ``*`` / ``*`` grant, and judged regardless of
+    # ``is_active`` (#1412). ``is_effective_superadmin`` answers False for a
+    # disabled role-only superadmin, so a stolen session could disable one,
+    # reset its password here with no step-up, and re-enable it. No exemption
+    # for the caller's own account: a stolen session resetting its own
+    # password would end up holding the password every step-up asks for.
+    if await holds_superadmin(db, user.id):
+        method = await require_operator_stepup(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            action="reset_password",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=f"reset password for superadmin {user.username}",
+        )
     policy, hashed = await _enforce_policy(db, body.new_password)
     user.hashed_password = hashed
     user.force_password_change = True
@@ -309,6 +429,10 @@ async def reset_password(
     user.password_history_encrypted = push_history(
         hashed, user.password_history_encrypted, policy.history_count
     )
+    # #1354 — like a self-service change, an admin reset discards a started
+    # MFA enrolment: a reset usually means the account was compromised, and
+    # the enrolment may have been started by whoever compromised it.
+    clear_pending_enrolment(user)
     # SECURITY (#400 / M3): an admin password reset must revoke every
     # outstanding session + refresh token for the target user — the whole
     # reason an admin resets a password is usually that the account is
@@ -322,9 +446,12 @@ async def reset_password(
         .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
         .values(revoked=True)
     )
-    db.add(
-        _audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}")
+    audit = _audit(
+        current_user, "reset_password", str(user.id), f"Reset password for {user.username}"
     )
+    if method:
+        audit.new_value = {"stepup_method": method}
+    db.add(audit)
     await db.commit()
     logger.info("password_reset", target=user.username, by=current_user.username)
 
@@ -357,6 +484,93 @@ async def unlock_account(
         )
     await db.commit()
     logger.info("account_unlocked", target=user.username, by=current_user.username)
+
+
+@router.post("/{user_id}/link-provider", response_model=UserResponse)
+async def link_provider(
+    user_id: uuid.UUID,
+    body: LinkProviderRequest,
+    current_user: SuperAdmin,
+    db: DB,
+) -> User:
+    """Link an external account to the provider it signs in through (#1235).
+
+    External accounts are keyed on their provider. An account that predates
+    that, and that cannot be attributed because several providers of its
+    type exist, is refused at login until it is linked here; so is a user
+    whose identifier at the provider changed (an LDAP DN after an OU move),
+    since the account is never adopted by username alone.
+
+    The link clears the stored external id: the next login through this
+    provider with the account's username claims it and records the
+    provider's id for the subject. Only this administrator action
+    authorises that username match. Every session the account holds is
+    revoked, so nothing opened under the previous identity survives it.
+
+    A local account cannot be linked. It has a password, and linking it
+    would hand it to whoever holds that username at the provider, which is
+    the takeover #1235 closes.
+    """
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    provider = await db.get(AuthProvider, body.auth_provider_id)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Auth provider not found"
+        )
+    if user.auth_source == "local":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "A local account cannot be linked to an external provider: whoever holds "
+                "the same username there would sign in as it."
+            ),
+        )
+    old = {
+        "auth_source": user.auth_source,
+        "auth_provider_id": str(user.auth_provider_id) if user.auth_provider_id else None,
+        "external_id": user.external_id,
+    }
+    user.auth_source = provider.type
+    user.auth_provider_id = provider.id
+    user.external_id = None
+    # The link changes who the account belongs to, and it is how an
+    # administrator repairs one a second provider signed in as before #1235.
+    # Sessions opened under the old identity must not outlive that, the
+    # same reasoning as the admin password reset above (#400).
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+        .values(revoked=True)
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="user.provider_linked",
+            resource_type="user",
+            resource_id=str(user.id),
+            resource_display=user.username,
+            result="success",
+            old_value=old,
+            new_value={
+                "auth_source": provider.type,
+                "auth_provider_id": str(provider.id),
+                "auth_provider": provider.name,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(user)
+    logger.info(
+        "user_provider_linked",
+        target=user.username,
+        provider=provider.name,
+        by=current_user.username,
+    )
+    return user
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -24,30 +24,40 @@ from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
-from app.core.crypto import encrypt_str
+from app.core.content_disposition import content_disposition
+from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
-from app.services.backup.runner import run_backup_for_target
+from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
+from app.services.backup.runner import (
+    BackupRunBusyError,
+    reap_stale_backup_run,
+    run_backup_for_target,
+)
 from app.services.backup.schedule import (
     InvalidCronExpression,
     compute_next_run,
     validate_cron,
 )
 from app.services.backup.targets import (
+    ARCHIVE_NAME_RE,
     BackupDestinationError,
     DestinationConfigError,
+    InvalidArchiveNameError,
     SecretFieldError,
     UnsupportedOperationError,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
     redact_config_secrets,
+    safe_filename,
 )
 
 router = APIRouter()
@@ -101,12 +111,54 @@ def _assert_retention_is_reachable(driver, *, write_only: bool, keep_n, keep_day
     )
 
 
+def _assert_hint_keeps_passphrase_secret(passphrase: str | None, hint: str | None) -> None:
+    """Refuse a hint that gives the passphrase away.
+
+    Checked before anything is stored, because the update path writes
+    the payload (hint included) into the append-only audit log — a hint
+    accepted once cannot be taken back out of it.
+    """
+    if hint_reveals_passphrase(passphrase, hint):
+        raise HTTPException(status_code=422, detail=HINT_REVEALS_PASSPHRASE)
+
+
 def _require_superadmin(current_user: CurrentUser) -> None:
     if not is_effective_superadmin(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Backup targets are restricted to superadmin",
         )
+
+
+def _archive_name(filename: str) -> str:
+    """Refuse a caller-supplied archive name that is not one of ours (#1243).
+
+    Two checks, and both are needed. ``safe_filename`` refuses anything
+    that is not one plain path component — ``..`` above all, which on a
+    WebDAV target used to become the parent collection's URL and turn an
+    archive delete into a recursive ``DELETE`` one level up. The name
+    pattern then restricts download / restore / delete to what the listing
+    shows: every driver filters its listing with ``ARCHIVE_NAME_RE``, so a
+    name outside it is one this API never offered, and refusing it keeps a
+    destination shared with unrelated files out of reach of these routes.
+
+    422 because the name is the caller's mistake; the drivers still run
+    ``safe_filename`` themselves, so a caller that bypasses this helper
+    fails closed rather than reaching storage.
+    """
+    try:
+        safe_filename(filename)
+    except InvalidArchiveNameError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not ARCHIVE_NAME_RE.match(filename):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{filename!r} is not a SpatiumDDI backup archive name "
+                "(spatiumddi-backup-*.zip or pre-restore-*.zip)"
+            ),
+        )
+    return filename
 
 
 # ── Schemas ────────────────────────────────────────────────────────────
@@ -284,6 +336,7 @@ async def create_target(
                 "exclusive — set exactly one (or neither for no auto-prune)"
             ),
         )
+    _assert_hint_keeps_passphrase_secret(body.passphrase, body.passphrase_hint)
 
     driver = get_destination(body.kind)
     try:
@@ -386,6 +439,22 @@ async def update_target(
             ),
         )
 
+    # Either half of the pair can change on its own, so check the pair
+    # as it will be stored: a new hint against the stored passphrase is
+    # the common case (the form re-sends the hint on every save), and a
+    # rotated passphrase must not turn out to be the old hint.
+    if "passphrase_hint" in payload or payload.get("passphrase") is not None:
+        new_hint = payload.get("passphrase_hint", row.passphrase_hint)
+        new_passphrase = payload.get("passphrase")
+        if new_passphrase is None:
+            try:
+                new_passphrase = decrypt_str(row.passphrase_encrypted)
+            except ValueError:
+                # Unreadable stored passphrase — nothing to compare
+                # against, and the runner already reports it as such.
+                new_passphrase = None
+        _assert_hint_keeps_passphrase_secret(new_passphrase, new_hint)
+
     driver = get_destination(row.kind)
     # ``exclude_unset`` keeps a key the client explicitly set to null, and
     # ``write_only`` is ``bool | None`` in the update model — so a literal
@@ -482,7 +551,17 @@ async def update_target(
             user_id=current_user.id,
             user_display_name=current_user.username,
             result="success",
-            new_value={k: v for k, v in payload.items() if k != "passphrase"},
+            # Never the raw payload: ``config`` carries credentials, and
+            # ``url`` can too (a presigned query string). Record which
+            # config keys changed, not their values.
+            new_value={
+                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
+                **(
+                    {"config_keys_changed": sorted(payload["config"] or {})}
+                    if "config" in payload
+                    else {}
+                ),
+            },
         )
     )
     await db.commit()
@@ -543,13 +622,23 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
         raise HTTPException(status_code=404, detail="backup target not found")
     if not row.enabled:
         raise HTTPException(status_code=409, detail="target is disabled — enable it first")
-    result = await run_backup_for_target(
-        db,
-        target=row,
-        triggered_by="manual",
-        actor_id=current_user.id,
-        actor_display=current_user.username,
-    )
+    # A run stranded by a dead process (#1515) is reaped to ``failed``
+    # first — otherwise a manual-only target (which the schedule
+    # sweep never visits) would 409 here forever.
+    await reap_stale_backup_run(db, target=row, actor_display=current_user.username)
+    try:
+        result = await run_backup_for_target(
+            db,
+            target=row,
+            triggered_by="manual",
+            actor_id=current_user.id,
+            actor_display=current_user.username,
+        )
+    except BackupRunBusyError as exc:
+        # The runner's atomic claim lost to a run already in flight
+        # (a double-click, or the schedule sweep) (#1571). 409, not a
+        # second concurrent run.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunNowResponse(**result)
 
 
@@ -675,7 +764,16 @@ async def download_latest_target_archive(
     if not archives:
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
-    newest = archives[0]
+    # "Latest" means the newest real BACKUP (#1574): a pre-restore
+    # safety dump shares this listing on the recommended local-volume
+    # path, is newest by mtime right after a restore, and is encrypted
+    # with the public constant passphrase rather than this target's —
+    # serving it here hands the puller an archive their passphrase
+    # cannot open. Safety dumps stay listed and downloadable by name.
+    real_archives = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    if not real_archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    newest = real_archives[0]
     # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
     # than a local pair: that module already handles ``*``, comma lists,
     # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
@@ -705,12 +803,12 @@ async def download_latest_target_archive(
         _iter(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{newest.filename}"',
+            "Content-Disposition": content_disposition(newest.filename),
             "Content-Length": str(len(archive_bytes)),
             "ETag": etag,
             "Last-Modified": format_datetime(newest.created_at, usegmt=True),
-            # The archive is encrypted, but it is still the whole
-            # install — no shared cache should hold it.
+            # Only secrets.enc inside the archive is encrypted; the
+            # database dump is not. No shared cache should hold it.
             "Cache-Control": "private, no-cache",
         },
     )
@@ -746,7 +844,7 @@ async def download_target_archive(
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
-    safe_name = filename.replace("/", "").replace("\\", "")
+    safe_name = _archive_name(filename)
     etag = format_etag(safe_name)
     # **The conditional check has to come AFTER the archive is resolved.**
     #
@@ -788,7 +886,7 @@ async def download_target_archive(
         _iter(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": content_disposition(safe_name),
             "Content-Length": str(len(archive_bytes)),
             "ETag": etag,
             "Cache-Control": "private, no-cache",
@@ -827,6 +925,7 @@ async def restore_from_archive(
     back the install on a hunch.
     """
     _require_superadmin(current_user)
+    _archive_name(body.filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -983,6 +1082,7 @@ async def delete_target_archive(
 ) -> None:
     """Manually drop one archive at this target."""
     _require_superadmin(current_user)
+    _archive_name(filename)
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")

@@ -61,7 +61,9 @@ _MAX_ERROR = 2000
 # replaces a newer render during a rolling upgrade (which the ``app_version``
 # equality check before #1185 did every 30 s), and a release that leaves the
 # renderer alone re-renders nothing.
-RENDERER_REVISION = 1
+#
+# 2 (#1171): every zone copy carries its SOA timers.
+RENDERER_REVISION = 2
 
 
 def _serves(revision: int | None) -> bool:

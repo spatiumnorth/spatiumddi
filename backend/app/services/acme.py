@@ -356,6 +356,24 @@ async def apply_timeout_for(
     return min(max(DEFAULT_APPLY_TIMEOUT_SECONDS, scaled), cap)
 
 
+async def _effective_op_state(db: AsyncSession, row: DNSRecordOp) -> str:
+    """An op's state, following ``superseded_by`` (#1232).
+
+    A superseded op's change is delivered by the newer op that retired it
+    (every op carries the whole desired RRset), so the wait resolves to that
+    op's outcome. Bounded, and a vanished successor counts as applied, the same
+    stance the wait already takes on a vanished op.
+    """
+    seen: set[uuid.UUID] = set()
+    while row.state == "superseded" and row.superseded_by and len(seen) < 32:
+        seen.add(row.id)
+        nxt = await db.get(DNSRecordOp, row.superseded_by)
+        if nxt is None:
+            return "applied"
+        row = nxt
+    return str(row.state)
+
+
 async def wait_for_op_applied(
     op_id: uuid.UUID,
     *,
@@ -381,7 +399,7 @@ async def wait_for_op_applied(
                 # Op row vanished — treat as applied so the client
                 # isn't held up by a race with the sweeper.
                 return "applied"
-            state = row.state
+            state = await _effective_op_state(fresh_db, row)
         if state in ("applied", "failed"):
             return state
         await asyncio.sleep(poll_interval)
@@ -419,8 +437,9 @@ async def wait_for_ops_applied(
             for missing in remaining - seen:
                 result[missing] = "applied"  # row swept
             for row in rows:
-                if row.state in ("applied", "failed"):
-                    result[row.id] = row.state
+                state = await _effective_op_state(fresh_db, row)
+                if state in ("applied", "failed"):
+                    result[row.id] = state
         remaining = set(op_ids) - set(result.keys())
         if remaining:
             await asyncio.sleep(APPLY_POLL_INTERVAL_SECONDS)

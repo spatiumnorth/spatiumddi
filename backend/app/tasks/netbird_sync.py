@@ -42,6 +42,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-instance rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each instance (#333).
+            instance_ids = [instance.id for instance in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -50,20 +53,27 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for instance in rows:
+            for instance_id in instance_ids:
+                instance = await db.get(NetbirdInstance, instance_id)
+                if instance is None:
+                    continue
                 if instance.last_synced_at is not None:
                     elapsed = now - instance.last_synced_at
                     if elapsed < timedelta(seconds=instance.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                instance_name = instance.name  # a failed flush expires instance
                 try:
                     summary = await reconcile_instance(db, instance)
                 except Exception as exc:  # noqa: BLE001
                     err_count += 1
-                    errors.append(f"{instance.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next instance still syncs.
+                    await db.rollback()
+                    errors.append(f"{instance_name}: {exc}")
                     logger.warning(
                         "netbird_reconcile_crash",
-                        instance=str(instance.id),
+                        instance=str(instance_id),
                         error=str(exc),
                     )
                     continue

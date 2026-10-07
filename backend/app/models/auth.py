@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
@@ -50,6 +51,21 @@ group_role = Table(
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "user"
+    __table_args__ = (
+        # #1290 — an email is unique when there is one. RADIUS and TACACS+
+        # never report an email, and neither does an LDAP entry without
+        # ``mail`` or an OIDC token without the claim, so their accounts are
+        # created with "". A plain unique index let exactly one such account
+        # exist: every later first-time login hit the index, a 23505, and
+        # failed. Empty values are left out of the index; real ones stay
+        # unique.
+        Index(
+            "ix_user_email",
+            "email",
+            unique=True,
+            postgresql_where=sa_text("email <> ''"),
+        ),
+    )
 
     # ``_active_time_bound_grants`` below is a plain per-request attribute,
     # not a mapped column. ``__allow_unmapped__`` tells SQLAlchemy 2.0's
@@ -70,19 +86,49 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     _active_time_bound_grants: "list[TimeBoundGrant] | None" = None
 
     username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # Auth source: local | ldap | oidc
+    # Auth source: local | ldap | oidc | saml | radius | tacacs
     auth_source: Mapped[str] = mapped_column(String(20), nullable=False, default="local")
     external_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True
-    )  # LDAP DN or OIDC sub
+    )  # LDAP DN, OIDC sub, SAML NameID; unique only within its provider
+    # The provider an external account belongs to (#1235). External
+    # identities are keyed on (auth_provider_id, external_id): two providers
+    # of the same type are two authorities, and keying on ``auth_source``
+    # (the TYPE) let one of them log in as the other's users. NULL for a
+    # local account, for an external account that predates this column and
+    # could not be attributed, and for one whose provider was deleted. Such
+    # an account is refused at sign-in (``account_link_required`` or
+    # ``username_collision``) and is attributed only by an administrator's
+    # link (``POST /users/{id}/link-provider``), never by a sign-in: another
+    # provider's identical ``sub`` / DN is not the same person. A deleted
+    # provider's accounts also lose their ``external_id`` (see the provider
+    # delete handler). See ``app.core.auth.user_sync``.
+    auth_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("auth_provider.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    @property
+    def password_change_required(self) -> bool:
+        """``force_password_change`` as enforced: only for a LOCAL account.
+
+        An external account (LDAP / OIDC / SAML / RADIUS / TACACS+) has no
+        password here to change — ``/auth/change-password`` requires a local
+        one — so honouring the flag on it locks the user out until an admin
+        clears it (#1242). Admins can no longer set it on one, and this keeps
+        any row that already carries it from staying stuck.
+        """
+        return self.force_password_change and self.auth_source == "local"
 
     # MFA — TOTP via pyotp + recovery codes (issue #69). The secret
     # is stored Fernet-encrypted; recovery codes are stored as a
@@ -206,9 +252,9 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     # name) so the viewer can show "Logged in via Okta" without a
     # join. ``last_seen_at`` is bumped on each authenticated request
     # (throttled to ~60 s in the auth dep) so the viewer can render
-    # a relative-age hint.
+    # a relative-age hint. As wide as ``auth_provider.name`` (#1337).
     auth_source: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="local", server_default=sa_text("'local'")
+        String(255), nullable=False, default="local", server_default=sa_text("'local'")
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

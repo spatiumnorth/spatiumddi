@@ -170,8 +170,12 @@ DNS / DHCP agents per Topology 2 / 3 above, pointing at the LB URL.
 - `k8s/ha/postgres-cluster.yaml` — CloudNativePG manifest (K8s analogue of
   Patroni). Three-node primary + 2 replicas with auto-failover.
 - `k8s/ha/redis-sentinel.yaml` — Redis Sentinel manifest.
-- `k8s/ha/postgres-docker-compose.yaml` — Patroni reference for Docker Compose
-  (use this if you're not on K8s yet but want a real HA database).
+- `k8s/ha/postgres-docker-compose.yaml` — a Patroni overlay for Docker
+  Compose that **does not work and is unsupported in 1.0**: Patroni never
+  starts, and on an existing install it comes up on empty volumes (see its
+  header, and [#137](https://github.com/spatiumnorth/spatiumddi/issues/137)
+  for making Compose HA real). For a real HA database off Kubernetes, use
+  the appliance ([Topology 7](#topology-7--appliance-multi-node-control-plane-ha-272)).
 - `charts/spatiumddi` — umbrella Helm chart that selects the HA shapes
   via `postgresql.kind=cnpg` / `redis.kind=sentinel`.
 
@@ -296,8 +300,7 @@ recommended HA path for operators who installed from the ISO.
   guardrailed).
 - **One floating VIP, set in the UI.** A bundled MetalLB (L2) hands the
   frontend Service a control-plane VIP you pick in `Appliance → Network &
-  Host`. (**Currently broken — see the known-issue note under Bring-up
-  below, [#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103).**) Point DNS/DHCP agents + operator browsers at the VIP, not a
+  Host`. Point DNS/DHCP agents + operator browsers at the VIP, not a
   single node IP — an agent pinned to one node's address loses its
   control plane whenever that node is down. (Control-plane *cluster
   members* need no such care: their supervisor heartbeats the in-cluster
@@ -324,23 +327,10 @@ recommended HA path for operators who installed from the ISO.
    VIP. The frontend moves onto the VIP; the cert auto-covers it. Point
    every off-cluster DNS/DHCP agent's control-plane URL at this VIP.
 
-> ⚠️ **Known issue — step 4 does not work today
-> ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).**
-> Setting a control-plane VIP currently leaves MetalLB failing to install:
-> the `helm-install-spatium-metallb` Job enters `CrashLoopBackOff`, no
-> `IPAddressPool` is created, and the frontend Service stays
-> `EXTERNAL-IP: <pending>` — so the VIP never appears. It does not recover
-> on its own. Helm 4 orders the MetalLB validating webhooks ahead of the
-> pool CRs, and each install retry deletes the controller backing that
-> webhook, so every attempt destroys the prerequisite the next one needs.
-> Until this is fixed, run the cluster **without** a VIP and point agents
-> and browsers at a node address; everything else in this topology
-> (etcd quorum, CNPG failover, Redis Sentinel, 3-replica api/worker) works
-> normally. See [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
-
 **Failure behaviour:** lose one of three nodes → etcd keeps quorum (2/3),
 CNPG fails over to a replica, the MetalLB VIP re-homes to a surviving
-node, the UI stays up on the same address. Bring the node back, or
+node, the UI stays up on the same address. CNPG replicates
+asynchronously, so a failover can lose the last few commits (RPO > 0). Bring the node back, or
 replace it — operator-driven dead-node replacement is the Phase 9
 follow-up tracked on [#272](https://github.com/spatiumnorth/spatiumddi/issues/272).
 
@@ -440,8 +430,8 @@ stateless. A few shape notes:
   isn't shared with anything; switch to S3 / SCP / Azure / GCS /
   SMB / FTP / WebDAV for distributed installs.
 - **Restore** runs via `pg_restore` against the live Postgres. In
-  Topology 4+ point this at the **primary** (Patroni HAProxy port
-  5000, not the read-only port 5001). The api containers' SQLAlchemy
+  Topology 4+ point this at the **primary** (for a hand-rolled Patroni
+  cluster behind HAProxy, the read/write port, not the read-only one). The api containers' SQLAlchemy
   pool gets disposed during restore, so transient 503s during the
   restore window are expected — see the `pool_pre_ping=True` +
   transient-DB handler in `app/db.py`.
