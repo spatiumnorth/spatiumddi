@@ -1317,7 +1317,15 @@ async def _cname_at(
     )
     if other is None:
         return False
-    logger.warning(
+    # #1493 — every DHCP renewal re-runs the sync for such a name, so the
+    # warning is logged once per (address, hostname, zone) in this process
+    # and at debug after that.
+    key = (str(ip.address), ip.hostname, zone.name)
+    log = logger.debug if key in _cname_skip_logged else logger.warning
+    _cname_skip_logged[key] = None
+    while len(_cname_skip_logged) > _CNAME_SKIP_LOG_MAX:
+        _cname_skip_logged.pop(next(iter(_cname_skip_logged)))
+    log(
         "ipam_dns_record_skipped_cname",
         address=str(ip.address),
         hostname=ip.hostname,
@@ -1327,6 +1335,12 @@ async def _cname_at(
         detail=f"{ip.hostname} already holds a {other.record_type}; no {rtype} written",
     )
     return True
+
+
+# #1493 — the (address, hostname, zone) triples whose CNAME skip was already
+# logged at warning in this process. Insertion-ordered, oldest dropped first.
+_cname_skip_logged: dict[tuple[str, str, str], None] = {}
+_CNAME_SKIP_LOG_MAX = 4096
 
 
 async def _sync_dns_record(
@@ -1454,6 +1468,10 @@ async def _sync_dns_record(
     # the primary always first. ``extra_zone_ids`` is JSONB list[str];
     # each entry is a UUID stored as string.
     desired_zone_ids: list[uuid.UUID] = []
+    # #1493 — whether the primary zone's forward record was skipped for a
+    # CNAME at the hostname, and whether any forward record was published.
+    primary_cname_skip = False
+    forward_published = False
     seen_extras: set[uuid.UUID] = set()
     if effective_zone_id is not None:
         desired_zone_ids.append(effective_zone_id)
@@ -1528,6 +1546,7 @@ async def _sync_dns_record(
 
         # Phase 2: walk each desired zone, create or update.
         for desired_zone_id in desired_zone_ids:
+            is_primary_zone = desired_zone_id == effective_zone_id
             target_zone = (
                 zone
                 if desired_zone_id == effective_zone_id
@@ -1541,6 +1560,7 @@ async def _sync_dns_record(
             existing = existing_by_zone.get(desired_zone_id)
             if existing is None:
                 if await _cname_at(db, target_zone, ip, forward_rtype):
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
@@ -1591,6 +1611,7 @@ async def _sync_dns_record(
                 if await _cname_at(db, target_zone, ip, forward_rtype, exclude_id=existing.id):
                     if desired_zone_id == effective_zone_id:
                         ip.dns_record_id = None
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
@@ -1641,6 +1662,7 @@ async def _sync_dns_record(
                     await db.delete(existing)
                     if desired_zone_id == effective_zone_id:
                         ip.dns_record_id = None
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 if name_changed:
                     # A rename is delete-at-old-name + create-at-new-name at
@@ -1686,6 +1708,7 @@ async def _sync_dns_record(
                         str(ip.address),
                         existing.ttl,
                     )
+            forward_published = True
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
     # A PTR points AT the forward FQDN. With no effective primary forward zone
@@ -1696,7 +1719,13 @@ async def _sync_dns_record(
     # TypeError (None + str) — reachable through the public create endpoint for a
     # split-horizon IP with extra_zone_ids and no forward zone, or an IP whose
     # primary forward zone was deleted (issue #480).
-    if fqdn is None:
+    # #1493 — and when the primary zone's forward record was skipped because
+    # the hostname holds a CNAME: a PTR naming it would name an alias, which
+    # RFC 1912 section 2.4 rules out (the reverse lookup would lead forward
+    # to the CNAME's target, not back to this address). Retract it the same
+    # way. The sync then reports whether any forward record was published,
+    # so the DDNS path stops logging a skipped name as applied.
+    if fqdn is None or primary_cname_skip:
         # Don't just skip: retract any auto-generated PTR we previously
         # published for this IP. When the primary forward zone was deleted /
         # detached, the PTR now points at a name that can no longer be
@@ -1724,6 +1753,11 @@ async def _sync_dns_record(
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
+        if primary_cname_skip and not forward_published:
+            # Read by the DDNS path so it reports the CNAME clash, not "no
+            # forward zone" (not a mapped column; lives for this request).
+            ip._dns_skipped_cname = True  # type: ignore[attr-defined]
+            return False
         return True
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))
