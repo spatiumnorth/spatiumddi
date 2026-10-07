@@ -19,7 +19,7 @@ Downgrade drops the column and the sequence. The older code never reads
 either.
 
 Revision ID: 6293ba5af00e
-Revises: ff32b91acad8
+Revises: 199eb1562927
 Create Date: 2026-10-03
 """
 
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "6293ba5af00e"
-down_revision = "ff32b91acad8"
+down_revision = "199eb1562927"
 branch_labels = None
 depends_on = None
 

@@ -99,6 +99,54 @@ the formatter handles the rest.
   after it instead of retrying and removing the record again. Ops from
   different transactions compare exactly as before.
 
+- **A Fleet reboot request reboots the appliance, or says why it did
+  not (#1446).** The control plane cleared `reboot_requested` 15 seconds
+  after it was stamped, assuming the supervisor had seen it by then. A
+  node with an upgrade staged does not long-poll, so its heartbeats
+  arrive a full interval apart: the first one after the request cleared
+  the flag and carried "no reboot" in its own reply, the supervisor
+  never saw the request, and the Fleet view showed it as done. Reported
+  by @stefanriegel on a control-plane member during a rolling upgrade.
+  The supervisor now reports its boot id on every heartbeat; the request
+  is delivered until a heartbeat arrives from a different boot, which is
+  the proof it landed, and is given up with a logged warning after 15
+  minutes. The supervisor writes the reboot trigger at most once per
+  boot, so a trigger left behind by a shutdown can no longer swallow the
+  next request. A supervisor too old to report its boot gets the request
+  exactly once. Migration `199eb1562927`.
+
+- **A large blocklist feed no longer OOM-kills the worker, once an hour,
+  forever (#1466).** The feed refresh loaded every existing entry as an
+  ORM object and added one tracked object per new domain. On the
+  catalog's Hagezi Gambling feed (~578k domains) that peaked at about
+  2 GiB above baseline, over the worker's 1.4 GiB limit, so the list
+  never synced and every attempt killed a worker. Because the task was
+  acked late and requeued on worker loss, the killed refresh went back
+  to the broker and took down the next worker after the visibility
+  timeout, along with whatever that worker was running. The refresh now
+  diffs on domain columns and writes in batches of plain INSERT / DELETE
+  statements (about 135 MiB for the same feed), and the task is acked on
+  receipt, so a refresh that does take its worker down is lost rather
+  than redelivered. Also fixed on the way: a feed listing a domain the
+  operator had already added by hand failed the whole refresh on the
+  list's unique constraint; the manual entry is now kept and the feed's
+  copy skipped.
+
+- **An agent appliance keeps access to its own Kubernetes API once the
+  control plane is multi-node (#1508).** The firewall renderers retired the
+  6443 bootstrap sentinel on every node as soon as the fleet's control plane
+  had two members. An agent appliance runs its own single-node k3s and gets
+  no scoped `kubeapi` rule, so its pods (supervisor, DNS, DHCP) lost their
+  own API, and the self-partition guard then refused every corrected rule
+  set. The sentinel is now retired only on a control-plane member; agents
+  keep it. **Recovery for an agent already cut off on 2026.10.02-1** (it does
+  not heal by itself, because the guard can't read membership while the API
+  is blocked): on the agent, run
+  `mv /etc/nftables.d/00-spatium-k3s-bootstrap.nft.retired /etc/nftables.d/00-spatium-k3s-bootstrap.nft`
+  and `nft -f /etc/nftables.conf` once, after the control plane runs this
+  release. The next heartbeat then applies a rule set that keeps it. A
+  `firewall_extra` 6443 rule added as a workaround can be removed afterwards.
+
 - **The Teams webhook flavor sends an Adaptive Card for a Workflows
   webhook (#1504).** It posted a legacy Office 365 `MessageCard`, and
   the form asked for a `…webhook.office.com/webhookb2/…` URL, but
@@ -1538,10 +1586,9 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
-- `6293ba5af00e` — #1489: `dns_record_op.seq`, nullable, filled from
-  the new sequence `dns_record_op_seq_seq` on insert. No backfill and no
-  table rewrite: ops queued before the upgrade keep NULL and their old
-  order. Downgrade drops the column and the sequence.
+- `199eb1562927` — #1446: `appliance.reboot_requested_boot_id`, a
+  nullable string. No backfill: NULL means the boot is not recorded yet.
+  Downgrade drops the column.
 
 - `61566a119901` — #1290: `ix_user_email` becomes a partial unique
   index, `WHERE email <> ''`. No data change. Downgrade restores the
@@ -1567,6 +1614,10 @@ the formatter handles the rest.
   group switches to serving them. Downgrade moves the serial of each zone
   whose group served its own timers (its SOA changes back) and drops the
   two columns.
+- `6293ba5af00e` — #1489: `dns_record_op.seq`, nullable, filled from
+  the new sequence `dns_record_op_seq_seq` on insert. No backfill and no
+  table rewrite: ops queued before the upgrade keep NULL and their old
+  order. Downgrade drops the column and the sequence.
 
 ## 2026.10.02-1 — 2026-10-02
 
