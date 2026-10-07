@@ -881,6 +881,23 @@ the formatter handles the rest.
 
 ### Security
 
+- **A cleared or replaced webhook secret no longer lives on in its
+  old plaintext column, and a collector echoing part of a secret no
+  longer leaks it into the log (GHSA-g9gv-9qp2-3qwm,
+  GHSA-5qf8-pqm4-58mj).** Follow-ups to #1506, found on its QA walk.
+  Writing a forward target's URL or `Authorization` header, or the
+  legacy pair through `PUT /api/v1/settings`, now also blanks the
+  matching pre-upgrade plaintext column in the same change, so the
+  old value does not stay readable in the database or in full
+  backups until the column is dropped. `redact()` for the
+  non-2xx `body_preview` now runs before the preview is truncated
+  to 200 characters, and also covers the bare header token, each
+  URL path segment and query value, and their JSON-escaped and
+  percent-encoded forms. An exclude-secrets restore's empty-bytea
+  encrypted URL is now treated as unset (`url_set`, the audit
+  snapshot, and the webhook-URL requirement), so a restored target
+  is reported unconfigured instead of silently not delivering.
+
 - **A resource-scoped API token is held to its subnet or zone on every
   route keyed on one (GHSA-46mq-mpwf-xxwv).** A token restricted with
   `resource_grants` passes the router permission gate on the resource type
