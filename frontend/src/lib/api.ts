@@ -13490,6 +13490,9 @@ export interface ClusterWorkloadHealth {
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
   status: string;
+  /** #1387 — database row only: "cnpg" when ready / total are the CNPG
+   *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
+  source?: string | null;
 }
 
 /** The resolve probe's verdict (#985). */

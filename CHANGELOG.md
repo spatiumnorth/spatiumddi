@@ -95,6 +95,54 @@ the formatter handles the rest.
   `_acme-challenge.example.com` for `*.example.com` instead of
   `_acme-challenge.*.example.com`.
 
+- **Kubernetes, Docker, Tailscale, NetBird and Cloud syncs no longer fail
+  on an address another integration already mirrors (#1677).** Same gap
+  as Proxmox in #1622: the reconciler logged "owned by another
+  integration; not claiming" and then inserted its own row at that
+  address anyway, or moved one of its rows onto it. That hit
+  `uq_ip_address_subnet_address`, and nothing from that cluster, host,
+  tenant or endpoint synced, with no `last_sync_error`. A Kubernetes node
+  whose LAN address UniFi, OPNsense or Proxmox already mirrors was enough.
+  These mirrors now leave such an address to its owner and sync the rest.
+  The Kubernetes, Docker, Tailscale, NetBird and UniFi sweeps also roll
+  back after a failed target now, and no integration sweep reads the
+  target's name off the expired row any more: a failed flush used to end
+  the whole sweep with `PendingRollbackError`, so every target after the
+  broken one was skipped too.
+
+- **Cluster health reads the database from CNPG, not a pod count (#1387).**
+  A pod count cannot see how many instances CNPG wants: a replica join that
+  failed for good leaves only `Failed` Job pods, which are skipped, so a
+  cluster wanting three instances read 2/2 healthy indefinitely, and during
+  first bootstrap, before any instance pod exists, there was no database row
+  at all. The database row now reads the CNPG Cluster's `readyInstances` of
+  `spec.instances` (the check the rolling upgrade already makes), so those
+  read 2/3 degraded and 0/3 down. The Cluster is found from the
+  `cnpg.io/cluster` label on its pods. When it cannot be read (a 403, a
+  non-CNPG install) the pod count stands, and the row's new `source` field
+  (`cnpg` / `pods`) and its tooltip say which.
+
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
+- **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
+  as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
+  when the hostname already holds a CNAME, but the PTR was still written,
+  naming the alias: a reverse lookup led forward to the CNAME's target
+  instead of back to the address (RFC 1912 section 2.4 asks a PTR to name an
+  A record). The PTR is now skipped too, and one an address had before
+  being renamed onto the CNAME's name is retracted. Such a sync now reports
+  that it published nothing, so the DDNS path logs `ddns_skipped_cname`
+  rather than `ddns_applied`, and `ipam_dns_record_skipped_cname` is logged
+  at warning once per address, hostname and zone instead of on every lease
+  renewal.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
