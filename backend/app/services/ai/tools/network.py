@@ -47,6 +47,7 @@ class ListDevicesArgs(BaseModel):
 
 @register_tool(
     name="list_network_devices",
+    permission=("read", "manage_network_devices"),
     module="network.device",
     description=(
         "List SNMP-polled network devices (routers / switches / APs / "
@@ -122,6 +123,7 @@ class ListAlertsArgs(BaseModel):
 
 @register_tool(
     name="list_alerts",
+    permission="authenticated",
     description=(
         "List alert events. Defaults to open (unresolved) alerts; "
         "set ``open_only=False`` for historical alerts. Each event "
@@ -163,6 +165,7 @@ class ListAlertRulesArgs(BaseModel):
 
 @register_tool(
     name="list_alert_rules",
+    permission="authenticated",
     description=(
         "List configured alert rules. Each summary includes name, "
         "rule type, enabled flag, and key thresholds."
@@ -212,6 +215,7 @@ class GetAuditHistoryArgs(BaseModel):
 
 @register_tool(
     name="get_audit_history",
+    permission=("read", "audit_log"),
     description=(
         "Query the append-only audit log. Filters: user, resource "
         "type, resource id, action. Returns chronological audit "
@@ -284,6 +288,7 @@ def _normalize_mac(value: str) -> str:
 
 @register_tool(
     name="find_switchport",
+    permission=("read", "manage_network_devices"),
     module="network.device",
     description=(
         "Find which switch port an IP / MAC is plugged into. Joins "
@@ -484,6 +489,7 @@ class PingHostArgs(BaseModel):
 
 @register_tool(
     name="ping_host",
+    permission=("read", "use_network_tools"),
     description=(
         "Send ICMP echo requests to a host and return liveness + RTT "
         "statistics. Use for 'ping 192.168.0.4' / 'is host X "

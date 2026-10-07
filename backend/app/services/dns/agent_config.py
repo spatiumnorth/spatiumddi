@@ -76,6 +76,7 @@ from app.services.dns.record_ops import (
     rrset_match_where,
     supersede,
 )
+from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
@@ -453,6 +454,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         pol = dnssec_policies_by_id.get(pid)
         return pol.name if pol is not None else None
 
+    # #1171 — whether the group's zones go out with their own SOA timers or the
+    # literal every BIND9 agent of an older release writes (``soa_timers``).
+    serves_soa_timers = bool(
+        await db.scalar(
+            select(DNSServerGroup.serves_soa_timers).where(DNSServerGroup.id == server.group_id)
+        )
+    )
+
     zone_payload: list[dict[str, Any]] = []
     for z in zones:
         base_zp: dict[str, Any] = {
@@ -502,6 +511,14 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
             # 127.0.0.1) and ``admin.<zone>`` whatever was set. "" = unset.
             "primary_ns": getattr(z, "primary_ns", "") or "",
             "admin_email": getattr(z, "admin_email", "") or "",
+            # #1171 — the zone's SOA timers. Stored, editable, exported and in
+            # the control plane's own zone template, never shipped, so the
+            # BIND9 agent wrote 3600/600/86400/300 into every zone's SOA. Like
+            # the apex above they are structural (zones_structural keeps them),
+            # so an edit re-renders the zone. That literal instead while a
+            # BIND9 agent of the group still writes it, so the group serves
+            # one SOA per serial (``soa_timers.served_soa_timers``).
+            **served_soa_timers(z, serves_soa_timers),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone

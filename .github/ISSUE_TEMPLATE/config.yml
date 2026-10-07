@@ -1,8 +1,11 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Security vulnerability
+    url: https://github.com/spatiumnorth/spatiumddi/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories, never in a public issue
+  - name: Questions and discussion
+    url: https://github.com/spatiumnorth/spatiumddi/discussions
+    about: How-to questions, setup help, and ideas you want to talk through first
   - name: Documentation
     url: https://www.spatiumddi.com/
     about: Feature specs, API reference, and deployment guides
-  - name: Security vulnerability
-    url: https://github.com/spatiumnorth/spatiumddi/security/advisories/new
-    about: Report security issues privately via GitHub Security Advisories

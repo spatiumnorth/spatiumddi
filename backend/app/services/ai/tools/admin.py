@@ -84,6 +84,7 @@ class ListUsersArgs(BaseModel):
 
 @register_tool(
     name="list_users",
+    permission="superadmin",
     description=(
         "List users (superadmin only). Each row carries username, "
         "email, display_name, is_active, is_superadmin, auth_source, "
@@ -166,6 +167,7 @@ class ListGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_groups",
+    permission="superadmin",
     description=(
         "List auth groups + their role assignments + member counts "
         "(superadmin only). Each row carries id, name, description, "
@@ -234,6 +236,7 @@ class ListRolesArgs(BaseModel):
 
 @register_tool(
     name="list_roles",
+    permission="superadmin",
     description=(
         "List RBAC roles + their permission grants + group "
         "assignments (superadmin only). Each row carries id, name, "

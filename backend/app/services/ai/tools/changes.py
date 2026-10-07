@@ -105,6 +105,7 @@ class FindChangeRequestsArgs(BaseModel):
 
 @register_tool(
     name="find_change_requests",
+    permission="self",
     description=(
         "List two-person approval change requests — risky operations "
         "(deletes, etc.) a policy queued for a second operator's approval. "
@@ -153,6 +154,7 @@ class CountChangeRequestsArgs(BaseModel):
 
 @register_tool(
     name="count_change_requests",
+    permission="self",
     description=(
         "Count two-person approval change requests grouped by lifecycle "
         "state (pending / executed / rejected / …). Use to size the "
@@ -234,6 +236,7 @@ async def _propose_decision(
 
 @register_tool(
     name="propose_approve_change_request",
+    permission=("approve", "change_request"),
     description=(
         "Prepare an approval proposal for a pending two-person change "
         "request (#62). Pass change_request_id (UUID) and an optional note. "
@@ -261,6 +264,7 @@ async def propose_approve_change_request(
 
 @register_tool(
     name="propose_reject_change_request",
+    permission=("approve", "change_request"),
     description=(
         "Prepare a rejection proposal for a pending two-person change "
         "request (#62). Pass change_request_id (UUID) and an optional note. "

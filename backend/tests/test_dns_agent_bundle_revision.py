@@ -44,6 +44,12 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "c69af6546ce6118fe11c4abfeb4abc230e7d4c8b33c679444fa6e06cfba33748",
         "views": "1e70781c25f21f3563a0800205adfaef09b615eb0990e0f4ab8569f9d02bb7a0",
     },
+    # #1171: every zone copy carries refresh / retry / expire / minimum, at
+    # the ZONE_DEFAULT_* values for these fixtures' zones.
+    2: {
+        "plain": "f3b09e44127b9a25c77f06180586ee1c935853403f98f72988efa8b35d19a73e",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
 }
 
 
