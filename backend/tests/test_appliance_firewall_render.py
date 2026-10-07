@@ -95,6 +95,8 @@ _MATRIX: list[dict] = [
         "cp_member_count": 3,
         "vip_configured": False,
     },
+    # #1508 — agent appliance in a multi-node fleet: no peers / pod / svc
+    {"role_assignment": {"roles": ["dns-bind9", "dhcp"]}, "cp_member_count": 3},
     # #285 Phase 6 — Web-UI source-scoped (v4 only)
     {"role_assignment": {"roles": []}, "web_ui_allowed_cidrs": ["192.168.0.0/24", "10.0.0.0/8"]},
     # #285 Phase 6 — Web-UI source-scoped (dual-stack) on a DNS node
@@ -318,6 +320,41 @@ def test_webui_sentinel_directive_all_renderers() -> None:
         for body in bodies:
             assert f"# spatium-webui: {expected}" in body
             assert f"# spatium-webui: {other}" not in body
+
+
+def test_bootstrap_sentinel_directive_all_renderers() -> None:
+    """The ``# spatium-bootstrap:`` directive, in every renderer (#1508).
+
+    The 6443 sentinel is retired only on a control-plane member of a
+    multi-node cluster, where the scoped ``kubeapi`` rule takes over. An
+    agent appliance runs its own single-node k3s and gets no ``kubeapi``
+    rule, so it keeps the sentinel however many members the control plane
+    has; retiring it there cut the agent's pods off from their own API.
+    """
+    sup = _load_supervisor_renderer()
+
+    single_cp = {"role_assignment": {"roles": []}, "pod_cidrs": ["10.42.0.0/16"]}
+    multi_cp_member = {
+        "role_assignment": {"roles": []},
+        "cluster_peer_cidrs": ["192.0.2.5/32"],
+        "pod_cidrs": ["10.42.0.0/16"],
+        "service_cidrs": ["10.43.0.0/16"],
+        "cp_member_count": 3,
+    }
+    agent_in_multi_cp = {"role_assignment": {"roles": ["dns-bind9"]}, "cp_member_count": 3}
+
+    for case, expected in (
+        (single_cp, "keep"),
+        (multi_cp_member, "retire"),
+        (agent_in_multi_cp, "keep"),
+    ):
+        other = "retire" if expected == "keep" else "keep"
+        bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+        if sup is not None:
+            bodies.append(_call(sup.render_drop_in, case).body)
+        for body in bodies:
+            assert f"# spatium-bootstrap: {expected}" in body, case
+            assert f"# spatium-bootstrap: {other}" not in body, case
 
 
 def test_ssh_sentinel_directive_all_renderers() -> None:

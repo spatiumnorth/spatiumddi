@@ -713,7 +713,13 @@ async def test_run_order_idempotent_on_already_valid(db_session: AsyncSession) -
 # ── (d) Phase 3 preview ─────────────────────────────────────────────
 
 
-async def _seed_managed_zone(db: AsyncSession, zone_name: str, *, driver: str = "bind9") -> None:
+async def _seed_managed_zone(
+    db: AsyncSession,
+    zone_name: str,
+    *,
+    driver: str = "bind9",
+    group_type: str = "internal",
+) -> None:
     """Seed a minimal managed primary zone (group + zone + primary server)
     that covers ``zone_name`` so ``resolve_managed`` reports ``managed=True``.
 
@@ -722,7 +728,7 @@ async def _seed_managed_zone(db: AsyncSession, zone_name: str, *, driver: str = 
     """
     from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
-    group = DNSServerGroup(name=f"grp-{uuid.uuid4().hex[:6]}")
+    group = DNSServerGroup(name=f"grp-{uuid.uuid4().hex[:6]}", group_type=group_type)
     db.add(group)
     await db.flush()
     db.add(
@@ -796,6 +802,113 @@ async def test_preview_managed_domain_reports_zone_and_driver(
     # Relative label inside the zone (challenge FQDN minus the zone suffix).
     assert row["record_name"] == "_acme-challenge.www"
     assert row["driver"] == "powerdns"
+
+
+async def _preview(client: AsyncClient, token: str, domains: list[str]) -> dict[str, dict]:
+    r = await client.post(
+        "/api/v1/appliance/acme/preview",
+        json={"domains": domains},
+        headers=_hdr(token),
+    )
+    assert r.status_code == 200, r.text
+    return {row["domain"]: row for row in r.json()}
+
+
+@pytest.mark.asyncio
+async def test_preview_public_parent_beats_internal_subzone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Split horizon (#1454): ``example.com`` is public (external group,
+    Cloudflare), ``home.example.com`` exists only internally. The challenge
+    for a name under the internal subzone must go into the public parent,
+    because that is the only zone a public CA can query; the preview says
+    which internal zone was skipped."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="cloudflare", group_type="external")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="technitium")
+    await db_session.commit()
+
+    rows = await _preview(client, token, ["*.home.example.com", "ddi.home.example.com"])
+
+    wild = rows["*.home.example.com"]
+    assert wild["managed"] is True
+    assert wild["zone_name"] == "example.com."
+    assert wild["driver"] == "cloudflare"
+    assert wild["challenge_fqdn"] == "_acme-challenge.home.example.com"
+    assert wild["record_name"] == "_acme-challenge.home"
+    assert "home.example.com." in wild["note"]
+
+    host = rows["ddi.home.example.com"]
+    assert host["zone_name"] == "example.com."
+    assert host["record_name"] == "_acme-challenge.ddi.home"
+    assert host["note"] is not None
+
+
+@pytest.mark.asyncio
+async def test_preview_internal_zone_still_used_when_no_public_zone_covers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Nothing public covers the name → the most specific internal zone
+    still takes it (a private ACME CA resolving internally keeps working),
+    and there is nothing to note."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="bind9")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="technitium")
+    await _seed_managed_zone(db_session, "example.net.", driver="cloudflare", group_type="external")
+    await db_session.commit()
+
+    row = (await _preview(client, token, ["www.home.example.com"]))["www.home.example.com"]
+    assert row["managed"] is True
+    assert row["zone_name"] == "home.example.com."
+    assert row["record_name"] == "_acme-challenge.www"
+    assert row["driver"] == "technitium"
+    assert row["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_cloud_driver_counts_as_public(db_session: AsyncSession) -> None:
+    """A group left at the default ``internal`` type but served by a cloud
+    DNS driver is public too, and on a same-name tie the public zone wins.
+    Exercised on ``_resolve_zone`` directly, which is what ``solve()``
+    writes the TXT through."""
+    from app.services.acme_client import dns01
+
+    await _seed_managed_zone(db_session, "example.com.", driver="route53")
+    await _seed_managed_zone(db_session, "home.example.com.", driver="bind9")
+    await _seed_managed_zone(db_session, "example.org.", driver="bind9")
+    await _seed_managed_zone(db_session, "example.org.", driver="cloudflare", group_type="external")
+    await db_session.commit()
+
+    res = await dns01._resolve_zone(db_session, "_acme-challenge.www.home.example.com")
+    assert res is not None
+    assert res.zone.name == "example.com."
+    assert res.public is True
+    assert res.relative == "_acme-challenge.www.home"
+    assert res.skipped_internal is not None
+    assert res.skipped_internal.name == "home.example.com."
+
+    res = await dns01._resolve_zone(db_session, "_acme-challenge.example.org")
+    assert res is not None
+    assert res.public is True
+    assert res.relative == "_acme-challenge"
+    assert res.skipped_internal is not None
+    assert res.skipped_internal.group_id != res.zone.group_id
+
+
+@pytest.mark.asyncio
+async def test_preview_wildcard_uses_base_name_for_challenge(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``*.example.com`` is validated at ``_acme-challenge.example.com``
+    (RFC 8555 §7.1.3), not ``_acme-challenge.*.example.com``."""
+    _, token = await _superadmin(db_session)
+    await _seed_managed_zone(db_session, "example.com.", driver="powerdns")
+    await db_session.commit()
+
+    row = (await _preview(client, token, ["*.example.com"]))["*.example.com"]
+    assert row["challenge_fqdn"] == "_acme-challenge.example.com"
+    assert row["zone_name"] == "example.com."
+    assert row["record_name"] == "_acme-challenge"
 
 
 # ── (e) Phase 3 manual + Phase 4 http-01 issue ──────────────────────

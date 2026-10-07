@@ -19,6 +19,7 @@ on any hand-written chain of these columns elsewhere in ``app/``.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -127,11 +128,31 @@ def dns_record_owned_elsewhere(record: object) -> bool:
     return bool(tags.get(ACME_RECORD_TAG))
 
 
+async def address_taken(
+    db: AsyncSession, subnet_id: Any, address: str, *, exclude_id: Any = None
+) -> bool:
+    """True if a row already holds ``address`` in ``subnet_id``.
+
+    A mirror checks this before it inserts a row or moves one of its own
+    rows into ``subnet_id``. After its claim pass, a row still sitting
+    there belongs to another integration or another target of the same
+    one; writing next to it would hit ``uq_ip_address_subnet_address``
+    and roll back the whole sync (#1622, #1677).
+    """
+    stmt = select(IPAddress.id).where(
+        IPAddress.subnet_id == subnet_id, IPAddress.address == address
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(IPAddress.id != exclude_id)
+    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
+
+
 __all__ = [
     "ACME_RECORD_TAG",
     "DNS_RECORD_OWNER_FKS",
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",
+    "address_taken",
     "dns_record_owned_elsewhere",
     "owned_by_other_integration",
     "owning_integration",

@@ -459,7 +459,11 @@ function ChainIntegrityBadge() {
   return (
     <span
       className="inline-flex items-center gap-1 rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-800 dark:bg-red-900/30 dark:text-red-300"
-      title={`${data.breaks.length} broken row(s) — first at seq=${data.breaks[0]?.seq}`}
+      title={`${data.breaks.length} broken row(s) — first at seq=${data.breaks[0]?.seq}${
+        data.breaks[0]
+          ? ` (${data.breaks[0].reason}: ${data.breaks[0].action} ${data.breaks[0].resource_type} ${data.breaks[0].resource_id})`
+          : ""
+      }`}
     >
       <ShieldAlert className="h-3 w-3" />
       Tampering detected ({data.breaks.length})

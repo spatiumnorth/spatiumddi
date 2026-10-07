@@ -72,6 +72,7 @@ for unit in chrony.service ssh.service \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
+            spatium-ssh-hostkeys.service \
             spatium-console.service \
             spatium-etc-reconcile.service \
             qemu-guest-agent.service \
@@ -204,6 +205,25 @@ cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-supervisor.conf" <<'EOF'
 d /var/persist/spatium-supervisor 0755 root root - -
 EOF
 
+# GHSA-h2j9-qrg7-grfw — the host-runner trigger directory. Every root
+# ``spatiumddi-*.path`` runner acts on a file dropped here, so it must not
+# be writable by every local account (it used to be 1777). 1770 with group
+# ``spatium-host`` (gid 2770): the supervisor's in-pod user and the api pod
+# carry that gid, nothing else on the host does. The sticky bit stays so
+# the semantics the supervisor/api code relies on (#786) are unchanged.
+# Applied at sysinit on EVERY boot — before k3s, so before either writer
+# exists — which is what repairs an appliance installed with the 1777 mode.
+# Numeric gid: /etc/group lives in the /etc overlay and may not be mounted
+# yet, and an existing install's copy has never heard of the group.
+# ``z`` re-modes the slot-upgrade sidecars the root runner publishes for
+# the supervisor/api to reset in place (#786) — they were 0666.
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-release-state.conf" <<'EOF'
+# GHSA-h2j9-qrg7-grfw — host-runner trigger directory + #786 sidecars.
+d /var/lib/spatiumddi/release-state 1770 root 2770 - -
+z /var/lib/spatiumddi/release-state/slot-upgrade-pending.state 0660 root 2770 - -
+z /var/lib/spatiumddi/release-state/slot-upgrade.progress 0660 root 2770 - -
+EOF
+
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
 # SSH: root login disabled, password login allowed.
 #
@@ -266,6 +286,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-removable-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-host-migrate"
+# GHSA-h2j9-qrg7-grfw — ExecCondition= owner check in front of every
+# trigger runner. Without the exec bit every guarded unit is skipped.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-trigger-guard"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/001-grub-render.sh"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/002-k3s-cidr-canonical.sh"
@@ -274,6 +297,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
+# GHSA-vvh9-6gfw-wphp — generates SSH host keys where etc-render did not.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-ssh-hostkeys.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"

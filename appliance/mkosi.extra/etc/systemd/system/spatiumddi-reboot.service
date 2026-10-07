@@ -3,6 +3,10 @@ Description=Reboot SpatiumDDI appliance after web-UI request (Phase 4f)
 
 [Service]
 Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit
+# skips cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/reboot-pending
 # 10-second grace so the api's 202-Accepted response actually reaches
 # the browser before the host kills the network stack.
 ExecStartPre=/bin/sleep 10

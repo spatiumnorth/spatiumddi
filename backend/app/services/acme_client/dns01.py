@@ -17,6 +17,14 @@ Zone resolution is longest-suffix match: a challenge for
 ``foo.bar.example.com`` lands in the ``example.com`` zone if that's the
 most specific managed zone that's a suffix of the FQDN. The relative
 record label is the FQDN minus the zone suffix.
+
+Public zones win over internal ones (#1454): with split-horizon DNS an
+internal-only ``home.example.com`` must not take the challenge for
+``*.home.example.com`` away from the public ``example.com`` parent, or a
+public CA never sees the TXT. A zone counts as public when its group is
+``group_type == "external"`` or the group is served by a cloud DNS
+driver. Internal zones are only used when no public zone covers the
+name, which keeps a private ACME CA that resolves internally working.
 """
 
 from __future__ import annotations
@@ -29,7 +37,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import dns_group_channel, publish_wake
-from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.drivers.dns import CLOUD_DNS_DRIVERS
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
 from app.services.acme import ACME_TXT_TTL
 from app.services.dns.record_ops import enqueue_record_op
 from app.services.dns.serial import bump_zone_serial
@@ -61,40 +70,88 @@ class DNS01Handle:
 
 
 def _challenge_fqdn(domain: str) -> str:
-    """``example.com`` → ``_acme-challenge.example.com`` (no trailing dot)."""
-    return f"{_ACME_CHALLENGE_PREFIX}.{domain.rstrip('.')}"
+    """``example.com`` → ``_acme-challenge.example.com`` (no trailing dot).
+
+    A wildcard is validated at its base name (RFC 8555 §7.1.3), so
+    ``*.example.com`` maps to ``_acme-challenge.example.com`` too. The
+    orchestrator already passes the authorization identifier, which never
+    carries the ``*.``; this matters for ``/preview``, which gets the
+    names as the operator typed them.
+    """
+    name = domain.rstrip(".")
+    if name.startswith("*."):
+        name = name[2:]
+    return f"{_ACME_CHALLENGE_PREFIX}.{name}"
 
 
-async def _resolve_zone(db: AsyncSession, fqdn: str) -> tuple[DNSZone, str] | None:
-    """Find the most specific managed zone whose name is a suffix of ``fqdn``.
+@dataclass
+class _ResolvedZone:
+    zone: DNSZone
+    relative: str  # label inside the zone ("@" for the apex)
+    public: bool
+    # A more specific (or same-named) internal zone that also covers the
+    # name and was passed over in favour of the public one.
+    skipped_internal: DNSZone | None = None
 
-    Returns ``(zone, relative_label)`` or ``None`` if no zone covers the
-    name. ``relative_label`` is what goes in ``DNSRecord.name`` — the
-    FQDN with the zone suffix stripped (``"_acme-challenge.foo"`` for a
-    ``foo`` host in zone ``example.com`` validating
-    ``_acme-challenge.foo.example.com``). An apex challenge yields the
-    bare prefix (``"_acme-challenge"``).
+
+async def _resolve_zone(db: AsyncSession, fqdn: str) -> _ResolvedZone | None:
+    """Find the managed zone the challenge TXT for ``fqdn`` goes into.
+
+    Longest-suffix match, but public zones are tried first: the most
+    specific public zone (group type ``external`` or served by a cloud
+    DNS driver) that covers ``fqdn`` wins, even when an internal zone is
+    more specific. Only when no public zone covers the name does the most
+    specific internal zone get it. ``None`` if no primary zone covers it.
+
+    ``relative`` is what goes in ``DNSRecord.name`` — the FQDN with the
+    zone suffix stripped (``"_acme-challenge.foo"`` for a ``foo`` host in
+    zone ``example.com``). An apex name yields ``"@"``.
     """
     target = fqdn.rstrip(".").lower()
-    rows = (await db.execute(select(DNSZone).where(DNSZone.zone_type == "primary"))).scalars().all()
-    best: DNSZone | None = None
-    best_zone_name = ""
-    for zone in rows:
+    rows = (
+        await db.execute(
+            select(DNSZone, DNSServerGroup.group_type)
+            .join(DNSServerGroup, DNSServerGroup.id == DNSZone.group_id)
+            .where(DNSZone.zone_type == "primary")
+        )
+    ).all()
+    cloud_group_ids = set(
+        (
+            await db.execute(
+                select(DNSServer.group_id).where(DNSServer.driver.in_(CLOUD_DNS_DRIVERS)).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # public? -> (name, zone) of the most specific zone covering ``target``
+    best: dict[bool, tuple[str, DNSZone]] = {}
+    for zone, group_type in rows:
         zone_name = zone.name.rstrip(".").lower()
         if not zone_name:
             continue
-        if target == zone_name or target.endswith("." + zone_name):
-            if len(zone_name) > len(best_zone_name):
-                best = zone
-                best_zone_name = zone_name
-    if best is None:
+        if not (target == zone_name or target.endswith("." + zone_name)):
+            continue
+        public = group_type == "external" or zone.group_id in cloud_group_ids
+        if public not in best or len(zone_name) > len(best[public][0]):
+            best[public] = (zone_name, zone)
+
+    skipped: DNSZone | None = None
+    if True in best:
+        chosen_name, chosen = best[True]
+        public = True
+        internal = best.get(False)
+        if internal is not None and len(internal[0]) >= len(chosen_name):
+            skipped = internal[1]
+    elif False in best:
+        chosen_name, chosen = best[False]
+        public = False
+    else:
         return None
 
-    if target == best_zone_name:
-        relative = "@"
-    else:
-        relative = target[: -(len(best_zone_name) + 1)]
-    return best, relative
+    relative = "@" if target == chosen_name else target[: -(len(chosen_name) + 1)]
+    return _ResolvedZone(zone=chosen, relative=relative, public=public, skipped_internal=skipped)
 
 
 async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
@@ -123,7 +180,14 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
             f"no SpatiumDDI-managed primary DNS zone covers {challenge_fqdn!r} — "
             f"the appliance can only solve DNS-01 for domains it hosts"
         )
-    zone, relative = resolved
+    zone, relative = resolved.zone, resolved.relative
+    if resolved.skipped_internal is not None:
+        logger.info(
+            "acme_client_dns01_internal_zone_skipped",
+            fqdn=challenge_fqdn,
+            zone=zone.name,
+            skipped_zone=resolved.skipped_internal.name,
+        )
 
     record = DNSRecord(
         zone_id=zone.id,
@@ -283,6 +347,10 @@ class ManagedZoneMatch:
     zone_name: str
     record_name: str  # relative label written into the zone
     driver: str | None  # bind9 / powerdns / cloudflare / route53 / ...
+    public: bool = False  # zone is in an external group / on a cloud driver
+    # Internal zone that also covers the name but was passed over for the
+    # public one (#1454) — surfaced by ``/preview``.
+    skipped_zone_name: str | None = None
 
 
 def challenge_fqdn(domain: str) -> str:
@@ -304,7 +372,7 @@ async def resolve_managed(db: AsyncSession, domain: str) -> ManagedZoneMatch | N
     resolved = await _resolve_zone(db, cfqdn)
     if resolved is None:
         return None
-    zone, relative = resolved
+    zone, relative = resolved.zone, resolved.relative
     driver = (
         await db.execute(
             select(DNSServer.driver)
@@ -312,8 +380,14 @@ async def resolve_managed(db: AsyncSession, domain: str) -> ManagedZoneMatch | N
             .limit(1)
         )
     ).scalar_one_or_none()
+    skipped = resolved.skipped_internal
     return ManagedZoneMatch(
-        zone_id=zone.id, zone_name=zone.name, record_name=relative, driver=driver
+        zone_id=zone.id,
+        zone_name=zone.name,
+        record_name=relative,
+        driver=driver,
+        public=resolved.public,
+        skipped_zone_name=skipped.name if skipped is not None else None,
     )
 
 
