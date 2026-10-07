@@ -141,6 +141,57 @@ def test_redact_catches_a_renormalised_url() -> None:
     assert "sig=s1gN4ture" not in redact(f"failed: {_TEAMS}", _TEAMS)
 
 
+def test_redact_catches_the_bare_token_and_a_single_path_segment() -> None:
+    # GHSA-5qf8-pqm4-58mj: a collector echoing only the token (no
+    # "Bearer ") or only one path segment must not leak either.
+    bare = _AUTH.split(None, 1)[1]
+    out = redact(f"invalid token {bare} for hook s3cr3tPathToken", _SLACK, _AUTH)
+    assert bare not in out and "s3cr3tPathToken" not in out
+    assert "[redacted]" in out
+    # A single query value on its own is a needle too.
+    assert "s1gN4tureFixture" not in redact("rejected sig s1gN4tureFixture", _TEAMS)
+
+
+def test_redact_catches_json_escaped_and_percent_encoded_forms() -> None:
+    # GHSA-5qf8-pqm4-58mj: re-encoded echoes defeat an exact match.
+    from urllib.parse import quote
+
+    json_escaped = _GENERIC.replace("/", r"\/")
+    assert "t0kenInPath" not in redact(f"echo {json_escaped}", _GENERIC)
+    percent_encoded = quote(_GENERIC, safe="")
+    assert "t0kenInPath" not in redact(f"echo {percent_encoded}", _GENERIC)
+    assert "hdr-fixture" not in redact(f"echo {quote(_AUTH, safe='')}", _AUTH)
+    bare = _AUTH.split(None, 1)[1]
+    bare_encoded = quote(bare, safe="")
+    assert bare not in redact(f"echo {bare_encoded}", _AUTH)
+
+
+async def test_a_non2xx_preview_is_redacted_before_it_is_truncated() -> None:
+    # GHSA-5qf8-pqm4-58mj: cutting to 200 chars first left the leading
+    # part of a straddling secret in clear.
+    body = "x" * 190 + f" {_GENERIC} {_AUTH}"
+
+    class _Client(httpx.AsyncClient):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            def _handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(401, text=body)
+
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    with (
+        capture_logs() as logs,
+        patch.object(svc.httpx, "AsyncClient", _Client),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        await svc._send_webhook(_GENERIC, _AUTH, {"text": "hi"})  # noqa: SLF001
+    warned = [e for e in logs if e["event"] == "audit_forward_webhook_non2xx"]
+    assert warned, logs
+    preview = warned[0]["body_preview"]
+    assert len(preview) <= 200
+    assert "t0kenInPath" not in preview and "hdr-fixture" not in preview
+
+
 # ── send path: logs and errors ─────────────────────────────────────
 
 
@@ -401,6 +452,149 @@ async def test_the_legacy_settings_webhook_is_write_only(
     assert resp.status_code == 200, resp.text
     assert resp.json()["audit_forward_webhook_auth_header_set"] is False
     assert resp.json()["audit_forward_webhook_url_set"] is True
+
+
+# ── GHSA-g9gv-9qp2-3qwm: plaintext leftovers ───────────────────────
+
+
+async def _add_plaintext_leftovers(db: AsyncSession) -> None:
+    """Recreate the pre-drop plaintext columns the migration keeps."""
+    for table, plain in (
+        ("audit_forward_target", "url"),
+        ("audit_forward_target", "auth_header"),
+        ("platform_settings", "audit_forward_webhook_url"),
+        ("platform_settings", "audit_forward_webhook_auth_header"),
+    ):
+        await db.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN {plain} VARCHAR(1024) NOT NULL DEFAULT ''")
+        )
+
+
+async def _leftover(db: AsyncSession, sql: str, params: dict) -> str:  # noqa: ANN001
+    return (await db.execute(text(sql), params)).scalar_one()
+
+
+async def test_clearing_or_replacing_a_secret_blanks_its_plaintext_leftover(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin(db_session)
+    await _add_plaintext_leftovers(db_session)
+    # Commit the DDL: an uncommitted ALTER holds an exclusive lock that
+    # the API's other connections would wait on.
+    await db_session.commit()
+
+    # Target: simulate pre-upgrade values, then replace both secrets.
+    created = (await client.post(_TARGETS, headers=headers, json=_webhook_body())).json()
+    tid = created["id"]
+    await db_session.execute(
+        text("UPDATE audit_forward_target SET url = :u, auth_header = :a WHERE id = :id"),
+        {"u": _GENERIC, "a": _AUTH, "id": tid},
+    )
+    await db_session.commit()
+    body = _webhook_body(url=_SLACK, auth_header="")
+    resp = await client.put(f"{_TARGETS}/{tid}", headers=headers, json=body)
+    assert resp.status_code == 200, resp.text
+    assert (
+        await _leftover(
+            db_session, "SELECT url FROM audit_forward_target WHERE id = :id", {"id": tid}
+        )
+        == ""
+    )
+    assert (
+        await _leftover(
+            db_session,
+            "SELECT auth_header FROM audit_forward_target WHERE id = :id",
+            {"id": tid},
+        )
+        == ""
+    )
+
+    # An update that keeps the secrets (fields omitted) leaves the
+    # leftover question alone — nothing was written, so the raw update
+    # below proves the next legacy write is the one that blanks it.
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={
+            "audit_forward_webhook_url": _GENERIC,
+            "audit_forward_webhook_auth_header": _AUTH,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    ps_id = (await db_session.execute(select(PlatformSettings.id))).scalar_one()
+    await db_session.execute(
+        text(
+            "UPDATE platform_settings SET audit_forward_webhook_url = :u, "
+            "audit_forward_webhook_auth_header = :a WHERE id = :id"
+        ),
+        {"u": _GENERIC, "a": _AUTH, "id": ps_id},
+    )
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"audit_forward_webhook_url": _SLACK, "audit_forward_webhook_auth_header": ""},
+    )
+    assert resp.status_code == 200, resp.text
+    assert (
+        await _leftover(
+            db_session,
+            "SELECT audit_forward_webhook_url FROM platform_settings WHERE id = :id",
+            {"id": ps_id},
+        )
+        == ""
+    )
+    assert (
+        await _leftover(
+            db_session,
+            "SELECT audit_forward_webhook_auth_header FROM platform_settings WHERE id = :id",
+            {"id": ps_id},
+        )
+        == ""
+    )
+
+    # Drop the recreated columns (and commit, as above) so the schema
+    # is back to the model shape for the migration test below, which
+    # re-adds them itself.
+    for table, plain in (
+        ("audit_forward_target", "url"),
+        ("audit_forward_target", "auth_header"),
+        ("platform_settings", "audit_forward_webhook_url"),
+        ("platform_settings", "audit_forward_webhook_auth_header"),
+    ):
+        await db_session.execute(text(f"ALTER TABLE {table} DROP COLUMN {plain}"))
+    await db_session.commit()
+
+
+# ── post-restore empty bytea ────────────────────────────────────────
+
+
+async def test_an_empty_bytea_url_is_unset_everywhere(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An exclude-secrets restore leaves b"" in url_encrypted, not NULL."""
+    from app.api.v1.settings.router import _forward_snapshot
+
+    headers = await _admin(db_session)
+    created = (await client.post(_TARGETS, headers=headers, json=_webhook_body())).json()
+    row = await db_session.get(AuditForwardTarget, uuid.UUID(created["id"]))
+    assert row is not None
+    row.url_encrypted = b""
+    row.auth_header_encrypted = b""
+    await db_session.flush()
+
+    listed = await client.get(_TARGETS, headers=headers)
+    mine = [t for t in listed.json() if t["id"] == created["id"]]
+    assert mine and mine[0]["url_set"] is False and mine[0]["auth_header_set"] is False
+
+    snapshot = _forward_snapshot(row)
+    assert snapshot["url_set"] is False and snapshot["auth_header_set"] is False
+
+    # Keeping the (blank) URL on update is refused, not silently saved.
+    edit = {k: v for k, v in _webhook_body().items() if k not in ("url", "auth_header")}
+    edit["name"] = created["name"]
+    resp = await client.put(f"{_TARGETS}/{created['id']}", headers=headers, json=edit)
+    assert resp.status_code == 422, resp.text
 
 
 # ── support bundle ─────────────────────────────────────────────────

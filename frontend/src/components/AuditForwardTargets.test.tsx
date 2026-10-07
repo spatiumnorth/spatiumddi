@@ -114,3 +114,23 @@ describe("webhook secrets in the target form", () => {
     expect("url" in body).toBe(false);
   });
 });
+
+describe("Teams flavor", () => {
+  // The Office 365 "Incoming Webhook" connector is retired (#1504); the
+  // form must send operators to a Workflows webhook instead.
+  it("points at a Workflows webhook, not the retired connector", async () => {
+    await openEdit();
+    fireEvent.change(screen.getByDisplayValue("Generic JSON"), {
+      target: { value: "teams" },
+    });
+    expect(
+      screen.getByRole("option", {
+        name: "Microsoft Teams (Workflows / Adaptive Card)",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Workflows app .* “Send webhook alerts to a channel”/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/MessageCard/)).toBeNull();
+  });
+});
