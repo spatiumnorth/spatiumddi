@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An agent appliance keeps access to its own Kubernetes API once the
+  control plane is multi-node (#1508).** The firewall renderers retired the
+  6443 bootstrap sentinel on every node as soon as the fleet's control plane
+  had two members. An agent appliance runs its own single-node k3s and gets
+  no scoped `kubeapi` rule, so its pods (supervisor, DNS, DHCP) lost their
+  own API, and the self-partition guard then refused every corrected rule
+  set. The sentinel is now retired only on a control-plane member; agents
+  keep it. **Recovery for an agent already cut off on 2026.10.02-1** (it does
+  not heal by itself, because the guard can't read membership while the API
+  is blocked): on the agent, run
+  `mv /etc/nftables.d/00-spatium-k3s-bootstrap.nft.retired /etc/nftables.d/00-spatium-k3s-bootstrap.nft`
+  and `nft -f /etc/nftables.conf` once, after the control plane runs this
+  release. The next heartbeat then applies a rule set that keeps it. A
+  `firewall_extra` 6443 rule added as a workaround can be removed afterwards.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
