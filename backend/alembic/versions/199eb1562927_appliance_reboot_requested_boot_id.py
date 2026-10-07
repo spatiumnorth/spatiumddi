@@ -7,7 +7,7 @@ the one recorded here. Nullable, no backfill: NULL means "not recorded yet",
 which the heartbeat handler fills from the next heartbeat.
 
 Revision ID: 199eb1562927
-Revises: 61566a119901
+Revises: ff32b91acad8
 Create Date: 2026-10-03
 """
 
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "199eb1562927"
-down_revision = "61566a119901"
+down_revision = "ff32b91acad8"
 branch_labels = None
 depends_on = None
 
