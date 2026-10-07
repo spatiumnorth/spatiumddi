@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing an appliance's DNS or DHCP group in Fleet moves its server
+  too (#1565).** `PUT /appliance/appliances/{id}/roles` changed only the
+  appliance's group pointer. The supervisor's env and firewall followed it,
+  while the appliance's already-registered server stayed in the old group
+  and kept serving that group's zones or scopes (re-registration never
+  moves a server, by design), and the firewall could open listeners for a
+  configuration the agent wasn't running. The PUT now moves the
+  appliance's own DNS server(s) through the #934 move and its DHCP
+  server(s) with the DHCP server PUT's checks, in the same transaction. A
+  move it refuses (a name clash, a mixed-driver group) refuses the whole
+  change, naming the server.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or

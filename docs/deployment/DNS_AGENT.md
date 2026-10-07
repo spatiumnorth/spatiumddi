@@ -910,6 +910,14 @@ dns-bind9-ns1:
 > [`DNS.md` §1](../features/DNS.md)). Naming a group that does not exist
 > still auto-creates an empty one, so a stale value here is untidy rather
 > than harmful.
+>
+> On an appliance, changing the DNS or DHCP group in **Fleet** is that move:
+> it moves the appliance's own registered DNS / DHCP server into the new
+> group in the same request, and refuses the change (409 / 422, naming the
+> server) when the move itself is refused — a name clash or a mixed-driver
+> group (#1565). Before, Fleet moved only the appliance's pointer, so its
+> env and firewall followed the new group while the server kept serving the
+> old one.
 
 ---
 
