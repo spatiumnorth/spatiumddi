@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade is driven by one orchestrator loop at a time, and its
+  lock holds under contention (#1512).** Every task in a worker pod used
+  the pod's hostname as its upgrade-lease identity, so a second drive of
+  the same run (Start clicked twice, a second tab, an API or MCP caller,
+  Start racing Resume, a Celery redelivery) "renewed" the first one's lease
+  and ran a second cordon / drain loop beside it, which could take two
+  nodes of a three-node cluster down at once. The lease is now held under
+  one identity per drive, and the run row is re-read `FOR UPDATE` before
+  it moves to `running`. `POST /upgrades/{id}/start` answers 409 on a
+  running run whose driver is alive. The lease writes are now real
+  compare-and-swaps on the version read: two takeovers of an expired lease
+  no longer both win, a renewal no longer writes its name back over a
+  takeover, and Abort's release is no longer renewed away (the aborted
+  drive's next renewal sees it lost the lease and stops). A halted run's
+  drive releases its lease on exit, so Resume can take it at once.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —

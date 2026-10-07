@@ -373,6 +373,18 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
             status.HTTP_409_CONFLICT,
             f"cannot start a run in state {run.state!r}; use /resume for halted runs",
         )
+    # #1512 — a running run whose driver is alive holds the upgrade lease.
+    # Enqueueing another drive (a second click, a second tab, an API or MCP
+    # caller) used to start a second loop beside it; the drive itself now
+    # refuses that too, but answering here tells the caller why. A running
+    # run with no live lease is a dead driver's, and Start resumes it.
+    if run.state == "running":
+        lease = mutex.get_state()
+        if lease.held:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"this run is already being driven ({lease.holder}); it carries on by itself",
+            )
 
     # Inline import — keeps the celery dep off the api boot path for
     # docker-compose deploys that don't run a worker.

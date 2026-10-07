@@ -422,7 +422,7 @@ async def abort_upgrade(
 # ── drive_upgrade — the actual orchestration loop ────────────────────
 
 
-async def _lease_renewal_loop(stop_event: asyncio.Event) -> None:
+async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
     """Background task — renew the upgrade Lease every
     ``LEASE_DURATION_S / 3`` seconds until ``stop_event`` is set.
 
@@ -440,7 +440,7 @@ async def _lease_renewal_loop(stop_event: asyncio.Event) -> None:
             return  # stop_event set during the wait
         except TimeoutError:
             pass
-        ok, err = mutex.renew(lease_duration_seconds=LEASE_DURATION_S)
+        ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
         if not ok:
             logger.warning("upgrade_lease_renew_failed", error=err)
             stop_event.set()
@@ -460,36 +460,54 @@ async def drive_upgrade(
     Acquires the upgrade lease for the duration; spawns the renewal
     task; releases on terminal transition.
     """
-    run = await get_run(db, run_id)
+    # #1512 — the row under FOR UPDATE, re-read: two drives of one run (a
+    # second Start, a second tab, Celery redelivery) used to both pass the
+    # planned → running check on their own stale copies. The second now waits
+    # here, then sees ``running`` and must win the lease to go on.
+    run = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise OrchestratorError(f"upgrade run {run_id} not found")
+    # One identity per drive, not per pod: a worker pod runs several tasks,
+    # and a second task under the pod's name renewed the first one's lease
+    # and ran a second drive loop beside it.
+    me = mutex.drive_identity()
     if run.state == "planned":
         # First call — acquire the lease.
-        ok, err = mutex.acquire(lease_duration_seconds=LEASE_DURATION_S)
+        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
         if not ok:
             raise OrchestratorError(f"could not acquire upgrade lease: {err}")
-        run.lease_holder = mutex._identity()  # noqa: SLF001 — same module family
+        run.lease_holder = me
         run.lease_acquired_at = _now()
         await _transition(db, run, "running", allowed_from=("planned",), event="started")
         await db.commit()
         await db.refresh(run)
     elif run.state == "running":
-        # Resume / re-enqueue path — confirm we still hold the lease,
-        # taking over if it expired (the previous celery worker died).
-        ok, err = mutex.acquire(lease_duration_seconds=LEASE_DURATION_S)
+        # Resume / re-enqueue path. A drive that is still alive holds the
+        # lease under its own identity, so this one is refused; it takes over
+        # only once that lease expired (the previous worker died) or was
+        # released (a halt).
+        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
         if not ok:
             raise OrchestratorError(f"can't take over upgrade lease for resume: {err}")
-        if run.lease_holder != mutex._identity():  # noqa: SLF001
-            run.lease_holder = mutex._identity()  # noqa: SLF001
-            run.lease_acquired_at = _now()
-            await _record_event(db, run, "lease_takeover")
-            await db.commit()
+        run.lease_holder = me
+        run.lease_acquired_at = _now()
+        await _record_event(db, run, "lease_takeover")
+        await db.commit()
     else:
         # Terminal or halted — nothing to drive.
         return run
 
     stop_event = asyncio.Event()
-    renewal_task = asyncio.create_task(_lease_renewal_loop(stop_event))
+    renewal_task = asyncio.create_task(_lease_renewal_loop(stop_event, me))
     try:
-        await _drive_loop(db, run, stop_event)
+        await _drive_loop(db, run, stop_event, me)
     finally:
         stop_event.set()
         # Wait for the renewal loop to exit cleanly. The ``await`` IS
@@ -511,6 +529,7 @@ async def _drive_loop(
     db: AsyncSession,
     run: SystemUpgradeRun,
     stop_event: asyncio.Event,
+    holder: str | None = None,
 ) -> None:
     """The per-node iteration. Each cycle:
 
@@ -542,6 +561,12 @@ async def _drive_loop(
                 run_id=str(run.id),
                 state=run.state,
             )
+            # #1512 — give up the lease on a halt too, so Resume's drive (a
+            # new identity) can take it at once instead of waiting out the
+            # expiry. Only ours is released.
+            ok, err = mutex.release(holder=holder)
+            if not ok:
+                logger.warning("upgrade_lease_release_failed", error=err)
             return
 
         per_node_progress = dict(run.progress.get("per_node") or {})
@@ -605,7 +630,7 @@ async def _drive_loop(
                     failure_category=category,
                 )
                 await db.commit()
-                ok, err = mutex.release()
+                ok, err = mutex.release(holder=holder)
                 if not ok:
                     logger.warning("upgrade_lease_release_failed", error=err)
                 logger.warning(
@@ -662,7 +687,7 @@ async def _drive_loop(
                     failed_checks=fails,
                 )
                 await db.commit()
-                ok, err = mutex.release()
+                ok, err = mutex.release(holder=holder)
                 if not ok:
                     logger.warning("upgrade_lease_release_failed", error=err)
                 logger.warning(
@@ -684,7 +709,7 @@ async def _drive_loop(
                 post_upgrade_verify=verify_overall,
             )
             await db.commit()
-            ok, err = mutex.release()
+            ok, err = mutex.release(holder=holder)
             if not ok:
                 logger.warning("upgrade_lease_release_failed", error=err)
             logger.info(
@@ -756,7 +781,7 @@ async def _drive_loop(
                 failure_category=category,
             )
             await db.commit()
-            ok, err = mutex.release()
+            ok, err = mutex.release(holder=holder)
             if not ok:
                 logger.warning("upgrade_lease_release_failed", error=err)
             logger.warning(

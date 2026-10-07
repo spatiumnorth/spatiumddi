@@ -781,6 +781,7 @@ def update_lease(
     lease_duration_seconds: int = 60,
     bump_transitions: bool = False,
     expected_transitions: int | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Update a Lease's renewTime + holderIdentity.
 
@@ -790,12 +791,14 @@ def update_lease(
     Acquisition (after a previous holder's lease expired): caller
     passes their own identity as ``holder`` + sets ``bump_transitions=
     True`` so ``leaseTransitions`` increments (this is how k8s
-    leader-election detects a takeover).
+    leader-election detects a takeover). ``expected_transitions`` is the
+    value the caller read; the patch writes it plus one.
 
-    ``expected_transitions`` lets callers do an optimistic-concurrency
-    update — if set, we read first and refuse the patch when the
-    server's value drifted (another holder beat us to the takeover).
-    Returns (ok, error). 409 reports an explicit conflict.
+    ``resource_version`` makes the update a compare-and-swap (#1512): the
+    patch carries the ``metadata.resourceVersion`` the caller read, and the
+    apiserver answers 409 when the lease changed since. Without it two
+    takeovers of one expired lease both succeeded. Returns (ok, error);
+    409 reports the conflict.
     """
     cfg = get_config()
     if cfg is None:
@@ -813,7 +816,10 @@ def update_lease(
         if expected_transitions is not None:
             spec["leaseTransitions"] = expected_transitions + 1
         spec["acquireTime"] = now
-    payload = json.dumps({"spec": spec}).encode("utf-8")
+    patch: dict[str, Any] = {"spec": spec}
+    if resource_version:
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
@@ -835,6 +841,7 @@ def clear_lease_holder(
     name: str,
     *,
     namespace: str | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mark a lease as released without deleting it.
 
@@ -851,7 +858,11 @@ def clear_lease_holder(
     # Two-hour-ago renewTime is well beyond any sane
     # leaseDurationSeconds → next read treats this as expired.
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
-    payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
+    patch: dict[str, Any] = {"spec": {"holderIdentity": "", "renewTime": old}}
+    if resource_version:
+        # #1512 — only clear the lease the caller read (see update_lease).
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
