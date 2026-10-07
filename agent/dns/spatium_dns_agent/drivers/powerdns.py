@@ -194,9 +194,11 @@ def _dedupe_contents(rtype: str, contents: list[str]) -> list[str]:
 
 
 # Never deleted by the reconcile's absent-rrset sweep (#1380). The apex SOA
-# and NS are the zone's own skeleton — PowerDNS creates them with the zone and
-# serving the zone without them is not a smaller zone but a broken one — and
-# the DNSSEC types are PowerDNS's to manage, not the bundle's.
+# and NS are the zone's own skeleton: deleting either leaves not a smaller zone
+# but a broken one. PowerDNS creates a default SOA with the zone; it does NOT
+# create an apex NS unless the create names nameservers, and the agent does not
+# render the zone's own SOA or NS yet (#1522). The DNSSEC types are PowerDNS's
+# to manage, not the bundle's.
 _APEX_KEPT_TYPES = frozenset({"SOA", "NS"})
 _DNSSEC_RRSET_TYPES = frozenset(
     {"CDNSKEY", "CDS", "DNSKEY", "NSEC", "NSEC3", "NSEC3PARAM", "RRSIG"}
