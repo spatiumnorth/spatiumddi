@@ -513,6 +513,38 @@ the formatter handles the rest.
   wrote into such a zone is dropped, with no update sent, the next time
   IPAM syncs the address.
 
+- **A slot upgrade no longer hands k3s half-written image tarballs
+  (#1630).** `spatium-upgrade-slot apply` copied the new slot's
+  image tarballs over the old ones in place while the old slot's
+  k3s kept running, and k3s's image watcher imported each file
+  while it was still being written. Those imports failed, and one
+  cut off inside a tarball's `index.json` could leave a containerd
+  ingest that failed the next boot's imports as well. Each tarball
+  is now copied under a hidden `.part` name the watcher ignores,
+  synced, and renamed into place.
+
+- **An image tarball k3s failed to import is noticed and imported
+  again (#1630).** k3s imports every tarball's `index.json` under
+  one containerd ref, and an import that died part-way left a
+  stale write there that failed every shorter `index.json` after
+  it, on every boot. k3s retries a failed tarball only when the
+  file changes, so a slot upgrade's first boot could leave a node
+  without its DNS and DHCP agents' images for good, with the pods
+  in `ErrImageNeverPull`. k3s.service now clears unfinished
+  containerd writes before k3s starts. On every boot, firstboot
+  checks k3s's own record of what it imported against containerd,
+  and has k3s re-import anything missing.
+
+- **A trial slot is not committed while one of its images is
+  missing (#1630).** firstboot committed a slot upgrade's trial
+  boot once the apiserver answered and the control chart was
+  placed, whatever k3s had imported, so a node whose DNS and DHCP
+  agents' images had failed to import made the swap durable
+  without them. If an image is still missing after the re-import
+  above, a trial boot now exits before the commit. The previous
+  slot stays the durable default and the next reboot reverts to
+  it, as with a failed host migration.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
