@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
 - **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
   as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
   when the hostname already holds a CNAME, but the PTR was still written,
