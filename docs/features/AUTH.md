@@ -539,6 +539,14 @@ per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.
 
+A resource-scoped token is held to its grants beyond the URL path too. An
+IPAM write that names a DNS zone in its body (`dns_zone_id`,
+`extra_zone_ids`, a subnet's zone bindings) may name only one of the
+subnet's own effective zones, the row's current zone, or a zone the token
+holds a `dns_zone` grant on (GHSA-875w). Reads that belong to no grantable
+resource at all, such as a DNS server's recent events and `rndc status`,
+are refused to a resource-scoped token (GHSA-c4v7).
+
 **Wire format.** Raw tokens start with `sddi_` followed by 40 bytes of
 url-safe base64 entropy (`secrets.token_urlsafe(40)`). Operators typically see only the first
 10 characters (`sddi_AbCdE`) in the UI as an identifier — this is
