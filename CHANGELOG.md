@@ -96,6 +96,27 @@ the formatter handles the rest.
   non-CNPG install) the pod count stands, and the row's new `source` field
   (`cnpg` / `pods`) and its tooltip say which.
 
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
+- **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
+  as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
+  when the hostname already holds a CNAME, but the PTR was still written,
+  naming the alias: a reverse lookup led forward to the CNAME's target
+  instead of back to the address (RFC 1912 section 2.4 asks a PTR to name an
+  A record). The PTR is now skipped too, and one an address had before
+  being renamed onto the CNAME's name is retracted. Such a sync now reports
+  that it published nothing, so the DDNS path logs `ddns_skipped_cname`
+  rather than `ddns_applied`, and `ipam_dns_record_skipped_cname` is logged
+  at warning once per address, hostname and zone instead of on every lease
+  renewal.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
@@ -358,6 +379,21 @@ the formatter handles the rest.
   dropped, with no update sent, the next time IPAM syncs or deletes the
   address.
 
+- **IPAM writes forward records only into a zone it serves as primary
+  (#1633).** A subnet could be bound to a conditional forwarder, a
+  secondary or a stub as its DNS zone, and an address could pick one as
+  its own zone or list one in its extra zones. IPAM wrote every host's
+  A/AAAA record and every alias into such a zone, and the record updates
+  went to a zone that cannot take them, so nobody served the record. The
+  drift check expected the record in that zone and showed the subnet in
+  sync. Such a zone still names the host (its FQDN, and the PTR IPAM
+  writes into a reverse zone it serves), but IPAM now writes no A/AAAA or
+  alias into it and queues nothing, the drift check expects none, and
+  adding an alias there answers 409 saying why. The same holds once a
+  zone in use is changed to a secondary. A record an earlier release
+  wrote into such a zone is dropped, with no update sent, the next time
+  IPAM syncs the address.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
@@ -390,6 +426,20 @@ the formatter handles the rest.
   window early, and keep-days deleted rollback copies on the backups'
   schedule. Retention now splits the listing: backups follow the
   target's policy, safety dumps keep their own last 3.
+
+- **A refused restore no longer blocks every later one as "already in
+  progress" (#1648).** The restore lock added for #1571 was taken on
+  the request's database session, which hands its connection back to
+  the pool at every commit, so the unlock ran on a different
+  connection and did nothing. The lock stayed on an idle pooled
+  connection: after one refused restore (a mistyped passphrase, an
+  invalid archive) the next could be refused with "another restore is
+  already in progress" until the api recycled that connection or
+  restarted. The same flaw could let a second restore in while one was
+  running, and the pool reset before the replay dropped the lock. The
+  lock now lives on a connection of its own for the whole restore,
+  which the restore spares when it ends the other sessions, and it is
+  released however the restore ends, a cancelled request included.
 
 - **A Proxmox sync no longer fails on an address another integration
   already mirrors (#1622).** When a guest reported an IP that UniFi (or any
