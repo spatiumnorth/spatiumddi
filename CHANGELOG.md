@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A ballooned seed VM no longer re-sizes the control plane on every
+  balloon step (#1585).** The supervisor sized api / worker / Postgres from
+  the node's current `MemTotal` on every heartbeat, and a virtio balloon
+  changes `MemTotal` while the guest runs (Proxmox does so by itself once the
+  host passes 80 % RAM). Each step re-rendered `spatium-control`: a new api
+  rollout and migrate Job, and on a bigger seed a CNPG rolling restart. One
+  install went through about 110 helm revisions in five hours. The sizing
+  now uses the largest `MemTotal` seen since this boot, kept per boot in the
+  supervisor's state dir, so it survives a supervisor restart. A balloon
+  only takes memory away from what the node booted with, so the size stays
+  put; more memory (a hot-plug) is taken at once, and a node rebooted with
+  less RAM sizes down on that boot.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
