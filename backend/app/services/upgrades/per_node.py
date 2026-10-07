@@ -671,7 +671,15 @@ async def _step_convergence(
     step = StepResult(name="convergence", started_at=_now_iso(), detail={"node": node_name})
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        node_status, node = k8s.get_node(node_name)
+        try:
+            node_status, node = k8s.get_node(node_name)
+        except k8s.KubeapiUnavailableError:
+            # A node rejoining after its reboot is exactly when the API
+            # times out; one timeout ending the step failed a run whose
+            # node came back seconds later (#1449). Keep polling until the
+            # window ends.
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            continue
         if node_status != 200 or node is None:
             await asyncio.sleep(_POLL_INTERVAL_S)
             continue

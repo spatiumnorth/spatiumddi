@@ -39,6 +39,7 @@ incomplete node is driven.
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -117,6 +118,9 @@ _LEASE_RENEW_INTERVAL_S = LEASE_DURATION_S / 3.0
 # pause so the previous node's services have time to fully resync (DS
 # bundle warm-up, CNPG replica streaming catches up).
 _BETWEEN_NODES_PAUSE_S = 10.0
+
+# How many times a run's end retries releasing the lease (2 s apart).
+_LEASE_RELEASE_ATTEMPTS = 5
 
 
 class OrchestratorError(RuntimeError):
@@ -467,6 +471,28 @@ async def abort_upgrade(
 # ── drive_upgrade — the actual orchestration loop ────────────────────
 
 
+def _release_lease(run: SystemUpgradeRun) -> None:
+    """Release the upgrade lease when a run ends, retrying an unanswered
+    API call. A run often ends while a node is rebooting, which is when
+    the API times out; a lease left held refuses the next Start until it
+    expires (#1449). Only our own lease is released."""
+    if not mutex.release_if_held(attempts=_LEASE_RELEASE_ATTEMPTS):
+        logger.warning("upgrade_lease_release_failed", run_id=str(run.id))
+
+
+def _own_node() -> str | None:
+    """The node this worker runs on (the chart's downward-API ``NODE_NAME``),
+    or None when it is not known."""
+    return os.environ.get("NODE_NAME") or None
+
+
+def _enqueue_drive(run_id: uuid.UUID, *, avoid_node: str | None) -> None:
+    """Enqueue the drive task; ``avoid_node`` asks that it not run there."""
+    from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
+
+    drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_node": avoid_node})
+
+
 async def _lease_renewal_loop(stop_event: asyncio.Event) -> None:
     """Background task — renew the upgrade Lease every
     ``LEASE_DURATION_S / 3`` seconds until ``stop_event`` is set.
@@ -601,7 +627,25 @@ async def _drive_loop(
         completed_nodes = [
             name for name, entry in per_node_progress.items() if entry.get("ok") is True
         ]
-        next_node = node_order.next_node_to_upgrade(plan_order, completed_nodes)
+        own_node = _own_node()
+        next_node = node_order.next_node_to_upgrade(plan_order, completed_nodes, defer=own_node)
+        if next_node is not None and next_node == own_node and len(plan_order) > 1:
+            # Every other node is done and the one left is the node this
+            # worker runs on. Draining it would evict this drive mid-chain,
+            # and the run would sit in ``running`` with nothing driving it
+            # until Celery redelivers the task an hour later (#1449). Hand
+            # the drive to a worker on another node instead: release the
+            # lease, enqueue the drive asking to be run elsewhere, and stop.
+            # The new drive takes the lease over and resumes at this node.
+            await _record_event(db, run, "drive_handoff", node=next_node)
+            await db.commit()
+            # Stop the renewal loop first: a renew after the release would
+            # write this pod back in as the holder.
+            stop_event.set()
+            _release_lease(run)
+            _enqueue_drive(run.id, avoid_node=own_node)
+            logger.info("upgrade_drive_handoff", run_id=str(run.id), node=next_node)
+            return
         if next_node is None:
             # Every node committed the new slot. Phase E — bump the
             # chart's image.tag so the api / worker / frontend
@@ -658,9 +702,7 @@ async def _drive_loop(
                     failure_category=category,
                 )
                 await db.commit()
-                ok, err = mutex.release()
-                if not ok:
-                    logger.warning("upgrade_lease_release_failed", error=err)
+                _release_lease(run)
                 logger.warning(
                     "upgrade_chart_bump_failed",
                     run_id=str(run.id),
@@ -715,9 +757,7 @@ async def _drive_loop(
                     failed_checks=fails,
                 )
                 await db.commit()
-                ok, err = mutex.release()
-                if not ok:
-                    logger.warning("upgrade_lease_release_failed", error=err)
+                _release_lease(run)
                 logger.warning(
                     "upgrade_post_verify_failed",
                     run_id=str(run.id),
@@ -737,9 +777,7 @@ async def _drive_loop(
                 post_upgrade_verify=verify_overall,
             )
             await db.commit()
-            ok, err = mutex.release()
-            if not ok:
-                logger.warning("upgrade_lease_release_failed", error=err)
+            _release_lease(run)
             logger.info(
                 "upgrade_succeeded",
                 run_id=str(run.id),
@@ -810,9 +848,7 @@ async def _drive_loop(
                 failure_category=category,
             )
             await db.commit()
-            ok, err = mutex.release()
-            if not ok:
-                logger.warning("upgrade_lease_release_failed", error=err)
+            _release_lease(run)
             logger.warning(
                 "upgrade_failed",
                 run_id=str(run.id),

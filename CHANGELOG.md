@@ -143,6 +143,21 @@ the formatter handles the rest.
     waits for: the next query failed with "connection is closed". Task
     sessions now ping their connection on checkout, and the reboot and
     health-gate waits end their transaction on every poll.
+  - Draining a node evicted the worker running the drive whenever the
+    drive ran there, and the run sat in `running` with nothing driving
+    it until Celery redelivered the task an hour later; a three-node
+    roll took over two hours. The node the drive's worker runs on now
+    goes last, and before it is drained the drive hands itself to a
+    worker on another node: it releases the lease and enqueues itself
+    asking to run elsewhere, and the new drive takes the lease over and
+    resumes at that node. A worker on the node being left passes the
+    task on rather than running it.
+  - `convergence` ended as a crash on the first API timeout, which is
+    when a node rejoining after its reboot is most likely to cause one.
+    It now keeps polling until its window ends.
+  - A run that ended while the API was not answering kept the upgrade
+    lease until it expired. The end of a run now retries the release,
+    and releases only a lease it still holds.
   The other points in that report are #1446, #1447 and #1448.
 
 - **The Teams webhook flavor sends an Adaptive Card for a Workflows

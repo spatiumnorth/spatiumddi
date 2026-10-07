@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -247,17 +248,51 @@ def renew(
     )
 
 
-def release_if_held(*, namespace: str | None = None) -> bool:
+def release_if_held(
+    *,
+    namespace: str | None = None,
+    attempts: int = 1,
+    retry_delay_s: float = 2.0,
+) -> bool:
     """Release the lease only if THIS pod holds it; True if released.
 
     For failure paths: :func:`release` clears whoever holds the lease, and a
     crashed drive must never drop a lease another worker has since taken
-    over (#1445)."""
-    state = get_state(namespace=namespace)
-    if not state.held or state.holder != _identity():
+    over (#1445).
+
+    ``attempts`` > 1 retries a release the API did not answer: a run often
+    ends while a node is rebooting, which is when the API times out, and a
+    lease left held refuses the next Start until it expires (#1449). The
+    holder is re-read on every attempt, so a retry never clears a lease
+    another worker took meanwhile."""
+    if k8s.get_config() is None:
+        # docker-compose: no Lease exists to release.
         return False
-    ok, _err = release(namespace=namespace)
-    return ok
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(retry_delay_s)
+        # Read the Lease directly rather than through get_state, which
+        # reports an unanswered read as "not held" (or held by
+        # "<unreachable>"): either would end the retry on exactly the
+        # failure it exists for.
+        try:
+            status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+        except k8s.KubeapiUnavailableError:
+            continue
+        if status == 404:
+            return False
+        if status != 200 or body is None:
+            continue
+        state = _parse_lease(body)
+        if not state.held or state.holder != _identity():
+            return False
+        try:
+            ok, _err = release(namespace=namespace)
+        except k8s.KubeapiUnavailableError:
+            continue
+        if ok:
+            return True
+    return False
 
 
 def release(*, namespace: str | None = None) -> tuple[bool, str | None]:
