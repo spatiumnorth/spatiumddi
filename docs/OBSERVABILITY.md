@@ -437,9 +437,18 @@ don't serialize the queue.
 - **HTTP webhook** — `httpx.AsyncClient`, 5 s timeout,
   `Content-Type: application/json`, optional `Authorization`
   header sent verbatim. The `webhook_flavor` column picks between
-  generic JSON, **Slack** (`mrkdwn` block), **Teams**
-  (`MessageCard`), and **Discord** (`embed`) so chat-channel
-  delivery doesn't need a separate adapter. For the chat flavors the
+  generic JSON, **Slack** (`mrkdwn` block), **Teams** (Adaptive
+  Card 1.4 in a `{"type": "message", "attachments": […]}` envelope),
+  and **Discord** (`embed`) so chat-channel delivery doesn't need a
+  separate adapter. For Teams, create the URL with the **Workflows**
+  app in the channel (template *Send webhook alerts to a channel*, or
+  a flow that starts with *When a Teams webhook request is received*);
+  the old Office 365 "Incoming Webhook" connector
+  (`…webhook.office.com/webhookb2/…`) has been retired and no longer
+  delivers (#1504). A Workflows webhook answers `202 Accepted` before
+  the flow runs, so **Test** reports success even when the flow then
+  fails to post the card; check the flow's run history in Power
+  Automate if nothing appears in the channel. For the chat flavors the
   URL is the credential (anyone holding it can post into the
   channel), so the URL and the header are **write-only secrets**
   (#1502): Fernet-encrypted at rest (`url_encrypted`,
