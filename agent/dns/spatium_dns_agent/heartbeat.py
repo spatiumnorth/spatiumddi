@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import __version__
+from . import __version__, features
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
@@ -102,7 +102,10 @@ class HeartbeatClient:
     def _client(self) -> httpx.Client:
         verify = self.cfg.httpx_verify()
         return httpx.Client(
-            base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0
+            base_url=self.cfg.control_plane_url,
+            verify=verify,
+            timeout=15.0,
+            headers=features.headers(),
         )
 
     def send_once(self) -> None:

@@ -1574,6 +1574,11 @@ function AcmeIssueModal({
                                   Manual TXT required
                                 </span>
                               )}
+                              {r.note && (
+                                <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                                  {r.note}
+                                </span>
+                              )}
                             </td>
                           </tr>
                         ))}
