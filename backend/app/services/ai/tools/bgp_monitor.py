@@ -57,6 +57,7 @@ class FindBgpHijacksArgs(BaseModel):
 
 @register_tool(
     name="find_bgp_hijacks",
+    permission=("read", "manage_asns"),
     description=(
         "List observed BGP prefix-hijack detections — cases where an "
         "unexpected origin AS was seen announcing a tracked prefix (or a "
@@ -99,6 +100,7 @@ class CountBgpHijacksArgs(BaseModel):
 
 @register_tool(
     name="count_bgp_hijacks",
+    permission=("read", "manage_asns"),
     description=(
         "Count BGP prefix-hijack detections, broken down by RPKI status "
         "(invalid / unknown) and detection kind. Use for 'how many "
@@ -140,6 +142,7 @@ class FindTrackedPrefixesArgs(BaseModel):
 
 @register_tool(
     name="find_tracked_prefixes",
+    permission=("read", "manage_asns"),
     description=(
         "List the prefixes SpatiumDDI monitors for BGP hijacks, with the "
         "expected origin AS, the source (roa / announced / both / "
@@ -191,6 +194,7 @@ class AllowlistBgpOriginArgs(BaseModel):
 
 @register_tool(
     name="propose_allowlist_bgp_origin",
+    permission=("write", "manage_asns"),
     description=(
         "Propose marking the observed origin AS of a BGP hijack "
         "detection as an EXPECTED additional origin for the tracked "
