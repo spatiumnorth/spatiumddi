@@ -17,6 +17,19 @@ stringData:
 {{- end }}
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
+{{- /* #1553 — refuse encrypted-transport ports the flavor cannot serve,
+       instead of rendering a Service port that forwards to nothing.
+       DoQ is Technitium-only (BIND9 and PowerDNS have no QUIC listener,
+       and the API refuses doq_enabled on a group with a non-Technitium
+       member). PowerDNS serves DoT/DoH only behind a dnsdist front,
+       which has no Kubernetes deployment yet — its ports would be
+       declared on the pod and both Services and answer nothing. */ -}}
+{{- if and $server.doqPort (ne $flavor "technitium") }}
+{{- fail (printf "dnsAgents server %q: doqPort is only supported with flavor: technitium (got flavor: %s) — remove doqPort or change the flavor" $server.name $flavor) }}
+{{- end }}
+{{- if and (eq $flavor "powerdns") (or $server.dotPort $server.dohPort) }}
+{{- fail (printf "dnsAgents server %q: dotPort/dohPort are not supported with flavor: powerdns — PowerDNS needs a dnsdist front for DoT/DoH, which has no Kubernetes deployment yet; remove dotPort/dohPort" $server.name) }}
+{{- end }}
 {{- $instance := printf "dns-%s-%s" $flavor $server.name -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
        optionally overrides repository + tag; missing keys (or the default
@@ -170,6 +183,8 @@ spec:
           requests:
             storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
 ---
+{{- $svc := $server.service | default dict -}}
+{{- $svcType := (get $svc "type") | default "LoadBalancer" -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -178,8 +193,41 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  {{- with (get $svc "annotations") }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  type: {{ (get ($server.service | default dict) "type") | default "LoadBalancer" }}
+  type: {{ $svcType }}
+  {{- if eq $svcType "LoadBalancer" }}
+  {{- /* #1548 — keep the client address, like the frontend VIP and
+         PR #1488's appliance DNS VIP: under the default Cluster policy
+         kube-proxy SNATs every query to the node / CNI address, so
+         per-client rate limits throttle the whole network at once and
+         query logs, RPZ hits and ACLs all key on the wrong address.
+         Local is safe here because each server is its own StatefulSet
+         (replicas: 1): MetalLB announces the address only from the
+         node running that server's pod, which is where the traffic
+         has to land anyway. Set service.externalTrafficPolicy: Cluster
+         to opt back out. */}}
+  externalTrafficPolicy: {{ (get $svc "externalTrafficPolicy") | default "Local" }}
+  {{- with (get $svc "loadBalancerIP") }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with (get $svc "loadBalancerSourceRanges") }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- else if and (eq $svcType "NodePort") (get $svc "externalTrafficPolicy") }}
+  externalTrafficPolicy: {{ get $svc "externalTrafficPolicy" }}
+  {{- end }}
+  {{- with (get $svc "ipFamilyPolicy") }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with (get $svc "ipFamilies") }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
     app.kubernetes.io/instance-name: {{ $server.name | quote }}

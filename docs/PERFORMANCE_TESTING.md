@@ -612,6 +612,15 @@ exercised as production would.
 
 - **DORA on arrival** → first `dhcp_lease` INSERT + `ip_address` mirror INSERT +
   DDNS publish (A+PTR). Record `(IP, lease_time, T1=900, T2=1800)`.
+- **Unanswered DORA sends back off like an RFC 2131 client (§4.1).** A device
+  waits 4 s for a reply to its first DISCOVER, then doubles the wait after each
+  resend (8, 16, 32 s, capped at 64 s). Each wait moves by a uniform ±1 s drawn
+  from the shard's seeded RNG, so a run is reproducible from its seed. A
+  SELECTING REQUEST that goes unanswered falls back to a DISCOVER on the same
+  schedule. After 4 sends (≈0, 4, 12, 28 s) the device gives up ≈60 s into the
+  round, counts a `timeout` and goes OFFLINE. A fixed 4 s wait would put every
+  device that lost a packet in the same instant back on the wire together, and
+  recreate the burst that lost it.
 - **RENEWING at T1=900s** (the dominant steady-state event, §0.A): **unicast
   REQUEST re-requesting the CURRENT lease (same ciaddr/IP)** — *not* a fresh
   DISCOVER. Each renewal = one Kea CSV row = one `dhcp_lease` UPDATE; the IPAM
@@ -704,7 +713,11 @@ Reverse zones per §0.A (8 per-octet headline; single-zone H3 variant).
 Per-protocol (both): DHCP-ACK latency p50/p95/p99/max (DORA *and* renewal,
 separately); exchange outcomes (ACK/NAK/**DECLINE**/**TIMEOUT**/retransmits —
 DECLINE+TIMEOUT are the protocol-tier health signal for (c)); offered vs achieved
-rate (divergence = load-gen saturation, not appliance).
+rate (divergence = load-gen saturation, not appliance). Because a DORA round
+runs ≈60 s before it times out (§3.2), the orchestrator also counts the ACKed
+handshakes that needed a resend first (`dora_ack_resent`, reported as "after a
+resend"), so a slow handshake that still got its lease stays visible, and the
+devices still mid-round when a shard stops (`dora_in_flight`).
 
 Orchestrator-specific: concurrent-online over time (traces the diurnal curve);
 renew/s (= online/900); DORA rate; both propagation-lag legs; per-shard

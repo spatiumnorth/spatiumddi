@@ -1300,7 +1300,7 @@ async def check_pre_upgrade_backup() -> PreflightResult:
     advice = (
         "This upgrade migrates the database forward, and the release you are "
         "leaving cannot run on it afterwards: a slot rollback alone does not bring "
-        "it back. Run a backup (Settings → Backup) before starting, so a copy from "
+        "it back. Run a backup (Administration → Backup) before starting, so a copy from "
         "before the upgrade exists."
     )
     if newest is None:
