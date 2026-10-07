@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The k3s join token is published whenever k3s writes it, not only in
+  the first 60 s after boot (#1509).** `spatiumddi-publish-k3s-token` ran
+  once at boot and polled for the token for 60 s. On a fresh seed k3s can
+  write it later (firstboot, airgap import, restarts), and nothing published
+  it until a reboot, so promoting the second node answered 409 ("hasn't
+  reported its k3s join token"). A new `spatiumddi-publish-k3s-token.path`
+  unit re-runs the service on every write of the token file
+  (`PathChanged=`, edge-triggered). The boot run stays for a token that
+  already exists at boot.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
