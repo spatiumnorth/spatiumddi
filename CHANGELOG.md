@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Teams webhook flavor sends an Adaptive Card for a Workflows
+  webhook (#1504).** It posted a legacy Office 365 `MessageCard`, and
+  the form asked for a `…webhook.office.com/webhookb2/…` URL, but
+  Microsoft retired that "Incoming Webhook" connector in May 2026, so
+  nothing reached the channel. A `teams` target now sends an Adaptive
+  Card 1.4 in the `{"type": "message", "attachments": […]}` envelope
+  the Workflows webhooks document (*Send webhook alerts to a channel*,
+  *When a Teams webhook request is received*); severity colours the
+  title, and a long digest is cut to stay under Teams' 28 KB message
+  limit. The form's label, placeholder and help text, and
+  OBSERVABILITY.md §5.1, now point at Workflows. The flavor value stays
+  `teams`, no migration. **An existing Teams target still on a
+  `webhook.office.com` URL needs a new Workflows URL**; a flow built
+  around the old MessageCard body must read `attachments` instead.
+  Note that a Workflows webhook answers 202 before the flow runs, so
+  **Test** succeeding does not prove the card was posted; the flow's
+  run history does.
+
 - **ACME DNS-01 puts the challenge into the public zone when an
   internal split-horizon subzone also covers the name (#1454).** The
   challenge zone was picked by longest suffix over every primary zone,
