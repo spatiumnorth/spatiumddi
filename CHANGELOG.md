@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **cloud-init stays off on an installed appliance (#1511).** The
+  installer masked cloud-init's units, but the masks land in the `/etc`
+  overlay, which is mounted after systemd has loaded its units, so they
+  never took effect at boot (and trixie's cloud-init 25.1 renamed the
+  units as well). With a preseed's `CIDATA` drive still attached,
+  cloud-init ran on the installed system and wrote a DHCP profile
+  (`cloud-init-<iface>.nmconnection`) next to the static one, so once a
+  DHCP server answered on the segment a rebooted node could come up on a
+  lease instead of its address. The installer now writes
+  `/etc/cloud/cloud-init.disabled`, which every cloud-init unit checks
+  when it starts. Nodes installed before this heal on their first boot of
+  a release that carries the fix: `spatium-etc-render` sets the marker and
+  removes leftover `cloud-init-*.nmconnection` profiles, but only on a
+  node the installer set up, so an image booted without the installer
+  keeps cloud-init.
+
 - **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
   BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
   zone's TTL instead, so a record set not to be cached for a cut-over or
