@@ -102,6 +102,44 @@ the formatter handles the rest.
   **Test** succeeding does not prove the card was posted; the flow's
   run history does.
 
+- **ACME DNS-01 puts the challenge into the public zone when an
+  internal split-horizon subzone also covers the name (#1454).** The
+  challenge zone was picked by longest suffix over every primary zone,
+  so an internal-only `home.example.com` won over the public
+  `example.com` and a public CA could never see the TXT. Zones in an
+  `external` group or served by a cloud DNS driver now go first;
+  internal zones are only used when nothing public covers the name.
+  `/preview` notes when an internal zone was skipped, and shows
+  `_acme-challenge.example.com` for `*.example.com` instead of
+  `_acme-challenge.*.example.com`.
+
+- **Feed-backed blocklists refresh on their update interval (#1467).**
+  `update_interval_hours` was stored and shown but never read, so a URL
+  list was fetched once and then only on a manual Refresh; lists created
+  through `POST /dns/blocklists` (not the catalog) weren't fetched at all.
+  A new hourly beat sweep (`dns-blocklist-refresh`) queues
+  `refresh_blocklist_feed` for every enabled URL list whose last sync is
+  at least `update_interval_hours` old, never-synced lists first, queued a
+  minute apart and at most 55 per sweep, so none is queued twice before it
+  has run. `0` stays manual-only. A failed fetch counts as a sync, so
+  a broken feed is retried once per interval; Refresh still retries at
+  once. The API now refuses an interval below 0 or above 8760 (422).
+
+- **A cloud or Windows DNS import no longer pushes the imported records
+  back to the server it read them from (#1456).** Importing a Cloudflare
+  account (or a Windows DNS server) into the group that holds that server
+  enqueued a `create` op per imported record, which the agentless path
+  applies at once: one create call per record to the provider the records
+  had just been read from. Cloudflare refused them as duplicates, leaving
+  a `failed` op per record; a provider that accepts duplicates would have
+  stored them twice. The preview now carries the server it pulled from
+  (`source_server_id`), and the commit skips the record ops when that
+  server is the zone's primary. A zone renamed on the way in, an import
+  into another provider's group, and records created after the import
+  still go out as before. The commit refuses a `source_server_id` that
+  isn't a server of the plan's own source. Failed ops left by an earlier
+  import are not cleaned up.
+
 - **Kubernetes, Docker, Tailscale, NetBird and Cloud syncs no longer fail
   on an address another integration already mirrors (#1677).** Same gap
   as Proxmox in #1622: the reconciler logged "owned by another
@@ -1010,6 +1048,21 @@ the formatter handles the rest.
   leaves it alone, as it does every reservation's row.
 
 ### Security
+
+- **A failed backup run's audit row no longer carries the destination's
+  error text (#1617).** The `backup_target_run_failed` row is forwarded
+  as-is, to syslog, webhook and SMTP forward targets and as the
+  `system.backup_failed` event, and a driver's error text routinely names
+  where the backups live: the NFS server and export, the SMB share, the S3
+  bucket, the SCP host and path. `new_value.error` is gone; the row carries
+  a fixed `failure_category` instead (`unreachable`, `timeout`,
+  `permission_denied`, `auth_failed`, `no_space`, `not_found`,
+  `config_invalid`, `retention_locked`, `secret_unreadable`,
+  `archive_error`, `destination_error`, `unexpected`, and `run_died` for a
+  run the stale-run reaper stamped). The full text is unchanged on the
+  target (`last_run_error`, superadmin-only) and in the row's
+  `error_detail`, which no forwarder emits. A consumer that parsed
+  `new_value.error` should switch to `failure_category`.
 
 - **A cleared or replaced webhook secret no longer lives on in its
   old plaintext column, and a collector echoing part of a secret no
