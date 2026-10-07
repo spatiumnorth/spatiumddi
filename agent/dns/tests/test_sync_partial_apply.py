@@ -160,6 +160,10 @@ def test_a_refused_zone_degrades_the_apply_without_a_revert(tmp_path: Path, monk
     assert status.failed_etag == "new"
     assert "bad.test." in (status.error or "")
     assert "Duplicate record in RRset" in (status.error or ""), "PowerDNS's own reason"
+    # The marker the control plane and UI read to say "zones refused", not
+    # "rolled back": there is no partial status in #882's vocabulary.
+    assert (status.error or "").startswith(sync_mod.PARTIAL_APPLY_PREFIX)
+    assert sync_mod.PARTIAL_APPLY_PREFIX == "partial apply: ", "mirrored by the backend and UI"
     assert loop.heartbeat.config_apply is status
     assert loop.heartbeat.daemon_status["status"] == "degraded"
     assert loop.heartbeat.daemon_status["reason"].startswith("config_apply_reverted: ")

@@ -67,6 +67,14 @@ def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[st
         ack["dispatch"] = op["dispatch"]
     return ack
 
+# Starts the error of an apply that landed with zones the daemon refused. The
+# control plane has no "partial" status (it reports ``reverted``), so the chip,
+# banner and ``agent_config_rejected`` alert read this prefix to say what really
+# happened: nothing rolled back, every other zone served. Mirrored in
+# backend/app/services/agents/config_apply.py and frontend/src/lib/configApply.ts.
+PARTIAL_APPLY_PREFIX = "partial apply: "
+
+
 class SyncLoop:
     def __init__(
         self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any
@@ -500,8 +508,8 @@ class SyncLoop:
             self._zones_refused = False
             return False
         error = truncate_error(
-            f"the daemon refused {len(refused)} zone(s); every other zone is served: "
-            + "; ".join(refused)
+            f"{PARTIAL_APPLY_PREFIX}the daemon refused {len(refused)} zone(s); "
+            "every other zone is served: " + "; ".join(refused)
         )
         self._zones_refused = True
         self.apply_status = ApplyStatus(

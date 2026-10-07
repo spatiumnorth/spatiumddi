@@ -3564,9 +3564,11 @@ async def _matching_agent_config_rejected_subjects(
     from app.models.dns import DNSServer  # noqa: PLC0415
     from app.services.agents.config_apply import (  # noqa: PLC0415
         FAILED_STATUSES,
+        PARTIAL_APPLY_PREFIX,
         SEVERITY_BY_STATUS,
         STATUS_NO_PREVIOUS,
         STATUS_REVERT_FAILED,
+        is_partial_apply,
     )
 
     matches: list[tuple[str, str, str, str | None]] = []
@@ -3583,6 +3585,7 @@ async def _matching_agent_config_rejected_subjects(
         )
         for row in rows:
             status = row.config_apply_status or ""
+            what: str | None
             if status == STATUS_NO_PREVIOUS:
                 what = (
                     "could not apply the configuration and had no previously-working "
@@ -3593,17 +3596,28 @@ async def _matching_agent_config_rejected_subjects(
                     "could not apply the configuration AND failed to roll back to the "
                     "previous one — its running state is unknown"
                 )
+            elif is_partial_apply(status, row.config_apply_error):
+                what = None
             else:
                 what = (
                     "rejected the configuration and rolled back to the last one that "
                     "worked, so it is healthy but NOT serving what is saved here"
                 )
             detail = (row.config_apply_error or "").strip()
-            message = (
-                f"{kind} server '{row.name}' {what}. "
-                f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
-                + (f" Daemon reported: {detail}" if detail else "")
-            )
+            if what is None:
+                # Nothing was rolled back: the bundle is live and every zone
+                # but the refused ones is served as saved.
+                refused = detail[len(PARTIAL_APPLY_PREFIX) :]
+                message = (
+                    f"{kind} server '{row.name}' applied the configuration, but {refused}. "
+                    "Nothing was rolled back; fix the refused zones' data."
+                )
+            else:
+                message = (
+                    f"{kind} server '{row.name}' {what}. "
+                    f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
+                    + (f" Daemon reported: {detail}" if detail else "")
+                )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append(
                 (subject_id, f"{row.name} ({kind})", message, SEVERITY_BY_STATUS.get(status))

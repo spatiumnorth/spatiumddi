@@ -107,7 +107,10 @@ the formatter handles the rest.
   verdict is now per zone: every zone PowerDNS accepts is served, and the
   refused ones are reported with PowerDNS's own reason as a degraded apply
   (status `reverted`, the warning-level #882 status, so
-  `agent_config_rejected` fires as a warning). It is not rolled back,
+  `agent_config_rejected` fires as a warning). Its error is marked
+  `partial apply:`, so the server chip, banner, Dashboard and alert say
+  "Zones refused", name the zones, and say nothing was rolled back, rather
+  than the rollback wording a real revert gets. It is not rolled back,
   because the last-known-good usually carries the same refused data: on
   ddi-pg one refused zone kept the whole server `revert_failed`. Record
   ops keep draining for every other zone. A failure that says nothing about
