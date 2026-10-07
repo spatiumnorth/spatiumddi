@@ -207,6 +207,17 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
             feed_changed = bool(to_add or to_remove)
 
+            # The entries went in and out through Core INSERT / DELETE, which
+            # the bundle_dirty listener never sees (it watches the ORM unit of
+            # work), so without this the agents kept serving the old list
+            # until some unrelated edit marked them. Blocklists are a global
+            # bundle input there too, hence everyone; nothing to mark when the
+            # set did not change.
+            if feed_changed:
+                from app.services.dns.bundle_dirty import mark_bundles_dirty
+
+                await mark_bundles_dirty(db, everyone=True)
+
             await db.commit()
 
             # Worker process — no request collector, so publish directly AFTER

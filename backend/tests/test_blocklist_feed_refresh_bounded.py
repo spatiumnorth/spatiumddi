@@ -16,13 +16,14 @@ memory, so the property is pinned deterministically.
 from __future__ import annotations
 
 import contextlib
+import uuid
 from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSBlockList, DNSBlockListEntry
+from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer, DNSServerGroup
 from app.tasks import dns as dns_tasks
 
 
@@ -200,3 +201,67 @@ def test_refresh_task_is_acked_on_receipt() -> None:
     overrides that; a lost refresh is idempotent and re-queued by Refresh.
     """
     assert dns_tasks.refresh_blocklist_feed.acks_late is False
+
+
+async def _agent_server(db_session: AsyncSession) -> DNSServer:
+    grp = DNSServerGroup(name="bl-dirty")
+    db_session.add(grp)
+    await db_session.flush()
+    srv = DNSServer(
+        group_id=grp.id,
+        driver="bind9",
+        host="10.0.0.1",
+        name="bl-dirty-1",
+        is_primary=True,
+        is_enabled=True,
+    )
+    db_session.add(srv)
+    await db_session.flush()
+    return srv
+
+
+async def _seq(db_session: AsyncSession, srv_id: uuid.UUID) -> int:
+    return int(
+        await db_session.scalar(select(DNSServer.bundle_dirty_seq).where(DNSServer.id == srv_id))
+        or 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_that_changes_the_list_marks_the_agents_bundles(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Core INSERT / DELETE bypass the bundle_dirty listener, so the refresh
+    marks the bundles itself. Without it the agents kept serving the old list."""
+    srv_id = (await _agent_server(db_session)).id
+    bl = await _make_list(db_session)
+    bl_id = bl.id
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="gone.example", source="feed"))
+    await db_session.commit()
+    before = await _seq(db_session, srv_id)
+
+    _wire(monkeypatch, db_session, "kept.example\nnew.example\n")
+    out = await dns_tasks._refresh_blocklist_feed_async(str(bl_id))  # noqa: SLF001
+    assert out["status"] == "success" and out["added"] == 2 and out["removed"] == 1
+
+    db_session.expire_all()
+    assert await _seq(db_session, srv_id) > before
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_refresh_marks_nothing(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    srv_id = (await _agent_server(db_session)).id
+    bl = await _make_list(db_session)
+    bl_id = bl.id
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="same.example", source="feed"))
+    await db_session.commit()
+    before = await _seq(db_session, srv_id)
+
+    _wire(monkeypatch, db_session, "same.example\n")
+    out = await dns_tasks._refresh_blocklist_feed_async(str(bl_id))  # noqa: SLF001
+    assert out["added"] == 0 and out["removed"] == 0
+
+    db_session.expire_all()
+    assert await _seq(db_session, srv_id) == before
