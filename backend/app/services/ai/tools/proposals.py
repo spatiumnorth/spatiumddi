@@ -487,7 +487,10 @@ async def propose_create_dhcp_static(
     args_model=ReprovisionLeaseArgs,
     writes=False,
     category="dhcp",
-    default_enabled=True,
+    # Off by default (non-negotiable #13): it removes the lease from every
+    # Kea server in the group and drops DNS records, like its neighbour
+    # propose_create_dhcp_static. preview_reprovision_lease stays on.
+    default_enabled=False,
     module="core.dhcp",
 )
 async def propose_reprovision_lease(

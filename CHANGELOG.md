@@ -39,7 +39,8 @@ the formatter handles the rest.
   device takes the reserved address, and the lease-event path removes the old
   IPAM row and DNS records. An expired lease is removed at once, from the
   database and, through a new `lease4_del` agent op, from Kea. MCP:
-  `preview_reprovision_lease`, `propose_reprovision_lease`. Windows DHCP,
+  `preview_reprovision_lease`, and `propose_reprovision_lease`, which is off
+  by default like `propose_create_dhcp_static`. Windows DHCP,
   DHCPv6 and the UI action are follow-ups. Agent: a lease Kea deleted (its
   memfile writes it again with lifetime 0) was reported as active and
   re-created on the control plane; it is now reported as expired.

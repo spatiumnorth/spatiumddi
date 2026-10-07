@@ -621,10 +621,12 @@ deleted lease by appending it again with `valid_lifetime` 0 and state 0, which
 the agent used to report as an *active* lease (bringing the lease, its mirror
 and its DNS records straight back). It is now reported as expired.
 
-MCP: `preview_reprovision_lease` (read-only) and `propose_reprovision_lease`
-(copilot proposal; the picked address is pinned into the proposal so Apply moves
-the device where the preview said). Both are default-on: the write touches one
-device and always goes through operator approval.
+MCP: `preview_reprovision_lease` (read-only, on by default) and
+`propose_reprovision_lease` (copilot proposal; the picked address is pinned into
+the proposal so Apply moves the device where the preview said). The proposal
+tool is off by default, like `propose_create_dhcp_static`: it removes the lease
+from every Kea server in the group and drops DNS records, so an admin enables
+it per install.
 
 ## 3a. Scope deletion, cascade, and restore
 

@@ -513,6 +513,19 @@ async def test_mcp_preview_and_propose(db_session: AsyncSession) -> None:
     assert op.required_permission == ("write", "dhcp_static")
 
 
+def test_mcp_registration_defaults() -> None:
+    """Broad-blast-radius write is opt-in (#13); the read-only preview is on."""
+    import app.services.ai.tools.dhcp  # noqa: F401 — registers the tools
+    import app.services.ai.tools.proposals  # noqa: F401
+    from app.services.ai.tools.base import REGISTRY
+
+    preview = REGISTRY.get("preview_reprovision_lease")
+    propose = REGISTRY.get("propose_reprovision_lease")
+    assert preview is not None and propose is not None
+    assert preview.default_enabled is True
+    assert propose.default_enabled is False
+
+
 def test_routes_publish_a_typed_schema() -> None:
     """Generated clients get the plan's fields, not an untyped object (#917)."""
     from app.main import app
