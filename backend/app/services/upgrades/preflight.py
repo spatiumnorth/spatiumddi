@@ -31,6 +31,10 @@ Checks shipped in Phase A:
   ``/var`` is the shared persistent partition. The agent snapshots the database
   automatically, but recovering means restoring that snapshot, not just
   redeploying the old image — so say so before Start. Warn-only. See #638.
+* ``check_pre_upgrade_backup`` — the upgrade migrates the database on the
+  persistent ``/var``, and the release being left cannot start on it
+  afterwards, so a slot rollback alone is not a way back. Warns when no
+  backup target has succeeded in the last day. Warn-only. See #1227.
 * ``check_quorum`` — cluster size is odd + ≥ 3 + every node currently
   Ready (so we don't start a rolling upgrade with a node already down).
 
@@ -95,6 +99,10 @@ class PreflightResult:
 
 # The skip-release warning's threshold, in days between two CalVer tags.
 _SKIP_RELEASE_WARN_DAYS = 90
+
+# How old the newest successful backup may be before the pre-upgrade backup
+# row warns (#1227). A day, matching the common nightly schedule.
+_PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 
 
 # ── Individual checks ─────────────────────────────────────────────────
@@ -617,6 +625,7 @@ async def run_all(
         await check_kea_ha_version_skew(),
         await check_powerdns_lmdb_migration(),
         await check_etcd_snapshot_freshness(),
+        await check_pre_upgrade_backup(),
     ]
     levels = {r.level for r in results}
     if "fail" in levels:
@@ -1185,5 +1194,107 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
             f"({newest.get('name')}). A rollback across a Kubernetes minor restores "
             "to that point."
         ),
+        detail=detail,
+    )
+
+
+async def check_pre_upgrade_backup() -> PreflightResult:
+    """Is there a recent backup to go back to? (#1227)
+
+    The upgrade migrates the database forward, and the database lives on the
+    persistent ``/var``, not in a slot. After it, the release being left
+    cannot start on that database: a slot rollback boots its code, its
+    migrate step fails with ``Can't locate revision``, and its api never
+    starts. So "roll back the slot" is not a way back on its own; a copy of
+    the database from before the upgrade is. Nothing takes one automatically
+    yet, so the newest successful backup IS the way back, and its age is how
+    much would be lost using it.
+
+    **Never ``fail``**, for the same reason as the etcd snapshot row: the fix
+    is one backup run, not abandoning the upgrade. Reads
+    ``backup_target.last_run_*``, which records the newest run whether it
+    succeeded or not, so a target whose last run failed does not count even
+    if an older run succeeded.
+    """
+    from app.models.backup import BackupTarget  # noqa: PLC0415
+
+    name = "pre_upgrade_backup"
+    try:
+        async with AsyncSessionLocal() as db:
+            appliances = (
+                await db.execute(
+                    select(Appliance.id)
+                    .where(
+                        Appliance.state == APPLIANCE_STATE_APPROVED,
+                        Appliance.deployment_kind == "appliance",
+                    )
+                    .limit(1)
+                )
+            ).first()
+            newest = (
+                await db.execute(
+                    select(BackupTarget.name, BackupTarget.last_run_at)
+                    .where(
+                        BackupTarget.enabled.is_(True),
+                        BackupTarget.last_run_status == "success",
+                        BackupTarget.last_run_at.is_not(None),
+                    )
+                    .order_by(BackupTarget.last_run_at.desc())
+                    .limit(1)
+                )
+            ).first()
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_backup_query_failed", error=str(e))
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message="Could not read the backup targets — confirm a recent backup exists.",
+            detail={"error": str(e)},
+        )
+
+    if appliances is None:
+        # No A/B slots, so no slot rollback to protect.
+        return PreflightResult(
+            name=name,
+            level="ok",
+            message="No appliance nodes — slot rollback does not apply.",
+            detail={"appliances": 0},
+        )
+
+    advice = (
+        "This upgrade migrates the database forward, and the release you are "
+        "leaving cannot run on it afterwards: a slot rollback alone does not bring "
+        "it back. Run a backup (Administration → Backup) before starting, so a copy from "
+        "before the upgrade exists."
+    )
+    if newest is None:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=f"No backup target has a successful backup. {advice}",
+            detail={"newest_backup_at": None, "target": None},
+        )
+    target_name, last_run_at = newest
+    age_hours = (datetime.now(UTC) - last_run_at).total_seconds() / 3600
+    detail = {
+        "newest_backup_at": last_run_at.isoformat(),
+        "target": target_name,
+        "age_hours": round(age_hours, 1),
+        "max_age_hours": _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS,
+    }
+    if age_hours > _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=(
+                f"The newest successful backup ({target_name}) is "
+                f"{age_hours:.0f} hours old. {advice}"
+            ),
+            detail=detail,
+        )
+    return PreflightResult(
+        name=name,
+        level="ok",
+        message=f"Newest successful backup ({target_name}) is {age_hours:.1f} hours old.",
         detail=detail,
     )

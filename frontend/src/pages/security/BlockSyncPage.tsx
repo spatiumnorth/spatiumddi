@@ -35,6 +35,8 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 
 // Relative "time ago" for the sync/pushed columns. Cheap, no dependency.
@@ -71,15 +73,17 @@ export function BlockSyncPage() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [pageNotice, setPageNotice] = useState<string | null>(null);
 
+  // Both stop polling once refused (#1343): each refused read is a denied
+  // audit row, and asking again does not change the answer.
   const targetsQ = useQuery({
     queryKey: ["block-sync", "targets"],
     queryFn: blockSyncApi.listTargets,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const blocksQ = useQuery({
     queryKey: ["block-sync", "blocks"],
     queryFn: blockSyncApi.listBlocks,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const targets = targetsQ.data ?? [];
@@ -207,9 +211,16 @@ export function BlockSyncPage() {
         <div className="rounded-lg border">
           {targets.length === 0 ? (
             <p className="p-8 text-center text-sm text-muted-foreground">
-              {targetsQ.isLoading
-                ? "Loading…"
-                : "No OPNsense routers, Palo Alto firewalls, UniFi controllers, or Meraki organizations to arm. Add an OPNsense, Palo Alto, UniFi, or Meraki integration first."}
+              {targetsQ.isLoading ? (
+                "Loading…"
+              ) : targetsQ.isError ? (
+                <ListReadError
+                  error={targetsQ.error}
+                  what="the block-sync targets"
+                />
+              ) : (
+                "No OPNsense routers, Palo Alto firewalls, UniFi controllers, or Meraki organizations to arm. Add an OPNsense, Palo Alto, UniFi, or Meraki integration first."
+              )}
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -363,9 +374,16 @@ export function BlockSyncPage() {
         <div className="rounded-lg border">
           {blocks.length === 0 ? (
             <p className="p-8 text-center text-sm text-muted-foreground">
-              {blocksQ.isLoading
-                ? "Loading…"
-                : "No network blocks yet. Create one with New block."}
+              {blocksQ.isLoading ? (
+                "Loading…"
+              ) : blocksQ.isError ? (
+                <ListReadError
+                  error={blocksQ.error}
+                  what="the network blocks"
+                />
+              ) : (
+                "No network blocks yet. Create one with New block."
+              )}
             </p>
           ) : (
             <div className="overflow-x-auto">

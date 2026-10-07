@@ -369,13 +369,17 @@ class PlatformSettings(Base):
     audit_forward_webhook_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
-    audit_forward_webhook_url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
-    # Optional Authorization header (e.g. "Bearer …" or "Basic …"); stored
-    # in plaintext today because the rest of this row is plaintext too —
-    # move to Fernet alongside the provider creds when we tighten secrets
-    # at rest across the board.
-    audit_forward_webhook_auth_header: Mapped[str] = mapped_column(
-        String(1024), nullable=False, default=""
+    # The legacy single webhook's URL and optional Authorization header,
+    # Fernet-encrypted at rest (#1502) like the same fields on
+    # ``audit_forward_target``. The plaintext ``audit_forward_webhook_url`` /
+    # ``audit_forward_webhook_auth_header`` columns are kept, unmapped and
+    # unread, for one release so a rolling upgrade's old pods keep working
+    # (#296); the next release drops them.
+    audit_forward_webhook_url_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    audit_forward_webhook_auth_header_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
     )
 
     # IEEE OUI vendor lookup. Opt-in because the daily fetch pulls a ~5 MB
@@ -690,7 +694,9 @@ class PlatformSettings(Base):
             "'" + json.dumps(DEFAULT_UNATTENDED_ORIGINS).replace("'", "''") + "'::jsonb"
         ),
     )
-    # Glob patterns never auto-upgraded (Unattended-Upgrade::Package-Blacklist).
+    # Packages never auto-upgraded (Unattended-Upgrade::Package-Blacklist).
+    # Each entry is a Python regular expression matched from the start of
+    # the package name, NOT a glob (#1384): ``linux-image-``, ``^openssl$``.
     apt_unattended_blocklist: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )

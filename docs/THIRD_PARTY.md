@@ -73,7 +73,7 @@ to their control channels, it does not link against them.
 | [PowerDNS dnsdist](https://dnsdist.org/) | `>= 2.0.8-r0` (Alpine) | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
 | [ISC Kea DHCP](https://www.isc.org/kea/) | `>= 3.0.3-r0` (Alpine), v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [radvd](https://radvd.litech.org/) | Alpine `radvd` | BSD-style | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
-| [GoBGP](https://github.com/osrg/gobgp) | 4.9.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
+| [GoBGP](https://github.com/osrg/gobgp) | 4.10.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
 | [BIND `dig` / `nsupdate`](https://www.isc.org/bind/) | `bind-tools` | MPL 2.0 | DNS + supervisor + API images | several Dockerfiles |
 
 Notes worth carrying:
@@ -162,7 +162,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 |---|---|---|
 | [Python](https://www.python.org/) 3.12 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
-| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.1, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
 | [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
 | [Uvicorn](https://www.uvicorn.org/) | BSD 3-Clause | ASGI server |
 | [SQLAlchemy](https://www.sqlalchemy.org/) / [Alembic](https://alembic.sqlalchemy.org/) | MIT | ORM + migrations |
@@ -385,11 +385,17 @@ is a documentation bug, not a support question.
 
 This page can drift. A running system cannot.
 
-Python packages in the API image, with versions and licenses:
+Python packages in the API image, with versions and licenses. The image ships
+no pip (#1392), so read the installed metadata directly:
 
 ```bash
-docker compose exec api python3 -m pip list
-docker compose exec api python3 -m pip show ldap3 paramiko
+docker compose exec api python3 -c 'import importlib.metadata as m
+for d in sorted(m.distributions(), key=lambda d: d.name.lower()):
+    md = d.metadata
+    print(d.name, d.version, md.get("License-Expression") or md.get("License") or "", sep="\t")'
+docker compose exec api python3 -c 'import importlib.metadata as m
+for n in ("ldap3", "paramiko"):
+    print(n, [str(f.locate()) for f in m.files(n) if f.name.upper().startswith(("LICEN", "COPYING"))])'
 ```
 
 OS packages on the appliance:

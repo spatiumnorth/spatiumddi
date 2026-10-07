@@ -21,7 +21,8 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
@@ -50,9 +51,14 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
-from app.services.appliance.apt import render_sources_list
+from app.services.appliance.apt import (
+    mask_proxy_url,
+    render_sources_list,
+    restore_proxy_credentials,
+)
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
 
 # SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
 # Debian build ships out of the box — DES/AES for priv, MD5/SHA for
@@ -145,8 +151,11 @@ class SettingsResponse(BaseModel):
     audit_forward_syslog_protocol: str
     audit_forward_syslog_facility: int
     audit_forward_webhook_enabled: bool
-    audit_forward_webhook_url: str
-    audit_forward_webhook_auth_header: str
+    # The legacy webhook's URL and header are credentials, so they are
+    # write-only here (#1502).
+    audit_forward_webhook_url_set: bool = False
+    audit_forward_webhook_url_display: str = ""
+    audit_forward_webhook_auth_header_set: bool = False
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -309,6 +318,15 @@ class SettingsResponse(BaseModel):
             cols = {c.name: getattr(data, c.name) for c in data.__table__.columns}
             cols["fingerbank_api_key_set"] = bool(cols.pop("fingerbank_api_key_encrypted", None))
             cols["snmp_community_set"] = bool(cols.pop("snmp_community_encrypted", None))
+            # #1502 — the legacy webhook URL is shown as its host only.
+            webhook_url = cols.pop("audit_forward_webhook_url_encrypted", None)
+            cols["audit_forward_webhook_url_set"] = bool(webhook_url)
+            cols["audit_forward_webhook_url_display"] = url_display(
+                reveal(webhook_url, field="audit_forward_webhook_url")
+            )
+            cols["audit_forward_webhook_auth_header_set"] = bool(
+                cols.pop("audit_forward_webhook_auth_header_encrypted", None)
+            )
             raw_users = cols.get("snmp_v3_users") or []
             cols["snmp_v3_users"] = [_redact_v3_user(u) for u in raw_users]
             # Issue #156 — fold each syslog target's CA PEM ciphertext into
@@ -321,6 +339,11 @@ class SettingsResponse(BaseModel):
                 _redact_apt_gpg_key(k) for k in (cols.get("apt_gpg_keys") or [])
             ]
             cols["apt_auth"] = [_redact_apt_auth(a) for a in (cols.get("apt_auth") or [])]
+            # GHSA-j77h-pqg7-h2g4 — a proxy URL may embed ``user:pass@``.
+            # Mask the userinfo, keep the host; ``update_settings`` puts the
+            # stored credential back when the form re-sends the mask.
+            cols["apt_proxy_http"] = mask_proxy_url(cols.get("apt_proxy_http"))
+            cols["apt_proxy_https"] = mask_proxy_url(cols.get("apt_proxy_https"))
             return cols
         return data
 
@@ -1021,16 +1044,45 @@ class SettingsUpdate(BaseModel):
             s = str(raw).strip()
             if not s:
                 continue
-            # These land inside apt.conf double-quoted strings (the host runner
-            # escapes quotes); reject control chars — C0 (< 0x20) AND ASCII DEL
-            # (0x7f) — plus over-long entries so a value can't smuggle a newline
-            # / extra directive past the render.
-            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in s) or len(s) > 200:
+            # These land inside apt.conf double-quoted strings, and apt.conf has
+            # no escape syntax there (#1384, verified against apt-config): a
+            # backslash is kept literally and a double quote ENDS the string,
+            # so an entry carrying one makes apt-config reject the whole policy
+            # file and the host keeps the old one. Reject quotes, control
+            # chars — C0 (< 0x20) AND ASCII DEL (0x7f) — and over-long entries
+            # so a value can't smuggle a newline / extra directive past the
+            # render.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F or c == '"' for c in s) or len(s) > 200:
                 raise ValueError(
-                    "unattended origin / package entries must be printable and ≤ 200 chars"
+                    "unattended origin / package entries must be printable, contain no "
+                    "double quote, and be ≤ 200 chars"
                 )
             out.append(s)
         return out
+
+    @field_validator("apt_unattended_blocklist")
+    @classmethod
+    def _blocklist_entries_are_regexes(cls, v: list[str] | None) -> list[str] | None:
+        # unattended-upgrades reads each Package-Blacklist entry as a Python
+        # regular expression matched from the start of the package name
+        # (#1384). The form used to call them globs, so ``*`` (an invalid
+        # regex) was a natural thing to type, and an entry that will not
+        # compile is refused here rather than on the host, where it would
+        # break the daily run and stop every security update with it. Runs
+        # after the generic checks above (pydantic applies validators in
+        # declaration order).
+        if v is None:
+            return None
+        for entry in v:
+            try:
+                re.compile(entry)
+            except re.error as exc:
+                raise ValueError(
+                    f"package blocklist entry {entry!r} is not a valid regular expression "
+                    f"({exc}); entries match from the start of the package name, "
+                    "e.g. 'linux-image-' or '^openssl$'"
+                ) from exc
+        return v
 
     @field_validator("apt_proxy_http", "apt_proxy_https")
     @classmethod
@@ -1893,6 +1945,21 @@ async def update_settings(
             # that a value was set.
             changes["fingerbank_api_key_set"] = True
 
+    # The legacy webhook's URL + Authorization header (#1502): same
+    # encrypt-and-redact shape, so neither reaches the column in clear or the
+    # ``platform_settings_updated`` log line below.
+    _legacy_webhook_written: list[str] = []
+    for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
+        if _field in changes:
+            raw = changes.pop(_field)
+            setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
+            changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
+            _legacy_webhook_written.append(_field)
+    if _legacy_webhook_written:
+        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
+        # same transaction, or the pre-upgrade value outlives the change.
+        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
+
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
         from app.core.crypto import encrypt_str
@@ -2153,6 +2220,17 @@ async def update_settings(
             ),
         )
 
+    # GHSA-j77h-pqg7-h2g4 — ``GET /settings`` masks a proxy URL's
+    # credential as ``***``; the form sends that back. Keep the stored one.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            try:
+                changes[field] = restore_proxy_credentials(changes[field], getattr(settings, field))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
+                ) from exc
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2160,6 +2238,10 @@ async def update_settings(
             "fingerbank_api_key_set",
             "snmp_community_cleared",
             "snmp_community_set",
+            "audit_forward_webhook_url_cleared",
+            "audit_forward_webhook_url_set",
+            "audit_forward_webhook_auth_header_cleared",
+            "audit_forward_webhook_auth_header_set",
         ):
             continue
         setattr(settings, field, value)
@@ -2174,6 +2256,10 @@ async def update_settings(
         changes["apt_gpg_keys"] = apt_gpg_keys_audit
     if apt_auth_audit is not None:
         changes["apt_auth"] = apt_auth_audit
+    # ``changes`` is logged below; never the proxy credential.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            changes[field] = mask_proxy_url(changes[field])
 
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
@@ -2667,9 +2753,9 @@ async def reveal_snmp_community(
     at least visible. Local-auth users only; external-auth users have
     no local password to re-confirm.
     """
+    from app.api.stepup import require_operator_stepup
     from app.core.crypto import decrypt_str
     from app.models.audit import AuditLog
-    from app.services.reauth import ReauthOutcome, reverify_operator
 
     def _audit_denied(reason: str) -> None:
         db.add(
@@ -2696,19 +2782,18 @@ async def reveal_snmp_community(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="snmp_community_reveal_denied",
+        resource_type="platform_settings",
+        resource_id="snmp",
+        resource_display="SNMP community",
+    )
 
     settings = await _get_or_create(db)
     if not settings.snmp_community_encrypted:
@@ -2725,7 +2810,7 @@ async def reveal_snmp_community(
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Stored community could not be decrypted (key mismatch?). "
-            "Re-set the community in Settings → Appliance → SNMP.",
+            "Re-set the community under Appliance → Fleet → Services → SNMP.",
         ) from None
 
     db.add(
@@ -2934,9 +3019,12 @@ class AuditTargetBody(BaseModel):
     protocol: str = "udp"
     facility: int = 16
     ca_cert_pem: str | None = None
-    # webhook
-    url: str = ""
-    auth_header: str = ""
+    # webhook. Both are write-only and Fernet-encrypted at rest (#1502):
+    # for a Slack / Discord / Teams target the URL IS the credential. Same
+    # three-way contract as ``smtp_password``: ``None`` (or omitted) keeps
+    # the stored value, ``""`` clears it, anything else replaces it.
+    url: str | None = None
+    auth_header: str | None = None
     webhook_flavor: str = "generic"
     # smtp
     smtp_host: str = ""
@@ -2999,6 +3087,38 @@ class AuditTargetBody(BaseModel):
             raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
         return v
 
+    @model_validator(mode="after")
+    def _valid_kind_config(self) -> AuditTargetBody:
+        # Per-kind completeness (#1581), mirroring the legacy
+        # flat-settings validators below. Without this a host-less
+        # syslog / URL-less webhook target was saved enabled, then
+        # silently skipped by ``audit_forward._load_targets``, and an
+        # SMTP target with no recipients warned on every audit row.
+        if self.kind == "syslog":
+            if not self.host.strip():
+                raise ValueError("host is required for a syslog target")
+            if not (1 <= self.port <= 65535):
+                raise ValueError("port must be 1–65535")
+            if not (0 <= self.facility <= 23):
+                raise ValueError("facility must be 0–23 (RFC 5424)")
+        elif self.kind == "webhook":
+            # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
+            # so only an explicit blank is refused here. A webhook with no
+            # URL at all is caught by ``_require_webhook_url``.
+            if self.url is not None and not self.url.strip():
+                raise ValueError("url is required for a webhook target")
+        elif self.kind == "smtp":
+            if not self.smtp_host.strip():
+                raise ValueError("smtp_host is required for an smtp target")
+            if not (1 <= self.smtp_port <= 65535):
+                raise ValueError("smtp_port must be 1–65535")
+            if not self.smtp_from_address.strip():
+                raise ValueError("smtp_from_address is required for an smtp target")
+            recipients = [a for a in (self.smtp_to_addresses or []) if a and a.strip()]
+            if not recipients:
+                raise ValueError("smtp_to_addresses must contain at least one recipient")
+        return self
+
 
 class AuditTargetResponse(BaseModel):
     id: str
@@ -3011,8 +3131,11 @@ class AuditTargetResponse(BaseModel):
     protocol: str
     facility: int
     ca_cert_pem: str | None
-    url: str
-    # Redact auth_header — we return whether it's set, never the value.
+    # The URL and header are never returned (#1502). ``url_display`` is the
+    # scheme and host only (``https://hooks.slack.com/…``), so targets can
+    # still be told apart.
+    url_set: bool
+    url_display: str
     auth_header_set: bool
     webhook_flavor: str
     smtp_host: str
@@ -3042,8 +3165,9 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         protocol=t.protocol,
         facility=t.facility,
         ca_cert_pem=t.ca_cert_pem,
-        url=t.url,
-        auth_header_set=bool(t.auth_header),
+        url_set=bool(t.url_encrypted),
+        url_display=url_display(reveal(t.url_encrypted, field="url", target=t.name)),
+        auth_header_set=bool(t.auth_header_encrypted),
         webhook_flavor=t.webhook_flavor or "generic",
         smtp_host=t.smtp_host or "",
         smtp_port=int(t.smtp_port or 587),
@@ -3060,6 +3184,41 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
+async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
+    """Blank the pre-#1506 plaintext leftovers for a written secret.
+
+    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
+    plaintext columns, unmapped and unread, holding the pre-upgrade
+    values. Clearing or replacing a secret changed only the encrypted
+    column, so the old value stayed readable in the DB and in full
+    backups. On any write of that secret, set its leftover column to
+    ``''`` in the same transaction — ``''`` is the column's server
+    default and the value the old application (which maps it as a
+    non-null string) reads as unset, so a rolling upgrade stays safe;
+    the migration's downgrade copies a still-encrypted value back, and
+    a cleared secret has none, so it stays ``''`` there too.
+
+    The columns are unmapped, so this is raw SQL, guarded by inspection:
+    a schema built from the models (tests, a fresh install before the
+    migration) may not have them at all, and the next release drops
+    them. Identifiers come only from the fixed call sites below, never
+    from request data.
+    """
+    if not columns:
+        return
+    conn = await db.connection()
+    existing = await conn.run_sync(
+        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
+    )
+    assignments = [f"{col} = ''" for col in columns if col in existing]
+    if not assignments:
+        return
+    await db.execute(
+        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
+        {"id": row_id},
+    )
+
+
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3072,8 +3231,8 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.protocol = body.protocol
     t.facility = body.facility
     t.ca_cert_pem = body.ca_cert_pem
-    t.url = body.url
-    t.auth_header = body.auth_header
+    t.url_encrypted = apply_write_only(t.url_encrypted, body.url)
+    t.auth_header_encrypted = apply_write_only(t.auth_header_encrypted, body.auth_header)
     t.webhook_flavor = body.webhook_flavor
     t.smtp_host = body.smtp_host
     t.smtp_port = body.smtp_port
@@ -3089,6 +3248,93 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
         t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
     t.min_severity = body.min_severity
     t.resource_types = body.resource_types
+
+
+def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
+    """Refuse a webhook target that would end up with no URL (#1581).
+
+    The body validator can't see the stored value, and an omitted ``url``
+    means "keep it", so this runs in the handler: on create there is
+    nothing to keep, on update there is only if the row already has one.
+    An empty bytea is *not* a stored URL: an exclude-secrets restore
+    writes ``b""`` into the encrypted column, and treating that as set
+    let a blank URL through while the target silently stopped
+    delivering. Empty bytes are unset everywhere (here, ``url_set``
+    and the audit snapshot).
+    """
+    if body.kind == "webhook" and body.url is None and not stored:
+        raise HTTPException(status_code=422, detail="url is required for a webhook target")
+
+
+def _save_error(exc: Exception, body: AuditTargetBody) -> str:
+    """The reason a save failed, without the statement's bound parameters.
+
+    SQLAlchemy's message for a failed flush ends with ``[parameters: …]``,
+    every value the INSERT / UPDATE carried (#1502). The driver's own
+    message (``duplicate key value violates unique constraint …``) is all
+    the operator needs.
+    """
+    reason = str(getattr(exc, "orig", None) or exc)
+    return redact(reason, body.url or "", body.auth_header or "", body.smtp_password or "")
+
+
+def _forward_snapshot(t: AuditForwardTarget) -> dict:
+    """Audit snapshot of an audit-forward target.
+
+    Never carries the webhook URL, ``auth_header`` or SMTP password
+    (nor the CA cert) — only ``*_set`` booleans for those, per #1502 /
+    PR #1506: the audit log must not become a copy of the secrets it
+    describes.
+    """
+    return {
+        "name": t.name,
+        "enabled": t.enabled,
+        "kind": t.kind,
+        "format": t.format,
+        "host": t.host,
+        "port": t.port,
+        "protocol": t.protocol,
+        "facility": t.facility,
+        "ca_cert_pem_set": bool(t.ca_cert_pem),
+        # bool(), not "is not None": an exclude-secrets restore leaves an
+        # empty bytea, which is unset, not a configured secret.
+        "url_set": bool(t.url_encrypted),
+        "auth_header_set": bool(t.auth_header_encrypted),
+        "webhook_flavor": t.webhook_flavor,
+        "smtp_host": t.smtp_host,
+        "smtp_port": t.smtp_port,
+        "smtp_security": t.smtp_security,
+        "smtp_username": t.smtp_username,
+        "smtp_password_set": bool(t.smtp_password_encrypted),
+        "smtp_from_address": t.smtp_from_address,
+        "smtp_to_addresses": list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        "smtp_reply_to": t.smtp_reply_to,
+        "min_severity": t.min_severity,
+        "resource_types": t.resource_types,
+    }
+
+
+def _audit_forward_target(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: AuditForwardTarget,
+    old_value: dict | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="audit_forward_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            old_value=old_value,
+            new_value=None if action == "delete" else _forward_snapshot(row),
+        )
+    )
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
@@ -3110,14 +3356,28 @@ async def create_audit_target(
     forbid_in_demo_mode("Audit-forward target creation is disabled")
     if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    _require_webhook_url(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
     db.add(row)
+    await db.flush()
+    await _blank_legacy_plaintext(
+        db,
+        "audit_forward_target",
+        row.id,
+        [
+            *(["url"] if body.url is not None else []),
+            *(["auth_header"] if body.auth_header is not None else []),
+        ],
+    )
+    _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"create failed: {_save_error(exc, body)}"
+        ) from exc
     await db.refresh(row)
     return _target_to_response(row)
 
@@ -3137,12 +3397,26 @@ async def update_audit_target(
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
+    _require_webhook_url(body, row.url_encrypted)
+    old_value = _forward_snapshot(row)
     _apply_body(row, body)
+    await _blank_legacy_plaintext(
+        db,
+        "audit_forward_target",
+        row.id,
+        [
+            *(["url"] if body.url is not None else []),
+            *(["auth_header"] if body.auth_header is not None else []),
+        ],
+    )
+    _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"update failed: {_save_error(exc, body)}"
+        ) from exc
     await db.refresh(row)
     return _target_to_response(row)
 
@@ -3154,6 +3428,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
+    _audit_forward_target(db, current_user, "delete", row, old_value=_forward_snapshot(row))
     await db.delete(row)
     await db.commit()
 
@@ -3190,6 +3465,9 @@ async def test_audit_target(
         "old_value": None,
         "new_value": None,
     }
+    # The webhook secrets are encrypted at rest too (#1502).
+    url = reveal(row.url_encrypted, field="url", target=row.name)
+    auth_header = reveal(row.auth_header_encrypted, field="auth_header", target=row.name)
     # Decrypt the SMTP password lazily — only the test path needs the
     # cleartext, and only inside this request scope.
     smtp_password = ""
@@ -3212,8 +3490,8 @@ async def test_audit_target(
         "protocol": row.protocol,
         "facility": row.facility,
         "ca_cert_pem": row.ca_cert_pem,
-        "url": row.url,
-        "auth_header": row.auth_header or "",
+        "url": url,
+        "auth_header": auth_header,
         "webhook_flavor": row.webhook_flavor or "generic",
         "smtp_host": row.smtp_host or "",
         "smtp_port": int(row.smtp_port or 587),
@@ -3227,9 +3505,15 @@ async def test_audit_target(
         "resource_types": None,
     }
     try:
-        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+        outcome = await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+        reason = redact(str(exc), url, auth_header, smtp_password)
+        raise HTTPException(status_code=502, detail=f"delivery failed: {reason}") from exc
+    if outcome != audit_forward_svc.DELIVERED:
+        # #1577: a filtered target, a misconfigured one, or a rejected
+        # webhook used to report "ok" here because delivery was merely
+        # attempted.
+        raise HTTPException(status_code=502, detail=f"delivery failed: {outcome}")
     return {"status": "ok", "target": row.name}
 
 

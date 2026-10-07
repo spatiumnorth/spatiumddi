@@ -361,13 +361,18 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 #### What an archive exposes
 
-**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. Most credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **The exception is each DNS server group's internal TSIG key** (`dns_server_group.tsig_key_secret`), which is stored in clear: the group's BIND9 servers grant zone transfers and dynamic updates to that key from any address, so anyone holding an archive can read and rewrite every zone the group serves for as long as that key is in use.
+**Only `secrets.enc` is encrypted. The database dump next to it is not.** Anyone who can read an archive can read the whole database: users and their emails, password and API-token hashes, every IPAM / DNS / DHCP row, and the audit log. The credentials SpatiumDDI stores (auth-provider secrets, agent keys, integration and destination credentials, operator TSIG keys, each DNS server group's internal TSIG key, and audit-forward webhook URLs and `Authorization` headers) stay Fernet-encrypted inside the dump, so reading those also takes the source install's key, which is inside `secrets.enc` behind the passphrase. **Leftovers until the next release:** two of those were stored in clear until this release, and their old columns are kept, unread, for one release so a rolling upgrade's old pods keep working. They still hold the pre-upgrade values:
+
+- The group TSIG key (#1364, `dns_server_group.tsig_key_secret`). That key matters: the group's BIND9 servers grant zone transfers and dynamic updates to it from any address. Rotate each group's key once the upgrade has finished (**DNS → server group → Rotate group TSIG key**, or `POST /dns/groups/{id}/group-tsig-key/rotate`) and the leftover copy is a dead secret.
+- Webhook forward targets (#1502, `audit_forward_target.url` / `auth_header`, and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header`). A Slack, Discord or Teams incoming-webhook URL lets anyone who has it post into that channel. Re-issue the URL in the chat platform (and any collector token) once the upgrade has finished, paste the new one into the target, and the leftover copy is dead. That is also the only way to retire a URL that is already in an older archive.
+
+An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
 
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
 #### Passphrase rules
 
-Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
+Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one. The hint is **not** secret: it is written in clear into `manifest.json` and the `secrets.enc` header of every archive, returned by the API, and recorded in the audit log when a target is edited. So a hint that contains the passphrase is refused with a 422 on every path that sets one (target create / update, create-and-download), compared case-insensitively. A target saved before that check existed keeps backing up, but its archives are written without the hint (logged as `backup_hint_contains_passphrase_dropped`); re-save it with a new passphrase and hint, because the old pair is already in its earlier archives and in the audit log.
 
 The passphrase is **not** the destination's auth credential — every destination type has its own credential fields (S3 keys, SCP password / private key, Azure account key, etc.) which are Fernet-encrypted at rest in the `backup_target.config` JSONB.
 
@@ -610,8 +615,8 @@ Three things make this a least-privilege pull rather than a full API key:
   the destination is not read at all — without this, a nightly poller
   re-downloads a multi-GB archive every run.
 * **The puller never needs the target passphrase**, and should not have it:
-  without it most stored credentials in the archive stay encrypted. The rest of
-  the database dump is readable, the DNS group TSIG keys included (see
+  without it the stored credentials in the archive stay encrypted. The rest of
+  the database dump is readable (see
   [What an archive exposes](#what-an-archive-exposes)), so protect the token and
   wherever the puller writes the archive as you would the install itself.
 
@@ -633,6 +638,10 @@ Each target carries:
 | `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
 
 Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+
+Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
+
+A failed run also writes a `backup_target_run_failed` audit row, which audit forwarding and the `system.backup_failed` event send on. It carries a fixed `failure_category` (`unreachable`, `timeout`, `permission_denied`, `auth_failed`, `no_space`, `not_found`, `config_invalid`, …) rather than the driver's error text, which often names the destination (#1617). The full text is still shown under the target in the backup targets list (`last_run_error`, superadmin-only).
 
 #### Manual triggers
 

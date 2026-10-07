@@ -65,22 +65,23 @@ async def _run_sweep() -> dict[str, Any]:
                     if elapsed < timedelta(seconds=endpoint.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                endpoint_name = endpoint.name  # a failed flush expires endpoint
                 try:
                     summary = await reconcile_endpoint(db, endpoint)
                 except Exception as exc:  # noqa: BLE001 — one endpoint shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{endpoint.name}: {exc}")
-                    logger.warning(
-                        "cloud_reconcile_crash",
-                        endpoint=str(endpoint.id),
-                        error=str(exc),
-                    )
                     # A crash inside reconcile_endpoint leaves the shared
                     # session in a failed-transaction state; without this
                     # rollback the next endpoint's first query raises
                     # PendingRollbackError, turning one bad endpoint into a
                     # sweep-wide failure (issue #333).
                     await db.rollback()
+                    errors.append(f"{endpoint_name}: {exc}")
+                    logger.warning(
+                        "cloud_reconcile_crash",
+                        endpoint=str(endpoint_id),
+                        error=str(exc),
+                    )
                     continue
                 ran += 1
                 if summary.ok:

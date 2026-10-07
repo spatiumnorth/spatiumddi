@@ -532,15 +532,6 @@ state on its heartbeat:
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
-  **Known issue — setting a VIP does not work today
-  ([#1103](https://github.com/spatiumnorth/spatiumddi/issues/1103)).** The
-  plumbing above is correct and the override reaches the cluster, but the
-  MetalLB install itself then fails permanently: Helm 4 orders the
-  validating webhooks ahead of the pool CRs, and each klipper-helm retry
-  runs `helm uninstall` first — deleting the controller that backs the
-  webhook — so no `IPAddressPool` is ever created and the frontend Service
-  stays `<pending>`. Leave the VIP unset until this is fixed; see
-  [TROUBLESHOOTING.md](../TROUBLESHOOTING.md#control-plane-vip-stays-pending).
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
   same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
   technitium DaemonSets
@@ -1551,7 +1542,7 @@ tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
 - nftables base-config strip — `/etc/nftables.conf` currently has hardcoded DNS / DHCP / HTTP "belt-and-braces" rules from the pre-#170 5-role world; on Application appliances the supervisor's drop-in should be the sole source of truth so the operator can verify role-driven rules are actually being enforced.
 - Per-appliance scoped agent keys — current implementation passes the platform-wide global `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`; a per-appliance scoped key would limit blast radius if a supervisor cert ever leaked.
 - Host-OS config plane (#155–#166) — **APT sources / proxy / GPG keys + private-mirror auth landed in 2026.06.19-1 (#155)** via `platform_settings.apt_*` → `apt_bundle` heartbeat → the `spatiumddi-apt-reload` host runner (staged `apt-get update` validate-before-swap), joining the already-shipped SNMP / NTP / SSH / resolver / syslog planes. Still pending on the same `ConfigBundle long-poll → trigger-file → host runner` pattern: static routes and the remaining #156–#166 surfaces.
-- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist globs), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
+- **Unattended-upgrades policy (#164, 2026.07.04-1)** — the **when / how** of auto-applying updates, orthogonal to `apt_managed` (the **where**), so an operator can set a reboot policy without taking over apt sources. New `platform_settings.apt_unattended_*` columns drive an **Unattended-upgrades policy** sub-section on the APT settings form: `apt_unattended_origins` (Allowed-Origins allowlist — **security-only default**, the locked-down baseline; an empty list means nothing is eligible even with the timer on), `apt_unattended_blocklist` (Package-Blacklist entries: Python regular expressions matched from the start of the package name, not globs, and refused at save when they do not compile, #1384), and `apt_unattended_automatic_reboot` + `apt_unattended_reboot_time` (HH:MM). The `apt_bundle` always carries the unattended block and folds it into `config_hash`, so a policy change re-fires the host trigger even with `apt_managed` off; `spatiumddi-apt-reload`'s `render_unattended()` stages, validates via `apt-config`, and installs both `20auto-upgrades` (the periodic-timer enable) and `50unattended-upgrades` (the policy). Surfaced on the `find_apt_settings` MCP tool; rides the existing APT trigger / heartbeat / `apt_state` Fleet chip.
 
 ---
 
@@ -2580,8 +2571,10 @@ introduced by an upgrade don't clobber operator-created ones.
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken): no commit happens. Next reboot reverts to the
-   previous `saved_entry` automatically. Worst case is one
-   wasted reboot.
+   previous `saved_entry` automatically. If the new slot's
+   migrate step had already run, the reverted release cannot
+   start on the migrated database: see
+   [Rolling back](#rolling-back-the-database-stays-on-var-1227).
 
 **CLI access (for emergency / scripted upgrades):**
 
@@ -2639,6 +2632,102 @@ amd64.raw.xz` with the kernel + initrd baked in + the image-
 baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
+
+### Rolling back: the database stays on `/var` (#1227)
+
+A slot swap replaces the root filesystem. PostgreSQL lives on the
+persistent `/var`, so it does not go back with the slot. An upgrade's
+migrate step moves the schema forward, and the release you left cannot
+run on that schema afterwards. Alembic cannot migrate backwards from a
+revision it has never heard of. Its migrate Job fails with
+`Can't locate revision`, its api / worker / beat wait for migrate
+forever, and on a single node the newer release's api keeps serving
+behind the older UI. Nothing retries.
+
+**What is checked before you go back.** Every path that moves a
+control-plane node to an older release first compares the database's
+schema revision with the one that release was built with:
+
+- `POST /api/v1/appliance/slot-upgrade/rollback`;
+- **Fleet → set next boot / set default** onto the other slot
+  (`/appliances/{id}/set-next-boot`, `/set-default-slot`);
+- **Fleet → Schedule OS upgrade** with an image older than the one
+  running (`/appliances/{id}/upgrade`).
+
+When the older release cannot run on the database, the request is
+refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
+naming both revisions. The Fleet UI shows that as a confirmation. To go
+ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
+that if you will restore a copy of the database from before the
+upgrade. Data-plane appliances are never checked, because their release
+does not touch the database. Pointing a node at the slot it already
+runs, which commits a trial boot, is not checked either.
+
+The revision each release was built with comes from two places.
+`backend/app/data/release_schema_heads.json` is generated from the
+release tags by `scripts/release_schema_heads.py`, and for a release it
+lists it is the answer. Every release also records its own when it
+starts, once the schema is at its head, in the `release_schema_head`
+table, which is what covers nightly and dev builds no tag names. An api
+records the booted slot's version only when that slot is its own
+release: after a rollback to a slot whose release cannot migrate, the
+newer release's api keeps running there, and recording the older
+version against its own head would let the next rollback to it through.
+A release in neither, such as an older nightly, is reported as `unknown`, and the
+switch goes ahead: refusing on "don't know" would block every rollback
+on an install that never recorded anything.
+
+**What is not covered.** The trial-boot auto-revert (step 8 above)
+happens on the host with no operator involved, so nothing can refuse
+it. No database snapshot is taken before an upgrade yet, so there is
+nothing to restore automatically. The rolling-upgrade preflight's
+`pre_upgrade_backup` row warns when no backup target has succeeded in
+the last 24 hours. Run one before starting.
+
+**Coming from 2026.09.04-1 or earlier: do not go back to it.** Take a
+backup before the upgrade. 2026.10.02-1 adds 22 migrations that
+2026.09.04-1 cannot run on, and 2026.09.04-1 predates both the check
+above and the clearer migrate error, so a trial-boot revert or a
+Compose / Helm redeploy of it leaves the control plane down with only
+`Can't locate revision` to go on. Its chart also lacks the #1042 fix,
+so a reinstall during the rollback can mint a new `SECRET_KEY` and
+leave every credential encrypted at rest unreadable. If you must go
+back, restore the pre-upgrade backup together with the older release.
+
+**Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
+firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
+`spatium` namespace, a Secret no Helm release owns, and points the
+control chart at it with `auth.existingSecret`. A failed install and the
+helm-controller's uninstall can therefore no longer delete it. On the
+first boot of that release it copies the key from the chart's own
+`spatium-control-spatiumddi-app`; it never overwrites an existing
+`spatium-control-app-keys`, and never generates a key while the chart's
+Secret exists without one. That is the Secret to back up:
+
+```bash
+kubectl -n spatium get secret spatium-control-app-keys -o yaml > app-keys.yaml
+```
+
+An appliance upgraded straight from 2026.09.04-1 loses
+`spatium-control-spatiumddi-app` on that upgrade, because the stored
+2026.09.04-1 manifest does not keep it. Going back to 2026.10.02-1 from
+there makes that chart generate a new key, so don't; if you must, restore
+the pre-upgrade backup together with it, as above.
+
+**If an appliance is already stuck.** The older release's
+`wait-for-migrate` init container prints the cause once, including
+`The database was migrated by a NEWER SpatiumDDI release`, then keeps
+logging `current=<written by a newer release, see above>`:
+
+```bash
+kubectl -n spatium logs deploy/spatium-control-spatiumddi-api -c wait-for-migrate
+```
+
+Re-applying the newer release recovers it. Its migrate step finds
+nothing to do, and every workload rolls out:
+`POST /api/v1/appliance/slot-upgrade/apply` with the same image, or
+**Schedule OS upgrade** in the Fleet UI. The only other way out is to
+restore a pre-upgrade copy of the database by hand.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
@@ -3233,8 +3322,15 @@ the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
    per-role ``deployment_kind`` coupling was dropped under #170
    Wave A3 — roles are assigned post-approval from the Fleet tab,
    not baked into the code). Pick ephemeral (single-use, default
-   15 min expiry) or persistent (multi-claim, optional ``max_claims``),
-   then click **Generate code**.
+   15 min expiry) or persistent (multi-claim, optional ``max_claims``,
+   30-day expiry by default; ``0`` means never, and the dialog warns),
+   then click **Generate code**. A persistent code minted before this
+   default existed never expired; the upgrade gives it an expiry 30 days
+   after the upgrade, so re-mint it if it must outlive that. Registration is throttled (#1356): ten
+   wrong codes from one address, or a hundred across the install, in 15
+   minutes refuse further attempts with ``429`` until the window passes.
+   A right code doesn't count, so a fleet rollout behind one NAT address
+   is never throttled.
 3. The 8 digits appear in a large monospace box with a live
    countdown + copy button. Write them down or copy them to a
    second device.

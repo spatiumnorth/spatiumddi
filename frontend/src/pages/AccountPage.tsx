@@ -5,6 +5,7 @@ import { Copy, KeyRound, ShieldCheck, Smartphone, Loader2 } from "lucide-react";
 import { authApi, formatApiError, type MfaEnrolBeginResponse } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { Modal } from "@/components/ui/modal";
+import { QrCode } from "@/components/QrCode";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -241,6 +242,7 @@ function EnrollModal({
   const [acknowledgedRecovery, setAcknowledgedRecovery] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const qc = useQueryClient();
 
   const verify = useMutation({
     mutationFn: () => authApi.mfaEnrollVerify(code.trim()),
@@ -249,10 +251,11 @@ function EnrollModal({
       const detail = (err as { response?: { data?: { detail?: string } } })
         ?.response?.data?.detail;
       setError(typeof detail === "string" ? detail : "Verification failed.");
+      // #1354 — an expired enrolment is discarded server-side, so the
+      // "previous enrolment" banner behind this modal is now stale.
+      qc.invalidateQueries({ queryKey: ["mfa-status"] });
     },
   });
-
-  const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(data.otpauth_uri)}`;
 
   return (
     <Modal title="Set up two-factor authentication" onClose={onClose}>
@@ -264,10 +267,13 @@ function EnrollModal({
               Google Authenticator, …) or copy the secret manually.
             </p>
             <div className="mt-2 flex flex-col items-center gap-2 sm:flex-row sm:items-start">
-              <img
-                src={qrSrc}
-                alt="otpauth QR code"
-                className="h-40 w-40 rounded border bg-white p-1"
+              {/* Rendered here, never fetched: the URI carries the TOTP
+                  secret, and an image service would receive it (#1353). */}
+              <QrCode
+                value={data.otpauth_uri}
+                size={160}
+                title="Authenticator QR code"
+                className="rounded border bg-white"
               />
               <div className="flex-1 space-y-1">
                 <span className="block text-[11px] font-medium text-muted-foreground">

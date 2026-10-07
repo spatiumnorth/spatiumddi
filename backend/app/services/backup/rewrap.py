@@ -76,7 +76,9 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("appliance", "id", "kubeconfig_encrypted"),
     ("appliance_ca", "id", "key_encrypted"),
     ("appliance_certificate", "id", "key_encrypted"),
+    ("audit_forward_target", "id", "auth_header_encrypted"),
     ("audit_forward_target", "id", "smtp_password_encrypted"),
+    ("audit_forward_target", "id", "url_encrypted"),
     ("auth_provider", "id", "secrets_encrypted"),
     ("backup_target", "id", "passphrase_encrypted"),
     ("bgp_lg_peer", "id", "md5_password_encrypted"),
@@ -84,6 +86,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("dhcp_server", "id", "credentials_encrypted"),
     ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
+    ("dns_server_group", "id", "tsig_key_secret_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
@@ -103,6 +106,8 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("pairing_code", "id", "code_encrypted"),
     ("panos_firewall", "id", "api_key_encrypted"),
     ("panos_firewall", "id", "block_sync_api_key_encrypted"),
+    ("platform_settings", "id", "audit_forward_webhook_auth_header_encrypted"),
+    ("platform_settings", "id", "audit_forward_webhook_url_encrypted"),
     ("platform_settings", "id", "fingerbank_api_key_encrypted"),
     ("platform_settings", "id", "snmp_community_encrypted"),
     ("proxmox_node", "id", "token_secret_encrypted"),
@@ -301,6 +306,26 @@ NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
         ("appliance", "kubeconfig_encrypted"),
         ("pairing_code", "code_encrypted"),
         ("acme_client_account", "account_key_encrypted"),
+    }
+)
+
+
+# Plaintext copies of a secret that an expand/contract migration has moved
+# into an ``*_encrypted`` column but not yet dropped (#296): unmapped, unread
+# by the application, and still holding the pre-upgrade value. They are not
+# Fernet tokens, so nothing above covers them, and an "exclude secrets"
+# diagnostic archive must still not carry them. The scrubber writes NULL.
+# Remove an entry in the release whose contract migration drops the column.
+LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # #1364 — moved to ``tsig_key_secret_encrypted``.
+        ("dns_server_group", "tsig_key_secret"),
+        # #1502 — moved to ``url_encrypted`` / ``auth_header_encrypted``.
+        # Made nullable by that migration so the scrubber's NULL restores.
+        ("audit_forward_target", "url"),
+        ("audit_forward_target", "auth_header"),
+        ("platform_settings", "audit_forward_webhook_url"),
+        ("platform_settings", "audit_forward_webhook_auth_header"),
     }
 )
 

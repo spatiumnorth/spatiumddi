@@ -607,7 +607,8 @@ DNSZone
   id, server_group_id, view_id (nullable)
   name (FQDN with trailing dot, e.g., "example.com.")
   type: enum(primary, secondary, stub, forward)
-  kind: enum(forward, reverse)    -- forward or reverse lookup zone
+  kind: enum(forward, reverse)    -- forward or reverse lookup zone; a primary
+                                  --   zone under in-addr.arpa / ip6.arpa is reverse (#1310)
   ttl (default SOA TTL)
   refresh, retry, expire, minimum (SOA fields)
   primary_ns, admin_email         (SOA fields)
@@ -1014,6 +1015,17 @@ letting one silently win.
 - **Blocklists disable DNSSEC validation** on a group that has any (RPZ
   rewriting is by definition answer tampering). The agent handles this
   automatically; it is why a filtered group cannot also validate.
+
+#### How often are feeds refreshed?
+
+A URL list is fetched when it is created, when someone presses **Refresh**,
+and by an hourly sweep once its **Update interval** has passed since the last
+sync (`update_interval_hours`, default 24; `0` = manual only, at most 8760).
+A failed fetch counts as a sync too, so a broken feed is retried once per
+interval rather than every hour; Refresh retries it at once. Lists that come
+due together are queued a minute apart, at most 55 per sweep so each has run
+before the next sweep looks again; any beyond that go in the next hour,
+longest-overdue first.
 
 #### Do feed entries block subdomains?
 

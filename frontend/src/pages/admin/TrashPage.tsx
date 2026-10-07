@@ -4,6 +4,7 @@ import { RotateCcw, Search, Trash2 } from "lucide-react";
 import { trashApi, type TrashEntry, type TrashEntryType } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 
 const TYPE_LABELS: Record<TrashEntryType, string> = {
   ip_space: "IP Space",
@@ -213,7 +214,7 @@ export function TrashPage() {
     [filterType, filterSince, filterQ],
   );
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trash", params],
     queryFn: () => trashApi.list(params),
   });
@@ -298,7 +299,12 @@ export function TrashPage() {
               {!isLoading && items.length === 0 && (
                 <tr>
                   <td colSpan={6} className="px-2 py-4 text-muted-foreground">
-                    Trash is empty.
+                    {/* A refused or failed read is not an empty trash (#1343). */}
+                    {isError ? (
+                      <ListReadError error={error} what="the trash" />
+                    ) : (
+                      "Trash is empty."
+                    )}
                   </td>
                 </tr>
               )}

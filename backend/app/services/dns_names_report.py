@@ -23,6 +23,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import (
+    bind_check_names_error,
     validate_fqdn,
     validate_hostname,
     validate_record_owner,
@@ -71,16 +72,19 @@ async def _scan_category(
     db: AsyncSession,
     report: _CategoryReport,
     stmt: Select[Any],
-    check: Callable[[str], Any],
+    check: Callable[[Any], Any],
     *,
     has_context: bool = False,
+    whole_row: bool = False,
 ) -> None:
     """Stream one category's rows through ``check``; flag violations.
 
     Fetches ``cap + 1`` so ``scanned_capped`` distinguishes "exactly at the
     cap" (fully scanned) from "truncated" (issue #597 review), and yields the
     event loop every ``_YIELD_EVERY`` rows so the CPU-bound validation can't
-    stall other requests. ``check`` raises ``ValueError`` on a bad value.
+    stall other requests. ``check`` raises ``ValueError`` on a bad value; it
+    gets the value, or with *whole_row* the whole row, for a rule that needs
+    more than the name (#1378).
     """
     rows = (await db.execute(stmt.limit(_MAX_SCAN_PER_CATEGORY + 1))).all()
     report.scanned_capped = len(rows) > _MAX_SCAN_PER_CATEGORY
@@ -88,11 +92,21 @@ async def _scan_category(
         row_id, value = row[0], row[1]
         ctx = row[2] if has_context else None
         try:
-            check(value)
+            check(row if whole_row else value)
         except ValueError as exc:
             report.add(row_id=row_id, value=value, reason=str(exc), context=ctx)
         if i and i % _YIELD_EVERY == 0:
             await asyncio.sleep(0)
+
+
+def _check_record_row(row: Any) -> None:
+    """A record row against the owner rule and BIND's check-names (#1378)."""
+    _row_id, name, _fqdn, record_type, value, zone_name = row
+    owner = validate_record_owner(name or "@")
+    owner_fqdn = zone_name if owner == "@" else f"{owner}.{zone_name}"
+    err = bind_check_names_error(record_type or "", owner_fqdn, value, origin=zone_name or "")
+    if err is not None:
+        raise ValueError(err)
 
 
 async def scan_name_conformance(db: AsyncSession) -> dict[str, Any]:
@@ -121,13 +135,24 @@ async def scan_name_conformance(db: AsyncSession) -> dict[str, Any]:
         validate_hostname,
     )
 
-    # DNS record owners (RFC 2181 rule).
+    # DNS record owners (RFC 2181 rule), and since #1378 the names BIND's
+    # check-names refuses: one such row makes the agent quarantine its
+    # server's whole config bundle, and rows stored before the API refused
+    # them are still there.
     await _scan_category(
         db,
         rec,
-        select(DNSRecord.id, DNSRecord.name, DNSRecord.fqdn),
-        lambda v: validate_record_owner(v or "@"),
+        select(
+            DNSRecord.id,
+            DNSRecord.name,
+            DNSRecord.fqdn,
+            DNSRecord.record_type,
+            DNSRecord.value,
+            DNSZone.name,
+        ).join(DNSZone, DNSZone.id == DNSRecord.zone_id),
+        _check_record_row,
         has_context=True,
+        whole_row=True,
     )
 
     # DNS zone names (FQDN rule). Strip the stored trailing dot first.

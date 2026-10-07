@@ -64,6 +64,17 @@ VALID_SOURCE_TYPES = {"manual", "url", "file_upload"}
 VALID_FEED_FORMATS = {"hosts", "domains", "adblock"}
 VALID_BLOCK_MODES = {"nxdomain", "sinkhole", "refused"}
 VALID_ENTRY_TYPES = {"block", "redirect", "nxdomain"}
+# update_interval_hours: 0 = manual refresh only; otherwise the hourly sweep
+# refreshes the feed once the interval has passed (#1467). Capped at a year.
+MAX_UPDATE_INTERVAL_HOURS = 8760
+
+
+def _check_interval(v: int | None) -> int | None:
+    if v is not None and not 0 <= v <= MAX_UPDATE_INTERVAL_HOURS:
+        raise ValueError(
+            f"update_interval_hours must be 0 (manual only) to {MAX_UPDATE_INTERVAL_HOURS}"
+        )
+    return v
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
@@ -88,6 +99,12 @@ class BlockListCreate(BaseModel):
     def _v_source(cls, v: str) -> str:
         if v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
+        return v
+
+    @field_validator("update_interval_hours")
+    @classmethod
+    def _v_interval(cls, v: int) -> int:
+        _check_interval(v)
         return v
 
     @field_validator("feed_format")
@@ -124,6 +141,11 @@ class BlockListUpdate(BaseModel):
         if v is not None and v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
+
+    @field_validator("update_interval_hours")
+    @classmethod
+    def _v_interval(cls, v: int | None) -> int | None:
+        return _check_interval(v)
 
     @field_validator("feed_format")
     @classmethod
@@ -1547,7 +1569,9 @@ async def effective_for_view(
     return EffectiveBlocklistResponse(
         scope=eff.scope,
         scope_id=eff.scope_id,
-        entries=[EffectiveEntryResponse(**e.__dict__) for e in eff.entries],
+        entries=[
+            EffectiveEntryResponse.model_validate(e, from_attributes=True) for e in eff.entries
+        ],
         exceptions=sorted(eff.exceptions),
         lists=eff.lists,
     )
@@ -1564,7 +1588,9 @@ async def effective_for_group(
     return EffectiveBlocklistResponse(
         scope=eff.scope,
         scope_id=eff.scope_id,
-        entries=[EffectiveEntryResponse(**e.__dict__) for e in eff.entries],
+        entries=[
+            EffectiveEntryResponse.model_validate(e, from_attributes=True) for e in eff.entries
+        ],
         exceptions=sorted(eff.exceptions),
         lists=eff.lists,
     )
