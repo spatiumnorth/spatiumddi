@@ -33,6 +33,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSBlockList,
@@ -1017,7 +1018,23 @@ async def update_blocklist(
     list_id: uuid.UUID, body: BlockListUpdate, db: DB, current_user: SuperAdmin
 ) -> BlockListResponse:
     bl = await _require_list(list_id, db)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears feed_url / sinkhole_ip; null for a
+    # NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"feed_url", "sinkhole_ip"},
+        non_nullable={
+            "name",
+            "description",
+            "category",
+            "source_type",
+            "feed_format",
+            "update_interval_hours",
+            "block_mode",
+            "feed_entries_are_wildcard",
+            "enabled",
+        },
+    )
     wildcard_flipped = (
         "feed_entries_are_wildcard" in changes
         and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
@@ -1301,7 +1318,12 @@ async def update_entry(
             status_code=409,
             detail="Only manual entries can be edited; feed-sourced entries are refreshed from source.",
         )
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears target; null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"target"},
+        non_nullable={"domain", "entry_type", "is_wildcard", "reason"},
+    )
     if "domain" in changes:
         domain = changes["domain"].strip().lower().strip(".")
         if not domain or "." not in domain:

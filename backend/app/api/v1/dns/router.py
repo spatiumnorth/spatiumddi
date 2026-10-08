@@ -50,6 +50,7 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
+from app.core.update_nulls import resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -1698,7 +1699,21 @@ async def update_group(
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
 
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears default_view (nullable); null for a
+    # NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"default_view"},
+        non_nullable={
+            "name",
+            "description",
+            "group_type",
+            "is_recursive",
+            "catalog_zones_enabled",
+            "catalog_zone_name",
+            "is_public_facing",
+        },
+    )
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -1969,8 +1984,21 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
-    changes = body.model_dump(
-        exclude_none=True,
+    # #1563 — explicit null clears api_port; null for a NOT NULL column
+    # is a 422. The excluded fields keep their own contracts below.
+    changes = resolve_update_changes(
+        body,
+        clearable={"api_port"},
+        non_nullable={
+            "name",
+            "driver",
+            "host",
+            "port",
+            "roles",
+            "status",
+            "notes",
+            "is_enabled",
+        },
         # ``group_id`` / ``is_primary`` (#934) are NOT plain column writes —
         # each has cross-row consequences the generic loop below can't have.
         exclude={
@@ -4306,7 +4334,20 @@ async def update_view(
     current_user: SuperAdmin,
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears allow_query / allow_query_cache (null
+    # = inherit server options, #430); null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"allow_query", "allow_query_cache"},
+        non_nullable={
+            "name",
+            "description",
+            "match_clients",
+            "match_destinations",
+            "recursion",
+            "order",
+        },
+    )
     changes.update(await _validated_view_fields(group_id, body, db))
     for k, v in changes.items():
         setattr(view, k, v)
@@ -5044,16 +5085,44 @@ async def update_zone(
 ) -> ZoneResponse:
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
-    changes = body.model_dump(exclude_none=True)
-    # ``color`` is the one field on this schema where NULL is a meaningful
-    # user intent ("clear the color"). Re-inject it when explicitly set to
-    # None in the incoming payload — exclude_none would otherwise drop it.
-    if "color" in body.model_fields_set and body.color is None:
-        changes["color"] = None
-    # Same NULL-is-meaningful treatment for the DNSSEC policy (issue #49):
-    # explicit null ⇒ fall back to BIND's built-in "default" policy.
-    if "dnssec_policy_id" in body.model_fields_set and body.dnssec_policy_id is None:
-        changes["dnssec_policy_id"] = None
+    # #1563 — explicit null CLEARS the nullable zone fields: view_id,
+    # linked_subnet_id, domain_id, customer_id and notify_enabled (the
+    # UI's unlink / "none" actions sent null and exclude_none silently
+    # kept the old value), plus color / dnssec_policy_id, whose
+    # NULL-is-meaningful re-injections this replaces (issue #49), and the
+    # nullable named.conf ACL lists. Null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "view_id",
+            "linked_subnet_id",
+            "domain_id",
+            "customer_id",
+            "notify_enabled",
+            "color",
+            "dnssec_policy_id",
+            "allow_query",
+            "allow_transfer",
+            "also_notify",
+        },
+        non_nullable={
+            "name",
+            "zone_type",
+            "kind",
+            "ttl",
+            "refresh",
+            "retry",
+            "expire",
+            "minimum",
+            "primary_ns",
+            "admin_email",
+            "dnssec_enabled",
+            "auto_tls_probe",
+            "dynamic_update_enabled",
+            "forward_only",
+            "tags",
+        },
+    )
     # Secondary / stub zones need at least one master to render loadable
     # BIND9 config (issue #336). Validate against the *effective* state —
     # the new zone_type/masters from this payload OR what's already on the
@@ -6972,7 +7041,14 @@ async def update_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears view_id and ttl (ttl null = inherit
+    # the zone TTL; exclude_none dropped both, so the clear never
+    # landed); null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"view_id", "ttl"},
+        non_nullable={"name", "value", "tags"},
+    )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     for k, v in changes.items():

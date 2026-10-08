@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 from app.services.tags import apply_tag_filter
@@ -267,7 +268,13 @@ async def update_asn(asn_id: uuid.UUID, body: ASNUpdate, db: DB, user: CurrentUs
     if row is None:
         raise HTTPException(status_code=404, detail="ASN not found")
 
-    changes = body.model_dump(exclude_unset=True)
+    # #1564 — same null contract as device_policies: clear nullable
+    # columns, 422 on null for the NOT NULL set instead of a 500.
+    changes = resolve_update_changes(
+        body,
+        clearable={"holder_org", "customer_id", "provider_id"},
+        non_nullable={"name", "description", "tags", "custom_fields"},
+    )
     for k, v in changes.items():
         setattr(row, k, v)
 
