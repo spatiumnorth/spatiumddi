@@ -680,13 +680,17 @@ function TargetModal({
               >
                 <option value="generic">Generic JSON</option>
                 <option value="slack">Slack (mrkdwn blocks)</option>
-                <option value="teams">Microsoft Teams (MessageCard)</option>
+                <option value="teams">
+                  Microsoft Teams (Workflows / Adaptive Card)
+                </option>
                 <option value="discord">Discord (embed)</option>
               </select>
               <div className="mt-1 text-[11px] text-muted-foreground">
                 {form.webhook_flavor === "generic"
                   ? "Posts the raw audit/alert JSON. For collectors that parse it themselves."
-                  : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+                  : form.webhook_flavor === "teams"
+                    ? "Create the URL with the Workflows app in the Teams channel → “Send webhook alerts to a channel”. Teams accepts the request before the flow runs, so a successful Test doesn't prove the card was posted; check the flow's run history."
+                    : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
               </div>
             </label>
             <label className="block">
@@ -706,7 +710,7 @@ function TargetModal({
                     : form.webhook_flavor === "slack"
                       ? "https://hooks.slack.com/services/T…/B…/…"
                       : form.webhook_flavor === "teams"
-                        ? "https://…webhook.office.com/webhookb2/…"
+                        ? "https://….environment.api.powerplatform.com/powerautomate/automations/direct/workflows/…"
                         : form.webhook_flavor === "discord"
                           ? "https://discord.com/api/webhooks/…/…"
                           : "https://collector.example.com/ingest"

@@ -26,7 +26,7 @@ from spatium_dhcp_agent import sync as sync_mod
 from spatium_dhcp_agent.cache import ensure_layout, save_config
 from spatium_dhcp_agent.config import AgentConfig
 from spatium_dhcp_agent.config_apply import STATUS_REVERTED, ApplyStatus
-from spatium_dhcp_agent.kea_ctrl import KeaCtrlError
+from spatium_dhcp_agent.kea_ctrl import KeaConfigRejected
 from spatium_dhcp_agent.peer_resolve import PeerResolveWatcher
 from spatium_dhcp_agent.sync import SyncLoop
 
@@ -55,7 +55,7 @@ def _bundle(tag: str, subnet: str) -> dict[str, Any]:
 
 @pytest.fixture
 def loop(agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch) -> SyncLoop:
-    monkeypatch.setattr(sync_mod, "config_test", lambda s, d: {"result": 0})
+    monkeypatch.setattr(sync_mod, "config_check", lambda daemon, path: None)
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: {"result": 0})
     ensure_layout(agent_cfg.state_dir)
     return SyncLoop(agent_cfg, token_ref=[""], heartbeat=_FakeHeartbeat())
@@ -79,10 +79,10 @@ def test_a_refused_re_render_restores_the_documents_and_reports_it(
     _poll_apply(loop, "A", "192.0.2.0/24")
     before = agent_cfg.kea_config_path.read_text()
 
-    def refuse(sock, doc):  # type: ignore[no-untyped-def]
-        raise KeaCtrlError("peer URL refused")
+    def refuse(daemon, path):  # type: ignore[no-untyped-def]
+        raise KeaConfigRejected("peer URL refused")
 
-    monkeypatch.setattr(sync_mod, "config_test", refuse)
+    monkeypatch.setattr(sync_mod, "config_check", refuse)
     assert loop.reapply_current_bundle("ha_peer_ip_changed") is False
     # Reported — before #1247 the status stayed OK and it was only logged.
     assert loop.apply_status.status == STATUS_REVERTED
@@ -102,12 +102,11 @@ def test_after_a_revert_a_host_change_re_renders_last_known_good(
     last-known-good A was never followed."""
     _poll_apply(loop, "A", "192.0.2.0/24")
 
-    def refuse_b(sock, doc):  # type: ignore[no-untyped-def]
-        if "198.51.100.0/24" in json.dumps(doc):
-            raise KeaCtrlError("bad scope")
-        return {"result": 0}
+    def refuse_b(daemon, path):  # type: ignore[no-untyped-def]
+        if "198.51.100.0/24" in path.read_text():
+            raise KeaConfigRejected("bad scope")
 
-    monkeypatch.setattr(sync_mod, "config_test", refuse_b)
+    monkeypatch.setattr(sync_mod, "config_check", refuse_b)
     bundle_b = _bundle("B", "198.51.100.0/24")
     save_config(loop.cfg.state_dir, bundle_b, "B")
     assert loop._apply_with_revert(bundle_b, "B") is False
@@ -139,12 +138,11 @@ def test_only_a_daemon_that_accepted_the_render_is_reloaded_back(
     _poll_apply(loop, "A", "192.0.2.0/24")
     reloads: list[str] = []
 
-    def v6_refuses(sock, doc):  # type: ignore[no-untyped-def]
-        if "Dhcp6" in doc:
-            raise KeaCtrlError("v6 refused")
-        return {"result": 0}
+    def v6_refuses(daemon, path):  # type: ignore[no-untyped-def]
+        if daemon == "dhcp6":
+            raise KeaConfigRejected("v6 refused")
 
-    monkeypatch.setattr(sync_mod, "config_test", v6_refuses)
+    monkeypatch.setattr(sync_mod, "config_check", v6_refuses)
     monkeypatch.setattr(
         sync_mod, "config_reload", lambda sock: reloads.append(str(sock))
     )

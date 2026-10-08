@@ -20,11 +20,13 @@ own config under ``/etc/dns`` and is configured entirely over its HTTP API
   reconcile it against the live API in ``swap_and_reload()`` (same split as
   PowerDNS, for symmetry with the rest of the codebase, even though there's
   no config file being swapped here).
-* Zone apex NS/SOA are Technitium-managed (auto-created on
-  ``/api/zones/create``) and are NOT pushed from the bundle — confirmed the
-  daemon renders its own SOA + one NS record at zone creation, so treating
-  the bundle's NS/SOA as authoritative would just create duplicate/foreign
-  NS records alongside Technitium's own.
+* Zone apex NS/SOA are created by the daemon on ``/api/zones/create`` (one
+  NS and an SOA MNAME naming its own host name, which in a pod is the pod
+  name). They are not reconciled record by record with the rest of the
+  zone: ``_reconcile_zone_apex`` rewrites the SOA fields the zone sets
+  (Primary NS, Admin Email, and with them the timers) and replaces the apex
+  NS set as a whole, each only when it differs, and leaves a zone that sets
+  neither Primary NS nor Admin Email nor apex NS alone.
 
 Zone types (issue #743): primary, secondary, stub and forward, plus
 catalog-zone membership for the primaries this server owns. Only a
@@ -354,6 +356,121 @@ def _technitium_master(entry: str) -> str:
     """
     host, sep, port = str(entry).strip().partition("@")
     return f"{host}:{port}" if sep and port else host
+
+
+# SOA fields the zone row owns, besides MNAME / RNAME. Shipped by the bundle
+# from #1171 on; an older control plane leaves them out and the daemon's
+# values stand.
+_SOA_TIMERS = ("refresh", "retry", "expire", "minimum")
+
+
+def _host_name(value: Any) -> str | None:
+    """``value`` as the bare, lower-case host name Technitium reads back, or
+    None when it cannot be one.
+
+    ``primary_ns`` is stored with or without the trailing dot (the zone form
+    keeps it, the importers strip it) and both mean an absolute name, the
+    reading the BIND9 renderer gives it too (#1153). Technitium returns
+    names un-dotted and lower-case, so comparing in that form is what keeps
+    a converged apex from looking changed.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip().rstrip(".").lower()
+    if not name or name == "@" or not name.isascii() or ".." in name:
+        return None
+    if any(c.isspace() for c in name):
+        return None
+    return name
+
+
+def _responsible_person(value: Any) -> str | None:
+    """A zone's ``admin_email`` in the ``user@domain`` form Technitium stores.
+
+    The zone row keeps the RNAME in SOA form (``hostmaster.example.com.``,
+    the first unescaped dot standing for the ``@``). Technitium converts that
+    itself on write, but reads it back as an address, so the comparison has
+    to happen in that form. An address that already has an ``@`` is kept.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip().rstrip(".")
+    if not name or not name.isascii() or any(c.isspace() for c in name):
+        return None
+    if "@" in name:
+        return name.lower()
+    i = 0
+    while True:
+        i = name.find(".", i)
+        if i <= 0:
+            return None
+        if name[i - 1] != "\\":
+            break
+        i += 1
+    local, domain = name[:i].replace("\\.", "."), name[i + 1 :]
+    return f"{local}@{domain}".lower() if domain else None
+
+
+def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
+    """The apex a primary zone should serve: its NS set and SOA fields.
+
+    Technitium writes its own apex when it creates a zone: one NS and an
+    SOA MNAME naming the server's host name, which in a pod is the pod
+    name, plus a placeholder RNAME. Left alone, every server in a group
+    answers with a different, unresolvable name server, and the zone's own
+    Primary NS / Admin Email / SOA timers never reach the wire.
+
+    Same precedence as the BIND9 renderer (#1153): the zone's own apex NS
+    records are the NS set, else its ``primary_ns``. MNAME is ``primary_ns``,
+    else the first declared NS. A field the zone does not set is left out,
+    so the daemon's value stands; a zone that sets neither apex NS, Primary
+    NS nor Admin Email returns None and its apex is not touched at all. The
+    bundle ships every zone's SOA timers since #1171, defaults included, so
+    they cannot mean the zone set anything: they ride along only with an
+    apex the zone does set.
+    """
+    zname = zone_name.rstrip(".").lower()
+    declared: list[str] = []
+    for rec in zone.get("records") or []:
+        if (rec.get("type") or "").upper() != "NS":
+            continue
+        if _qualified_name(zname, rec.get("name") or "@").lower() != zname:
+            continue
+        value = str(rec.get("value") or "").strip()
+        # Read the target as a zone file would: ``@`` is the apex, a name
+        # without the trailing dot is relative to the zone.
+        if value in ("", "@"):
+            host: str | None = zname
+        elif value.endswith("."):
+            host = _host_name(value)
+        else:
+            host = _host_name(f"{value}.{zname}")
+        if host and host not in declared:
+            declared.append(host)
+
+    primary = _host_name(zone.get("primary_ns"))
+    ns = declared or ([primary] if primary else [])
+
+    soa: dict[str, Any] = {}
+    mname = primary or (declared[0] if declared else None)
+    if mname:
+        soa["primaryNameServer"] = mname
+    rname = _responsible_person(zone.get("admin_email"))
+    if rname:
+        soa["responsiblePerson"] = rname
+    if not ns and not soa:
+        return None
+    for field in _SOA_TIMERS:
+        timer = zone.get(field)
+        if isinstance(timer, int) and not isinstance(timer, bool) and timer >= 0:
+            soa[field] = timer
+    ttl = zone.get("ttl")
+    apex: dict[str, Any] = {"ns": ns, "soa": soa}
+    if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0:
+        # The SOA record's own TTL caps negative caching together with
+        # MINIMUM (RFC 2308), and BIND serves it at the zone's $TTL.
+        apex["ttl"] = ttl
+    return apex
 
 
 def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
@@ -695,9 +812,11 @@ class TechnitiumDriver(DriverBase):
                         continue
                     name = _qualified_name(zname, rec.get("name") or "@")
                     if rtype == "NS" and name == zname:
-                        # Apex NS is daemon-managed (created at zone-create
-                        # time, pointed at the container's own hostname).
-                        # Off-apex NS (delegations) are handled normally.
+                        # Apex NS is reconciled with the SOA, as a set
+                        # (``_zone_apex`` / ``_reconcile_zone_apex``), not
+                        # record by record: the daemon writes its own apex
+                        # NS at zone create. Off-apex NS (delegations) are
+                        # handled normally.
                         continue
                     records.append(
                         {
@@ -721,6 +840,10 @@ class TechnitiumDriver(DriverBase):
                 entry["masters"] = masters
             if forwarders:
                 entry["forwarders"] = forwarders
+            if ztype in _RECORD_MANAGED_ZONE_TYPES:
+                apex = _zone_apex(zname, zone)
+                if apex is not None:
+                    entry["apex"] = apex
             zones_payload.append(entry)
 
 
@@ -1704,6 +1827,131 @@ class TechnitiumDriver(DriverBase):
                     added=added,
                     deleted=deleted,
                 )
+            self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
+
+    def _reconcile_zone_apex(self, token: str, zone: str, apex: dict[str, Any] | None) -> None:
+        """Bring a primary zone's SOA and apex NS set in line with ``apex``.
+
+        Both are written only when they differ from what the daemon serves.
+        A SOA update makes Technitium bump the serial (verified against
+        15.4: it requires the current serial and stores current + 1), so an
+        unconditional write would change every zone's serial on every pass.
+
+        NS targets are added before the old ones are removed, so the zone is
+        never left without a name server, even if a call fails halfway.
+        """
+        if not apex:
+            return
+        resp = self._call(token, "GET", "zones/records/get", {"domain": zone, "zone": zone})
+        try:
+            body = resp.json()
+        except ValueError:
+            return
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_apex_read_failed", zone=zone, error=body.get("errorMessage")
+            )
+            return
+        records = body.get("response", {}).get("records") or []
+        apex_name = zone.rstrip(".").lower()
+        at_apex = [r for r in records if (r.get("name") or "").lower() == apex_name]
+        soa = next((r for r in at_apex if r.get("type") == "SOA"), None)
+        live_ns = [
+            str((r.get("rData") or {}).get("nameServer") or "").rstrip(".").lower()
+            for r in at_apex
+            if r.get("type") == "NS"
+        ]
+
+        soa_changed = False
+        desired_soa = apex.get("soa") or {}
+        ttl = apex.get("ttl")
+        if soa is not None and (desired_soa or ttl):
+            current = soa.get("rData") or {}
+            current_fields: dict[str, Any] = {
+                key: str(current.get(key) or "").rstrip(".").lower()
+                for key in ("primaryNameServer", "responsiblePerson")
+            }
+            current_fields.update({f: current.get(f) for f in _SOA_TIMERS})
+            differs = any(current_fields.get(k) != v for k, v in desired_soa.items())
+            if ttl and soa.get("ttl") != ttl:
+                differs = True
+            if differs:
+                params: dict[str, Any] = {
+                    "zone": zone,
+                    "domain": zone,
+                    "type": "SOA",
+                    "serial": current.get("serial"),
+                    "ttl": ttl or soa.get("ttl"),
+                    **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
+                    **{f: current.get(f) for f in _SOA_TIMERS},
+                }
+                params.update(desired_soa)
+                body = self._call(token, "POST", "zones/records/update", params).json()
+                if body.get("status") == "ok":
+                    soa_changed = True
+                else:
+                    log.warning(
+                        "technitium_zone_soa_update_failed",
+                        zone=zone,
+                        error=body.get("errorMessage"),
+                    )
+
+        added: list[str] = []
+        removed: list[str] = []
+        desired_ns = apex.get("ns") or []
+        if desired_ns:
+            for target in desired_ns:
+                if target in live_ns:
+                    continue
+                body = self._call(
+                    token,
+                    "POST",
+                    "zones/records/add",
+                    {
+                        "zone": zone,
+                        "domain": zone,
+                        "type": "NS",
+                        "ttl": ttl or 3600,
+                        "nameServer": target,
+                    },
+                ).json()
+                if body.get("status") == "ok":
+                    added.append(target)
+                else:
+                    log.warning(
+                        "technitium_zone_apex_ns_add_failed",
+                        zone=zone,
+                        name_server=target,
+                        error=body.get("errorMessage"),
+                    )
+            # Only drop the old set once the new one is in place.
+            if all(t in live_ns or t in added for t in desired_ns):
+                for target in live_ns:
+                    if target in desired_ns:
+                        continue
+                    body = self._call(
+                        token,
+                        "POST",
+                        "zones/records/delete",
+                        {"zone": zone, "domain": zone, "type": "NS", "nameServer": target},
+                    ).json()
+                    if body.get("status") == "ok":
+                        removed.append(target)
+                    else:
+                        log.warning(
+                            "technitium_zone_apex_ns_delete_failed",
+                            zone=zone,
+                            name_server=target,
+                            error=body.get("errorMessage"),
+                        )
+        if soa_changed or added or removed:
+            log.info(
+                "technitium_zone_apex_reconciled",
+                zone=zone,
+                soa_updated=soa_changed,
+                ns_added=added,
+                ns_removed=removed,
+            )
 
     def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> None:
         """Create the zone if absent, with the params its type requires.
