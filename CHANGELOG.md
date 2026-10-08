@@ -84,6 +84,36 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **ACME auto-renewal renews each certificate in its own issuance
+  shape (#1529).** The renewal sweep ignored the stored challenge
+  type and provider and renewed every certificate as managed-zone
+  DNS-01 from one global domain list, so http-01 certificates never
+  renewed and manual-DNS certificates got a renewal order every 12 h
+  that could only fail. The sweep now reads the shape — challenge
+  type, provider, domains — from the successful order that produced
+  each certificate. A certificate that needs a person (manual DNS-01
+  for domains SpatiumDDI doesn't host, and not since covered by a
+  managed zone) is skipped and raises a new seeded
+  `acme-manual-renewal` alert instead. The `platform_settings` shape
+  columns are now written only when an order succeeds, never at
+  order creation, so a later failed issue attempt can't retarget an
+  existing certificate's renewal.
+
+- **ACME DNS-01 solves no longer strand challenge records, stall on
+  other groups, or verify against the wrong resolver (#1530, #1531,
+  #1532).** A solve that fails after its `_acme-challenge` TXT record
+  commits now tears the record down on every failure path, and the
+  stale-TXT sweep — which existed but had no caller — is on an hourly
+  beat schedule and also covers stranded client-path records, not
+  just acme-dns provider accounts. The sibling-op wait in `solve()`
+  is scoped to servers in the zone's own group: serials are
+  date-based, so a same-name zone in another group (a split-horizon
+  pair) could otherwise stall or fail the solve. And the manual
+  DNS-01 propagation check walks the domain's authoritative name
+  servers (found by walking up from the challenge FQDN) and requires
+  the TXT on every one, instead of asking the appliance's own
+  resolver, which is not what the CA queries.
+
 - **Raw DHCP option codes are checked on every way into a group, not
   only on write (#1347).** #1296 made a scope or option-template write
   refuse the raw spelling its group's servers drop (Windows reads `opt-NN`,
