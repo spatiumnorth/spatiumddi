@@ -42,6 +42,7 @@ class LookupWhoisIpArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_ip",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for an IP address — "
         "answers 'who owns this IP?'. Resolves the responsible RIR via "
@@ -90,6 +91,7 @@ class LookupWhoisAsnArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_asn",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for an AS number — "
         "answers 'who runs this ASN?'. Returns the holder org, the "
@@ -145,6 +147,7 @@ class LookupWhoisDomainArgs(BaseModel):
 
 @register_tool(
     name="lookup_whois_domain",
+    permission=("read", "use_network_tools"),
     description=(
         "Look up the public WHOIS / RDAP record for a domain name — "
         "answers 'who owns this domain?'. Returns the registrar, the "

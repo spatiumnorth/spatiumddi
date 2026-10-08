@@ -18,6 +18,7 @@ from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.option_validation import normalize_options
@@ -291,7 +292,13 @@ async def update_static(
     # relocate a reservation's IP via Set-).
     prev_mac = str(st.mac_address)
     prev_ip = str(st.ip_address)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears client_id / duid / options_override /
+    # ip_address_id; null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"client_id", "duid", "options_override", "ip_address_id"},
+        non_nullable={"ip_address", "mac_address", "hostname", "description", "tags"},
+    )
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
         await validate_dhcp_options(
@@ -319,7 +326,7 @@ async def update_static(
         resource_id=str(st.id),
         resource_display=f"{st.mac_address}->{st.ip_address}",
         changed_fields=list(changes.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()
     await db.refresh(st)

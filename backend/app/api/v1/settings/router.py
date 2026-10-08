@@ -21,7 +21,8 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
@@ -50,7 +51,11 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
-from app.services.appliance.apt import render_sources_list
+from app.services.appliance.apt import (
+    mask_proxy_url,
+    render_sources_list,
+    restore_proxy_credentials,
+)
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
 from app.services.forward_secrets import apply_write_only, redact, reveal, url_display
@@ -334,6 +339,11 @@ class SettingsResponse(BaseModel):
                 _redact_apt_gpg_key(k) for k in (cols.get("apt_gpg_keys") or [])
             ]
             cols["apt_auth"] = [_redact_apt_auth(a) for a in (cols.get("apt_auth") or [])]
+            # GHSA-j77h-pqg7-h2g4 — a proxy URL may embed ``user:pass@``.
+            # Mask the userinfo, keep the host; ``update_settings`` puts the
+            # stored credential back when the form re-sends the mask.
+            cols["apt_proxy_http"] = mask_proxy_url(cols.get("apt_proxy_http"))
+            cols["apt_proxy_https"] = mask_proxy_url(cols.get("apt_proxy_https"))
             return cols
         return data
 
@@ -1938,11 +1948,17 @@ async def update_settings(
     # The legacy webhook's URL + Authorization header (#1502): same
     # encrypt-and-redact shape, so neither reaches the column in clear or the
     # ``platform_settings_updated`` log line below.
+    _legacy_webhook_written: list[str] = []
     for _field in ("audit_forward_webhook_url", "audit_forward_webhook_auth_header"):
         if _field in changes:
             raw = changes.pop(_field)
             setattr(settings, f"{_field}_encrypted", apply_write_only(None, raw))
             changes[f"{_field}_cleared" if raw == "" else f"{_field}_set"] = True
+            _legacy_webhook_written.append(_field)
+    if _legacy_webhook_written:
+        # GHSA-g9gv-9qp2-3qwm: blank the plaintext leftovers too, in the
+        # same transaction, or the pre-upgrade value outlives the change.
+        await _blank_legacy_plaintext(db, "platform_settings", settings.id, _legacy_webhook_written)
 
     # snmp_community: same encrypt-and-redact shape as fingerbank.
     if "snmp_community" in changes:
@@ -2204,6 +2220,17 @@ async def update_settings(
             ),
         )
 
+    # GHSA-j77h-pqg7-h2g4 — ``GET /settings`` masks a proxy URL's
+    # credential as ``***``; the form sends that back. Keep the stored one.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            try:
+                changes[field] = restore_proxy_credentials(changes[field], getattr(settings, field))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field}: {exc}"
+                ) from exc
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
         if field in (
@@ -2229,6 +2256,10 @@ async def update_settings(
         changes["apt_gpg_keys"] = apt_gpg_keys_audit
     if apt_auth_audit is not None:
         changes["apt_auth"] = apt_auth_audit
+    # ``changes`` is logged below; never the proxy credential.
+    for field in ("apt_proxy_http", "apt_proxy_https"):
+        if field in changes:
+            changes[field] = mask_proxy_url(changes[field])
 
     # Issue #157 — dedicated audit row for any SSH config change
     # (non-negotiable #4). SSH access is high-blast-radius (it gates who
@@ -2779,7 +2810,7 @@ async def reveal_snmp_community(
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Stored community could not be decrypted (key mismatch?). "
-            "Re-set the community in Settings → Appliance → SNMP.",
+            "Re-set the community under Appliance → Fleet → Services → SNMP.",
         ) from None
 
     db.add(
@@ -3153,6 +3184,41 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
     )
 
 
+async def _blank_legacy_plaintext(db: DB, table: str, row_id: Any, columns: list[str]) -> None:
+    """Blank the pre-#1506 plaintext leftovers for a written secret.
+
+    GHSA-g9gv-9qp2-3qwm: the ``*_encrypted`` migration kept the old
+    plaintext columns, unmapped and unread, holding the pre-upgrade
+    values. Clearing or replacing a secret changed only the encrypted
+    column, so the old value stayed readable in the DB and in full
+    backups. On any write of that secret, set its leftover column to
+    ``''`` in the same transaction — ``''`` is the column's server
+    default and the value the old application (which maps it as a
+    non-null string) reads as unset, so a rolling upgrade stays safe;
+    the migration's downgrade copies a still-encrypted value back, and
+    a cleared secret has none, so it stays ``''`` there too.
+
+    The columns are unmapped, so this is raw SQL, guarded by inspection:
+    a schema built from the models (tests, a fresh install before the
+    migration) may not have them at all, and the next release drops
+    them. Identifiers come only from the fixed call sites below, never
+    from request data.
+    """
+    if not columns:
+        return
+    conn = await db.connection()
+    existing = await conn.run_sync(
+        lambda c: {col["name"] for col in sa_inspect(c).get_columns(table)}
+    )
+    assignments = [f"{col} = ''" for col in columns if col in existing]
+    if not assignments:
+        return
+    await db.execute(
+        text(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
+        {"id": row_id},
+    )
+
+
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     from app.core.crypto import encrypt_str
 
@@ -3190,8 +3256,13 @@ def _require_webhook_url(body: AuditTargetBody, stored: bytes | None) -> None:
     The body validator can't see the stored value, and an omitted ``url``
     means "keep it", so this runs in the handler: on create there is
     nothing to keep, on update there is only if the row already has one.
+    An empty bytea is *not* a stored URL: an exclude-secrets restore
+    writes ``b""`` into the encrypted column, and treating that as set
+    let a blank URL through while the target silently stopped
+    delivering. Empty bytes are unset everywhere (here, ``url_set``
+    and the audit snapshot).
     """
-    if body.kind == "webhook" and body.url is None and stored is None:
+    if body.kind == "webhook" and body.url is None and not stored:
         raise HTTPException(status_code=422, detail="url is required for a webhook target")
 
 
@@ -3225,8 +3296,10 @@ def _forward_snapshot(t: AuditForwardTarget) -> dict:
         "protocol": t.protocol,
         "facility": t.facility,
         "ca_cert_pem_set": bool(t.ca_cert_pem),
-        "url_set": t.url_encrypted is not None,
-        "auth_header_set": t.auth_header_encrypted is not None,
+        # bool(), not "is not None": an exclude-secrets restore leaves an
+        # empty bytea, which is unset, not a configured secret.
+        "url_set": bool(t.url_encrypted),
+        "auth_header_set": bool(t.auth_header_encrypted),
         "webhook_flavor": t.webhook_flavor,
         "smtp_host": t.smtp_host,
         "smtp_port": t.smtp_port,
@@ -3288,6 +3361,15 @@ async def create_audit_target(
     _apply_body(row, body)
     db.add(row)
     await db.flush()
+    await _blank_legacy_plaintext(
+        db,
+        "audit_forward_target",
+        row.id,
+        [
+            *(["url"] if body.url is not None else []),
+            *(["auth_header"] if body.auth_header is not None else []),
+        ],
+    )
     _audit_forward_target(db, current_user, "create", row)
     try:
         await db.commit()
@@ -3318,6 +3400,15 @@ async def update_audit_target(
     _require_webhook_url(body, row.url_encrypted)
     old_value = _forward_snapshot(row)
     _apply_body(row, body)
+    await _blank_legacy_plaintext(
+        db,
+        "audit_forward_target",
+        row.id,
+        [
+            *(["url"] if body.url is not None else []),
+            *(["auth_header"] if body.auth_header is not None else []),
+        ],
+    )
     _audit_forward_target(db, current_user, "update", row, old_value=old_value)
     try:
         await db.commit()

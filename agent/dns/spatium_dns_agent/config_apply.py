@@ -87,9 +87,9 @@ MAX_ERROR_LEN = 2000
 #
 # The boundary that matters is between VALIDATE and RELOAD. Everything up to
 # and including validation happens against a staging copy — BIND renders into
-# ``rendered.new`` and runs ``named-checkconf`` there; Kea is asked
-# ``config-test`` before ``config-reload`` — so the running daemon has not
-# been touched and there is nothing to undo. Only a failure at RELOAD means
+# ``rendered.new`` and runs ``named-checkconf`` there; Kea's file is checked
+# with ``kea-dhcp4 -t`` before ``config-reload`` — so the running daemon has
+# not been touched and there is nothing to undo. Only a failure at RELOAD means
 # the live config has already been replaced, and only then does recovering
 # require re-rendering the previous bundle.
 

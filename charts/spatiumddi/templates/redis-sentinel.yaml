@@ -6,19 +6,24 @@
 {{- $replicas := int .Values.redis.sentinel.replicas -}}
 {{- $quorum := add (div $replicas 2) 1 -}}
 {{- $master := .Values.redis.sentinel.masterName -}}
-{{- $masterFqdn := printf "%s-0.%s.%s.svc.cluster.local" $sts $headless .Release.Namespace -}}
 {{- $authEnabled := .Values.redis.auth.enabled -}}
 # ─────────────────────────────────────────────────────────────────────────────
 # Redis HA via Sentinel (#272 Phase 3).
 #
 # A StatefulSet of N pods, each running a redis-server + a
-# redis-sentinel sidecar. Pod-0 starts as master; pods 1..N-1 start
-# as replicas of pod-0 (an init container writes ``replicaof`` into
-# the rendered redis.conf). The sentinels monitor the master + fail
+# redis-sentinel sidecar. The sentinels monitor the master + fail
 # over automatically — after a failover the master moves to whichever
 # replica wins the election, and clients (api / worker / beat) find it
 # by querying the sentinels through the ``sentinel://`` URL in
 # spatiumddi.commonEnv (no static master Service needed).
+#
+# Each pod's role is decided by its init container at every start
+# (files/redis-sentinel-render-config.sh): it asks the running sentinels
+# which pod is the master and follows it, or starts as master itself
+# when they name it. Only when no sentinel answers (the whole set
+# starting cold) does pod-0 start as master and pods 1..N-1 as its
+# replicas. A fixed pod-0-is-master rule on every start turned a
+# re-created master pod into a replica of its own replica (#1442).
 #
 # Config is rendered by the init container from a ConfigMap template +
 # the password env (so the secret never lands in the ConfigMap).
@@ -66,6 +71,10 @@ data:
     requirepass __PASSWORD__
     masterauth __PASSWORD__
     {{- end }}
+  # #1442 — how many pods render-config asks for the current master. Here
+  # rather than in the pod's env so a promote that grows the set re-renders
+  # it without rolling the pods already running (like the quorum below).
+  replicas: {{ $replicas | quote }}
   sentinel.conf.tmpl: |
     sentinel resolve-hostnames yes
     sentinel announce-hostnames yes
@@ -96,7 +105,9 @@ data:
     # address, so peers replace the entry in place instead of accumulating one.
     sentinel announce-ip __POD_FQDN__
     sentinel announce-port 26379
-    sentinel monitor {{ $master }} {{ $masterFqdn }} 6379 {{ $quorum }}
+    # __MASTER_HOST__ is the master render-config learned from the running
+    # sentinels (pod-0 on a cold start of the whole set), #1442.
+    sentinel monitor {{ $master }} __MASTER_HOST__ 6379 {{ $quorum }}
     sentinel down-after-milliseconds {{ $master }} {{ .Values.redis.sentinel.downAfterMs }}
     sentinel failover-timeout {{ $master }} {{ .Values.redis.sentinel.failoverTimeoutMs }}
     sentinel parallel-syncs {{ $master }} 1
@@ -134,9 +145,9 @@ spec:
         {{- end }}
         fsGroup: 999
       initContainers:
-        # Render redis.conf + sentinel.conf from the ConfigMap
-        # template, substituting the password + setting replicaof on
-        # the non-master pods. ${HOSTNAME} is <sts>-<ordinal>.
+        # Render redis.conf + sentinel.conf from the ConfigMap template:
+        # the password, this pod's stable FQDN, and its role, taken from
+        # the running sentinels (#1442; the script says how).
         - name: render-config
           image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
@@ -144,28 +155,17 @@ spec:
             - sh
             - -c
             - |
-              set -eu
-              PW="${REDIS_PASSWORD:-}"
-              # Escape sed-replacement metacharacters (\ & and the /
-              # delimiter) so a password containing them renders a valid
-              # auth line instead of a broken one. The auto-generated
-              # chart secret is alnum, but a non-appliance operator may
-              # BYO a password with special chars.
-              ESC=$(printf '%s' "$PW" | sed -e 's/[\\/&]/\\&/g')
-              # #590 — this pod's stable identity. ${HOSTNAME} is <sts>-<ordinal>,
-              # which the headless Service resolves for the pod's whole lifetime,
-              # unlike the pod IP that changes on every reschedule. Contains only
-              # dots + dashes, so it needs no sed escaping.
-              POD_FQDN="${HOSTNAME}.{{ $headless }}.{{ .Release.Namespace }}.svc.cluster.local"
-              sed -e "s/__PASSWORD__/${ESC}/g" -e "s/__POD_FQDN__/${POD_FQDN}/g" \
-                /tmpl/redis.conf.tmpl > /data/redis.conf
-              sed -e "s/__PASSWORD__/${ESC}/g" -e "s/__POD_FQDN__/${POD_FQDN}/g" \
-                /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
-              if [ "${HOSTNAME}" != "{{ $sts }}-0" ]; then
-                echo "replicaof {{ $masterFqdn }} 6379" >> /data/redis.conf
-              fi
-          {{- if $authEnabled }}
+              {{- .Files.Get "files/redis-sentinel-render-config.sh" | nindent 14 }}
           env:
+            - name: REDIS_STS
+              value: {{ $sts | quote }}
+            - name: REDIS_HEADLESS
+              value: {{ $headless | quote }}
+            - name: REDIS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: REDIS_MASTER_SET
+              value: {{ $master | quote }}
+          {{- if $authEnabled }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
