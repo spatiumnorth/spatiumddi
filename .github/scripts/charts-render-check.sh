@@ -129,6 +129,12 @@ render() { # name chart [helm --set args...]
     # address (externalTrafficPolicy: Local); see the script's docstring.
     python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
         || failures=$((failures + 1))
+    # A MetalLB VIP must keep the client's source address (the DNS VIP's
+    # rate limits, query logs and RPZ hits are all per client). The DHCP
+    # relay VIP is exempt: Kea answers the relay at giaddr, so the packet's
+    # source address is never used.
+    python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
