@@ -2235,9 +2235,12 @@ class TechnitiumDriver(DriverBase):
         """
         password = self.admin_bootstrap_password()
         try:
-            resp = httpx.get(
+            # A form body, never query parameters: a URL is logged (httpx
+            # writes every request line at INFO) and the password must not be
+            # (GHSA-x4gw-9gqx-vr4m).
+            resp = httpx.post(
                 f"{_API_BASE}/user/createToken",
-                params={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
+                data={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
                 timeout=_API_TIMEOUT,
             )
             body = resp.json()

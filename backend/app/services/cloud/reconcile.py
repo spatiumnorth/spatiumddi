@@ -66,6 +66,7 @@ from app.services.integration_ownership import (
     address_taken,
     owned_by_other_integration,
     owning_integration,
+    subnet_has_surviving_addresses,
 )
 
 logger = structlog.get_logger(__name__)
@@ -468,6 +469,13 @@ async def _apply_blocks_and_subnets(
     if allow_delete:
         for net_str, row in current_subnets.items():
             if net_str in desired_map:
+                continue
+            # #1558: don't cascade-delete operator / foreign /
+            # operator-edited addresses with the subnet — un-claim it
+            # instead when any survive, like the OPNsense reconciler.
+            if await subnet_has_surviving_addresses(db, row.id, "cloud_endpoint_id"):
+                row.cloud_endpoint_id = None
+                summary.subnets_updated += 1
                 continue
             await db.delete(row)
             summary.subnets_deleted += 1

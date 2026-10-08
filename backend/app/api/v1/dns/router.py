@@ -48,6 +48,7 @@ from app.core.permissions import (
     _token_grants_for,
     require_any_resource_permission,
     token_scope_allows,
+    token_scoped_resource_ids,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
 from app.core.update_nulls import resolve_update_changes
@@ -1867,8 +1868,7 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
     which the operator may legitimately skip. The point here is to turn
     "saved fine, then every sync fails" into a 422 on save.
 
-    ``technitium_api`` (#810) is the only driver with anything to check
-    today, and it has two things worth catching:
+    ``technitium_api`` (#810) has two things worth catching:
 
     * the API URL must carry an explicit scheme. Guessing ``http`` for a
       bare host would silently put the bearer token on the wire in
@@ -1879,7 +1879,31 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
       co-located Technitium on the appliance's own loopback is a legitimate
       target, and this module's contract is to log those rather than refuse
       them.
+
+    ``azure_dns`` (#1534) validates that all five credential fields are
+    present — an empty ``resource_group`` used to pass the probe (which
+    listed zones subscription-wide) while every record op failed.
     """
+    if driver == "azure_dns":
+        from app.drivers.dns.azuredns import AzureDNSDriver  # noqa: PLC0415
+
+        missing = [
+            field
+            for field in AzureDNSDriver.credential_fields
+            if not str(creds.get(field) or "").strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "azure_dns credentials are missing required field(s): "
+                    + ", ".join(missing)
+                    + ". All of tenant_id, client_id, client_secret, "
+                    "subscription_id and resource_group are required."
+                ),
+            )
+        return
+
     if driver != "technitium_api":
         return
 
@@ -4920,7 +4944,10 @@ async def get_server_pending_ops(
     counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
 
     ops_res = await db.execute(
-        select(DNSRecordOp).where(*op_filter).order_by(DNSRecordOp.created_at.desc()).limit(limit)
+        select(DNSRecordOp)
+        .where(*op_filter)
+        .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.seq.desc().nulls_last())
+        .limit(limit)
     )
     items = [
         PendingOpEntry(
@@ -4966,19 +4993,36 @@ class ServerEventsResponse(BaseModel):
     items: list[ServerEventEntry]
 
 
+def _refuse_resource_scoped_token(user: Any) -> None:
+    """Server-level reads are not any token grant's resource (GHSA-c4v7-2235-v88h).
+
+    A resource-scoped token passes the router's DNS gate on its ``dns_zone``
+    grant, but a server's audit history and ``rndc status`` belong to no zone,
+    so there is nothing to narrow them to. Refuse them for such a token;
+    sessions, unscoped tokens and wildcard-granted tokens are unaffected
+    (``token_scoped_resource_ids`` answers ``None`` for those).
+    """
+    if token_scoped_resource_ids(user, "dns_server") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this DNS server",
+        )
+
+
 @router.get(
     "/servers/{server_id}/recent-events",
     response_model=ServerEventsResponse,
 )
 async def get_server_recent_events(
-    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser, limit: int = 50
 ) -> ServerEventsResponse:
     """Audit-log rows where ``resource_id`` matches this server.
 
     The audit log keys ``resource_id`` as text, so we filter on the
     string form of the UUID. Drives the "Events" tab on the Server
-    Detail modal.
+    Detail modal. Refused for a resource-scoped API token.
     """
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -5075,9 +5119,11 @@ class RndcStatusResponse(BaseModel):
     response_model=RndcStatusResponse,
 )
 async def get_server_rndc_status(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> RndcStatusResponse:
-    """Latest agent-pushed ``rndc status`` output for this server."""
+    """Latest agent-pushed ``rndc status`` output for this server. Refused for
+    a resource-scoped API token."""
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -6714,6 +6760,11 @@ async def _push_zone_to_agentless_servers(
     cleans it up. Matches the DHCP write-through pattern.
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import (  # noqa: PLC0415
+        CloudDNSConflictError,
+        CloudDNSDriverBase,
+    )
+    from app.drivers.dns.base import RecordData  # noqa: PLC0415
 
     # ``group_id`` overrides the zone's own when the caller needs to drive
     # a group the zone is not (yet / no longer) in — the #935 move pushes a
@@ -6729,13 +6780,51 @@ async def _push_zone_to_agentless_servers(
     if not targets:
         return
 
+    # On delete, cloud providers that must empty a zone before deleting
+    # it scope that emptying to the records SpatiumDDI manages — the
+    # zone's DB rows, loaded NOW while they still exist in every delete
+    # flow (permanent delete pushes before the row delete; the trash
+    # purge's record pass deliberately skips in-zone records so they
+    # are still here; a zone move keeps its rows). ``include_deleted``
+    # because the purge path works on soft-deleted rows by definition.
+    # An empty list is meaningful: "we manage nothing here — remove
+    # nothing"; only a non-delete op leaves this as None.
+    managed_records: list[RecordData] | None = None
+    if op == "delete":
+        rec_res = await db.execute(
+            select(DNSRecord)
+            .where(DNSRecord.zone_id == zone.id)
+            .execution_options(include_deleted=True)
+        )
+        managed_records = [
+            RecordData(
+                name=r.name,
+                record_type=r.record_type,
+                value=r.value,
+                ttl=r.ttl,
+                priority=r.priority,
+                weight=r.weight,
+                port=r.port,
+            )
+            for r in rec_res.scalars().all()
+        ]
+
     errors: list[str] = []
     for server in targets:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
-            await driver.apply_zone_change(server, zone, op)
+            if isinstance(driver, CloudDNSDriverBase):
+                await driver.apply_zone_change(server, zone, op, managed_records=managed_records)
+            else:
+                await driver.apply_zone_change(server, zone, op)
+        except CloudDNSConflictError as exc:
+            # The provider already holds a zone/record this op would
+            # have to take over (e.g. a same-name Route 53 hosted zone
+            # SpatiumDDI did not create). Surface as 409 — the remedy
+            # is the explicit import flow named in the message.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
             errors.append(f"{server.name}: {exc}")
             logger.warning(
