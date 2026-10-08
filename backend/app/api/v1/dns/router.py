@@ -6644,7 +6644,11 @@ async def _push_zone_to_agentless_servers(
     keeps it. So before raising, the servers that succeeded get the
     inverse op as compensation (create → delete, delete → create),
     best-effort, so a partial fan-out converges back instead of leaving
-    the zone live on some servers and absent on others (#1537).
+    the zone live on some servers and absent on others (#1537). Rolling
+    back a delete re-creates the zone AND pushes its records back, since a
+    re-created zone is otherwise empty; a record that cannot be restored is
+    named in the 502 rather than reported as a clean rollback (#1613).
+    The zone move's source-group delete goes through here too.
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
@@ -6664,6 +6668,7 @@ async def _push_zone_to_agentless_servers(
         return
 
     errors: list[str] = []
+    failed_drivers: set[str] = set()
     succeeded: list[DNSServer] = []
     for server in targets:
         driver = get_driver(server.driver)
@@ -6673,46 +6678,113 @@ async def _push_zone_to_agentless_servers(
             await driver.apply_zone_change(server, zone, op)
             succeeded.append(server)
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
-            errors.append(f"{server.name}: {exc}")
+            errors.append(f"{server.name}: {_exc_text(exc)}")
+            failed_drivers.add(server.driver)
             logger.warning(
                 "dns.zone.push_agentless_failed",
                 server=str(server.id),
                 zone=zone.name,
                 op=op,
-                error=str(exc),
+                error=_exc_text(exc),
             )
 
-    if errors:
-        compensated: list[str] = []
-        compensation_failed: list[str] = []
-        inverse = {"create": "delete", "delete": "create"}.get(op)
-        if inverse is not None:
-            for server in succeeded:
-                driver = get_driver(server.driver)
-                try:
-                    await driver.apply_zone_change(server, zone, inverse)
-                    compensated.append(server.name)
-                except Exception as exc:  # noqa: BLE001 — best effort; reported below
-                    compensation_failed.append(f"{server.name}: {exc}")
-                    logger.warning(
-                        "dns.zone.push_agentless_compensation_failed",
-                        server=str(server.id),
-                        zone=zone.name,
-                        op=inverse,
-                        error=str(exc),
-                    )
-        detail = (
-            f"Failed to {op} zone on Windows DNS: {'; '.join(errors)}. "
-            "Zone state in SpatiumDDI was not changed."
+    if not errors:
+        return
+
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        restore_zone_records_to_server,
+    )
+
+    compensated: list[str] = []
+    records_unrestored: list[str] = []
+    compensation_failed: list[str] = []
+    inverse = {"create": "delete", "delete": "create"}.get(op)
+    if inverse is not None:
+        for server in succeeded:
+            driver = get_driver(server.driver)
+            try:
+                await driver.apply_zone_change(server, zone, inverse)
+            except Exception as exc:  # noqa: BLE001 — best effort; reported below
+                compensation_failed.append(f"{server.name}: {_exc_text(exc)}")
+                logger.warning(
+                    "dns.zone.push_agentless_compensation_failed",
+                    server=str(server.id),
+                    zone=zone.name,
+                    op=inverse,
+                    error=_exc_text(exc),
+                )
+                continue
+            if inverse != "create":
+                compensated.append(server.name)
+                continue
+            # The inverse of a delete is a create, and a create gives back an
+            # EMPTY zone — so the records go back too, or the server that
+            # did nothing wrong is left answering for the zone with none of
+            # its data until someone runs Sync with Servers (#1613 QA).
+            try:
+                restored = await restore_zone_records_to_server(db, server, driver, zone)
+                problems = list(restored.push_errors)
+                if restored.pushed < restored.candidates and not problems:
+                    problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+            except Exception as exc:  # noqa: BLE001 — reported below
+                problems = [_exc_text(exc)]
+            if problems:
+                records_unrestored.append(f"{server.name} ({'; '.join(problems)})")
+                logger.warning(
+                    "dns.zone.push_agentless_record_restore_failed",
+                    server=str(server.id),
+                    zone=zone.name,
+                    errors=problems,
+                )
+            else:
+                compensated.append(server.name)
+
+    kinds = ", ".join(sorted(_agentless_driver_label(d) for d in failed_drivers))
+    detail = (
+        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors)}. "
+        "The change was not saved in SpatiumDDI."
+    )
+    if compensated:
+        detail += f" Rolled back on: {', '.join(compensated)}."
+    if records_unrestored:
+        detail += (
+            f" Zone re-created on {'; '.join(records_unrestored)}, but its records "
+            "could not all be restored — run Sync with Servers on the zone."
         )
-        if compensated:
-            detail += f" Rolled back on: {', '.join(compensated)}."
-        if compensation_failed:
-            detail += (
-                f" Rollback failed on: {'; '.join(compensation_failed)} — "
-                "those servers may still hold the zone; reconcile manually."
-            )
-        raise HTTPException(status_code=502, detail=detail)
+    if compensation_failed:
+        state = "still hold" if op == "create" else "no longer hold"
+        detail += (
+            f" Rollback failed on: {'; '.join(compensation_failed)} — "
+            f"those servers may {state} the zone; reconcile manually."
+        )
+    raise HTTPException(status_code=502, detail=detail)
+
+
+# Display names for the agentless drivers, so a failure names the system
+# that refused rather than calling every one of them "Windows DNS".
+_AGENTLESS_DRIVER_LABELS: dict[str, str] = {
+    "windows_dns": "Windows DNS",
+    "technitium_api": "Technitium",
+    "cloudflare": "Cloudflare",
+    "route53": "Route 53",
+    "azure_dns": "Azure DNS",
+    "google_dns": "Google Cloud DNS",
+    "digitalocean": "DigitalOcean",
+    "hetzner": "Hetzner DNS",
+    "linode": "Linode",
+    "vultr": "Vultr",
+}
+
+
+def _agentless_driver_label(driver: str) -> str:
+    return _AGENTLESS_DRIVER_LABELS.get(driver, driver)
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``str(exc)``, or the exception's class name when that is empty —
+    an ``httpx.ConnectError`` for a refused connection stringifies to ``""``
+    and would otherwise leave the cause blank in the 502."""
+    return str(exc) or type(exc).__name__
 
 
 # ── Record endpoints ────────────────────────────────────────────────────────

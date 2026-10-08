@@ -536,6 +536,48 @@ async def _additive_push(
     )
 
 
+async def restore_zone_records_to_server(
+    db: AsyncSession, server: Any, driver: Any, zone: DNSZone
+) -> PushResult:
+    """Push ``zone``'s records back to one agentless ``server`` (#1613).
+
+    Used when a zone delete is rolled back on a server where the delete
+    had already succeeded: re-creating the zone there gives back an empty
+    zone, and an empty zone that answers is worse than either outcome the
+    operator asked for. So the records go back too, through the same
+    additive push Sync with Servers uses — the zone is read first and only
+    what is missing is sent, so whatever the provider created with the zone
+    (apex NS / SOA) is not pushed a second time.
+
+    A zone already in the trash (the purge sweep) carries records that were
+    soft-deleted with it; they are part of what the server was serving, so
+    those are restored rather than none. A record trashed separately before
+    the zone keeps its own batch and stays gone.
+
+    Never raises for a record-level failure: the caller reports what the
+    result says, which is the whole point of not claiming a clean rollback.
+    """
+    stmt = select(DNSRecord).where(DNSRecord.zone_id == zone.id)
+    if zone.deleted_at is not None and zone.deletion_batch_id is not None:
+        stmt = stmt.where(DNSRecord.deletion_batch_id == zone.deletion_batch_id).execution_options(
+            include_deleted=True
+        )
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    on_wire: list[RecordData] = []
+    if hasattr(driver, "pull_zone_records"):
+        try:
+            on_wire = await driver.pull_zone_records(server, zone.name, tsig=None)
+        except Exception as exc:  # noqa: BLE001 — push everything rather than nothing
+            logger.warning(
+                "dns.zone_restore_records_pull_failed",
+                zone=zone.name,
+                server=str(server.id),
+                error=str(exc) or type(exc).__name__,
+            )
+    return await _additive_push(db, server, driver, zone, on_wire, rows, apply=True)
+
+
 async def sync_zone_with_server(
     db: AsyncSession,
     zone: DNSZone,

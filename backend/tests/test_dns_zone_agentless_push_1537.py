@@ -142,3 +142,121 @@ async def test_full_success_pushes_every_enabled_server_once(
     await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
 
     assert sorted(fake_driver.calls) == [("first", "create"), ("second", "create")]
+
+
+# ── #1613 QA: a rolled-back delete restores the zone's records ─────────────
+
+
+class _RecordingDriver(_FakeDriver):
+    """``_FakeDriver`` plus the record half of a driver: reads the zone back
+    as empty (it was just re-created) and records every record push."""
+
+    def __init__(self, fail_on: set[str] | None = None, record_fail_on: set[str] | None = None):
+        super().__init__(fail_on)
+        self.record_fail_on = record_fail_on or set()
+        self.record_pushes: list[tuple[str, str, str, str]] = []
+
+    async def pull_zone_records(
+        self, server: DNSServer, zone_name: str, *, tsig=None
+    ):  # noqa: ANN001, ANN201
+        return []
+
+    async def apply_record_changes(self, server: DNSServer, changes):  # noqa: ANN001, ANN201
+        from app.drivers.dns.base import RecordChangeResult
+
+        results = []
+        for ch in changes:
+            self.record_pushes.append((server.name, ch.op, ch.record.name, ch.record.record_type))
+            if server.name in self.record_fail_on:
+                results.append(RecordChangeResult(ok=False, change=ch, error="quota exceeded"))
+            else:
+                results.append(RecordChangeResult(ok=True, change=ch))
+        return results
+
+
+async def _persisted_zone_with_records(db: AsyncSession, grp: DNSServerGroup) -> DNSZone:
+    from app.models.dns import DNSRecord
+
+    zone = DNSZone(name="example.com.", group_id=grp.id)
+    db.add(zone)
+    await db.flush()
+    db.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    db.add(DNSRecord(zone_id=zone.id, name="mail", record_type="A", value="10.0.0.2"))
+    await db.flush()
+    return zone
+
+
+@pytest.fixture
+def recording_driver(monkeypatch: pytest.MonkeyPatch) -> _RecordingDriver:
+    fake = _RecordingDriver()
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    return fake
+
+
+async def test_rolled_back_delete_restores_the_zones_records(
+    db_session: AsyncSession, recording_driver: _RecordingDriver
+) -> None:
+    """Re-creating the zone alone left the healthy server answering for an
+    EMPTY zone until someone ran Sync with Servers, while the 502 said the
+    delete had been rolled back."""
+    grp = await _group(db_session)
+    await _server(db_session, grp, "first")
+    await _server(db_session, grp, "second")
+    zone = await _persisted_zone_with_records(db_session, grp)
+    recording_driver.fail_on = {"second"}
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, zone, "delete")
+
+    assert ("first", "create") in recording_driver.calls
+    assert sorted(recording_driver.record_pushes) == [
+        ("first", "create", "mail", "A"),
+        ("first", "create", "www", "A"),
+    ]
+    assert "Rolled back on: first" in excinfo.value.detail
+    assert "could not all be restored" not in excinfo.value.detail
+
+
+async def test_record_restore_failure_is_reported_not_called_a_rollback(
+    db_session: AsyncSession, recording_driver: _RecordingDriver
+) -> None:
+    grp = await _group(db_session)
+    await _server(db_session, grp, "first")
+    await _server(db_session, grp, "second")
+    zone = await _persisted_zone_with_records(db_session, grp)
+    recording_driver.fail_on = {"second"}
+    recording_driver.record_fail_on = {"first"}
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, zone, "delete")
+
+    detail = excinfo.value.detail
+    assert "Rolled back on" not in detail
+    assert "Zone re-created on first" in detail
+    assert "quota exceeded" in detail
+    assert "Sync with Servers" in detail
+
+
+async def test_failure_names_the_actual_driver_and_a_non_empty_cause(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every agentless failure used to read "on Windows DNS", and an
+    exception with an empty str() (a refused httpx connection) left the
+    cause blank after the server name."""
+
+    class _Silent(_FakeDriver):
+        async def apply_zone_change(self, server: DNSServer, zone: DNSZone, op: str) -> None:
+            self.calls.append((server.name, op))
+            raise ConnectionRefusedError()
+
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: _Silent())
+    grp = await _group(db_session)
+    await _server(db_session, grp, "r53")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
+
+    detail = excinfo.value.detail
+    assert "Windows DNS" not in detail
+    assert "Route 53" in detail
+    assert "r53: ConnectionRefusedError" in detail

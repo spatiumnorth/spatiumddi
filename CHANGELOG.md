@@ -194,7 +194,16 @@ the formatter handles the rest.
   zone pushes went to disabled servers and reported success when
   only some servers applied; disabled servers are excluded from
   the push and a partial failure is compensated and surfaced
-  instead of acked. And the sync record-type filter is derived
+  instead of acked. Rolling back a delete (including a zone move's
+  delete from the source group) re-creates the zone **and pushes its
+  records back** on each server where the delete had succeeded —
+  re-creating the zone alone left that server answering for an empty
+  zone — and if a record cannot be restored the error says so and
+  points at Sync with Servers rather than reporting a clean rollback.
+  The error also names the system that refused (Technitium, Route 53,
+  …) instead of always saying "Windows DNS", and a refused Technitium
+  connection names its cause instead of ending at "request failed:".
+  And the sync record-type filter is derived
   from each driver's declared capabilities, so CAA records (and
   any other type a driver supports) are actually pulled and pushed
   instead of being filtered out by a hardcoded list.
