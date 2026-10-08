@@ -70,6 +70,7 @@ class ListKubernetesTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_kubernetes_targets",
+    permission=("read", "kubernetes_cluster"),
     module="integrations.kubernetes",
     description=(
         "List configured Kubernetes clusters that SpatiumDDI mirrors "
@@ -133,6 +134,7 @@ class ListDockerTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_docker_targets",
+    permission=("read", "docker_host"),
     module="integrations.docker",
     description=(
         "List configured Docker hosts that SpatiumDDI mirrors into "
@@ -195,6 +197,7 @@ class ListProxmoxTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_proxmox_targets",
+    permission=("read", "proxmox_node"),
     module="integrations.proxmox",
     description=(
         "List configured Proxmox VE endpoints that SpatiumDDI mirrors "
@@ -260,6 +263,7 @@ class ListTailscaleTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_tailscale_targets",
+    permission=("read", "tailscale_tenant"),
     module="integrations.tailscale",
     description=(
         "List configured Tailscale tenants (tailnets) that SpatiumDDI "
@@ -317,6 +321,7 @@ class ListNetbirdTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_netbird_targets",
+    permission=("read", "netbird_instance"),
     module="integrations.netbird",
     description=(
         "List configured NetBird instances (mesh deployments) that "
@@ -374,6 +379,7 @@ class ListUnifiTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_unifi_targets",
+    permission=("read", "unifi_controller"),
     module="integrations.unifi",
     description=(
         "List configured UniFi controllers that SpatiumDDI mirrors "
@@ -455,6 +461,7 @@ class ListCloudTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_cloud_targets",
+    permission=("read", "cloud_endpoint"),
     module="integrations.cloud",
     description=(
         "List configured public-cloud accounts (AWS / Azure / GCP) that "
@@ -523,6 +530,7 @@ class ListOPNsenseTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_opnsense_targets",
+    permission=("read", "opnsense_router"),
     module="integrations.opnsense",
     description=(
         "List configured OPNsense firewalls that SpatiumDDI mirrors "
@@ -584,6 +592,7 @@ class ListPanosTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_panos_targets",
+    permission=("read", "panos_firewall"),
     module="integrations.paloalto",
     description=(
         "List configured Palo Alto PAN-OS / Panorama firewalls that "
@@ -685,6 +694,7 @@ _SOURCE_KIND_COL = {
 
 @register_tool(
     name="find_firewall_objects",
+    permission=("read", ("panos_firewall", "fortinet_firewall", "meraki_org")),
     description=(
         "List mirrored firewall address objects / groups from every configured "
         "firewall vendor (Palo Alto #605, Fortinet + Meraki #606) — the 'shadow "
@@ -760,6 +770,7 @@ class CountFirewallObjectsArgs(BaseModel):
 
 @register_tool(
     name="count_firewall_objects",
+    permission=("read", ("panos_firewall", "fortinet_firewall", "meraki_org")),
     description=(
         "Count mirrored firewall address objects across every vendor (Palo Alto "
         "#605, Fortinet + Meraki #606) grouped by kind, plus the number that "
@@ -813,6 +824,7 @@ class ListFortinetTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_fortinet_targets",
+    permission=("read", "fortinet_firewall"),
     module="integrations.fortinet",
     description=(
         "List configured Fortinet FortiGate firewalls that SpatiumDDI mirrors "
@@ -871,6 +883,7 @@ class ListMerakiTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_meraki_targets",
+    permission=("read", "meraki_org"),
     module="integrations.meraki",
     description=(
         "List configured Cisco Meraki organizations that SpatiumDDI mirrors into "
@@ -926,6 +939,7 @@ class ListFirewallFeedsArgs(BaseModel):
 
 @register_tool(
     name="list_firewall_feeds",
+    permission=("read", "firewall_feed"),
     module="security.firewall_feeds",
     description=(
         "List SpatiumDDI-hosted firewall block-list feeds (#606). A feed-polling "

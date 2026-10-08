@@ -39,7 +39,8 @@ from app.models.network import NetworkDevice
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
-from app.services.ai.tools.base import register_tool
+from app.services.ai.tools.base import register_tool, tool_permission_allows
+from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -96,6 +97,7 @@ class ListSpacesArgs(BaseModel):
 
 @register_tool(
     name="list_ip_spaces",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "List IP spaces (top-level routing domains / VRFs). "
         "Returns each space's id, name, description, default flag, "
@@ -116,6 +118,11 @@ async def list_ip_spaces(
                 func.lower(IPSpace.description).like(like),
             )
         )
+    # A subnet-bound API token sees only the space(s) parenting its subnet(s),
+    # as on the REST list (#523).
+    scoped = token_subnet_ids(user)
+    if scoped is not None:
+        stmt = stmt.where(IPSpace.id.in_(select(Subnet.space_id).where(Subnet.id.in_(scoped))))
     stmt = stmt.order_by(IPSpace.name.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [
@@ -150,6 +157,7 @@ class ListBlocksArgs(BaseModel):
 
 @register_tool(
     name="list_ip_blocks",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "List IP blocks (aggregate / supernet ranges). Each block "
         "summary includes its CIDR, name, parent block, space, and "
@@ -176,6 +184,15 @@ async def list_ip_blocks(
             or_(
                 func.lower(IPBlock.name).like(like),
                 func.text(IPBlock.network).like(like),
+            )
+        )
+    scoped = token_subnet_ids(user)
+    if scoped is not None:
+        stmt = stmt.where(
+            IPBlock.id.in_(
+                select(Subnet.block_id)
+                .where(Subnet.id.in_(scoped))
+                .where(Subnet.block_id.isnot(None))
             )
         )
     stmt = stmt.order_by(IPBlock.network.asc()).limit(args.limit)
@@ -222,6 +239,7 @@ class ListSubnetsArgs(BaseModel):
 
 @register_tool(
     name="list_subnets",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "List subnets — the routable units that own IP addresses. "
         "Use this tool whenever the operator names a subnet by CIDR "
@@ -265,6 +283,9 @@ async def list_subnets(
                 func.text(Subnet.network).like(like),
             )
         )
+    scoped = token_subnet_ids(user)
+    if scoped is not None:
+        stmt = stmt.where(Subnet.id.in_(scoped))
     stmt = stmt.order_by(Subnet.network.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
     return [
@@ -308,6 +329,7 @@ class FindSubnetsDecommissioningArgs(BaseModel):
 
 @register_tool(
     name="find_subnets_decommissioning",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "List subnets with a planned decommission date (issue #46) "
         "falling within the next N days (default 30) — plus any that "
@@ -338,6 +360,9 @@ async def find_subnets_decommissioning(
         .order_by(Subnet.decom_date.asc())
         .limit(args.limit)
     )
+    scoped = token_subnet_ids(user)
+    if scoped is not None:
+        stmt = stmt.where(Subnet.id.in_(scoped))
     rows = (await db.execute(stmt)).scalars().all()
     return [
         {
@@ -363,6 +388,7 @@ class SubnetSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_subnet_summary",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Detailed summary for one subnet: status counts (allocated, "
         "free, reserved, dhcp, etc.), gateway, VLAN, recent allocation "
@@ -376,7 +402,7 @@ async def get_subnet_summary(
     db: AsyncSession, user: User, args: SubnetSummaryArgs
 ) -> dict[str, Any]:
     subnet = await db.get(Subnet, args.subnet_id)
-    if subnet is None or subnet.deleted_at is not None:
+    if subnet is None or subnet.deleted_at is not None or not token_allows_subnet(user, subnet.id):
         return {"error": "subnet not found", "subnet_id": args.subnet_id}
     counts_stmt = (
         select(IPAddress.status, func.count(IPAddress.id))
@@ -423,6 +449,7 @@ class SubnetReconciliationArgs(BaseModel):
 
 @register_tool(
     name="find_subnet_reconciliation",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "IP-discovery reconciliation for one subnet (issue #23): which "
         "allocated IPs aren't answering on the wire, which live IPs were "
@@ -446,7 +473,7 @@ async def find_subnet_reconciliation(
     except (ValueError, TypeError):
         return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
     subnet = await db.get(Subnet, subnet_uuid)
-    if subnet is None or subnet.deleted_at is not None:
+    if subnet is None or subnet.deleted_at is not None or not token_allows_subnet(user, subnet.id):
         return {"error": "subnet not found", "subnet_id": args.subnet_id}
     stale = max(1, min(args.stale_minutes, 525600))
     return await build_reconciliation_report(db, subnet, stale_minutes=stale)
@@ -465,6 +492,7 @@ class SubnetUtilizationTrendArgs(BaseModel):
 
 @register_tool(
     name="get_subnet_utilization_trend",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Daily IP-utilization history for one subnet (issue #44): a "
         "time-ordered series of allocated / total / percent snapshots plus "
@@ -485,7 +513,7 @@ async def get_subnet_utilization_trend(
     except (ValueError, TypeError):
         return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
     subnet = await db.get(Subnet, subnet_uuid)
-    if subnet is None or subnet.deleted_at is not None:
+    if subnet is None or subnet.deleted_at is not None or not token_allows_subnet(user, subnet.id):
         return {"error": "subnet not found", "subnet_id": args.subnet_id}
     days = max(1, min(args.days, 365))
     cutoff = datetime.now(UTC) - timedelta(days=days)
@@ -553,6 +581,7 @@ class FindStaleIPsArgs(BaseModel):
 
 @register_tool(
     name="find_stale_ips",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Address-space hygiene report (issue #45): allocated IPs that "
         "nothing has seen on the wire in N days (default 90), drawn from "
@@ -580,6 +609,12 @@ async def find_stale_ips(db: AsyncSession, user: User, args: FindStaleIPsArgs) -
             subnet_uuid = uuid.UUID(args.subnet_id)
         except (ValueError, TypeError):
             return {"error": "subnet_id must be a UUID", "subnet_id": args.subnet_id}
+    # The report builder takes one subnet, not a set — so a subnet-bound
+    # API token must name one of its subnets rather than see the estate.
+    if token_subnet_ids(user) is not None and (
+        subnet_uuid is None or not token_allows_subnet(user, subnet_uuid)
+    ):
+        return {"error": "this API token is scoped to specific subnets; pass one as subnet_id"}
     return await build_stale_ip_report(
         db,
         stale_days=max(1, min(args.stale_days, 3650)),
@@ -604,6 +639,7 @@ class FindIPArgs(BaseModel):
 
 @register_tool(
     name="find_ip",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Look up a single IP address by its dotted-decimal value "
         "(e.g. ``192.168.0.4``) and return its full row: hostname, "
@@ -625,7 +661,11 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
     stmt = select(IPAddress).where(
         func.host(IPAddress.address) == func.host(cast(literal(args.address), INET))
     )
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = [
+        ip
+        for ip in (await db.execute(stmt)).scalars().all()
+        if token_allows_subnet(user, ip.subnet_id)
+    ]
     if not rows:
         return {"matches": []}
     # OUI vendor enrichment — bulk_lookup_vendors short-circuits to {}
@@ -689,6 +729,7 @@ class FindIPAddressesArgs(BaseModel):
 
 @register_tool(
     name="find_ip_addresses",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Search IP addresses ACROSS every subnet by substring (``q``), "
         "hostname, MAC or status — the cross-subnet companion to ``find_ip`` "
@@ -944,6 +985,29 @@ _TAG_KIND_TABLE: dict[str, tuple[type, bool, Any]] = {
 
 _TAG_KIND_DEFAULT = ["subnet", "ip_block", "ip_address", "ip_space"]
 
+# The read permission each tag kind needs — the gate on that kind's own REST
+# route. ``find_by_tag`` itself only requires an IPAM read, so the extended
+# kinds are checked one by one and a kind the caller can't read is skipped.
+_IPAM_TYPES = ("ip_space", "ip_block", "subnet", "ip_address")
+_DNS_TYPES = ("dns_group", "dns_zone", "dns_record")
+_TAG_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ip_space": ("read", _IPAM_TYPES),
+    "ip_block": ("read", _IPAM_TYPES),
+    "subnet": ("read", _IPAM_TYPES),
+    "ip_address": ("read", _IPAM_TYPES),
+    "asn": ("read", ("manage_asns",)),
+    "vrf": ("read", ("vrf",)),
+    "network_device": ("read", ("manage_network_devices",)),
+    "domain": ("read", ("manage_domains",)),
+    "circuit": ("read", ("circuit",)),
+    "network_service": ("read", ("network_service",)),
+    "overlay_network": ("read", ("overlay_network",)),
+    "dns_zone": ("read", _DNS_TYPES),
+    "dns_record": ("read", _DNS_TYPES),
+    "dhcp_scope": ("read", ("dhcp_scope",)),
+    "dhcp_static_assignment": ("read", ("dhcp_static",)),
+}
+
 
 class FindByTagArgs(BaseModel):
     key: str = Field(description="Tag key — case-sensitive.")
@@ -969,6 +1033,7 @@ class FindByTagArgs(BaseModel):
 
 @register_tool(
     name="find_by_tag",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Find tagged resources across IPAM, network modeling, DNS / "
         "DHCP scopes, etc. — every resource type that carries a "
@@ -996,6 +1061,10 @@ async def find_by_tag(db: AsyncSession, user: User, args: FindByTagArgs) -> dict
                 {"error": f"unknown resource kind {kind!r}; recognised: {sorted(_TAG_KIND_TABLE)}"}
             ]
             continue
+        perm = _TAG_KIND_PERMISSION.get(kind)
+        if perm is None or not tool_permission_allows(user, perm):
+            out[kind] = [{"error": f"permission denied for resource kind {kind!r}"}]
+            continue
         model, has_soft_delete, render = entry
         # ``model`` carries ``type`` from the dispatch table, which mypy
         # can't tighten into a ``Select[Any]`` for a generic select
@@ -1004,6 +1073,19 @@ async def find_by_tag(db: AsyncSession, user: User, args: FindByTagArgs) -> dict
         if has_soft_delete:
             stmt = stmt.where(model.deleted_at.is_(None))
         stmt = apply_tag_filter(stmt, model.tags, [tag_param])
+        # Resource-scoped API tokens see only their bound subnets / zones.
+        if kind == "subnet" and (scoped := token_subnet_ids(user)) is not None:
+            stmt = stmt.where(model.id.in_(scoped))
+        elif kind == "ip_space" and (scoped := token_subnet_ids(user)) is not None:
+            stmt = stmt.where(model.id.in_(select(Subnet.space_id).where(Subnet.id.in_(scoped))))
+        elif kind == "ip_block" and (scoped := token_subnet_ids(user)) is not None:
+            stmt = stmt.where(model.id.in_(select(Subnet.block_id).where(Subnet.id.in_(scoped))))
+        elif kind == "ip_address" and (scoped := token_subnet_ids(user)) is not None:
+            stmt = stmt.where(model.subnet_id.in_(scoped))
+        elif kind == "dns_zone" and (zones := token_zone_ids(user)) is not None:
+            stmt = stmt.where(model.id.in_(zones))
+        elif kind == "dns_record" and (zones := token_zone_ids(user)) is not None:
+            stmt = stmt.where(model.zone_id.in_(zones))
         stmt = stmt.limit(args.limit_per_kind)
         rows = (await db.execute(stmt)).scalars().all()
         out[kind] = [render(r) for r in rows]
@@ -1019,6 +1101,7 @@ class CountResourcesArgs(BaseModel):
 
 @register_tool(
     name="count_ipam_resources",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Total counts of IPAM resources — spaces, blocks, subnets, IP "
         "addresses, plus a breakdown of IP addresses by status. "
@@ -1068,6 +1151,7 @@ class FindAddressSetsArgs(BaseModel):
 
 @register_tool(
     name="find_address_sets",
+    permission=("read", ("address_set", "subnet")),
     description=(
         "List address sets — named, RBAC-scoped slices of a subnet's "
         "address space (a contiguous range like .50–.99 or an explicit "
@@ -1120,6 +1204,7 @@ class CountAddressSetsArgs(BaseModel):
 
 @register_tool(
     name="count_address_sets",
+    permission=("read", ("address_set", "subnet")),
     description=(
         "Total count of address sets plus a breakdown by range kind "
         "(contiguous vs explicit). Use to answer 'how many address sets "
@@ -1175,6 +1260,7 @@ class FindIPHygieneFindingsArgs(BaseModel):
 
 @register_tool(
     name="find_ip_hygiene_findings",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Fleet-wide IPAM hygiene findings (issue #369), in three buckets: "
         "'free_but_responding' (IPs marked available that answered on the "
