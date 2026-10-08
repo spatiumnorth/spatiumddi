@@ -973,3 +973,109 @@ async def test_group_drivers_track_a_move(client: AsyncClient, db_session: Async
     by_name = {g["name"]: g["server_drivers"] for g in listing.json()}
     assert by_name["src"] == []
     assert by_name["dst"] == ["bind9"]
+
+
+# ── #1565: Fleet's group change moves the appliance's own servers ─────────────
+
+
+async def _fleet_appliance(db: AsyncSession, group: DNSServerGroup, **kw: object):  # noqa: ANN202
+    from app.models.appliance import Appliance
+
+    appliance = Appliance(
+        hostname=f"ddi-{uuid.uuid4().hex[:6]}",
+        public_key_der=b"\x00" * 32,
+        public_key_fingerprint=f"fp-{uuid.uuid4().hex}",
+        state="approved",
+        assigned_roles=["dns-bind9"],
+        assigned_dns_group_id=group.id,
+        **kw,
+    )
+    db.add(appliance)
+    await db.flush()
+    return appliance
+
+
+def _roles_url(appliance_id: uuid.UUID) -> str:
+    return f"/api/v1/appliance/appliances/{appliance_id}/roles"
+
+
+@pytest.mark.asyncio
+async def test_fleet_group_change_moves_the_appliances_dns_server(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The pointer used to move alone: env and firewall followed the new
+    group while the registered server kept serving the old one."""
+    token = await _superadmin(db_session, "root1565a")
+    default = await _group(db_session, "default")
+    target = await _group(db_session, "internal")
+    appliance = await _fleet_appliance(db_session, default)
+    srv = await _server(db_session, default, "ns1", appliance_id=appliance.id)
+    await db_session.commit()
+
+    resp = await client.put(
+        _roles_url(appliance.id), json={"dns_group_id": str(target.id)}, headers=_auth(token)
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(srv)
+    await db_session.refresh(appliance)
+    assert srv.group_id == target.id
+    assert appliance.assigned_dns_group_id == target.id
+
+
+@pytest.mark.asyncio
+async def test_fleet_group_change_refused_when_the_move_is(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _superadmin(db_session, "root1565b")
+    default = await _group(db_session, "default")
+    target = await _group(db_session, "internal")
+    appliance = await _fleet_appliance(db_session, default)
+    srv = await _server(db_session, default, "ns1", appliance_id=appliance.id)
+    await _server(db_session, target, "ns1")  # name clash in the target
+    await db_session.commit()
+
+    resp = await client.put(
+        _roles_url(appliance.id), json={"dns_group_id": str(target.id)}, headers=_auth(token)
+    )
+    assert resp.status_code == 409, resp.text
+    assert "ns1" in resp.text
+
+    await db_session.refresh(srv)
+    await db_session.refresh(appliance)
+    assert srv.group_id == default.id
+    assert appliance.assigned_dns_group_id == default.id
+
+
+@pytest.mark.asyncio
+async def test_fleet_dhcp_group_change_moves_the_appliances_dhcp_server(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.dhcp import DHCPServer, DHCPServerGroup
+
+    token = await _superadmin(db_session, "root1565c")
+    dns_default = await _group(db_session, "default")
+    old = DHCPServerGroup(name=f"d-{uuid.uuid4().hex[:6]}")
+    new = DHCPServerGroup(name=f"d-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([old, new])
+    await db_session.flush()
+    appliance = await _fleet_appliance(db_session, dns_default, assigned_dhcp_group_id=old.id)
+    dsrv = DHCPServer(
+        name=f"k-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="127.0.0.1",
+        server_group_id=old.id,
+        appliance_id=appliance.id,
+    )
+    db_session.add(dsrv)
+    await db_session.commit()
+
+    resp = await client.put(
+        _roles_url(appliance.id), json={"dhcp_group_id": str(new.id)}, headers=_auth(token)
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(dsrv)
+    await db_session.refresh(appliance)
+    assert dsrv.server_group_id == new.id
+    assert appliance.assigned_dhcp_group_id == new.id
