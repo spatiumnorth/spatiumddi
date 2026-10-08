@@ -48,7 +48,10 @@ spec:
           # if your CNI can proxy UDP/67 use a plain ClusterIP + relay instead.
           env:
             - name: SPATIUM_API_URL
-              value: http://spatiumddi-api.spatiumddi.svc.cluster.local:8000
+              # The API Service is named `api` (k8s/base/api.yaml);
+              # trailing dot for the hostNetwork search-domain reason
+              # in k8s/dns/bind9-statefulset.yaml (#777).
+              value: http://api.spatiumddi.svc.cluster.local.:8000
             - name: SPATIUM_SERVER_NAME
               valueFrom:
                 fieldRef:
@@ -77,8 +80,18 @@ spec:
               mountPath: /var/lib/spatium-dhcp-agent
             - name: kea-state
               mountPath: /var/lib/kea
+          # #1589 — readiness must mean "Kea is up", independent of HA.
+          # TCP 8000 is the Kea HA hook's peer listener: a standalone
+          # server never binds it, so a tcpSocket probe on 8000 kept a
+          # healthy standalone pod out of the Service endpoints forever.
+          # Probe the Kea control socket instead — the same check the
+          # image's HEALTHCHECK runs (either family counts).
           readinessProbe:
-            tcpSocket: { port: 8000 }
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -S /run/kea/kea4-ctrl-socket || test -S /run/kea/kea6-ctrl-socket"
             initialDelaySeconds: 5
             periodSeconds: 10
   volumeClaimTemplates:

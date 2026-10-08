@@ -21,6 +21,7 @@ import {
   type SiteRead,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { poolHealthCheckFields } from "@/lib/formPayloads";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -425,11 +426,9 @@ export function PoolModal({
         ttl,
         enabled,
         hc_type: hcType,
-        hc_target_port:
-          hcType === "none" || hcType === "icmp" ? null : hcPort || null,
         hc_path: hcPath,
         hc_method: hcMethod,
-        hc_verify_tls: hcType === "https" ? hcVerifyTls : false,
+        ...poolHealthCheckFields({ hcType, hcPort, hcVerifyTls }, editing),
         hc_expected_status_codes:
           codes.length > 0 ? codes : [200, 201, 202, 204, 301, 302, 304],
         hc_interval_seconds: hcInterval,
