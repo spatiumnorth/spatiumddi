@@ -37,8 +37,10 @@ const SETUP_KEY = `# Generate a UniFi Network API key:
 # 2. Click "Create API Key"
 # 3. Name it "spatiumddi" with an expiry that matches your rotation
 #    window. The key inherits your admin's permissions on the
-#    controller; SpatiumDDI never writes back, so a read-only role
-#    is the correct choice when your UniFi version supports it.
+#    controller. The mirror only reads, so a read-only role is the
+#    correct choice for this key when your UniFi version supports
+#    it. Active block sync, if you arm it for this controller,
+#    writes with its own credentials, entered on the Block Sync page.
 # 4. Copy the printed value. The key only displays once.
 #
 # Cloud-hosted controllers (UniFi Site Manager): generate at
@@ -106,12 +108,14 @@ export function UnifiPage() {
               </span>
             </div>
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-              Read-only integration. Each controller is polled via the UniFi
-              REST API; networks, VLANs, active clients, and DHCP fixed-IP
-              reservations are mirrored into IPAM. Local controllers connect
-              directly; cloud controllers proxy through{" "}
-              <code className="font-mono">api.ui.com</code>. SpatiumDDI never
-              writes to UniFi.
+              Each controller is polled via the UniFi REST API; networks, VLANs,
+              active clients, and DHCP fixed-IP reservations are mirrored into
+              IPAM. Local controllers connect directly; cloud controllers proxy
+              through <code className="font-mono">api.ui.com</code>. The mirror
+              only reads. SpatiumDDI writes to a controller only when Active
+              block sync is armed on it (Tools → Block Sync): it then pushes
+              client blocks (L2 quarantine) with the separate write credentials
+              entered there.
             </p>
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
