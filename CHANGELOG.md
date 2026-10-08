@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A server group an appliance cannot carry is refused instead of
+  silently dropped (#1468).** The supervisor writes the assigned DNS or
+  DHCP group's name into the role env and accepts only letters, digits,
+  `.`, `_` and `-`. Anything else, such as a group created in the UI as
+  `UniFi DHCP migration`, was dropped with a warning on every heartbeat,
+  so the agent registered without its group and a fresh server landed in
+  the default group. Assigning such a group to an appliance role (REST
+  and Copilot), or renaming an assigned group to such a name, is now a
+  422 that suggests a valid name. Groups no appliance uses keep free-text
+  names, and re-saving an existing name is still accepted.
+
 - **DHCP clients renew at half the lease time instead of every 15
   minutes (#1259).** The agent rendered a fixed `renew-timer: 900` /
   `rebind-timer: 1800` into both Kea daemons, whatever the lease time, so

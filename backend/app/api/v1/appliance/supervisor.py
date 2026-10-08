@@ -112,6 +112,7 @@ from app.services.appliance.ca import (
     verify_session_token,
 )
 from app.services.appliance.firewall import firewall_bundle
+from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.network_mtu import (
     evaluate_node as evaluate_node_mtu,
@@ -4147,6 +4148,10 @@ async def update_appliance_roles(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"DNS server group {body.dns_group_id} not found.",
             )
+        # #1468 — the supervisor drops a name it won't put in the role env.
+        problem = group_name_problem("dns", dns_group.name)
+        if problem is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
         row.assigned_dns_group_id = dns_group.id
     if body.dhcp_group_id is not None:
         from app.models.dhcp import DHCPServerGroup
@@ -4157,6 +4162,9 @@ async def update_appliance_roles(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"DHCP server group {body.dhcp_group_id} not found.",
             )
+        problem = group_name_problem("dhcp", dhcp_group.name)
+        if problem is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
         row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
