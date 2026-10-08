@@ -61,6 +61,7 @@ class ListASNsArgs(BaseModel):
 
 @register_tool(
     name="list_asns",
+    permission=("read", "manage_asns"),
     module="network.asn",
     description=(
         "List Autonomous Systems tracked in SpatiumDDI. Use for "
@@ -122,6 +123,7 @@ class GetASNArgs(BaseModel):
 
 @register_tool(
     name="get_asn",
+    permission=("read", "manage_asns"),
     module="network.asn",
     description=(
         "Return full detail for one AS: number, name, holder_org, "
@@ -202,6 +204,7 @@ class ListDomainsArgs(BaseModel):
 
 @register_tool(
     name="list_domains",
+    permission=("read", "manage_domains"),
     description=(
         "List domain-registration rows. Distinct from DNS zones — "
         "this is the *registry* side of a name (registrar, expiry, "
@@ -273,6 +276,7 @@ class ListVRFsArgs(BaseModel):
 
 @register_tool(
     name="list_vrfs",
+    permission=("read", "vrf"),
     module="network.vrf",
     description=(
         "List VRFs (virtual routing/forwarding domains). Each row "
@@ -362,6 +366,7 @@ class ListCircuitsArgs(BaseModel):
 
 @register_tool(
     name="list_circuits",
+    permission=("read", "circuit"),
     module="network.circuit",
     description=(
         "List WAN circuits — carrier-supplied logical pipes. Each row "
@@ -446,6 +451,7 @@ class ListNetworkServicesArgs(BaseModel):
 
 @register_tool(
     name="list_network_services",
+    permission=("read", "network_service"),
     module="network.service",
     description=(
         "List service-catalog rows (issue #94). A NetworkService "
@@ -513,6 +519,7 @@ class GetServiceSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_network_service_summary",
+    permission=("read", "network_service"),
     module="network.service",
     description=(
         "Full detail of a NetworkService: every attached resource by "
@@ -584,6 +591,7 @@ class ListOverlayNetworksArgs(BaseModel):
 
 @register_tool(
     name="list_overlay_networks",
+    permission=("read", "overlay_network"),
     module="network.overlay",
     description=(
         "List SD-WAN / IPsec / WireGuard / DMVPN / VXLAN / GRE "
@@ -656,6 +664,7 @@ class GetOverlayTopologyArgs(BaseModel):
 
 @register_tool(
     name="get_overlay_topology",
+    permission=("read", "overlay_network"),
     module="network.overlay",
     description=(
         "Return the membership + policy detail of one overlay "
@@ -749,6 +758,7 @@ class ListAppCategoriesArgs(BaseModel):
 
 @register_tool(
     name="list_application_categories",
+    permission=("read", "application_category"),
     module="network.overlay",
     description=(
         "List the SaaS application catalog used by overlay routing "
@@ -800,6 +810,7 @@ class TraceCircuitImpactArgs(BaseModel):
 
 @register_tool(
     name="trace_circuit_impact",
+    permission=("read", "circuit"),
     module="network.circuit",
     description=(
         "Walk every overlay site whose preferred-circuit chain references "
