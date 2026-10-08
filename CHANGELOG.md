@@ -197,7 +197,11 @@ the formatter handles the rest.
   the UI's "clear" silently did nothing — it now clears: DHCP pool,
   static and phone-profile fields, DNS group/server/view/zone/record
   fields, blocklist `feed_url`/`sinkhole_ip`, blocklist-entry
-  target, and pool `hc_target_port`.
+  target, and pool `hc_target_port`. The edit forms now omit fields
+  hidden for the current mode (blocklist feed URL / sinkhole IP, pool
+  health-check port, a v4 static's DUID, a cloud server's API port, a
+  non-select custom field's options), so an untouched edit cannot
+  clear them.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

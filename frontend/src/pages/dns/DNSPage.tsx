@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
+import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -1375,7 +1376,9 @@ function ServerModal({
       // addressed via the stored cloud credentials, not host:port.
       host: cloud ? driver : host,
       port: cloud ? 443 : parseInt(port, 10),
-      api_port: cloud ? null : apiPort ? parseInt(apiPort, 10) : null,
+      // Hidden for cloud + technitium_api: omitted on edit so the stored
+      // value survives (#1596 reads an explicit null as "clear").
+      ...serverApiPortField({ driver, cloud, apiPort }, editing),
       roles: roleList,
       notes,
       is_enabled: isEnabled,
@@ -9596,19 +9599,24 @@ function BlocklistModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate({
-            name,
-            description,
-            category,
-            source_type: sourceType,
-            feed_url: sourceType === "url" ? feedUrl || null : null,
-            feed_format: feedFormat,
-            block_mode: blockMode,
-            sinkhole_ip: blockMode === "sinkhole" ? sinkholeIp || null : null,
-            update_interval_hours: updateHours,
-            feed_entries_are_wildcard: feedWildcard,
-            enabled,
-          });
+          mut.mutate(
+            blocklistPayload(
+              {
+                name,
+                description,
+                category,
+                sourceType,
+                feedUrl,
+                feedFormat,
+                blockMode,
+                sinkholeIp,
+                updateHours,
+                feedWildcard,
+                enabled,
+              },
+              !!list,
+            ),
+          );
         }}
       >
         <Field label="Name">
