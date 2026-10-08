@@ -487,8 +487,9 @@ class SyncLoop:
     def _report_refused_zones(self, etag: str | None) -> bool:
         """Report an apply that landed with some zones refused. True if so.
 
-        PowerDNS takes zones one at a time, so it can accept most of a bundle
-        and refuse a few zones' data (see ``DriverBase.refused_zones``). That
+        PowerDNS takes zones one at a time, and Technitium records one at a
+        time, so either can accept most of a bundle and refuse a few zones'
+        data or individual records (see ``DriverBase.refused_zones``). That
         is neither ``ok`` — those zones are not served — nor a reason to
         revert: re-applying the last-known-good cannot make the daemon accept
         data it refused, and it would undo the zones it did accept.
@@ -499,8 +500,8 @@ class SyncLoop:
         everything the operator saved" — is the honest one here, and whose
         severity (warning) and ``agent_config_rejected`` alert fit. Unlike a
         real revert, ``etag`` is the NEW bundle (it is live) and so is
-        ``failed_etag``; the error names each refused zone with the daemon's
-        own reason.
+        ``failed_etag``; the error names each refused zone (or record) with
+        the daemon's own reason.
         """
         fn = getattr(self.driver, "refused_zones", None)
         refused = [str(z) for z in (fn() if callable(fn) else [])]
@@ -508,8 +509,8 @@ class SyncLoop:
             self._zones_refused = False
             return False
         error = truncate_error(
-            f"{PARTIAL_APPLY_PREFIX}the daemon refused {len(refused)} zone(s); "
-            "every other zone is served: " + "; ".join(refused)
+            f"{PARTIAL_APPLY_PREFIX}the daemon refused {len(refused)} item(s); "
+            "everything else is served: " + "; ".join(refused)
         )
         self._zones_refused = True
         self.apply_status = ApplyStatus(

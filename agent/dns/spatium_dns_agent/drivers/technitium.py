@@ -838,13 +838,17 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
 
-    # Per-apply failure collector (#1516). ``swap_and_reload`` installs a
-    # list here; the log-and-continue helpers below append every refused
-    # step to it, and ``swap_and_reload`` raises at the end if it is
-    # non-empty, so a partly refused apply engages the #882 quarantine /
-    # revert machinery instead of being reported as success. ``None``
-    # outside an apply (record ops, direct helper calls) means "log
-    # only", preserving the helpers' standalone behaviour.
+    # Per-apply refusal collector (#1516). ``swap_and_reload`` installs a
+    # list here; the log-and-continue helpers below append every step the
+    # daemon refused, and ``swap_and_reload`` hands the list to
+    # ``refused_zones()`` (#1280's partial apply). The apply still lands:
+    # the sync loop reports the refusals, commits the bundle and keeps
+    # draining record ops, instead of quarantining the whole bundle and
+    # holding back every later change behind the one refused record. A
+    # transport / auth failure is not a refusal — ``_call`` raises those,
+    # which fails the apply as before. ``None`` outside an apply (record
+    # ops, direct helper calls) means "log only", preserving the helpers'
+    # standalone behaviour.
     _apply_failures: list[str] | None = None
 
     def _note_apply_failure(self, what: str) -> None:
@@ -1027,7 +1031,8 @@ class TechnitiumDriver(DriverBase):
             # the sync loop advanced the etag, reported the serials as
             # served and committed the bundle as last-known-good with
             # nothing applied at all. Raise so the #882 quarantine /
-            # revert path engages and the bundle is retried.
+            # revert path engages and the bundle is retried — this is our
+            # own state failing, not the daemon refusing data.
             raise RuntimeError(f"technitium zones.json unreadable: {exc}") from exc
 
         token = self._get_api_token()
@@ -1041,8 +1046,9 @@ class TechnitiumDriver(DriverBase):
         # refused transfer. Push the keys before anything references them.
         #
         # Every step below still runs even when an earlier one is refused
-        # (#1516): attempt everything, collect the refusals, and raise at
-        # the end so the apply as a whole is not reported as success.
+        # (#1516): attempt everything, collect the refusals, and report
+        # them through ``refused_zones()`` so the apply reads as a partial
+        # one rather than as success (#1280's model).
         self._apply_failures = []
         try:
             server_path = current / "server.json"
@@ -1053,8 +1059,11 @@ class TechnitiumDriver(DriverBase):
                     server_state = json.loads(server_path.read_text())
                     server_state_known = True
                 except ValueError as exc:
+                    # Our own render, unreadable: the TSIG / transport /
+                    # blocking state is unknown rather than refused, so this
+                    # fails the apply outright.
                     log.error("technitium_server_payload_unreadable", error=str(exc))
-                    self._note_apply_failure(f"server.json unreadable: {exc}")
+                    raise RuntimeError(f"technitium server.json unreadable: {exc}") from exc
             # #1517: unconditional whenever server.json was readable —
             # an emptied key list is a real desired state and the callee
             # clears every key on the daemon. Only an unreadable (or
@@ -1081,12 +1090,15 @@ class TechnitiumDriver(DriverBase):
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None
+        # Partial apply, not a failure (#1280): every step the daemon took is
+        # live, and re-applying this bundle or the last-known-good cannot make
+        # it accept what it just refused — the QA walk of #1608 showed a
+        # raise here quarantining the bundle, holding back every later change
+        # to the group, and the revert deleting records it had just added.
+        self._refused_zones = tuple(failures)
         if failures:
-            raise RuntimeError(
-                "technitium apply partly refused ("
-                + "; ".join(failures[:10])
-                + (f"; +{len(failures) - 10} more" if len(failures) > 10 else "")
-                + ")"
+            log.warning(
+                "technitium_apply_partly_refused", count=len(failures), refused=failures[:10]
             )
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
@@ -1506,7 +1518,8 @@ class TechnitiumDriver(DriverBase):
                         error=imported.get("errorMessage"),
                     )
                     self._note_apply_failure(
-                        f"blocking {kind} add {domain}: {added.get('errorMessage')}"
+                        f"blocking {kind} import ({len(chunk)} from {chunk[0]}): "
+                        f"{imported.get('errorMessage')}"
                     )
         log.info(
             "technitium_blocking_applied",
@@ -1961,7 +1974,7 @@ class TechnitiumDriver(DriverBase):
                             error=body.get("errorMessage"),
                         )
                         self._note_apply_failure(
-                            f"record delete {zone}/{rec.get('domain')}: "
+                            f"{zone}: record delete {rec.get('domain')} {rec.get('type')}: "
                             f"{body.get('errorMessage')}"
                         )
                 else:
@@ -1987,7 +2000,7 @@ class TechnitiumDriver(DriverBase):
                             error=body.get("errorMessage"),
                         )
                         self._note_apply_failure(
-                            f"record add {zone}/{rec.get('domain')}: "
+                            f"{zone}: record add {rec.get('domain')} {rec.get('type')}: "
                             f"{body.get('errorMessage')}"
                         )
                     continue
@@ -2178,7 +2191,7 @@ class TechnitiumDriver(DriverBase):
                 error=body.get("errorMessage"),
             )
             self._note_apply_failure(
-                f"zone create {zone}: {body.get('errorMessage')}"
+                f"{zone}: zone create: {body.get('errorMessage')}"
             )
 
     def _reapply_zone_upstream(
@@ -2201,7 +2214,7 @@ class TechnitiumDriver(DriverBase):
                 error=body.get("errorMessage"),
             )
             self._note_apply_failure(
-                f"zone upstream {zone}: {body.get('errorMessage')}"
+                f"{zone}: zone upstream: {body.get('errorMessage')}"
             )
 
     def _apply_zone_options(
@@ -2227,7 +2240,7 @@ class TechnitiumDriver(DriverBase):
                 value=transfer,
                 supported=sorted(_ZONE_TRANSFER_VALUES),
             )
-            self._note_apply_failure(f"zone options {zone}: bad zoneTransfer {transfer}")
+            self._note_apply_failure(f"{zone}: zone options: bad zoneTransfer {transfer}")
             return
 
         params: dict[str, Any] = {"zone": zone}
@@ -2244,7 +2257,7 @@ class TechnitiumDriver(DriverBase):
                 error=body.get("errorMessage"),
             )
             self._note_apply_failure(
-                f"zone options {zone}: {body.get('errorMessage')}"
+                f"{zone}: zone options: {body.get('errorMessage')}"
             )
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
@@ -2257,14 +2270,14 @@ class TechnitiumDriver(DriverBase):
         try:
             body = resp.json()
         except ValueError:
-            self._note_apply_failure(f"zone records get {zone}: non-JSON response")
+            self._note_apply_failure(f"{zone}: zone records get: non-JSON response")
             return []
         if body.get("status") != "ok":
             # Reading an empty/error body as "zone is empty" would make
             # the reconcile re-add everything and report the refused
             # reads as churn (#1516).
             self._note_apply_failure(
-                f"zone records get {zone}: {body.get('errorMessage') or body.get('status')}"
+                f"{zone}: zone records get: {body.get('errorMessage') or body.get('status')}"
             )
             return []
         out = []
@@ -2416,6 +2429,15 @@ class TechnitiumDriver(DriverBase):
             if fresh is not None:
                 log.info("technitium_api_token_reprovisioned", path=path)
                 resp = self._request(fresh, method, path, params)
+        # A daemon that cannot authenticate us or answers 5xx has not
+        # REFUSED anything — it is unusable. Raise, so a structural apply
+        # fails (and is quarantined / reverted) instead of reading every
+        # step as a per-item refusal and reporting a partial apply (#1608).
+        if self._is_invalid_token(resp):
+            raise RuntimeError(f"Technitium API {path}: token rejected (auth failure)")
+        status_code = getattr(resp, "status_code", 200)
+        if isinstance(status_code, int) and status_code >= 500:
+            raise RuntimeError(f"Technitium API {path}: HTTP {status_code}")
         return resp
 
     def _request(

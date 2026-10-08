@@ -1520,6 +1520,25 @@ def test_apply_blocking_rewrites_when_the_live_set_is_unreadable(tmp_path: Path)
     assert "blocked/import" in [c[2] for c in calls]
 
 
+def test_a_refused_blocklist_import_is_recorded_not_a_name_error(tmp_path: Path) -> None:
+    """A refused ``{kind}/import`` chunk is a refusal like any other. The
+    #1516 note for it referenced names from the per-domain loop the chunked
+    import (#1425) replaced, so it raised NameError and failed the apply."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "blocked/import":
+            return {"status": "error", "errorMessage": "Access was denied."}
+        if path.endswith("/export"):
+            return "stale.test\n"
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert d._apply_failures == ["blocking blocked import (1 from a.test): Access was denied."]
+
+
 def test_apply_blocking_empty_list_still_clears_the_daemon(tmp_path: Path) -> None:
     """An emptied list has to actually clear on the daemon."""
     d = TechnitiumDriver(state_dir=tmp_path)
@@ -1703,10 +1722,12 @@ def test_swap_succeeds_when_every_step_is_accepted(tmp_path: Path) -> None:
     d.swap_and_reload()  # must not raise
 
 
-def test_swap_raises_when_a_record_add_is_refused(tmp_path: Path) -> None:
-    """#1516: a refused record add used to be a log line and a reported
-    success. Now the apply raises (ConfigApplyError via apply_config, so
-    quarantine/revert engages) — after still attempting the add."""
+def test_swap_reports_a_refused_record_add_as_a_partial_apply(tmp_path: Path) -> None:
+    """#1516 / #1608: a refused record add used to be a log line and a
+    reported success, then (first cut of #1608) a raise that quarantined
+    the whole bundle. It is a partial apply now (#1280's model): the apply
+    lands and ``refused_zones()`` names the zone, record and the daemon's
+    reason."""
 
     def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
         if path == "zones/records/add":
@@ -1715,17 +1736,18 @@ def test_swap_raises_when_a_record_add_is_refused(tmp_path: Path) -> None:
 
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _prep_swap(d, responder)
-    with pytest.raises(ConfigApplyError) as excinfo:
-        d.apply_config(_ONE_ZONE_BUNDLE)
-    assert excinfo.value.phase == "reload"
+    d.apply_config(_ONE_ZONE_BUNDLE)  # must not raise
     assert any(c[2] == "zones/records/add" for c in calls)
+    (refusal,) = d.refused_zones()
+    assert refusal.startswith("example.com: record add www.example.com A: ")
+    assert "invalid record name" in refusal
 
 
-def test_swap_raises_when_zone_create_is_refused_but_still_reconciles(
+def test_swap_reports_a_refused_zone_create_but_still_reconciles(
     tmp_path: Path,
 ) -> None:
     """#1516: one refused zone must not stop the rest of the apply —
-    every zone is attempted, then the collected failures raise."""
+    every zone is attempted, and the refusal is reported, not raised."""
 
     def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
         if path == "zones/create":
@@ -1734,14 +1756,13 @@ def test_swap_raises_when_zone_create_is_refused_but_still_reconciles(
 
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _prep_swap(d, responder)
-    d.render(_ONE_ZONE_BUNDLE)
-    with pytest.raises(RuntimeError, match="partly refused"):
-        d.swap_and_reload()
+    d.apply_config(_ONE_ZONE_BUNDLE)
     # Records for the (missing) zone were still attempted.
     assert any(c[2] == "zones/records/add" for c in calls)
+    assert any("zone create: no SOA from primary" in r for r in d.refused_zones())
 
 
-def test_swap_raises_when_tsig_sync_is_refused(tmp_path: Path) -> None:
+def test_swap_reports_a_refused_tsig_sync(tmp_path: Path) -> None:
     def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
         if path == "settings/set" and "tsigKeys" in params:
             return {"status": "error", "errorMessage": "bad key"}
@@ -1755,9 +1776,25 @@ def test_swap_raises_when_tsig_sync_is_refused(tmp_path: Path) -> None:
     }
     d = TechnitiumDriver(state_dir=tmp_path)
     _prep_swap(d, responder)
-    d.render(bundle)
-    with pytest.raises(RuntimeError, match="tsig keys"):
-        d.swap_and_reload()
+    d.apply_config(bundle)
+    assert d.refused_zones() == ["tsig keys: bad key"]
+
+
+def test_swap_fails_when_the_daemon_rejects_our_token(tmp_path: Path) -> None:
+    """An auth failure is not a refusal of the operator's data: nothing can
+    be applied at all, so the apply fails (and #882 quarantines / reverts)
+    rather than reporting every step as a refused item."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        return {"status": "invalid-token"}
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d._reprovision_token = lambda stale: None  # type: ignore[method-assign]
+    with pytest.raises(ConfigApplyError) as excinfo:
+        d.apply_config(_ONE_ZONE_BUNDLE)
+    assert excinfo.value.phase == "reload"
+    assert "auth failure" in str(excinfo.value.cause)
 
 
 # ── #1513: rdata round-trip canonicalisation ────────────────────────────

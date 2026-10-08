@@ -976,8 +976,21 @@ the formatter handles the rest.
   written, on the agent and control-plane paths. The agent always
   syncs TSIG keys, including an empty bundle, so removing the last
   key actually clears it on the daemon. A Technitium apply the
-  daemon partly refuses now reports the refusal and is retried
-  instead of reading as success. And rdata normalization is
+  daemon partly refuses is now reported instead of reading as
+  success — as a partial apply, the model #1280 introduced for
+  PowerDNS: the server shows "Zones refused", naming each refused
+  zone, record or setting with Technitium's own reason, while
+  everything else in the bundle is applied and kept. Nothing is
+  rolled back and the bundle is not retried, so one record the
+  daemon rejects no longer holds back the group's later changes
+  (records in the same zone, TSIG keys); the refused record's own
+  record op is returned as failed, and the verdict clears once a
+  structural apply lands with nothing refused. A daemon that cannot
+  be reached, rejects the agent's token or answers 5xx still fails
+  the apply and falls back to the last-known-good. A refused
+  blocklist import no longer crashes the apply with a `NameError`.
+  The partial-apply summary now counts "item(s)" rather than
+  "zone(s)", since a Technitium refusal is per record. And rdata normalization is
   round-trip safe: SVCB/HTTPS parameters survive, URI records keep
   their trailing-slash semantics, and A/AAAA values are compared in
   canonical form on both sides, so a hand-typed expanded IPv6
