@@ -260,3 +260,70 @@ async def test_failure_names_the_actual_driver_and_a_non_empty_cause(
     assert "Windows DNS" not in detail
     assert "Route 53" in detail
     assert "r53: ConnectionRefusedError" in detail
+
+
+# ── #1607 × #1613: a provider conflict still compensates ───────────────────
+
+
+class _ConflictDriver(_FakeDriver):
+    """Raises ``CloudDNSConflictError`` for servers in ``conflict_on`` — the
+    #1607 Route 53 refusal to adopt a same-name hosted zone it did not
+    create — and a plain error for servers in ``fail_on``."""
+
+    def __init__(self, conflict_on: set[str], fail_on: set[str] | None = None) -> None:
+        super().__init__(fail_on)
+        self.conflict_on = conflict_on
+
+    async def apply_zone_change(self, server: DNSServer, zone: DNSZone, op: str) -> None:
+        from app.drivers.dns._cloud_base import CloudDNSConflictError
+
+        self.calls.append((server.name, op))
+        if server.name in self.conflict_on and op == "create":
+            raise CloudDNSConflictError(f"{server.name}: a hosted zone named example.com exists")
+        if server.name in self.fail_on:
+            raise RuntimeError(f"{server.name} unreachable")
+
+
+async def test_conflict_on_second_server_rolls_back_the_first_and_answers_409(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conflict used to be raised from inside the fan-out loop, so the
+    zone created on the first server stayed there while the 409 said nothing
+    had been saved — and a retry then conflicted on the first server too."""
+    fake = _ConflictDriver(conflict_on={"second"})
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    await _server(db_session, grp, "first")
+    await _server(db_session, grp, "second")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
+
+    assert excinfo.value.status_code == 409
+    assert fake.calls == [("first", "create"), ("second", "create"), ("first", "delete")]
+    detail = excinfo.value.detail
+    assert "hosted zone named example.com exists" in detail
+    assert "Rolled back on: first" in detail
+    assert "not saved" in detail
+
+
+async def test_conflict_mixed_with_another_failure_is_still_a_502(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolving the conflict alone would not make a retry succeed, so a
+    conflict next to an unreachable server is not reported as a 409."""
+    fake = _ConflictDriver(conflict_on={"second"}, fail_on={"third"})
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    for name in ("first", "second", "third"):
+        await _server(db_session, grp, name)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
+
+    assert excinfo.value.status_code == 502
+    assert ("first", "delete") in fake.calls
+    detail = excinfo.value.detail
+    assert "hosted zone named example.com exists" in detail
+    assert "third unreachable" in detail
+    assert "Rolled back on: first" in detail

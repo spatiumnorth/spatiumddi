@@ -6805,8 +6805,9 @@ async def _push_zone_to_agentless_servers(
     receive writes — or, when unreachable, block every zone create,
     delete and move in the group with its 502.
 
-    Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
-    — the DB row stays in an uncommitted state and the session rollback
+    Failure surfaces as a 502 (409 when every failure was a provider
+    conflict, #1607 — raised only after the compensation below) so the
+    caller's ``db.commit()`` never runs — the DB row stays in an uncommitted state and the session rollback
     cleans it up. Matches the DHCP write-through pattern. The rollback
     only covers the DB, though: a server that already applied the change
     keeps it. So before raising, the servers that succeeded get the
@@ -6851,44 +6852,43 @@ async def _push_zone_to_agentless_servers(
     # nothing"; only a non-delete op leaves this as None.
     managed_records: list[RecordData] | None = None
     if op == "delete":
-        rec_res = await db.execute(
-            select(DNSRecord)
-            .where(DNSRecord.zone_id == zone.id)
-            .execution_options(include_deleted=True)
-        )
-        managed_records = [
-            RecordData(
-                name=r.name,
-                record_type=r.record_type,
-                value=r.value,
-                ttl=r.ttl,
-                priority=r.priority,
-                weight=r.weight,
-                port=r.port,
-            )
-            for r in rec_res.scalars().all()
-        ]
+        managed_records = await _managed_zone_records(db, zone)
+
+    async def _apply(server: DNSServer, driver: Any, this_op: str) -> None:
+        if isinstance(driver, CloudDNSDriverBase):
+            # The compensating delete of a rolled-back create needs the
+            # same scoping as a real delete, or a cloud driver would empty
+            # nothing and the provider refuse a zone holding our records.
+            records = managed_records
+            if this_op == "delete" and records is None:
+                records = await _managed_zone_records(db, zone)
+            await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+        else:
+            await driver.apply_zone_change(server, zone, this_op)
 
     errors: list[str] = []
     failed_drivers: set[str] = set()
     succeeded: list[DNSServer] = []
+    # A CloudDNSConflictError is recorded like any other failure rather
+    # than raised from inside the loop: raising here would skip the
+    # compensation below, leaving servers that already took the change
+    # holding it while SpatiumDDI reports that nothing was saved. The 409
+    # is chosen once every server has been tried and rolled back.
+    conflicts = 0
     for server in targets:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
-            if isinstance(driver, CloudDNSDriverBase):
-                await driver.apply_zone_change(server, zone, op, managed_records=managed_records)
-            else:
-                await driver.apply_zone_change(server, zone, op)
+            await _apply(server, driver, op)
             succeeded.append(server)
-        except CloudDNSConflictError as exc:
-            # The provider already holds a zone/record this op would
-            # have to take over (e.g. a same-name Route 53 hosted zone
-            # SpatiumDDI did not create). Surface as 409 — the remedy
-            # is the explicit import flow named in the message.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
+            if isinstance(exc, CloudDNSConflictError):
+                # The provider already holds a zone/record this op would
+                # have to take over (e.g. a same-name Route 53 hosted zone
+                # SpatiumDDI did not create). The remedy is the explicit
+                # import flow named in the message.
+                conflicts += 1
             errors.append(f"{server.name}: {_exc_text(exc)}")
             failed_drivers.add(server.driver)
             logger.warning(
@@ -6914,7 +6914,7 @@ async def _push_zone_to_agentless_servers(
         for server in succeeded:
             driver = get_driver(server.driver)
             try:
-                await driver.apply_zone_change(server, zone, inverse)
+                await _apply(server, driver, inverse)
             except Exception as exc:  # noqa: BLE001 — best effort; reported below
                 compensation_failed.append(f"{server.name}: {_exc_text(exc)}")
                 logger.warning(
@@ -6968,7 +6968,37 @@ async def _push_zone_to_agentless_servers(
             f" Rollback failed on: {'; '.join(compensation_failed)} — "
             f"those servers may {state} the zone; reconcile manually."
         )
-    raise HTTPException(status_code=502, detail=detail)
+    # 409 only when every failure was a conflict — the remedy is then the
+    # import flow the message names. A mix with a provider / network
+    # failure is still a 502: the conflict text rides in the detail, but
+    # resolving it alone would not make a retry succeed.
+    status_code = 409 if conflicts == len(errors) else 502
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:
+    """The zone's DB records as driver ``RecordData`` — the set a cloud
+    driver may remove when it empties a zone before deleting it (#1607).
+    ``include_deleted`` because the trash purge works on soft-deleted rows."""
+    from app.drivers.dns.base import RecordData  # noqa: PLC0415
+
+    rec_res = await db.execute(
+        select(DNSRecord)
+        .where(DNSRecord.zone_id == zone.id)
+        .execution_options(include_deleted=True)
+    )
+    return [
+        RecordData(
+            name=r.name,
+            record_type=r.record_type,
+            value=r.value,
+            ttl=r.ttl,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+        )
+        for r in rec_res.scalars().all()
+    ]
 
 
 # Display names for the agentless drivers, so a failure names the system
