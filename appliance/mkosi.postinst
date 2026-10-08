@@ -267,6 +267,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
 # reports "no managed profile" and the warning never appears.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
+# #1630 — k3s.service's ExecStartPre (clear-ingests) and firstboot's image
+# check before a slot commit (verify --repair).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.

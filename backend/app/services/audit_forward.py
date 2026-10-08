@@ -561,13 +561,14 @@ _SEVERITY_COLOURS = {
     "critical": 0xDC2626,  # darker red
 }
 
-_TEAMS_COLOURS = {
-    "info": "4FACFE",
-    "warn": "F59E0B",
-    "error": "EF4444",
-    "denied": "EF4444",
-    "warning": "F59E0B",
-    "critical": "DC2626",
+#: Adaptive Cards have no free-form colour, only named text colours.
+_TEAMS_TITLE_COLOURS = {
+    "info": "Accent",
+    "warn": "Warning",
+    "warning": "Warning",
+    "error": "Attention",
+    "denied": "Attention",
+    "critical": "Attention",
 }
 
 
@@ -642,17 +643,70 @@ def _slack_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: Teams refuses a message over ~28 KB. The caps are on the JSON-escaped
+#: text (``\uXXXX`` for non-ASCII, the worst case), leaving room for
+#: the card around it.
+_TEAMS_TITLE_LIMIT = 2_000
+_TEAMS_BODY_LIMIT = 20_000
+
+
+def _cap_json_escaped(text: str, limit: int) -> str:
+    """Cut ``text`` so ``json.dumps(text)`` fits ``limit`` bytes, marking the cut."""
+    if len(json.dumps(text)) <= limit:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid] + "…")) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
+
+
 def _teams_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """An Adaptive Card in the envelope a Teams Workflows webhook takes (#1504).
+
+    The Office 365 "Incoming Webhook" connector, which took the old
+    ``MessageCard`` body, has been retired. Its replacement, a Workflows
+    webhook ("When a Teams webhook request is received" / "Send webhook
+    alerts to a channel"), posts the cards in ``attachments``. A
+    MessageCard has none: depending on the flow it is accepted with 202
+    and never posted.
+    """
     title, body = _payload_summary_lines(payload)
     sev = _payload_severity(payload)
-    colour = _TEAMS_COLOURS.get(sev, "4FACFE")
+    # Card text is Markdown, where a single newline is only a soft break.
+    paragraphs = "\n\n".join(line for line in (body or "").splitlines() if line.strip())
     return {
-        "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary": title,
-        "themeColor": colour,
-        "title": title,
-        "text": body or "—",
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "msteams": {"width": "Full"},
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(title, _TEAMS_TITLE_LIMIT),
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "color": _TEAMS_TITLE_COLOURS.get(sev, "Accent"),
+                            "wrap": True,
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(paragraphs or "—", _TEAMS_BODY_LIMIT),
+                            "wrap": True,
+                        },
+                    ],
+                },
+            }
+        ],
     }
 
 
