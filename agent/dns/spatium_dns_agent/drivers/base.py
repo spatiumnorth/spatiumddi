@@ -32,6 +32,10 @@ class DriverBase(ABC):
     #: it is also the "has the daemon been launched at all" fact that
     #: :meth:`daemon_launched` reports.
     daemon_pid: int | None = None
+    #: Zones the most recent :meth:`apply_config` left unserved because the
+    #: daemon refused their data, each with the daemon's own reason. Reset at
+    #: the start of every apply; read through :meth:`refused_zones`.
+    _refused_zones: tuple[str, ...] = ()
 
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
@@ -113,6 +117,22 @@ class DriverBase(ABC):
         """
         return None
 
+    def refused_zones(self) -> list[str]:
+        """Zones the last successful :meth:`apply_config` could not serve.
+
+        A non-empty list means the apply DID land — every other zone is
+        served — but the daemon refused the data of the zones named here
+        (one ``"<zone>: <daemon's reason>"`` string each). The sync loop
+        reports that as a degraded apply and does NOT revert: re-applying
+        the last-known-good bundle cannot make the daemon accept data it
+        just refused, and would take the zones it did accept down with it.
+
+        Drivers whose daemon loads all zones or none (BIND9 validates the
+        whole tree with ``named-checkconf``) keep the empty default and
+        fail the apply instead.
+        """
+        return list(self._refused_zones)
+
     def apply_config(self, bundle: dict[str, Any]) -> None:
         """Default orchestration: render → validate → swap+reload.
 
@@ -124,6 +144,7 @@ class DriverBase(ABC):
         previous bundle has to be re-rendered to get back to a known state
         (#882).
         """
+        self._refused_zones = ()
         for phase, step in (
             (PHASE_RENDER, lambda: self.render(bundle)),
             (PHASE_VALIDATE, self.validate),

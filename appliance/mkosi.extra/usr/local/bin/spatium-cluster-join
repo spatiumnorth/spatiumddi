@@ -254,7 +254,7 @@ backup_and_wipe_identity() {
 }
 
 # #555 — prune stale identity backups. Each one holds the etcd db + tls/
-# private keys (CA material) and lives in the 1777 release-state dir; the
+# private keys (CA material) and lives in the release-state dir; the
 # old code left every join/leave backup forever ("a later sweep can prune"
 # — no sweep existed). Keep the newest 3 (a couple of promote/leave cycles
 # of manual-recovery headroom). log() goes to stderr so this never pollutes

@@ -202,8 +202,9 @@ In order, a login through provider P as subject S with username U:
 
 1. signs in as the account linked to P with external id S;
 2. else claims the account an administrator linked to P
-   (`POST /users/{id}/link-provider`) whose username is U and which has not
-   signed in since the link;
+   (`POST /users/{id}/link-provider`), or created for P
+   (`POST /users` with `auth_provider_id`, #1291), whose username is U and
+   which has not signed in since;
 3. else, for an account from before `auth_provider_id` existed (NULL, same
    type, external id S), refuses with `account_link_required` until an
    administrator links it. The login never links such an account itself:
@@ -547,6 +548,14 @@ per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.
 
+A resource-scoped token is held to its grants beyond the URL path too. An
+IPAM write that names a DNS zone in its body (`dns_zone_id`,
+`extra_zone_ids`, a subnet's zone bindings) may name only one of the
+subnet's own effective zones, the row's current zone, or a zone the token
+holds a `dns_zone` grant on (GHSA-875w). Reads that belong to no grantable
+resource at all, such as a DNS server's recent events and `rndc status`,
+are refused to a resource-scoped token (GHSA-c4v7).
+
 **Wire format.** Raw tokens start with `sddi_` followed by 40 bytes of
 url-safe base64 entropy (`secrets.token_urlsafe(40)`). Operators typically see only the first
 10 characters (`sddi_AbCdE`) in the UI as an identifier — this is
@@ -699,7 +708,14 @@ rather than swallowing the failure. Permission-related rejections
 - **Auto-create disabled.** First external login for a new subject is
   refused with `401` if `provider.auto_create_users=False`: the provider
   then signs in only accounts already linked to it.
-  `backend/app/core/auth/user_sync.py`.
+  `backend/app/core/auth/user_sync.py`. To admit a new user, pre-create the
+  account (#1291): Users → New User → *Signs in through* the provider, or
+  `POST /users` with `auth_provider_id` and no password. That makes an
+  account bound to the provider with no password and no external id yet;
+  the user's first sign-in through that provider as that username claims
+  it, exactly as after a `link-provider`. A sign-in with the same username
+  through any other provider is still refused as a collision, and creating
+  such an account as a superadmin needs the operator step-up.
 - **Username collision.** An external subject not linked to an account,
   whose username already belongs to any account — local, or linked to
   another provider — is rejected (`username_collision`) rather than

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
   type DHCPOption,
@@ -8,7 +8,7 @@ import {
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
-import { optionsFromMap, optionsToMap } from "./dhcpOptionKeys";
+import { optionsFromMap, optionsToMap, rawPrefixFor } from "./dhcpOptionKeys";
 
 export function CreateOptionTemplateModal({
   template,
@@ -29,10 +29,18 @@ export function CreateOptionTemplateModal({
   const initialOptions: DHCPOption[] = optionsFromMap(template?.options);
   const [options, setOptions] = useState<DHCPOption[]>(initialOptions);
   const [error, setError] = useState("");
+  // #1347 — a catalogue pick is keyed in the spelling the group's servers
+  // read, so a Windows group gets `opt-43`, not a `code:43` it would refuse.
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dhcp-servers", groupId],
+    queryFn: () => dhcpApi.listServers(groupId),
+    enabled: !!groupId,
+  });
+  const rawPrefix = rawPrefixFor(groupServers.map((s) => s.driver));
 
   const mut = useMutation({
     mutationFn: () => {
-      const optionsDict = optionsToMap(options);
+      const optionsDict = optionsToMap(options, rawPrefix);
       const data: DHCPOptionTemplateWrite = {
         name,
         description,
