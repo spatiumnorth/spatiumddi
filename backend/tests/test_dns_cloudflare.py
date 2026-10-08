@@ -1036,3 +1036,99 @@ async def test_list_zone_records_splits_srv_data(monkeypatch: pytest.MonkeyPatch
         weight=0,
         port=5222,
     )
+
+
+# ── SRV through the #783 set write (#1526 × #1495) ─────────────────────
+
+
+async def test_set_write_srv_sends_data_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An op carrying an RRset takes the set-write path; SRV must still go
+    out as a ``data`` object, never a bare-target ``content``."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+        rrset=RRsetData(
+            ttl=300,
+            members=(RRsetMember(value="sip.example.com", priority=10, weight=20, port=5060),),
+        ),
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["data"] == {
+        "priority": 10,
+        "weight": 20,
+        "port": 5060,
+        "target": "sip.example.com",
+    }
+    assert "content" not in post["json"]
+
+
+@pytest.mark.parametrize(
+    "row_extra",
+    [
+        {
+            "content": "20 5060 sip.example.com",
+            "priority": 10,
+            "data": {"priority": 10, "weight": 20, "port": 5060, "target": "sip.example.com"},
+        },
+        {"content": "20 5060 sip.example.com.", "priority": 10},
+        {"content": "10 20 5060 sip.example.com"},
+    ],
+)
+async def test_set_write_srv_converged_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch, row_extra: dict[str, Any]
+) -> None:
+    """A live SRV row matching on all four components is kept untouched,
+    whichever shape Cloudflare reports it in."""
+    row = {
+        "id": "s",
+        "type": "SRV",
+        "name": "_sip._tcp.example.com",
+        "ttl": 300,
+        **row_extra,
+    }
+    fake = _FakeClient(
+        {"get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([row]))]}
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+        rrset=RRsetData(
+            ttl=300,
+            members=(RRsetMember(value="sip.example.com", priority=10, weight=20, port=5060),),
+        ),
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    assert [c["method"] for c in fake.calls] == ["get", "get"]

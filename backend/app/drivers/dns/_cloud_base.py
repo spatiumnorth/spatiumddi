@@ -101,6 +101,11 @@ def provider_value_candidates(record: RecordData) -> set[str]:
     ):
         baked = f"{record.priority} {record.weight} {record.port} {value}"
         candidates.update({baked, baked.rstrip(".")})
+    if rtype in ("MX", "SRV"):
+        # Exactly what the write path sends, defaults included (#1526):
+        # an MX with no stored priority went out as "10 <target>".
+        composed = compose_structured_rdata(record)
+        candidates.update({composed, composed.rstrip(".")})
     return candidates
 
 
