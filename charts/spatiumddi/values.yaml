@@ -260,6 +260,11 @@ api:
     # which actually lives at ``/var/lib/spatiumddi/release-state/...``
     # on the appliance's filesystem.
     releaseStateDir: /var/lib/spatiumddi/release-state
+    # GHSA-h2j9-qrg7-grfw — the gid that owns releaseStateDir (mode 1770,
+    # set by spatiumddi-firstboot + a tmpfiles.d entry). Added to the api
+    # pod's supplementalGroups so it can write triggers there. Must match
+    # SPATIUM_HOST_GID in appliance/…/spatiumddi-firstboot.
+    hostGroupGid: 2770
     hostLogDir: /var/log/spatiumddi
     hostEtcDir: /etc/spatiumddi
     # #386 — host dir backing the api's upgrade-image store
