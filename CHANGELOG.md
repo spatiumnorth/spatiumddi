@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Mirror delete-side guards (#1558, #1554, #1557, #1561).** The
+  UniFi, Proxmox, Docker, Kubernetes and Cloud mirrors deleted a
+  removed subnet outright, cascade-deleting every operator address
+  still in it; they now un-claim the subnet when operator, foreign,
+  or operator-edited addresses survive, like OPNsense already did.
+  IPAM's DNS drift sweep no longer reports (or auto-deletes)
+  auto-generated records owned by an integration mirror, the DNS
+  pool pipeline, or ACME as stale. Tailscale, NetBird and OPNsense
+  Dnsmasq mirrors store only the host label as the IPAM hostname
+  (the FQDN stays in custom fields), so publishing no longer appends
+  the zone a second time. The Kubernetes, Tailscale and NetBird
+  record passes skip — with a summary warning — an insert that would
+  land beside a non-owned record at the same name, CNAME conflicts
+  included.
+
 - **Failed backup writes no longer strand hidden `.tmp` files on
   FTP, SCP, SMB and local-volume targets (#1570).** Each driver
   stages an archive as `<archive>.tmp` and renames it; a write that

@@ -46,6 +46,7 @@ from app.services.integration_ownership import (
     address_taken,
     owned_by_other_integration,
     owning_integration,
+    subnet_has_surviving_addresses,
 )
 from app.services.proxmox.client import (
     ProxmoxClient,
@@ -577,6 +578,14 @@ async def _apply_blocks_and_subnets(
             if vnet_name in extant_vnet_names:
                 used_wrapper_cidrs.add(net_str)
                 continue
+        # #1558: a blind delete cascades to every address in the subnet,
+        # including operator / foreign / operator-edited rows. Hand the
+        # subnet back (un-claim) when any such survivor exists, like the
+        # OPNsense reconciler does.
+        if await subnet_has_surviving_addresses(db, row.id, "proxmox_node_id"):
+            row.proxmox_node_id = None
+            summary.subnets_updated += 1
+            continue
         await db.delete(row)
         summary.subnets_deleted += 1
 
