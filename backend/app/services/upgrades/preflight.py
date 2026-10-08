@@ -275,6 +275,151 @@ def check_disk_headroom(
     )
 
 
+# A node whose last heartbeat is older than this has a /var reading that no
+# longer says anything about now (#1234). The supervisor heartbeats every
+# ~30 s, so ten minutes is many missed beats, not jitter.
+_NODE_DISK_REPORT_MAX_AGE_SECONDS = 10 * 60
+
+
+def _node_var_free_bytes(cluster_health: Any) -> int | None:
+    """Free bytes on a node's ``/var`` from its reported partitions.
+
+    ``None`` = no usable reading (key absent, entry absent, malformed) —
+    UNKNOWN, never zero and never "plenty".
+    """
+    if not isinstance(cluster_health, dict):
+        return None
+    parts = cluster_health.get("host_disk_partitions")
+    if not isinstance(parts, list):
+        return None
+    for p in parts:
+        if not isinstance(p, dict) or p.get("mount") != "/var":
+            continue
+        total, used = p.get("total_bytes"), p.get("used_bytes")
+        if (
+            isinstance(total, int)
+            and isinstance(used, int)
+            and not isinstance(total, bool)
+            and not isinstance(used, bool)
+            and total > 0
+        ):
+            return max(total - used, 0)
+    return None
+
+
+def judge_node_disk_headroom(
+    nodes: list[Any],
+    *,
+    need_bytes: int,
+    now: datetime,
+    max_age_seconds: int = _NODE_DISK_REPORT_MAX_AGE_SECONDS,
+) -> PreflightResult:
+    """Judge each appliance node's reported ``/var`` headroom (#1234).
+
+    ``spatium-upgrade-slot`` stages the slot image under the NODE's
+    ``/var``, so the api pod's own filesystem says nothing about whether a
+    member can take the upgrade. ``fail`` names every node short of
+    ``need_bytes``; a node with no reading, or one older than
+    ``max_age_seconds``, is ``warn`` and named (NULL = unknown, never ok).
+    """
+    short: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    checked: list[dict[str, Any]] = []
+    for n in nodes:
+        label = getattr(n, "hostname", None) or str(getattr(n, "id", "?"))
+        seen = getattr(n, "last_seen_at", None)
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        free = _node_var_free_bytes(getattr(n, "cluster_health", None))
+        if free is None:
+            unknown.append({"node": label, "reason": "no /var disk report"})
+            continue
+        if seen is None or (now - seen).total_seconds() > max_age_seconds:
+            unknown.append({"node": label, "reason": "disk report is stale", "free_bytes": free})
+            continue
+        entry = {"node": label, "free_bytes": free}
+        checked.append(entry)
+        if free < need_bytes:
+            short.append(entry)
+    detail: dict[str, Any] = {
+        "needed_bytes": need_bytes,
+        "nodes": checked,
+        "short": short,
+        "unverified": unknown,
+    }
+    gib = 1024**3
+    if short:
+        names = ", ".join(f"{e['node']} ({e['free_bytes'] // gib} GiB free)" for e in short)
+        return PreflightResult(
+            name="disk_headroom",
+            level="fail",
+            message=(
+                f"/var too small on {names}; need {need_bytes // gib} GiB "
+                "(slot image + margin) — free space before upgrading"
+            ),
+            detail=detail,
+        )
+    if unknown:
+        names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message=f"/var headroom unverified on {names}",
+            detail=detail,
+        )
+    return PreflightResult(
+        name="disk_headroom",
+        level="ok",
+        message=f"/var has room on all {len(checked)} node(s) (need {need_bytes // gib} GiB)",
+        detail=detail,
+    )
+
+
+async def check_node_disk_headroom(
+    *,
+    slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
+    safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
+) -> PreflightResult:
+    """Per-node ``/var`` headroom for appliance fleets (#1234).
+
+    Falls back to :func:`check_disk_headroom` (the api container's own
+    ``/var``) when there are no approved appliance rows — docker-compose /
+    plain k8s — which is the only place that check is meaningful.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(Appliance).where(
+                            Appliance.state == APPLIANCE_STATE_APPROVED,
+                            Appliance.deployment_kind == "appliance",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_node_disk_query_failed", error=str(e))
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message="Could not read per-node disk reports — check /var headroom manually.",
+            detail={"error": str(e)},
+        )
+    if not rows:
+        return check_disk_headroom(
+            slot_image_size_bytes=slot_image_size_bytes,
+            safety_margin_bytes=safety_margin_bytes,
+        )
+    return judge_node_disk_headroom(
+        rows,
+        need_bytes=slot_image_size_bytes + safety_margin_bytes,
+        now=datetime.now(UTC),
+    )
+
+
 async def check_mirror_disk_headroom(
     *,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
@@ -618,7 +763,7 @@ async def run_all(
     results: list[PreflightResult] = [
         check_inflight_conflict(namespace=namespace),
         await check_replication_lag(),
-        check_disk_headroom(),
+        await check_node_disk_headroom(),
         await check_mirror_disk_headroom(),
         check_version_path(target_version=target_version),
         check_quorum(),
