@@ -89,8 +89,14 @@ def downgrade() -> None:
 
     # The plaintext column was kept. Copy the current values back, in
     # case they were changed since the upgrade, then drop the encrypted
-    # column.
+    # column. A row whose headers were cleared since the upgrade has no
+    # encrypted value but may still hold its pre-upgrade plaintext:
+    # clear that first, or the downgrade sends the cleared credential
+    # again.
     conn = op.get_bind()
+    conn.execute(
+        sa.text("UPDATE event_subscription SET headers = NULL WHERE headers_encrypted IS NULL")
+    )
     rows = conn.execute(
         sa.text(
             "SELECT id, headers_encrypted FROM event_subscription "

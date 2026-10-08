@@ -68,8 +68,16 @@ class EventSubscription(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ``auth_provider.secrets_encrypted``.
     #
     # The pre-#1579 plaintext ``headers`` JSONB column is still in the
-    # table, unmapped and unread, for one release, so a rolling
-    # upgrade's old pods keep working (#296). The next release drops it.
+    # table for one release, so a rolling upgrade's old pods keep working
+    # (#296). The next release drops it. It is mapped here only so a header
+    # write can NULL it: never loaded (deferred) and never read. Left
+    # alone, a header cleared or replaced on this build kept its old value
+    # there, and a schema downgrade (which copies the current values back)
+    # or a downgrade-and-upgrade round trip sent the cleared credential
+    # again.
+    legacy_plaintext_headers: Mapped[dict[str, str] | None] = mapped_column(
+        "headers", JSONB, nullable=True, deferred=True
+    )
     headers_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # Per-subscription HTTP timeout. The default (10s) is high enough to
     # let receivers do real work but low enough that one slow consumer

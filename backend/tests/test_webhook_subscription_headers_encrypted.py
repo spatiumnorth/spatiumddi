@@ -243,6 +243,57 @@ async def test_api_stores_encrypted_and_never_returns_values(
     assert cleared.json()["header_names"] == []
 
 
+async def test_a_header_write_nulls_the_legacy_plaintext_copy(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The pre-#1579 plaintext column must not outlive a clear or a replace
+    on this build, or a schema downgrade sends the old credential again.
+    An edit that leaves headers alone leaves it."""
+    headers = await _admin(db_session)
+    created = await client.post(
+        _SUBS,
+        headers=headers,
+        json={"name": f"lg-{uuid.uuid4().hex[:6]}", "url": "https://r.example.test/h"},
+    )
+    assert created.status_code == 201, created.text
+    sid, name, url = created.json()["id"], created.json()["name"], created.json()["url"]
+
+    async def _legacy() -> object:
+        db_session.expire_all()
+        return (
+            await db_session.execute(
+                text("SELECT headers FROM event_subscription WHERE id = :id"), {"id": sid}
+            )
+        ).scalar_one()
+
+    async def _seed_legacy() -> None:
+        await db_session.execute(
+            text("UPDATE event_subscription SET headers = CAST(:h AS jsonb) WHERE id = :id"),
+            {"h": json.dumps(_HEADERS), "id": sid},
+        )
+        await db_session.commit()
+
+    await _seed_legacy()
+    keep = await client.put(f"{_SUBS}/{sid}", headers=headers, json={"name": name, "url": url})
+    assert keep.status_code == 200, keep.text
+    assert await _legacy() == _HEADERS, "an edit that leaves headers alone keeps it"
+
+    cleared = await client.put(
+        f"{_SUBS}/{sid}", headers=headers, json={"name": name, "url": url, "headers": {}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert await _legacy() is None
+
+    await _seed_legacy()
+    replaced = await client.put(
+        f"{_SUBS}/{sid}",
+        headers=headers,
+        json={"name": name, "url": url, "headers": {"Authorization": "Bearer new"}},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert await _legacy() is None
+
+
 # ── backup coverage ──────────────────────────────────────────────────
 
 
@@ -298,9 +349,9 @@ async def test_the_migration_encrypts_existing_plaintext(db_session: AsyncSessio
     db_session.add(sub)
     await db_session.flush()
 
-    # The test schema is built from the models, which no longer map the
-    # plaintext column; on an upgrading install it is still there.
-    await db_session.execute(text("ALTER TABLE event_subscription ADD COLUMN headers JSONB"))
+    # The test schema is built from the models, which map the plaintext
+    # column (deferred, write-only); drop the
+    # encrypted one to get the pre-#1579 shape.
     await db_session.execute(text("ALTER TABLE event_subscription DROP COLUMN headers_encrypted"))
     await db_session.execute(
         text("UPDATE event_subscription SET headers = CAST(:h AS jsonb) WHERE id = :id"),
@@ -338,3 +389,49 @@ async def test_the_migration_encrypts_existing_plaintext(db_session: AsyncSessio
         )
     ).scalar_one()
     assert back == _HEADERS
+
+
+async def test_a_downgrade_does_not_bring_back_cleared_headers(db_session: AsyncSession) -> None:
+    """A subscription whose headers were cleared after the upgrade has no
+    encrypted value but kept its pre-upgrade plaintext; the downgrade used
+    to copy only rows WITH an encrypted value, so the cleared credential
+    was served again by the old build."""
+    spec = importlib.util.spec_from_file_location("m_d27e1d8716bd_b", _MIGRATION)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    sub = EventSubscription(
+        name=f"m-{uuid.uuid4().hex[:6]}",
+        description="",
+        enabled=True,
+        url="https://receiver.example.test/hook",
+    )
+    db_session.add(sub)
+    await db_session.flush()
+    # Upgraded install, then cleared on the new build: encrypted NULL, but
+    # the kept plaintext column still holds the pre-upgrade token.
+    await db_session.execute(
+        text(
+            "UPDATE event_subscription SET headers = CAST(:h AS jsonb), "
+            "headers_encrypted = NULL WHERE id = :id"
+        ),
+        {"h": json.dumps(_HEADERS), "id": sub.id},
+    )
+
+    def _downgrade(sync_conn) -> None:  # noqa: ANN001
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        ctx = MigrationContext.configure(sync_conn)
+        with Operations.context(ctx):
+            module.downgrade()
+
+    conn = await db_session.connection()
+    await conn.run_sync(_downgrade)
+    back = (
+        await db_session.execute(
+            text("SELECT headers FROM event_subscription WHERE id = :id"), {"id": sub.id}
+        )
+    ).scalar_one()
+    assert back is None

@@ -496,7 +496,7 @@ backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_column:153
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_constraint_fk:152
 backend/alembic/versions/d1e7c4a90fb3_cloud_integration.py:drop_table:155
 backend/alembic/versions/d1f4b7c92e58_appliance_firewall_state.py:drop_column:43
-backend/alembic/versions/d27e1d8716bd_webhook_subscription_headers_encrypted.py:drop_column:106
+backend/alembic/versions/d27e1d8716bd_webhook_subscription_headers_encrypted.py:drop_column:117
 backend/alembic/versions/d2a8e417b9f3_backup_target.py:drop_table:112
 backend/alembic/versions/d2f7a91e4c8b_nmap_scans.py:drop_table:96
 backend/alembic/versions/d3a9c5b71e84_subnet_kind.py:drop_column:71

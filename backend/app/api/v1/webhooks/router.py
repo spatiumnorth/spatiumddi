@@ -177,6 +177,11 @@ def _apply_body(
         sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
     elif body.headers is not None:
         sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
+        # The pre-#1579 plaintext copy must not outlive a clear or a
+        # replace: a schema downgrade would bring the old value back. An
+        # old pod mid-rolling-upgrade then sends no header for this row,
+        # which is what the edit asked for.
+        sub.legacy_plaintext_headers = None
     sub.timeout_seconds = body.timeout_seconds
     sub.max_attempts = body.max_attempts
 
