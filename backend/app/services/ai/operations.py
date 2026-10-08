@@ -3897,6 +3897,34 @@ class GrantTemporaryAccessArgs(BaseModel):
     )
 
 
+_GRANT_MAKES_SUPERADMIN = (
+    "This grant would make {n} member(s) of the group superadmins, and that needs "
+    "your password or authenticator code, which a chat Apply cannot ask for "
+    "(#1412). Grant it from Groups → Time-bound grants instead."
+)
+
+
+async def _grant_makes_superadmins(
+    db: AsyncSession, group_id: UUID, args: GrantTemporaryAccessArgs
+) -> int:
+    """How many users a ``*`` / ``*`` grant would make superadmins (#1412)."""
+    from app.services.superadmin_grant import (  # noqa: PLC0415
+        newly_superadmin,
+        permissions_grant_superadmin,
+    )
+
+    requested = [
+        {
+            "action": args.action,
+            "resource_type": args.resource_type,
+            "resource_id": (args.resource_id or "").strip() or None,
+        }
+    ]
+    if not permissions_grant_superadmin(requested):
+        return 0
+    return len(await newly_superadmin(db, lambda m: m.granted_groups.add(group_id)))
+
+
 async def _preview_grant_temporary_access(
     db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
 ) -> PreviewResult:
@@ -3918,6 +3946,9 @@ async def _preview_grant_temporary_access(
     group = await db.get(Group, gid)
     if group is None:
         return PreviewResult(ok=False, detail=f"No group with id {args.group_id}.")
+    granted = await _grant_makes_superadmins(db, gid, args)
+    if granted:
+        return PreviewResult(ok=False, detail=_GRANT_MAKES_SUPERADMIN.format(n=granted))
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     scope = f"/{args.resource_id}" if args.resource_id else " (any instance)"
     preview_text = (
@@ -3941,6 +3972,10 @@ async def _apply_grant_temporary_access(
     group = await db.get(Group, UUID(args.group_id))
     if group is None:
         raise ValueError(f"No group with id {args.group_id}.")
+    # Re-checked at apply: membership can change between preview and Apply.
+    granted = await _grant_makes_superadmins(db, group.id, args)
+    if granted:
+        raise ValueError(_GRANT_MAKES_SUPERADMIN.format(n=granted))
     resource_id = (args.resource_id or "").strip() or None
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     grant = TimeBoundGrant(

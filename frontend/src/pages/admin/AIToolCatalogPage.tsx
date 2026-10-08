@@ -191,8 +191,11 @@ export function AIToolCatalogPage() {
             <p className="text-xs text-muted-foreground">
               Each tool here is something the Operator Copilot can call on your
               behalf. Disabled tools stay listed for the model so it can tell
-              users "ask your admin to enable X" instead of giving up. Per-
-              provider allowlists narrow this further on the AI Providers page.
+              users "ask your admin to enable X" instead of giving up. A
+              provider can narrow this further with its own tool allowlist,
+              which is set through the API (the provider's{" "}
+              <code>enabled_tools</code>); the AI Providers page has no control
+              for it.
             </p>
           </div>
         </div>

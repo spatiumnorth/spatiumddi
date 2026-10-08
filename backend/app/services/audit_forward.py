@@ -59,6 +59,7 @@ from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
 from app.services.after_commit_dispatch import dispatch
+from app.services.forward_secrets import redact, reveal, secret_url_in_flight
 
 logger = structlog.get_logger(__name__)
 
@@ -518,22 +519,27 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
     headers = {"Content-Type": "application/json"}
     if auth_header:
         headers["Authorization"] = auth_header
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code >= 300:
-            # Raise rather than log-and-swallow (#1577): the caller
-            # turns this into a ``failed`` delivery outcome, so a
-            # rejected webhook is not recorded as delivered.
-            logger.warning(
-                "audit_forward_webhook_non2xx",
-                status=resp.status_code,
-                body_preview=resp.text[:200],
-            )
-            raise httpx.HTTPStatusError(
-                f"webhook answered HTTP {resp.status_code}",
-                request=resp.request,
-                response=resp,
-            )
+    # The URL is the credential for a chat webhook (#1502). httpx logs every
+    # request with its full URL at INFO; this keeps that line to the host.
+    with secret_url_in_flight(url):
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code >= 300:
+        # Raise rather than log-and-swallow (#1577): the caller
+        # turns this into a ``failed`` delivery outcome, so a
+        # rejected webhook is not recorded as delivered.
+        logger.warning(
+            "audit_forward_webhook_non2xx",
+            status=resp.status_code,
+            # Redact BEFORE truncating (GHSA-5qf8-pqm4-58mj): a secret
+            # straddling the 200-char cut is no longer an exact match.
+            body_preview=redact(resp.text, url, auth_header)[:200],
+        )
+        raise httpx.HTTPStatusError(
+            f"webhook answered HTTP {resp.status_code}",
+            request=resp.request,
+            response=resp,
+        )
 
 
 # ── Chat-flavor webhook formatters (Slack / Teams / Discord) ───────────────
@@ -555,13 +561,14 @@ _SEVERITY_COLOURS = {
     "critical": 0xDC2626,  # darker red
 }
 
-_TEAMS_COLOURS = {
-    "info": "4FACFE",
-    "warn": "F59E0B",
-    "error": "EF4444",
-    "denied": "EF4444",
-    "warning": "F59E0B",
-    "critical": "DC2626",
+#: Adaptive Cards have no free-form colour, only named text colours.
+_TEAMS_TITLE_COLOURS = {
+    "info": "Accent",
+    "warn": "Warning",
+    "warning": "Warning",
+    "error": "Attention",
+    "denied": "Attention",
+    "critical": "Attention",
 }
 
 
@@ -636,17 +643,70 @@ def _slack_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: Teams refuses a message over ~28 KB. The caps are on the JSON-escaped
+#: text (``\uXXXX`` for non-ASCII, the worst case), leaving room for
+#: the card around it.
+_TEAMS_TITLE_LIMIT = 2_000
+_TEAMS_BODY_LIMIT = 20_000
+
+
+def _cap_json_escaped(text: str, limit: int) -> str:
+    """Cut ``text`` so ``json.dumps(text)`` fits ``limit`` bytes, marking the cut."""
+    if len(json.dumps(text)) <= limit:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid] + "…")) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
+
+
 def _teams_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """An Adaptive Card in the envelope a Teams Workflows webhook takes (#1504).
+
+    The Office 365 "Incoming Webhook" connector, which took the old
+    ``MessageCard`` body, has been retired. Its replacement, a Workflows
+    webhook ("When a Teams webhook request is received" / "Send webhook
+    alerts to a channel"), posts the cards in ``attachments``. A
+    MessageCard has none: depending on the flow it is accepted with 202
+    and never posted.
+    """
     title, body = _payload_summary_lines(payload)
     sev = _payload_severity(payload)
-    colour = _TEAMS_COLOURS.get(sev, "4FACFE")
+    # Card text is Markdown, where a single newline is only a soft break.
+    paragraphs = "\n\n".join(line for line in (body or "").splitlines() if line.strip())
     return {
-        "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary": title,
-        "themeColor": colour,
-        "title": title,
-        "text": body or "—",
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "msteams": {"width": "Full"},
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(title, _TEAMS_TITLE_LIMIT),
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "color": _TEAMS_TITLE_COLOURS.get(sev, "Accent"),
+                            "wrap": True,
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": _cap_json_escaped(paragraphs or "—", _TEAMS_BODY_LIMIT),
+                            "wrap": True,
+                        },
+                    ],
+                },
+            }
+        ],
     }
 
 
@@ -895,7 +955,9 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
             "audit_forward_target_failed",
             target=target.get("name"),
             kind=kind,
-            error=str(exc),
+            # An httpx error can quote the URL, which for a chat webhook is
+            # the credential (#1502).
+            error=redact(str(exc), target.get("url") or "", target.get("auth_header") or ""),
         )
         return FAILED
     return DELIVERED
@@ -980,11 +1042,15 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
                 "protocol": t.protocol or "udp",
                 "facility": int(t.facility or 16),
             }
-        elif webhook_cfg is None and t.kind == "webhook" and t.url:
-            webhook_cfg = {
-                "url": t.url,
-                "auth_header": t.auth_header or "",
-            }
+        elif webhook_cfg is None and t.kind == "webhook" and t.url_encrypted:
+            url = reveal(t.url_encrypted, field="url", target=t.name)
+            if url:
+                webhook_cfg = {
+                    "url": url,
+                    "auth_header": reveal(
+                        t.auth_header_encrypted, field="auth_header", target=t.name
+                    ),
+                }
         if syslog_cfg is not None and webhook_cfg is not None:
             break
 
@@ -1009,10 +1075,14 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
             "protocol": ps.audit_forward_syslog_protocol or "udp",
             "facility": int(ps.audit_forward_syslog_facility),
         }
-    if ps.audit_forward_webhook_enabled and ps.audit_forward_webhook_url:
+    legacy_url = reveal(ps.audit_forward_webhook_url_encrypted, field="audit_forward_webhook_url")
+    if ps.audit_forward_webhook_enabled and legacy_url:
         webhook_cfg = {
-            "url": ps.audit_forward_webhook_url,
-            "auth_header": ps.audit_forward_webhook_auth_header or "",
+            "url": legacy_url,
+            "auth_header": reveal(
+                ps.audit_forward_webhook_auth_header_encrypted,
+                field="audit_forward_webhook_auth_header",
+            ),
         }
     return syslog_cfg, webhook_cfg
 
@@ -1044,14 +1114,21 @@ async def _load_targets() -> list[dict[str, Any]]:
                     "resource_types": t.resource_types,
                 }
             )
-        elif t.kind == "webhook" and t.url:
+        elif t.kind == "webhook" and t.url_encrypted:
+            # Encrypted at rest (#1502). One that won't decrypt is skipped,
+            # like an SMTP password below.
+            url = reveal(t.url_encrypted, field="url", target=t.name)
+            if not url:
+                continue
             out.append(
                 {
                     "name": t.name,
                     "kind": "webhook",
                     "webhook_flavor": t.webhook_flavor or "generic",
-                    "url": t.url,
-                    "auth_header": t.auth_header or "",
+                    "url": url,
+                    "auth_header": reveal(
+                        t.auth_header_encrypted, field="auth_header", target=t.name
+                    ),
                     "min_severity": t.min_severity,
                     "resource_types": t.resource_types,
                 }

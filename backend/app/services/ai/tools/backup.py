@@ -128,6 +128,7 @@ class ListBackupTargetsArgs(BaseModel):
 
 @register_tool(
     name="list_backup_targets",
+    permission="superadmin",
     description=(
         "List all configured backup targets (superadmin only). "
         "Each row carries id / name / kind / enabled / "
@@ -197,6 +198,7 @@ class ListBackupArchivesArgs(BaseModel):
 
 @register_tool(
     name="list_backup_archives_at_target",
+    permission="superadmin",
     description=(
         "List archives currently stored at a specific backup target "
         "(superadmin only). Calls the driver's ``list_archives`` so "
@@ -309,6 +311,7 @@ _DEFAULT_BACKUP_ACTIONS = (
 
 @register_tool(
     name="find_backup_audit_history",
+    permission="superadmin",
     description=(
         "Return the recent backup + factory-reset audit history "
         "(superadmin only). Each row carries timestamp / action / "
@@ -380,6 +383,7 @@ class FindRestoreDrillsArgs(BaseModel):
 
 @register_tool(
     name="find_restore_drills",
+    permission="superadmin",
     description=(
         "Return restore-verification drill history (superadmin only). "
         "A drill replays a backup target's newest archive into a "
@@ -448,6 +452,7 @@ class RestoreDrillReadinessArgs(BaseModel):
 
 @register_tool(
     name="get_restore_drill_readiness",
+    permission="superadmin",
     description=(
         "One-shot recovery-readiness rollup across every backup target "
         "(superadmin only). Per target: whether drills are scheduled, "
@@ -496,6 +501,7 @@ class BackupHealthArgs(BaseModel):
 
 @register_tool(
     name="get_backup_health",
+    permission="superadmin",
     description=(
         "Per backup target: is its schedule actually producing backups? "
         "(superadmin only). Each row carries state (ok / failed / stale / "
