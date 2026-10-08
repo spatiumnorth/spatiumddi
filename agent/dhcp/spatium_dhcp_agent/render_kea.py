@@ -1306,7 +1306,7 @@ def render(
     # A raw-code option is only safe to emit once a definition for it exists:
     # Kea types an undefined code as BINARY and REJECTS THE WHOLE CONFIG when
     # the value isn't hex. Dropping one option is survivable; a rejected config
-    # is not, and `sync.py` writes the file before `config-test`, so a bad
+    # is not, and `sync.py` writes the file before `kea-dhcp4 -t`, so a bad
     # render outlives the process that made it.
     #
     # This also covers the two cases where no definitions arrive at all: the
