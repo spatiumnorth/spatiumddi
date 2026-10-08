@@ -22,6 +22,7 @@ secret on a forwarding target can use the same contract:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -107,7 +108,12 @@ def redact(text: str, *secrets: str) -> str:
     * each URL path segment and each query key/value longer than a few
       characters, raw and percent-decoded; and
     * every needle above in its JSON-escaped (``\\/``) and percent-encoded
-      forms, which defeat an exact match the same way a truncation does.
+      forms, which defeat an exact match the same way a truncation does; and
+    * any mixture of encodings of a needle's punctuation: each non-
+      alphanumeric character may appear as itself, as ``%HH`` in either hex
+      case, or as a JSON ``\\u00HH`` escape (GHSA-rc6p-vq45-64v3). .NET writes
+      lower-case percent-encoding and escapes ``+`` as ``\\u002B``, so exact
+      strings alone leaked any base64 token.
 
     Callers must redact *before* truncating: a secret straddling a cut is
     no longer an exact match, so its leading part would survive.
@@ -176,7 +182,30 @@ def redact(text: str, *secrets: str) -> str:
     for needle in sorted(needles, key=len, reverse=True):
         if needle:
             out = out.replace(needle, REDACTED)
+    # Then each plain (decoded) needle in any encoding of its punctuation.
+    plain = {unquote(n) for n in base if n and len(unquote(n)) >= 4}
+    for needle in sorted(plain, key=len, reverse=True):
+        out = re.sub(_encoding_tolerant_pattern(needle), REDACTED, out)
     return out
+
+
+def _encoding_tolerant_pattern(plain: str) -> str:
+    """A regex for ``plain`` that also matches any of its punctuation written
+    as ``%HH`` (either hex case), a JSON ``\\u00HH`` escape, or ``\\/`` for ``/``,
+    in any mixture (GHSA-rc6p-vq45-64v3)."""
+    out: list[str] = []
+    for ch in plain:
+        if ch.isalnum() or ord(ch) > 0xFF:
+            out.append(re.escape(ch))
+            continue
+        hexpair = "".join(
+            f"[{c.upper()}{c.lower()}]" if c.isalpha() else c for c in f"{ord(ch):02X}"
+        )
+        alts = [re.escape(ch), "%" + hexpair, r"\\u00" + hexpair]
+        if ch == "/":
+            alts.append(r"\\/")
+        out.append("(?:" + "|".join(alts) + ")")
+    return "".join(out)
 
 
 # ── httpx request log line ─────────────────────────────────────────────────

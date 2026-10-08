@@ -8,6 +8,7 @@ import itertools
 import re
 import string
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -23,7 +24,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname
+from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -58,7 +59,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
-from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
@@ -783,6 +784,65 @@ def _token_subnet_scope_uuids(user: Any) -> set[uuid.UUID] | None:
     return out
 
 
+async def _enforce_zone_token_scope(
+    db: AsyncSession,
+    user: Any,
+    subnet: Subnet | None,
+    zone_ids: Iterable[Any],
+    *,
+    already: Iterable[Any] = (),
+) -> None:
+    """403 when a resource-scoped token names a DNS zone it holds no grant on
+    (GHSA-875w-8f2h-9mw6).
+
+    IPAM writes take the zone to publish into from the request body
+    (``dns_zone_id``, ``extra_zone_ids``, a subnet's own zone bindings). The
+    router gate only sees the path, and ``ipam:write`` never evaluates the DNS
+    write it causes, so a token bound to one subnet could publish into any zone
+    whose id it knew. A zone passes when it is one of ``subnet``'s effective
+    zones (what that subnet publishes into anyway), one already in ``already``
+    (the row's current binding, so a re-save is not refused), or a zone the
+    token holds a ``dns_zone`` grant on. Sessions, unscoped tokens and tokens
+    with a wildcard ``dns_zone`` grant are not checked.
+    """
+    wanted = {str(z) for z in zone_ids if z}
+    if not wanted or token_scoped_resource_ids(user, "dns_zone") is None:
+        return
+    allowed = {str(z) for z in already if z}
+    if subnet is not None:
+        _, primary, additional = await _resolve_effective_dns(db, subnet)
+        allowed |= {str(z) for z in (additional or []) if z}
+        if primary is not None:
+            allowed.add(str(primary))
+    for zid in sorted(wanted - allowed):
+        if not token_scope_allows(user, "dns_zone", zid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"API token is not scoped to DNS zone {zid}",
+            )
+
+
+def _require_static_delete(user: Any, statics: list[DHCPStaticAssignment], what: str) -> None:
+    """403 when an IPAM delete would remove DHCP reservations the caller may
+    not delete (GHSA-hxpx-gjqf-6p4f).
+
+    Deleting an address (or purging orphans) removes the reservations linked
+    to it, on the DHCP server too. The statics endpoints require ``delete`` on
+    ``dhcp_static`` for that, and #1629's IPAM sync applies the same rule, so
+    this path must as well, or subnet write alone removes a reservation. The
+    delete is refused rather than half-done: the reservation must not outlive
+    a row the caller asked to remove, and a 204 has nowhere to put a warning.
+    """
+    if statics and not user_has_permission(user, "delete", "dhcp_static"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"{what} is linked to {len(statics)} DHCP reservation(s); removing "
+                "them needs 'delete' permission on DHCP reservations (dhcp_static)."
+            ),
+        )
+
+
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
 #
 # An IP that falls inside a ``dynamic`` DHCP pool is handed out by the DHCP
@@ -1109,6 +1169,31 @@ _dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] |
 )
 
 
+# Agentless drivers that still refuse an illegal owner name, so a record
+# carrying one never landed there either. ``technitium_api`` is the same
+# daemon the agent drives. Windows DNS can be set to accept UTF-8 names, and
+# the cloud providers have their own rules, so those keep the delete.
+_AGENTLESS_REFUSING_ILLEGAL_NAMES: frozenset[str] = frozenset({"technitium_api"})
+
+
+def _never_publishable(name: str, rtype: str, value: str) -> bool:
+    """Whether a record could never have been accepted by a DNS server.
+
+    Before #1459 an integration's free-text name ("Vitrinen Schalter") was
+    published verbatim. BIND9, PowerDNS and Technitium refuse such a record,
+    so a delete of it fails on every retry and stays ``failed`` forever. Once
+    the name is folded into a legal one, the rename retracts the old name,
+    and on those servers that retraction has nothing to remove on the wire.
+    """
+    try:
+        validate_record_owner(name)
+        if rtype == "PTR":
+            validate_fqdn(value)
+    except ValueError:
+        return True
+    return False
+
+
 async def _enqueue_dns_op(
     db: AsyncSession,
     zone: DNSZone,
@@ -1126,8 +1211,27 @@ async def _enqueue_dns_op(
     enqueued). For an agentless primary (Windows DNS) the op is applied
     synchronously and its ``state`` is ``applied`` / ``failed`` on return —
     callers use that to avoid stamping a record that didn't land (#428)."""
-    from app.services.dns.record_ops import enqueue_record_op
+    from app.drivers.dns import is_agentless
+    from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
     from app.services.dns.serial import bump_zone_serial
+
+    if op == "delete" and _never_publishable(name, rtype, value):
+        # Only where the primary could never have taken the name: a Windows
+        # server with UTF-8 names enabled may really hold it, and skipping
+        # the retraction there would orphan the record.
+        primary = await resolve_primary_server(db, zone)
+        if primary is not None and (
+            not is_agentless(primary.driver) or primary.driver in _AGENTLESS_REFUSING_ILLEGAL_NAMES
+        ):
+            logger.info(
+                "ipam_dns_delete_skipped_invalid_name",
+                zone=zone.name,
+                name=name,
+                record_type=rtype,
+                driver=primary.driver,
+                detail="the primary refuses this name, so it never held the record",
+            )
+            return None
 
     target_serial = bump_zone_serial(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
@@ -1216,7 +1320,9 @@ async def _create_alias_records(
     if not effective_zone_id:
         return
     zone = await db.get(DNSZone, effective_zone_id)
-    if zone is None:
+    if zone is None or not ipam_authors_zone(zone):
+        # #1633 — a forwarder, a secondary or a stub: another server owns its
+        # names, so IPAM writes no alias into it.
         return
     zone_domain = zone.name.rstrip(".")
     primary_fqdn = f"{ip.hostname}.{zone_domain}."
@@ -1317,7 +1423,15 @@ async def _cname_at(
     )
     if other is None:
         return False
-    logger.warning(
+    # #1493 — every DHCP renewal re-runs the sync for such a name, so the
+    # warning is logged once per (address, hostname, zone) in this process
+    # and at debug after that.
+    key = (str(ip.address), ip.hostname, zone.name)
+    log = logger.debug if key in _cname_skip_logged else logger.warning
+    _cname_skip_logged[key] = None
+    while len(_cname_skip_logged) > _CNAME_SKIP_LOG_MAX:
+        _cname_skip_logged.pop(next(iter(_cname_skip_logged)))
+    log(
         "ipam_dns_record_skipped_cname",
         address=str(ip.address),
         hostname=ip.hostname,
@@ -1327,6 +1441,12 @@ async def _cname_at(
         detail=f"{ip.hostname} already holds a {other.record_type}; no {rtype} written",
     )
     return True
+
+
+# #1493 — the (address, hostname, zone) triples whose CNAME skip was already
+# logged at warning in this process. Insertion-ordered, oldest dropped first.
+_cname_skip_logged: dict[tuple[str, str, str], None] = {}
+_CNAME_SKIP_LOG_MAX = 4096
 
 
 async def _sync_dns_record(
@@ -1344,6 +1464,9 @@ async def _sync_dns_record(
     Forward A goes in the subnet's DNS zone (or explicitly passed zone_id);
     reverse PTR goes in the matching `kind=reverse` zone. Both records are
     pushed to the agent via RFC 2136 dynamic update through the record_op queue.
+    Each is written only into a zone SpatiumDDI serves as primary (#1419 for
+    the PTR, #1633 for the forward records): a forwarder, a secondary or a stub
+    still names the host, but takes no record and no op.
 
     ``ttl`` sets the record TTL on **newly created** records (the DDNS path
     passes the subnet's effective ``ddns_ttl`` — #428); None inherits the
@@ -1454,6 +1577,10 @@ async def _sync_dns_record(
     # the primary always first. ``extra_zone_ids`` is JSONB list[str];
     # each entry is a UUID stored as string.
     desired_zone_ids: list[uuid.UUID] = []
+    # #1493 — whether the primary zone's forward record was skipped for a
+    # CNAME at the hostname, and whether any forward record was published.
+    primary_cname_skip = False
+    forward_published = False
     seen_extras: set[uuid.UUID] = set()
     if effective_zone_id is not None:
         desired_zone_ids.append(effective_zone_id)
@@ -1467,6 +1594,22 @@ async def _sync_dns_record(
             continue
         seen_extras.add(extra_uuid)
         desired_zone_ids.append(extra_uuid)
+
+    # #1633 — IPAM writes a forward record only into a zone it serves as
+    # primary, the rule #1419 set for PTRs. A forwarder, a secondary or a stub,
+    # whether bound to the subnet, chosen for this address or listed in
+    # ``extra_zone_ids``, is not a target: another server owns its names and
+    # refuses the record op. Such a zone still names the host (``fqdn`` above,
+    # the PTR below). A record a release before the fix wrote into one is
+    # dropped in Phase 1, with no op.
+    authored_zone_ids: list[uuid.UUID] = []
+    for desired_zone_id in desired_zone_ids:
+        target = (
+            zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
+        )
+        if target is not None and ipam_authors_zone(target):
+            authored_zone_ids.append(desired_zone_id)
+    desired_zone_ids = authored_zone_ids
 
     # Fetch any pre-existing auto-generated A/AAAA for this IP across
     # ALL zones — fanout cleanup needs the full picture. The address
@@ -1482,10 +1625,11 @@ async def _sync_dns_record(
 
     if is_default_gateway_name:
         # Tear down any A/AAAA record that may have been published before the
-        # user renamed the IP back to the default. PTR continues below.
+        # user renamed the IP back to the default. PTR continues below. A
+        # zone IPAM does not author never took the record (#1633): no op.
         for record in existing_records:
             old_zone = await db.get(DNSZone, record.zone_id)
-            if old_zone is not None:
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db,
                     old_zone,
@@ -1512,7 +1656,10 @@ async def _sync_dns_record(
             if rec.zone_id in desired_zone_ids:
                 continue
             old_zone = await db.get(DNSZone, rec.zone_id)
-            if old_zone is not None:
+            # #1633 — a zone IPAM does not author never took the record (a
+            # release before the fix wrote it there): drop the row, queue no
+            # op it would refuse.
+            if old_zone is not None and ipam_authors_zone(old_zone):
                 await _enqueue_dns_op(
                     db,
                     old_zone,
@@ -1525,9 +1672,18 @@ async def _sync_dns_record(
                 )
             await db.delete(rec)
             existing_by_zone.pop(rec.zone_id, None)
+            if ip.dns_record_id == rec.id:
+                ip.dns_record_id = None  # Phase 2 stamps the new record, if any
+
+        if zone is not None and not ipam_authors_zone(zone):
+            # #1633 — no record for the zone the host is named in, but the
+            # address keeps it as its forward zone, so a later edit stays in
+            # it rather than re-homing the host into the subnet's zone (#493).
+            ip.forward_zone_id = effective_zone_id
 
         # Phase 2: walk each desired zone, create or update.
         for desired_zone_id in desired_zone_ids:
+            is_primary_zone = desired_zone_id == effective_zone_id
             target_zone = (
                 zone
                 if desired_zone_id == effective_zone_id
@@ -1541,6 +1697,7 @@ async def _sync_dns_record(
             existing = existing_by_zone.get(desired_zone_id)
             if existing is None:
                 if await _cname_at(db, target_zone, ip, forward_rtype):
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
@@ -1591,6 +1748,7 @@ async def _sync_dns_record(
                 if await _cname_at(db, target_zone, ip, forward_rtype, exclude_id=existing.id):
                     if desired_zone_id == effective_zone_id:
                         ip.dns_record_id = None
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
@@ -1641,6 +1799,7 @@ async def _sync_dns_record(
                     await db.delete(existing)
                     if desired_zone_id == effective_zone_id:
                         ip.dns_record_id = None
+                    primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
                 if name_changed:
                     # A rename is delete-at-old-name + create-at-new-name at
@@ -1686,6 +1845,7 @@ async def _sync_dns_record(
                         str(ip.address),
                         existing.ttl,
                     )
+            forward_published = True
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
     # A PTR points AT the forward FQDN. With no effective primary forward zone
@@ -1696,7 +1856,13 @@ async def _sync_dns_record(
     # TypeError (None + str) — reachable through the public create endpoint for a
     # split-horizon IP with extra_zone_ids and no forward zone, or an IP whose
     # primary forward zone was deleted (issue #480).
-    if fqdn is None:
+    # #1493 — and when the primary zone's forward record was skipped because
+    # the hostname holds a CNAME: a PTR naming it would name an alias, which
+    # RFC 1912 section 2.4 rules out (the reverse lookup would lead forward
+    # to the CNAME's target, not back to this address). Retract it the same
+    # way. The sync then reports whether any forward record was published,
+    # so the DDNS path stops logging a skipped name as applied.
+    if fqdn is None or primary_cname_skip:
         # Don't just skip: retract any auto-generated PTR we previously
         # published for this IP. When the primary forward zone was deleted /
         # detached, the PTR now points at a name that can no longer be
@@ -1724,6 +1890,11 @@ async def _sync_dns_record(
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
+        if primary_cname_skip and not forward_published:
+            # Read by the DDNS path so it reports the CNAME clash, not "no
+            # forward zone" (not a mapped column; lives for this request).
+            ip._dns_skipped_cname = True  # type: ignore[attr-defined]
+            return False
         return True
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))
@@ -4280,6 +4451,11 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             detail="API token is bound to a specific subnet and cannot create new subnets",
         )
     _require_type_write(current_user, "subnet")
+    # GHSA-875w — a zone the new subnet is bound to must be one the token may
+    # write (zones it inherits from its block are not named here).
+    await _enforce_zone_token_scope(
+        db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
+    )
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -5354,6 +5530,15 @@ async def update_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — rebinding the subnet's zones would make every later address
+    # write publish there: a zone it names must be one the token may write
+    # (its current effective zones pass, so a re-save is not refused).
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        subnet,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+    )
     _require_type_write(current_user, "subnet")
 
     old_block_id = subnet.block_id
@@ -6669,6 +6854,17 @@ async def _apply_dns_sync(
         )
         stale_records = list(stale_res.scalars().all())
 
+        # #1554 re-check: a stale ID handed to us (by the auto-sync task
+        # or a manual apply) may name a record owned by an integration
+        # mirror, the DNS pool pipeline, or ACME — those are not IPAM
+        # sync output and must never be deleted here, whatever the
+        # report that produced the ID said.
+        from app.services.integration_ownership import (  # noqa: PLC0415
+            dns_record_owned_elsewhere,
+        )
+
+        stale_records = [r for r in stale_records if not dns_record_owned_elsewhere(r)]
+
         # Group by zone so each zone's primary server gets a single
         # batched driver call (critical for agentless Windows DNS — one
         # WinRM round trip per zone instead of one per record).
@@ -7368,6 +7564,11 @@ async def create_address(
             detail=f"Address {body.address} is already allocated in this subnet",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
+
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
@@ -7727,6 +7928,19 @@ async def update_address(
     # would match it. The ``exclude_ip_id`` filter prevents this IP from
     # colliding with its own current state.
     touched = body.model_dump(exclude_unset=True)
+    # GHSA-875w — a zone this edit names must be one the token may write; the
+    # row's current bindings pass, so a re-save is not refused.
+    if "dns_zone_id" in touched or "extra_zone_ids" in touched:
+        await _enforce_zone_token_scope(
+            db,
+            current_user,
+            await db.get(Subnet, ip.subnet_id),
+            [
+                body.dns_zone_id if "dns_zone_id" in touched else None,
+                *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+            ],
+            already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+        )
     hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
     mac_touched = "mac_address" in touched
     # Effective role for the collision check — pending value if the
@@ -7936,6 +8150,17 @@ async def add_alias(
         raise HTTPException(
             status_code=409,
             detail="No DNS zone configured for this subnet — add one first.",
+        )
+    zone = await db.get(DNSZone, zone_id)
+    if zone is not None and not ipam_authors_zone(zone):
+        # #1633 — say why rather than fall through to "failed to create".
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"DNS zone {zone.name} is a {zone.zone_type} zone, not one SpatiumDDI "
+                "serves as primary: another server owns its names, so IPAM writes no "
+                "records into it."
+            ),
         )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     # Find the just-created record
@@ -8228,11 +8453,13 @@ async def delete_address(
             _static_conds.append(DHCPStaticAssignment.id == uuid.UUID(str(ip.static_assignment_id)))
     statics_res = await db.execute(select(DHCPStaticAssignment).where(or_(*_static_conds)))
     statics_rows = list(statics_res.scalars().all())
+    _require_static_delete(current_user, statics_rows, f"Address {ip.address}")
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
     # Kea / ISC. Typically one row — the batch overhead is negligible.
     await push_statics_bulk_delete(db, statics_rows)
     for static in statics_rows:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     if permanent:
@@ -8323,8 +8550,10 @@ async def purge_orphans(
         )
     )
     lingering_statics = list(stat_res.scalars().all())
+    _require_static_delete(current_user, lingering_statics, "This purge")
     await push_statics_bulk_delete(db, lingering_statics)
     for static in lingering_statics:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     for ip in rows:
@@ -8683,6 +8912,8 @@ async def bulk_allocate_commit(
     # Token-scope parity with the other address handlers (this one historically
     # lacked the check).
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -8964,6 +9195,10 @@ async def allocate_next_ip(
             detail="mac_address is required when status is 'static_dhcp'",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
     if not body.force:
@@ -9847,6 +10082,24 @@ async def bulk_edit_addresses(
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
                 continue
+            # GHSA-875w — nor move an IP into a zone the token holds no grant
+            # on (the IP's own subnet zones and its current zone pass).
+            if new_zone_id is not None:
+                if ip.subnet_id not in subnet_cache:
+                    loaded = await db.get(Subnet, ip.subnet_id)
+                    if loaded is not None:
+                        subnet_cache[ip.subnet_id] = loaded
+                try:
+                    await _enforce_zone_token_scope(
+                        db,
+                        current_user,
+                        subnet_cache.get(ip.subnet_id),
+                        [new_zone_id],
+                        already=[ip.forward_zone_id],
+                    )
+                except HTTPException:
+                    skipped.append(ip.id)
+                    continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
             subnet_writable, set_ranges = await _gate_for(ip.subnet_id)

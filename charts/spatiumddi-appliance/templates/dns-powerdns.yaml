@@ -169,6 +169,10 @@ metadata:
 spec:
   {{- if .Values.dns.useMetalLBVIP }}
   type: LoadBalancer
+  # Keep the client's source address — see dns-bind9.yaml.
+  externalTrafficPolicy: Local
+  # #1550 — see dns-bind9.yaml: a MetalLB VIP needs no NodePorts.
+  allocateLoadBalancerNodePorts: false
   {{- else }}
   type: ClusterIP
   {{- end }}
