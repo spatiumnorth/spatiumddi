@@ -44,7 +44,11 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.services._mirror_hostname import normalize_desired_hostname
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.integration_ownership import (
+    owned_by_other_integration,
+    owning_integration,
+    subnet_has_surviving_addresses,
+)
 from app.services.unifi.client import (
     UnifiClient,
     UnifiClientConfig,
@@ -571,6 +575,14 @@ async def _apply_blocks_and_subnets(
 
     for net_str, row in current_subnets.items():
         if net_str in desired_map:
+            continue
+        # #1558: a blind delete cascades to every address in the subnet,
+        # including operator / foreign / operator-edited rows. Hand the
+        # subnet back (un-claim) when any such survivor exists, like the
+        # OPNsense reconciler does.
+        if await subnet_has_surviving_addresses(db, row.id, "unifi_controller_id"):
+            row.unifi_controller_id = None
+            summary.subnets_updated += 1
             continue
         await db.delete(row)
         summary.subnets_deleted += 1

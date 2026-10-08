@@ -497,7 +497,15 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
 
     # ── Zone writes ─────────────────────────────────────────────────────
 
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         api_url, token, verify = self._creds(creds)
         bare = normalize_fqdn(str(getattr(zone, "name", ""))).rstrip(".")
         if not bare:

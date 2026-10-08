@@ -42,6 +42,7 @@ from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DN
 from app.services.acme import ACME_TXT_TTL
 from app.services.dns.record_ops import enqueue_record_op
 from app.services.dns.serial import bump_zone_serial
+from app.services.integration_ownership import ACME_RECORD_TAG
 
 logger = structlog.get_logger(__name__)
 
@@ -200,6 +201,9 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
         value=txt_value,
         ttl=ACME_TXT_TTL,
         auto_generated=True,
+        # #1554: ACME records are not IPAM sync output — mark them so
+        # the IPAM DNS drift sweep leaves them alone.
+        tags={ACME_RECORD_TAG: True},
     )
     db.add(record)
     target_serial = bump_zone_serial(zone)

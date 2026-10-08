@@ -5181,11 +5181,26 @@ EOF
             log "SSH: password authentication disabled (key-only)"
         fi
 
-        # Disable cloud-init on the installed system (we configured
-        # everything ourselves; cloud-init would just sit waiting for a
-        # datasource that isn't there).
+        # Disable cloud-init on the installed system: the network, the
+        # admin account and every other answer come from STATE, which we
+        # wrote ourselves.
+        #
+        # #1511 — the masks alone never worked. They land in the /etc
+        # overlay (/var/persist/etc), which etc.mount brings up after
+        # systemd has loaded its units, so at boot every cloud-init unit
+        # was still loadable, and cloud-init 25.1 (trixie) also renamed
+        # them (cloud-init-main, cloud-init-network). With the CIDATA
+        # drive still attached after a preseed install, init-local wrote
+        # a DHCP profile (cloud-init-<iface>.nmconnection) beside the
+        # static one. Every cloud-init unit carries
+        # ConditionPathExists=!/etc/cloud/cloud-init.disabled and starts
+        # after etc.mount, so the marker is what keeps it off. The masks
+        # stay, with the 25.1 names, for anything that reloads units later.
+        install -d -m 0755 "$MOUNT/etc/cloud"
+        : > "$MOUNT/etc/cloud/cloud-init.disabled"
         chroot "$MOUNT" systemctl mask \
-            cloud-init.service cloud-init-local.service \
+            cloud-init.service cloud-init-main.service \
+            cloud-init-local.service cloud-init-network.service \
             cloud-config.service cloud-final.service \
             >> "$INSTALL_LOG" 2>&1 || true
 

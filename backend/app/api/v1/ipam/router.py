@@ -8,6 +8,7 @@ import itertools
 import re
 import string
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -58,7 +59,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
-from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
@@ -781,6 +782,65 @@ def _token_subnet_scope_uuids(user: Any) -> set[uuid.UUID] | None:
         except (ValueError, TypeError):
             continue
     return out
+
+
+async def _enforce_zone_token_scope(
+    db: AsyncSession,
+    user: Any,
+    subnet: Subnet | None,
+    zone_ids: Iterable[Any],
+    *,
+    already: Iterable[Any] = (),
+) -> None:
+    """403 when a resource-scoped token names a DNS zone it holds no grant on
+    (GHSA-875w-8f2h-9mw6).
+
+    IPAM writes take the zone to publish into from the request body
+    (``dns_zone_id``, ``extra_zone_ids``, a subnet's own zone bindings). The
+    router gate only sees the path, and ``ipam:write`` never evaluates the DNS
+    write it causes, so a token bound to one subnet could publish into any zone
+    whose id it knew. A zone passes when it is one of ``subnet``'s effective
+    zones (what that subnet publishes into anyway), one already in ``already``
+    (the row's current binding, so a re-save is not refused), or a zone the
+    token holds a ``dns_zone`` grant on. Sessions, unscoped tokens and tokens
+    with a wildcard ``dns_zone`` grant are not checked.
+    """
+    wanted = {str(z) for z in zone_ids if z}
+    if not wanted or token_scoped_resource_ids(user, "dns_zone") is None:
+        return
+    allowed = {str(z) for z in already if z}
+    if subnet is not None:
+        _, primary, additional = await _resolve_effective_dns(db, subnet)
+        allowed |= {str(z) for z in (additional or []) if z}
+        if primary is not None:
+            allowed.add(str(primary))
+    for zid in sorted(wanted - allowed):
+        if not token_scope_allows(user, "dns_zone", zid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"API token is not scoped to DNS zone {zid}",
+            )
+
+
+def _require_static_delete(user: Any, statics: list[DHCPStaticAssignment], what: str) -> None:
+    """403 when an IPAM delete would remove DHCP reservations the caller may
+    not delete (GHSA-hxpx-gjqf-6p4f).
+
+    Deleting an address (or purging orphans) removes the reservations linked
+    to it, on the DHCP server too. The statics endpoints require ``delete`` on
+    ``dhcp_static`` for that, and #1629's IPAM sync applies the same rule, so
+    this path must as well, or subnet write alone removes a reservation. The
+    delete is refused rather than half-done: the reservation must not outlive
+    a row the caller asked to remove, and a 204 has nowhere to put a warning.
+    """
+    if statics and not user_has_permission(user, "delete", "dhcp_static"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"{what} is linked to {len(statics)} DHCP reservation(s); removing "
+                "them needs 'delete' permission on DHCP reservations (dhcp_static)."
+            ),
+        )
 
 
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
@@ -4391,6 +4451,11 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             detail="API token is bound to a specific subnet and cannot create new subnets",
         )
     _require_type_write(current_user, "subnet")
+    # GHSA-875w — a zone the new subnet is bound to must be one the token may
+    # write (zones it inherits from its block are not named here).
+    await _enforce_zone_token_scope(
+        db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
+    )
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -5465,6 +5530,15 @@ async def update_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — rebinding the subnet's zones would make every later address
+    # write publish there: a zone it names must be one the token may write
+    # (its current effective zones pass, so a re-save is not refused).
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        subnet,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+    )
     _require_type_write(current_user, "subnet")
 
     old_block_id = subnet.block_id
@@ -6780,6 +6854,17 @@ async def _apply_dns_sync(
         )
         stale_records = list(stale_res.scalars().all())
 
+        # #1554 re-check: a stale ID handed to us (by the auto-sync task
+        # or a manual apply) may name a record owned by an integration
+        # mirror, the DNS pool pipeline, or ACME — those are not IPAM
+        # sync output and must never be deleted here, whatever the
+        # report that produced the ID said.
+        from app.services.integration_ownership import (  # noqa: PLC0415
+            dns_record_owned_elsewhere,
+        )
+
+        stale_records = [r for r in stale_records if not dns_record_owned_elsewhere(r)]
+
         # Group by zone so each zone's primary server gets a single
         # batched driver call (critical for agentless Windows DNS — one
         # WinRM round trip per zone instead of one per record).
@@ -7479,6 +7564,11 @@ async def create_address(
             detail=f"Address {body.address} is already allocated in this subnet",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
+
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
@@ -7838,6 +7928,19 @@ async def update_address(
     # would match it. The ``exclude_ip_id`` filter prevents this IP from
     # colliding with its own current state.
     touched = body.model_dump(exclude_unset=True)
+    # GHSA-875w — a zone this edit names must be one the token may write; the
+    # row's current bindings pass, so a re-save is not refused.
+    if "dns_zone_id" in touched or "extra_zone_ids" in touched:
+        await _enforce_zone_token_scope(
+            db,
+            current_user,
+            await db.get(Subnet, ip.subnet_id),
+            [
+                body.dns_zone_id if "dns_zone_id" in touched else None,
+                *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+            ],
+            already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+        )
     hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
     mac_touched = "mac_address" in touched
     # Effective role for the collision check — pending value if the
@@ -8350,11 +8453,13 @@ async def delete_address(
             _static_conds.append(DHCPStaticAssignment.id == uuid.UUID(str(ip.static_assignment_id)))
     statics_res = await db.execute(select(DHCPStaticAssignment).where(or_(*_static_conds)))
     statics_rows = list(statics_res.scalars().all())
+    _require_static_delete(current_user, statics_rows, f"Address {ip.address}")
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
     # Kea / ISC. Typically one row — the batch overhead is negligible.
     await push_statics_bulk_delete(db, statics_rows)
     for static in statics_rows:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     if permanent:
@@ -8445,8 +8550,10 @@ async def purge_orphans(
         )
     )
     lingering_statics = list(stat_res.scalars().all())
+    _require_static_delete(current_user, lingering_statics, "This purge")
     await push_statics_bulk_delete(db, lingering_statics)
     for static in lingering_statics:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     for ip in rows:
@@ -8805,6 +8912,8 @@ async def bulk_allocate_commit(
     # Token-scope parity with the other address handlers (this one historically
     # lacked the check).
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -9086,6 +9195,10 @@ async def allocate_next_ip(
             detail="mac_address is required when status is 'static_dhcp'",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
     if not body.force:
@@ -9969,6 +10082,24 @@ async def bulk_edit_addresses(
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
                 continue
+            # GHSA-875w — nor move an IP into a zone the token holds no grant
+            # on (the IP's own subnet zones and its current zone pass).
+            if new_zone_id is not None:
+                if ip.subnet_id not in subnet_cache:
+                    loaded = await db.get(Subnet, ip.subnet_id)
+                    if loaded is not None:
+                        subnet_cache[ip.subnet_id] = loaded
+                try:
+                    await _enforce_zone_token_scope(
+                        db,
+                        current_user,
+                        subnet_cache.get(ip.subnet_id),
+                        [new_zone_id],
+                        already=[ip.forward_zone_id],
+                    )
+                except HTTPException:
+                    skipped.append(ip.id)
+                    continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
             subnet_writable, set_ranges = await _gate_for(ip.subnet_id)
