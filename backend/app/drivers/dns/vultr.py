@@ -367,7 +367,15 @@ class VultrDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Vultr: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         label = self._zone_label(getattr(zone, "name", ""))
         async with self._client(token) as client:

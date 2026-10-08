@@ -31,18 +31,21 @@ A couple of Route-53-specific wrinkles the hooks paper over:
 from __future__ import annotations
 
 import asyncio
-import uuid
+import hashlib
 from typing import Any
 
 import structlog
 
 from app.drivers.dns._cloud_base import (
+    CloudDNSConflictError,
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
     compose_structured_rdata,
+    managed_value_index,
     normalize_fqdn,
     split_structured_rdata,
+    value_is_managed,
 )
 from app.drivers.dns.base import RecordChange, RecordData
 
@@ -444,21 +447,61 @@ class Route53DNSDriver(CloudDNSDriverBase):
         return normalize_fqdn(name.rstrip(".") + "." + apex.rstrip("."))
 
     # ── Zone write ──────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         client = self._client(creds)
         name = normalize_fqdn(getattr(zone, "name", "") or "")
         if name == ".":
             raise CloudDNSError("route53._apply_zone: zone name is required")
 
         if op == "create":
+            # #1527 — derive CallerReference from the logical create (the
+            # zone row id when the caller carries one, plus the zone name)
+            # so AWS deduplicates a retried request under the same
+            # reference instead of minting a second hosted zone.
+            caller_reference = hashlib.sha256(
+                f"{getattr(zone, 'id', '')}:{name}".encode()
+            ).hexdigest()
+            matches = await self._find_zones_by_name(client, name)
+            for match in matches:
+                if match["caller_reference"] == caller_reference:
+                    # A retry of THIS zone row's create — the hosted zone
+                    # already minted by the first attempt IS ours (same
+                    # deterministic CallerReference), so the create is
+                    # already done. Anything else with this name is not.
+                    logger.info(
+                        "route53.apply_zone.create_idempotent_retry",
+                        server=str(getattr(server, "id", "")),
+                        zone=name,
+                        zone_id=match["id"],
+                    )
+                    return
+            if matches:
+                # Never adopt a hosted zone SpatiumDDI did not create:
+                # adopting it would put a foreign zone under management,
+                # and a later delete here would tear it down. Refuse and
+                # point at the explicit adoption path instead.
+                existing = sorted(matches, key=lambda m: (m["private"], m["id"]))[0]
+                raise CloudDNSConflictError(
+                    f"route53: a hosted zone named {name!r} already exists in this "
+                    f"AWS account (hosted zone id {existing['id']}); SpatiumDDI will "
+                    "not adopt a zone it did not create. Use 'Import existing zones' "
+                    "(POST /api/v1/dns/import/cloud/preview, then "
+                    "POST /api/v1/dns/import/cloud/commit) to bring the existing "
+                    "zone under management, or delete it in the AWS console and retry."
+                )
             try:
                 await asyncio.to_thread(
                     client.create_hosted_zone,
                     Name=name,
-                    # CallerReference must be unique per create — a fresh
-                    # uuid makes the call idempotently safe to retry only
-                    # within the same uuid; a new attempt mints a new one.
-                    CallerReference=uuid.uuid4().hex,
+                    CallerReference=caller_reference,
                 )
             except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
                 raise CloudDNSError(
@@ -467,10 +510,38 @@ class Route53DNSDriver(CloudDNSDriverBase):
             return
 
         if op == "delete":
-            zone_id = await self._resolve_zone_id(client, name)
+            try:
+                zone_id = await self._resolve_zone_id(client, name)
+            except CloudDNSError as exc:
+                # #1528 — an already-absent zone is the desired end state;
+                # treat it as success so trash purge / permanent delete /
+                # move don't retry forever.
+                if "not found" in str(exc):
+                    logger.info(
+                        "route53.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=name,
+                    )
+                    return
+                raise
+            # #1528 — Route 53 refuses to delete a populated zone
+            # (HostedZoneNotEmpty); empty OUR records first. Records the
+            # provider holds that SpatiumDDI never managed are left in
+            # place — if they keep the zone non-empty, the delete below
+            # fails honestly instead of wiping them.
+            await self._empty_zone(client, zone_id, name, managed_records)
             try:
                 await asyncio.to_thread(client.delete_hosted_zone, Id=zone_id)
             except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+                if _is_no_such_hosted_zone(exc):
+                    return
+                if _is_hosted_zone_not_empty(exc):
+                    raise CloudDNSError(
+                        f"route53 delete_hosted_zone failed for {name!r}: the zone "
+                        "still contains records SpatiumDDI does not manage, so it "
+                        "was left in place. Remove those records in the AWS console "
+                        "(or import the zone and delete them here), then retry."
+                    ) from exc
                 raise CloudDNSError(
                     f"route53 delete_hosted_zone failed for {name!r}: {exc}"
                 ) from exc
@@ -478,22 +549,146 @@ class Route53DNSDriver(CloudDNSDriverBase):
 
         raise CloudDNSError(f"route53._apply_zone: unsupported op {op!r}")
 
+    async def _empty_zone(
+        self,
+        client: Any,
+        zone_id: str,
+        apex: str,
+        managed_records: list[RecordData] | None,
+    ) -> None:
+        """Delete the rrsets SpatiumDDI manages ahead of a zone delete (#1528).
+
+        Scoped to ``managed_records`` (the zone's records as our DB knows
+        them): a live rrset value is removed only when SpatiumDDI manages
+        it. An rrset whose values are ALL managed is deleted wholesale
+        (the exact live rrset, as Route 53 requires for a DELETE); a
+        mixed rrset is UPSERTed down to just its unmanaged values, so a
+        foreign value sharing a name/type with ours survives. SOA and
+        apex NS are always skipped — Route 53 owns them and allows the
+        zone delete with only those present.
+
+        ``managed_records is None`` means the caller supplied no scoping
+        information: delete NOTHING. The subsequent ``delete_hosted_zone``
+        then either succeeds (zone held only SOA / apex NS) or fails
+        ``HostedZoneNotEmpty``, which the caller surfaces — an honest
+        failure, never a guessed-at wipe.
+        """
+        if managed_records is None:
+            logger.info(
+                "route53.apply_zone.delete_unscoped_no_empty",
+                zone=apex,
+                zone_id=zone_id,
+            )
+            return
+        index = managed_value_index(managed_records, apex, self._absolutize)
+        apex_fqdn = normalize_fqdn(apex)
+        changes: list[dict[str, Any]] = []
+        next_name: str | None = None
+        next_type: str | None = None
+        try:
+            while True:
+                kwargs: dict[str, Any] = {"HostedZoneId": zone_id, "MaxItems": "300"}
+                if next_name:
+                    kwargs["StartRecordName"] = next_name
+                if next_type:
+                    kwargs["StartRecordType"] = next_type
+                resp = await asyncio.to_thread(client.list_resource_record_sets, **kwargs)
+                for rrset in resp.get("ResourceRecordSets", []):
+                    rtype = str(rrset.get("Type", "")).upper()
+                    if rtype == "SOA":
+                        continue
+                    if rtype == "NS" and normalize_fqdn(str(rrset.get("Name", ""))) == apex_fqdn:
+                        continue
+                    change = self._scoped_empty_change(rrset, index)
+                    if change is not None:
+                        changes.append(change)
+                if resp.get("IsTruncated") is not True:
+                    break
+                next_name = resp.get("NextRecordName")
+                next_type = resp.get("NextRecordType")
+                if next_name is None and next_type is None:
+                    break
+        except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+            raise CloudDNSError(
+                f"route53 list_resource_record_sets (zone empty) failed for " f"{apex!r}: {exc}"
+            ) from exc
+
+        for start in range(0, len(changes), 100):
+            change_batch = {"Changes": changes[start : start + 100]}
+            try:
+                await asyncio.to_thread(
+                    client.change_resource_record_sets,
+                    HostedZoneId=zone_id,
+                    ChangeBatch=change_batch,
+                )
+            except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
+                raise CloudDNSError(
+                    f"route53 change_resource_record_sets (zone empty) failed "
+                    f"for {apex!r}: {exc}"
+                ) from exc
+
+    def _scoped_empty_change(
+        self, rrset: dict[str, Any], index: dict[tuple[str, str], set[str]]
+    ) -> dict[str, Any] | None:
+        """Build the change removing one live rrset's managed values.
+
+        Returns ``None`` when SpatiumDDI manages none of the rrset's
+        values (the rrset is foreign — leave it exactly as it is).
+        """
+        rtype = str(rrset.get("Type", "")).upper()
+        key = (normalize_fqdn(str(rrset.get("Name", ""))), rtype)
+        candidates = index.get(key)
+        if not candidates:
+            return None
+
+        alias = rrset.get("AliasTarget")
+        if alias:
+            # ALIAS rrsets are single-valued: delete whole or leave whole.
+            if value_is_managed(str(alias.get("DNSName", "")), candidates):
+                return {"Action": "DELETE", "ResourceRecordSet": rrset}
+            return None
+
+        values = self._existing_values(rrset)
+        managed = [v for v in values if value_is_managed(v, candidates)]
+        if not managed:
+            return None
+        if len(managed) == len(values):
+            # Every value is ours — delete the exact live rrset.
+            return {"Action": "DELETE", "ResourceRecordSet": rrset}
+        # Mixed rrset — reduce it to just the unmanaged values.
+        remaining = [v for v in values if not value_is_managed(v, candidates)]
+        return {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": rrset.get("Name"),
+                "Type": rtype,
+                "TTL": int(rrset.get("TTL", 300) or 300),
+                "ResourceRecords": [{"Value": v} for v in remaining],
+            },
+        }
+
     # ── Hosted-zone id resolution ───────────────────────────────────────
-    async def _resolve_zone_id(self, client: Any, zone_name: str) -> str:
-        """Resolve a hosted-zone id from a zone FQDN.
+    async def _find_zones_by_name(self, client: Any, zone_name: str) -> list[dict[str, Any]]:
+        """Return every hosted zone whose name exactly matches ``zone_name``.
+
+        Each entry is ``{"id", "caller_reference", "private"}``. Route 53
+        happily holds several zones under one name (a public zone and a
+        VPC-associated private zone, duplicates from console creates),
+        so callers that care WHICH zone they act on need the full match
+        set, not a first-hit.
 
         ``list_hosted_zones_by_name`` returns hosted zones in Route 53's
         name sort order starting at-or-after ``DNSName``. A single
         ``MaxItems='1'`` result can be a *neighbouring* zone (one that
         sorts at-or-after the queried name but isn't the exact match —
-        common when the account holds sibling / sub-zones), so we must not
-        conclude "not found" from one row. Instead we page through the
-        result set via the ``IsTruncated`` / ``NextDNSName`` /
-        ``NextHostedZoneId`` continuation tokens, scanning each page for the
-        exact apex match. A modest page size keeps the common case (the
-        match is the first row) to a single round-trip.
+        common when the account holds sibling / sub-zones), so we page
+        through the result set via the ``IsTruncated`` / ``NextDNSName``
+        / ``NextHostedZoneId`` continuation tokens, scanning each page
+        for exact apex matches. A modest page size keeps the common case
+        (the match is the first row) to a single round-trip.
         """
         apex = normalize_fqdn(zone_name)
+        matches: list[dict[str, Any]] = []
         next_dns_name: str | None = apex
         next_zone_id: str | None = None
         while True:
@@ -510,7 +705,19 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 ) from exc
             for z in resp.get("HostedZones", []):
                 if normalize_fqdn(z.get("Name", "")) == apex:
-                    return str(z.get("Id", "")).split("/")[-1]
+                    matches.append(
+                        {
+                            "id": str(z.get("Id", "")).split("/")[-1],
+                            "caller_reference": str(z.get("CallerReference", "")),
+                            "private": bool((z.get("Config") or {}).get("PrivateZone")),
+                        }
+                    )
+                elif matches:
+                    # Zones arrive in name sort order, so every exact-name
+                    # match is contiguous: the first different name after
+                    # the match run means the run is complete — no later
+                    # page can hold another match.
+                    return matches
             if not resp.get("IsTruncated"):
                 break
             # Route 53 hands back the start key for the NEXT page. Without
@@ -520,7 +727,25 @@ class Route53DNSDriver(CloudDNSDriverBase):
             next_zone_id = resp.get("NextHostedZoneId")
             if next_dns_name is None and next_zone_id is None:
                 break
-        raise CloudDNSError(f"route53: hosted zone {zone_name!r} not found")
+        return matches
+
+    async def _resolve_zone_id(self, client: Any, zone_name: str) -> str:
+        """Resolve a hosted-zone id from a zone FQDN.
+
+        Same-name ambiguity is resolved deterministically: when the
+        account holds several zones under this exact name, prefer the
+        PUBLIC zone over a private (VPC-associated) one — SpatiumDDI
+        manages authoritative zones, and a same-name private zone is
+        almost never the managed one — then the lowest hosted-zone id,
+        so every caller lands on the same zone every time. (Zones
+        SpatiumDDI itself created are created exactly once per name;
+        duplicates only enter the picture via import / console, where
+        this rule is the documented tie-break.)
+        """
+        matches = await self._find_zones_by_name(client, zone_name)
+        if not matches:
+            raise CloudDNSError(f"route53: hosted zone {zone_name!r} not found")
+        return sorted(matches, key=lambda m: (m["private"], m["id"]))[0]["id"]
 
     # ── Capabilities ────────────────────────────────────────────────────
     def capabilities(self) -> dict[str, Any]:
@@ -577,6 +802,28 @@ def _is_invalid_change_batch(exc: Exception) -> bool:
         if code in {"InvalidChangeBatch", "NoSuchChange"}:
             return True
     return "InvalidChangeBatch" in str(exc)
+
+
+def _is_no_such_hosted_zone(exc: Exception) -> bool:
+    """True when ``exc`` is a Route 53 NoSuchHostedZone error (#1528)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))
+        if code == "NoSuchHostedZone":
+            return True
+    return "NoSuchHostedZone" in str(exc)
+
+
+def _is_hosted_zone_not_empty(exc: Exception) -> bool:
+    """True when ``exc`` is a Route 53 HostedZoneNotEmpty error — the
+    zone still holds records (after managed-only emptying, records
+    SpatiumDDI does not manage)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", ""))
+        if code == "HostedZoneNotEmpty":
+            return True
+    return "HostedZoneNotEmpty" in str(exc)
 
 
 __all__ = ["Route53DNSDriver"]

@@ -383,7 +383,15 @@ class LinodeDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Linode: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         bare = zone_fqdn.rstrip(".")

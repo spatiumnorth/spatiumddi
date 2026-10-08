@@ -161,6 +161,7 @@ _AGENT_REASONS = [
     ("config_apply_no_previous: named-checkconf failed", True),  # dns sync.py
     ("dhcp4_config_rejected: pool 10.0.0.0/24 is not part of the subnet", True),
     ("dhcp6_config_rejected: unknown option", True),
+    ("config_apply_unvalidated: dhcp4: kea-dhcp4 -t timed out after 30s", True),  # dhcp
     ("dhcp4_socket_unreachable: [Errno 111] Connection refused", False),
     ("dhcp6_socket_unreachable: [Errno 2] No such file or directory", False),
 ]

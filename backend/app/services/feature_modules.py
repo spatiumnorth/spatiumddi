@@ -372,7 +372,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="dns.import",
         label="DNS configuration import",
         group="DNS",
-        description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
+        description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Run it from Administration → Import → DNS; each source asks for its own credentials or file upload.",
         requires=("core.dns",),
     ),
     # Dynamic-update (RFC 2136) ACLs on zones (issue #641). Lets an
@@ -417,7 +417,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="dhcp.import",
         label="DHCP configuration import",
         group="DHCP",
-        description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Settings → Import → DHCP surface; sources gate behind their own credential / file-upload step.",
+        description="One-shot import from Kea / Windows DHCP / ISC dhcpd.conf into SpatiumDDI's native scopes + pools + reservations + classes. Run it from Administration → Import → DHCP; each source asks for its own credentials or file upload.",
         requires=("core.dhcp",),
     ),
     # IPAM — NetBox read-only one-shot migration importer (issue #36).
@@ -456,7 +456,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="ipam.import.netbox",
         label="NetBox import",
         group="IPAM",
-        description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Settings → Import → NetBox surface; connection + token are supplied per-import (never persisted).",
+        description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Run it from Administration → Import → NetBox; the connection and token are supplied per import and never stored.",
     ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
@@ -563,7 +563,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="appliance.firewall",
         label="Fleet Firewall",
         group="Appliance",
-        description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (Settings → firewall_enabled, default OFF). Enabling this module does NOT apply any firewall.",
+        description="Declarative per-role, fleet-wide appliance firewall policy compiled to nftables. DISCOVERY/STAGING only — enforcement is a separate master switch (the Enforcement card under Appliance → Firewall → Policies; default OFF). Enabling this module does NOT apply any firewall.",
     ),
     # Security — embedded ACME client for the Web UI TLS cert (#438).
     # Default-ENABLED deliberately: the module is the DISCOVERY toggle so
@@ -575,7 +575,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.certificates",
         label="Certificates (ACME / Let's Encrypt)",
         group="Security",
-        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in (Settings → acme_enabled).",
+        description="Embedded RFC 8555 ACME client that issues a CA-trusted Web UI TLS cert from Let's Encrypt, solving the DNS-01 challenge through SpatiumDDI's own managed DNS zones. Discovery toggle only — issuance is RBAC-gated and requires an explicit operator opt-in: registering an ACME account, under Appliance → Fleet → Web UI Certificate → Issue via Let's Encrypt.",
     ),
     # Default-OFF (#1069): armed, this reaches out and opens TLS connections
     # to endpoints on a schedule, and its discovery half can mint its own
@@ -694,7 +694,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         id="security.dnsbl",
         label="DNSBL / RBL reputation monitoring",
         group="Security",
-        description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Settings → dnsbl_monitoring_enabled) and turn on at least one list.",
+        description="Check every public-facing IP SpatiumDDI knows (public IPAM addresses, internet-facing subnets, NAT/PAT egress addresses, and operator-pinned IPs) against the major DNS blocklists (Spamhaus ZEN, Barracuda, SpamCop, SORBS, …) on a daily reversed-octet sweep — catching mail-deliverability / reputation problems before users report them. Discovery toggle only: no external DNS queries run until you enable the sweep (Administration → DNS Blocklists → Enable daily sweep) and turn on at least one list.",
         default_enabled=False,
         requires=("core.dns",),
     ),

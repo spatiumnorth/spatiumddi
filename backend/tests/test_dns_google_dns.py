@@ -598,6 +598,125 @@ async def test_apply_zone_delete_resolves_zone(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_apply_zone_delete_empties_only_managed_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — zone emptying is scoped to records SpatiumDDI manages.
+
+    The managed www A + delegated sub-zone NS rrsets are deleted; the
+    foreign TXT rrset (in the provider zone but NOT in our DB) must
+    NOT appear in the change set; SOA / apex NS are always skipped.
+    """
+    driver = GoogleCloudDNSDriver()
+    soa = _rrset("doomed.example.", "SOA", 21600, ["ns dns 1 2 3 4 5"])
+    apex_ns = _rrset("doomed.example.", "NS", 172800, ["ns-cloud.googledomains.com."])
+    www = _rrset("www.doomed.example.", "A", 300, ["10.0.0.1"])
+    sub_ns = _rrset("sub.doomed.example.", "NS", 300, ["ns.other.example."])
+    foreign_txt = _rrset("doomed.example.", "TXT", 300, ['"v=spf1 -all"'])
+    target = _StubZone(
+        "doomed-example", "doomed.example.", rrsets=[soa, apex_ns, www, sub_ns, foreign_txt]
+    )
+    client = _client_with_zones(target)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    managed = [
+        RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        RecordData(name="sub", record_type="NS", value="ns.other.example.", ttl=300),
+    ]
+    await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=managed)
+
+    ch = target.changes_obj
+    assert ch.created is True
+    # Only the managed rrsets were deleted — the foreign TXT survives.
+    assert ch.deleted == [www, sub_ns]
+    assert ch.added == []
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_mixed_rrset_keeps_foreign_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed value sharing an rrset with a foreign value: the rrset
+    is replaced with just the foreign value, never dropped wholesale."""
+    driver = GoogleCloudDNSDriver()
+    mixed = _rrset("rr.doomed.example.", "A", 300, ["10.0.0.1", "10.0.0.2"])
+    target = _StubZone("doomed-example", "doomed.example.", rrsets=[mixed])
+    client = _client_with_zones(target)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    managed = [RecordData(name="rr", record_type="A", value="10.0.0.1", ttl=300)]
+    await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=managed)
+
+    ch = target.changes_obj
+    assert ch.created is True
+    assert ch.deleted == [mixed]
+    # Reduced rrset re-added carrying ONLY the foreign value.
+    assert target.built_rrsets == [("rr.doomed.example.", "A", 300, ["10.0.0.2"])]
+    assert len(ch.added) == 1
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_foreign_only_zone_deletes_no_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """We manage nothing in the zone → the emptying commits no change
+    set at all; foreign records are left exactly as they are."""
+    driver = GoogleCloudDNSDriver()
+    foreign = _rrset("www.doomed.example.", "A", 300, ["10.0.0.1"])
+    target = _StubZone("doomed-example", "doomed.example.", rrsets=[foreign])
+    client = _client_with_zones(target)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=[])
+
+    ch = target.changes_obj
+    assert ch.created is False
+    assert ch.deleted == []
+    assert ch.added == []
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_without_scoping_deletes_no_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """managed_records=None (caller supplied no scoping): no record is
+    deleted on the way out — only the zone delete itself is attempted."""
+    driver = GoogleCloudDNSDriver()
+    populated = _StubZone(
+        "doomed-example",
+        "doomed.example.",
+        rrsets=[_rrset("www.doomed.example.", "A", 300, ["10.0.0.1"])],
+    )
+    client = _client_with_zones(populated)
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+    assert populated.changes_obj.created is False
+    assert populated.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_absent_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — deleting a zone that is already gone is a no-op success."""
+    driver = GoogleCloudDNSDriver()
+    client = _client_with_zones(_StubZone("other-com", "other.com."))
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="gone.example.")
+    # No raise.
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+
+@pytest.mark.asyncio
 async def test_apply_zone_bad_op(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = GoogleCloudDNSDriver()
     _patch_client(monkeypatch, driver, _client_with_zones())

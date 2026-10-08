@@ -111,19 +111,67 @@ async def test_list_zones_by_resource_group(
     ]
 
 
-async def test_list_zones_falls_back_to_subscription_list_when_rg_empty(
+async def test_list_zones_empty_resource_group_is_named_error(
     monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
 ) -> None:
+    """#1534 — an empty resource_group must not fall back to a
+    subscription-wide list that makes the probe pass while record ops fail."""
     client = Mock()
-    client.zones.list.return_value = [SimpleNamespace(name="example.org", number_of_record_sets=1)]
     _patch_client(monkeypatch, driver, client)
 
     creds = dict(_CREDS, resource_group="")
-    zones = await driver._list_zones(server, creds)
+    with pytest.raises(CloudDNSError, match="resource_group"):
+        await driver._list_zones(server, creds)
 
-    client.zones.list.assert_called_once_with()
+    client.zones.list.assert_not_called()
     client.zones.list_by_resource_group.assert_not_called()
-    assert [z.name for z in zones] == ["example.org."]
+
+
+def test_client_missing_fields_raise_named_error_not_keyerror() -> None:
+    """#1534 — missing fields surface as CloudDNSError naming them."""
+    drv = AzureDNSDriver()
+    with pytest.raises(CloudDNSError) as excinfo:
+        drv._client({"tenant_id": "t"})
+    message = str(excinfo.value)
+    assert "client_id" in message
+    assert "resource_group" in message
+    assert "KeyError" not in message
+
+
+def test_client_empty_resource_group_raises_named_error() -> None:
+    drv = AzureDNSDriver()
+    with pytest.raises(CloudDNSError, match="resource_group"):
+        drv._client(dict(_CREDS, resource_group=""))
+
+
+async def test_probe_fails_when_resource_group_empty(
+    monkeypatch: pytest.MonkeyPatch, server: SimpleNamespace
+) -> None:
+    """#1534 — probe exercises the resource-group scope record paths use,
+    so a server with no resource group reports failure, not success."""
+    drv = AzureDNSDriver()
+    monkeypatch.setattr(drv, "_load_credentials", lambda srv: dict(_CREDS, resource_group=""))
+    client = Mock()
+    _patch_client(monkeypatch, drv, client)
+
+    probe = await drv.probe(server)
+    assert probe.ok is False
+    assert "resource_group" in probe.message
+
+
+async def test_save_time_validation_rejects_missing_azure_fields() -> None:
+    """#1534 — _validate_driver_credentials refuses an azure_dns save
+    missing any of the five fields, with a 422 naming them."""
+    from fastapi import HTTPException
+
+    from app.api.v1.dns.router import _validate_driver_credentials
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _validate_driver_credentials("azure_dns", {"tenant_id": "t"})
+    assert excinfo.value.status_code == 422
+    assert "resource_group" in str(excinfo.value.detail)
+    # A complete set passes.
+    await _validate_driver_credentials("azure_dns", dict(_CREDS))
 
 
 async def test_pull_zones_from_server_returns_neutral_dicts(

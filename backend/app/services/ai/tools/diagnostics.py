@@ -97,6 +97,7 @@ class FindInternalErrorsArgs(BaseModel):
 
 @register_tool(
     name="find_internal_errors",
+    permission="superadmin",
     description=(
         "List uncaught Python exceptions captured from the API + "
         "Celery workers (superadmin only). Each row carries service, "
@@ -149,6 +150,7 @@ class CountInternalErrorsArgs(BaseModel):
 
 @register_tool(
     name="count_internal_errors",
+    permission="superadmin",
     description=(
         "Count uncaught exceptions matching a filter (superadmin "
         "only). Returns ``{count, total_occurrences}`` — distinct "
@@ -202,6 +204,7 @@ class GetInternalErrorArgs(BaseModel):
 
 @register_tool(
     name="get_internal_error",
+    permission="superadmin",
     description=(
         "Return the full record for a single uncaught exception "
         "(superadmin only): traceback + sanitised request/task "
@@ -249,6 +252,7 @@ class FindNonconformingNamesArgs(BaseModel):
 
 @register_tool(
     name="find_nonconforming_names",
+    permission="superadmin",
     description=(
         "Report existing names that violate DNS naming rules "
         "(issue #597, superadmin only). Scans IPAM hostnames, DNS "

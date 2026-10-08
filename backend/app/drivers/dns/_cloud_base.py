@@ -36,6 +36,7 @@ Per-driver credential dict shapes (decrypted from
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,68 @@ class CloudDNSError(Exception):
     Raised so the record-ops + import + probe paths surface a clean
     operator-facing message instead of a raw SDK traceback.
     """
+
+
+class CloudDNSConflictError(CloudDNSError):
+    """The provider already holds a resource SpatiumDDI must not take over.
+
+    Raised e.g. when a zone create names a hosted zone that already
+    exists in the provider account: silently adopting it would put a
+    zone SpatiumDDI never created under management (and a later delete
+    would tear it down). Callers map this to HTTP 409; the remedy is
+    the explicit "Import existing zones" flow, which is the one
+    sanctioned adoption path.
+    """
+
+
+def provider_value_candidates(record: RecordData) -> set[str]:
+    """Spellings a cloud provider may store for one DB record's value.
+
+    Most providers store the value verbatim, but MX / SRV bake the
+    numeric fields into the rdata string (``"10 mail.example.com."``,
+    ``"0 5 5060 sip.example.com."``) while a SpatiumDDI DB row keeps
+    them in separate columns — so a managed-record match has to try
+    both shapes. Trailing-dot variants are included because providers
+    normalise host targets to FQDNs while DB rows may not.
+    """
+    value = record.value
+    candidates = {value, value.rstrip(".")}
+    rtype = record.record_type.upper()
+    if record.priority is not None and rtype == "MX":
+        baked = f"{record.priority} {value}"
+        candidates.update({baked, baked.rstrip(".")})
+    elif (
+        record.priority is not None
+        and record.weight is not None
+        and record.port is not None
+        and rtype == "SRV"
+    ):
+        baked = f"{record.priority} {record.weight} {record.port} {value}"
+        candidates.update({baked, baked.rstrip(".")})
+    return candidates
+
+
+def managed_value_index(
+    records: list[RecordData],
+    apex: str,
+    absolutize: Callable[[str, str], str],
+) -> dict[tuple[str, str], set[str]]:
+    """Index managed (DB) records by (absolute name, type) → value spellings.
+
+    Used by zone-delete emptying: a provider rrset value may only be
+    deleted when it appears in this index — anything else belongs to
+    whoever else writes to the zone and must be left untouched.
+    """
+    index: dict[tuple[str, str], set[str]] = {}
+    for rec in records:
+        key = (normalize_fqdn(absolutize(rec.name, apex)), rec.record_type.upper())
+        index.setdefault(key, set()).update(provider_value_candidates(rec))
+    return index
+
+
+def value_is_managed(live_value: str, candidates: set[str]) -> bool:
+    """True when a provider-side rrset value matches a managed spelling."""
+    return live_value in candidates or live_value.rstrip(".") in candidates
 
 
 @dataclass(frozen=True)
@@ -221,17 +284,35 @@ class CloudDNSDriverBase(DNSDriver):
             rtype=change.record.record_type,
         )
 
-    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
+    async def apply_zone_change(
+        self,
+        server: Any,
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         """Create / delete a hosted zone on the provider.
 
         Called by the zone-CRUD service helper for agentless drivers. ``op``
         is ``create`` | ``delete``. Cloud providers have no rename — the
         caller sends delete+create.
+
+        ``managed_records`` (delete only) is the zone's record set as
+        SpatiumDDI's DB knows it, loaded by the caller while the rows
+        still exist. A provider that must empty a zone before deleting
+        it scopes that emptying to these records: provider-side records
+        SpatiumDDI never managed are left untouched, and if they keep
+        the provider from deleting the zone, the provider's refusal
+        surfaces as the error (an honest failure, never a silent wipe).
+        ``None`` means "no scoping information" — the provider must
+        not delete ANY record on the way out, only attempt the zone
+        delete itself.
         """
         if op not in {"create", "delete"}:
             raise ValueError(f"{self.name}.apply_zone_change: unsupported op {op!r}")
         creds = self._load_credentials(server)
-        await self._apply_zone(server, creds, zone, op)
+        await self._apply_zone(server, creds, zone, op, managed_records=managed_records)
         logger.info(
             "cloud_dns.apply_zone_change",
             driver=self.name,
@@ -316,6 +397,20 @@ class CloudDNSDriverBase(DNSDriver):
             zone_count=len(zones),
         )
 
+    async def health_check(self, server: Any) -> tuple[bool, str]:
+        """Health hook for ``app.tasks.dns._check_health`` (#1455).
+
+        Without it the health task falls back to a SOA query against
+        ``server.host:server.port`` — for a cloud provider that is the
+        literal ``"cloudflare"`` on 443, which can never answer, so every
+        cloud server sat at ``unreachable`` while its API calls worked.
+        The provider API is what the control plane actually drives, so it
+        is also what health should measure: reuse :meth:`probe`, which
+        already never raises for an expected failure.
+        """
+        result = await self.probe(server)
+        return result.ok, result.message
+
     # ── Provider hooks (subclasses implement) ───────────────────────────
     @abstractmethod
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:
@@ -332,8 +427,21 @@ class CloudDNSDriverBase(DNSDriver):
         """Create / update / delete one record on the provider."""
 
     @abstractmethod
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
-        """Create / delete one hosted zone on the provider."""
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
+        """Create / delete one hosted zone on the provider.
+
+        ``managed_records`` is threaded through from
+        :meth:`apply_zone_change` — see its docstring for the
+        delete-scoping contract.
+        """
 
     @abstractmethod
     def capabilities(self) -> dict[str, Any]:
@@ -342,10 +450,14 @@ class CloudDNSDriverBase(DNSDriver):
 
 __all__ = [
     "CloudDNSDriverBase",
+    "CloudDNSConflictError",
     "CloudDNSError",
     "CloudDNSProbe",
     "CloudDNSZone",
     "compose_structured_rdata",
+    "managed_value_index",
     "normalize_fqdn",
+    "provider_value_candidates",
     "split_structured_rdata",
+    "value_is_managed",
 ]

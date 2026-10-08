@@ -86,6 +86,43 @@ async def find_cname_conflict(
     return (await db.execute(stmt.order_by(DNSRecord.created_at).limit(1))).scalars().first()
 
 
+async def find_record_insert_conflict(
+    db: AsyncSession,
+    zone_id: uuid.UUID,
+    *,
+    name: str,
+    record_type: str,
+    own_fk: str,
+    own_id: uuid.UUID,
+) -> DNSRecord | None:
+    """A non-owned row that blocks an integration mirror inserting a
+    record at (zone, name) (#1561), or None.
+
+    The record passes of the Kubernetes / Tailscale / NetBird mirrors
+    only ever saw rows carrying their own FK, so they inserted beside
+    operator records (and other integrations' records) at the same
+    name: an unexplained extra round-robin A, or a CNAME beside an A —
+    the state the record API refuses with 409 and BIND refuses to load.
+    A row blocks the insert when it is NOT owned by the caller
+    (``own_fk`` != ``own_id``) and either shares the type, or either
+    side is a CNAME (``types_conflict`` — the same rule
+    ``find_cname_conflict`` applies for the API). The caller's own rows
+    never block: the pass manages those itself.
+    """
+    stmt = select(DNSRecord).where(
+        DNSRecord.zone_id == zone_id,
+        func.lower(DNSRecord.name) == name.strip().lower(),
+    )
+    rows = (await db.execute(stmt.order_by(DNSRecord.created_at))).scalars().all()
+    rtype = record_type.strip().upper()
+    for row in rows:
+        if getattr(row, own_fk, None) == own_id:
+            continue
+        if row.record_type.strip().upper() == rtype or types_conflict(rtype, row.record_type):
+            return row
+    return None
+
+
 def describe_cname_conflict(record_type: str, fqdn: str, existing: DNSRecord) -> str:
     """The refusal message, shared so REST and the Copilot say the same thing."""
     name = fqdn.rstrip(".")
