@@ -491,7 +491,7 @@ The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` wit
 | Add / update / delete record | `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch | Idempotent; one HTTP call per rrset; PowerDNS handles serial bump internally. |
 | Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. |
 | Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
-| Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
+| Reconcile zone (full sync) | `GET .../zones/<zone>`, then one `PATCH` that `DELETE`s rrsets absent from the bundle and `REPLACE`s every rrset it carries (a `POST .../zones` for a zone PowerDNS does not have yet) | Runs on agent start and every structural change. Verdict is per zone: a zone whose data PowerDNS refuses (400/409/422) keeps what it held and is reported as a degraded apply (`reverted`, with PowerDNS's reason), every other zone is still served, and nothing is rolled back. Identical records in one rrset are sent once (#1379). The absent-rrset sweep never touches the apex SOA/NS or DNSSEC types, and skips zones with a dynamic-update ACL (#1380). |
 | Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
 | Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
 | Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer mode is not wired up in the agent (Phase 5 polish). |
@@ -1177,10 +1177,13 @@ PowerDNS is coarse-only — no per-name / per-type / `deny`, so
    `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
    zone whose dynamic updates were turned off stops accepting them.
 
-**Drift** — the pdns reconciler is additive per-rrset (`REPLACE` per managed
-`name+type`, never a blanket zone replace), so externally-injected records
-(new names) **already survive** a reconcile, and a conflicting managed
-`name+type` is re-asserted (control-plane wins). An active ingest-back for
+**Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
+additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
+replace), so records RFC 2136 clients injected (new names) **survive** a
+reconcile, and a conflicting managed `name+type` is re-asserted
+(control-plane wins). A zone *without* an ACL is reconciled exactly: an rrset
+the bundle no longer carries is deleted (#1380), apex SOA/NS and DNSSEC types
+excepted. An active ingest-back for
 *visibility* (mirroring external records into the control-plane DB, like the
 BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
 
