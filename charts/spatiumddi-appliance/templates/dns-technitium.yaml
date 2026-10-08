@@ -188,6 +188,8 @@ metadata:
 spec:
   {{- if .Values.dns.useMetalLBVIP }}
   type: LoadBalancer
+  # #1550 — see dns-bind9.yaml: a MetalLB VIP needs no NodePorts.
+  allocateLoadBalancerNodePorts: false
   {{- else }}
   type: ClusterIP
   {{- end }}
