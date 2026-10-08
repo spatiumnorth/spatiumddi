@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing an appliance's DNS or DHCP group in Fleet moves its server
+  too (#1565).** `PUT /appliance/appliances/{id}/roles` changed only the
+  appliance's group pointer. The supervisor's env and firewall followed it,
+  while the appliance's already-registered server stayed in the old group
+  and kept serving that group's zones or scopes (re-registration never
+  moves a server, by design), and the firewall could open listeners for a
+  configuration the agent wasn't running. The PUT now moves the
+  appliance's own DNS server(s) through the #934 move and its DHCP
+  server(s) with the DHCP server PUT's checks, in the same transaction. A
+  move it refuses (a name clash, a mixed-driver group) refuses the whole
+  change, naming the server.
+
 - **DNS record ops reach every server in the order they were queued
   (#1489).** Reported by @stefanriegel on a three-server Technitium
   group: after a UniFi sync, records were missing on single servers
