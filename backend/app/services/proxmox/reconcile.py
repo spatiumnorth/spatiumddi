@@ -41,7 +41,11 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.integration_ownership import (
+    address_taken,
+    owned_by_other_integration,
+    owning_integration,
+)
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
@@ -670,18 +674,6 @@ async def _apply_blocks_and_subnets(
 # ── Apply: addresses ──────────────────────────────────────────────────
 
 
-async def _address_taken(
-    db: AsyncSession, subnet_id: Any, address: str, *, exclude_id: Any = None
-) -> bool:
-    """True if a row already holds ``address`` in ``subnet_id``."""
-    stmt = select(IPAddress.id).where(
-        IPAddress.subnet_id == subnet_id, IPAddress.address == address
-    )
-    if exclude_id is not None:
-        stmt = stmt.where(IPAddress.id != exclude_id)
-    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
-
-
 async def _apply_addresses(
     db: AsyncSession,
     node: ProxmoxNode,
@@ -775,7 +767,7 @@ async def _apply_addresses(
                 # may already sit at the target (subnet, address); the
                 # move would hit ``uq_ip_address_subnet_address`` and
                 # roll back the whole sweep. Leave our row where it is.
-                if await _address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
                     summary.warnings.append(
                         f"address {addr}: subnet {subnet.network} already has a row "
                         f"for it; not moving"
@@ -808,7 +800,7 @@ async def _apply_addresses(
             # at this (subnet, address) is owned by another integration
             # or Proxmox endpoint (warned there). Inserting next to it
             # would hit ``uq_ip_address_subnet_address``.
-            if await _address_taken(db, subnet.id, d.address):
+            if await address_taken(db, subnet.id, d.address):
                 continue
             db.add(
                 IPAddress(
