@@ -48,6 +48,7 @@ from app.core.permissions import (
     _token_grants_for,
     require_any_resource_permission,
     token_scope_allows,
+    token_scoped_resource_ids,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
 from app.core.update_nulls import resolve_update_changes
@@ -4966,19 +4967,36 @@ class ServerEventsResponse(BaseModel):
     items: list[ServerEventEntry]
 
 
+def _refuse_resource_scoped_token(user: Any) -> None:
+    """Server-level reads are not any token grant's resource (GHSA-c4v7-2235-v88h).
+
+    A resource-scoped token passes the router's DNS gate on its ``dns_zone``
+    grant, but a server's audit history and ``rndc status`` belong to no zone,
+    so there is nothing to narrow them to. Refuse them for such a token;
+    sessions, unscoped tokens and wildcard-granted tokens are unaffected
+    (``token_scoped_resource_ids`` answers ``None`` for those).
+    """
+    if token_scoped_resource_ids(user, "dns_server") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this DNS server",
+        )
+
+
 @router.get(
     "/servers/{server_id}/recent-events",
     response_model=ServerEventsResponse,
 )
 async def get_server_recent_events(
-    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser, limit: int = 50
 ) -> ServerEventsResponse:
     """Audit-log rows where ``resource_id`` matches this server.
 
     The audit log keys ``resource_id`` as text, so we filter on the
     string form of the UUID. Drives the "Events" tab on the Server
-    Detail modal.
+    Detail modal. Refused for a resource-scoped API token.
     """
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -5075,9 +5093,11 @@ class RndcStatusResponse(BaseModel):
     response_model=RndcStatusResponse,
 )
 async def get_server_rndc_status(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> RndcStatusResponse:
-    """Latest agent-pushed ``rndc status`` output for this server."""
+    """Latest agent-pushed ``rndc status`` output for this server. Refused for
+    a resource-scoped API token."""
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")

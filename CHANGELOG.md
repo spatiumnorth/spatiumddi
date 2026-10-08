@@ -84,6 +84,41 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Five low-severity follow-ups from the 2026-10-06 QA walks.**
+  - **A resource-scoped API token can no longer read a DNS server's
+    recent events or `rndc status` (GHSA-c4v7-2235-v88h).** Neither
+    belongs to any zone, so there is nothing to narrow them to; a
+    zone- or subnet-scoped token now gets 403 on both. Sessions,
+    unscoped tokens and wildcard-granted tokens are unaffected.
+  - **An IPAM write can no longer publish into a DNS zone the token
+    holds no grant on (GHSA-875w-8f2h-9mw6).** Address create,
+    update, next-IP and bulk allocate, bulk edit, and subnet create
+    and update took the zone from the request body and checked only
+    the subnet. A zone named there must now be one of the subnet's
+    own effective zones, the row's current zone, or a zone the token
+    is granted; otherwise 403 (bulk edit skips the row, as it does
+    for any row the caller may not touch).
+  - **Deleting an IPAM address, or purging orphans, no longer removes
+    a DHCP reservation for a caller without `delete` on
+    `dhcp_static` (GHSA-hxpx-gjqf-6p4f).** It is refused with 403,
+    matching the rule #1629 applied to every other IPAM path. When
+    the delete goes ahead, each reservation it removes now writes its
+    own `dhcp_static_assignment` audit row.
+  - **The Technitium DNS agent no longer writes the daemon's admin
+    password to its log (GHSA-x4gw-9gqx-vr4m).** `createToken` is
+    now a POST with a form body instead of a GET with the password in
+    the query string, and every agent keeps the `httpx` / `httpcore`
+    loggers at WARNING, so no request URL reaches the log. A
+    Technitium agent's log from before this release may still hold
+    the password, from the agent's first start; if those logs were
+    shipped off the appliance, treat the daemon's admin password as
+    exposed.
+  - **`redact()` now matches a webhook secret in any mixture of
+    `%HH` (either hex case) and JSON `\u00HH` encodings
+    (GHSA-rc6p-vq45-64v3).** .NET collectors write lower-case
+    percent-encoding and escape `+` as `+`, so a base64 token
+    they echoed back was still logged in clear.
+
 - **The k3s join token is published whenever k3s writes it, not only in
   the first 60 s after boot (#1509).** `spatiumddi-publish-k3s-token` ran
   once at boot and polled for the token for 60 s. On a fresh seed k3s can
