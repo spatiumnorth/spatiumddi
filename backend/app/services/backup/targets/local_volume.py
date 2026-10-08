@@ -141,16 +141,28 @@ class LocalVolumeDestination(BackupDestination):
         # thread would put those lstats on the shared api event loop.
         def _do() -> None:
             root = self._path(config)
+            target = root / safe_filename(filename)
+            tmp = target.with_suffix(target.suffix + ".tmp")
             try:
                 root.mkdir(parents=True, exist_ok=True)
-                target = root / safe_filename(filename)
-                tmp = target.with_suffix(target.suffix + ".tmp")
                 tmp.write_bytes(archive_bytes)
                 # Atomic rename so partial writes are never visible to
                 # the listing pass — important for the retention sweep
                 # which keys on filename + size.
                 os.replace(tmp, target)
             except OSError as exc:
+                # Best-effort cleanup of the staged file (#1570),
+                # mirroring the NFS driver: listing and retention only
+                # match ``*.zip``, so a leftover ``.tmp`` is invisible
+                # and is never pruned.
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        "backup_local_volume_partial_cleanup_failed",
+                        path=str(tmp),
+                        error=str(cleanup_exc),
+                    )
                 # Translated, not propagated. ``run_backup_for_target``
                 # commits ``last_run_status="in_progress"`` BEFORE the
                 # write and catches only the BackupDestination/Archive
@@ -215,7 +227,12 @@ class LocalVolumeDestination(BackupDestination):
         def _do() -> bytes:
             root = self._path(config)
             target = root / safe
-            if not target.is_file():
+            # Refuse symlinks, matching ``list_archives`` (#1573):
+            # ``is_file`` / ``read_bytes`` follow links, so a symlink
+            # named like an archive was invisible in the listing but
+            # served here — escaping the configured root the listing
+            # deliberately never leaves.
+            if target.is_symlink() or not target.is_file():
                 raise BackupDestinationError(f"archive {safe!r} not found at {root}")
             return target.read_bytes()
 

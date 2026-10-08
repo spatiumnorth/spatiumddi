@@ -41,6 +41,8 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.dhcp.option_spelling import group_raw_codes
+from app.services.dhcp.option_validation import rekey_raw_options
 from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 
 from .canonical import (
@@ -536,6 +538,28 @@ async def commit_import(
 
     now = datetime.now(UTC)
     results: list[CommitScopeResult] = []
+    warnings = list(preview.warnings)
+
+    # #1347 — options arrive in the SOURCE server's raw spelling (the Windows
+    # importer keeps an unmapped option as ``opt-NN``), whatever the target
+    # group's servers read. Stored as-is, a Kea group dropped every one of
+    # them at render, and the only signal was an import warning. Re-key them
+    # to the target's spelling, and drop (and say so) the ones no server in
+    # the group can serve.
+    raw_codes = await group_raw_codes(db, target_group_id)
+    for parsed in preview.scopes:
+        if not parsed.options:
+            continue
+        rekeyed, dropped = rekey_raw_options(
+            parsed.options, raw_codes=raw_codes, address_family=parsed.address_family
+        )
+        parsed.options = rekeyed
+        if dropped:
+            warnings.append(
+                f"{parsed.subnet_cidr}: dropped raw option(s) {', '.join(dropped)}, which "
+                "no server in the target group can serve; set them again as named "
+                "options if they are needed"
+            )
 
     for parsed in preview.scopes:
         try:
@@ -584,5 +608,5 @@ async def commit_import(
         target_group_id=target_group_id,
         scopes=results,
         client_classes_created=classes_created,
-        warnings=list(preview.warnings),
+        warnings=warnings,
     )

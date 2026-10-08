@@ -70,6 +70,17 @@ ExecStartPre=/bin/mkdir -p /etc/rancher/k3s /var/lib/rancher/k3s /var/log/spatiu
 # wipe moves it aside together with the containerd store it describes.
 ExecStartPre=/bin/mkdir -p /var/lib/rancher/k3s/agent/images
 ExecStartPre=/bin/touch /var/lib/rancher/k3s/agent/images/.cache.json
+# #1630 — clear containerd's unfinished content writes ("ingests") before
+# k3s starts. k3s imports every tarball's ``index.json`` under one shared
+# ref, ``tar-index.json``. An import that died part-way leaves that write
+# on disk, and containerd then fails every SHORTER ``index.json`` after it
+# with "unexpected commit size N, expected M", on every boot, until a
+# longer one happens to commit over it. A slot upgrade's first boot lost
+# the DNS and DHCP agents' images that way. No import can be in flight
+# here (k3s's containerd dies with the k3s that started it), and the
+# appliance resumes no pulls. ``-``: a failure here never keeps k3s down;
+# firstboot's image check is the backstop.
+ExecStartPre=-/usr/local/bin/spatium-k3s-images clear-ingests
 # ``server`` boots an all-in-one node (control plane + agent). Single
 # node — no joining a cluster. All other flags live in /etc/rancher/
 # k3s/config.yaml so they're operator-editable without touching the

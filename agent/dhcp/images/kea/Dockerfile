@@ -70,7 +70,7 @@ FROM alpine:3.24 AS runtime
 # ``kea-ctrl-agent`` is deliberately NOT installed (#637). Kea 3.0 deprecates
 # it, and nothing in SpatiumDDI ever spoke to it: the agent drives kea-dhcp4 /
 # kea-dhcp6 over their unix control sockets (spatium_dhcp_agent/kea_ctrl.py —
-# config-test, config-reload, status-get, statistic-get-all) and the backend
+# config-reload, status-get, statistic-get-all) and the backend
 # KeaDriver.apply_config is a no-op. It was dead weight whose supervise loop
 # could take the whole container down via the entrypoint's ``wait -n``.
 #

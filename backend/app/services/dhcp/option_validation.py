@@ -268,13 +268,17 @@ def _describe_code(code: int) -> str:
     return f"option {code} ({known.name})" if known else f"option {code}"
 
 
-def normalize_options(raw: Any) -> dict[str, Any]:
+def normalize_options(raw: Any, *, raw_codes: str = "code") -> dict[str, Any]:
     """Accept ``{name: value}`` or ``[{code, name, value}, …]``; return a mapping.
 
     Does not validate. A list entry is keyed by its name when that name is one
     SpatiumDDI renders, else by its code: the custom-options editor sends the
     IANA catalogue name (``vendor-encapsulated-options``), which the renderer
     does not know, alongside a code (43) it can deliver as ``code:43``.
+
+    ``raw_codes`` is the spelling the group's servers read (#1347): a
+    catalogue pick on a Windows group is keyed ``opt-43``, which Windows
+    serves, rather than ``code:43``, which the write check would refuse.
     """
     if raw is None:
         return {}
@@ -311,7 +315,8 @@ def normalize_options(raw: Any) -> dict[str, Any]:
         if known:
             key = str(name)
         elif code_int is not None:
-            key = CODE_TO_NAME.get(code_int) or f"code:{code_int}"
+            raw_key = f"opt-{code_int}" if raw_codes == "opt" else f"code:{code_int}"
+            key = CODE_TO_NAME.get(code_int) or raw_key
         elif name:
             key = name  # unknown, and validation will say so
         else:
@@ -390,8 +395,10 @@ def _check_one(key: str, value: Any, address_family: str, raw_codes: str = RAW_C
 
     win = _WINDOWS_CODE.fullmatch(key)
     if win:
-        if address_family == "ipv6" and raw_codes != RAW_CODES_WINDOWS:
-            # The ``code:NN`` the spelling check would suggest is v4-only.
+        if address_family == "ipv6":
+            # Every raw spelling is v4-only: ``code:NN`` above, and Windows
+            # writes options with ``Set-DhcpServerv4OptionValue`` alone, so an
+            # ``opt-NN`` on a v6 scope reaches no server either (#1347).
             raise ValueError(f"option '{key}': raw option codes are DHCPv4 only")
         _refuse_raw_spelling(key, win.group(1), raw_codes)
         if not 1 <= int(win.group(1)) <= 254:
@@ -520,6 +527,64 @@ def _changed_options(
         for key, value in options.items()
         if not (str(key) in prev and prev[str(key)] == value)
     ]
+
+
+def raw_code_keys(options: Mapping[str, Any]) -> list[str]:
+    """The raw-code keys (``code:NN`` / ``opt-NN``) in ``options``."""
+    return [str(k) for k in options if _is_code_key(str(k))]
+
+
+def raw_keys_dropped_by(options: Mapping[str, Any], raw_codes: str) -> list[str]:
+    """Raw-code keys a group with spelling ``raw_codes`` would drop (#1347)."""
+    out = []
+    for key in raw_code_keys(options):
+        if raw_codes == RAW_CODES_NONE:
+            out.append(key)
+        elif key.startswith("opt-") and raw_codes != RAW_CODES_WINDOWS:
+            out.append(key)
+        elif key.startswith("code:") and raw_codes == RAW_CODES_WINDOWS:
+            out.append(key)
+    return out
+
+
+def rekey_raw_options(
+    options: Mapping[str, Any], *, raw_codes: str, address_family: str = "ipv4"
+) -> tuple[dict[str, Any], list[str]]:
+    """Re-spell raw-code keys for a group whose servers read ``raw_codes``.
+
+    For an importer (#1347), which brings options across in the SOURCE
+    server's spelling (Windows' ``opt-NN``) whatever the target group's
+    servers read. Returns the re-keyed options and the keys that could not
+    be carried: raw codes are DHCPv4-only, a mixed group (``none``) serves no
+    raw code, and Kea can deliver only the codes it ships a definition for.
+    Named options pass through unchanged.
+    """
+    out: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in options.items():
+        key = str(key)
+        match = _RAW_CODE.fullmatch(key) or _WINDOWS_CODE.fullmatch(key)
+        if not match:
+            out[key] = value
+            continue
+        code = int(match.group(1))
+        if address_family != "ipv4" or raw_codes == RAW_CODES_NONE:
+            dropped.append(key)
+            continue
+        if raw_codes == RAW_CODES_WINDOWS:
+            if 1 <= code <= 254:
+                out[f"opt-{code}"] = value
+            else:
+                dropped.append(key)
+            continue
+        target = f"code:{code}"
+        try:
+            _check_one(target, value, address_family, raw_codes)
+        except ValueError:
+            dropped.append(key)
+            continue
+        out[target] = value
+    return out, dropped
 
 
 def changes_raw_code(options: Mapping[str, Any], previous: Mapping[str, Any] | None = None) -> bool:

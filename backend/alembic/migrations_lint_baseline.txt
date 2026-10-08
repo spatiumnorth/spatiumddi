@@ -10,6 +10,7 @@ backend/alembic/versions/0f83a227b16d_event_subscription_outbox_tables_for_.py:d
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:73
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:74
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:75
+backend/alembic/versions/199eb1562927_appliance_reboot_requested_boot_id.py:drop_column:34
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:283
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:287
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:289
@@ -71,6 +72,7 @@ backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.p
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:40
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:41
 backend/alembic/versions/5d2a8f91c4e6_add_dns_settings_and_fix_session_timeout.py:drop_column:42
+backend/alembic/versions/6293ba5af00e_dns_record_op_queue_seq.py:drop_column:54
 backend/alembic/versions/66471b4aa8e0_appliance_role_switch_state.py:drop_column:45
 backend/alembic/versions/66471b4aa8e0_appliance_role_switch_state.py:drop_column:46
 backend/alembic/versions/78bfb374d56d_appliance_firewall_extra.py:drop_column:48

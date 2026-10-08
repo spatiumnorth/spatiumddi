@@ -1033,6 +1033,37 @@ def _quiet_packet_logger(daemon: str, server: dict[str, Any]) -> list[dict[str, 
     return [{"name": f"{daemon}.packets", "severity": "WARN"}]
 
 
+# #1259 — renewal (T1) and rebind (T2) times, derived from each lease's own
+# lifetime instead of pinned. The roots used to carry ``renew-timer: 900`` /
+# ``rebind-timer: 1800``, so a 1-day lease renewed every 15 minutes (~48x the
+# RFC load), a v4 lease of 15 minutes or less got no T1/T2 at all (Kea omits
+# a T1 that is not below T2 / the lease), and a short v6 lease got a T1 past
+# its own expiry.
+#
+# The percentages are the RFC ones: RFC 2131 §4.4.5 for v4 (0.5 / 0.875 of
+# the lease) and RFC 8415 for v6 (0.5 / 0.8), which are also Kea's own
+# defaults. kea-dhcp6 applies them to the PREFERRED lifetime, which defaults to
+# 62.5% of the valid one, so a 1-day v6 lease renews after 7.5 h (measured on
+# kea-dhcp6 3.0.3). v4 needs ``calculate-tee-times`` turned on (Kea defaults
+# it off and then sends no T1/T2 options); v6 already defaults it on, and is
+# rendered explicitly anyway so the file says what the server does.
+#
+# Never put ``renew-timer`` / ``rebind-timer`` back on the roots: Kea prefers
+# explicit timers over calculated ones and subnets inherit them, so a global
+# value silently disables the calculation everywhere. A per-subnet value (the
+# legacy ``_subnet`` path below) still wins for that subnet only.
+_TEE_TIMES_V4: dict[str, Any] = {
+    "calculate-tee-times": True,
+    "t1-percent": 0.5,
+    "t2-percent": 0.875,
+}
+_TEE_TIMES_V6: dict[str, Any] = {
+    "calculate-tee-times": True,
+    "t1-percent": 0.5,
+    "t2-percent": 0.8,
+}
+
+
 def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     """Render Kea's ``multi-threading`` block from the bundle (#980).
 
@@ -1173,8 +1204,8 @@ def render(
         # #980 — see _multi_threading. Rendered on every bundle, so the ETag
         # already covers it via the "server" block it reads from.
         "multi-threading": _multi_threading(server),
-        "renew-timer": 900,
-        "rebind-timer": 1800,
+        # #1259 — T1/T2 from the lease lifetime; see _TEE_TIMES_V4.
+        **_TEE_TIMES_V4,
         "hooks-libraries": [
             {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
         ],
@@ -1298,7 +1329,7 @@ def render(
     # A raw-code option is only safe to emit once a definition for it exists:
     # Kea types an undefined code as BINARY and REJECTS THE WHOLE CONFIG when
     # the value isn't hex. Dropping one option is survivable; a rejected config
-    # is not, and `sync.py` writes the file before `config-test`, so a bad
+    # is not, and `sync.py` writes the file before `kea-dhcp4 -t`, so a bad
     # render outlives the process that made it.
     #
     # This also covers the two cases where no definitions arrive at all: the
@@ -1367,8 +1398,8 @@ def render(
         # leaving it on auto would put back most of the threads Dhcp4 just
         # dropped.
         "multi-threading": _multi_threading(server),
-        "renew-timer": 900,
-        "rebind-timer": 1800,
+        # #1259 — see _TEE_TIMES_V6.
+        **_TEE_TIMES_V6,
         "hooks-libraries": [
             {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
         ],
