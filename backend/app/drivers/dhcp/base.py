@@ -424,6 +424,12 @@ class DHCPDriver(ABC):
     """
 
     name: str = "abstract"
+    # #1347 — how this driver spells a raw option code, and so which raw keys
+    # it serves: ``"code"`` reads ``code:NN`` and drops ``opt-NN``; ``"opt"``
+    # (Windows) reads ``opt-NN`` and drops ``code:NN``. Declared here rather
+    # than decided in a router, so a new driver states its own spelling
+    # instead of silently getting Kea's.
+    raw_option_spelling: str = "code"
 
     @abstractmethod
     def render_config(self, bundle: ConfigBundle) -> str:

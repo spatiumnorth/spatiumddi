@@ -30,6 +30,7 @@ from app.models.dns import (
 )
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
+from app.services.ai.tools.scope import token_allows_zone, token_zone_ids
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 
@@ -88,6 +89,7 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
 
 @register_tool(
     name="list_dns_zones",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
         "Each summary includes name, type, kind (forward / reverse), "
@@ -108,6 +110,10 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
     if args.search:
         like = f"%{args.search.lower()}%"
         stmt = stmt.where(func.lower(DNSZone.name).like(like))
+    # A zone-bound API token sees only its zone(s), as on the REST list.
+    zone_ids = token_zone_ids(user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSZone.id.in_(zone_ids))
     stmt = stmt.order_by(DNSZone.name.asc())
 
     wanted = args.name_scope  # already normalised + validated
@@ -170,6 +176,7 @@ class QueryRecordsArgs(BaseModel):
 
 @register_tool(
     name="query_dns_records",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
         "and name / FQDN substring. Returns each record's relative "
@@ -185,6 +192,10 @@ async def query_dns_records(
     stmt = select(DNSRecord).where(DNSRecord.deleted_at.is_(None))
     if args.zone_id:
         stmt = stmt.where(DNSRecord.zone_id == args.zone_id)
+    # A zone-bound API token reads only its zone(s)' records.
+    zone_ids = token_zone_ids(user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSRecord.zone_id.in_(zone_ids))
     if args.record_type:
         stmt = stmt.where(DNSRecord.record_type == args.record_type.upper())
     if args.name:
@@ -220,6 +231,7 @@ class ListServerGroupsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_server_groups",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
@@ -271,6 +283,7 @@ class FindDnsServersArgs(BaseModel):
 
 @register_tool(
     name="find_dns_servers",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List individual DNS servers with the group each belongs to, its "
         "driver, whether it is the group's primary, and its enabled / "
@@ -337,6 +350,7 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Report what moving a DNS zone to another server group would do, "
         "WITHOUT doing it. Answers 'can this zone move to that group, and "
@@ -366,7 +380,7 @@ async def preview_dns_zone_move(
         return {"error": f"Invalid UUID: {exc}"}
 
     zone = await db.get(DNSZone, zone_uuid)
-    if zone is None:
+    if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "Zone not found"}
     target = await db.get(DNSServerGroup, group_uuid)
     if target is None:
@@ -460,6 +474,7 @@ class ForwardDnsArgs(BaseModel):
 
 @register_tool(
     name="forward_dns",
+    permission=("read", "use_network_tools"),
     description=(
         "Live forward DNS lookup ('dig <name> <rdtype>'). Resolves "
         "against the host's resolver by default, or against operator-"
@@ -541,6 +556,7 @@ class ReverseDnsArgs(BaseModel):
 
 @register_tool(
     name="reverse_dns",
+    permission=("read", "use_network_tools"),
     description=(
         "Live reverse-DNS lookup. Resolves the appropriate "
         "``<addr>.in-addr.arpa`` / ``<addr>.ip6.arpa`` PTR record. "
@@ -625,6 +641,7 @@ class ListDNSRecordsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_records",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
         "substring, FQDN substring, type, value substring, zone, or "
@@ -662,6 +679,9 @@ async def list_dns_records(
         stmt = stmt.where(DNSRecord.zone_id == args.zone_id)
     if args.group_id:
         stmt = stmt.where(DNSZone.group_id == args.group_id)
+    zone_ids = token_zone_ids(user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSRecord.zone_id.in_(zone_ids))
     stmt = stmt.order_by(DNSRecord.fqdn.asc(), DNSRecord.record_type.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).all()
     return [
@@ -701,6 +721,7 @@ class ListDNSBlockListsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_blocklists",
+    permission=("read", "dns_blocklist"),
     description=(
         "List DNS blocklists (RPZ rows). Each carries id, name, "
         "description, category, source_type (manual / url / "
@@ -777,6 +798,7 @@ class ListDNSPoolsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_pools",
+    permission=("read", "manage_dns_pools"),
     description=(
         "List GSLB pools (health-checked A/AAAA target sets sharing "
         "one DNS name). Each row carries id, name, description, "
@@ -867,6 +889,7 @@ class ListDNSViewsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_views",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List split-horizon DNS views — different clients see "
         "different zone data. Each row carries id, name, "
@@ -915,6 +938,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 
 @register_tool(
     name="find_zone_dnssec_info",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
         "flag, the list of DS records (key tag, algorithm, digest "
@@ -936,7 +960,7 @@ async def find_zone_dnssec_info(
     from app.models.dns import DNSKey  # noqa: PLC0415
 
     zone = await db.get(DNSZone, args.zone_id)
-    if zone is None:
+    if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
     keys = (await db.execute(select(DNSKey).where(DNSKey.zone_id == zone.id))).scalars().all()
     return {
@@ -969,6 +993,7 @@ class FindDNSRateLimitSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_rate_limit_settings",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return the BIND9 Response Rate Limiting (RRL) + amplification "
         "defense posture for one DNS server group (or all groups when "
@@ -1054,6 +1079,7 @@ class FindZoneDriftArgs(BaseModel):
 
 @register_tool(
     name="find_dns_zone_drift",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
         "pulls the live zone from every server in the zone's group and "
@@ -1075,7 +1101,7 @@ async def find_dns_zone_drift(
     from app.services.dns.drift import compute_zone_drift  # noqa: PLC0415
 
     zone = await db.get(DNSZone, args.zone_id)
-    if zone is None:
+    if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
     report = await compute_zone_drift(db, group_id=zone.group_id, zone=zone)
     return {
@@ -1108,6 +1134,7 @@ class ListDNSSECPoliciesArgs(BaseModel):
 
 @register_tool(
     name="list_dnssec_policies",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List the DNSSEC signing policies operators can attach to BIND9 "
         "zones (issue #49): name, algorithm, NSEC3 settings, and KSK/ZSK "
@@ -1159,6 +1186,7 @@ class FindDNSQueryStatsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_query_stats",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Per-server DNS query stats over a trailing window from "
         "dns_metric_sample (the same rcode counters the NXDOMAIN-spike / "
@@ -1255,6 +1283,7 @@ class FindDNSQueriesArgs(BaseModel):
 
 @register_tool(
     name="find_dns_queries",
+    permission=("read", "server"),
     description=(
         "Individual DNS queries a client made, newest first, WITH what it "
         "was told back (issue #914): rcode plus the answer count, so "
@@ -1341,6 +1370,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 
 @register_tool(
     name="find_zone_update_acls",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "
         "whether ``dynamic_update_enabled`` is on, the ordered list of "
@@ -1364,7 +1394,7 @@ async def find_zone_update_acls(
     )
 
     zone = await db.get(DNSZone, args.zone_id)
-    if zone is None:
+    if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
     driver_names = await _group_driver_names(db, zone.group_id)
     caps = _effective_dynamic_update_caps(driver_names)
@@ -1406,6 +1436,7 @@ async def find_zone_update_acls(
 
 @register_tool(
     name="propose_set_zone_update_acl",
+    permission=("write", "dns_zone"),
     description=(
         "Propose setting a DNS zone's dynamic-update (RFC 2136) ACL "
         "(issue #641) — a full ordered replace of who may send DDNS "
@@ -1437,6 +1468,7 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
 
 @register_tool(
     name="find_dns_encrypted_transports",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Report which DNS server groups serve DNS-over-TLS (DoT) or "
         "DNS-over-HTTPS (DoH) to clients, and which forward to their "
@@ -1532,6 +1564,7 @@ class ListResolverPresetsArgs(BaseModel):
 
 @register_tool(
     name="list_resolver_presets",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List the curated public upstream DNS resolvers SpatiumDDI ships "
         "presets for — Cloudflare, Google, Quad9 and friends — with each "
@@ -1592,6 +1625,7 @@ class ListBlocklistTemplatesArgs(BaseModel):
 
 @register_tool(
     name="list_blocklist_templates",
+    permission=("read", "dns_blocklist"),
     description=(
         "List the built-in DNS blocklist templates and one-click "
         "profiles that ship with this release — the content-filtering "

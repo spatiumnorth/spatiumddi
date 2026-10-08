@@ -201,9 +201,12 @@ async def test_reconcile_mirrors_device_addresses(
     assert {str(r.address) for r in rows} == {"100.64.1.5", "fd7a:115c:a1e0::5"}
     for r in rows:
         assert r.status == "tailscale-node"
-        assert r.hostname == "laptop.example.ts.net"
+        # #1557: hostname is the host label only; the FQDN is kept in
+        # custom_fields so IPAM publishing doesn't append the zone twice.
+        assert r.hostname == "laptop"
         assert "linux" in (r.description or "")
         cf = r.custom_fields or {}
+        assert cf.get("fqdn") == "laptop.example.ts.net"
         assert cf.get("user") == "alice@example.com"
         assert cf.get("tags") == ["tag:dev"]
         assert cf.get("enabled_routes") == ["192.168.7.0/24"]

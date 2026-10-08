@@ -524,6 +524,39 @@ async def test_missing_token_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         await driver._apply_record(_Server(), {}, change)
 
 
+# ── Health check (#1455) ────────────────────────────────────────────────
+# The health task calls ``health_check`` when a driver has one and
+# otherwise SOA-probes ``server.host`` — which for Cloudflare is the
+# literal "cloudflare" on 443, so the server read unreachable forever.
+async def test_health_check_is_healthy_when_the_api_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([{"id": "z1", "name": "example.com"}]))]})
+    driver = _patch_client(monkeypatch, fake)
+    monkeypatch.setattr(driver, "_load_credentials", lambda server: _CREDS)
+
+    ok, message = await driver.health_check(_Server())
+
+    assert ok is True
+    assert "1 hosted zone" in message
+    # It asked the API, not a DNS socket.
+    assert [c["path"] for c in fake.calls] == ["/zones"]
+
+
+async def test_health_check_reports_the_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"success": False, "errors": [{"message": "Invalid API Token"}]}
+    fake = _FakeClient({"get": [_FakeResponse(403, payload)]})
+    driver = _patch_client(monkeypatch, fake)
+    monkeypatch.setattr(driver, "_load_credentials", lambda server: _CREDS)
+
+    ok, message = await driver.health_check(_Server())
+
+    assert ok is False
+    assert "Invalid API Token" in message
+
+
 # ── Static helpers ──────────────────────────────────────────────────────
 def test_relativize_helper() -> None:
     driver = CloudflareDNSDriver()

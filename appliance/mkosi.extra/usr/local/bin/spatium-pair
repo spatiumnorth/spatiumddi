@@ -124,6 +124,8 @@ if [ -f "$ENV_FILE" ]; then
     # Replace lines if present; otherwise append. Use a temp file
     # so a crash mid-edit doesn't truncate .env.
     ENV_TMP="$ENV_FILE.new"
+    # 0600 before the secrets go in, not after (GHSA-h2j9-qrg7-grfw).
+    install -m 0600 /dev/null "$ENV_TMP"
     awk -v url="$NEW_URL" -v code="$NEW_CODE" '
         BEGIN { url_seen=0; code_seen=0 }
         /^CONTROL_PLANE_URL=/ { print "CONTROL_PLANE_URL=" url; url_seen=1; next }
@@ -134,13 +136,13 @@ if [ -f "$ENV_FILE" ]; then
             if (!code_seen) print "BOOTSTRAP_PAIRING_CODE=" code
         }
     ' "$ENV_FILE" > "$ENV_TMP"
-    # Mode 0644 (not 0600) — spatiumddi-firstboot writes the original
-    # .env at 0644 so the supervisor's unprivileged user can read it
-    # through the /etc/spatiumddi:/etc/spatiumddi-host:ro bind mount.
-    # Writing 0600 here would silently break role-assignment apply
-    # ("up failed: open /etc/spatiumddi-host/.env: permission denied")
-    # on every subsequent re-pair until an operator chmod'd it back.
-    chmod 0644 "$ENV_TMP"
+    # Mode 0600 root, matching spatiumddi-firstboot (GHSA-h2j9-qrg7-grfw):
+    # it holds the database password, SECRET_KEY and the agent PSKs. The
+    # 0644 this used to carry was for a docker-compose ``--env-file`` read
+    # by the supervisor's unprivileged user, which the k3s appliance no
+    # longer does — the supervisor entrypoint reads .env as root, before
+    # su-exec drops privileges.
+    chmod 0600 "$ENV_TMP"
     mv "$ENV_TMP" "$ENV_FILE"
 fi
 
