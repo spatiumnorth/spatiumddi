@@ -4921,7 +4921,10 @@ async def get_server_pending_ops(
     counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
 
     ops_res = await db.execute(
-        select(DNSRecordOp).where(*op_filter).order_by(DNSRecordOp.created_at.desc()).limit(limit)
+        select(DNSRecordOp)
+        .where(*op_filter)
+        .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.seq.desc().nulls_last())
+        .limit(limit)
     )
     items = [
         PendingOpEntry(
