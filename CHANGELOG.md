@@ -187,18 +187,23 @@ the formatter handles the rest.
   closed by the generic evaluator's auto-resolve passes; the
   conformity engine owns them.
 
-- **TXT records are quoted properly on every DNS driver (#1514).**
+- **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
   TXT values are stored unquoted, and the BIND9 agent dropped them
   into zone files and RFC 2136 updates verbatim — so a `;` in a
   DMARC value started a zone-file comment and spaces in an SPF
   value split it into character-strings resolvers join without the
-  spaces. All driver copies of the quoting helper (BIND9, PowerDNS
-  and Technitium agents, and the backend BIND9/PowerDNS drivers)
-  now quote and escape consistently, chunk long values at 255
-  *octets* without splitting an escape sequence (the old copies cut
-  at 255 characters after escaping, which could do both), strip
-  control characters, and leave already-quoted values untouched.
-  A cross-driver test asserts the copies agree.
+  spaces. The BIND9 and PowerDNS agent drivers and the backend
+  BIND9/PowerDNS drivers now share one quoting helper per package
+  (`drivers/_txt.py` in the agent, `drivers/dns/_txt.py` in the
+  backend). An unquoted value is one string, split into 255-*octet*
+  character-strings without splitting a UTF-8 character (the old
+  copies cut at 255 characters after escaping, which could split an
+  escape sequence and exceed the octet limit). An already-quoted
+  value is served exactly as entered: each quoted string stays its
+  own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
+  keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
+  a string over 255 octets is split further. Control characters are
+  stripped. The Technitium TXT path is unchanged (#1694).
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

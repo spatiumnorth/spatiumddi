@@ -50,3 +50,33 @@ def test_non_ascii_chunks_stay_within_255_octets() -> None:
 def test_backend_copies_agree() -> None:
     for value in ("", "plain", "é" * 200, "a" * 300, '"already quoted"'):
         assert bind9_quote_txt(value) == powerdns_quote_txt(value)
+
+
+# ── Already-quoted values round-trip exactly (#1609 QA regression) ────
+
+
+def test_multi_string_quoted_value_keeps_its_boundaries() -> None:
+    for quote in HELPERS:
+        assert _strings(quote('"txtvers=1" "path=/printer" "note=2nd floor"')) == [
+            b"txtvers=1",
+            b"path=/printer",
+            b"note=2nd floor",
+        ]
+        assert _strings(quote('"part one" "part two"')) == [b"part one", b"part two"]
+
+
+def test_decimal_escape_is_one_octet() -> None:
+    for quote in HELPERS:
+        assert _strings(quote('"caf\\195\\169 \\226\\156\\147"')) == ["café ✓".encode()]
+        assert _strings(quote('"a\\255b\\000c"')) == [b"a\xffb\x00c"]
+
+
+def test_quoted_string_over_255_octets_still_splits() -> None:
+    for quote in HELPERS:
+        value = '"' + "x" * 300 + '" "tail"'
+        assert [len(s) for s in _strings(quote(value))] == [255, 45, 4]
+
+
+def test_unquoted_non_ascii_splits_on_character_boundary() -> None:
+    for quote in HELPERS:
+        assert [len(s) for s in _strings(quote("é" * 200))] == [254, 146]

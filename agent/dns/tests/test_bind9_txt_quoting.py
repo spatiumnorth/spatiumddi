@@ -19,6 +19,7 @@ from typing import Any
 import dns.rdata
 import dns.rdatatype
 import dns.zone
+import pytest
 
 from spatium_dns_agent.drivers.bind9 import Bind9Driver, _quote_txt, _wire_value
 from spatium_dns_agent.drivers.powerdns import _quote_txt as _pdns_quote_txt
@@ -129,3 +130,56 @@ def test_write_zone_file_serves_spf_and_dmarc_intact(tmp_path: Path) -> None:
         dmarc = served.find_rdataset("_dmarc.example.test.", dns.rdatatype.TXT)
         assert list(apex[0].strings) == [SPF.encode()]
         assert list(dmarc[0].strings) == [DMARC.encode()]
+
+
+# ── Already-quoted values round-trip exactly (#1609 QA regression) ────
+#
+# The first #1609 cut joined the character-strings of an already-quoted
+# value into one and read ``\DDD`` as a code point. Both changed what
+# BIND9 and PowerDNS served for a value that ``main`` served as entered.
+
+AGENT_HELPERS = pytest.mark.parametrize(
+    "quote", [_quote_txt, _pdns_quote_txt], ids=["bind9", "powerdns"]
+)
+
+DNS_SD = '"txtvers=1" "path=/printer" "note=2nd floor"'
+
+
+@AGENT_HELPERS
+def test_multi_string_quoted_value_keeps_its_boundaries(quote: Any) -> None:
+    assert _served_strings(quote(DNS_SD)) == [
+        b"txtvers=1",
+        b"path=/printer",
+        b"note=2nd floor",
+    ]
+    assert _served_strings(quote('"part one" "part two"')) == [
+        b"part one",
+        b"part two",
+    ]
+
+
+@AGENT_HELPERS
+def test_decimal_escape_is_one_octet(quote: Any) -> None:
+    value = '"caf\\195\\169 \\226\\156\\147"'
+    assert _served_strings(quote(value)) == ["café ✓".encode()]
+    # A non-UTF-8 octet survives too.
+    assert _served_strings(quote('"a\\255b\\000c"')) == [b"a\xffb\x00c"]
+
+
+@AGENT_HELPERS
+def test_quoted_string_over_255_octets_still_splits(quote: Any) -> None:
+    value = '"' + "x" * 300 + '" "tail"'
+    assert [len(s) for s in _served_strings(quote(value))] == [255, 45, 4]
+
+
+@AGENT_HELPERS
+def test_unquoted_non_ascii_splits_on_character_boundary(quote: Any) -> None:
+    strings = _served_strings(quote("é" * 200))
+    assert [len(s) for s in strings] == [254, 146]
+
+
+def test_write_zone_file_serves_multi_string_txt_intact(tmp_path: Path) -> None:
+    text = _zone_file_text(tmp_path, [_rec("_ipp._tcp", "TXT", DNS_SD)])
+    served = dns.zone.from_text(text, origin="example.test", relativize=False)
+    rdset = served.find_rdataset("_ipp._tcp.example.test.", dns.rdatatype.TXT)
+    assert list(rdset[0].strings) == [b"txtvers=1", b"path=/printer", b"note=2nd floor"]
