@@ -439,8 +439,8 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DHCP subsystem is disabled on this control plane, so "
-                "new agents cannot register. Enable it under Settings → "
-                "Features."
+                "new agents cannot register. Enable it on the Features & "
+                "Integrations page."
             ),
         )
     group: DHCPServerGroup | None = None

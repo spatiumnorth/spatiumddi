@@ -27,6 +27,7 @@ from app.models.dhcp import (
     DHCPScope,
     DHCPServerGroup,
 )
+from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
@@ -128,7 +129,7 @@ async def create_template(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
-    options = normalize_options(body.options)
+    options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(db, options, group_id=group_id, address_family=body.address_family)
     tpl = DHCPOptionTemplate(
         group_id=group_id,
@@ -187,7 +188,10 @@ async def update_template(
     if "options" in payload or family != tpl.address_family:
         # The stored map is normalised too: a template saved before #1228
         # may carry an alias (``domain-name-servers``) the check rejects.
-        options = normalize_options(payload["options"] if "options" in payload else tpl.options)
+        options = normalize_options(
+            payload["options"] if "options" in payload else tpl.options,
+            raw_codes=await group_raw_codes(db, tpl.group_id),
+        )
         # Validate only changed options (#597, #1228) so a round-tripped
         # grandfathered value doesn't block an unrelated edit — unless the
         # family changed, which makes every option new to the template.

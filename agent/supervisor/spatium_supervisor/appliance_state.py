@@ -448,6 +448,17 @@ _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pendin
 _REBOOT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/reboot-pending-fleet"
 )
+# #1446 — the boot a fleet reboot trigger was last written in. The control
+# plane keeps delivering ``reboot_requested`` until a heartbeat arrives from
+# a different boot, so between writing the trigger and the host going down,
+# heartbeats still carry it. Without this marker each of those would
+# re-write the trigger the runner had just moved aside, and a trigger left
+# behind by the shutdown would make the NEXT request a no-op (the
+# ``exists()`` check below), which is the "reboot cleared, nothing happened"
+# failure this issue is about.
+_REBOOT_FIRED_BOOT_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-fleet-fired-boot"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -657,7 +668,7 @@ _CLUSTER_JOIN_MAX_ATTEMPTS = 3
 # #590 — "this terminal verdict has already been delivered" marker.
 #
 # The .state sidecar is written by the ROOT host runner and lives in a
-# 1777-sticky dir, so this unprivileged supervisor cannot delete it — it
+# sticky dir, so this unprivileged supervisor cannot delete it — it
 # would otherwise keep re-reporting a stale ``failed`` from a previous
 # episode. Now that the backend CLEARS the desired-state on a reported
 # ``failed`` (instead of re-firing the join forever), a stale re-report
@@ -907,10 +918,10 @@ def apply_clear_upgrade_command() -> bool:
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
-    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
-    # this file is root-owned (the host runner writes it); a non-owner can
-    # never unlink it, but the runner now publishes it 0666 so an in-place
-    # write succeeds. An empty object reads as "no progress" to every
+    # OVERWRITE rather than unlink. release-state is sticky (1770 root:2770)
+    # and this file is root-owned (the host runner writes it); a non-owner
+    # can never unlink it, but the runner publishes it 0660 to gid 2770,
+    # which this process carries, so an in-place write succeeds. An empty object reads as "no progress" to every
     # consumer, which is what a cleared upgrade should show.
     try:
         if _SLOT_UPGRADE_PROGRESS.exists():
@@ -1093,8 +1104,9 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     The host-config trigger files can carry decrypted secrets — the SNMP
     community, APT private-mirror passwords + GPG armour (#155), the syslog
     forwarding CA material (#156), the SSH config (#157), and the k3s join
-    token (#272) — and they land in the 1777-sticky ``release-state`` dir
-    that any unprivileged host user can list. A plain ``write_text`` then
+    token (#272) — and they land in the shared ``release-state`` dir, which
+    every host account could list while it was 1777 (GHSA-h2j9-qrg7-grfw)
+    and the api pod still can. A plain ``write_text`` then
     ``chmod(0o600)`` left a window where the file existed at the umask
     default (typically 0644, world-readable) before the chmod landed, so a
     local user could race-open the ``.new`` temp and read the secret.
@@ -1155,7 +1167,7 @@ def _fire_host_config(
         tmp = trigger_file.with_suffix(".new")
         # The payload can carry decrypted secrets (SNMP community, APT
         # GPG armour + private-mirror passwords #155, syslog CA #156, the
-        # SSH config #157) and lands in the 1777-sticky release-state dir.
+        # SSH config #157) and lands in the shared, sticky release-state dir.
         # Create it owner-only atomically — see _write_owner_only — so no
         # window exists where another unprivileged host user could read it.
         _write_owner_only(tmp, payload)
@@ -1309,6 +1321,15 @@ def _read_slot_upgrade_progress() -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
+def read_boot_id() -> str | None:
+    """This boot's kernel boot id, or None when it cannot be read."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
     """Phase 8f-8 — write the reboot trigger when the control plane
     has stamped ``reboot_requested=True`` on the server row.
@@ -1319,15 +1340,26 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
     ``/var/lib/spatiumddi-host/release-state`` bind mount only exist
     on a SpatiumDDI appliance — but defence in depth is cheap.
 
-    Returns True if a trigger was fired, False otherwise. Idempotent —
-    if the trigger file already exists (host runner hasn't picked it
-    up yet) we skip rather than stacking writes.
+    Returns True if a trigger was fired, False otherwise. Fires at most
+    once per boot (#1446): the control plane keeps sending the request
+    until a heartbeat comes from a new boot, so every heartbeat between the
+    write and the shutdown carries it again.
     """
     if detect_deployment_kind() != "appliance":
         return False
     if not reboot_requested:
         return False
-    if _REBOOT_TRIGGER_FILE.exists():
+    boot_id = read_boot_id()
+    try:
+        fired_in = _REBOOT_FIRED_BOOT_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        fired_in = ""
+    # #1446 — once per boot. A trigger already written in THIS boot is the
+    # host going down; a trigger left over from an EARLIER boot is stale (the
+    # runner never consumed it) and is rewritten, so PathChanged fires.
+    if boot_id and fired_in == boot_id:
+        return False
+    if _REBOOT_TRIGGER_FILE.exists() and not boot_id:
         return False
     try:
         _REBOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1340,6 +1372,8 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
             encoding="utf-8",
         )
         tmp.replace(_REBOOT_TRIGGER_FILE)
+        if boot_id:
+            _REBOOT_FIRED_BOOT_MARKER.write_text(boot_id + "\n", encoding="utf-8")
         return True
     except OSError:
         return False
@@ -1804,7 +1838,7 @@ def maybe_fire_cluster_join(
         )
         # The join token is a control-plane-admin-equivalent secret; write
         # it owner-only atomically (see _write_owner_only) so it can't be
-        # read by another unprivileged user out of the 1777-sticky dir.
+        # read by another writer of the shared, sticky release-state dir.
         _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
     except OSError:
@@ -4167,6 +4201,11 @@ def collect() -> dict[str, object]:
         "slot_a_version": slot_a_version,
         "slot_b_version": slot_b_version,
         "is_trial_boot": is_trial_boot,
+        # #1446 — which boot this heartbeat comes from. The control plane
+        # retires a reboot request when a heartbeat arrives from a
+        # different boot, instead of on a 15 s stopwatch that could expire
+        # before the request was ever delivered.
+        "boot_id": read_boot_id() if is_appliance else None,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.
