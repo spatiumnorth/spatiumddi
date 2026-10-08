@@ -43,6 +43,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
     owned_by_other_integration,
     owning_integration,
@@ -100,6 +101,9 @@ class _DesiredAddress:
     description: str
     mac: str | None
     network_id: str | None  # to find the matching subnet on insert
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass

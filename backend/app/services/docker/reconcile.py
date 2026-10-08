@@ -41,6 +41,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.docker import DockerHost
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.docker.client import (
     DockerClient,
     DockerClientError,
@@ -113,6 +114,9 @@ class _DesiredAddress:
     status: str  # docker-container | docker-gateway
     hostname: str
     description: str
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
