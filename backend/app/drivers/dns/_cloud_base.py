@@ -349,6 +349,20 @@ class CloudDNSDriverBase(DNSDriver):
             zone_count=len(zones),
         )
 
+    async def health_check(self, server: Any) -> tuple[bool, str]:
+        """Health hook for ``app.tasks.dns._check_health`` (#1455).
+
+        Without it the health task falls back to a SOA query against
+        ``server.host:server.port`` — for a cloud provider that is the
+        literal ``"cloudflare"`` on 443, which can never answer, so every
+        cloud server sat at ``unreachable`` while its API calls worked.
+        The provider API is what the control plane actually drives, so it
+        is also what health should measure: reuse :meth:`probe`, which
+        already never raises for an expected failure.
+        """
+        result = await self.probe(server)
+        return result.ok, result.message
+
     # ── Provider hooks (subclasses implement) ───────────────────────────
     @abstractmethod
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:

@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
+import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -341,7 +342,7 @@ const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
     {
       key: "api_token",
       label: "API token",
-      placeholder: "Hetzner DNS API token",
+      placeholder: "Hetzner Cloud API token",
       secret: true,
     },
   ],
@@ -515,16 +516,20 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
         {driver === "hetzner" && (
           <div>
             <p>
-              Open the{" "}
+              In the{" "}
               <span className="font-medium text-foreground">
-                Hetzner DNS Console
-              </span>{" "}
-              (dns.hetzner.com) and go to{" "}
-              <span className="font-medium text-foreground">
-                API tokens → Create access token
+                Hetzner Console
               </span>
-              . This is a DNS-specific token (separate from the Hetzner Cloud
-              API). Paste it above.
+              , open the project that holds your DNS zones and go to{" "}
+              <span className="font-medium text-foreground">
+                Security → API tokens → Generate API token
+              </span>{" "}
+              with{" "}
+              <span className="font-medium text-foreground">
+                Read &amp; Write
+              </span>{" "}
+              permission (read-only is enough to list and import). Paste it
+              above. Tokens from the retired DNS Console no longer work.
             </p>
           </div>
         )}
@@ -555,6 +560,91 @@ function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
         )}
       </div>
     </details>
+  );
+}
+
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live zones (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop and its reason shows in the dialog. What a delete still takes
+ *  is the group's zones already in Trash, for good. */
+function DeleteDNSGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DNSServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dns-servers", group.id],
+    queryFn: () => dnsApi.listServers(group.id),
+  });
+  const zonesQ = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || zonesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const zones = zonesQ.data?.length ?? 0;
+  if (servers || zones) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      zones ? `${zones} zone${zones === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First move or delete {servers + zones === 1 ? "it" : "them"}.
+            {zones > 0 &&
+              " A deleted zone goes to Trash; deleting the group then deletes its zones in Trash for good, with their records."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <ConfirmDestroyModal
+      title={title}
+      description={`Permanently delete group "${group.name}"? Zones of this group already in Trash are deleted with it, with their records, and can no longer be restored.`}
+      checkLabel={`I understand the group "${group.name}" and its zones in Trash will be deleted for good.`}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
   );
 }
 
@@ -1375,7 +1465,9 @@ function ServerModal({
       // addressed via the stored cloud credentials, not host:port.
       host: cloud ? driver : host,
       port: cloud ? 443 : parseInt(port, 10),
-      api_port: cloud ? null : apiPort ? parseInt(apiPort, 10) : null,
+      // Hidden for cloud + technitium_api: omitted on edit so the stored
+      // value survives (#1596 reads an explicit null as "clear").
+      ...serverApiPortField({ driver, cloud, apiPort }, editing),
       roles: roleList,
       notes,
       is_enabled: isEnabled,
@@ -9596,19 +9688,24 @@ function BlocklistModal({
         className="space-y-3"
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate({
-            name,
-            description,
-            category,
-            source_type: sourceType,
-            feed_url: sourceType === "url" ? feedUrl || null : null,
-            feed_format: feedFormat,
-            block_mode: blockMode,
-            sinkhole_ip: blockMode === "sinkhole" ? sinkholeIp || null : null,
-            update_interval_hours: updateHours,
-            feed_entries_are_wildcard: feedWildcard,
-            enabled,
-          });
+          mut.mutate(
+            blocklistPayload(
+              {
+                name,
+                description,
+                category,
+                sourceType,
+                feedUrl,
+                feedFormat,
+                blockMode,
+                sinkholeIp,
+                updateHours,
+                feedWildcard,
+                enabled,
+              },
+              !!list,
+            ),
+          );
         }}
       >
         <Field label="Name">
@@ -9695,6 +9792,7 @@ function BlocklistModal({
               <input
                 type="number"
                 min={0}
+                max={8760}
                 className={inputCls}
                 value={updateHours}
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
@@ -11236,10 +11334,8 @@ export function DNSPage() {
         <GroupModal group={editGroup} onClose={() => setEditGroup(null)} />
       )}
       {confirmDeleteGroup && (
-        <ConfirmDestroyModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${confirmDeleteGroup.name}"? The group must be empty — move or delete its servers and zones first.`}
-          checkLabel={`I understand the group "${confirmDeleteGroup.name}" will be deleted.`}
+        <DeleteDNSGroupModal
+          group={confirmDeleteGroup}
           onConfirm={() => deleteGroup.mutate(confirmDeleteGroup.id)}
           onClose={() => {
             setConfirmDeleteGroup(null);

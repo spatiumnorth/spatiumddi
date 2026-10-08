@@ -26,6 +26,7 @@ Credential dict shape (decrypted from ``DNSServer.credentials_encrypted``)::
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 import httpx
@@ -36,7 +37,7 @@ from app.drivers.dns._cloud_base import (
     CloudDNSZone,
     normalize_fqdn,
 )
-from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.base import RecordChange, RecordData, RRsetData
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the
@@ -51,6 +52,40 @@ _PER_PAGE = 50
 # that as ``ttl=None`` on the neutral RecordData so it round-trips as
 # "let the provider decide" rather than a literal 1-second TTL.
 _TTL_AUTO = 1
+
+# Types whose priority is part of the record's identity (two MX with the
+# same exchange and different preferences are two records).
+_PRIORITY_TYPES = frozenset({"MX", "SRV", "URI"})
+
+# Types whose content is a host name: compared case-insensitively and with
+# or without the trailing dot, which is how they come back from the API.
+_NAME_CONTENT_TYPES = frozenset({"CNAME", "NS", "MX", "PTR", "DNAME"})
+
+
+def _content_key(record_type: str, content: str) -> str:
+    """The form in which two spellings of the same value compare equal.
+
+    SpatiumDDI and Cloudflare do not always spell a value alike: a TXT value
+    stored with or without its surrounding quotes, a host name with or
+    without the root dot, an IPv6 address in another notation. Compared
+    literally, the RRset write would read an unchanged record as missing and
+    POST it again, which Cloudflare refuses as an identical record.
+    """
+    value = (content or "").strip()
+    rtype = record_type.upper()
+    if rtype == "TXT":
+        # One quoted string only; a multi-string value ("a" "b") is kept as is.
+        if len(value) >= 2 and value[0] == value[-1] == '"' and '" "' not in value:
+            return value[1:-1]
+        return value
+    if rtype in ("A", "AAAA"):
+        try:
+            return ipaddress.ip_address(value).compressed
+        except ValueError:
+            return value.lower()
+    if rtype in _NAME_CONTENT_TYPES:
+        return value.rstrip(".").lower()
+    return value
 
 
 class CloudflareDNSDriver(CloudDNSDriverBase):
@@ -243,7 +278,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         content: str | None = None,
         priority: int | None = None,
     ) -> str | None:
-        """Return the Cloudflare record id matching name+type+value, or ``None``.
+        """Return the Cloudflare record id matching name+type+value, or ``None``."""
+        rec = await self._find_record(client, zone_id, name, record_type, content, priority)
+        return None if rec is None else str(rec["id"])
+
+    async def _find_record(
+        self,
+        client: httpx.AsyncClient,
+        zone_id: str,
+        name: str,
+        record_type: str,
+        content: str | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the Cloudflare record matching name+type+value, or ``None``.
 
         SpatiumDDI keys DNS records per value and supports round-robin (multiple
         A/AAAA at one hostname) and multiple MX/NS/TXT. So when ``content`` is
@@ -266,7 +314,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
             return None
         # Name+type-only lookup (content unknown): keep legacy first-match.
         if content is None:
-            return str(results[0]["id"])
+            return dict(results[0])
         # Value-keyed lookup: pick the row whose content (and priority for
         # MX/SRV) actually matches — the server-side filter is a narrowing
         # hint, not a guarantee.
@@ -275,8 +323,115 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 continue
             if priority is not None and rec.get("priority") != priority:
                 continue
-            return str(rec["id"])
+            return dict(rec)
         return None
+
+    async def _list_rrset(
+        self, client: httpx.AsyncClient, zone_id: str, name: str, record_type: str
+    ) -> list[dict[str, Any]]:
+        """Every Cloudflare record at ``name`` + ``record_type``."""
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            resp = await client.get(
+                f"/zones/{zone_id}/dns_records",
+                params={"name": name, "type": record_type, "per_page": 100, "page": page},
+            )
+            body = self._unwrap(resp)
+            out.extend(r for r in body.get("result") or [] if r.get("type") == record_type)
+            info = body.get("result_info") or {}
+            if page >= int(info.get("total_pages") or 1):
+                return out
+            page += 1
+
+    async def _write_rrset(
+        self,
+        client: httpx.AsyncClient,
+        zone_id: str,
+        zone_fqdn: str,
+        change: RecordChange,
+        rrset: RRsetData,
+    ) -> None:
+        """Make the records at the op's name + type exactly ``change.rrset``.
+
+        Cloudflare stores one row per value, and the op names only the value
+        it changes TO. Looking the row up by that value (the per-value path
+        below) cannot find the row being changed, so an edit that changes a
+        value used to POST a second record next to the old one: two TXT
+        records where there was one, and two DMARC records make the domain's
+        DMARC policy invalid. The op carries the complete desired set (#783),
+        so the set is reconciled instead: rows that match a member are kept
+        (TTL corrected in place), missing members are created, and only then
+        are the rows no member matches removed, so the name never goes empty.
+
+        SpatiumDDI does not model Cloudflare's ``proxied`` flag, and a PUT or
+        POST without it lands DNS-only, publishing the origin address. So a
+        kept row's flag is carried into its PUT (a proxied row is never PUT:
+        its TTL always reads back as auto), and a created row joins the
+        proxy status the rows at the name already have.
+        """
+        rec = change.record
+        rtype = rec.record_type
+        name = self._absolute_name(rec.name, zone_fqdn)
+        ttl = rrset.ttl if rrset.ttl is not None else rec.ttl
+        wire_ttl = _TTL_AUTO if ttl is None else ttl
+        keyed_priority = rtype in _PRIORITY_TYPES
+
+        unmatched = await self._list_rrset(client, zone_id, name, rtype)
+        proxied = any(r.get("proxied") for r in unmatched)
+        to_create: list[dict[str, Any]] = []
+        for member in rrset.members:
+            payload: dict[str, Any] = {
+                "type": rtype,
+                "name": name,
+                "content": member.value,
+                "ttl": wire_ttl,
+            }
+            if member.priority is not None:
+                payload["priority"] = member.priority
+            key = _content_key(rtype, member.value)
+            match = next(
+                (
+                    r
+                    for r in unmatched
+                    if _content_key(rtype, str(r.get("content") or "")) == key
+                    and (not keyed_priority or r.get("priority") == member.priority)
+                ),
+                None,
+            )
+            if match is None:
+                if proxied:
+                    payload["proxied"] = True
+                to_create.append(payload)
+                continue
+            unmatched.remove(match)
+            # A proxied record's TTL is auto whatever was set, so it would
+            # always read as mismatched; there is nothing to correct.
+            if not match.get("proxied") and match.get("ttl") != wire_ttl:
+                if "proxied" in match:
+                    payload["proxied"] = match["proxied"]
+                resp = await client.put(f"/zones/{zone_id}/dns_records/{match['id']}", json=payload)
+                self._unwrap(resp)
+
+        for payload in to_create:
+            resp = await client.post(f"/zones/{zone_id}/dns_records", json=payload)
+            try:
+                self._unwrap(resp)
+            except CloudDNSError as exc:
+                if "identical record already exists" not in str(exc).lower():
+                    raise
+                # Cloudflare says the value is there, but it did not match
+                # any row above, so it is one of the rows still unmatched.
+                # Deleting them now could delete the very record that was
+                # just reported as present: stop before the delete pass.
+                raise CloudDNSError(
+                    f"Cloudflare: {name} {rtype} {payload['content']!r} exists in a form "
+                    "this driver does not recognise; left the existing records in place."
+                ) from exc
+
+        for row in unmatched:
+            resp = await client.delete(f"/zones/{zone_id}/dns_records/{row['id']}")
+            self._unwrap(resp)
 
     async def _apply_record(self, server: Any, creds: dict[str, Any], change: RecordChange) -> None:
         token = self._token(creds)
@@ -285,13 +440,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         async with self._client(token) as client:
             zone_id = await self._resolve_zone_id(client, zone_fqdn)
 
+            # #783 — a create or update that carries the complete desired
+            # RRset is a set write. Without one (a caller that opted out via
+            # ``rrset_action``) the per-value behaviour below stands.
+            if change.op in ("create", "update") and change.rrset and change.rrset.members:
+                await self._write_rrset(client, zone_id, zone_fqdn, change, change.rrset)
+                return
+
             if change.op == "create":
                 resp = await client.post(f"/zones/{zone_id}/dns_records", json=payload)
                 self._unwrap(resp)
                 return
 
             if change.op == "update":
-                rid = await self._find_record_id(
+                existing = await self._find_record(
                     client,
                     zone_id,
                     payload["name"],
@@ -299,14 +461,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     content=change.record.value,
                     priority=change.record.priority,
                 )
-                if rid is None:
+                if existing is None:
                     # No existing row to update — treat as create so the
                     # desired state still lands (mirrors the windows_dns +
                     # _cloud_base "update is create on miss" contract).
                     resp = await client.post(f"/zones/{zone_id}/dns_records", json=payload)
                     self._unwrap(resp)
                     return
-                resp = await client.put(f"/zones/{zone_id}/dns_records/{rid}", json=payload)
+                # A PUT replaces the whole record: without the row's own
+                # ``proxied`` it would land DNS-only.
+                if "proxied" in existing:
+                    payload["proxied"] = existing["proxied"]
+                resp = await client.put(
+                    f"/zones/{zone_id}/dns_records/{existing['id']}", json=payload
+                )
                 self._unwrap(resp)
                 return
 
