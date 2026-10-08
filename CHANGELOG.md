@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **SAML metadata no longer advertises a single logout endpoint that
+  does not exist (#1420).** Every SAML provider's service-provider
+  metadata named a `SingleLogoutService` at
+  `/api/v1/auth/{provider_id}/slo`, which no route served: an IdP
+  configured from the metadata sent its LogoutRequests to a 404,
+  reported a partial logout, and the SpatiumDDI session outlived the
+  user's IdP logout. SpatiumDDI does not take part in SAML single
+  logout, so the metadata now advertises only the ACS it serves, and
+  docs/features/AUTH.md says what logging out does and does not end.
+
 - **A member joining a multi-node appliance no longer stops DNS and DHCP
   on every node (#1439).** A member's promotion changes its role apply
   key (the agents' control-plane URL, #1350), so its first heartbeat
