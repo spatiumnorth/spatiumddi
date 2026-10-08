@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
+  with `is_active: false` only set the flag: the account's sessions
+  were refused while it stayed disabled, but they stayed valid, so
+  re-enabling it brought every one back (an attacker's included), and
+  a refused request still showed as activity in Sessions. A change of
+  `is_active` now revokes every session the account holds, as an admin
+  password reset does, and the audit row says how many; a re-enabled
+  account starts with none, and a disabled account's refused requests
+  no longer move a session's last-seen time.
+
 - **SAML metadata no longer advertises a single logout endpoint that
   does not exist (#1420).** Every SAML provider's service-provider
   metadata named a `SingleLogoutService` at

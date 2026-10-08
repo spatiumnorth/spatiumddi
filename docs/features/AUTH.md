@@ -727,10 +727,15 @@ rather than swallowing the failure. Permission-related rejections
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or
   has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
-- **User deactivated mid-session.** A refresh request from a disabled
-  user returns `401` even if the refresh token itself is still valid
-  — deactivating a user revokes their session on the next refresh.
-  `backend/app/api/v1/auth/router.py`.
+- **Disabling an account ends its sessions (#1383).** `PUT
+  /api/v1/users/{id}` that changes `is_active` revokes every session
+  the account holds, as an admin password reset does, and its audit row
+  records how many (`sessions_revoked`). Re-enabling revokes any that are
+  left, so a re-enabled account starts with no sessions, even one disabled
+  before this change. While an account is disabled, a request on one of
+  its sessions is refused with `403` and is not recorded as activity
+  (`last_seen_at` stays), and a refresh returns `401`.
+  `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
 
 ### Password management
 
