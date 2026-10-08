@@ -65,7 +65,7 @@ def test_enabled_writes_payload(ssh_paths: Path) -> None:
 def test_trigger_is_owner_only(ssh_paths: Path) -> None:
     # _fire_host_config writes secret-bearing payloads (here the sshd
     # config; for the APT/SNMP planes, mirror passwords + the SNMP
-    # community) into the 1777-sticky release-state dir, so the trigger
+    # community) into the shared release-state dir, so the trigger
     # file must land 0o600 with no world-readable window (sec scanning #82).
     assert appliance_state.maybe_fire_ssh_reload(_BLOCK) is True
     mode = stat.S_IMODE((ssh_paths / "ssh-config-pending").stat().st_mode)

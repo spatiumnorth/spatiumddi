@@ -60,6 +60,7 @@ from app.services.ai.tools import (
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
     effective_tool_names,
 )
 
@@ -399,7 +400,7 @@ backup / restore, appliance OS upgrades and reboots. Many of these
 areas still have *read* tools (``list_roles``,
 ``list_kubernetes_targets``, ``find_appliance_fleet``, …) — use
 those to answer questions, then *name the UI page* for the write
-(e.g. "Settings → Integrations", "Admin → Roles", "DNS → Zone →
+(e.g. "Features & Integrations", "Admin → Roles", "DNS → Zone →
 Views tab") rather than guessing at the data model.
 
 If you genuinely can't help, say so — and offer the closest
@@ -580,7 +581,7 @@ async def build_system_prompt(
     # Disabled-tool block. Lists every registered tool that's NOT in
     # the effective set, with its one-liner. The model uses this to
     # tell the user "I'd answer that with X, but it's disabled —
-    # ask your admin to enable it under Settings → AI → Tool Catalog"
+    # ask your admin to enable it under Administration → AI Tool Catalog"
     # instead of producing a generic "I can't help with that". Costs
     # ~50 tokens per disabled tool — acceptable, and the operator
     # can always trim the catalog if context is tight.
@@ -590,10 +591,10 @@ async def build_system_prompt(
     if disabled:
         lines = [f"- {t.name}: {t.description.splitlines()[0]}" for t in disabled]
         disabled_block = (
-            "\n\nDisabled tools (turned off in Settings → AI → Tool "
+            "\n\nDisabled tools (turned off in Administration → AI Tool "
             "Catalog, excluded by this provider's allowlist, or stripped "
-            "because their feature module is disabled under Settings → "
-            "Features; do NOT call them — instead, when a user asks "
+            "because their feature module is disabled on the Features & "
+            "Integrations page; do NOT call them — instead, when a user asks "
             "something one of these would answer, tell them the tool is "
             "disabled and to ask their administrator to enable it):\n" + "\n".join(lines)
         )
@@ -652,7 +653,11 @@ class ChatOrchestrator:
             provider_enabled=provider_enabled,
             enabled_modules=enabled_modules,
         )
-        tools = [t for t in REGISTRY.read_only() if t.name in effective]
+        # Only the tools this user may call (GHSA-4wrc-78rq-vgcg) — the
+        # registry enforces the same check at dispatch.
+        tools = REGISTRY.callable_by(
+            self.user, [t for t in REGISTRY.read_only() if t.name in effective]
+        )
         system_prompt = await build_system_prompt(self.db, self.user, tools, provider)
         # "Ask AI about this" — operator clicked a context affordance
         # in the IPAM / DNS / DHCP UI; the frontend supplied a
@@ -754,14 +759,18 @@ class ChatOrchestrator:
             provider_enabled=provider_enabled,
             enabled_modules=enabled_modules,
         )
+        # Narrowed to the tools this user may call (GHSA-4wrc-78rq-vgcg);
+        # ``ToolRegistry.call`` enforces the same check at dispatch.
+        callable_tools = REGISTRY.callable_by(
+            self.user, [t for t in REGISTRY.read_only() if t.name in effective]
+        )
         return [
             ToolDefinition(
                 name=t.name,
                 description=t.description,
                 parameters=t.parameters_schema(),
             )
-            for t in REGISTRY.read_only()
-            if t.name in effective
+            for t in callable_tools
         ]
 
     async def _build_fallback_chain(self, primary: AIProvider) -> list[AIProvider]:
@@ -1115,8 +1124,19 @@ class ChatOrchestrator:
                                 "This tool exists but is not enabled in the operator's "
                                 "Tool Catalog. Tell the user the feature is disabled and "
                                 "to ask their administrator to enable "
-                                f"'{exc.name}' under Settings → AI → Tool Catalog. "
+                                f"'{exc.name}' under Administration → AI Tool Catalog. "
                                 "Do not retry this tool call."
+                            ),
+                        }
+                    )
+                    is_error = True
+                except ToolPermissionDenied as exc:
+                    result_text = json.dumps(
+                        {
+                            "error": str(exc),
+                            "hint": (
+                                "The signed-in user's role does not grant this. "
+                                "Tell them; do not retry this tool call."
                             ),
                         }
                     )

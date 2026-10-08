@@ -11,52 +11,16 @@ import {
   Lock,
   LockOpen,
 } from "lucide-react";
-import {
-  authProvidersApi,
-  usersApi,
-  type AppUser,
-  type StepUp,
-} from "@/lib/api";
+import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
-import { ReauthFields } from "@/components/ReauthFields";
+import { StepUpSection } from "@/components/StepUpSection";
+import { stepUpBody } from "@/lib/stepup";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function stepUpBody(password: string, totp: string): StepUp {
-  return { stepup_password: password || null, stepup_totp_code: totp || null };
-}
-
-/** #1355 — confirming yourself before handing out a credential that passes
- *  every later step-up (a superadmin, or a superadmin's password). */
-function StepUpSection({
-  reason,
-  password,
-  onPassword,
-  totp,
-  onTotp,
-}: {
-  reason: string;
-  password: string;
-  onPassword: (v: string) => void;
-  totp: string;
-  onTotp: (v: string) => void;
-}) {
-  return (
-    <div className="rounded-md border bg-amber-500/5 p-3">
-      <p className="mb-2 text-xs text-muted-foreground">{reason}</p>
-      <ReauthFields
-        password={password}
-        onPassword={onPassword}
-        totp={totp}
-        onTotp={onTotp}
-      />
-    </div>
-  );
-}
 
 function Field({
   label,
@@ -669,9 +633,19 @@ export function UsersPage() {
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    {user.is_superadmin ? (
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                    {(user.is_effective_superadmin ?? user.is_superadmin) ? (
+                      <span
+                        className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"
+                        title={
+                          user.is_superadmin
+                            ? undefined
+                            : "Superadmin through a group's role (#1412)"
+                        }
+                      >
                         <ShieldCheck className="h-3.5 w-3.5" /> superadmin
+                        {!user.is_superadmin && (
+                          <span className="text-muted-foreground">(role)</span>
+                        )}
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 text-xs text-muted-foreground">

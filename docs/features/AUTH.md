@@ -110,8 +110,13 @@ session alone doesn't prove and an SSO account has no local password.
   user can re-enrol from scratch.
 - **Re-confirming sensitive reveals (#408)**: the secret-reveal
   endpoints (agent keys / SNMP community / appliance kubeconfig / pairing
-  codes) re-verify the operator right before handing back the cleartext,
-  via the shared `app.services.reauth.reverify_operator` helper. A **local
+  codes / block-sync and firewall-feed secrets) re-verify the operator right
+  before handing back the cleartext, through the shared operator step-up
+  (`app.api.stepup.require_operator_stepup`, #1413), so a wrong answer
+  spends the same per-account budget as every other step-up and each
+  refusal is audited under the endpoint's own `*_reveal_denied` action.
+  The approvals break-glass keeps its own audit row and account-lockout
+  count but passes the same budget gate. A **local
   user proves their password**; a **password-less external-auth user
   proves a current TOTP code** (so they must enrol MFA first, hence the
   open enrolment above). TOTP is deliberately **not** accepted in lieu of
@@ -129,9 +134,32 @@ session alone doesn't prove and an SSO account has no local password.
   carries `stepup_password` / `stepup_totp_code` (`password` / `totp_code` on
   the secrets reveal). Wrong answers spend the per-account step-up budget
   (fails closed; an omitted answer is refused without spending it), a refusal is `403`, and every attempt is audited with the
-  method used (`stepup_method`). An SSO account must enrol TOTP before it can
-  mint an API token. Granting superadmin through a group's role is not yet
-  covered (#1412).
+  method used (`stepup_method`). Once the budget is spent the step-up
+  answers `429` with `Retry-After` set to the time left on the block, and
+  that refusal is audited too (`error_detail: stepup_blocked`, #1413). An SSO account must enrol TOTP before it can
+  mint an API token.
+- **So does granting superadmin through a group (#1412).** A user is also
+  a superadmin when one of their groups holds a role carrying `*` / `*`, or
+  a live `*` / `*` time-bound grant. So the step-up is required by any
+  group create / edit, role edit or time-bound grant that would make someone
+  a superadmin who is not one: adding a member to such a group, giving such
+  a role to a group with members, adding `*` / `*` to a role groups already
+  hold, or a `*` / `*` grant. The check is on the effect, computed before
+  anything is written (`app.services.superadmin_grant`), so an edit that
+  touches only existing superadmins needs none, and one that reaches fifty
+  users needs one. Superadmin status here ignores `is_active`: judged the
+  active-only way, a stolen session could disable a role-only superadmin,
+  reset its password with no step-up, and re-enable it. The dialogs learn
+  that a step-up is needed from the server — a `403` carrying
+  `X-Stepup-Required: true` — then ask for it and resubmit. The Copilot's
+  temporary-access proposal refuses such a grant, since a chat Apply cannot
+  ask for a password. An auth-provider group mapping that targets a
+  superadmin group needs it too (#1476): it grants nothing at once, but the
+  next sign-in from any account in the external group becomes a superadmin,
+  and who that is cannot be known when the mapping is saved. So the check
+  there is on the target group: creating such a mapping, re-pointing one at
+  such a group, or renaming the external group of one that targets it. A
+  priority change needs none, since every matching mapping applies.
 
 ## External identity providers
 

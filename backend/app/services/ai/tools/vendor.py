@@ -52,6 +52,7 @@ class CountDevicesByVendorArgs(BaseModel):
 
 @register_tool(
     name="count_devices_by_vendor",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Roll up MAC addresses by vendor (OUI lookup). Use for "
         "questions like 'how many Apple devices are on my "
@@ -96,6 +97,7 @@ class FindDevicesByVendorArgs(BaseModel):
 
 @register_tool(
     name="find_devices_by_vendor",
+    permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "List specific devices whose MAC OUI matches a vendor "
         "substring. Use after count_devices_by_vendor when the "
