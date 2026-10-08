@@ -7,6 +7,7 @@ import {
   type DHCPScope,
 } from "@/lib/api";
 import { hostnameError } from "@/lib/dnsNames";
+import { staticDuidField } from "@/lib/formPayloads";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 export function CreateStaticAssignmentModal({
@@ -53,7 +54,7 @@ export function CreateStaticAssignmentModal({
         hostname,
         description,
         client_id: clientId || null,
-        duid: isV6 ? duid || null : null,
+        ...staticDuidField({ isV6, duid }, editing),
       };
       return editing
         ? dhcpApi.updateStatic(scope.id, staticAssignment!.id, data)

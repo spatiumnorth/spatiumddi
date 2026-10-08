@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Update endpoints handle explicit nulls consistently (#1564,
+  #1563).** Sending `null` for a NOT NULL field on domain, ASN,
+  circuit, router or VLAN updates used to reach Postgres and come
+  back as a 500; it is now a 422 naming the fields, via a shared
+  `resolve_update_changes` helper that separates "field absent"
+  from "clear this nullable column" from "null for a NOT NULL
+  column". And where an explicit null was previously ignored — so
+  the UI's "clear" silently did nothing — it now clears: DHCP pool,
+  static and phone-profile fields, DNS group/server/view/zone/record
+  fields, blocklist `feed_url`/`sinkhole_ip`, blocklist-entry
+  target, and pool `hc_target_port`. The edit forms now omit fields
+  hidden for the current mode (blocklist feed URL / sinkhole IP, pool
+  health-check port, a v4 static's DUID, a cloud server's API port, a
+  non-select custom field's options), so an untouched edit cannot
+  clear them.
+
 - **ACME auto-renewal renews each certificate in its own issuance
   shape (#1529).** The renewal sweep ignored the stored challenge
   type and provider and renewed every certificate as managed-zone
