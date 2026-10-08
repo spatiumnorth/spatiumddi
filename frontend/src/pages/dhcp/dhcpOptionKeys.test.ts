@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { optionKeyCode, optionsFromMap, optionsToMap } from "./dhcpOptionKeys";
+import {
+  optionKeyCode,
+  optionsFromMap,
+  optionsToMap,
+  rawPrefixFor,
+} from "./dhcpOptionKeys";
 
 describe("option keys for map-shaped stores (#1228)", () => {
   it("keys a catalogue pick by the raw code, not its IANA name", () => {
@@ -30,5 +35,25 @@ describe("option keys for map-shaped stores (#1228)", () => {
     expect(rows.map((r) => r.code)).toEqual([43, 26, 252]);
     expect(optionsToMap(rows)).toEqual(stored);
     expect(optionKeyCode("netbios-name-servers")).toBe(0);
+  });
+});
+
+describe("raw spelling follows the group's servers (#1347)", () => {
+  it("is opt- only for an all-Windows group", () => {
+    expect(rawPrefixFor(["windows_dhcp"])).toBe("opt-");
+    expect(rawPrefixFor(["windows_dhcp", "windows_dhcp"])).toBe("opt-");
+    expect(rawPrefixFor(["kea"])).toBe("code:");
+    expect(rawPrefixFor(["windows_dhcp", "fortigate"])).toBe("code:");
+    expect(rawPrefixFor([])).toBe("code:");
+  });
+
+  it("keys a catalogue pick with the group's prefix", () => {
+    const pick = {
+      code: 43,
+      name: "vendor-encapsulated-options",
+      value: "0a0b",
+    };
+    expect(optionsToMap([pick], "opt-")).toEqual({ "opt-43": "0a0b" });
+    expect(optionsToMap([pick])).toEqual({ "code:43": "0a0b" });
   });
 });
