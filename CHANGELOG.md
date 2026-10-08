@@ -84,6 +84,118 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **ACME auto-renewal renews each certificate in its own issuance
+  shape (#1529).** The renewal sweep ignored the stored challenge
+  type and provider and renewed every certificate as managed-zone
+  DNS-01 from one global domain list, so http-01 certificates never
+  renewed and manual-DNS certificates got a renewal order every 12 h
+  that could only fail. The sweep now reads the shape — challenge
+  type, provider, domains — from the successful order that produced
+  each certificate. A certificate that needs a person (manual DNS-01
+  for domains SpatiumDDI doesn't host, and not since covered by a
+  managed zone) is skipped and raises a new seeded
+  `acme-manual-renewal` alert instead. The `platform_settings` shape
+  columns are now written only when an order succeeds, never at
+  order creation, so a later failed issue attempt can't retarget an
+  existing certificate's renewal.
+
+- **ACME DNS-01 solves no longer strand challenge records, stall on
+  other groups, or verify against the wrong resolver (#1530, #1531,
+  #1532).** A solve that fails after its `_acme-challenge` TXT record
+  commits now tears the record down on every failure path, and the
+  stale-TXT sweep — which existed but had no caller — is on an hourly
+  beat schedule and also covers stranded client-path records, not
+  just acme-dns provider accounts. The sibling-op wait in `solve()`
+  is scoped to servers in the zone's own group: serials are
+  date-based, so a same-name zone in another group (a split-horizon
+  pair) could otherwise stall or fail the solve. And the manual
+  DNS-01 propagation check walks the domain's authoritative name
+  servers (found by walking up from the challenge FQDN) and requires
+  the TXT on every one, instead of asking the appliance's own
+  resolver, which is not what the CA queries.
+
+- **Raw DHCP option codes are checked on every way into a group, not
+  only on write (#1347).** #1296 made a scope or option-template write
+  refuse the raw spelling its group's servers drop (Windows reads `opt-NN`,
+  Kea and FortiGate `code:NN`). Three other paths still produced options
+  saved and never served, with no error:
+  - **A server joining a group.** A scope saved with `code:43` on a Kea,
+    FortiGate or empty group kept it when a Windows server was added or
+    moved in, and Windows then served the scope without it. Creating or
+    moving a server into such a group is now refused, naming the scopes and
+    keys.
+  - **The Windows importer** wrote `opt-NN` into whatever group it was
+    given, and a Kea group dropped every one at render. Options are now
+    re-keyed to the target group's spelling on commit, and the ones no
+    server there can serve are dropped and named in the warnings.
+  - **The option editor** keyed a catalogue pick as `code:NN` even on a
+    Windows group, where the write then refused it. It now uses the group's
+    spelling, for scopes and option templates alike.
+  Each DHCP driver now declares the spelling it reads, rather than the
+  router special-casing Windows, and `opt-NN` on a DHCPv6 scope is refused
+  on a Windows group too: the Windows write path is DHCPv4-only, so it
+  reached no server.
+
+- **A new external user can be admitted with auto-create off (#1291).**
+  `POST /users` created local accounts only, and `link-provider` refuses a
+  local account, so a provider with `auto_create_users` off signed in only
+  the accounts it already had: a new employee was refused for good, and
+  the docs' "create the user manually" had no API or UI behind it. Now Users
+  → New User has a *Signs in through* picker, and `POST /users` accepts
+  `auth_provider_id` with no password. That creates an account bound to the
+  provider with no password, which the user's first sign-in through that
+  provider claims; the same username through any other provider is still
+  refused. Creating one as a superadmin needs the operator step-up, as for
+  a local superadmin.
+
+- **A Fleet reboot request reboots the appliance, or says why it did
+  not (#1446).** The control plane cleared `reboot_requested` 15 seconds
+  after it was stamped, assuming the supervisor had seen it by then. A
+  node with an upgrade staged does not long-poll, so its heartbeats
+  arrive a full interval apart: the first one after the request cleared
+  the flag and carried "no reboot" in its own reply, the supervisor
+  never saw the request, and the Fleet view showed it as done. Reported
+  by @stefanriegel on a control-plane member during a rolling upgrade.
+  The supervisor now reports its boot id on every heartbeat; the request
+  is delivered until a heartbeat arrives from a different boot, which is
+  the proof it landed, and is given up with a logged warning after 15
+  minutes. The supervisor writes the reboot trigger at most once per
+  boot, so a trigger left behind by a shutdown can no longer swallow the
+  next request. A supervisor too old to report its boot gets the request
+  exactly once. Migration `199eb1562927`.
+
+- **A large blocklist feed no longer OOM-kills the worker, once an hour,
+  forever (#1466).** The feed refresh loaded every existing entry as an
+  ORM object and added one tracked object per new domain. On the
+  catalog's Hagezi Gambling feed (~578k domains) that peaked at about
+  2 GiB above baseline, over the worker's 1.4 GiB limit, so the list
+  never synced and every attempt killed a worker. Because the task was
+  acked late and requeued on worker loss, the killed refresh went back
+  to the broker and took down the next worker after the visibility
+  timeout, along with whatever that worker was running. The refresh now
+  diffs on domain columns and writes in batches of plain INSERT / DELETE
+  statements (about 135 MiB for the same feed), and the task is acked on
+  receipt, so a refresh that does take its worker down is lost rather
+  than redelivered. Also fixed on the way: a feed listing a domain the
+  operator had already added by hand failed the whole refresh on the
+  list's unique constraint; the manual entry is now kept and the feed's
+  copy skipped.
+
+- **An agent appliance keeps access to its own Kubernetes API once the
+  control plane is multi-node (#1508).** The firewall renderers retired the
+  6443 bootstrap sentinel on every node as soon as the fleet's control plane
+  had two members. An agent appliance runs its own single-node k3s and gets
+  no scoped `kubeapi` rule, so its pods (supervisor, DNS, DHCP) lost their
+  own API, and the self-partition guard then refused every corrected rule
+  set. The sentinel is now retired only on a control-plane member; agents
+  keep it. **Recovery for an agent already cut off on 2026.10.02-1** (it does
+  not heal by itself, because the guard can't read membership while the API
+  is blocked): on the agent, run
+  `mv /etc/nftables.d/00-spatium-k3s-bootstrap.nft.retired /etc/nftables.d/00-spatium-k3s-bootstrap.nft`
+  and `nft -f /etc/nftables.conf` once, after the control plane runs this
+  release. The next heartbeat then applies a rule set that keeps it. A
+  `firewall_extra` 6443 rule added as a workaround can be removed afterwards.
+
 - **The Teams webhook flavor sends an Adaptive Card for a Workflows
   webhook (#1504).** It posted a legacy Office 365 `MessageCard`, and
   the form asked for a `…webhook.office.com/webhookb2/…` URL, but
@@ -464,6 +576,38 @@ the formatter handles the rest.
   zone in use is changed to a secondary. A record an earlier release
   wrote into such a zone is dropped, with no update sent, the next time
   IPAM syncs the address.
+
+- **A slot upgrade no longer hands k3s half-written image tarballs
+  (#1630).** `spatium-upgrade-slot apply` copied the new slot's
+  image tarballs over the old ones in place while the old slot's
+  k3s kept running, and k3s's image watcher imported each file
+  while it was still being written. Those imports failed, and one
+  cut off inside a tarball's `index.json` could leave a containerd
+  ingest that failed the next boot's imports as well. Each tarball
+  is now copied under a hidden `.part` name the watcher ignores,
+  synced, and renamed into place.
+
+- **An image tarball k3s failed to import is noticed and imported
+  again (#1630).** k3s imports every tarball's `index.json` under
+  one containerd ref, and an import that died part-way left a
+  stale write there that failed every shorter `index.json` after
+  it, on every boot. k3s retries a failed tarball only when the
+  file changes, so a slot upgrade's first boot could leave a node
+  without its DNS and DHCP agents' images for good, with the pods
+  in `ErrImageNeverPull`. k3s.service now clears unfinished
+  containerd writes before k3s starts. On every boot, firstboot
+  checks k3s's own record of what it imported against containerd,
+  and has k3s re-import anything missing.
+
+- **A trial slot is not committed while one of its images is
+  missing (#1630).** firstboot committed a slot upgrade's trial
+  boot once the apiserver answered and the control chart was
+  placed, whatever k3s had imported, so a node whose DNS and DHCP
+  agents' images had failed to import made the swap durable
+  without them. If an image is still missing after the re-import
+  above, a trial boot now exits before the commit. The previous
+  slot stays the durable default and the next reboot reverts to
+  it, as with a failed host migration.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
@@ -1534,6 +1678,10 @@ the formatter handles the rest.
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
   recorded, and restoring NULL would make them never expire again.
+- `199eb1562927` — #1446: `appliance.reboot_requested_boot_id`, a
+  nullable string. No backfill: NULL means the boot is not recorded yet.
+  Downgrade drops the column.
+
 - `61566a119901` — #1290: `ix_user_email` becomes a partial unique
   index, `WHERE email <> ''`. No data change. Downgrade restores the
   plain unique index and refuses, with a message, while more than one

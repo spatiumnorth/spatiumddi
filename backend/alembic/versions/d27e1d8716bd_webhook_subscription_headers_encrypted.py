@@ -37,7 +37,7 @@ The two migrations touch different tables, so the order is
 immaterial.
 
 Revision ID: d27e1d8716bd
-Revises: ff32b91acad8
+Revises: 199eb1562927
 Create Date: 2026-10-04
 """
 
@@ -48,7 +48,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "d27e1d8716bd"
-down_revision = "ff32b91acad8"
+down_revision = "199eb1562927"
 branch_labels = None
 depends_on = None
 

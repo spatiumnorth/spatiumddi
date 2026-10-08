@@ -2467,7 +2467,9 @@ export const usersApi = {
       username: string;
       email: string;
       display_name: string;
-      password: string;
+      // A local account. Omitted for one bound to a provider (#1291).
+      password?: string;
+      auth_provider_id?: string;
       is_superadmin: boolean;
       force_password_change: boolean;
     } & StepUp,

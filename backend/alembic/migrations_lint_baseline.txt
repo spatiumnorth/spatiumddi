@@ -10,6 +10,7 @@ backend/alembic/versions/0f83a227b16d_event_subscription_outbox_tables_for_.py:d
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:73
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:74
 backend/alembic/versions/1440e72b9297_metallb_bgp_mode.py:drop_column:75
+backend/alembic/versions/199eb1562927_appliance_reboot_requested_boot_id.py:drop_column:34
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:283
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:287
 backend/alembic/versions/1a48e694db0b_initial_schema.py:drop_table:289
