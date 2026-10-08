@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium serves the zone's own Primary NS, Admin Email and SOA
+  timers (#1490).** The driver left the apex to the daemon, which writes
+  one NS and an SOA MNAME naming its own host name at zone create (the
+  pod name, under the DNS VIP) and a placeholder RNAME. So every server
+  in a group answered with a different, unresolvable name server, and
+  `primary_ns` / `admin_email`, shipped in the bundle since #1153, never
+  reached the wire. The SOA timers kept Technitium's defaults too,
+  including a 15-minute negative-caching `minimum`. The agent now
+  applies the zone's apex with the BIND9 precedence: NS from the zone's
+  apex NS records, else its Primary NS; MNAME, RNAME and the shipped
+  timers into the SOA, at the zone's TTL. It writes only what differs,
+  since every SOA write bumps the serial, and adds the new NS before
+  removing the old one. A zone that sets neither Primary NS nor Admin
+  Email nor apex NS is left as it was; the timers (shipped for every zone
+  since #1171) go along only with an apex the zone does set.
+
 - **A server group an appliance cannot carry is refused instead of
   silently dropped (#1468).** The supervisor writes the assigned DNS or
   DHCP group's name into the role env and accepts only letters, digits,
