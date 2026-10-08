@@ -199,7 +199,15 @@ class LocalVolumeDestination(BackupDestination):
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
-        return await asyncio.to_thread(_do)
+        try:
+            return await asyncio.to_thread(_do)
+        except OSError as exc:
+            # Translated at the driver boundary (#1515), like write:
+            # a bare OSError escaping the runner left the target
+            # stranded ``in_progress``.
+            raise BackupDestinationError(
+                f"could not list archives at {config['path']}: {exc}"
+            ) from exc
 
     async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
         safe = safe_filename(filename)
@@ -211,7 +219,12 @@ class LocalVolumeDestination(BackupDestination):
                 raise BackupDestinationError(f"archive {safe!r} not found at {root}")
             return target.read_bytes()
 
-        return await asyncio.to_thread(_do)
+        try:
+            return await asyncio.to_thread(_do)
+        except OSError as exc:
+            raise BackupDestinationError(
+                f"could not read {safe!r} from {config['path']}: {exc}"
+            ) from exc
 
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         safe = safe_filename(filename)
@@ -227,7 +240,13 @@ class LocalVolumeDestination(BackupDestination):
                     path=str(target),
                     error=str(exc),
                 )
-                raise
+                # Translated, not re-raised bare (#1515): delete runs
+                # in the retention sweep AFTER the archive was
+                # written, so a bare OSError escaped the runner
+                # before the success stamp — the run that just
+                # succeeded was recorded as neither success nor
+                # failure and the target stranded ``in_progress``.
+                raise BackupDestinationError(f"could not delete {safe!r} at {root}: {exc}") from exc
 
         await asyncio.to_thread(_do)
 

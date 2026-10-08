@@ -49,6 +49,7 @@ class FindUpgradePreflightArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_preflight",
+    permission="superadmin",
     description=(
         "Run pre-flight safety checks for a multi-node rolling upgrade to "
         "the given target version (superadmin only, read-only). Returns "
@@ -102,6 +103,7 @@ class FindUpgradeRunsArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_runs",
+    permission="superadmin",
     description=(
         "List recent SystemUpgradeRun rows from the multi-node rolling-"
         "upgrade orchestrator (superadmin only, read-only). Each row "
@@ -163,6 +165,7 @@ class FindUpgradeLeaseArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_lease",
+    permission="superadmin",
     description=(
         "Read the cluster-wide rolling-upgrade single-upgrader Lease "
         "state (superadmin only, read-only). Mirrors the "

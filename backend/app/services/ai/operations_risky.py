@@ -1021,6 +1021,30 @@ class DeleteGroupArgs(BaseModel):
     group_id: UUID
 
 
+async def _group_scope_counts(db: AsyncSession, group_id: UUID) -> tuple[int, int]:
+    """``(live, in_trash)``: the scopes a DHCP server group holds (#1399).
+
+    The default soft-delete filter hides the scopes in Trash, so the live count
+    is a plain count and the total opts out of the filter.
+    """
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+
+    stmt = select(func.count()).select_from(DHCPScope).where(DHCPScope.group_id == group_id)
+    live = (await db.execute(stmt)).scalar_one()
+    total = (await db.execute(stmt.execution_options(include_deleted=True))).scalar_one()
+    return live, total - live
+
+
+def _group_holds_scopes(name: str, live: int) -> str:
+    """Why a group holding live scopes is refused (#1399)."""
+    return (
+        f"DHCP server group {name!r} still holds {live} scope(s). Delete its "
+        "scopes first, then the group. A deleted scope goes to Trash; deleting "
+        "the group then deletes its scopes in Trash for good, with their pools "
+        "and reservations."
+    )
+
+
 async def _preview_delete_group(
     db: AsyncSession, user: User, args: DeleteGroupArgs
 ) -> PreviewResult:
@@ -1043,6 +1067,18 @@ async def _preview_delete_group(
                 f"DHCP server group {g.name!r} still contains "
                 f"{server_count} server(s). Move them to another group "
                 "(or standalone) before deleting the group."
+            ),
+        )
+    live, in_trash = await _group_scope_counts(db, args.group_id)
+    if live:
+        return PreviewResult(ok=False, detail=_group_holds_scopes(g.name, live))
+    if in_trash:
+        return PreviewResult(
+            ok=True,
+            detail="ready",
+            preview_text=(
+                f"Delete DHCP server group `{g.name}` and, for good, its "
+                f"{in_trash} scope(s) in Trash with their pools and reservations"
             ),
         )
     return PreviewResult(
@@ -1082,13 +1118,24 @@ async def _apply_delete_group(
             ),
         )
 
-    # Deleting the group hard-deletes its scopes, and the FK CASCADE takes their
-    # reservations with them — no Python runs, so nothing would release the IPAM
-    # mirrors and the addresses would be stranded at ``status="static_dhcp"``
-    # pointing at rows Postgres has dropped (#618). Delete the mirror rows (not
-    # just free them) so the IPs fold back into free gaps. The scopes' dynamic
-    # leases (nullable ON DELETE SET NULL backlink) would otherwise survive the
-    # group delete, so tear those + their mirrors down too.
+    # A group still holding a live scope is refused like one holding servers
+    # (#1399): the cascade below would destroy the scope with its pools and
+    # reservations, none of them into Trash. The guard counted servers only
+    # since scopes moved from the server onto the group.
+    live, _ = await _group_scope_counts(db, args.group_id)
+    if live:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=_group_holds_scopes(g.name, live)
+        )
+
+    # Only the group's scopes already in Trash reach here. Deleting the group
+    # hard-deletes them, and the FK CASCADE takes their reservations with them —
+    # no Python runs, so nothing would release the IPAM mirrors and the
+    # addresses would be stranded at ``status="static_dhcp"`` pointing at rows
+    # Postgres has dropped (#618). Delete the mirror rows (not just free them)
+    # so the IPs fold back into free gaps. The scopes' dynamic leases (nullable
+    # ON DELETE SET NULL backlink) would otherwise survive the group delete, so
+    # tear those + their mirrors down too.
     from app.models.dhcp import DHCPScope  # noqa: PLC0415
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
     from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics  # noqa: PLC0415
@@ -1116,7 +1163,10 @@ async def _apply_delete_group(
         resource_type="dhcp_server_group",
         resource_id=str(g.id),
         resource_display=g.name,
-        old_value={"ipam_mirrors_released": released},
+        old_value={
+            "ipam_mirrors_released": released,
+            "trashed_scopes_deleted": len(group_scopes),
+        },
     )
     await db.delete(g)
     await db.commit()
@@ -1125,7 +1175,10 @@ async def _apply_delete_group(
 
 _OP_DELETE_GROUP = Operation(
     name="delete_group",
-    description="Delete a DHCP server group (refused if it still holds servers).",
+    description=(
+        "Delete a DHCP server group (refused while it holds servers or scopes; "
+        "its scopes already in Trash are deleted with it, for good)."
+    ),
     args_model=DeleteGroupArgs,
     preview=_preview_delete_group,
     apply=_apply_delete_group,
