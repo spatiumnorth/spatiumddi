@@ -145,3 +145,73 @@ async def test_a_family_swap_onto_a_cname_name_writes_none(db_session: AsyncSess
     await db_session.flush()
 
     assert await _address_records(db_session, zone, "www") == []
+
+
+# ── #1493: no PTR naming the alias, and the sync reports the skip ─────────────
+
+
+async def _reverse_zone(db: AsyncSession, subnet: Subnet, zone: DNSZone) -> DNSZone:
+    rev = DNSZone(
+        group_id=zone.group_id,
+        name="1.81.10.in-addr.arpa.",
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.corp.test.",
+        admin_email="admin.corp.test.",
+        linked_subnet_id=subnet.id,
+    )
+    db.add(rev)
+    await db.flush()
+    return rev
+
+
+async def _ptrs(db: AsyncSession, ip: IPAddress) -> list[DNSRecord]:
+    rows = await db.execute(
+        select(DNSRecord).where(DNSRecord.ip_address_id == ip.id, DNSRecord.record_type == "PTR")
+    )
+    return list(rows.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_no_ptr_is_written_for_a_name_that_holds_a_cname(db_session: AsyncSession) -> None:
+    subnet, zone = await _setup(db_session)
+    await _reverse_zone(db_session, subnet, zone)
+    ip = await _ip(db_session, subnet, "10.81.1.20", "www")
+
+    published = await _sync_dns_record(db_session, ip, subnet)
+    await db_session.flush()
+
+    assert await _ptrs(db_session, ip) == []
+    # Nothing was published, so the DDNS path must not log ``ddns_applied``.
+    assert published is False
+    assert getattr(ip, "_dns_skipped_cname", False) is True
+
+
+@pytest.mark.asyncio
+async def test_renaming_onto_a_cname_retracts_the_ptr(db_session: AsyncSession) -> None:
+    subnet, zone = await _setup(db_session)
+    await _reverse_zone(db_session, subnet, zone)
+    ip = await _ip(db_session, subnet, "10.81.1.21", "app")
+    await _sync_dns_record(db_session, ip, subnet)
+    await db_session.flush()
+    assert len(await _ptrs(db_session, ip)) == 1
+
+    ip.hostname = "www"
+    await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.flush()
+
+    assert await _ptrs(db_session, ip) == []
+    assert ip.reverse_zone_id is None
+
+
+@pytest.mark.asyncio
+async def test_an_address_with_its_own_name_still_gets_its_ptr(db_session: AsyncSession) -> None:
+    subnet, zone = await _setup(db_session)
+    await _reverse_zone(db_session, subnet, zone)
+    ip = await _ip(db_session, subnet, "10.81.1.22", "host")
+
+    assert await _sync_dns_record(db_session, ip, subnet) is True
+    await db_session.flush()
+
+    ptrs = await _ptrs(db_session, ip)
+    assert [p.value for p in ptrs] == ["host.corp.test."]

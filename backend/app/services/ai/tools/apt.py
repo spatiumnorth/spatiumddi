@@ -5,7 +5,8 @@ can ask the Copilot "is APT management on?", "what mirrors are
 configured?", "is a proxy set?", or "are private-mirror creds
 configured?". The response matches the ``GET /api/v1/settings/``
 redaction: GPG armoured-key text + auth passwords fold into
-``armoured_text_set`` / ``password_set`` booleans, never plaintext.
+``armoured_text_set`` / ``password_set`` booleans, never plaintext, and
+a credential embedded in a proxy URL reads as ``***``.
 
 Read-only. No ``propose_update_apt_settings`` — same reasoning as the
 SNMP tool: APT management touches Fernet-encrypted fields + a
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.settings import PlatformSettings
 from app.services.ai.tools.base import register_tool
+from app.services.appliance.apt import mask_proxy_url
 
 
 class FindAptSettingsArgs(BaseModel):
@@ -39,13 +41,14 @@ class FindAptSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_apt_settings",
+    permission="authenticated",
     description=(
         "Return the appliance APT configuration — whether SpatiumDDI "
         "manages apt (apt_managed), the configured repository sources "
         "(name / uri / suites / components / enabled), how many GPG "
         "keys + private-mirror credentials are set (redacted booleans, "
         "never the armoured key text or passwords), the HTTP/HTTPS proxy "
-        "URLs + no_proxy list, and whether unattended-upgrades is on. "
+        "URLs (any embedded credential masked as ***) + no_proxy list, and whether unattended-upgrades is on. "
         "Use to answer 'is apt managed?', 'what mirror are we pulling "
         "from?', 'is a proxy configured?', or 'are security updates "
         "enabled?'. Managed apt config rolls out to every SpatiumDDI "
@@ -83,8 +86,9 @@ async def find_apt_settings(
         "enabled_source_count": sum(1 for s in sources if s["enabled"]),
         "gpg_key_count": len(settings.apt_gpg_keys or []),
         "auth_entry_count": len(settings.apt_auth or []),
-        "proxy_http": settings.apt_proxy_http or "",
-        "proxy_https": settings.apt_proxy_https or "",
+        # GHSA-j77h-pqg7-h2g4 — same masking as ``GET /settings``.
+        "proxy_http": mask_proxy_url(settings.apt_proxy_http),
+        "proxy_https": mask_proxy_url(settings.apt_proxy_https),
         "no_proxy": settings.apt_proxy_no_proxy or "",
         "unattended_upgrades_enabled": bool(settings.apt_unattended_upgrades_enabled),
         # Issue #164 — unattended-upgrades policy (the WHEN/HOW of auto-applying).

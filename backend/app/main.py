@@ -472,6 +472,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_schema_behind_head_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_behind_head_alert_rule_seed_skipped", reason=str(exc))
+    # acme-manual-renewal alert rule — singleton, enabled by default
+    # (#1529). Fires when the ACME renewal sweep must skip a cert whose
+    # issuance shape needs a person (manual DNS-01). Idempotent seed.
+    try:
+        from app.services.alerts import seed_acme_manual_renewal_alert_rule  # noqa: PLC0415
+
+        await seed_acme_manual_renewal_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("acme_manual_renewal_alert_rule_seed_skipped", reason=str(exc))
     # Record the schema head this release runs at (#1227), so a later
     # rollback to it can be checked before the switch rather than after.
     # Only once the schema is at head; never blocks startup.
@@ -950,8 +959,9 @@ def create_app() -> FastAPI:
         # error (#865). Without this the header is present on the wire but
         # the JS layer can't read it under CORS — for a cross-origin
         # frontend the feature would silently degrade to the dead end it
-        # fixes.
-        expose_headers=["X-Total-Count", "X-Adoption-Required"],
+        # fixes. ``X-Stepup-Required`` marks a 403 that wants the operator
+        # step-up, so a dialog can prompt and resubmit (#1412).
+        expose_headers=["X-Total-Count", "X-Adoption-Required", "X-Stepup-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given

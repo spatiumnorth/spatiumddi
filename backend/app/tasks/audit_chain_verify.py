@@ -99,7 +99,8 @@ async def _async_verify_and_alert() -> dict:
             subject_display=f"audit_log.seq={first.seq}",
             severity="critical",
             message=(
-                f"Audit-log chain break at seq={first.seq} ({first.reason}). "
+                f"Audit-log chain break at seq={first.seq} ({first.reason}: "
+                f"{first.action} {first.resource_type} {first.resource_id}). "
                 f"Total {len(result.breaks)} broken row(s) across {result.rows_checked} checked."
             ),
             fired_at=datetime.now(UTC),
@@ -110,6 +111,9 @@ async def _async_verify_and_alert() -> dict:
                     "seq": first.seq,
                     "audit_id": first.audit_id,
                     "reason": first.reason,
+                    "action": first.action,
+                    "resource_type": first.resource_type,
+                    "resource_id": first.resource_id,
                     "expected_hash": first.expected_hash,
                     "actual_hash": first.actual_hash,
                 },
