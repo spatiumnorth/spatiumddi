@@ -40,7 +40,7 @@ from spatium_dns_agent.config_apply import (
     truncate_error,
 )
 from spatium_dns_agent.drivers.base import DriverBase, HeldZone
-from spatium_dns_agent.sync import SyncLoop, _held_back_error
+from spatium_dns_agent.sync import PARTIAL_APPLY_PREFIX, SyncLoop, _partial_apply_error
 
 
 # ── cache: previous == last GOOD, not last fetched ────────────────────────
@@ -447,12 +447,22 @@ def test_a_held_zone_is_reported_not_quarantined(tmp_path: Path) -> None:
 
 def test_held_back_error_names_every_zone_and_stays_bounded() -> None:
     gone = HeldZone("new.test", None, "zone new.test/IN: bad dotted quad", False)
-    text = _held_back_error((HELD, gone))
-    assert text.startswith("named-checkzone refused 2 zone files, held back until")
+    text = _partial_apply_error((HELD, gone), ())
+    assert text.startswith(
+        PARTIAL_APPLY_PREFIX + "named-checkzone refused 2 zone files, held back until"
+    )
     assert "bad.test (view internal): zone bad.test/IN" in text
     assert "new.test: zone new.test/IN: bad dotted quad (not served)" in text
     long = HeldZone("x.test", None, "y" * 5000, True)
-    assert len(_held_back_error((long,))) <= MAX_ERROR_LEN
+    assert len(_partial_apply_error((long,), ())) <= MAX_ERROR_LEN
+
+
+def test_both_kinds_of_unserved_zone_are_named_in_one_verdict() -> None:
+    """No driver both holds back and refuses today; if one did, the verdict
+    names both rather than dropping one."""
+    text = _partial_apply_error((HELD,), ["other.test: HTTP 422 bad rrset"])
+    assert text.startswith(PARTIAL_APPLY_PREFIX + "named-checkzone refused a zone file")
+    assert "the daemon refused 1 zone(s); every other zone is served: other.test" in text
 
 
 class _Http:
@@ -545,6 +555,40 @@ def test_a_change_made_while_a_zone_is_held_still_applies(
     assert loop.apply_status.etag == "e2"
     assert loop._quarantine.etag is None
     assert loop._current_structural_etag is None
+    _assert_echoed(loop, STATUS_REVERTED)
+
+
+def test_a_held_zone_reads_as_a_partial_apply_and_survives_a_record_only_poll(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A BIND9 hold is reported with :data:`PARTIAL_APPLY_PREFIX`, so the UI and
+    the ``agent_config_rejected`` alert say "nothing rolled back" instead of
+    #882's rollback wording (#1280). And a poll that re-renders nothing must
+    not read that verdict as stale: the zone is still held."""
+    ensure_layout(tmp_path)
+    monkeypatch.setattr("spatium_dns_agent.sync.push_rendered_config", lambda *a: None)
+    driver = _Driver(tmp_path)
+    loop = _loop(tmp_path, driver)
+    http = _Http([_flat("e1", "s1", []), _flat("e2", "s1", ["op-3"])])
+    loop._client = lambda: http  # type: ignore[method-assign]
+    driver.hold = (HELD,)
+
+    loop._poll_once()
+    error = loop.apply_status.error or ""
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert error.startswith(PARTIAL_APPLY_PREFIX + "named-checkzone refused a zone file")
+    assert "bad.test (view internal)" in error
+
+    # Force the record-only path: the structural etag matches, so nothing
+    # re-renders and only the stale-verdict clear stands between the poll and
+    # an ``ok`` that would hide the held zone.
+    loop._current_structural_etag = "s1"
+    loop._poll_once()
+
+    assert driver.applied == ["e1"], "a record-only poll re-renders nothing"
+    assert driver.ops == ["op-3"]
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert (loop.apply_status.error or "").startswith(PARTIAL_APPLY_PREFIX)
     _assert_echoed(loop, STATUS_REVERTED)
 
 

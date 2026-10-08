@@ -148,9 +148,10 @@ class DriverBase(ABC):
         the last-known-good bundle cannot make the daemon accept data it
         just refused, and would take the zones it did accept down with it.
 
-        Drivers whose daemon loads all zones or none (BIND9 validates the
-        whole tree with ``named-checkconf``) keep the empty default and
-        fail the apply instead.
+        Drivers whose daemon loads all zones or none keep the empty default.
+        BIND9 is one, but its zone check holds back a zone ``named-checkzone``
+        refuses before the daemon sees it (:attr:`held_back`, #1403); the sync
+        loop reports both kinds as the same partial apply.
         """
         return list(self._refused_zones)
 
