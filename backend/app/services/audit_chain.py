@@ -35,6 +35,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -77,6 +78,48 @@ def canonical_json(row: AuditLog) -> str:
         "error_detail": row.error_detail,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+#: The JSONB columns that participate in the hash.
+_JSONB_HASHED_COLUMNS = ("old_value", "new_value", "changed_fields")
+
+
+def _pg_number(token: str) -> int | float:
+    """The number PostgreSQL hands back for a JSON number ``token``.
+
+    JSONB stores numbers as ``numeric`` and prints them in plain decimal
+    notation with no exponent and no negative zero, so ``1e+16`` comes back
+    as the integer ``10000000000000000`` and ``-0.0`` as ``0.0``. A token
+    whose decimal exponent is non-negative has no fractional digits and
+    therefore reads back as an int; any other token reads back as the same
+    float (``repr`` is round-trip exact), bar the sign of zero.
+    """
+    exponent = Decimal(token).as_tuple().exponent
+    if isinstance(exponent, int) and exponent >= 0:
+        return int(Decimal(token))
+    value = float(token)
+    return 0.0 if value == 0 else value
+
+
+def normalise_jsonb_value(value: Any) -> Any:
+    """``value`` exactly as a JSONB column will return it (GHSA-8288-8vg9-82gr).
+
+    ``compute_audit_hashes`` hashes before the INSERT and ``verify_chain``
+    re-hashes what PostgreSQL returns, so anything the JSONB round trip
+    rewrites made an honest row report ``row_hash_mismatch``. Serialises the
+    way the engine's ``json_serializer`` does (``default=str``, so UUIDs,
+    datetimes and Decimals become the strings that are stored), then maps
+    every number to what ``numeric`` prints. ``NaN`` / ``Infinity``, which
+    JSONB rejects outright (failing the INSERT and the audited change with
+    it), are kept as the strings ``"NaN"`` / ``"Infinity"`` / ``"-Infinity"``.
+    """
+    if value is None:
+        return None
+    return json.loads(
+        json.dumps(value, default=str),
+        parse_float=_pg_number,
+        parse_constant=str,
+    )
 
 
 #: ``AuditLog.request_id`` is ``String(64)``.
@@ -163,6 +206,14 @@ def compute_audit_hashes(session: Session) -> None:
                 and getattr(row, col.key, None) is None
             ):
                 setattr(row, col.key, default.arg)
+        # Store what is hashed: hand the row the JSONB-round-tripped form of
+        # its JSON payloads, so the verifier's re-hash of the read-back row
+        # sees the same values. ``canonical_json`` itself is untouched —
+        # every existing hash and the migration backfill depend on it.
+        for key in _JSONB_HASHED_COLUMNS:
+            current = getattr(row, key)
+            if current is not None:
+                setattr(row, key, normalise_jsonb_value(current))
 
     # DO NOT re-sort. ``verify_chain`` walks rows by ``seq`` (the DB
     # sequence assigned at INSERT) and checks each row's ``prev_hash``
@@ -205,6 +256,11 @@ class ChainBreak:
     expected_hash: str
     actual_hash: str
     reason: str  # "row_hash_mismatch" | "prev_hash_mismatch"
+    # Which row broke, so an operator (and the restore drill) can name the
+    # audited change without a second lookup (#1615).
+    action: str = ""
+    resource_type: str = ""
+    resource_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +303,9 @@ async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> Chai
                     expected_hash=expected_prev or "",
                     actual_hash=row.prev_hash or "",
                     reason="prev_hash_mismatch",
+                    action=row.action,
+                    resource_type=row.resource_type,
+                    resource_id=row.resource_id,
                 )
             )
         canonical = canonical_json(row)
@@ -259,6 +318,9 @@ async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> Chai
                     expected_hash=recomputed,
                     actual_hash=row.row_hash,
                     reason="row_hash_mismatch",
+                    action=row.action,
+                    resource_type=row.resource_type,
+                    resource_id=row.resource_id,
                 )
             )
         expected_prev = row.row_hash

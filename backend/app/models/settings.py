@@ -369,13 +369,17 @@ class PlatformSettings(Base):
     audit_forward_webhook_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
-    audit_forward_webhook_url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
-    # Optional Authorization header (e.g. "Bearer …" or "Basic …"); stored
-    # in plaintext today because the rest of this row is plaintext too —
-    # move to Fernet alongside the provider creds when we tighten secrets
-    # at rest across the board.
-    audit_forward_webhook_auth_header: Mapped[str] = mapped_column(
-        String(1024), nullable=False, default=""
+    # The legacy single webhook's URL and optional Authorization header,
+    # Fernet-encrypted at rest (#1502) like the same fields on
+    # ``audit_forward_target``. The plaintext ``audit_forward_webhook_url`` /
+    # ``audit_forward_webhook_auth_header`` columns are kept, unmapped and
+    # unread, for one release so a rolling upgrade's old pods keep working
+    # (#296); the next release drops them.
+    audit_forward_webhook_url_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    audit_forward_webhook_auth_header_encrypted: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
     )
 
     # IEEE OUI vendor lookup. Opt-in because the daily fetch pulls a ~5 MB
@@ -1101,9 +1105,12 @@ class PlatformSettings(Base):
     # ``security.certificates`` feature module is the separate discovery
     # toggle. ``acme_auto_renew`` is the seam for the deferred renewal
     # beat task (not yet consumed in Phase 1). ``acme_challenge_type`` /
-    # ``acme_dns_provider`` / ``acme_domains`` are populated by
-    # ``POST /issue`` to record the desired issuance shape for that
-    # Phase-2 renewal task to read.
+    # ``acme_dns_provider`` / ``acme_domains`` record the issuance shape
+    # of the last SUCCESSFUL order — written by the orchestrator on
+    # success only (#1529; ``POST /issue`` used to write them at order
+    # creation, so a failed attempt could retarget renewals). The
+    # renewal sweep's per-certificate source of truth is the successful
+    # order itself; these columns are its legacy fallback.
     acme_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )

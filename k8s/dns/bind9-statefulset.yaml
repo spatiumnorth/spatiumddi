@@ -46,7 +46,12 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: CONTROL_PLANE_URL
-              value: http://spatiumddi-api.spatiumddi.svc.cluster.local:8000
+              # The API Service is named `api` (k8s/base/api.yaml).
+              # Trailing dot: the pod inherits the node's search
+              # domains, and under ndots:5 a NODATA-answering inherited
+              # zone aborts the resolver's search walk before the bare
+              # name is ever tried (#777). Absolute skips the list.
+              value: http://api.spatiumddi.svc.cluster.local.:8000
             - name: SERVER_NAME
               valueFrom:
                 fieldRef:

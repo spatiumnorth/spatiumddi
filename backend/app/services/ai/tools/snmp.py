@@ -40,6 +40,7 @@ class FindSNMPSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_snmp_settings",
+    permission="authenticated",
     description=(
         "Return the appliance SNMP configuration — master toggle, "
         "version (v2c | v3), whether the community string is set, "

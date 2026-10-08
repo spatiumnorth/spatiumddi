@@ -710,7 +710,10 @@ async def _assert_audit_chain(
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
-        f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
+        f"; first at seq {first.seq} ({first.reason}: {first.action} "
+        f"{first.resource_type} {first.resource_id})"
+        if first is not None
+        else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
 
