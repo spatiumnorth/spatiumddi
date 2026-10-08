@@ -428,6 +428,34 @@ EOF
     fi
 fi
 
+# ── cloud-init leftovers (#1511) ─────────────────────────────────────
+# An ISO install takes its network from STATE; cloud-init has no part in
+# it. Installs before #1511 only masked cloud-init's units, and those
+# masks sit in this /etc overlay, which is not mounted yet when systemd
+# loads its units, so with the CIDATA drive still attached cloud-init ran
+# anyway and wrote a DHCP profile (cloud-init-<iface>.nmconnection) next
+# to the STATE one. Once a DHCP server answered on the segment, a reboot
+# could bring the node up on a lease instead of its address. The marker
+# works where the masks did not: cloud-init's units check it when they
+# start, after etc.mount.
+#
+# Only on a node spatium-install set up: it leaves either the marker or
+# the old cloud-init-local mask. An image that boots without the
+# installer (a cloud image) keeps cloud-init, and its profiles.
+if [ -e /etc/cloud/cloud-init.disabled ] \
+    || [ "$(readlink /etc/systemd/system/cloud-init-local.service 2>/dev/null || true)" = /dev/null ]; then
+    if [ ! -e /etc/cloud/cloud-init.disabled ]; then
+        install -d -m 0755 /etc/cloud
+        : > /etc/cloud/cloud-init.disabled
+        echo "cloud-init: disabled from the next boot on (#1511)"
+    fi
+    for _ci_profile in /etc/NetworkManager/system-connections/cloud-init-*.nmconnection; do
+        [ -e "$_ci_profile" ] || continue
+        rm -f "$_ci_profile"
+        echo "  removed the cloud-init network profile ${_ci_profile##*/} (#1511)"
+    done
+fi
+
 # ── Network status sidecar (#1017) ───────────────────────────────────
 #
 # What this boot actually applied, for the supervisor to report upward.
