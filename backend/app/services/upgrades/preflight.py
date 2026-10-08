@@ -430,9 +430,8 @@ async def check_mirror_disk_headroom(
     Phase B-only check — only fires when ``settings.slot_image_mirror_url``
     is set. Queries the mirror's ``/api/v1/appliance/internal/slot-
     images/_/disk-usage`` endpoint over the in-cluster Service to get
-    the real PVC volume's free space; ``check_disk_headroom`` above
-    looks at the api pod's /var which isn't where the slot image
-    actually lands in mirror mode.
+    the real PVC volume's free space; ``check_node_disk_headroom`` above
+    covers each node's /var (#1234), which is not the mirror's volume.
 
     On docker-compose / non-mirror shapes returns ``ok`` with detail
     noting "no mirror configured" so the operator-facing report still
