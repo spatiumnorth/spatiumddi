@@ -68,6 +68,7 @@ from app.services.backup.targets import (
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
 )
 
 logger = structlog.get_logger(__name__)
@@ -708,7 +709,10 @@ async def _assert_audit_chain(
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
-        f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
+        f"; first at seq {first.seq} ({first.reason}: {first.action} "
+        f"{first.resource_type} {first.resource_id})"
+        if first is not None
+        else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
 
@@ -932,11 +936,18 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     except DrillError as exc:
         return DrillOutcome(state="error", error=str(exc))
 
-    # 1. Fetch the newest archive from the destination.
+    # 1. Fetch the newest archive from the destination. Pre-restore
+    #    safety dumps are not this target's backups (#1574): they are
+    #    encrypted with the public constant passphrase, so drilling one
+    #    would report a healthy target's archive as unrestorable.
     try:
         driver = get_destination(target.kind)
         plain_config = decrypt_config_secrets(driver, target.config)
-        listings = await driver.list_archives(config=plain_config)
+        listings = [
+            listing
+            for listing in await driver.list_archives(config=plain_config)
+            if not is_pre_restore_archive(listing.filename)
+        ]
     except (BackupDestinationError, SecretFieldError, ValueError) as exc:
         if target.write_only:
             # A write-only target whose credential cannot list is the

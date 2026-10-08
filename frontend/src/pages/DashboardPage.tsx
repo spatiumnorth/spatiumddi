@@ -4276,7 +4276,7 @@ function ConformityPanel() {
   if (ready && !moduleEnabled) {
     return (
       <div className="rounded-lg border bg-card p-8 text-center text-sm text-muted-foreground">
-        Conformity module is disabled — enable it in Settings → Features.
+        Conformity module is disabled — enable it under Features & Integrations.
       </div>
     );
   }

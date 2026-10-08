@@ -41,6 +41,24 @@ from urllib.parse import urlsplit
 #: ``latest``, counted by retention, and fail every download / delete.
 ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-)[^/\\\x00-\x1f\x7f]*\.zip$")
 
+#: Prefix of the pre-restore safety dumps ``restore`` writes into the
+#: same directory a local-volume target is usually pointed at.
+PRE_RESTORE_PREFIX = "pre-restore-"
+
+#: How many safety dumps retention keeps. They are rollback copies,
+#: not backups: they get their OWN small allowance (#1574) so they
+#: neither consume the target's configured keep count nor pile up
+#: without bound.
+PRE_RESTORE_KEEP_LAST_N = 3
+
+
+def is_pre_restore_archive(filename: str) -> bool:
+    """True for a pre-restore safety dump, as opposed to a real backup
+    archive. The two share a listing (and, on the recommended
+    local-volume path, a directory) but not a passphrase, a retention
+    policy, or a meaning for "latest" (#1574)."""
+    return filename.startswith(PRE_RESTORE_PREFIX)
+
 
 def safe_filename(filename: str) -> str:
     """Return *filename* if it is one plain path component, else refuse it.

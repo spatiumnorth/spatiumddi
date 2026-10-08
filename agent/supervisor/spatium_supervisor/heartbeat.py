@@ -1472,8 +1472,7 @@ def heartbeat_once(
         # subprocess below if the supervisor crashed mid-write.
         # #555 — owner-only (0600) at creation: role-compose.env carries
         # DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap PSKs, and a plain
-        # write_text lands it at the umask default (0644, world-readable in
-        # the 1777 release-state dir) before any chmod. Reuse the shared
+        # write_text lands it at the umask default (0644) before any chmod. Reuse the shared
         # O_NOFOLLOW+0600 writer.
         tmp = env_path.with_suffix(".tmp")
         appliance_state._write_owner_only(tmp, rendered)
