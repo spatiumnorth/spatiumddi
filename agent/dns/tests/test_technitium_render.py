@@ -1685,10 +1685,26 @@ def test_render_apex_declared_ns_records_win(tmp_path: Path) -> None:
 
 
 def test_render_apex_absent_when_zone_sets_nothing(tmp_path: Path) -> None:
-    """A zone with no Primary NS, Admin Email or timers keeps the daemon's
-    apex untouched — the behaviour before the apex was managed."""
+    """A zone with no Primary NS or Admin Email keeps the daemon's apex
+    untouched — the behaviour before the apex was managed. The bundle ships
+    every zone's SOA timers since #1171 (the defaults, here), so they alone
+    must not make an apex."""
     out = _render_zone(
-        tmp_path, {"name": "plain.test.", "type": "primary", "ttl": 3600, "records": []}
+        tmp_path,
+        {
+            "name": "plain.test.",
+            "type": "primary",
+            "ttl": 3600,
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 86400,
+            "minimum": 300,
+            "records": [],
+        },
+    )
+    assert "apex" not in out
+    out = _render_zone(
+        tmp_path, {"name": "bare.test.", "type": "primary", "ttl": 3600, "records": []}
     )
     assert "apex" not in out
 

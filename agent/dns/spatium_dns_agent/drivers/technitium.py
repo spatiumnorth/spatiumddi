@@ -24,8 +24,9 @@ own config under ``/etc/dns`` and is configured entirely over its HTTP API
   NS and an SOA MNAME naming its own host name, which in a pod is the pod
   name). They are not reconciled record by record with the rest of the
   zone: ``_reconcile_zone_apex`` rewrites the SOA fields the zone sets
-  (Primary NS, Admin Email, timers) and replaces the apex NS set as a whole,
-  each only when it differs, and leaves a zone that sets none of them alone.
+  (Primary NS, Admin Email, and with them the timers) and replaces the apex
+  NS set as a whole, each only when it differs, and leaves a zone that sets
+  neither Primary NS nor Admin Email nor apex NS alone.
 
 Zone types (issue #743): primary, secondary, stub and forward, plus
 catalog-zone membership for the primaries this server owns. Only a
@@ -422,8 +423,11 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
     Same precedence as the BIND9 renderer (#1153): the zone's own apex NS
     records are the NS set, else its ``primary_ns``. MNAME is ``primary_ns``,
     else the first declared NS. A field the zone does not set is left out,
-    so the daemon's value stands; a zone that sets nothing returns None and
-    its apex is not touched at all.
+    so the daemon's value stands; a zone that sets neither apex NS, Primary
+    NS nor Admin Email returns None and its apex is not touched at all. The
+    bundle ships every zone's SOA timers since #1171, defaults included, so
+    they cannot mean the zone set anything: they ride along only with an
+    apex the zone does set.
     """
     zname = zone_name.rstrip(".").lower()
     declared: list[str] = []
@@ -454,12 +458,12 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
     rname = _responsible_person(zone.get("admin_email"))
     if rname:
         soa["responsiblePerson"] = rname
+    if not ns and not soa:
+        return None
     for field in _SOA_TIMERS:
         timer = zone.get(field)
         if isinstance(timer, int) and not isinstance(timer, bool) and timer >= 0:
             soa[field] = timer
-    if not ns and not soa:
-        return None
     ttl = zone.get("ttl")
     apex: dict[str, Any] = {"ns": ns, "soa": soa}
     if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0:

@@ -96,8 +96,9 @@ the formatter handles the rest.
   apex NS records, else its Primary NS; MNAME, RNAME and the shipped
   timers into the SOA, at the zone's TTL. It writes only what differs,
   since every SOA write bumps the serial, and adds the new NS before
-  removing the old one. A zone that sets none of these is left as it
-  was.
+  removing the old one. A zone that sets neither Primary NS nor Admin
+  Email nor apex NS is left as it was; the timers (shipped for every zone
+  since #1171) go along only with an apex the zone does set.
 - **ACME auto-renewal renews each certificate in its own issuance
   shape (#1529).** The renewal sweep ignored the stored challenge
   type and provider and renewed every certificate as managed-zone
