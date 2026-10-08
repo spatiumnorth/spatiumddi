@@ -49,6 +49,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_appliance_firewall_render.py": (
         "agent/supervisor/spatium_supervisor/firewall_renderer.py"
     ),
+    # #1468 — the group-name rule must match the supervisor's own pattern.
+    "test_appliance_group_names.py": ("agent/supervisor/spatium_supervisor/role_orchestrator.py"),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",

@@ -47,7 +47,15 @@ from app.models.auth import User
 from app.models.influxdb import InfluxDBTarget
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
-from app.services.ai.tools.base import register_tool
+from app.services.ai.tools.base import register_tool, tool_permission_allows
+
+# The agent fleet-health tools span three resource families; each kind is
+# shown only to a caller who can read that family on its own REST surface.
+_AGENT_KIND_PERMISSION: dict[str, tuple[str, tuple[str, ...]]] = {
+    "dns_server": ("read", ("dns_group", "dns_zone", "dns_record")),
+    "dhcp_server": ("read", ("dhcp_server",)),
+    "looking_glass_collector": ("read", ("bgp_lg_peer",)),
+}
 
 
 def _since_default(hours: float | None) -> datetime | None:
@@ -79,6 +87,7 @@ class QueryDNSQueryLogArgs(BaseModel):
 
 @register_tool(
     name="query_dns_query_log",
+    permission=("read", "server"),
     description=(
         "Query the BIND9 query log (rows shipped by the DNS agent's "
         "QueryLogShipper). Filterable by qname substring, qtype, "
@@ -153,6 +162,7 @@ class QueryDHCPActivityLogArgs(BaseModel):
 
 @register_tool(
     name="query_dhcp_activity_log",
+    permission=("read", "server"),
     description=(
         "Query the Kea DHCPv4 activity log (rows shipped by the DHCP "
         "agent's LogShipper). Filterable by severity, Kea log code, "
@@ -205,6 +215,7 @@ class QueryLogsArgs(BaseModel):
 
 @register_tool(
     name="query_logs",
+    permission=("read", "server"),
     description=(
         "Inventory of agent-driven log sources available — DNS query "
         "log + DHCP activity log + audit log — with the row count "
@@ -275,6 +286,7 @@ class GetDNSQueryRateArgs(BaseModel):
 
 @register_tool(
     name="get_dns_query_rate",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "DNS query-rate timeseries from the ``dns_metric_sample`` "
         "table. Returns recent buckets with queries_total / noerror "
@@ -333,6 +345,7 @@ class GetDHCPLeaseRateArgs(BaseModel):
 
 @register_tool(
     name="get_dhcp_lease_rate",
+    permission=("read", "dhcp_server"),
     description=(
         "DHCP packet-rate timeseries from the ``dhcp_metric_sample`` "
         "table. Returns recent buckets with discover / offer / "
@@ -417,6 +430,7 @@ class GlobalSearchArgs(BaseModel):
 
 @register_tool(
     name="global_search",
+    permission="authenticated",
     description=(
         "Cross-resource search across IPAM (IPs / subnets / blocks / "
         "spaces) and DNS (groups / zones / records). Same lookup the "
@@ -468,6 +482,7 @@ class FindAgentConfigFailuresArgs(BaseModel):
 
 @register_tool(
     name="find_agents_with_config_failures",
+    permission=("read", ("dns_group", "dhcp_server")),
     description=(
         "List DNS servers, DHCP servers and Looking Glass collectors whose "
         "agent could NOT apply the configuration the control plane sent, and "
@@ -486,7 +501,7 @@ class FindAgentConfigFailuresArgs(BaseModel):
 )
 async def find_agents_with_config_failures(
     db: AsyncSession,
-    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    user: User,
     args: FindAgentConfigFailuresArgs,
 ) -> list[dict[str, Any]]:
     from app.models.bgp_looking_glass import LookingGlassCollector  # noqa: PLC0415
@@ -500,6 +515,8 @@ async def find_agents_with_config_failures(
         (DHCPServer, "dhcp_server"),
         (LookingGlassCollector, "looking_glass_collector"),
     ):
+        if not tool_permission_allows(user, _AGENT_KIND_PERMISSION[kind]):
+            continue
         stmt = select(model)
         if args.include_unreported:
             stmt = stmt.where(
@@ -545,6 +562,7 @@ class FindAgentSpoolBacklogArgs(BaseModel):
 
 @register_tool(
     name="find_agents_with_spool_backlog",
+    permission=("read", ("dns_group", "dhcp_server")),
     description=(
         "List DNS and DHCP servers whose agent is holding a backlog of pushes "
         "(query logs, DHCP activity, metrics, Kea lease events) that the "
@@ -562,7 +580,7 @@ class FindAgentSpoolBacklogArgs(BaseModel):
 )
 async def find_agents_with_spool_backlog(
     db: AsyncSession,
-    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    user: User,
     args: FindAgentSpoolBacklogArgs,
 ) -> list[dict[str, Any]]:
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
@@ -571,6 +589,8 @@ async def find_agents_with_spool_backlog(
 
     out: list[dict[str, Any]] = []
     for model, kind in ((DNSServer, "dns_server"), (DHCPServer, "dhcp_server")):
+        if not tool_permission_allows(user, _AGENT_KIND_PERMISSION[kind]):
+            continue
         rows = (
             (await db.execute(select(model).where(model.spool_status.is_not(None)))).scalars().all()
         )
@@ -625,6 +645,7 @@ class FindInfluxDBTargetsArgs(BaseModel):
 
 @register_tool(
     name="find_influxdb_targets",
+    permission="superadmin",
     description=(
         "List configured InfluxDB push-export targets and their delivery "
         "health. Each row carries name, version (v1 / v2 / v3), URL, the "

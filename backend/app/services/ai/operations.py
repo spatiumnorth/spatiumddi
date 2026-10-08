@@ -3644,6 +3644,9 @@ async def _preview_assign_appliance_role(
                     f"{cap_key}=true; cannot assign role {r!r}."
                 ),
             )
+    group_problem = await _assign_role_group_problem(db, args)
+    if group_problem is not None:
+        return PreviewResult(ok=False, detail=group_problem)
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3658,6 +3661,37 @@ async def _preview_assign_appliance_role(
         "starts / stops service containers accordingly."
     )
     return PreviewResult(ok=True, detail="ready", preview_text="\n".join(preview_lines))
+
+
+async def _assign_role_group_problem(db: AsyncSession, args: AssignApplianceRoleArgs) -> str | None:
+    """Why a group in ``args`` can't be assigned, or None (#1468).
+
+    Same rule as the REST role-assign route: the supervisor drops a group
+    name it won't put in the role env, so refuse it here instead.
+    """
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.group_names import group_name_problem  # noqa: PLC0415
+
+    if args.dns_group_id:
+        try:
+            dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+        except ValueError:
+            return f"dns_group_id must be a UUID, got {args.dns_group_id!r}"
+        if dns_group is None:
+            return f"DNS group {args.dns_group_id} not found."
+        problem = group_name_problem("dns", dns_group.name)
+        if problem is not None:
+            return problem
+    if args.dhcp_group_id:
+        try:
+            dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+        except ValueError:
+            return f"dhcp_group_id must be a UUID, got {args.dhcp_group_id!r}"
+        if dhcp_group is None:
+            return f"DHCP group {args.dhcp_group_id} not found."
+        return group_name_problem("dhcp", dhcp_group.name)
+    return None
 
 
 async def _apply_assign_appliance_role(
@@ -3676,6 +3710,10 @@ async def _apply_assign_appliance_role(
     row = await db.get(Appliance, appliance_uuid)
     if row is None:
         raise ValueError(f"Appliance {args.appliance_id} not found.")
+    # Re-checked at apply: a group can be renamed between preview and apply.
+    group_problem = await _assign_role_group_problem(db, args)
+    if group_problem is not None:
+        raise ValueError(group_problem)
     row.assigned_roles = list(args.roles)
     if args.dns_group_id:
         dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
@@ -3859,6 +3897,34 @@ class GrantTemporaryAccessArgs(BaseModel):
     )
 
 
+_GRANT_MAKES_SUPERADMIN = (
+    "This grant would make {n} member(s) of the group superadmins, and that needs "
+    "your password or authenticator code, which a chat Apply cannot ask for "
+    "(#1412). Grant it from Groups → Time-bound grants instead."
+)
+
+
+async def _grant_makes_superadmins(
+    db: AsyncSession, group_id: UUID, args: GrantTemporaryAccessArgs
+) -> int:
+    """How many users a ``*`` / ``*`` grant would make superadmins (#1412)."""
+    from app.services.superadmin_grant import (  # noqa: PLC0415
+        newly_superadmin,
+        permissions_grant_superadmin,
+    )
+
+    requested = [
+        {
+            "action": args.action,
+            "resource_type": args.resource_type,
+            "resource_id": (args.resource_id or "").strip() or None,
+        }
+    ]
+    if not permissions_grant_superadmin(requested):
+        return 0
+    return len(await newly_superadmin(db, lambda m: m.granted_groups.add(group_id)))
+
+
 async def _preview_grant_temporary_access(
     db: AsyncSession, user: User, args: GrantTemporaryAccessArgs
 ) -> PreviewResult:
@@ -3880,6 +3946,9 @@ async def _preview_grant_temporary_access(
     group = await db.get(Group, gid)
     if group is None:
         return PreviewResult(ok=False, detail=f"No group with id {args.group_id}.")
+    granted = await _grant_makes_superadmins(db, gid, args)
+    if granted:
+        return PreviewResult(ok=False, detail=_GRANT_MAKES_SUPERADMIN.format(n=granted))
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     scope = f"/{args.resource_id}" if args.resource_id else " (any instance)"
     preview_text = (
@@ -3903,6 +3972,10 @@ async def _apply_grant_temporary_access(
     group = await db.get(Group, UUID(args.group_id))
     if group is None:
         raise ValueError(f"No group with id {args.group_id}.")
+    # Re-checked at apply: membership can change between preview and Apply.
+    granted = await _grant_makes_superadmins(db, group.id, args)
+    if granted:
+        raise ValueError(_GRANT_MAKES_SUPERADMIN.format(n=granted))
     resource_id = (args.resource_id or "").strip() or None
     expires = datetime.now(UTC) + timedelta(hours=args.expires_in_hours)
     grant = TimeBoundGrant(

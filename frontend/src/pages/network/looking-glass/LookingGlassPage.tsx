@@ -117,7 +117,8 @@ export function LookingGlassPage() {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-muted-foreground">
         The BGP Looking Glass is disabled. An administrator can enable the
-        "network.looking_glass" feature module in Settings → Features.
+        "network.looking_glass" feature module on the Features & Integrations
+        page.
       </div>
     );
   }

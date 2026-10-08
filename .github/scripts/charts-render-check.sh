@@ -37,6 +37,11 @@
 #   no-external-kea-ha — every render, plus the raw ``k8s/dhcp`` manifests: no
 #                      NodePort / LoadBalancer Service in front of a DHCP agent
 #                      publishes TCP 8000, Kea's unauthenticated HA listener.
+#   dhcp-readiness   — every render, plus a dedicated pass over the umbrella
+#                      posture render and the raw manifests: no DHCP agent
+#                      readiness probe gates on that same HA listener
+#                      (#1589) — a standalone Kea server never binds it, so
+#                      the pod would never become Ready.
 #   dns-agent-service — every render: a DNS agent LoadBalancer Service keeps
 #                      the client address (``externalTrafficPolicy: Local``,
 #                      #1548), plus one dedicated render asserting the
@@ -113,9 +118,22 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$file" \
         || failures=$((failures + 1))
+    # #1589 — no DHCP agent readiness probe may gate on the Kea HA
+    # listener (TCP 8000): a standalone server never binds it.
+    python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" "$file" \
+        || failures=$((failures + 1))
+    # #1550 — MetalLB VIP Services must not allocate NodePorts.
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" "$file" \
+        || failures=$((failures + 1))
     # #1548 — a DNS agent LoadBalancer Service must keep the client
     # address (externalTrafficPolicy: Local); see the script's docstring.
     python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
+        || failures=$((failures + 1))
+    # A MetalLB VIP must keep the client's source address (the DNS VIP's
+    # rate limits, query logs and RPZ hits are all per client). The DHCP
+    # relay VIP is exempt: Kea answers the relay at giaddr, so the packet's
+    # source address is never used.
+    python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
         || failures=$((failures + 1))
 }
 
@@ -416,6 +434,107 @@ coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 echo "── no external Kea HA port (raw k8s/dhcp manifests)"
 python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$ROOT"/k8s/dhcp/*.yaml \
     || failures=$((failures + 1))
+
+# #1589 — the DHCP agent's readiness probe must test the Kea control
+# socket, not the HA listener, in the umbrella chart's render (the
+# posture render is the one that names a DHCP server) and in the raw
+# manifests alike. --require so a render that stops exercising the
+# template fails instead of passing vacuously.
+echo "── DHCP agent readiness probes the Kea control socket (#1589)"
+python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require --require-kea-socket \
+    "$OUT/umbrella-posture.yaml" "$ROOT/k8s/dhcp/kea-statefulset.yaml" \
+    || failures=$((failures + 1))
+
+# The guard must still FIRE on the probe shape it exists to catch.
+# Grep the message, not just the exit code (same reasoning as the
+# priorityClasses negative control above).
+echo "── negative control: tcpSocket readiness on the Kea HA port must fail"
+cat > "$OUT/neg-dhcp-readiness.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dhcp-kea-dhcp1
+  labels:
+    app.kubernetes.io/name: spatium-dhcp
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spatium-dhcp
+    spec:
+      containers:
+        - name: dhcp
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require-kea-socket "$OUT/neg-dhcp-readiness.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "HA peer listener"; then
+    echo "   ok: tcpSocket readiness on port 8000 refused by the #1589 guard"
+else
+    echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #1550 — no render above sets frontend.controlPlaneVIP, so the
+# frontend's LoadBalancer shape is exercised here, together with the
+# appliance all-on render (DNS VIPs + DHCP relay VIP). --require so
+# either side silently dropping its VIP Service fails the gate.
+echo "── MetalLB VIP Services allocate no NodePorts (#1550)"
+if helm template umbrella-vip "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set frontend.controlPlaneVIP=10.0.0.10 > "$OUT/umbrella-vip.yaml"; then
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" --require \
+        "$OUT/umbrella-vip.yaml" "$OUT/appliance-all-on.yaml" \
+        || failures=$((failures + 1))
+else
+    echo "   FAIL: umbrella chart did not render with frontend.controlPlaneVIP set" >&2
+    failures=$((failures + 1))
+fi
+
+echo "── negative control: a VIP LoadBalancer allocating NodePorts must fail"
+cat > "$OUT/neg-vip-nodeports.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9
+spec:
+  type: LoadBalancer
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" \
+    "$OUT/neg-vip-nodeports.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "allocateLoadBalancerNodePorts"; then
+    echo "   ok: VIP LoadBalancer without allocateLoadBalancerNodePorts: false refused by the #1550 guard"
+else
+    echo "   FAIL: expected the #1550 guard to refuse a VIP LoadBalancer allocating NodePorts (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #1547 — the raw manifests must point at Services that exist (or
+# that CNPG creates): postgres-rw, the `api` Service, sentinel://
+# Redis URLs and a redis-sentinel Service.
+echo "── raw k8s/ manifests point at Services that exist (#1547)"
+python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" "$ROOT/k8s" \
+    || failures=$((failures + 1))
+
+echo "── negative control: a DATABASE_URL host CNPG never creates must fail"
+cp -r "$ROOT/k8s" "$OUT/neg-k8s"
+sed -i 's/@postgres-rw:/@postgres-primary:/' "$OUT/neg-k8s/base/configmap.yaml"
+neg_out="$(python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" \
+    "$OUT/neg-k8s" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "postgres-primary"; then
+    echo "   ok: DATABASE_URL at postgres-primary refused by the #1547 guard"
+else
+    echo "   FAIL: expected the #1547 guard to refuse a postgres-primary DATABASE_URL (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2
