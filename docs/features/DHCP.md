@@ -141,6 +141,25 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+The spelling is checked on the other ways in as well (#1347):
+
+- **A server joining a group.** Creating a server in a group, or moving
+  one into it, is refused (422) when the group's servers would then drop
+  a raw option already stored on one of its scopes: a Windows server
+  joining a group whose scopes hold `code:43`, say. The refusal names the
+  scopes and keys, so they can be re-keyed or removed first.
+- **The importer.** Options arrive in the source server's spelling (the
+  Windows importer keeps an unmapped option as `opt-NN`). They are re-keyed
+  to the target group's spelling on commit, and any no server in the group
+  can serve (a code Kea has no definition for, or any raw code in a mixed
+  group) are dropped, each named in the import's warnings.
+- **The option editor.** A pick from the option-code catalogue is keyed in
+  the group's spelling: `opt-43` on a Windows group, `code:43` elsewhere.
+
+Each DHCP driver declares the spelling it reads
+(`DHCPDriver.raw_option_spelling`), so a new driver states its own rather
+than inheriting Kea's.
+
 **A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
 SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
 a group with a Windows member is refused, and so is creating or moving a
@@ -148,7 +167,8 @@ Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
-equivalent and all raw codes. A client class renders into the DHCPv4
+equivalent and all raw codes, `opt-NN` on a Windows group included: the
+Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A client class renders into the DHCPv4
 config always, and into the DHCPv6 config when the group has v6 scopes, so
 its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
 refused, because Dhcp4 would reject it.
@@ -1050,14 +1070,20 @@ whichever bundle came before this one — that rotation destroyed the fallback
 after two poll cycles), and `quarantine.json` records an etag whose apply
 failed so it is not re-rendered on every poll.
 
-Kea's `config-test` is what makes the distinction usable: a rejection is a
+The preflight (`kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file, in a
+separate process) is what makes the distinction usable: a rejection is a
 verdict about the config, whereas an unreachable control socket says nothing
-about it — Kea may simply be restarting. Only a rejection reverts; reverting
-on an unreachable socket would discard a good bundle because of a timing
-accident.
+about it — Kea may simply be restarting. A rejection reverts; reverting on an
+unreachable socket would discard a good bundle because of a timing accident.
+A check that could not run at all (missing binary, 30 s timeout, crash) is
+not a verdict either, but it is not an acceptance: the reload is skipped and
+the apply fails in the `validate` phase, so it is reverted on disk,
+quarantined and retried on the backoff. The agent does not use Kea's
+`config-test` command: on Kea 3.0.3 it leaves the running daemon unable to
+start the HA listener (#1447).
 
 The revert rewrites the on-disk `kea-dhcp4.conf` / `kea-dhcp6.conf`, not just
-the agent's bookkeeping. `config-test` rejects *without* disturbing the
+the agent's bookkeeping. The `-t` check rejects *without* disturbing the
 running daemon, so Kea itself is fine either way — but the refused document
 has already been written to those paths, and that file is what Kea reads on
 its next start. Leaving it turns a rejected apply into a crash loop the next
@@ -1077,7 +1103,7 @@ unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
 read by nothing before), is exposed on the server row, drives a chip and a
 detail banner, and feeds the `agent_daemon_degraded` alert rule once a
 daemon that is not serving has stayed that way past a five-minute grace. A
-rejected config is not that: `config-test` refuses without disturbing the
+rejected config is not that: the `-t` check refuses without disturbing the
 running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
 Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
 reported by `agent_config_rejected`. The server response's
@@ -1825,7 +1851,7 @@ but Kea rejects a malformed config **whole**, so an unbalanced paren
 would stop every other class, scope and reservation in the group
 converging, not just this policy. Same blast radius `named.conf`
 validation exists for in #876 / #899. The agent still runs Kea's own
-`config-test` before applying, and #882's quarantine means a rejected
+`kea-dhcp4 -t` check before applying, and #882's quarantine means a rejected
 bundle is reverted rather than re-applied in a loop.
 
 ### Rendering

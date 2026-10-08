@@ -17,6 +17,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.option_validation import normalize_options
@@ -305,7 +306,22 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         )
         if overlap:
             raise HTTPException(status_code=409, detail=overlap)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null CLEARS the nullable pool fields (the UI's
+    # "none" for class_restriction / PD fields sent null and the old
+    # exclude_none silently kept the old value); null for a NOT NULL
+    # pool column is a 422 instead.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "class_restriction",
+            "lease_time_override",
+            "options_override",
+            "pd_prefix",
+            "delegated_length",
+            "excluded_prefix",
+        },
+        non_nullable={"name", "start_ip", "end_ip", "pool_type"},
+    )
     scope = await db.get(DHCPScope, pool.scope_id)
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
@@ -330,7 +346,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         resource_id=str(pool.id),
         resource_display=f"{pool.start_ip}-{pool.end_ip}",
         changed_fields=list(changes.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     await db.commit()
     await db.refresh(pool)

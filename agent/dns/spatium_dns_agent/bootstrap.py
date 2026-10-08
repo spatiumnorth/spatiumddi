@@ -22,6 +22,7 @@ import time
 import httpx
 import structlog
 
+from . import features
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
 
@@ -36,7 +37,12 @@ def _fingerprint(agent_id: str) -> str:
 
 def _client(cfg: AgentConfig) -> httpx.Client:
     verify = cfg.httpx_verify()
-    return httpx.Client(base_url=cfg.control_plane_url, verify=verify, timeout=30.0)
+    return httpx.Client(
+        base_url=cfg.control_plane_url,
+        verify=verify,
+        timeout=30.0,
+        headers=features.headers(),
+    )
 
 
 def register(cfg: AgentConfig) -> tuple[str, str, dict]:

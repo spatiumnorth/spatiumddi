@@ -53,8 +53,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import structlog
-from sqlalchemy import text
 
 from app.services.backup.archive import (
     BackupArchiveError,
@@ -130,14 +130,20 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
     which is fine — psql itself opens a brand-new connection on the
     next call.
 
+    It spares one other: the connection holding the restore lock
+    (#1648). Ending it would release the lock in the middle of the
+    replay and let a second restore in (#1571). It holds no table, so
+    it is in nobody's way.
+
     Failures here are logged but non-fatal; if the pool drops are
     enough on their own (no other connections present) the replay
     proceeds normally.
     """
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-        "WHERE datname = current_database() AND pid <> pg_backend_pid();"
+        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+        f"AND pid NOT IN ({_RESTORE_LOCK_HOLDERS_SQL});"
     )
     proc = await asyncio.create_subprocess_exec(
         "psql",
@@ -586,7 +592,7 @@ async def _truncate_tables(tables: list[str], db_url: str) -> None:
     if not tables:
         return
     pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     quoted = ", ".join(f'"{t}"' for t in tables)
     cmd = [
         "psql",
@@ -628,7 +634,7 @@ async def _run_pg_restore_data_only(dump_path: Path, db_url: str, tables: list[s
         raise BackupRestoreError("selective restore: no tables to load")
     pg_env, dbname = _pg_env_from_url(db_url)
     await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     cmd = [
         "pg_restore",
         "--dbname",
@@ -737,7 +743,7 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     much registrar work is queued up.
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT z.name FROM dns_zone z "
         "JOIN dns_server_group g ON g.id = z.group_id "
@@ -791,39 +797,82 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
 #: crc32-based per-resource keys elsewhere by accident.
 _RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
 
+#: The backend holding the restore lock, if any: the running restore's own
+#: lock connection, which ``_terminate_other_db_connections`` must not end
+#: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
+#: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
+#: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
+_RESTORE_LOCK_HOLDERS_SQL = (
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND pid IS NOT NULL AND objsubid = 1 "
+    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
+    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
 
-async def apply_backup_restore(db, **kwargs: Any) -> RestoreOutcome:
+
+async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
     """Restore under the install-wide advisory lock (#1571).
 
     ``pg_try_advisory_lock`` is non-blocking on purpose: a second
     restore is refused immediately with an operator-readable error
     rather than queued behind a replay that disposes the connection
-    pool mid-flight. The lock is session-level, held on ``db``'s
-    connection; Phase 4 of the restore disposes the whole pool,
-    which releases it on the success path, and the ``finally`` below
-    releases it on every path that gets there first. A process that
-    dies mid-restore releases it with its connection — it cannot
-    wedge restores the way a row-based mutex could.
+    pool mid-flight.
+
+    The lock is session-level, so it belongs to the connection that
+    took it. That is a connection of its own, opened here and held for
+    the whole restore (#1648). It used to be ``db``'s, but a session
+    hands its connection back to the pool at every commit, and the rest
+    of the restore ran on whatever connection it checked out next. With
+    others idle in the pool that was a different one, where the unlock
+    found nothing to release: the lock stayed behind on an idle pooled
+    connection and refused every later restore as "already in
+    progress", a second restore whose session checked out the holder got
+    in while the first ran, and Phase 4's pool dispose dropped the lock
+    before the replay. Nothing in the restore can take this connection
+    away: it is not in the pool Phase 4 disposes, and
+    ``_terminate_other_db_connections`` spares the lock's holder.
+    Ending it releases the lock on every path, a cancelled request
+    included, and a process that dies mid-restore releases it with its
+    connection — it cannot wedge restores the way a row-based mutex
+    could.
     """
     if db is None:  # unit tests drive the phases with stubs
-        return await _apply_backup_restore_inner(db, **kwargs)
-    acquired = (
-        await db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": _RESTORE_LOCK_KEY})
-    ).scalar_one()
-    if not acquired:
-        raise BackupRestoreError(
-            "another restore is already in progress on this install — "
-            "wait for it to finish before starting a second one"
-        )
-    await db.commit()
+        return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+    # asyncpg takes ``postgresql://``, not SQLAlchemy's dialect URL (as the
+    # rewrap does); the bounds are the app engine's (``app.db``).
+    lock_conn = await asyncpg.connect(
+        dsn=db_url.replace("postgresql+asyncpg://", "postgresql://", 1),
+        timeout=5,
+        command_timeout=30,
+        server_settings={"application_name": "spatiumddi-restore-lock"},
+    )
     try:
-        return await _apply_backup_restore_inner(db, **kwargs)
-    finally:
+        if not await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", _RESTORE_LOCK_KEY):
+            raise BackupRestoreError(
+                "another restore is already in progress on this install — "
+                "wait for it to finish before starting a second one"
+            )
         try:
-            await db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _RESTORE_LOCK_KEY})
-            await db.commit()
-        except Exception:  # noqa: BLE001 — pool disposal releases it anyway
-            logger.debug("backup_restore_advisory_unlock_failed", exc_info=True)
+            return await _apply_backup_restore_inner(db, db_url=db_url, **kwargs)
+        finally:
+            try:
+                released = await lock_conn.fetchval(
+                    "SELECT pg_advisory_unlock($1)", _RESTORE_LOCK_KEY
+                )
+            except Exception:  # noqa: BLE001 — ending the connection releases it anyway
+                logger.warning("backup_restore_advisory_unlock_failed", exc_info=True)
+            else:
+                if not released:
+                    # Only if this connection lost the lock mid-restore, so
+                    # the restore it guarded may not have run alone.
+                    logger.error("backup_restore_advisory_lock_lost")
+    finally:
+        # terminate(), not close(): close() awaits the server's goodbye, and
+        # a request cancelled again meanwhile (an anyio cancel scope cancels
+        # at every await) leaves the socket open, and the lock on it.
+        # terminate() drops the socket at once; the server ends the session,
+        # and the lock with it if the unlock never ran.
+        lock_conn.terminate()
 
 
 async def _apply_backup_restore_inner(
@@ -893,8 +942,12 @@ async def _apply_backup_restore_inner(
 
     # Phase 2: passphrase verify. Decrypt secrets.enc up front so
     # we fail with "wrong passphrase" before deleting anything.
+    # The PBKDF2 derivation is ~0.3 s of CPU by design; run it off
+    # the event loop so a restore can't stall the api (#1568).
     try:
-        secrets_payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        secrets_payload = await asyncio.to_thread(
+            decrypt_secrets, secrets_enc, passphrase=passphrase
+        )
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
 

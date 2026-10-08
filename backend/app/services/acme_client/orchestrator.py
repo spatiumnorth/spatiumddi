@@ -258,6 +258,7 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         order.status = ACME_ORDER_VALID
         order.certificate_id = cert_row.id
         order.last_error = None
+        await _record_issuance_shape(db, order)
         await db.commit()
         logger.info(
             "acme_client_order_valid",
@@ -303,6 +304,28 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
                 await cleanup_db.commit()
         except Exception as exc:  # noqa: BLE001 — best-effort teardown
             logger.warning("acme_client_http01_cleanup_failed", order_id=str(oid), error=str(exc))
+
+
+async def _record_issuance_shape(db: AsyncSession, order: ACMEOrder) -> None:
+    """Copy a SUCCESSFUL order's issuance shape onto ``platform_settings``.
+
+    #1529: these settings used to be written by ``POST /issue`` at order
+    creation, so a later — even failed — issue attempt for different
+    domains changed what the active cert would be renewed for. Writing
+    them only here, on success, keeps them describing the last order
+    that actually produced a cert. The renewal sweep primarily reads
+    the per-certificate shape from the successful order itself
+    (``ACMEOrder.certificate_id``); these settings remain as the
+    legacy fallback for certs with no linked order.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    settings = await db.get(PlatformSettings, 1)
+    if settings is None:
+        return
+    settings.acme_challenge_type = order.challenge_type
+    settings.acme_dns_provider = order.dns_provider
+    settings.acme_domains = list(order.domains)
 
 
 async def _fail(db: AsyncSession, order_id: uuid.UUID, message: str) -> str:
