@@ -96,9 +96,20 @@ SERVICE = "orchestrator"
 # --- timings (verified §0.A) ---
 T1_RENEW_S = canonical.T1_RENEW_S      # 900
 T2_REBIND_S = canonical.T2_REBIND_S    # 1800
-DORA_TIMEOUT_S = 4.0                    # OFFER/ACK wait before retransmit/timeout
+# DORA retransmission, as an RFC 2131 §4.1 client does it: the wait for an
+# OFFER/ACK after send n of a round (n = 0 for the first) is
+# min(BASE * 2**n, CAP) seconds, each wait moved by a uniform draw in
+# [-JITTER, +JITTER] from the shard's seeded RNG. With MAX_DORA_RETRIES = 3 a
+# device sends 4 times (≈0, 4, 12, 28 s) and gives up ≈60 s after its first
+# send, the shape of a Windows client's first minute. A fixed 4 s wait put
+# every device that lost a packet in the same instant back on the wire
+# together 4 s later, recreating the burst that lost it, and counted "no
+# lease within 16 s" as a timeout.
+DORA_BACKOFF_BASE_S = 4.0
+DORA_BACKOFF_CAP_S = 64.0
+DORA_BACKOFF_JITTER_S = 1.0
+MAX_DORA_RETRIES = 3                    # resends after the first send: 4 waits a round
 RENEW_TIMEOUT_S = 4.0
-MAX_DORA_RETRIES = 3
 RELEASE_FRACTION = 0.05                 # §3.2: ~5% explicit RELEASE, 95% silent
 PROPAGATION_SAMPLE = 1000              # 1-in-1000 arrivals get the propagation probe
 SCHED_TICK_S = 0.05                     # timer-wheel resolution
@@ -107,6 +118,20 @@ STALE_TICKS = 3                         # setpoint staleness fail-safe (3 missed
 SETPOINT_TICK_S = 60.0                 # controller publishes on a 60s tick
 DNS_QPS_ACTIVE = 1.0                    # §1.7 per active-online device
 ZIPF_S = 1.0                            # §1.7 Zipfian popularity exponent
+
+
+def dora_retransmit_wait(sends_before: int, rng: random.Random) -> float:
+    """Seconds to wait for a reply to a DORA send before retransmitting it.
+
+    ``sends_before`` is how many times the device has already resent in this
+    round (``Device.dora_retries``): 0 for the first send, so the waits run
+    4, 8, 16, 32 s, then 64 s for good, each ± ``DORA_BACKOFF_JITTER_S``. The
+    jitter comes from ``rng`` (the shard's seeded ``random.Random``), so a
+    run's schedule is reproducible from its seed while devices that lost a
+    packet together no longer resend together."""
+    n = min(max(0, sends_before), 16)  # 4 * 2**16 is far past the cap already
+    wait = min(DORA_BACKOFF_BASE_S * 2**n, DORA_BACKOFF_CAP_S)
+    return wait + rng.uniform(-DORA_BACKOFF_JITTER_S, DORA_BACKOFF_JITTER_S)
 
 
 class DState(Enum):
@@ -188,6 +213,7 @@ class Counters:
     offer_ignored: int = 0         # OFFERs that found the device not DISCOVERING
     request_sent: int = 0          # SELECTING REQUESTs sent (one per accepted OFFER)
     dora_ack_over_budget: int = 0  # of dora_ack: its exchange's own timer had fired
+    dora_ack_resent: int = 0       # of dora_ack: the round had to resend first (no reply in ~4 s)
     dora_ack_late: int = 0         # DORA ACKs after the device gave up (a `timeout` that was slow)
     renew_ack_late: int = 0        # renew ACKs after the renew timer escalated / the device left
     rebind_ack_late: int = 0       # rebind ACKs after the device lapsed (a `lapses` that was slow)
@@ -462,10 +488,17 @@ class Orchestrator:
             self.log.debug("send failed: %s", exc,
                            extra={"fields": {"event": "send_error", "index": dev.index}})
 
+    def _dora_wait(self, dev: Device) -> float:
+        """The reply wait for the DORA send about to go out: the round's backoff
+        step for this device (``dora_retransmit_wait``), jittered from the
+        shard's seeded RNG."""
+        return dora_retransmit_wait(dev.dora_retries, self.rng)
+
     def _send_discover(self, dev: Device, *, new_round: bool) -> None:
         """A DISCOVER. ``new_round`` opens a fresh DORA round (arrival, re-arrival,
-        NAK); a retransmit after ``dora_timeout`` keeps the round, so a reply to
-        any of its sends still belongs to it."""
+        NAK) and starts its backoff from the first step, as a client back in
+        INIT does; a retransmit after ``dora_timeout`` keeps the round, so a
+        reply to any of its sends still belongs to it."""
         if dev.discover_tpl is None:
             dev.discover_tpl = dp.build_discover(
                 mac=dev.mac, client_id=dev.client_id_bytes,
@@ -478,6 +511,7 @@ class Orchestrator:
         if new_round:
             dev.episode += 1
             dev.lapsed = False
+            dev.dora_retries = 0
         dev.state = DState.DISCOVERING
         dev.tx_at = time.monotonic()
         self.ledger.open(dev.xid, dev.index, KIND_DISCOVER, dev.tx_at, dev.episode)
@@ -486,7 +520,7 @@ class Orchestrator:
         # The timer belongs to THIS exchange (#1057): it retransmits only if this
         # send is still the device's live one when it fires — a DISCOVER's
         # deadline no longer fires over the REQUEST that answered its OFFER.
-        self._schedule(DORA_TIMEOUT_S, dev.index, f"dora_timeout:{dev.xid}")
+        self._schedule(self._dora_wait(dev), dev.index, f"dora_timeout:{dev.xid}")
 
     def _send_request_renew(self, dev: Device) -> None:
         assert dev.leased_ip
@@ -529,7 +563,10 @@ class Orchestrator:
         self.ledger.open(dev.xid, dev.index, KIND_SELECT, dev.tx_at, dev.episode)
         self._send(bytes(pkt), dev)
         self.counters.request_sent += 1
-        self._schedule(DORA_TIMEOUT_S, dev.index, f"dora_timeout:{dev.xid}")
+        # Same step as the DISCOVER it answers: the REQUEST shares the round's
+        # dora_retries, and an unanswered one falls back to a DISCOVER at the
+        # next step, so a round still ends after 4 waits (≈60 s).
+        self._schedule(self._dora_wait(dev), dev.index, f"dora_timeout:{dev.xid}")
 
     def _schedule_t1(self, dev: Device) -> None:
         """(Re)arm the T1 renewal for the lease the device holds now. The token
@@ -643,13 +680,21 @@ class Orchestrator:
         self.counters.dora_ack += 1
         if closed.over_budget:
             self.counters.dora_ack_over_budget += 1
+        # A lease that took a resend is a success the round had to work for:
+        # with the backoff a round runs ≈60 s before it is a `timeout`, so
+        # this is what keeps a slow handshake visible (read before
+        # _take_lease clears the round's retry count).
+        resends = dev.dora_retries
+        if resends or closed.over_budget:
+            self.counters.dora_ack_resent += 1
         self.lat_dora.record_ms(latency_ms)
         # DDNS coupling happens ONLY on first DORA (hostname-bearing devices).
         if dev.hostname:
             self.counters.ddns_first_publish += 1
         self.lifecycle.emit(mac=dev.mac, index=dev.index, event="dora_ack",
                             ip=new_ip, ack_ms=round(latency_ms, 2),
-                            ddns=bool(dev.hostname), over_budget=closed.over_budget)
+                            ddns=bool(dev.hostname), over_budget=closed.over_budget,
+                            resends=resends)
         self._take_lease(dev, reply, now)
         # Propagation probe membership (1-in-1000 arrivals).
         if dev.probe:
@@ -1145,7 +1190,7 @@ class Orchestrator:
                 # like the fields above: never sum these across windows).
                 "dora_sent": cur["dora_sent"], "dora_offer": cur["dora_offer"],
                 "request_sent": cur["request_sent"], "dora_ack": cur["dora_ack"],
-                "dora_ack_late": cur["dora_ack_late"],
+                "dora_ack_late": cur["dora_ack_late"], "dora_ack_resent": cur["dora_ack_resent"],
                 "renew_sent": cur["renew_sent"], "renew_ack": cur["renew_ack"],
                 "renew_ack_late": cur["renew_ack_late"],
                 "rebind_sent": cur["rebind_sent"], "rebind_ack": cur["rebind_ack"],
@@ -1206,6 +1251,12 @@ class Orchestrator:
                     self.lat_prop_ipam, self.lat_prop_dns):
             acc.dump_hdr(str(self.rp.generator(f"orchestrator.shard{self.shard}.{acc.name}.hdr")))
         counters = self._counter_snapshot()
+        # A DORA round still open at stop has no verdict (ack, timeout or nak),
+        # so it is in no handshake bucket. A round now runs ≈60 s before it
+        # can time out, so that tail is counted rather than left out.
+        counters["dora_in_flight"] = sum(
+            1 for d in self.devices.values() if d.state is DState.DISCOVERING
+        )
         summary = {
             "ts": utc_now_iso(),
             "shard": self.shard,

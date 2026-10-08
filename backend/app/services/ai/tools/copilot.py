@@ -68,6 +68,7 @@ class AskYesNoArgs(BaseModel):
 
 @register_tool(
     name="ask_yes_no",
+    permission="authenticated",
     description=(
         "Ask the operator a yes-or-no question and pause the "
         "conversation until they click a button. Use for true "
