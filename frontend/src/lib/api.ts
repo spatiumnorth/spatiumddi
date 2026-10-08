@@ -2467,7 +2467,9 @@ export const usersApi = {
       username: string;
       email: string;
       display_name: string;
-      password: string;
+      // A local account. Omitted for one bound to a provider (#1291).
+      password?: string;
+      auth_provider_id?: string;
       is_superadmin: boolean;
       force_password_change: boolean;
     } & StepUp,
@@ -2602,6 +2604,9 @@ export interface AuditChainBreak {
   expected_hash: string;
   actual_hash: string;
   reason: "row_hash_mismatch" | "prev_hash_mismatch";
+  action: string;
+  resource_type: string;
+  resource_id: string;
 }
 
 export interface AuditIntegrity {
@@ -11843,6 +11848,8 @@ export interface ACMEDomainResolution {
   zone_name: string | null;
   record_name: string | null;
   driver: string | null;
+  // e.g. a more specific internal zone was skipped for a public one
+  note?: string | null;
 }
 
 // A manual TXT the operator must publish for an allow_manual order to
@@ -13485,6 +13492,9 @@ export interface ClusterWorkloadHealth {
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
   status: string;
+  /** #1387 — database row only: "cnpg" when ready / total are the CNPG
+   *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
+  source?: string | null;
 }
 
 /** The resolve probe's verdict (#985). */
