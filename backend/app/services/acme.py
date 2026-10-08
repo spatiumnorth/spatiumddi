@@ -29,6 +29,7 @@ from sqlalchemy.orm import selectinload
 from app.db import AsyncSessionLocal
 from app.models.acme import ACMEAccount
 from app.models.dns import DNSAgentBundle, DNSRecord, DNSRecordOp, DNSZone
+from app.services.integration_ownership import ACME_RECORD_TAG
 
 log = structlog.get_logger(__name__)
 
@@ -260,6 +261,9 @@ async def apply_txt_update(db: AsyncSession, account: ACMEAccount, txt: str) -> 
         value=txt,
         ttl=ACME_TXT_TTL,
         auto_generated=True,
+        # #1554: ACME records are not IPAM sync output — mark them so
+        # the IPAM DNS drift sweep leaves them alone.
+        tags={ACME_RECORD_TAG: True},
     )
     db.add(new_rec)
     # Let _enqueue_dns_op bump the serial + hit the primary server.
@@ -452,12 +456,24 @@ async def wait_for_ops_applied(
 
 
 async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24 * 3600) -> int:
-    """Delete TXT records at ACME subdomains older than ``max_age_seconds``.
+    """Delete stale ACME TXT records older than ``max_age_seconds``.
 
-    Clients that crash between "/update set txt" and "/update delete txt"
-    leave records behind. LE issuance has long since succeeded by the
-    time this runs; the stale records don't hurt anyone but we clean
-    them up so the zone doesn't accumulate noise.
+    Two populations:
+
+    * **Provider path** — TXT records at acme-dns account subdomains.
+      Clients that crash between "/update set txt" and "/update delete
+      txt" leave records behind.
+    * **Client path** (#1530) — ``_acme-challenge`` TXT records written
+      by the embedded ACME client's ``dns01.solve``. ``solve`` tears its
+      record down on any failure, but a hard kill (worker SIGKILL, host
+      loss) between the commit and the teardown can still strand one;
+      this sweep is the backstop. Matches the ``auto_generated`` records
+      ``solve`` writes, named ``_acme-challenge`` or
+      ``_acme-challenge.<host>`` inside their zone.
+
+    LE issuance has long since succeeded by the time this runs; the
+    stale records don't hurt anyone but we clean them up so the zone
+    doesn't accumulate noise.
 
     Returns the number of rows deleted. Enqueues delete ops so the
     agent applies the removal.
@@ -486,6 +502,7 @@ async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24
     )
     rows = (await db.execute(stmt)).all()
     deleted = 0
+    swept_ids: set[uuid.UUID] = set()
     for rec, account in rows:
         zone = await db.get(DNSZone, rec.zone_id)
         if zone is None:
@@ -505,11 +522,51 @@ async def sweep_stale_txt_records(db: AsyncSession, *, max_age_seconds: int = 24
             target_serial=target_serial,
         )
         deleted += 1
+        swept_ids.add(rec.id)
         log.info(
             "acme_txt_swept",
             account_id=str(account.id),
             zone=zone.name,
             subdomain=account.subdomain,
+            age_hours=(datetime.now(UTC) - rec.created_at).total_seconds() / 3600,
+        )
+
+    # Client path (#1530): stale ``_acme-challenge`` records from the
+    # embedded client's managed-zone solves. The relative label is the
+    # bare prefix at a zone apex, or ``_acme-challenge.<host>`` below it.
+    client_stmt = select(DNSRecord).where(
+        DNSRecord.record_type == "TXT",
+        DNSRecord.auto_generated.is_(True),
+        DNSRecord.created_at < cutoff,
+        (DNSRecord.name == "_acme-challenge")
+        | DNSRecord.name.like(r"\_acme-challenge.%", escape="\\"),
+    )
+    if swept_ids:
+        client_stmt = client_stmt.where(DNSRecord.id.not_in(swept_ids))
+    client_rows = (await db.execute(client_stmt)).scalars().all()
+    for rec in client_rows:
+        zone = await db.get(DNSZone, rec.zone_id)
+        if zone is None:
+            continue
+        target_serial = bump_zone_serial(zone)
+        await db.execute(delete(DNSRecord).where(DNSRecord.id == rec.id))
+        await enqueue_record_op(
+            db,
+            zone,
+            "delete",
+            {
+                "name": rec.name,
+                "type": "TXT",
+                "value": rec.value,
+                "ttl": rec.ttl or ACME_TXT_TTL,
+            },
+            target_serial=target_serial,
+        )
+        deleted += 1
+        log.info(
+            "acme_client_txt_swept",
+            zone=zone.name,
+            record_name=rec.name,
             age_hours=(datetime.now(UTC) - rec.created_at).total_seconds() / 3600,
         )
     if deleted:

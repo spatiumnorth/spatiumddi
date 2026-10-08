@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.drivers.dns._cloud_base import CloudDNSError
+from app.drivers.dns._cloud_base import CloudDNSConflictError, CloudDNSError
 from app.drivers.dns.base import RecordChange, RecordData
 from app.drivers.dns.route53 import Route53DNSDriver
 
@@ -724,6 +724,8 @@ async def test_apply_record_update_replaces_without_read(monkeypatch: pytest.Mon
 async def test_apply_zone_create(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = Route53DNSDriver()
     client = MagicMock()
+    # No existing zone of this name — the create proceeds.
+    client.list_hosted_zones_by_name.return_value = {"HostedZones": [], "IsTruncated": False}
     _patch_client(monkeypatch, driver, client)
 
     zone = SimpleNamespace(name="new.example.")
@@ -731,12 +733,311 @@ async def test_apply_zone_create(monkeypatch: pytest.MonkeyPatch) -> None:
 
     kwargs = client.create_hosted_zone.call_args.kwargs
     assert kwargs["Name"] == "new.example."
-    # CallerReference must be a non-empty unique token.
+    # CallerReference must be a non-empty token, stable for the logical
+    # create (#1527) so a retry is deduplicated by AWS.
     assert kwargs["CallerReference"]
+    import hashlib
+
+    assert kwargs["CallerReference"] == hashlib.sha256(b":new.example.").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create_refuses_existing_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A same-name hosted zone SpatiumDDI did not create is NEVER adopted:
+    the create is refused with a conflict naming the existing zone id and
+    pointing at Import existing zones — the explicit adoption path."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [
+            {
+                "Id": "/hostedzone/Zexisting",
+                "Name": "new.example.",
+                "CallerReference": "minted-by-someone-else",
+            }
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="new.example.")
+    with pytest.raises(CloudDNSConflictError) as excinfo:
+        await driver._apply_zone(_server(), CREDS, zone, "create")
+
+    message = str(excinfo.value)
+    assert "Zexisting" in message
+    assert "Import existing zones" in message
+    assert "/api/v1/dns/import/cloud/preview" in message
+    client.create_hosted_zone.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create_retry_of_same_row_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retried create of the SAME zone row finds the hosted zone its
+    first attempt minted (same deterministic CallerReference) and
+    succeeds without minting a second zone or refusing."""
+    import hashlib
+
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    caller_reference = hashlib.sha256(b"zone-uuid-1:new.example.").hexdigest()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [
+            {
+                "Id": "/hostedzone/Zours",
+                "Name": "new.example.",
+                "CallerReference": caller_reference,
+            }
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(id="zone-uuid-1", name="new.example.")
+    # No raise, no second create.
+    await driver._apply_zone(_server(), CREDS, zone, "create")
+    client.create_hosted_zone.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_zone_id_prefers_public_over_private_same_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-name public + private zones: the pick is deterministic —
+    the PUBLIC zone wins even when the API lists the private one first."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [
+            {
+                "Id": "/hostedzone/Zpriv",
+                "Name": "example.com.",
+                "Config": {"PrivateZone": True},
+            },
+            {
+                "Id": "/hostedzone/Zpub",
+                "Name": "example.com.",
+                "Config": {"PrivateZone": False},
+            },
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    assert await driver._resolve_zone_id(client, "example.com.") == "Zpub"
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create_caller_reference_stable_across_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1527 — two attempts at the same logical create share a reference."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {"HostedZones": [], "IsTruncated": False}
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(id="zone-uuid-1", name="new.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "create")
+    first = client.create_hosted_zone.call_args.kwargs["CallerReference"]
+    await driver._apply_zone(_server(), CREDS, zone, "create")
+    second = client.create_hosted_zone.call_args.kwargs["CallerReference"]
+    assert first == second
 
 
 @pytest.mark.asyncio
 async def test_apply_zone_delete_resolves_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z42", "Name": "doomed.example."}]
+    }
+    # Zone carries only SOA + apex NS — nothing to empty before delete.
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "doomed.example.",
+                "Type": "SOA",
+                "TTL": 900,
+                "ResourceRecords": [{"Value": "ns-1.awsdns.com. hostmaster.awsdns.com. 1 2 3 4 5"}],
+            },
+            {
+                "Name": "doomed.example.",
+                "Type": "NS",
+                "TTL": 172800,
+                "ResourceRecords": [{"Value": "ns-1.awsdns.com."}],
+            },
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+    client.change_resource_record_sets.assert_not_called()
+    assert client.delete_hosted_zone.call_args.kwargs["Id"] == "Z42"
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_empties_only_managed_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — zone emptying is scoped to records SpatiumDDI manages.
+
+    The managed www A + delegated sub-zone NS rrsets are deleted; the
+    foreign TXT rrset (in the provider zone but NOT in our DB) must
+    NOT be touched; SOA / apex NS are always skipped.
+    """
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z42", "Name": "doomed.example."}]
+    }
+    www = {
+        "Name": "www.doomed.example.",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "10.0.0.1"}],
+    }
+    sub_ns = {
+        "Name": "sub.doomed.example.",
+        "Type": "NS",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "ns.other.example."}],
+    }
+    foreign_txt = {
+        "Name": "doomed.example.",
+        "Type": "TXT",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": '"v=spf1 -all"'}],
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "doomed.example.",
+                "Type": "SOA",
+                "TTL": 900,
+                "ResourceRecords": [{"Value": "ns hostmaster 1 2 3 4 5"}],
+            },
+            {
+                "Name": "doomed.example.",
+                "Type": "NS",
+                "TTL": 172800,
+                "ResourceRecords": [{"Value": "ns-1.awsdns.com."}],
+            },
+            www,
+            sub_ns,
+            foreign_txt,
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    managed = [
+        RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
+        RecordData(name="sub", record_type="NS", value="ns.other.example.", ttl=300),
+    ]
+    await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=managed)
+
+    # One batched change carrying exactly the two managed rrsets — the
+    # foreign TXT rrset is absent, so it survives the emptying.
+    batch = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]
+    assert batch["Changes"] == [
+        {"Action": "DELETE", "ResourceRecordSet": www},
+        {"Action": "DELETE", "ResourceRecordSet": sub_ns},
+    ]
+    assert client.delete_hosted_zone.call_args.kwargs["Id"] == "Z42"
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_mixed_rrset_keeps_foreign_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed value sharing an rrset with a foreign value: the rrset
+    is UPSERTed down to just the foreign value, never deleted wholesale."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z42", "Name": "doomed.example."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "rr.doomed.example.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}, {"Value": "10.0.0.2"}],
+            },
+        ],
+        "IsTruncated": False,
+    }
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    managed = [RecordData(name="rr", record_type="A", value="10.0.0.1", ttl=300)]
+    await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=managed)
+
+    batch = client.change_resource_record_sets.call_args.kwargs["ChangeBatch"]
+    assert batch["Changes"] == [
+        {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "rr.doomed.example.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.2"}],
+            },
+        }
+    ]
+    assert client.delete_hosted_zone.call_args.kwargs["Id"] == "Z42"
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_foreign_records_block_delete_honestly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Foreign records are never deleted; when they keep the zone
+    non-empty, Route 53's refusal surfaces as a clear error instead of
+    the records being silently wiped."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {
+        "HostedZones": [{"Id": "/hostedzone/Z42", "Name": "doomed.example."}]
+    }
+    client.list_resource_record_sets.return_value = {
+        "ResourceRecordSets": [
+            {
+                "Name": "www.doomed.example.",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "10.0.0.1"}],
+            },
+        ],
+        "IsTruncated": False,
+    }
+    client.delete_hosted_zone.side_effect = _ClientError(
+        "HostedZoneNotEmpty", "The specified hosted zone contains non-DNSSEC resource records"
+    )
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="doomed.example.")
+    # We manage NOTHING in this zone — emptying must submit no changes.
+    with pytest.raises(CloudDNSError, match="does not manage"):
+        await driver._apply_zone(_server(), CREDS, zone, "delete", managed_records=[])
+
+    client.change_resource_record_sets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_without_scoping_deletes_no_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """managed_records=None (caller supplied no scoping): no record is
+    deleted on the way out — only the zone delete itself is attempted."""
     driver = Route53DNSDriver()
     client = MagicMock()
     client.list_hosted_zones_by_name.return_value = {
@@ -747,7 +1048,25 @@ async def test_apply_zone_delete_resolves_id(monkeypatch: pytest.MonkeyPatch) ->
     zone = SimpleNamespace(name="doomed.example.")
     await driver._apply_zone(_server(), CREDS, zone, "delete")
 
+    client.list_resource_record_sets.assert_not_called()
+    client.change_resource_record_sets.assert_not_called()
     assert client.delete_hosted_zone.call_args.kwargs["Id"] == "Z42"
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_absent_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1528 — deleting a zone that is already gone is a no-op success."""
+    driver = Route53DNSDriver()
+    client = MagicMock()
+    client.list_hosted_zones_by_name.return_value = {"HostedZones": [], "IsTruncated": False}
+    _patch_client(monkeypatch, driver, client)
+
+    zone = SimpleNamespace(name="gone.example.")
+    await driver._apply_zone(_server(), CREDS, zone, "delete")
+
+    client.delete_hosted_zone.assert_not_called()
 
 
 @pytest.mark.asyncio
