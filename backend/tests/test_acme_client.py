@@ -50,6 +50,7 @@ from app.models.acme_client import (
     ACME_ORDER_INVALID,
     ACME_ORDER_PENDING,
     ACME_ORDER_PROCESSING,
+    ACME_ORDER_VALID,
     ACMEClientAccount,
     ACMEOrder,
 )
@@ -1175,3 +1176,309 @@ async def test_secret_expiring_covers_letsencrypt_web_cert(
     ids = {sid for sid, _disp, _msg, _sev in subjects}
     assert f"appliance_cert_tls:{near.id}" in ids
     assert f"appliance_cert_tls:{far.id}" not in ids
+
+
+# ── (i) Manual DNS-01 propagation check queries authoritative NS ─────
+
+
+@pytest.mark.asyncio
+async def test_poll_public_txt_requires_every_authoritative_ns() -> None:
+    """#1532 — the manual-fallback propagation gate requires the TXT on
+    EVERY authoritative nameserver, queried directly — not on the
+    worker's own resolver, which can serve the record (split-horizon /
+    cache) while the servers the CA queries don't have it yet."""
+    from unittest.mock import AsyncMock
+
+    from app.services.acme_client import dns01
+
+    fqdn = "_acme-challenge.www.example.com"
+
+    async def _ips(host: str) -> list[str]:
+        return {"ns1.example.com": ["192.0.2.1"], "ns2.example.com": ["192.0.2.2"]}[host]
+
+    async def _txt_complete(ip: str, name: str) -> set[str]:
+        return {"expected-token"}
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=AsyncMock(side_effect=_txt_complete)) as txt_at,
+    ):
+        assert await dns01.poll_public_txt(fqdn, "expected-token", timeout=5, interval=0) is True
+    # Both authoritative servers were asked directly.
+    assert {c.args[0] for c in txt_at.call_args_list} == {"192.0.2.1", "192.0.2.2"}
+
+    async def _txt_missing_on_one(ip: str, name: str) -> set[str]:
+        return {"expected-token"} if ip == "192.0.2.1" else set()
+
+    with (
+        patch.object(
+            dns01,
+            "_authoritative_ns_hosts",
+            new=AsyncMock(return_value=["ns1.example.com", "ns2.example.com"]),
+        ),
+        patch.object(dns01, "_ns_host_ips", new=_ips),
+        patch.object(dns01, "_txt_values_at", new=_txt_missing_on_one),
+    ):
+        # One authoritative server lacks the record → keep waiting
+        # (here: until the short timeout) instead of signalling ready.
+        assert (
+            await dns01.poll_public_txt(fqdn, "expected-token", timeout=0.2, interval=0.01) is False
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ns_hosts_walks_up_to_the_zone() -> None:
+    """#1532 — the NS set is found by walking up from the challenge FQDN
+    to the first level that answers NS (the zone apex)."""
+    from types import SimpleNamespace
+
+    from app.services.acme_client import dns01
+
+    class _FakeResolver:
+        lifetime: float = 0.0
+
+        async def resolve(self, name: str, rdtype: str):  # noqa: ANN202
+            assert rdtype == "NS"
+            if name == "example.com":
+                return [
+                    SimpleNamespace(target="ns1.example.com."),
+                    SimpleNamespace(target="ns2.example.com."),
+                ]
+            raise RuntimeError("no NS here")
+
+    with patch("dns.asyncresolver.Resolver", _FakeResolver):
+        hosts = await dns01._authoritative_ns_hosts("_acme-challenge.www.example.com")
+    assert hosts == ["ns1.example.com", "ns2.example.com"]
+
+
+# ── (j) #1529: renewal reuses the per-cert issuance shape ───────────
+
+
+@pytest.mark.asyncio
+async def test_issue_does_not_write_settings_shape(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1529 — ``POST /issue`` must NOT record the issuance shape on
+    ``platform_settings`` at order creation: a later (even failed) issue
+    attempt for different domains used to retarget what the active cert
+    would be renewed for. The shape is written only on order success."""
+    _, token = await _superadmin(db_session)
+    await _seed_account(db_session)
+    await _enable_acme(db_session)
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    settings.acme_challenge_type = "dns-01"
+    settings.acme_domains = ["keep.example.com"]
+    await db_session.commit()
+
+    with patch("app.tasks.acme.run_acme_order.delay"):
+        r = await client.post(
+            "/api/v1/appliance/acme/issue",
+            json={"domains": ["new.example.com"], "challenge_type": "http-01"},
+            headers=_hdr(token),
+        )
+    assert r.status_code == 201, r.text
+
+    db_session.expire_all()
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    assert settings.acme_challenge_type == "dns-01"
+    assert settings.acme_domains == ["keep.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_record_issuance_shape_copies_successful_order(
+    db_session: AsyncSession,
+) -> None:
+    """#1529 — on success the orchestrator copies the order's shape onto
+    settings, so they describe the last order that actually produced a
+    cert (the sweep's legacy fallback)."""
+    account = await _seed_account(db_session)
+    await _enable_acme(db_session)
+    order = ACMEOrder(
+        account_id=account.id,
+        domains=["app.example.com"],
+        challenge_type="http-01",
+        dns_provider=None,
+        status=ACME_ORDER_VALID,
+    )
+    db_session.add(order)
+    await db_session.commit()
+
+    await orchestrator._record_issuance_shape(db_session, order)
+    # ``_record_issuance_shape`` runs inside ``execute_order``'s unit of
+    # work; the caller commits. Commit here too, or ``expire_all``
+    # below discards the unflushed change and reloads the old row.
+    await db_session.commit()
+
+    db_session.expire_all()
+    settings = await db_session.get(PlatformSettings, 1)
+    assert settings is not None
+    assert settings.acme_challenge_type == "http-01"
+    assert settings.acme_domains == ["app.example.com"]
+
+
+async def _seed_shape(db_session: AsyncSession) -> None:
+    """Common renewal-shape seed: enabled settings + account, with the
+    global ``acme_domains`` emptied so a renewal can ONLY come from the
+    per-cert order shape (proving the sweep no longer uses the global)."""
+    settings = await db_session.get(PlatformSettings, 1)
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db_session.add(settings)
+    settings.acme_enabled = True
+    settings.acme_auto_renew = True
+    settings.acme_domains = []
+    await _seed_account(db_session)
+
+
+async def _valid_order_for(
+    db_session: AsyncSession, cert, **kwargs
+) -> ACMEOrder:  # noqa: ANN001, ANN202
+    account = (
+        await db_session.execute(
+            select(ACMEClientAccount).order_by(ACMEClientAccount.created_at.desc()).limit(1)
+        )
+    ).scalar_one()
+    order = ACMEOrder(
+        account_id=account.id,
+        status=ACME_ORDER_VALID,
+        certificate_id=cert.id,
+        **kwargs,
+    )
+    db_session.add(order)
+    await db_session.flush()
+    return order
+
+
+@pytest.mark.asyncio
+async def test_renew_reuses_http01_issuance_shape(db_session: AsyncSession) -> None:
+    """#1529 — a cert issued over http-01 renews as http-01 with the
+    successful order's domains — not as managed-zone dns-01 with the
+    global domain list (the old behaviour, under which it never
+    renewed at all)."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["old.example.com"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["app.example.com"],
+        challenge_type="http-01",
+        allow_manual=False,
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].challenge_type == "http-01"
+    assert orders[0].domains == ["app.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_renew_manual_dns01_skips_and_alerts(db_session: AsyncSession) -> None:
+    """#1529 — a cert issued with manual DNS-01 for an unmanaged domain
+    cannot renew unattended: the sweep creates NO order, opens ONE
+    deduped ``acme-manual-renewal`` alert event, and reports the skip."""
+    from app.models.alerts import AlertEvent, AlertRule
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    db_session.add(
+        AlertRule(
+            name="acme-manual-renewal",
+            rule_type="acme_manual_renewal",
+            severity="warning",
+            enabled=True,
+        )
+    )
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["manual.example.org"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["manual.example.org"],
+        challenge_type="dns-01",
+        allow_manual=True,
+    )
+    await db_session.commit()
+    # Capture the id before expire_all() below: accessing cert.id
+    # afterwards would lazy-load an expired attribute outside a
+    # greenlet (MissingGreenlet).
+    cert_id = cert.id
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+        assert result == "renewed=0 skipped_manual=1", result
+        delay.assert_not_called()
+        # Second sweep: still skipped, still exactly one open event.
+        result2 = await acme_tasks._renew()
+        assert result2 == "renewed=0 skipped_manual=1", result2
+
+    db_session.expire_all()
+    pending = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert pending == []
+    events = (
+        (await db_session.execute(select(AlertEvent).where(AlertEvent.subject_id == str(cert_id))))
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
+    assert events[0].resolved_at is None
+    assert "manual DNS-01" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_renew_manual_dns01_renews_when_now_managed(
+    db_session: AsyncSession,
+) -> None:
+    """#1529 — a manual-fallback order whose domains are ALL covered by
+    a managed zone today renews unattended as plain dns-01 (no manual
+    step is actually needed)."""
+    from app.tasks import acme as acme_tasks
+
+    await _seed_shape(db_session)
+    await _seed_managed_zone(db_session, "example.org.")
+    cert = await _seed_le_cert(db_session, days_to_expiry=10, sans=["www.example.org"])
+    await _valid_order_for(
+        db_session,
+        cert,
+        domains=["www.example.org"],
+        challenge_type="dns-01",
+        allow_manual=True,
+    )
+    await db_session.commit()
+
+    with patch.object(acme_tasks.run_acme_order, "delay") as delay:
+        result = await acme_tasks._renew()
+    assert result == "renewed=1", result
+    delay.assert_called_once()
+
+    db_session.expire_all()
+    orders = (
+        (await db_session.execute(select(ACMEOrder).where(ACMEOrder.status == ACME_ORDER_PENDING)))
+        .scalars()
+        .all()
+    )
+    assert len(orders) == 1
+    assert orders[0].challenge_type == "dns-01"
+    assert orders[0].allow_manual is False
