@@ -34,6 +34,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import address_taken, owned_by_other_integration
 from app.services.tailscale.client import (
     TailscaleClient,
@@ -56,6 +57,9 @@ class _DesiredAddress:
     hostname: str  # FQDN (`<host>.<tailnet>.ts.net`)
     description: str
     custom_fields: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass

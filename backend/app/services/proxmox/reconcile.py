@@ -41,6 +41,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
     address_taken,
     owned_by_other_integration,
@@ -88,6 +89,9 @@ class _DesiredAddress:
     hostname: str
     description: str
     mac: str | None = None
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
