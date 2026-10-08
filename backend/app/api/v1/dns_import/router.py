@@ -137,6 +137,9 @@ class PreviewOut(BaseModel):
     warnings: list[str]
     total_records: int
     record_type_histogram: dict[str, int]
+    # Set by the live-pull previews (cloud, Windows DNS) to the server the
+    # records came from; the commit doesn't push them back to it (#1456).
+    source_server_id: uuid.UUID | None = None
 
 
 class ConflictDecision(BaseModel):
@@ -345,6 +348,7 @@ def _preview_to_pydantic(p: ImportPreview, tlds: frozenset[str] | None = None) -
         warnings=list(p.warnings),
         total_records=p.total_records,
         record_type_histogram=dict(p.record_type_histogram),
+        source_server_id=p.source_server_id,
     )
 
 
@@ -379,7 +383,27 @@ def _preview_from_pydantic(o: PreviewOut) -> ImportPreview:
         warnings=list(o.warnings),
         total_records=o.total_records,
         record_type_histogram=dict(o.record_type_histogram),
+        source_server_id=o.source_server_id,
     )
+
+
+async def _check_source_server(db: DB, plan: PreviewOut) -> None:
+    """Reject a plan whose ``source_server_id`` doesn't match its source.
+
+    The id comes back from the client with the plan, and it turns off the
+    record ops to that server (#1456), so it has to name a server of the
+    plan's own driver: a live-pull source only, never a file import.
+    """
+    if plan.source_server_id is None:
+        return
+    server = await db.get(DNSServer, plan.source_server_id)
+    if server is None or server.driver != plan.source:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Plan source_server_id {plan.source_server_id} is not a " f"{plan.source} server"
+            ),
+        )
 
 
 def _commit_result_to_pydantic(r: CommitResult) -> CommitOut:
@@ -492,6 +516,7 @@ async def bind9_commit(
             detail=f"Plan source mismatch: endpoint=bind9 plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -651,6 +676,7 @@ async def windows_dns_commit(
             detail=f"Plan source mismatch: endpoint=windows_dns plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -789,6 +815,7 @@ async def powerdns_commit(
             detail=f"Plan source mismatch: endpoint=powerdns plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -914,6 +941,7 @@ async def technitium_commit(
             detail=f"Plan source mismatch: endpoint=technitium plan={body.plan.source}",
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)
@@ -1048,6 +1076,7 @@ async def cloud_dns_commit(
             ),
         )
 
+    await _check_source_server(db, body.plan)
     preview = _preview_from_pydantic(body.plan)
     actions: dict[str, tuple[ConflictAction, str | None]] = {
         zone_name: (decision.action, decision.rename_to)

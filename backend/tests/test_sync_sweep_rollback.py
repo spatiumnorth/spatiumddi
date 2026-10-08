@@ -1,4 +1,4 @@
-"""Per-endpoint crash containment for the Cloud + Proxmox sweeps (#333).
+"""Per-endpoint crash containment for the integration sweeps (#333, #1677).
 
 Both sweeps open **one** ``AsyncSession`` and loop every endpoint /
 node through ``reconcile_*`` on that shared session. ``reconcile_*``
@@ -203,3 +203,194 @@ async def test_proxmox_sweep_recovers_after_node_crash(db_session: AsyncSession)
     assert len(calls) == 1 and len(reconciled) == 1
     assert calls[0] != reconciled[0]
     assert any("boom" in msg for msg in result["error_messages"])
+
+
+# ── Every integration sweep, with a real flush failure (#1677) ──────────
+#
+# A failed flush does more than poison the transaction: SQLAlchemy also
+# expires every object on the session, so the sweep's ``except`` can no
+# longer read ``target.name`` without hitting the dead transaction
+# (``PendingRollbackError``), and the whole sweep dies there.
+
+
+def _sweep_targets(space_id: uuid.UUID) -> dict[str, tuple]:
+    """sweep → (task module, reconcile path, platform flag, target factory)."""
+    from app.models.docker import DockerHost  # noqa: PLC0415
+    from app.models.fortinet import FortinetFirewall  # noqa: PLC0415
+    from app.models.kubernetes import KubernetesCluster  # noqa: PLC0415
+    from app.models.meraki import MerakiOrg  # noqa: PLC0415
+    from app.models.netbird import NetbirdInstance  # noqa: PLC0415
+    from app.models.opnsense import OPNsenseRouter  # noqa: PLC0415
+    from app.models.panos import PANOSFirewall  # noqa: PLC0415
+    from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
+    from app.models.unifi import UnifiController  # noqa: PLC0415
+    from app.tasks import (  # noqa: PLC0415
+        docker_sync,
+        fortinet_sync,
+        kubernetes_sync,
+        meraki_sync,
+        netbird_sync,
+        opnsense_sync,
+        panos_sync,
+        tailscale_sync,
+        unifi_sync,
+    )
+
+    def _name(prefix: str) -> str:
+        return f"{prefix}-{uuid.uuid4().hex[:6]}"
+
+    return {
+        "kubernetes": (
+            kubernetes_sync,
+            "app.services.kubernetes.reconcile.reconcile_cluster",
+            "integration_kubernetes_enabled",
+            lambda: KubernetesCluster(
+                name=_name("k8s"),
+                api_server_url="https://k8s.example.test:6443",
+                ca_bundle_pem="",
+                token_encrypted=b"x",
+                ipam_space_id=space_id,
+                pod_cidr="",
+                service_cidr="",
+            ),
+        ),
+        "docker": (
+            docker_sync,
+            "app.services.docker.reconcile.reconcile_host",
+            "integration_docker_enabled",
+            lambda: DockerHost(
+                name=_name("docker"),
+                connection_type="tcp",
+                endpoint=f"{_name('d')}.example.test:2376",
+                ipam_space_id=space_id,
+                client_key_encrypted=b"",
+            ),
+        ),
+        "tailscale": (
+            tailscale_sync,
+            "app.services.tailscale.reconcile.reconcile_tenant",
+            "integration_tailscale_enabled",
+            lambda: TailscaleTenant(
+                name=_name("ts"), tailnet="-", api_key_encrypted=b"", ipam_space_id=space_id
+            ),
+        ),
+        "netbird": (
+            netbird_sync,
+            "app.services.netbird.reconcile.reconcile_instance",
+            "integration_netbird_enabled",
+            lambda: NetbirdInstance(name=_name("nb"), ipam_space_id=space_id),
+        ),
+        "unifi": (
+            unifi_sync,
+            "app.services.unifi.reconcile.reconcile_controller",
+            "integration_unifi_enabled",
+            lambda: UnifiController(name=_name("unifi"), ipam_space_id=space_id),
+        ),
+        "proxmox": (
+            proxmox_sync,
+            "app.services.proxmox.reconcile.reconcile_node",
+            "integration_proxmox_enabled",
+            lambda: ProxmoxNode(
+                name=_name("pve"),
+                host=f"{_name('h')}.example.test",
+                token_id="root@pam!sync",
+                token_secret_encrypted=encrypt_dict({"secret": "x"}),
+                ipam_space_id=space_id,
+            ),
+        ),
+        "cloud": (
+            cloud_sync,
+            "app.services.cloud.reconcile.reconcile_endpoint",
+            "integration_cloud_enabled",
+            lambda: CloudEndpoint(
+                name=_name("cloud"),
+                provider="aws",
+                credentials_encrypted=encrypt_dict({"access_key_id": "x"}),
+                provider_config={},
+                regions=["us-east-1"],
+                ipam_space_id=space_id,
+            ),
+        ),
+        "opnsense": (
+            opnsense_sync,
+            "app.services.opnsense.reconcile.reconcile_router",
+            "integration_opnsense_enabled",
+            lambda: OPNsenseRouter(
+                name=_name("opn"), host=f"{_name('o')}.example.test", ipam_space_id=space_id
+            ),
+        ),
+        "fortinet": (
+            fortinet_sync,
+            "app.services.fortinet.reconcile.reconcile_firewall",
+            "integration_fortinet_enabled",
+            lambda: FortinetFirewall(
+                name=_name("fgt"), host=f"{_name('f')}.example.test", ipam_space_id=space_id
+            ),
+        ),
+        "panos": (
+            panos_sync,
+            "app.services.panos.reconcile.reconcile_firewall",
+            "integration_panos_enabled",
+            lambda: PANOSFirewall(
+                name=_name("pan"), host=f"{_name('p')}.example.test", ipam_space_id=space_id
+            ),
+        ),
+        "meraki": (
+            meraki_sync,
+            "app.services.meraki.reconcile.reconcile_org",
+            "integration_meraki_enabled",
+            lambda: MerakiOrg(name=_name("meraki"), ipam_space_id=space_id),
+        ),
+    }
+
+
+_SWEEPS = [
+    "kubernetes",
+    "docker",
+    "tailscale",
+    "netbird",
+    "unifi",
+    "proxmox",
+    "cloud",
+    "opnsense",
+    "fortinet",
+    "panos",
+    "meraki",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sweep", _SWEEPS)
+async def test_sweep_survives_flush_failure(db_session: AsyncSession, sweep: str) -> None:
+    space = await _make_space(db_session)
+    space_name = space.name
+    module, reconcile_path, flag, factory = _sweep_targets(space.id)[sweep]
+    await _platform_settings(db_session, **{flag: True})
+    db_session.add(factory())
+    db_session.add(factory())
+    await db_session.commit()
+
+    calls: list[uuid.UUID] = []
+    reconciled: list[uuid.UUID] = []
+
+    async def _fake_reconcile(db: AsyncSession, target):  # noqa: ANN001
+        if not calls:
+            calls.append(target.id)
+            # What a duplicate insert in the reconciler does: the flush
+            # raises IntegrityError and expires every object in ``db``.
+            db.add(IPSpace(name=space_name, description=""))
+            await db.flush()
+        await db.execute(select(type(target)).where(type(target).id == target.id))
+        reconciled.append(target.id)
+        return CloudSummary(ok=True)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(reconcile_path, _fake_reconcile)
+        result = await module._run_sweep()
+
+    assert result["status"] == "ok"
+    assert result["errors"] == 1
+    assert result["ok"] == 1
+    assert len(calls) == 1 and len(reconciled) == 1
+    assert calls[0] != reconciled[0]
+    assert any("IntegrityError" in msg or "duplicate" in msg for msg in result["error_messages"])

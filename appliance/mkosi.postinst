@@ -50,6 +50,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-cluster-restore.path \
             spatiumddi-etcd-evict.path \
             spatiumddi-publish-k3s-token.service \
+            spatiumddi-publish-k3s-token.path \
             k3s.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
@@ -266,6 +267,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
 # reports "no managed profile" and the warning never appears.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
+# #1630 — k3s.service's ExecStartPre (clear-ingests) and firstboot's image
+# check before a slot commit (verify --repair).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
@@ -383,6 +387,7 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-evict"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-etcd-evict.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-publish-k3s-token.path"
 
 # Issue #276 — spatium-etc-render runs in the sysinit phase (it must
 # set hostname + SSH host keys before sshd / k3s). The multi-user

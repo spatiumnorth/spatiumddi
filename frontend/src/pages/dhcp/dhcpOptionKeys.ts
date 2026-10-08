@@ -25,6 +25,18 @@ const CANONICAL_CODES: Record<string, number> = {
 
 const RAW_KEY = /^(?:code:|opt-)(\d+)$/;
 
+/** How a group's servers spell a raw option code (#1347): Windows reads
+ *  `opt-NN` and drops `code:NN`; Kea and FortiGate the reverse. Mirrors
+ *  `spelling_for_drivers` in `backend/app/services/dhcp/option_spelling.py`
+ *  for the one case the editor can act on: an all-Windows group. */
+export type RawPrefix = "code:" | "opt-";
+
+export function rawPrefixFor(drivers: string[]): RawPrefix {
+  return drivers.length > 0 && drivers.every((d) => d === "windows_dhcp")
+    ? "opt-"
+    : "code:";
+}
+
 /** The option code a stored key stands for, or 0 when it names none. */
 export function optionKeyCode(key: string): number {
   if (key in CANONICAL_CODES) return CANONICAL_CODES[key];
@@ -33,7 +45,10 @@ export function optionKeyCode(key: string): number {
 }
 
 /** The key one editor row is stored under. */
-export function optionKey(opt: DHCPOption): string {
+export function optionKey(
+  opt: DHCPOption,
+  rawPrefix: RawPrefix = "code:",
+): string {
   const name = opt.name ?? "";
   if (name in CANONICAL_CODES) return name;
   // A raw-code row keeps its own spelling (an imported `opt-NN` re-keyed
@@ -48,17 +63,18 @@ export function optionKey(opt: DHCPOption): string {
     const canonical = Object.entries(CANONICAL_CODES).find(
       ([, c]) => c === opt.code,
     );
-    return canonical ? canonical[0] : `code:${opt.code}`;
+    return canonical ? canonical[0] : `${rawPrefix}${opt.code}`;
   }
   return name;
 }
 
 export function optionsToMap(
   options: DHCPOption[],
+  rawPrefix: RawPrefix = "code:",
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const opt of options) {
-    const key = optionKey(opt);
+    const key = optionKey(opt, rawPrefix);
     if (key) out[key] = opt.value;
   }
   return out;

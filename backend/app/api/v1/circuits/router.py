@@ -26,6 +26,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.circuit import (
     CIRCUIT_STATUSES,
     TRANSPORT_CLASSES,
@@ -328,9 +329,39 @@ async def update_circuit(
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Circuit not found")
 
+    # #1564 — resolve nulls BEFORE _check_fks / the status stamp: a null
+    # ``status`` fed to _stamp_status_transition (or a null ``name`` /
+    # ``provider_id`` reaching Postgres) was a 500; it is now a 422,
+    # while null for a nullable FK / date / cost clears the column.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "ckt_id",
+            "customer_id",
+            "a_end_site_id",
+            "a_end_subnet_id",
+            "z_end_site_id",
+            "z_end_subnet_id",
+            "term_start_date",
+            "term_end_date",
+            "monthly_cost",
+        },
+        non_nullable={
+            "name",
+            "provider_id",
+            "transport_class",
+            "bandwidth_mbps_down",
+            "bandwidth_mbps_up",
+            "currency",
+            "status",
+            "notes",
+            "tags",
+            "custom_fields",
+        },
+    )
+
     await _check_fks(db, body)
 
-    changes = body.model_dump(exclude_unset=True)
     if "status" in changes and changes["status"] != row.status:
         _stamp_status_transition(row, changes["status"])
         # ``_stamp_status_transition`` already set row.status; remove
