@@ -11,7 +11,7 @@ each ``_apply_*`` (defense in depth).
 
 M1 (MEDIUM) — MCP ``tools/call`` read-only gating. ``mcp_post`` dispatched
 ANY registered tool by name (including ``propose_*`` writes) ignoring the
-read-only advertised set. The fix passes ``effective={read-only names}``
+read-only advertised set. The fix passes ``effective={MCP tool names}``
 so a read-scoped MCP caller can't invoke a write/propose tool.
 """
 
@@ -318,4 +318,5 @@ async def test_mcp_tools_list_excludes_write_and_propose(db_session: AsyncSessio
     listed = {t["name"] for t in resp["result"]["tools"]}
     excluded = {t.name for t in REGISTRY.all() if t.writes or t.name.startswith("propose_")}
     assert listed.isdisjoint(excluded)
-    assert listed == mcp_mod._mcp_tool_names()
+    assert listed == {t.name for t in await mcp_mod._mcp_tools(db_session, user)}
+    assert listed <= await mcp_mod._mcp_tool_names(db_session)

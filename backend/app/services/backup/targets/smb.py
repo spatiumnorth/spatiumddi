@@ -195,6 +195,20 @@ class SmbDestination(BackupDestination):
                     pass  # didn't exist
                 rename(tmp, target)
             except Exception as exc:  # noqa: BLE001
+                # Best-effort cleanup of the staged file (#1570),
+                # mirroring the NFS driver: listing and retention only
+                # match ``*.zip``, so a leftover ``.tmp`` is invisible
+                # and is never pruned.
+                try:
+                    remove(tmp)
+                except FileNotFoundError:
+                    pass  # the failure predates the staged file
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.warning(
+                        "smb_partial_cleanup_failed",
+                        path=tmp,
+                        error=str(cleanup_exc),
+                    )
                 raise BackupDestinationError(f"SMB write failed: {exc}") from exc
 
         await asyncio.to_thread(_do)

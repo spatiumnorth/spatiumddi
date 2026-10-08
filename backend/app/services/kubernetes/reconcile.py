@@ -54,7 +54,8 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
-from app.services.integration_ownership import owned_by_other_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.integration_ownership import address_taken, owned_by_other_integration
 from app.services.kubernetes.client import (
     KubernetesClient,
     KubernetesClientError,
@@ -140,6 +141,9 @@ class _DesiredAddress:
     status: str  # kubernetes-node | kubernetes-lb | kubernetes-service | kubernetes-pod
     hostname: str
     description: str
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass(frozen=True)
@@ -638,6 +642,16 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # Another integration's row (or another Kubernetes cluster's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)  # old parent loses one
                 row.subnet_id = subnet.id
                 changed = True
@@ -655,6 +669,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,

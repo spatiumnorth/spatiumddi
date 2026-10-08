@@ -151,6 +151,16 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # #1171 — the group's bundles carry each zone's own SOA timers. False while
+    # any BIND9 agent of the group writes the literal 3600 600 86400 300 (an
+    # older release): the bundles then carry that literal, so every agent
+    # serves one SOA under each serial. ``services.dns.soa_timers`` switches it
+    # and moves the serial of each zone whose timers differ, in one
+    # transaction.
+    serves_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )
@@ -240,6 +250,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #1171 — this server's agent writes each zone's own SOA timers into its
+    # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
+    # register or heartbeat. False for an agent of an older release, which
+    # writes 3600 600 86400 300 for every zone. A group serves the zones' own
+    # timers only while every BIND9 agent in it does
+    # (``services.dns.soa_timers``).
+    agent_renders_soa_timers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── #882 last config-apply verdict ────────────────────────────────────
     #
@@ -871,6 +890,18 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+# The SOA timers a zone gets when none are given: REFRESH, RETRY, EXPIRE and
+# MINIMUM (the negative-cache TTL). They are what the BIND9 agent served for
+# every zone before it rendered the stored ones (#1171), so a new zone serves
+# what every zone always has. The old defaults (86400 / 7200 / 3600000 / 3600)
+# were stored but never served, and a one-hour negative TTL is long for a DDI:
+# a name looked up before its DDNS record exists stays NXDOMAIN for the hour.
+ZONE_DEFAULT_REFRESH = 3600
+ZONE_DEFAULT_RETRY = 600
+ZONE_DEFAULT_EXPIRE = 86400
+ZONE_DEFAULT_MINIMUM = 300
+
+
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
 
@@ -901,10 +932,10 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     # SOA fields
     ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
-    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
-    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=7200)
-    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=3600000)
-    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_REFRESH)
+    retry: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_RETRY)
+    expire: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_EXPIRE)
+    minimum: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_MINIMUM)
     primary_ns: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     admin_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 

@@ -529,6 +529,10 @@ export function AptSection({
             mark();
           }}
         />
+        <p className="text-xs text-muted-foreground">
+          A credential in a proxy URL shows as <code>***@</code>. Leave it as-is
+          to keep the stored one.
+        </p>
       </div>
 
       {/* ── Private-mirror auth ── */}
