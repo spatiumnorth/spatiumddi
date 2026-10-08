@@ -84,6 +84,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A member joining a multi-node appliance no longer stops DNS and DHCP
+  on every node (#1439).** A member's promotion changes its role apply
+  key (the agents' control-plane URL, #1350), so its first heartbeat
+  after the join re-applied the cluster's one role chart with the roles
+  it held at that moment: none. Every agent was rendered off, and the
+  helm upgrade deleted every agent DaemonSet on every node, the seed's
+  included, until a node holding the roles wrote the chart again (its
+  watchdog, every five minutes). Forming a cluster, adding a member and
+  a Replace each left the cluster without DNS and DHCP for one to four
+  minutes. A node that holds no agent key now keeps an agent on while
+  another node is labelled for its role, with that role's key and
+  server group taken from the live chart and everything else from its
+  own render; a node list or chart it cannot read fails the apply
+  instead of writing it blind.
+
+- **Giving a cluster node some of the roles, or taking one back, no
+  longer stops that role's agents on every node (#1427).** A node
+  renders an agent only when it holds that role's key, so a member given
+  DNS alone, or a node DHCP was taken back from, wrote the DHCP agent off
+  in the cluster's one role chart, and Kea was killed on every node still
+  assigned DHCP until a watchdog wrote the chart again (89 seconds without
+  DHCP on a three-node cluster; about 3.5 minutes on a field cluster of
+  2026.10.02-1). Every agent a node does not hold now stays on while
+  another node is labelled for its role, so a role change is a node label
+  again, as the chart intends.
+
 - **A cluster member that held the Redis master and rebooted before
   Sentinel failed over no longer leaves Redis without a master (#1442).**
   Each Redis pod's init container wrote a fixed topology on every start:
