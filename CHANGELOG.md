@@ -138,6 +138,109 @@ the formatter handles the rest.
   updates are not swept, since their clients write records the bundle does
   not carry.
 
+- **Raw `k8s/` manifests and the DHCP agent readiness probe pointed
+  at things that don't exist (#1547, #1550, #1589).** `DATABASE_URL`
+  used `postgres-primary`, a Service CNPG never creates for the
+  `postgres` Cluster — it is now `postgres-rw` everywhere, and the
+  quick start exposes its standalone Postgres under that name. The
+  agents pointed at a `spatiumddi-api` Service; the API Service is
+  named `api`. The Redis URLs were plain `redis://` against the
+  headless Service (replica READONLY, no password against a
+  `requirepass` manifest, no Sentinel Service) — they are now
+  `sentinel://` URLs with the password, plus a `redis-sentinel`
+  Service. The Redis password itself lives only in the
+  `spatiumddi-secrets` Secret (`redis-password`): the api / worker /
+  beat Deployments interpolate it into the URLs as
+  `$(REDIS_PASSWORD)` and the Sentinel StatefulSet's init container
+  renders it into `redis.conf` — no credential sits in the ConfigMap. The DHCP agent's readiness probe gated on TCP 8000, the
+  Kea HA peer listener a standalone server never binds, so a
+  standalone pod never joined its Service endpoints; it now probes
+  the Kea control socket, as the image HEALTHCHECK does. And the
+  MetalLB VIP Services no longer allocate NodePorts nobody routes
+  through. New charts-gate checks (`chart-dhcp-readiness.py`,
+  `chart-vip-nodeports.py`, `chart-raw-k8s-refs.py`, each with a
+  negative control) pin all of it.
+
+- **Update endpoints handle explicit nulls consistently (#1564,
+  #1563).** Sending `null` for a NOT NULL field on domain, ASN,
+  circuit, router or VLAN updates used to reach Postgres and come
+  back as a 500; it is now a 422 naming the fields, via a shared
+  `resolve_update_changes` helper that separates "field absent"
+  from "clear this nullable column" from "null for a NOT NULL
+  column". And where an explicit null was previously ignored — so
+  the UI's "clear" silently did nothing — it now clears: DHCP pool,
+  static and phone-profile fields, DNS group/server/view/zone/record
+  fields, blocklist `feed_url`/`sinkhole_ip`, blocklist-entry
+  target, and pool `hc_target_port`. The edit forms now omit fields
+  hidden for the current mode (blocklist feed URL / sinkhole IP, pool
+  health-check port, a v4 static's DUID, a cloud server's API port, a
+  non-select custom field's options), so an untouched edit cannot
+  clear them.
+
+- **ACME auto-renewal renews each certificate in its own issuance
+  shape (#1529).** The renewal sweep ignored the stored challenge
+  type and provider and renewed every certificate as managed-zone
+  DNS-01 from one global domain list, so http-01 certificates never
+  renewed and manual-DNS certificates got a renewal order every 12 h
+  that could only fail. The sweep now reads the shape — challenge
+  type, provider, domains — from the successful order that produced
+  each certificate. A certificate that needs a person (manual DNS-01
+  for domains SpatiumDDI doesn't host, and not since covered by a
+  managed zone) is skipped and raises a new seeded
+  `acme-manual-renewal` alert instead. The `platform_settings` shape
+  columns are now written only when an order succeeds, never at
+  order creation, so a later failed issue attempt can't retarget an
+  existing certificate's renewal.
+
+- **ACME DNS-01 solves no longer strand challenge records, stall on
+  other groups, or verify against the wrong resolver (#1530, #1531,
+  #1532).** A solve that fails after its `_acme-challenge` TXT record
+  commits now tears the record down on every failure path, and the
+  stale-TXT sweep — which existed but had no caller — is on an hourly
+  beat schedule and also covers stranded client-path records, not
+  just acme-dns provider accounts. The sibling-op wait in `solve()`
+  is scoped to servers in the zone's own group: serials are
+  date-based, so a same-name zone in another group (a split-horizon
+  pair) could otherwise stall or fail the solve. And the manual
+  DNS-01 propagation check walks the domain's authoritative name
+  servers (found by walking up from the challenge FQDN) and requires
+  the TXT on every one, instead of asking the appliance's own
+  resolver, which is not what the CA queries.
+
+- **Raw DHCP option codes are checked on every way into a group, not
+  only on write (#1347).** #1296 made a scope or option-template write
+  refuse the raw spelling its group's servers drop (Windows reads `opt-NN`,
+  Kea and FortiGate `code:NN`). Three other paths still produced options
+  saved and never served, with no error:
+  - **A server joining a group.** A scope saved with `code:43` on a Kea,
+    FortiGate or empty group kept it when a Windows server was added or
+    moved in, and Windows then served the scope without it. Creating or
+    moving a server into such a group is now refused, naming the scopes and
+    keys.
+  - **The Windows importer** wrote `opt-NN` into whatever group it was
+    given, and a Kea group dropped every one at render. Options are now
+    re-keyed to the target group's spelling on commit, and the ones no
+    server there can serve are dropped and named in the warnings.
+  - **The option editor** keyed a catalogue pick as `code:NN` even on a
+    Windows group, where the write then refused it. It now uses the group's
+    spelling, for scopes and option templates alike.
+  Each DHCP driver now declares the spelling it reads, rather than the
+  router special-casing Windows, and `opt-NN` on a DHCPv6 scope is refused
+  on a Windows group too: the Windows write path is DHCPv4-only, so it
+  reached no server.
+
+- **A new external user can be admitted with auto-create off (#1291).**
+  `POST /users` created local accounts only, and `link-provider` refuses a
+  local account, so a provider with `auto_create_users` off signed in only
+  the accounts it already had: a new employee was refused for good, and
+  the docs' "create the user manually" had no API or UI behind it. Now Users
+  → New User has a *Signs in through* picker, and `POST /users` accepts
+  `auth_provider_id` with no password. That creates an account bound to the
+  provider with no password, which the user's first sign-in through that
+  provider claims; the same username through any other provider is still
+  refused. Creating one as a superadmin needs the operator step-up, as for
+  a local superadmin.
+
 - **A Fleet reboot request reboots the appliance, or says why it did
   not (#1446).** The control plane cleared `reboot_requested` 15 seconds
   after it was stamped, assuming the supervisor had seen it by then. A
@@ -566,6 +669,38 @@ the formatter handles the rest.
   zone in use is changed to a secondary. A record an earlier release
   wrote into such a zone is dropped, with no update sent, the next time
   IPAM syncs the address.
+
+- **A slot upgrade no longer hands k3s half-written image tarballs
+  (#1630).** `spatium-upgrade-slot apply` copied the new slot's
+  image tarballs over the old ones in place while the old slot's
+  k3s kept running, and k3s's image watcher imported each file
+  while it was still being written. Those imports failed, and one
+  cut off inside a tarball's `index.json` could leave a containerd
+  ingest that failed the next boot's imports as well. Each tarball
+  is now copied under a hidden `.part` name the watcher ignores,
+  synced, and renamed into place.
+
+- **An image tarball k3s failed to import is noticed and imported
+  again (#1630).** k3s imports every tarball's `index.json` under
+  one containerd ref, and an import that died part-way left a
+  stale write there that failed every shorter `index.json` after
+  it, on every boot. k3s retries a failed tarball only when the
+  file changes, so a slot upgrade's first boot could leave a node
+  without its DNS and DHCP agents' images for good, with the pods
+  in `ErrImageNeverPull`. k3s.service now clears unfinished
+  containerd writes before k3s starts. On every boot, firstboot
+  checks k3s's own record of what it imported against containerd,
+  and has k3s re-import anything missing.
+
+- **A trial slot is not committed while one of its images is
+  missing (#1630).** firstboot committed a slot upgrade's trial
+  boot once the apiserver answered and the control chart was
+  placed, whatever k3s had imported, so a node whose DNS and DHCP
+  agents' images had failed to import made the swap durable
+  without them. If an image is still missing after the re-import
+  above, a trial boot now exits before the commit. The previous
+  slot stays the durable default and the next reboot reverts to
+  it, as with a failed host migration.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
