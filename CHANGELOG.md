@@ -119,6 +119,45 @@ the formatter handles the rest.
     percent-encoding and escape `+` as `+`, so a base64 token
     they echoed back was still logged in clear.
 
+- **The k3s join token is published whenever k3s writes it, not only in
+  the first 60 s after boot (#1509).** `spatiumddi-publish-k3s-token` ran
+  once at boot and polled for the token for 60 s. On a fresh seed k3s can
+  write it later (firstboot, airgap import, restarts), and nothing published
+  it until a reboot, so promoting the second node answered 409 ("hasn't
+  reported its k3s join token"). A new `spatiumddi-publish-k3s-token.path`
+  unit re-runs the service on every write of the token file
+  (`PathChanged=`, edge-triggered). The boot run stays for a token that
+  already exists at boot.
+
+- **A ballooned seed VM no longer re-sizes the control plane on every
+  balloon step (#1585).** The supervisor sized api / worker / Postgres from
+  the node's current `MemTotal` on every heartbeat, and a virtio balloon
+  changes `MemTotal` while the guest runs (Proxmox does so by itself once the
+  host passes 80 % RAM). Each step re-rendered `spatium-control`: a new api
+  rollout and migrate Job, and on a bigger seed a CNPG rolling restart. One
+  install went through about 110 helm revisions in five hours. The sizing
+  now uses the largest `MemTotal` seen since this boot, kept per boot in the
+  supervisor's state dir, so it survives a supervisor restart. A balloon
+  only takes memory away from what the node booted with, so the size stays
+  put; more memory (a hot-plug) is taken at once, and a node rebooted with
+  less RAM sizes down on that boot.
+
+- **cloud-init stays off on an installed appliance (#1511).** The
+  installer masked cloud-init's units, but the masks land in the `/etc`
+  overlay, which is mounted after systemd has loaded its units, so they
+  never took effect at boot (and trixie's cloud-init 25.1 renamed the
+  units as well). With a preseed's `CIDATA` drive still attached,
+  cloud-init ran on the installed system and wrote a DHCP profile
+  (`cloud-init-<iface>.nmconnection`) next to the static one, so once a
+  DHCP server answered on the segment a rebooted node could come up on a
+  lease instead of its address. The installer now writes
+  `/etc/cloud/cloud-init.disabled`, which every cloud-init unit checks
+  when it starts. Nodes installed before this heal on their first boot of
+  a release that carries the fix: `spatium-etc-render` sets the marker and
+  removes leftover `cloud-init-*.nmconnection` profiles, but only on a
+  node the installer set up, so an image booted without the installer
+  keeps cloud-init.
+
 - **Mirror delete-side guards (#1558, #1554, #1557, #1561).** The
   UniFi, Proxmox, Docker, Kubernetes and Cloud mirrors deleted a
   removed subnet outright, cascade-deleting every operator address

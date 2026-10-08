@@ -1279,6 +1279,50 @@ def node_memory_mib() -> int | None:
     return None
 
 
+# #1585 — the size the control plane is budgeted from. A virtio balloon
+# changes the guest's MemTotal while it runs (Proxmox inflates it by itself
+# once the host passes 80 % RAM), and the sizing is linear at MiB
+# resolution, so every balloon step re-rendered spatium-control: a new api
+# rollout and migrate Job, and on a bigger seed a CNPG rolling restart, per
+# step (about 110 helm revisions in five hours on one install). A balloon
+# only ever takes memory away from what the guest booted with, so the
+# largest MemTotal seen since this boot is the RAM the node really has. It is
+# kept per boot_id in the supervisor's state dir, so a supervisor restart
+# while ballooned does not size down either. A real RAM change needs a reboot
+# (or a hot-plug, which raises MemTotal and so is taken at once).
+_SIZING_MEMORY_FILE = "sizing-memory.json"
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def sizing_memory_mib(state_dir: Path | None = None) -> int | None:
+    """The MemTotal (MiB) to size the control plane from: the largest
+    ``node_memory_mib()`` seen since this boot (#1585); ``None`` when
+    MemTotal is unreadable. Never raises."""
+    current = node_memory_mib()
+    if current is None:
+        return None
+    try:
+        boot_id = _BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        boot_id = ""
+    if state_dir is None or not boot_id:
+        return current
+    path = Path(state_dir) / _SIZING_MEMORY_FILE
+    try:
+        seen = json.loads(path.read_text(encoding="utf-8"))
+        if seen.get("boot_id") == boot_id and int(seen.get("mem_mib", 0)) >= current:
+            return int(seen["mem_mib"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"boot_id": boot_id, "mem_mib": current}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("supervisor.sizing_memory_unpersisted", error=str(exc))
+    return current
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
