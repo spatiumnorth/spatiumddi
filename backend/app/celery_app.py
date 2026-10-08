@@ -71,6 +71,7 @@ celery_app = Celery(
         "app.tasks.ipam_dns_sync",
         "app.tasks.ipam_utilization_recount",
         "app.tasks.dns",
+        "app.tasks.blocklist_refresh_sweep",
         "app.tasks.dns_pull",
         "app.tasks.looking_glass",
         "app.tasks.dhcp_health",
@@ -151,6 +152,7 @@ celery_app.conf.update(
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+        "app.tasks.blocklist_refresh_sweep.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
@@ -260,6 +262,13 @@ celery_app.conf.update(
         "lg-route-reresolve-sweep": {
             "task": "app.tasks.looking_glass.reresolve_route_links",
             "schedule": schedule(run_every=300.0),
+        },
+        # Every hour, queue a feed refresh for each enabled URL blocklist
+        # whose ``update_interval_hours`` has elapsed since its last sync
+        # (#1467). 0 = manual only. Hourly is the granularity, as for OUI.
+        "dns-blocklist-refresh": {
+            "task": "app.tasks.blocklist_refresh_sweep.dispatch_due_blocklists",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
@@ -461,6 +470,14 @@ celery_app.conf.update(
         "acme-renew-due": {
             "task": "app.tasks.acme.renew_due_certificates",
             "schedule": schedule(run_every=12 * 3600.0),
+        },
+        # Hourly, sweep stale ACME TXT records older than 24 h — the
+        # provider-path janitor plus the embedded client's stranded
+        # ``_acme-challenge`` records (#1530). The sweep function had
+        # no caller before this entry existed.
+        "acme-stale-txt-sweep": {
+            "task": "app.tasks.acme.sweep_stale_acme_txt_records",
+            "schedule": schedule(run_every=3600.0),
         },
         # Daily DNSBL / RBL reputation sweep of every public-facing
         # candidate IP against the enabled blocklists (issue #528). Gated

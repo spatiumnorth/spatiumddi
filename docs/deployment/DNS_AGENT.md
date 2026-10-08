@@ -425,7 +425,7 @@ the recovery. BIND renders and validates into `rendered.new`, so a
 state a revert would produce, and re-rendering the previous bundle there would
 bounce a healthy server for nothing. Only a swap/reload failure, where the
 live config directory has already been replaced, re-renders the previous
-bundle. Kea is the mirror image — `config-test` rejects without disturbing the
+bundle. Kea is the mirror image — `kea-dhcp4 -t` rejects without disturbing the
 running server, but the refused document has already been written to
 `kea_config_path`, and that file is what Kea reads on its next start, so a
 rejection there always rewrites the files even though the daemon is fine.

@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""spatium-k3s-images — every image the slot bakes is in containerd, or it says so (#1630).
+
+The appliance ships its container images as tarballs in
+/var/lib/rancher/k3s/agent/images/, and k3s imports them into containerd
+(k3s pkg/agent/containerd/watcher.go). It imports a tarball when the file is
+new to it or its size or mtime changed, which a slot upgrade does to every
+tarball it copies across. Every pod on the appliance runs with
+``imagePullPolicy: Never``, so a tarball that did not import is a workload
+that never starts: ``ErrImageNeverPull``.
+
+#1630: a slot upgrade's first boot failed to import seven tarballs, the DNS
+and DHCP agents' among them, and nothing noticed:
+
+  failed to ingest "index.json": failed commit on ref "tar-index.json":
+  commit failed: unexpected commit size 3071, expected 374
+
+  * k3s imports each tar member under the containerd ref ``tar-<name>``
+    (``archive.ImportIndex``), so every tarball's ``index.json`` shares the
+    ref ``tar-index.json`` in the ``k8s.io`` namespace.
+  * A write under a ref that is not committed stays on disk as an "ingest".
+    It does so when the import reading it fails part-way or is killed.
+  * containerd resumes an ingest whose recorded size matches. Otherwise it
+    starts it over, but reopens the old data file without truncating it
+    (containerd plugins/content/local/store.go ``writer``). A shorter blob
+    then fails its commit on the file's old length (writer.go ``Commit``).
+  * So one stale ``index.json`` fails every shorter ``index.json`` imported
+    after it, until a longer one commits over it. It survives restarts.
+  * k3s records only the tarballs that imported (``.cache.json``) and does
+    not retry a failed one until the file changes again.
+
+Two subcommands:
+
+  clear-ingests   remove containerd's unfinished content writes. k3s.service
+                  runs it as an ExecStartPre: no import can be in flight
+                  then, because k3s's containerd dies with the k3s process
+                  that started it (k3s containerd.go ``addDeathSig``).
+                  containerd's own ``Abort(ref)`` is exactly this removal
+                  (store.go ``Abort``). The metadata entry left behind is
+                  harmless: the next write under that ref finds nothing to
+                  resume and starts clean.
+
+  verify          once k3s's start-up import is over, check that k3s
+                  imported every baked tarball (its own record,
+                  ``.cache.json``) and that every image those tarballs carry
+                  is in containerd. With ``--repair``, clear the ingests no
+                  import is writing, and make k3s re-import what it missed
+                  by moving the tarball's mtime (the watcher re-imports a
+                  file whose mtime moved past its cache entry). Exit 0 when
+                  everything is there, 1 when something is still missing.
+                  spatiumddi-firstboot runs it before it commits a trial
+                  slot.
+
+Paths are env-overridable (``SPATIUM_K3S_IMAGES_DIR``,
+``SPATIUM_K3S_CONTENT_DIR``, ``SPATIUM_K3S_BIN``) for the tests in
+appliance/tests/test_k3s_images.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+IMAGES_DIR = Path(os.environ.get("SPATIUM_K3S_IMAGES_DIR", "/var/lib/rancher/k3s/agent/images"))
+CONTENT_DIR = Path(
+    os.environ.get(
+        "SPATIUM_K3S_CONTENT_DIR",
+        "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content",
+    )
+)
+K3S = os.environ.get("SPATIUM_K3S_BIN", "/usr/local/bin/k3s")
+# What k3s bakes and spatium-upgrade-slot copies across a slot upgrade.
+TARBALL_GLOB = "*.tar.zst"
+# The kubelet's healthz: k3s binds it to 127.0.0.1, or ::1 on a node with an
+# IPv6 node IP (k3s pkg/daemons/agent/agent.go), on the kubelet's default port.
+KUBELET_HEALTHZ = ("http://127.0.0.1:10248/healthz", "http://[::1]:10248/healthz")
+# An ingest none of whose files changed for this long has no import writing
+# it. containerd touches the data file on every write.
+IDLE_INGEST_S = 60.0
+POLL_S = 5.0
+PREFIX = "spatium-k3s-images:"
+
+
+def say(msg: str, *, err: bool = False) -> None:
+    print(f"{PREFIX} {msg}", file=sys.stderr if err else sys.stdout, flush=True)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+# ── stale ingests ────────────────────────────────────────────────────────────
+
+
+def _newest_mtime(d: Path) -> float:
+    newest = d.stat().st_mtime
+    for p in d.iterdir():
+        try:
+            newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            # containerd may finish (rename away) a write between iterdir and
+            # stat; a vanished file is not part of the ingest any more.
+            continue
+    return newest
+
+
+def clear_ingests(min_idle_s: float = 0.0, now: float | None = None) -> list[tuple[str, int]]:
+    """Remove containerd's unfinished content writes, the ones idle for at
+    least ``min_idle_s`` (0: all of them). Returns ``(ref, bytes written)``
+    for each one removed."""
+    try:
+        entries = sorted(p for p in (CONTENT_DIR / "ingest").iterdir() if p.is_dir())
+    except OSError:
+        return []
+    now = time.time() if now is None else now
+    cleared: list[tuple[str, int]] = []
+    for d in entries:
+        try:
+            if min_idle_s and now - _newest_mtime(d) < min_idle_s:
+                continue
+            ref_file, data = d / "ref", d / "data"
+            ref = ref_file.read_text(errors="replace").strip() if ref_file.exists() else d.name
+            size = data.stat().st_size if data.exists() else 0
+        except OSError:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            cleared.append((ref, size))
+    return cleared
+
+
+# ── what k3s imported, and what containerd holds ─────────────────────────────
+
+
+def read_import_cache() -> dict[str, dict]:
+    """k3s's record of the tarballs it imported, keyed by file name:
+    ``{"size", "modTime", "images"}`` (watcher.go ``fileInfo``; k3s keys it
+    by full path). A tarball whose import failed has no entry."""
+    try:
+        raw = (IMAGES_DIR / ".cache.json").read_text()
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {Path(k).name: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _epoch(stamp: object) -> float | None:
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def imported(tarball: Path, entry: dict | None) -> bool:
+    """Did k3s import this file as it is now? Its entry must carry the
+    file's size, a modTime no older than the file's (k3s stores it to the
+    second), and an image list. watcher.go re-imports when any of those is
+    off, and writes the entry only after an import succeeded."""
+    if not entry or not isinstance(entry.get("images"), list):
+        return False
+    try:
+        st = tarball.stat()
+    except OSError:
+        return False
+    if entry.get("size") != st.st_size:
+        return False
+    cached = _epoch(entry.get("modTime"))
+    return cached is not None and math.floor(st.st_mtime) <= cached
+
+
+def present_images() -> set[str] | None:
+    """The image names in containerd's ``k8s.io`` namespace, or None when
+    containerd does not answer."""
+    try:
+        proc = subprocess.run(
+            [K3S, "ctr", "-n", "k8s.io", "images", "ls", "-q"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def kubelet_up() -> bool:
+    for url in KUBELET_HEALTHZ:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+@dataclass
+class Report:
+    tarballs: list[Path]
+    unimported: list[Path]          # k3s has no record of importing these
+    missing: dict[str, list[str]]   # tarball name -> its images containerd lacks
+    images: int                     # images the imported tarballs carry
+    store: bool                     # containerd answered
+
+    @property
+    def ok(self) -> bool:
+        return self.store and not self.unimported and not self.missing
+
+    def names(self) -> list[str]:
+        return [t.name for t in self.unimported] + [
+            img for imgs in self.missing.values() for img in imgs
+        ]
+
+
+def inspect() -> Report:
+    cache = read_import_cache()
+    tarballs = sorted(IMAGES_DIR.glob(TARBALL_GLOB))
+    unimported = [t for t in tarballs if not imported(t, cache.get(t.name))]
+    store = present_images()
+    missing: dict[str, list[str]] = {}
+    count = 0
+    for t in tarballs:
+        if t in unimported:
+            continue
+        names = [n for n in cache[t.name]["images"] if isinstance(n, str)]
+        count += len(names)
+        if store is not None:
+            gone = [n for n in names if n not in store]
+            if gone:
+                missing[t.name] = gone
+    return Report(tarballs, unimported, missing, count, store is not None)
+
+
+def _describe(report: Report) -> None:
+    if not report.store:
+        say("containerd did not answer `k3s ctr images ls`", err=True)
+    for t in report.unimported:
+        say(f"k3s has not imported {t.name}", err=True)
+    for name, imgs in report.missing.items():
+        for img in imgs:
+            say(f"{img} (from {name}) is not in containerd", err=True)
+
+
+def _all_there(report: Report) -> None:
+    say(f"all {len(report.tarballs)} baked tarballs imported, {report.images} images present")
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+
+def cmd_clear_ingests(args: argparse.Namespace) -> int:
+    for ref, size in clear_ingests(min_idle_s=args.min_idle):
+        say(f"cleared stale containerd ingest {ref} ({size} bytes)")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    # k3s imports the whole images dir before it starts the kubelet (k3s
+    # containerd.go Run -> PreloadImages -> importAndWatchImages returns once
+    # its queue is empty), so a kubelet that answers means the start-up
+    # import is over and whatever it missed stays missed.
+    deadline = time.monotonic() + args.wait
+    while not kubelet_up():
+        if time.monotonic() >= deadline:
+            say(f"the kubelet did not answer within {args.wait:g}s; "
+                "judging k3s's import as it stands", err=True)
+            break
+        _sleep(POLL_S)
+    report = inspect()
+    if report.ok:
+        _all_there(report)
+        return 0
+    _describe(report)
+    if not args.repair or not report.store:
+        return 1
+
+    for ref, size in clear_ingests(min_idle_s=IDLE_INGEST_S):
+        say(f"cleared stale containerd ingest {ref} ({size} bytes)")
+    redo = sorted(set(report.unimported) | {IMAGES_DIR / name for name in report.missing})
+    say(f"re-importing {len(redo)} tarball(s) through k3s: {', '.join(t.name for t in redo)}")
+    now = time.time()
+    for t in redo:
+        os.utime(t, (now, now))
+
+    deadline = time.monotonic() + args.repair_wait
+    while True:
+        _sleep(POLL_S)
+        report = inspect()
+        if report.ok or time.monotonic() >= deadline:
+            break
+    if report.ok:
+        _all_there(report)
+        return 0
+    _describe(report)
+    say(f"still missing after the re-import: {', '.join(report.names()) or 'containerd'}", err=True)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="spatium-k3s-images",
+        description="Keep k3s's import of the slot's baked images honest (#1630).",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    clear = sub.add_parser("clear-ingests", help="remove containerd's unfinished content writes")
+    clear.add_argument("--min-idle", type=float, default=0.0,
+                       help="only those idle this many seconds (default: all; k3s is not running)")
+    clear.set_defaults(fn=cmd_clear_ingests)
+    verify = sub.add_parser("verify", help="every baked tarball imported, every image present")
+    verify.add_argument("--repair", action="store_true",
+                        help="clear idle ingests and have k3s re-import what it missed")
+    verify.add_argument("--wait", type=float, default=120.0,
+                        help="seconds to wait for the kubelet, i.e. for k3s's start-up import")
+    verify.add_argument("--repair-wait", type=float, default=180.0,
+                        help="seconds to wait for k3s to re-import")
+    verify.set_defaults(fn=cmd_verify)
+    args = parser.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
