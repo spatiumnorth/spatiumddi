@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A new external user can be admitted with auto-create off (#1291).**
+  `POST /users` created local accounts only, and `link-provider` refuses a
+  local account, so a provider with `auto_create_users` off signed in only
+  the accounts it already had: a new employee was refused for good, and
+  the docs' "create the user manually" had no API or UI behind it. Now Users
+  → New User has a *Signs in through* picker, and `POST /users` accepts
+  `auth_provider_id` with no password. That creates an account bound to the
+  provider with no password, which the user's first sign-in through that
+  provider claims; the same username through any other provider is still
+  refused. Creating one as a superadmin needs the operator step-up, as for
+  a local superadmin.
+
 - **A Fleet reboot request reboots the appliance, or says why it did
   not (#1446).** The control plane cleared `reboot_requested` 15 seconds
   after it was stamped, assuming the supervisor had seen it by then. A

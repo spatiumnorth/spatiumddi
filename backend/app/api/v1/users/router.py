@@ -120,7 +120,14 @@ class CreateUserRequest(BaseModel):
     username: str
     email: str
     display_name: str
-    password: str
+    # Required for a local account. Must be omitted for an external one
+    # (``auth_provider_id`` set), which signs in through its provider (#1291).
+    password: str | None = None
+    # #1291 — pre-create an account bound to this provider: no password,
+    # ``external_id`` NULL. The user's first sign-in through that provider
+    # as this username claims it (``user_sync._find_linked_user``, step 2),
+    # which is how a provider with auto-create off admits someone new.
+    auth_provider_id: uuid.UUID | None = None
     is_superadmin: bool = False
     force_password_change: bool = True
     # #1355 — the caller's own step-up (password, or authenticator code for
@@ -132,7 +139,7 @@ class CreateUserRequest(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_length(cls, v: str) -> str:
+    def password_length(cls, v: str | None) -> str | None:
         # #1004 — NOT a length policy. This is the "obviously empty" floor
         # that keeps a legacy client getting a 422 instead of reaching the
         # handler; every length verdict belongs to the configured policy,
@@ -146,9 +153,19 @@ class CreateUserRequest(BaseModel):
         # your current password". A floor of 1 cannot collide with a policy
         # minimum (settings clamp it to 6..128), so the two can never
         # disagree again.
-        if not v:
+        if v is not None and not v:
             raise ValueError("Password cannot be empty")
         return v
+
+    @model_validator(mode="after")
+    def _password_xor_provider(self) -> "CreateUserRequest":
+        if self.auth_provider_id is None and self.password is None:
+            raise ValueError("A local account needs a password")
+        if self.auth_provider_id is not None and self.password is not None:
+            raise ValueError(
+                "An account bound to a provider signs in through it and takes no password"
+            )
+        return self
 
     @field_validator("username")
     @classmethod
@@ -264,6 +281,14 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             detail="Username or email already in use",
         )
 
+    provider: AuthProvider | None = None
+    if body.auth_provider_id is not None:
+        provider = await db.get(AuthProvider, body.auth_provider_id)
+        if provider is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Auth provider not found"
+            )
+
     method = None
     if body.is_superadmin:
         method = await require_operator_stepup(
@@ -276,6 +301,52 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             resource_id=body.username,
             resource_display=f"superadmin {body.username}",
         )
+
+    if provider is not None:
+        # #1291 — a pending external account: bound to the provider, no
+        # password, ``external_id`` NULL. The first sign-in through this
+        # provider as this username claims it and records the subject's id;
+        # this administrator action is what authorises that username match,
+        # exactly as after ``link-provider``. A sign-in through any OTHER
+        # provider with the same name is still refused as a collision.
+        user = User(
+            username=body.username,
+            email=body.email,
+            display_name=body.display_name,
+            hashed_password=None,
+            is_superadmin=body.is_superadmin,
+            force_password_change=False,
+            auth_source=provider.type,
+            auth_provider_id=provider.id,
+            external_id=None,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        audit = _audit(
+            current_user,
+            "create",
+            str(user.id),
+            f"Created user {body.username} for sign-in through {provider.name}",
+        )
+        audit.new_value = {
+            "auth_source": provider.type,
+            "auth_provider_id": str(provider.id),
+            "auth_provider": provider.name,
+            **({"is_superadmin": True, "stepup_method": method} if method else {}),
+        }
+        db.add(audit)
+        await db.commit()
+        await db.refresh(user)
+        logger.info(
+            "user_created",
+            username=body.username,
+            provider=provider.name,
+            by=current_user.username,
+        )
+        return user
+
+    assert body.password is not None  # the request validator requires it here
     policy, hashed = await _enforce_policy(db, body.password)
     history = push_history(hashed, None, policy.history_count)
     user = User(
