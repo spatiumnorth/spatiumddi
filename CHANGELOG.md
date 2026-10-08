@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A cluster member that held the Redis master and rebooted before
+  Sentinel failed over no longer leaves Redis without a master (#1442).**
+  Each Redis pod's init container wrote a fixed topology on every start:
+  redis-0 the master, every other pod a replica of redis-0, every
+  sentinel monitoring redis-0. After any failover the master can sit on
+  another pod, and when that pod was re-created before Sentinel had
+  failed over (its node rebooted, as in a rolling upgrade) it came back
+  as a replica of redis-0 while redis-0 was still its replica. No pod was
+  master, Sentinel aborted every failover (`no-good-slave`), and the api
+  and the workers stayed down until someone intervened by hand. The init
+  container now asks the running sentinels which pod is the master and
+  follows it, or starts as master when they name the pod itself, and
+  renders the same master into the pod's sentinel.conf; the highest
+  config epoch wins when they disagree, and the question is retried for
+  up to 60 s before the ordinal rule applies, which it now does only
+  when no sentinel answers (the whole set starting cold). The script
+  moved to `charts/spatiumddi/files/redis-sentinel-render-config.sh`,
+  where `appliance/tests` runs it.
+
 - **Cloud DNS zone creates and deletes no longer duplicate or wedge
   (#1527, #1528, #1534).** Creating a Route 53 zone whose name
   already exists in the account is refused with a conflict error
