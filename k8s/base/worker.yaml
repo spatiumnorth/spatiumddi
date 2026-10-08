@@ -75,22 +75,33 @@ spec:
                   name: spatiumddi-secrets
                   key: secret-key
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+            # #1547 — Redis password from the Secret, interpolated
+            # into the sentinel:// URLs (env `value` only — a
+            # ConfigMap cannot interpolate and must never carry a
+            # credential). Same wiring as the umbrella chart's
+            # commonEnv; see k8s/base/api.yaml for the URL shapes.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
             - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: REDIS_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
             - name: CELERY_BROKER_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_BROKER_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/1"
             - name: CELERY_RESULT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_RESULT_BACKEND
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/2"
           resources:
             requests:
               cpu: 200m
@@ -166,22 +177,33 @@ spec:
                   name: spatiumddi-secrets
                   key: secret-key
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+            # #1547 — Redis password from the Secret, interpolated
+            # into the sentinel:// URLs (env `value` only — a
+            # ConfigMap cannot interpolate and must never carry a
+            # credential). Same wiring as the umbrella chart's
+            # commonEnv; see k8s/base/api.yaml for the URL shapes.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
             - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: REDIS_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
             - name: CELERY_BROKER_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_BROKER_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/1"
             - name: CELERY_RESULT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_RESULT_BACKEND
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/2"
           resources:
             requests:
               cpu: 50m

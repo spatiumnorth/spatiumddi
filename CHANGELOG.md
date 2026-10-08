@@ -105,6 +105,168 @@ the formatter handles the rest.
   Duplicate names are not suffixed:
   two clients both called `Office PC` still share one name.
 
+- **DDNS follows a hostname change on an existing lease (#1618).**
+  Both lease ingest paths (Kea lease events and the agentless lease
+  pull) write the client's new hostname onto the auto-from-lease IPAM
+  row before DDNS runs, and DDNS's idempotency check compared against
+  that row — so a renamed client looked unchanged, kept its old A/PTR,
+  and the new name was never published. The check now compares against
+  the name of the record that is actually published, so a rename
+  retracts the old name and creates the new one; a renewal with the
+  same name still queues nothing. Rows already left behind by this get
+  fixed on the client's next renewal, or by the DDNS backstop when DNS
+  auto-sync is on.
+
+- **Technitium serves the zone's own Primary NS, Admin Email and SOA
+  timers (#1490).** The driver left the apex to the daemon, which writes
+  one NS and an SOA MNAME naming its own host name at zone create (the
+  pod name, under the DNS VIP) and a placeholder RNAME. So every server
+  in a group answered with a different, unresolvable name server, and
+  `primary_ns` / `admin_email`, shipped in the bundle since #1153, never
+  reached the wire. The SOA timers kept Technitium's defaults too,
+  including a 15-minute negative-caching `minimum`. The agent now
+  applies the zone's apex with the BIND9 precedence: NS from the zone's
+  apex NS records, else its Primary NS; MNAME, RNAME and the shipped
+  timers into the SOA, at the zone's TTL. It writes only what differs,
+  since every SOA write bumps the serial, and adds the new NS before
+  removing the old one. A zone that sets neither Primary NS nor Admin
+  Email nor apex NS is left as it was; the timers (shipped for every zone
+  since #1171) go along only with an apex the zone does set.
+
+- **A server group an appliance cannot carry is refused instead of
+  silently dropped (#1468).** The supervisor writes the assigned DNS or
+  DHCP group's name into the role env and accepts only letters, digits,
+  `.`, `_` and `-`. Anything else, such as a group created in the UI as
+  `UniFi DHCP migration`, was dropped with a warning on every heartbeat,
+  so the agent registered without its group and a fresh server landed in
+  the default group. Assigning such a group to an appliance role (REST
+  and Copilot), or renaming an assigned group to such a name, is now a
+  422 that suggests a valid name. Groups no appliance uses keep free-text
+  names, and re-saving an existing name is still accepted.
+
+- **DHCP clients renew at half the lease time instead of every 15
+  minutes (#1259).** The agent rendered a fixed `renew-timer: 900` /
+  `rebind-timer: 1800` into both Kea daemons, whatever the lease time, so
+  a client on a 1-day lease renewed 48 times a day. Kea now derives T1/T2
+  from each lease (`calculate-tee-times`): DHCPv4 clients renew at 50 %
+  and rebind at 87.5 % of the lease (RFC 2131); DHCPv6 uses 50 % / 80 %
+  of the preferred lifetime (RFC 8415, Kea's default), e.g. a renew after
+  7.5 h on a 1-day lease. This is a behaviour change: far fewer renewals,
+  so less DHCP and lease-event load, and a lease change or an outage of
+  the server is noticed later by clients. Short leases get usable timers
+  for the first time: a v4 lease of 15 minutes or less used to carry no
+  T1/T2 at all, and a short v6 lease a T1 past its own expiry. If you
+  relied on the 15-minute cadence, shorten the scope's lease time. Takes
+  effect when the DHCP agent restarts on the new image; no control-plane
+
+- **The DNS VIP keeps the client's address (#1487).** With
+  `dns.useMetalLBVIP` on, the `dns-bind9` / `dns-powerdns` /
+  `dns-technitium` Services ran with the default
+  `externalTrafficPolicy: Cluster`, so kube-proxy SNATed every query and
+  the DNS server saw the CNI gateway and the other nodes instead of the
+  client. Technitium's default per-client rate limit (600 queries a
+  minute per address) then applied to the whole network at once, and
+  query logs, RPZ hit attribution and client ACLs all keyed on the node.
+  The three Services now set `externalTrafficPolicy: Local`, like the
+  control-plane VIP: the DNS pods run on every DNS node, so MetalLB still
+  announces the VIP from a node with a ready pod and fails over as
+  before. A new render check, `chart-vip-client-ip.py`, fails any MetalLB
+  VIP Service that does not keep the client address; the DHCP relay VIP
+  is exempt because Kea answers the relay at `giaddr`.
+
+- **PowerDNS serves each record's configured TTL, reports the zones it
+  refuses, and stops serving records that were deleted (#1225, #1379,
+  #1380).** The PowerDNS agent's full reconcile, which runs on every agent
+  start and every structural change, stamped the ZONE's TTL on every rrset,
+  so after a restart every record was served at the zone default: measured
+  against a real PowerDNS, records configured at 60 s, 86400 s and 0 all
+  answered 3600, while the incremental record-op path honoured them. Each
+  rrset now carries its records' TTL; a record with none inherits the
+  zone's, 0 stays 0, and records at one name and type that disagree resolve
+  to the lowest, the same rule the control plane applies to the rrset it
+  ships with a record op, so against a current control plane the two paths
+  agree. (A pre-#773 control plane sends ops without that rrset, and the op
+  path's own fallback for a record with no TTL is still 3600.) Zone names
+  are now matched case-insensitively: PowerDNS stores them lowercased, so a
+  zone configured as `Case.Test` was re-created on every reconcile after
+  the first, answered 409, and was skipped, which left its records
+  unreconciled.
+
+  A zone PowerDNS refused to create or patch was logged and skipped, so
+  #882's apply status reported `ok` for a zone that was never served. The
+  verdict is now per zone: every zone PowerDNS accepts is served, and the
+  refused ones are reported with PowerDNS's own reason as a degraded apply
+  (status `reverted`, the warning-level #882 status, so
+  `agent_config_rejected` fires as a warning). Its error is marked
+  `partial apply:`, so the server chip, banner, Dashboard and alert say
+  "Zones refused", name the zones, and say nothing was rolled back, rather
+  than the rollback wording a real revert gets. It is not rolled back,
+  because the last-known-good usually carries the same refused data: on
+  ddi-pg one refused zone kept the whole server `revert_failed`. Record
+  ops keep draining for every other zone. A failure that says nothing about
+  a zone's data still fails the whole apply and reverts as before: a failed
+  zone listing (which used to treat every existing zone as new), a zone
+  that cannot be read back, a 5xx, an unreadable rendered payload, and
+  dynamic-update ACL metadata or TSIG keys PowerDNS refused, where a failed
+  CLEAR left a zone accepting updates the operator had turned off. Record
+  ops shipped with a bundle whose apply failed are now returned to the
+  control plane as not applied, so they are retried; they used to sit
+  `in_flight` unacked, and a delete among them kept answering after the
+  server recovered.
+
+  Identical records at one name and type are sent once (#1379). A manual A
+  record beside the identical IPAM-generated one made PowerDNS refuse the
+  whole zone ("Duplicate record in RRset"), so seed data alone left a zone
+  unserved. Names and name-shaped values compare case-insensitively and
+  without the trailing dot; the lowest TTL still wins.
+
+  The reconcile now deletes rrsets the bundle no longer carries (#1380). It
+  used to replace only what the bundle had, so in a DNS group with views,
+  where a record change is a full render and the op is never sent, a
+  deleted record stayed live on PowerDNS. The apex SOA and NS and the
+  DNSSEC record types are never deleted, and zones that accept RFC 2136
+  updates are not swept, since their clients write records the bundle does
+  not carry.
+
+- **Raw `k8s/` manifests and the DHCP agent readiness probe pointed
+  at things that don't exist (#1547, #1550, #1589).** `DATABASE_URL`
+  used `postgres-primary`, a Service CNPG never creates for the
+  `postgres` Cluster — it is now `postgres-rw` everywhere, and the
+  quick start exposes its standalone Postgres under that name. The
+  agents pointed at a `spatiumddi-api` Service; the API Service is
+  named `api`. The Redis URLs were plain `redis://` against the
+  headless Service (replica READONLY, no password against a
+  `requirepass` manifest, no Sentinel Service) — they are now
+  `sentinel://` URLs with the password, plus a `redis-sentinel`
+  Service. The Redis password itself lives only in the
+  `spatiumddi-secrets` Secret (`redis-password`): the api / worker /
+  beat Deployments interpolate it into the URLs as
+  `$(REDIS_PASSWORD)` and the Sentinel StatefulSet's init container
+  renders it into `redis.conf` — no credential sits in the ConfigMap. The DHCP agent's readiness probe gated on TCP 8000, the
+  Kea HA peer listener a standalone server never binds, so a
+  standalone pod never joined its Service endpoints; it now probes
+  the Kea control socket, as the image HEALTHCHECK does. And the
+  MetalLB VIP Services no longer allocate NodePorts nobody routes
+  through. New charts-gate checks (`chart-dhcp-readiness.py`,
+  `chart-vip-nodeports.py`, `chart-raw-k8s-refs.py`, each with a
+  negative control) pin all of it.
+
+- **Update endpoints handle explicit nulls consistently (#1564,
+  #1563).** Sending `null` for a NOT NULL field on domain, ASN,
+  circuit, router or VLAN updates used to reach Postgres and come
+  back as a 500; it is now a 422 naming the fields, via a shared
+  `resolve_update_changes` helper that separates "field absent"
+  from "clear this nullable column" from "null for a NOT NULL
+  column". And where an explicit null was previously ignored — so
+  the UI's "clear" silently did nothing — it now clears: DHCP pool,
+  static and phone-profile fields, DNS group/server/view/zone/record
+  fields, blocklist `feed_url`/`sinkhole_ip`, blocklist-entry
+  target, and pool `hc_target_port`. The edit forms now omit fields
+  hidden for the current mode (blocklist feed URL / sinkhole IP, pool
+  health-check port, a v4 static's DUID, a cloud server's API port, a
+  non-select custom field's options), so an untouched edit cannot
+  clear them.
+
 - **ACME auto-renewal renews each certificate in its own issuance
   shape (#1529).** The renewal sweep ignored the stored challenge
   type and provider and renewed every certificate as managed-zone
