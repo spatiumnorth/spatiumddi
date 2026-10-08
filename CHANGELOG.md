@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Rolling-upgrade preflight warns on a SemVer jump that skips a major
+  version (#1182).** Between two CalVer releases the version check warns when
+  the target is more than 90 days newer. SemVer tags carry no date, so between
+  two SemVer releases every forward jump passed silently, 1.2.0 to 4.0.0
+  included. It now warns when the jump crosses more than one major version
+  (1.x to 3.x) and suggests stopping at each major in between. 1.x to 2.x,
+  and minor and patch jumps, never warn, and the switch from CalVer to 1.0.0
+  is never a skip. A warning, not a refusal: two rolling upgrades back to back
+  stay supported.
+
+- **A CalVer release tag with a leading-zero release number is refused
+  (#1182).** `2026.10.07-01` parsed to the same release as `2026.10.07-1`, and
+  the chart-version rewrite published both as chart `2026.10.7-1`.
+  `scripts/release_version.py` now refuses it, and `-0`, the same way it
+  already refused `1.0.0-rc.01`.
+
 - **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
   with `is_active: false` only set the flag: the account's sessions
   were refused while it stayed disabled, but they stayed valid, so
