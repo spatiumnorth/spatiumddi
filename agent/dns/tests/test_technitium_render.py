@@ -33,13 +33,18 @@ from spatium_dns_agent.drivers.technitium import (
 
 
 class _FakeResponse:
-    """Stand-in for ``httpx.Response`` — the driver only ever calls
-    ``.json()`` on it."""
+    """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
+    body is a plain-text one (``blocked/export``), whose ``.json()`` raises
+    as httpx's does."""
 
-    def __init__(self, body: dict[str, Any]) -> None:
+    def __init__(self, body: dict[str, Any] | str) -> None:
         self._body = body
+        self.status_code = 200
+        self.text = body if isinstance(body, str) else ""
 
     def json(self) -> dict[str, Any]:
+        if isinstance(self._body, str):
+            raise ValueError("not JSON")
         return self._body
 
 
@@ -1383,12 +1388,24 @@ def test_blocking_payload_collapses_per_view_lists() -> None:
     assert out["blocked"] == ["a.test", "b.test"]
 
 
+def _blocking_responder(live: dict[str, str] | None = None):
+    """``{kind}/export`` answers the plain-text ``live`` set (empty by
+    default); everything else answers ok."""
+    live = live or {}
+
+    def responder(path, params, n):
+        kind, _, op = path.partition("/")
+        if op == "export":
+            return live.get(kind, "")
+        return {"status": "ok"}
+
+    return responder
+
+
 def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
-    """Flush-then-rewrite, not diff: ``blocked/list`` is a one-level tree
-    browser whose intermediate nodes are not themselves blocked domains,
-    so reconciling against a flat read of it deletes whole subtrees."""
+    """A set that differs is flushed, then imported."""
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    calls = _install_fake_request(d, _blocking_responder())
     d._apply_blocking(
         "t",
         {"enabled": True, "blocked": ["a.test"], "allowed": ["b.test"],
@@ -1396,8 +1413,93 @@ def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
     )
     paths = [c[2] for c in calls]
     assert paths[0] == "settings/set"
-    assert paths.index("blocked/flush") < paths.index("blocked/add")
-    assert paths.index("allowed/flush") < paths.index("allowed/add")
+    assert paths.index("blocked/flush") < paths.index("blocked/import")
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+    # #1425: never one call per domain.
+    assert "blocked/add" not in paths and "allowed/add" not in paths
+
+
+def test_apply_blocking_imports_in_chunks_not_one_call_per_domain(tmp_path: Path) -> None:
+    """``blocked/add`` rewrote Technitium's zone file on every call, so a 16k
+    list took ~30 minutes (#1425). ``blocked/import`` takes a comma-separated
+    list and saves once per call."""
+    from spatium_dns_agent.drivers.technitium import _BLOCKING_IMPORT_CHUNK
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder())
+    domains = [f"d{i:05d}.test" for i in range(12001)]
+    d._apply_blocking(
+        "t", {"enabled": True, "blocked": domains, "blocking_type": "NxDomain"}
+    )
+    imports = [c for c in calls if c[2] == "blocked/import"]
+    assert len(imports) == -(-len(domains) // _BLOCKING_IMPORT_CHUNK)
+    sent = [x for c in imports for x in c[3]["blockedZones"].split(",")]
+    assert sorted(sent) == sorted(domains)
+    assert all(c[1] == "POST" for c in imports)  # form body, not a URL
+
+
+def test_apply_blocking_leaves_an_unchanged_set_alone(tmp_path: Path) -> None:
+    """A structural apply that did not touch a blocklist rewrites nothing:
+    no flush, so no window without blocking (#1425)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "b.test\na.test\n", "allowed": "c.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test", "B.test."], "allowed": ["c.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert not any(p.endswith(("/flush", "/import")) for p in paths)
+
+
+def test_apply_blocking_rewrites_only_the_set_that_changed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "a.test\n", "allowed": "old.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test"], "allowed": ["new.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" not in paths
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+
+
+def test_apply_blocking_rewrites_when_the_live_set_is_unreadable(tmp_path: Path) -> None:
+    """An error answer to export is not trusted as "already matches"."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path.endswith("/export"):
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(d, responder)
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert "blocked/import" in [c[2] for c in calls]
+
+
+def test_apply_blocking_empty_list_still_clears_the_daemon(tmp_path: Path) -> None:
+    """An emptied list has to actually clear on the daemon."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder({"blocked": "stale.test\n"}))
+    d._apply_blocking("t", {"enabled": True, "blocked": [], "blocking_type": "NxDomain"})
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" in paths
+    assert "blocked/import" not in paths
+
+
+def test_idn_entries_compare_in_their_ascii_form() -> None:
+    """Technitium stores and exports the IDNA form, so comparing the Unicode
+    spelling would read an IDN entry as changed on every apply."""
+    from spatium_dns_agent.drivers.technitium import _ascii_domain
+
+    assert _ascii_domain("Bücher.Test.") == "xn--bcher-kva.test"
+    assert _ascii_domain("plain.test") == "plain.test"
 
 
 def test_apply_blocking_rejects_unknown_blocking_type(tmp_path: Path) -> None:

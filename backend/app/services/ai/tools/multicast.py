@@ -63,6 +63,7 @@ class FindMulticastGroupArgs(BaseModel):
 
 @register_tool(
     name="find_multicast_group",
+    permission=("read", "multicast"),
     description=(
         "Search the multicast group registry. Each result includes "
         "address, name, application, parent IPSpace, optional VLAN / "
@@ -153,6 +154,7 @@ class FindMulticastMembershipArgs(BaseModel):
 
 @register_tool(
     name="find_multicast_membership",
+    permission=("read", "multicast"),
     description=(
         "Search multicast group memberships — the producer / consumer "
         "/ RP rows that bind an IP to a group. Includes seen_via "
@@ -232,6 +234,7 @@ class FindMulticastDomainArgs(BaseModel):
 
 @register_tool(
     name="find_multicast_domain",
+    permission=("read", "multicast"),
     description=(
         "Search PIM (multicast routing) domains. Each result includes "
         "name, pim_mode, optional VRF binding, rendezvous-point "
@@ -283,6 +286,7 @@ class CountGroupsByVRFArgs(BaseModel):
 
 @register_tool(
     name="count_multicast_groups_by_vrf",
+    permission=("read", "multicast"),
     description=(
         "Count multicast groups bucketed by their PIM domain's VRF "
         "binding. Returns one row per VRF (with name + ID) plus a "

@@ -679,6 +679,58 @@ def test_slack_payload_short_body_unchanged() -> None:
     assert "…" not in payload["blocks"][1]["text"]["text"]
 
 
+# ── Teams Workflows Adaptive Card (#1504) ──────────────────────────
+#
+# The Office 365 connector that took a MessageCard is retired; a
+# Workflows webhook posts the Adaptive Cards in ``attachments``.
+
+
+def _teams_card(payload: dict[str, object]) -> dict:
+    body = svc._shape_webhook_body("teams", payload)  # noqa: SLF001
+    assert body["type"] == "message"
+    assert "@type" not in body and "themeColor" not in body
+    (attachment,) = body["attachments"]
+    assert attachment["contentType"] == "application/vnd.microsoft.card.adaptive"
+    assert attachment["contentUrl"] is None
+    card = attachment["content"]
+    assert card["type"] == "AdaptiveCard"
+    assert card["version"] == "1.4"
+    return card
+
+
+def test_teams_payload_is_an_adaptive_card_envelope() -> None:
+    card = _teams_card(_payload())
+    title, text = card["body"]
+    assert title["type"] == text["type"] == "TextBlock"
+    assert title["text"] == "create · dns_zone"
+    assert text["text"] == "example.com. (success) by alice"
+    assert title["wrap"] and text["wrap"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "colour"),
+    [
+        (_payload(), "Accent"),
+        (_payload(result="denied"), "Attention"),
+        (_alert(severity="warning"), "Warning"),
+        (_alert(), "Attention"),
+    ],
+)
+def test_teams_title_colour_follows_severity(payload: dict[str, object], colour: str) -> None:
+    assert _teams_card(payload)["body"][0]["color"] == colour
+
+
+def test_teams_alert_lines_become_paragraphs() -> None:
+    text = _teams_card(_alert())["body"][1]["text"]
+    assert text == "ddi1\n\narray root_a is degraded (1 of 2 members)"
+
+
+def test_teams_long_digest_stays_under_the_message_limit() -> None:
+    body = svc._shape_webhook_body("teams", _digest(summary="ü" * 50_000))  # noqa: SLF001
+    assert len(json.dumps(body)) < 28 * 1024
+    assert body["attachments"][0]["content"]["body"][1]["text"].endswith("…")
+
+
 # ── UDP syslog address family (#1583) ──────────────────────────────
 
 

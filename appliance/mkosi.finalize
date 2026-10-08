@@ -34,3 +34,11 @@ find "$BUILDROOT" -name '*.pyc' -delete 2>/dev/null || true
 find "$BUILDROOT/var/log" -type f -delete 2>/dev/null || true
 truncate -s0 "$BUILDROOT/etc/machine-id" 2>/dev/null || true
 rm -f "$BUILDROOT/var/lib/systemd/random-seed" 2>/dev/null || true
+
+# GHSA-vvh9-6gfw-wphp — SSH host keys. The openssh-server postinst
+# generates them inside the build container, so without this every
+# appliance installed from one image would present the same identity,
+# and the private keys would ship in the public ISO. Each boot generates
+# its own instead: spatium-etc-render on an installed system (persisted
+# to STATE), spatium-ssh-hostkeys.service everywhere else (the live ISO).
+rm -f "$BUILDROOT"/etc/ssh/ssh_host_* 2>/dev/null || true

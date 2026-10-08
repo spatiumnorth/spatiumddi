@@ -1634,3 +1634,140 @@ async def test_unlocked_row_deletes_when_vm_disappears(
         .all()
     )
     assert list(rows) == []
+
+
+async def _make_lan_with_unifi_row(db: AsyncSession, space: IPSpace, address: str):
+    """10.0.0.0/24 in ``space`` with a UniFi-owned row at ``address``."""
+    from app.models.unifi import UnifiController  # noqa: PLC0415
+
+    controller = UnifiController(name=f"unifi-{uuid.uuid4().hex[:6]}", ipam_space_id=space.id)
+    db.add(controller)
+    block = IPBlock(space_id=space.id, network="10.0.0.0/24", name="lan")
+    db.add(block)
+    await db.flush()
+    sub = Subnet(
+        space_id=space.id, block_id=block.id, network="10.0.0.0/24", name="lan", total_ips=254
+    )
+    db.add(sub)
+    await db.flush()
+    row = IPAddress(
+        subnet_id=sub.id,
+        address=address,
+        status="unifi-client",
+        hostname="desktop-1",
+        unifi_controller_id=controller.id,
+    )
+    db.add(row)
+    await db.flush()
+    return sub, row
+
+
+def _vm(vmid: int, mac: str, ip: str) -> _ProxmoxGuest:
+    return _ProxmoxGuest(
+        node="pve01",
+        vmid=vmid,
+        name=f"vm-{vmid}",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(slot="net0", mac=mac, bridge="vmbr0", vlan_tag=None, static_cidr=None)
+        ],
+        runtime_ips_by_mac={mac.lower(): [ip]},
+    )
+
+
+_LAN_BRIDGE = {
+    "pve01": [
+        _ProxmoxNetworkIface(
+            node="pve01", iface="vmbr0", iface_type="bridge", cidr="10.0.0.1/24", active=True
+        )
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_address_owned_by_other_integration_is_not_inserted_again(
+    db_session: AsyncSession,
+) -> None:
+    """A VM reports an address UniFi already mirrors. The reconciler
+    warns and leaves the UniFi row alone; it must not insert a second
+    row at the same (subnet, address) and fail the whole sweep on
+    ``uq_ip_address_subnet_address``."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    sub, unifi_row = await _make_lan_with_unifi_row(db_session, space, "10.0.0.50")
+    await db_session.commit()
+
+    fake = _FakeClient(
+        networks=_LAN_BRIDGE,
+        qemu={
+            "pve01": [
+                _vm(100, "BC:24:11:E8:4A:3F", "10.0.0.50"),
+                _vm(101, "BC:24:11:E8:4A:40", "10.0.0.51"),
+            ]
+        },
+    )
+    with _patch_client(fake):
+        summary = await reconcile_node(db_session, node)
+    assert summary.ok, summary.error
+    assert any("10.0.0.50 owned by another integration" in w for w in summary.warnings)
+
+    await db_session.refresh(unifi_row)
+    assert unifi_row.proxmox_node_id is None
+    assert unifi_row.hostname == "desktop-1"
+    rows = (
+        (await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == sub.id)))
+        .scalars()
+        .all()
+    )
+    by_addr = {str(r.address): r for r in rows}
+    assert by_addr["10.0.0.50"].id == unifi_row.id
+    # The rest of the sweep still landed.
+    assert by_addr["10.0.0.51"].proxmox_node_id == node.id
+
+
+@pytest.mark.asyncio
+async def test_own_row_is_not_moved_onto_another_integrations_row(
+    db_session: AsyncSession,
+) -> None:
+    """Our row for a VM sits in a subnet that no longer encloses it for
+    this node, and the subnet that does already has a UniFi row at the
+    address. The move would collide; the row stays put and the sweep
+    still commits."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    _sub, unifi_row = await _make_lan_with_unifi_row(db_session, space, "10.0.0.50")
+    other_space = await _make_space(db_session)
+    other_block = await _make_block(db_session, other_space, "10.0.0.0/24")
+    old_sub = Subnet(
+        space_id=other_space.id,
+        block_id=other_block.id,
+        network="10.0.0.0/24",
+        name="old",
+        total_ips=254,
+    )
+    db_session.add(old_sub)
+    await db_session.flush()
+    own_row = IPAddress(
+        subnet_id=old_sub.id,
+        address="10.0.0.50",
+        status="proxmox-vm",
+        hostname="vm-100",
+        proxmox_node_id=node.id,
+    )
+    db_session.add(own_row)
+    await db_session.commit()
+
+    fake = _FakeClient(
+        networks=_LAN_BRIDGE, qemu={"pve01": [_vm(100, "BC:24:11:E8:4A:3F", "10.0.0.50")]}
+    )
+    with _patch_client(fake):
+        summary = await reconcile_node(db_session, node)
+    assert summary.ok, summary.error
+    assert any("not moving" in w for w in summary.warnings)
+
+    await db_session.refresh(own_row)
+    await db_session.refresh(unifi_row)
+    assert own_row.subnet_id == old_sub.id
+    assert unifi_row.proxmox_node_id is None

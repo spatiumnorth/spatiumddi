@@ -55,7 +55,7 @@ def test_join_writes_trigger_with_payload(appliance_paths: Path) -> None:
 
 def test_join_trigger_is_owner_only(appliance_paths: Path) -> None:
     # The payload carries the k3s join token (a control-plane-admin-
-    # equivalent secret) into the 1777-sticky release-state dir — the
+    # equivalent secret) into the shared release-state dir — the
     # trigger file must be 0o600 so no other unprivileged host user can
     # read it before the root runner consumes it (sec scanning #82).
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "tok") is True
