@@ -1750,6 +1750,258 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     assert out["custom_addresses"] == []
 
 
+# ── Zones the bundle dropped are retired, only if this agent made them ───
+
+
+def _retire(
+    tmp_path: Path,
+    *,
+    desired: list[str],
+    ledger: list[str] | None = None,
+    previous: list[str] | None = None,
+    ledger_raw: str | None = None,
+    errors: dict[str, str] | None = None,
+    bundle_names: list[str] | None | bool = True,
+) -> tuple[list[str], list[str]]:
+    """Run ``_retire_dropped_zones``; return (zones deleted, ledger after).
+
+    ``bundle_names`` is the zone list the bundle carried: ``True`` (the
+    default) means the same names as ``desired``, ``None`` a bundle with no
+    zone list."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    if ledger is not None:
+        d._managed_zones_path().write_text(_json.dumps(ledger))
+    if ledger_raw is not None:
+        d._managed_zones_path().write_text(ledger_raw)
+    prev = tmp_path / "rendered.prev" / "zones.json"
+    if previous is not None:
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        prev.write_text(_json.dumps([{"zone": z} for z in previous]))
+
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        msg = (errors or {}).get(params.get("zone", ""))
+        return {"status": "error", "errorMessage": msg} if msg else {"status": "ok"}
+
+    calls = _install_fake_request(d, _responder)
+    names = list(desired) if bundle_names is True else bundle_names
+    d._retire_dropped_zones(
+        "tok-1",
+        [{"zone": z} for z in desired],
+        prev,
+        bundle_zone_names=names,  # type: ignore[arg-type]
+    )
+    deleted = [c[3]["zone"] for c in calls if c[2] == "zones/delete"]
+    return deleted, _json.loads(d._managed_zones_path().read_text())
+
+
+def test_zone_dropped_from_the_bundle_is_deleted(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_only_zones_in_the_ledger_are_candidates(tmp_path: Path) -> None:
+    """A zone an operator made on the daemon is never in the ledger, and the
+    retire pass does not even list the daemon's zones to find one."""
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test"])
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_first_run_seeds_the_ledger_from_the_previous_render(tmp_path: Path) -> None:
+    """An agent upgraded mid-change: the zone the new bundle dropped was in
+    the previous render, so it is still retired."""
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], previous=["a.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_first_run_without_history_deletes_nothing(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test", "b.test"])
+    assert deleted == []
+    assert ledger == ["a.test", "b.test"]
+
+
+def test_failed_delete_is_retried_and_missing_zone_is_forgotten(tmp_path: Path) -> None:
+    deleted, ledger = _retire(
+        tmp_path,
+        desired=["a.test"],
+        ledger=["a.test", "busy.test", "manual.test"],
+        errors={
+            "busy.test": "Some transient failure",
+            "manual.test": "No such zone was found: manual.test",
+        },
+    )
+    assert sorted(deleted) == ["busy.test", "manual.test"]
+    # The failure stays a candidate for the next pass; the already-gone one
+    # does not.
+    assert ledger == ["a.test", "busy.test"]
+
+
+def test_unreadable_ledger_deletes_nothing_and_is_rebuilt(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger_raw="{not json")
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_zone_names_compare_case_insensitively(tmp_path: Path) -> None:
+    deleted, _ = _retire(tmp_path, desired=["Example.TEST"], ledger=["example.test"])
+    assert deleted == []
+
+
+# ── An empty zone list vs. no zone list (review on #1497) ────────────────
+#
+# An explicit ``"zones": []`` is what the control plane sends for a group
+# with no zones (``render_bundle_body`` selects ``DNSZone.group_id ==
+# server.group_id`` and nothing else), so it retires everything, like BIND9
+# emptying ``named.conf``. A bundle with no zone list, or a zone the bundle
+# still names that this driver could not render, is not a deletion and
+# retires nothing.
+
+
+def test_explicit_empty_zone_list_retires_every_managed_zone(tmp_path: Path) -> None:
+    """The last zone of a group is deleted: the guard must not block it."""
+    deleted, ledger = _retire(tmp_path, desired=[], ledger=["a.test", "b.test"], bundle_names=[])
+    assert deleted == ["a.test", "b.test"]
+    assert ledger == []
+
+
+def test_no_zone_list_retires_nothing_and_keeps_the_ledger(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        deleted, ledger = _retire(
+            tmp_path, desired=[], ledger=["a.test", "b.test"], bundle_names=None
+        )
+    assert deleted == []
+    # Kept, so the next bundle that does carry a list still retires them.
+    assert ledger == ["a.test", "b.test"]
+    held = [e for e in logs if e["event"] == "technitium_zone_retire_held_back"]
+    assert held and held[0]["reason"] == "bundle_has_no_zone_list"
+    assert held[0]["zones"] == ["a.test", "b.test"]
+
+
+def test_zone_still_in_the_bundle_is_not_retired_when_unrendered(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        deleted, ledger = _retire(
+            tmp_path,
+            desired=["a.test"],
+            ledger=["a.test", "sec.test", "gone.test"],
+            bundle_names=["a.test", "Sec.Test"],
+        )
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test", "sec.test"]
+    held = [e for e in logs if e["event"] == "technitium_zone_retire_held_back"]
+    assert held and held[0]["reason"] == "zone_still_in_bundle"
+    assert held[0]["zones"] == ["sec.test"]
+
+
+def _apply_bundle(
+    tmp_path: Path, bundle: dict[str, Any], ledger: list[str]
+) -> tuple[list[str], list[str]]:
+    """render → validate → swap_and_reload against a fake API; return
+    (zones deleted, ledger after)."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d._managed_zones_path().write_text(_json.dumps(ledger))
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    deleted = [c[3]["zone"] for c in calls if c[2] == "zones/delete"]
+    return deleted, _json.loads(d._managed_zones_path().read_text())
+
+
+def test_bundle_of_a_group_with_no_zones_retires_them_end_to_end(tmp_path: Path) -> None:
+    deleted, ledger = _apply_bundle(tmp_path, {"zones": []}, ["a.test", "b.test"])
+    assert deleted == ["a.test", "b.test"]
+    assert ledger == []
+
+
+def test_bundle_without_a_zone_list_retires_nothing_end_to_end(tmp_path: Path) -> None:
+    for i, bundle in enumerate(({}, {"zones": None}, {"zones": {"a.test": {}}})):
+        state = tmp_path / str(i)
+        state.mkdir()
+        deleted, ledger = _apply_bundle(state, bundle, ["a.test", "b.test"])
+        assert deleted == [], bundle
+        assert ledger == ["a.test", "b.test"], bundle
+
+
+def test_zone_the_render_skipped_is_not_retired_end_to_end(tmp_path: Path) -> None:
+    """A secondary that lost its primaries is skipped by the render, but
+    SpatiumDDI still has it: it must not be deleted from the daemon."""
+    bundle = {
+        "zones": [
+            {"name": "a.test.", "type": "primary"},
+            {"name": "sec.test.", "type": "secondary", "masters": []},
+        ]
+    }
+    deleted, ledger = _apply_bundle(tmp_path, bundle, ["a.test", "sec.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test", "sec.test"]
+
+
+def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -> None:
+    """QA walk on #1497: Technitium files a record added to ``p1`` under the
+    closest zone it hosts, here ``kid.p1``, and ``zones/delete`` of the child
+    takes it along. The parent's reconcile has to run after the retire, or
+    the name is NXDOMAIN until the next structural pass."""
+    zones: dict[str, list[dict[str, Any]]] = {}
+
+    def _daemon(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        zone = params.get("zone", "")
+        if path == "zones/create":
+            zones.setdefault(zone, [])
+        elif path == "zones/delete":
+            zones.pop(zone, None)
+        elif path == "zones/records/add":
+            domain = params["domain"]
+            home = max((z for z in zones if domain == z or domain.endswith("." + z)), key=len)
+            zones[home].append(params)
+        elif path == "zones/records/get":
+            records = [
+                {
+                    "name": r["domain"],
+                    "type": r["type"],
+                    "ttl": r.get("ttl"),
+                    "rData": {"ipAddress": r.get("ipAddress")},
+                }
+                for r in zones.get(zone, [])
+            ]
+            return {"status": "ok", "response": {"records": records}}
+        return {"status": "ok"}
+
+    def _apply(bundle: dict[str, Any]) -> None:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        d.daemon_running = lambda: True  # type: ignore[method-assign]
+        d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+        _install_fake_request(d, _daemon)
+        d.render(bundle)
+        d.validate()
+        d.swap_and_reload()
+
+    parent = {
+        "name": "p1.",
+        "type": "primary",
+        "records": [{"name": "www.kid", "type": "A", "value": "192.0.2.11"}],
+    }
+    _apply({"zones": [{"name": "kid.p1.", "type": "primary", "records": []}, parent]})
+    assert [r["domain"] for r in zones["kid.p1"]] == ["www.kid.p1"]
+
+    _apply({"zones": [parent]})
+    assert "kid.p1" not in zones
+    assert [r["domain"] for r in zones["p1"]] == ["www.kid.p1"]
+
+
 # ── swap_and_reload: TSIG sync (#1517) + partial refusal (#1516) ────────
 
 

@@ -1487,6 +1487,23 @@ the formatter handles the rest.
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
 
+- **A zone deleted in SpatiumDDI is removed from its Technitium
+  servers (#1496).** The agent created every zone in the bundle and
+  never deleted one, so a deleted zone kept answering authoritatively on
+  every server with its last records, and a deleted child zone kept
+  shadowing its parent. The agent now remembers the zones it created
+  from a bundle and deletes the ones a later bundle drops. Zones it
+  never created, such as one made on the daemon directly, are never
+  touched. The first run after the upgrade picks up the zones of the
+  previous bundle; zones orphaned before that have to be removed by
+  hand (`zones/delete` on each server). An empty zone list, which the
+  control plane sends only for a group with no zones, retires every
+  zone like BIND9 does. A bundle with no zone list at all, and a zone
+  the bundle still has that the driver skipped (a secondary with no
+  primaries, say), retire nothing and log
+  `technitium_zone_retire_held_back`. PowerDNS has the same gap and is
+  not changed here.
+
 - **Editing a record's value on Cloudflare replaces it instead of adding
   a second record (#1494).** The driver handled `update` by looking up
   the Cloudflare row by the op's value, which is the NEW value and not
