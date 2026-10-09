@@ -51,7 +51,21 @@ def test_classify_zone_detects_reverse() -> None:
         (
             "URI",
             {"priority": 1, "weight": 1, "uri": "https://example.test/"},
-            "1 1 https://example.test/",
+            # #1513: the bare-authority slash Technitium appends is
+            # canonicalised away on read, matching the write side.
+            "1 1 https://example.test",
+        ),
+        (
+            "URI",
+            {"priority": 1, "weight": 1, "uri": "https://example.test/path/"},
+            # …but a path's trailing slash is significant and stays.
+            "1 1 https://example.test/path/",
+        ),
+        (
+            "AAAA",
+            {"ipAddress": "2001:DB8:0:0::1"},
+            # #1513: canonicalised through ipaddress on read.
+            "2001:db8::1",
         ),
     ],
 )
@@ -204,3 +218,43 @@ def test_build_imported_zone_preserves_zero_ttl() -> None:
         [{"name": "www.example.com", "type": "A", "ttl": 0, "rData": {"ipAddress": "10.0.0.1"}}],
     )
     assert zone.records[0].ttl == 0
+
+
+# ── #1513: rdata round-trip canonicalisation (write direction) ─────────
+
+
+def test_svcb_params_sorted_by_key_and_valueless_keys_kept() -> None:
+    """The read direction rebuilds svcParams sorted by key, so the write
+    direction must sort too — and a valueless param (no-default-alpn)
+    must be emitted as ``key|``, not dropped."""
+    from app.services.technitium.rdata import svcb_params
+
+    _, _, params = svcb_params('1 . port=443 alpn="h2"')
+    assert params == "alpn|h2,port|443"
+    _, _, params = svcb_params('1 . no-default-alpn alpn="h2"')
+    assert params == "alpn|h2,no-default-alpn|"
+
+
+def test_record_params_uri_and_aaaa_canonicalisation() -> None:
+    from app.services.technitium.rdata import record_params
+
+    # A path's trailing slash survives; a bare authority's does not.
+    assert record_params("URI", "1 1 https://example.com/path/")["uri"] == (
+        "https://example.com/path/"
+    )
+    assert record_params("URI", "1 1 https://example.com/")["uri"] == "https://example.com"
+    # Non-canonical AAAA is canonicalised on write.
+    assert record_params("AAAA", "2001:DB8:0:0::1") == {"ipAddress": "2001:db8::1"}
+
+
+def test_pull_normalize_value_uri_and_aaaa() -> None:
+    """The drift key folds the same canonicalisations (#1513)."""
+    from app.services.dns.pull_from_server import _normalize_value
+
+    assert _normalize_value("URI", "1 1 https://example.test/", "example.test.") == (
+        "1 1 https://example.test"
+    )
+    assert _normalize_value("URI", "1 1 https://example.test/path/", "example.test.") == (
+        "1 1 https://example.test/path/"
+    )
+    assert _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.") == "2001:db8::1"

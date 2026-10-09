@@ -61,13 +61,18 @@ async def _run_sweep() -> dict[str, Any]:
                     if elapsed < timedelta(seconds=fw.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                fw_name = fw.name  # a failed flush expires fw
                 try:
                     summary = await reconcile_firewall(db, fw)
                 except Exception as exc:  # noqa: BLE001 — one firewall shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{fw.name}: {exc}")
-                    logger.warning("panos_reconcile_crash", firewall=str(fw.id), error=str(exc))
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next firewall still syncs.
                     await db.rollback()
+                    errors.append(f"{fw_name}: {exc}")
+                    logger.warning(
+                        "panos_reconcile_crash", firewall=str(firewall_id), error=str(exc)
+                    )
                     continue
                 ran += 1
                 if summary.ok:

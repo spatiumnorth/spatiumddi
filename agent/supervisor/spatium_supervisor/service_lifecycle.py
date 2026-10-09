@@ -331,6 +331,107 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
     return values
 
 
+# #1439 — the agent blocks one role-env key renders (one ``DNS_AGENT_KEY`` renders
+# all three DNS engines), with the roles whose node labels schedule them.
+_AGENT_FAMILIES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("dnsBind9", "dnsPowerdns", "dnsTechnitium"), ("dns-bind9", "dns-powerdns", "dns-technitium")),
+    (("dhcpKea",), ("dhcp",)),
+    (("lookingGlass",), ("looking-glass",)),
+)
+
+# #1439 — what only a node holding the role is given, in that role's block: its
+# key, its server group and its DHCP group's network mode. A node that keeps a
+# block on for the nodes holding the role has none of them, so they come from the
+# live chart a holder wrote; the rest of the block is the node's own render.
+_HOLDER_VALUES = ("agentKey", "serverGroupName", "networkMode")
+
+
+def _agent_block_on(values: dict[str, object], block: str) -> bool:
+    """Whether ``values`` renders ``block``'s DaemonSet: enabled, with its key."""
+    b = values.get(block)
+    return isinstance(b, dict) and b.get("enabled") is True and bool(b.get("agentKey"))
+
+
+def keep_other_nodes_agents(
+    values: dict[str, object], live: dict[str, object], other_roles: set[str]
+) -> tuple[dict[str, object], list[str]]:
+    """PURE — #1439: ``values`` with the agents other nodes serve kept on.
+
+    A formed cluster has ONE ``spatiumddi-appliance`` HelmChart, and every
+    node's supervisor applies it whole, from its own role env. A node renders an
+    agent block only when its own env carries that role's key (#1062), and the
+    control plane ships a key only to a node that holds the role. So a node that
+    did not hold a role wrote that role's block disabled, and the helm upgrade
+    deleted the DaemonSet on every node, including the nodes the role is
+    assigned to. The chart's own contract is the other way round
+    (``dns-bind9.yaml``): ``enabled`` is release ownership and scheduling is the
+    node label.
+
+    So whether a family this node renders off is written on is the cluster's
+    answer, not this node's: on while another node carries one of its role
+    labels (``other_roles``). The block is this node's own render, with what only
+    a holder is given (:data:`_HOLDER_VALUES`) taken from the live chart
+    (``live``, ``{}`` before there is one) that a holder wrote. A family no
+    other node is labelled for is written off, as before: that is how the last
+    holder's removal takes the DaemonSet away. So is one whose key the live chart
+    does not hold: this node cannot render it, and a holder's own apply does.
+    Returns ``(values, kept blocks)``.
+    """
+    out = dict(values)
+    kept: list[str] = []
+    for blocks, roles in _AGENT_FAMILIES:
+        if any(_agent_block_on(values, b) for b in blocks):
+            continue
+        if not other_roles & set(roles):
+            continue
+        keyed = [b for b in blocks if _agent_block_on(live, b)]
+        if not keyed:
+            continue
+        for b in blocks:
+            held = live[b] if b in keyed else live[keyed[0]]
+            own = values.get(b)
+            block = dict(own) if isinstance(own, dict) else {}
+            block["enabled"] = True
+            if isinstance(held, dict):
+                block.update({k: held[k] for k in _HOLDER_VALUES if k in held})
+            out[b] = block
+            kept.append(b)
+    return out, kept
+
+
+def _keep_agents_other_nodes_serve(
+    values: dict[str, object],
+) -> tuple[dict[str, object], list[str], str | None]:
+    """``(values, kept, error)`` — :func:`keep_other_nodes_agents` against the
+    other nodes' role labels and the live chart, read from the kubeapi.
+
+    Only a control-plane member writes a chart other nodes share; an appliance
+    off the cluster runs its own k3s and its own chart, and reads nothing. The
+    labels are read first: when no other node is labelled for an agent this node
+    renders off, there is nothing to keep and the chart is not read (a single
+    node reads one node list). An unknown read is an error, never an empty
+    answer: taken as "nothing to keep" it would write the very outage this
+    guards, so the apply fails and the next heartbeat retries. A node that cannot
+    name itself counts every node, which keeps rather than drops."""
+    off = [
+        roles
+        for blocks, roles in _AGENT_FAMILIES
+        if not any(_agent_block_on(values, b) for b in blocks)
+    ]
+    if not off or not appliance_state.is_control_plane_member():
+        return values, [], None
+    other_roles, err = k8s_api.node_role_labels(exclude=_resolve_node_name())
+    if other_roles is None:
+        return values, [], f"the cluster's node role labels could not be read: {err}"
+    if not any(other_roles & set(roles) for roles in off):
+        return values, [], None
+    live = k8s_api._helmchart_values(_HELMCHART_NAME, namespace=_CHART_NAMESPACE)
+    if live is None:
+        return values, [], "the live role chart could not be read; not writing it blind"
+    out, kept = keep_other_nodes_agents(values, live, other_roles)
+    return out, kept, None
+
+
 def roles_awaiting_key(profiles: list[str], values: dict[str, object]) -> set[str]:
     """The assigned profiles whose DaemonSet the values do NOT render yet
     (#1062): the role's chart block is ``enabled: False`` because its agent
@@ -524,6 +625,23 @@ def apply_role_assignment(
         # not rendered (its DaemonSet could only crash); the next
         # heartbeat that brings the key re-applies with it.
         log.info("supervisor.k3s_lifecycle.roles_awaiting_key", roles=sorted(held_back))
+
+    # #1439, #1427 — every agent this node does not hold stays on while another
+    # node is labelled for its role. #1439: a member just promoted, before any
+    # role reaches it (its promotion changes the role apply key, #1281's
+    # control-plane URL), turned every agent off cluster-wide at every join and
+    # every Replace, until the seed's watchdog wrote the chart again. #1427: a
+    # node given some of the roles, or one a role was taken back from, turned
+    # that role off the same way, on the nodes still assigned it.
+    values, kept, keep_err = _keep_agents_other_nodes_serve(values)
+    if keep_err:
+        return LifecycleResult(state="failed", reason=keep_err)
+    if kept:
+        log.info(
+            "supervisor.k3s_lifecycle.agents_kept",
+            blocks=kept,
+            reason="another node serves them",
+        )
 
     try:
         chart_bytes = _read_chart_tarball()

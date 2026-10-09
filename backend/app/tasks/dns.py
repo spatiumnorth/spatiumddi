@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import socket
 import uuid
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
@@ -26,6 +28,16 @@ AGENT_STALE_AFTER = timedelta(seconds=120)
 DNS_PROBE_TIMEOUT = 3.0
 
 logger = structlog.get_logger(__name__)
+
+# Rows per INSERT / DELETE statement in a feed refresh (#1466). Bounds what
+# one statement holds in memory; 5000 domains in an ``IN (...)`` stays well
+# under asyncpg's 32767 bind-parameter limit.
+_FEED_WRITE_BATCH = 5000
+
+
+def _batched(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
@@ -112,45 +124,69 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                     ),
                 )
 
-            # Load current feed-sourced entries
-            existing_result = await db.execute(
-                select(DNSBlockListEntry).where(
-                    DNSBlockListEntry.list_id == bl.id,
-                    DNSBlockListEntry.source == "feed",
+            # Diff on domain COLUMNS, write with Core statements in batches —
+            # never one ORM entity per entry (#1466). The catalog's Hagezi
+            # Gambling feed is ~580k domains; loading the existing rows as
+            # entities and adding one tracked instance per new domain OOM-
+            # killed a 1.4 GiB worker on every attempt. The #948 lesson, on
+            # the worker side.
+            #
+            # Every existing domain is read, not only feed rows: the list is
+            # unique on (list_id, domain), so a feed domain the operator
+            # already added by hand must be skipped, not inserted — that
+            # insert failed the whole refresh on the constraint.
+            feed_existing: set[str] = set()
+            other_existing: set[str] = set()
+            existing_rows = await db.execute(
+                select(DNSBlockListEntry.domain, DNSBlockListEntry.source).where(
+                    DNSBlockListEntry.list_id == bl.id
                 )
             )
-            existing = {e.domain: e for e in existing_result.scalars().all()}
+            for domain, source in existing_rows.tuples():
+                (feed_existing if source == "feed" else other_existing).add(domain)
 
-            # Compute diff
-            to_add = domains - set(existing.keys())
-            to_remove = set(existing.keys()) - domains
+            to_add = domains - feed_existing - other_existing
+            to_remove = feed_existing - domains
 
-            for d in to_add:
-                db.add(
-                    DNSBlockListEntry(
-                        list_id=bl.id,
-                        domain=d,
-                        entry_type="block",
-                        source="feed",
-                        # Per-list, defaulting on (#878 made it universal,
-                        # #894 made it a choice): a list naming
-                        # `tracker.example` normally means
-                        # `cdn.tracker.example` too, which is what every
-                        # consumer of these feeds does — but a
-                        # host-specific feed wants apex-only.
-                        is_wildcard=wildcard,
-                    )
+            for batch in _batched(sorted(to_add), _FEED_WRITE_BATCH):
+                await db.execute(
+                    pg_insert(DNSBlockListEntry).on_conflict_do_nothing(
+                        index_elements=["list_id", "domain"]
+                    ),
+                    [
+                        {
+                            "list_id": bl.id,
+                            "domain": d,
+                            "entry_type": "block",
+                            "source": "feed",
+                            # Per-list, defaulting on (#878 made it universal,
+                            # #894 made it a choice): a list naming
+                            # `tracker.example` normally means
+                            # `cdn.tracker.example` too, which is what every
+                            # consumer of these feeds does — but a
+                            # host-specific feed wants apex-only.
+                            "is_wildcard": wildcard,
+                        }
+                        for d in batch
+                    ],
                 )
 
-            for d in to_remove:
-                await db.delete(existing[d])
+            for batch in _batched(sorted(to_remove), _FEED_WRITE_BATCH):
+                await db.execute(
+                    delete(DNSBlockListEntry)
+                    .where(
+                        DNSBlockListEntry.list_id == bl.id,
+                        DNSBlockListEntry.source == "feed",
+                        DNSBlockListEntry.domain.in_(batch),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
 
-            # Recompute count — plain COUNT, no arithmetic on top: a query autoflushes
-            # the pending adds and deletes, so the result ALREADY reflects
-            # them. Adding ``len(to_add)`` on top double-counted every row on
-            # a first sync — a 16k-domain feed reported 33k (#878). It also
-            # loads ids instead of dragging every ORM row into memory, which
-            # matters on the 460k-entry feeds.
+            # Recompute count — plain COUNT, no arithmetic on top: the
+            # inserts and deletes above already ran in this transaction, so
+            # the result ALREADY reflects them. Adding ``len(to_add)`` on top
+            # double-counted every row on a first sync — a 16k-domain feed
+            # reported 33k (#878).
             bl.entry_count = int(
                 await db.scalar(
                     select(func.count())
@@ -170,6 +206,17 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
             wake_group_ids: set[str] = {str(sg.id) for sg in bl.server_groups}
             wake_group_ids.update(str(v.group_id) for v in bl.views if v.group_id is not None)
             feed_changed = bool(to_add or to_remove)
+
+            # The entries went in and out through Core INSERT / DELETE, which
+            # the bundle_dirty listener never sees (it watches the ORM unit of
+            # work), so without this the agents kept serving the old list
+            # until some unrelated edit marked them. Blocklists are a global
+            # bundle input there too, hence everyone; nothing to mark when the
+            # set did not change.
+            if feed_changed:
+                from app.services.dns.bundle_dirty import mark_bundles_dirty
+
+                await mark_bundles_dirty(db, everyone=True)
 
             await db.commit()
 
@@ -204,6 +251,14 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     retry_backoff_max=300,
     retry_jitter=True,
     max_retries=3,
+    # Ack on receipt, overriding the global ``task_acks_late`` (#1466). With
+    # late ack + ``task_reject_on_worker_lost``, a refresh that takes its
+    # worker down stays unacked and the broker hands it to the next worker
+    # after the visibility timeout — one OOM kill per hour, indefinitely,
+    # each one losing whatever else that worker was running. A lost refresh
+    # costs nothing: it is idempotent and the operator's Refresh re-queues it.
+    # ``autoretry_for`` is unaffected — a retry publishes a new message.
+    acks_late=False,
 )
 def refresh_blocklist_feed(self: object, list_id: str) -> dict[str, int | str]:  # type: ignore[type-arg]
     """Fetch feed_url, parse as hosts/domain/adblock list, sync entries with source=feed.
@@ -278,6 +333,35 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 def agent_stale_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
     return asyncio.run(_dns_agent_stale_sweep_async())
+
+
+# ── Agentless record-op retry sweep (#1538) ────────────────────────────────
+
+
+async def _agentless_op_retry_sweep_async() -> dict[str, int]:
+    """Replay due agentless record ops that a transient provider error
+    rescheduled. Agentless servers have no agent heartbeat to drain their
+    op queue, so this beat sweep is what makes the #1232 retry budget real
+    for them."""
+    from app.services.dns.record_ops import apply_pending_agentless_ops
+
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            if not await is_module_enabled(db, "core.dns"):
+                return {"applied": 0, "rescheduled": 0, "skipped": 0}
+            counts = await apply_pending_agentless_ops(db)
+            await db.commit()
+            return counts
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="app.tasks.dns.agentless_op_retry_sweep")
+def agentless_op_retry_sweep() -> dict[str, int]:
+    """Celery beat task — runs every 60s, replays due agentless record ops."""
+    return asyncio.run(_agentless_op_retry_sweep_async())
 
 
 async def _probe_server_soa(host: str, port: int) -> bool:

@@ -93,6 +93,36 @@ class AzureDNSDriver(CloudDNSDriverBase):
     )
 
     # ── SDK client factory (lazy import; patched in tests) ───────────────
+    def _validate_credentials(self, creds: dict[str, Any]) -> None:
+        """Require every credential field, naming the missing ones (#1534).
+
+        Previously the fields were indexed directly, so a missing field
+        surfaced as a raw ``KeyError('tenant_id')``, and an empty
+        ``resource_group`` passed the zone-listing probe while every
+        record path failed on the empty group. ``resource_group`` is
+        required: every Azure DNS call is scoped by it.
+        """
+        missing = [
+            field for field in self.credential_fields if not str(creds.get(field) or "").strip()
+        ]
+        if missing:
+            raise CloudDNSError(
+                "azure_dns credentials are missing required field(s): "
+                + ", ".join(missing)
+                + ". All of tenant_id, client_id, client_secret, "
+                "subscription_id and resource_group are required."
+            )
+
+    def _resource_group(self, creds: dict[str, Any]) -> str:
+        """Return the configured resource group, or raise (#1534)."""
+        rg = str(creds.get("resource_group") or "").strip()
+        if not rg:
+            raise CloudDNSError(
+                "azure_dns credentials require a non-empty 'resource_group': "
+                "every zone and record call is scoped by it."
+            )
+        return rg
+
     def _client(self, creds: dict[str, Any]) -> Any:
         """Build a ``DnsManagementClient`` from a service-principal secret.
 
@@ -101,6 +131,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
         :class:`CloudDNSError` on a missing dependency so the operator gets
         an actionable message rather than a bare ``ImportError``.
         """
+        # #1534 — validate before indexing so a missing field is a named
+        # CloudDNSError, never a raw KeyError.
+        self._validate_credentials(creds)
         try:
             from azure.identity import ClientSecretCredential
             from azure.mgmt.dns import DnsManagementClient
@@ -140,12 +173,13 @@ class AzureDNSDriver(CloudDNSDriverBase):
     # ── Zone listing ─────────────────────────────────────────────────────
     async def _list_zones(self, server: Any, creds: dict[str, Any]) -> list[CloudDNSZone]:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
 
         def _list() -> list[Any]:
-            if rg:
-                return list(client.zones.list_by_resource_group(rg))
-            return list(client.zones.list())
+            # #1534 — always scoped by resource group, the same scope the
+            # record paths use, so probe() (which lists zones) can no
+            # longer pass for a server whose record ops would all fail.
+            return list(client.zones.list_by_resource_group(rg))
 
         try:
             zones = await asyncio.to_thread(_list)
@@ -170,7 +204,7 @@ class AzureDNSDriver(CloudDNSDriverBase):
         self, server: Any, creds: dict[str, Any], zone_name: str
     ) -> list[RecordData]:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(zone_name)
 
         def _list() -> list[Any]:
@@ -215,7 +249,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(cname.cname)
         elif rtype == "MX":
             for r in getattr(rs, "mx_records", None) or []:
-                add(f"{r.preference} {r.exchange}")
+                # Split form (#1526): bare exchange in value, preference in
+                # its own column — NOT the composed "10 mail.example.com".
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.exchange,
+                        ttl=ttl,
+                        priority=int(r.preference),
+                    )
+                )
         elif rtype == "TXT":
             for r in getattr(rs, "txt_records", None) or []:
                 add("".join(r.value))
@@ -224,7 +268,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
                 add(r.nsdname)
         elif rtype == "SRV":
             for r in getattr(rs, "srv_records", None) or []:
-                add(f"{r.priority} {r.weight} {r.port} {r.target}")
+                out.append(
+                    RecordData(
+                        name=name,
+                        record_type=rtype,
+                        value=r.target,
+                        ttl=ttl,
+                        priority=int(r.priority),
+                        weight=int(r.weight),
+                        port=int(r.port),
+                    )
+                )
         elif rtype == "PTR":
             for r in getattr(rs, "ptr_records", None) or []:
                 add(r.ptrdname)
@@ -236,7 +290,7 @@ class AzureDNSDriver(CloudDNSDriverBase):
     # ── Record write ─────────────────────────────────────────────────────
     async def _apply_record(self, server: Any, creds: dict[str, Any], change: RecordChange) -> None:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(change.zone_name)
         relative = _relative_name(change.record.name)
         rtype = change.record.record_type.upper()
@@ -480,8 +534,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
         """Build the create_or_update body for one neutral record.
 
         Returns the loosely-typed dict form the SDK accepts (``ttl`` plus
-        the type-specific record list); MX / SRV string values are split
-        back into their structured components.
+        the type-specific record list). MX / SRV take their structured
+        components from the record's own columns (#1526) — ``value`` is
+        the bare target, never a composed string to split back apart.
         """
         rtype = record.record_type.upper()
         ttl = record.ttl if record.ttl is not None else 3600
@@ -495,20 +550,19 @@ class AzureDNSDriver(CloudDNSDriverBase):
         elif rtype == "CNAME":
             params["cname_record"] = {"cname": value}
         elif rtype == "MX":
-            pref, _, exch = value.partition(" ")
-            params["mx_records"] = [{"preference": int(pref), "exchange": exch.strip()}]
+            pref = record.priority if record.priority is not None else 10
+            params["mx_records"] = [{"preference": pref, "exchange": value}]
         elif rtype == "TXT":
             params["txt_records"] = [{"value": [value]}]
         elif rtype == "NS":
             params["ns_records"] = [{"nsdname": value}]
         elif rtype == "SRV":
-            prio, weight, port, target = (value.split(None, 3) + ["", "", "", ""])[:4]
             params["srv_records"] = [
                 {
-                    "priority": int(prio),
-                    "weight": int(weight),
-                    "port": int(port),
-                    "target": target.strip(),
+                    "priority": record.priority if record.priority is not None else 0,
+                    "weight": record.weight if record.weight is not None else 0,
+                    "port": record.port if record.port is not None else 0,
+                    "target": value,
                 }
             ]
         elif rtype == "PTR":
@@ -521,9 +575,17 @@ class AzureDNSDriver(CloudDNSDriverBase):
         return params
 
     # ── Zone write ───────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         client = self._client(creds)
-        rg = (creds.get("resource_group") or "").strip()
+        rg = self._resource_group(creds)
         zone_label = _zone_label(getattr(zone, "name", ""))
 
         if op == "create":

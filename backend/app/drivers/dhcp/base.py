@@ -75,12 +75,25 @@ class StaticAssignmentDef:
 
 @dataclass(frozen=True)
 class ClientClassDef:
-    """A client class with a match expression and option overrides."""
+    """A client class with a match expression and option overrides.
+
+    ``address_family`` (``ipv4`` | ``ipv6`` | ``dual``) says which daemons the
+    class renders into (#1229). ``options_v4`` / ``options_v6`` are the parts
+    of ``options`` each daemon gets — all of them for a single-family class,
+    split by what each option is valid in for a ``dual`` one (#1295). The
+    control plane computes the split because only it holds the option tables.
+    """
 
     name: str
     match_expression: str = ""
     description: str = ""
     options: dict[str, Any] = field(default_factory=dict)
+    address_family: str = "ipv4"
+    options_v4: dict[str, Any] = field(default_factory=dict)
+    options_v6: dict[str, Any] = field(default_factory=dict)
+
+    def in_family(self, family: str) -> bool:
+        return self.address_family in (family, "dual")
 
 
 @dataclass(frozen=True)
@@ -424,6 +437,12 @@ class DHCPDriver(ABC):
     """
 
     name: str = "abstract"
+    # #1347 — how this driver spells a raw option code, and so which raw keys
+    # it serves: ``"code"`` reads ``code:NN`` and drops ``opt-NN``; ``"opt"``
+    # (Windows) reads ``opt-NN`` and drops ``code:NN``. Declared here rather
+    # than decided in a router, so a new driver states its own spelling
+    # instead of silently getting Kea's.
+    raw_option_spelling: str = "code"
 
     @abstractmethod
     def render_config(self, bundle: ConfigBundle) -> str:

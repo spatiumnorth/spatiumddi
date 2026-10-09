@@ -505,6 +505,7 @@ async def list_dhcp_client_classes(
             "name": c.name,
             "match_expression": c.match_expression,
             "description": c.description,
+            "address_family": c.address_family,
             "options": c.options,
         }
         for c in rows

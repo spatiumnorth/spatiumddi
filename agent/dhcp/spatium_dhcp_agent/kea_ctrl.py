@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -74,29 +75,91 @@ def config_reload(socket_path: Path) -> None:
     log.info("kea_config_reload_ok")
 
 
-def config_test(socket_path: Path, config_doc: dict[str, Any]) -> None:
-    """Validate a rendered config WITHOUT applying it (#477).
+class KeaConfigRejected(KeaCtrlError):
+    """``kea-dhcp4 -t`` / ``kea-dhcp6 -t`` refused the config (exit 1)."""
 
-    Kea's ``config-test`` parses + sanity-checks the config passed in
-    ``arguments`` and returns result=0 when valid, or a non-zero result with
-    ``text`` describing the exact problem (e.g. a pool outside the subnet).
-    ``send_command`` raises :class:`KeaCtrlError` carrying that ``text`` on
-    rejection, so a caller can surface Kea's real reason instead of an opaque
-    "reload failed" and never reload a config the daemon will reject.
 
-    A daemon too old to know ``config-test`` answers result=2 ("command not
-    supported"); we treat that as a soft pass so the preflight degrades to a
-    plain reload rather than blocking the apply.
+class KeaCheckUnavailable(RuntimeError):
+    """The ``-t`` preflight could not give a verdict at all.
+
+    Binary missing, not executable, timed out, killed by a signal, or an
+    exit code other than Kea's documented 0 / 1. Deliberately NOT a
+    :class:`KeaCtrlError`: it says nothing about the config, and it must
+    never be read as "config OK" either.
     """
-    log.info("kea_config_test_send", socket=str(socket_path))
+
+
+# Binaries that check a config file in a separate process. Same PATH lookup
+# the entrypoint uses to start the daemons.
+CHECK_BINARIES = {"dhcp4": "kea-dhcp4", "dhcp6": "kea-dhcp6"}
+CONFIG_CHECK_TIMEOUT = 30.0
+# Kea prints the verdict on the last stderr line, prefixed with one of these
+# (kea-dhcp4/6 main.cc). Everything else on stderr/stdout is log noise.
+_CHECK_REASON_PREFIXES = ("Error encountered:", "Syntax check failed with:")
+_MAX_REASON = 500
+
+
+def _check_reason(stderr: str, stdout: str) -> str:
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if line.startswith(_CHECK_REASON_PREFIXES):
+            return line[:_MAX_REASON]
+    if lines:
+        return lines[-1][:_MAX_REASON]
+    out = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    return out[-1][:_MAX_REASON] if out else "no output"
+
+
+def config_check(
+    daemon: str, config_path: Path, *, timeout: float = CONFIG_CHECK_TIMEOUT
+) -> None:
+    """Validate the config file Kea is about to reload, in a separate process.
+
+    Runs ``kea-dhcp4 -t <file>`` (``kea-dhcp6`` for ``daemon="dhcp6"``) —
+    the same check-only parse the ``config-test`` command does (#477), but
+    without sending anything to the running daemon. Kea 3.0.3's
+    ``config-test`` leaves the running server's multi-threading manager in
+    test mode, after which the HA hook's dedicated HTTP listener never binds
+    again (#1447, fixed upstream in Kea 3.0.4). A ``-t`` process exits and
+    takes that state with it.
+
+    ``config_path`` is the file ``config-reload`` reads, so the check and
+    the reload see the same bytes.
+
+    Raises :class:`KeaConfigRejected` with Kea's reason on exit 1 (Kea's
+    documented "error encountered"), and :class:`KeaCheckUnavailable` when
+    no verdict could be had. Returns on exit 0.
+    """
+    binary = CHECK_BINARIES[daemon]
+    log.info("kea_config_check_start", daemon=daemon, path=str(config_path))
     try:
-        send_command(socket_path, "config-test", arguments=config_doc)
-    except KeaCtrlError as e:
-        if "result=2" in str(e):  # command unsupported → skip the preflight
-            log.info("kea_config_test_unsupported", socket=str(socket_path))
-            return
-        raise
-    log.info("kea_config_test_ok")
+        proc = subprocess.run(
+            [binary, "-t", str(config_path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        log.warning("kea_config_check_timeout", daemon=daemon, timeout=timeout)
+        raise KeaCheckUnavailable(f"{binary} -t timed out after {timeout:g}s") from e
+    except OSError as e:
+        log.warning("kea_config_check_not_run", daemon=daemon, error=str(e))
+        raise KeaCheckUnavailable(f"{binary} -t could not run: {e}") from e
+
+    if proc.returncode == 0:
+        log.info("kea_config_check_ok", daemon=daemon)
+        return
+    reason = _check_reason(proc.stderr, proc.stdout)
+    if proc.returncode == 1:
+        log.warning("kea_config_check_rejected", daemon=daemon, reason=reason)
+        raise KeaConfigRejected(f"{binary} -t rejected the config: {reason}")
+    log.warning(
+        "kea_config_check_failed", daemon=daemon, returncode=proc.returncode, reason=reason
+    )
+    raise KeaCheckUnavailable(f"{binary} -t exited with code {proc.returncode}: {reason}")
 
 
 def lease4_del(socket_path: Path, ip_address: str) -> bool:
