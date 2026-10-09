@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -37,7 +38,8 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
-from .base import RRSET_OP_KINDS, DriverBase
+from ._txt import quote_txt as _quote_txt
+from .base import RRSET_OP_KINDS, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
@@ -641,6 +643,12 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
     carries (#773), so a multi-value MX or SRV composes identically either way.
     """
     rtype_u = rtype.upper()
+    if rtype_u == "TXT":
+        # TXT must reach the wire quoted (issue #1514): an unquoted
+        # value is parsed by BIND as zone-file syntax, so a ``;``
+        # truncates SPF/DMARC at a comment and spaces split the value
+        # into separate character-strings resolvers concatenate wrong.
+        return _quote_txt(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -1728,7 +1736,10 @@ class Bind9Driver(DriverBase):
             # weight+port for SRV) before the target. The control plane
             # stores those in separate columns; compose the wire shape
             # here so ``named-checkzone`` parses the zone cleanly.
-            if rtype == "MX" and rec.get("priority") is not None:
+            if rtype == "TXT":
+                # Quote TXT (issue #1514) — see _wire_value.
+                value = _quote_txt(value)
+            elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
             elif (
@@ -1744,7 +1755,7 @@ class Bind9Driver(DriverBase):
         return apex.notes + timer_notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
-        """Render an RPZ zone file.
+        """Render an RPZ zone file, streaming it to disk.
 
         RPZ uses CNAME trigger records to tell BIND9 how to rewrite responses:
           - CNAME .            → synthesize NXDOMAIN
@@ -1773,73 +1784,23 @@ class Bind9Driver(DriverBase):
         Nothing upstream catches it: ``validate()`` runs named-checkconf,
         which does not read zone files.
         """
+        # Streamed (#1109 Part 3): building a list of every line, joining
+        # it and encoding the result kept three full copies of a ~1.2M
+        # record zone alive beside a running named. Lines now go straight
+        # through a buffered writer; the output is byte-identical to the
+        # old ``"\n".join(lines) + "\n"``. The caller renders into a
+        # staging directory that is swapped in whole, so writing in place
+        # here gives up no atomicity.
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
-        lines = [
-            "$TTL 60",
-            "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
-            "@ IN NS localhost.",
-        ]
-        # Exceptions are emitted as passthru below, so an entry for the
-        # same name must not also be emitted. Matches the control-plane
-        # renderer, which already skips excluded domains.
-        excluded = {
-            str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x
-        }
-        # First writer of an owner name wins. The choice between two
-        # disagreeing lists is arbitrary — what is NOT arbitrary is that
-        # the zone must load, since the alternative is enforcing nothing
-        # at all. Collisions are logged so the operator can reconcile the
-        # lists rather than wonder which one is in effect.
+        # ``seen`` is the owner-name collision ledger (#878) and must stay.
         seen: dict[str, str] = {}
         collisions: list[str] = []
         bad_targets: list[str] = []
-        for e in bl.get("entries") or []:
-            domain = e["domain"].rstrip(".")
-            key = domain.lower()
-            if key in excluded:
-                continue
-            action = e.get("action") or "block"
-            block_mode = e.get("block_mode") or "nxdomain"
-            is_wildcard = bool(e.get("is_wildcard"))
-            target = e.get("target")
-            if action == "redirect" and target:
-                # An unusable target means the rewrite cannot be expressed.
-                # Dropping the entry is the honest outcome — a redirect is
-                # a rewrite, so not rewriting is the same as no rule, while
-                # substituting a block would invent policy the operator
-                # never asked for.
-                rewrite = _redirect_rdata(str(target))
-                if rewrite is None:
-                    bad_targets.append(domain)
-                    continue
-                rdata = rewrite
-            elif block_mode == "sinkhole":
-                rdata = "CNAME rpz-drop."
-            else:  # default: nxdomain
-                rdata = "CNAME ."
-            if key in seen:
-                # An identical repeat is harmless duplication (BIND loads
-                # it); only a differing one would have killed the zone.
-                if seen[key] != rdata:
-                    collisions.append(domain)
-                continue
-            seen[key] = rdata
-            lines.append(f"{domain} {rdata}")
-            if is_wildcard:
-                lines.append(f"*.{domain} {rdata}")
-        # Exceptions → passthrough (never blocked even if a broader rule
-        # matches). Deduped on the same lowercased key so two spellings of
-        # one name cannot land twice either.
-        emitted_exceptions: set[str] = set()
-        for exc in bl.get("exceptions") or []:
-            d = str(exc).rstrip(".")
-            if not d or d.lower() in emitted_exceptions:
-                continue
-            emitted_exceptions.add(d.lower())
-            lines.append(f"{d} CNAME rpz-passthru.")
-            lines.append(f"*.{d} CNAME rpz-passthru.")
-        path.write_text("\n".join(lines) + "\n")
+        with path.open("w", encoding="utf-8", buffering=1 << 20) as fh:
+            for line in self._rpz_zone_lines(bl, seen, collisions, bad_targets):
+                fh.write(line)
+                fh.write("\n")
         if bad_targets:
             log.warning(
                 "bind9_rpz_redirect_target_unusable",
@@ -1873,7 +1834,77 @@ class Bind9Driver(DriverBase):
             owners=len(seen),
         )
 
+    def _rpz_zone_lines(
+        self,
+        bl: dict[str, Any],
+        seen: dict[str, str],
+        collisions: list[str],
+        bad_targets: list[str],
+    ) -> Iterator[str]:
+        """Yield the RPZ zone file's lines; see ``_write_rpz_zone_file``."""
+        yield "$TTL 60"
+        yield "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )"
+        yield "@ IN NS localhost."
+        # Exceptions are emitted as passthru below, so an entry for the
+        # same name must not also be emitted. Matches the control-plane
+        # renderer, which already skips excluded domains.
+        excluded = {
+            str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x
+        }
+        # First writer of an owner name wins. The choice between two
+        # disagreeing lists is arbitrary — what is NOT arbitrary is that
+        # the zone must load, since the alternative is enforcing nothing
+        # at all. Collisions are logged so the operator can reconcile the
+        # lists rather than wonder which one is in effect.
+        for e in bl.get("entries") or []:
+            domain = e["domain"].rstrip(".")
+            key = domain.lower()
+            if key in excluded:
+                continue
+            action = e.get("action") or "block"
+            block_mode = e.get("block_mode") or "nxdomain"
+            is_wildcard = bool(e.get("is_wildcard"))
+            target = e.get("target")
+            if action == "redirect" and target:
+                # An unusable target means the rewrite cannot be expressed.
+                # Dropping the entry is the honest outcome — a redirect is
+                # a rewrite, so not rewriting is the same as no rule, while
+                # substituting a block would invent policy the operator
+                # never asked for.
+                rewrite = _redirect_rdata(str(target))
+                if rewrite is None:
+                    bad_targets.append(domain)
+                    continue
+                rdata = rewrite
+            elif block_mode == "sinkhole":
+                rdata = "CNAME rpz-drop."
+            else:  # default: nxdomain
+                rdata = "CNAME ."
+            if key in seen:
+                # An identical repeat is harmless duplication (BIND loads
+                # it); only a differing one would have killed the zone.
+                if seen[key] != rdata:
+                    collisions.append(domain)
+                continue
+            seen[key] = rdata
+            yield f"{domain} {rdata}"
+            if is_wildcard:
+                yield f"*.{domain} {rdata}"
+        # Exceptions → passthrough (never blocked even if a broader rule
+        # matches). Deduped on the same lowercased key so two spellings of
+        # one name cannot land twice either.
+        emitted_exceptions: set[str] = set()
+        for exc in bl.get("exceptions") or []:
+            d = str(exc).rstrip(".")
+            if not d or d.lower() in emitted_exceptions:
+                continue
+            emitted_exceptions.add(d.lower())
+            yield f"{d} CNAME rpz-passthru."
+            yield f"*.{d} CNAME rpz-passthru."
+
     def validate(self) -> None:
+        # What this apply holds back (#1403); refilled by _check_zone_files.
+        self.held_back = ()
         new_dir = self.state_dir / "rendered.new"
         conf = new_dir / "named.conf"
         # Fail closed (#1224). Skipping validation because the checker is
@@ -1907,12 +1938,33 @@ class Bind9Driver(DriverBase):
         self._check_zone_files(new_dir)
 
     def _check_zone_files(self, new_dir: Path) -> None:
-        """``named-checkzone`` every zone file this render added or changed (#1224).
+        """``named-checkzone`` every zone file this render added or changed (#1224),
+        and hold back each one it refuses instead of failing the apply (#1403).
 
         ``named-checkconf`` never reads zone files, so a zone named cannot
         load used to pass validation. named then kept serving the OLD copy of
         an existing zone and answered SERVFAIL for a new one, while the
         apply reported OK and was committed as last-known-good.
+
+        A refused file then failed the WHOLE apply, and the sync loop
+        quarantined the server's whole config bundle with it: one zone with
+        data named will not load stopped every record change in every zone
+        the server holds, until the bad data was removed (#1403). Each
+        refused zone is held back instead, which is what named itself does
+        with a zone file it cannot load, and the rest of the bundle applies:
+
+        * a zone named already serves keeps that copy. The live file is
+          copied over the staged one, so after the swap the zone is
+          byte-identical, and is neither reloaded nor verified;
+        * a zone with no live copy (a new zone) has its staged file removed.
+          Its stanza stays in named.conf, so named does not load the zone and
+          answers SERVFAIL for it; leaving the stanza out instead would hand
+          its names to recursion.
+
+        Every hold is recorded in ``held_back`` for the sync loop to report,
+        and the next bundle is re-rendered, so the zone goes live as soon as
+        its data loads. A checker that cannot run at all (missing, or timed
+        out) still fails the apply: that is not a verdict on the zone.
 
         Not ``named-checkconf -z``: the rendered conf names zone files by
         absolute path under the LIVE tree, so it would test the files already
@@ -1944,8 +1996,9 @@ class Bind9Driver(DriverBase):
                 "named-checkzone is not installed, so the zone files cannot be "
                 "validated; refusing to apply them unchecked"
             )
-        failures: list[str] = []
+        held: list[HeldZone] = []
         for zname, view in targets:
+            rel = _zone_rel(zname, view)
             res = subprocess.run(
                 [
                     "named-checkzone",
@@ -1954,23 +2007,37 @@ class Bind9Driver(DriverBase):
                     "-k",
                     "fail",
                     zname,
-                    str(new_dir / _zone_rel(zname, view)),
+                    str(new_dir / rel),
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=300,
             )
-            if res.returncode != 0:
-                detail = _first_line(
-                    res.stdout, res.stderr, skip_warnings=True
-                ).replace(f"{new_dir}/", "")
-                failures.append(f"{_zone_label(zname, view)}: {detail}")
-        if failures:
-            more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
-            raise RuntimeError(
-                "zone file rejected by named-checkzone: " + "; ".join(failures[:5]) + more
+            if res.returncode == 0:
+                continue
+            detail = _first_line(res.stdout, res.stderr, skip_warnings=True).replace(
+                f"{new_dir}/", ""
             )
+            last_good = live / rel
+            served = last_good.is_file()
+            if served:
+                shutil.copyfile(last_good, new_dir / rel)
+            else:
+                (new_dir / rel).unlink()
+            held.append(HeldZone(zname, view, detail, served))
+        if held:
+            log.warning(
+                "bind9_zones_held_back",
+                count=len(held),
+                sample=[f"{_zone_label(h.zone, h.view)}: {h.reason}" for h in held[:5]],
+                detail=(
+                    "named-checkzone refused these zones' new files. A zone named "
+                    "already served keeps its last good copy; a new one is not "
+                    "served. Every other change in the config applied."
+                ),
+            )
+        self.held_back = tuple(held)
 
     def swap_and_reload(self) -> None:
         """Put the staged tree live and confirm named is serving it.
@@ -2673,7 +2740,7 @@ class Bind9Driver(DriverBase):
         if exe is None:
             return None
         try:
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 [exe, "-v"],
                 capture_output=True,
                 text=True,

@@ -28,6 +28,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
 from app.core.permissions import require_permission, user_has_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.domain import Domain
@@ -382,7 +383,14 @@ async def update_domain(
     if d is None:
         raise HTTPException(status_code=404, detail="Domain not found")
 
-    changes = body.model_dump(exclude_unset=True)
+    # #1564 — explicit null clears a nullable FK; null for a NOT NULL
+    # column (name / expected_nameservers / tags / custom_fields) is a
+    # 422, not the NOT NULL violation → 500 it used to reach Postgres as.
+    changes = resolve_update_changes(
+        body,
+        clearable={"customer_id", "registrar_provider_id"},
+        non_nullable={"name", "expected_nameservers", "tags", "custom_fields"},
+    )
     if not changes:
         return _to_read(d, (await effective_registry(db)).tlds)
 

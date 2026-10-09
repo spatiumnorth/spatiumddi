@@ -453,11 +453,15 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
 
 
 def _render_client_class(c: ClientClassDef, *, address_family: str = "ipv4") -> dict[str, Any]:
+    """One operator class for one daemon. The caller filters on
+    ``c.in_family`` first (#1229): a class whose test uses ``pkt4`` makes
+    kea-dhcp6 reject the whole config, and the mirror image for ``pkt6``."""
     d: dict[str, Any] = {"name": c.name}
     if c.match_expression:
         d["test"] = c.match_expression
-    if c.options:
-        d["option-data"] = _render_option_data(c.options, address_family=address_family)
+    options = c.options_v6 if address_family == "ipv6" else c.options_v4
+    if options:
+        d["option-data"] = _render_option_data(options, address_family=address_family)
     return d
 
 
@@ -586,7 +590,9 @@ class KeaDriver(DHCPDriver):
                 },
                 "subnet4": [_render_scope(s) for s in v4_scopes],
                 "client-classes": [
-                    _render_client_class(c, address_family="ipv4") for c in bundle.client_classes
+                    _render_client_class(c, address_family="ipv4")
+                    for c in bundle.client_classes
+                    if c.in_family("ipv4")
                 ]
                 + [_render_pxe_class(p) for p in bundle.pxe_classes]
                 + [_render_phone_class(p) for p in bundle.phone_classes]
@@ -628,7 +634,9 @@ class KeaDriver(DHCPDriver):
                 },
                 "subnet6": [_render_scope(s) for s in v6_scopes],
                 "client-classes": [
-                    _render_client_class(c, address_family="ipv6") for c in bundle.client_classes
+                    _render_client_class(c, address_family="ipv6")
+                    for c in bundle.client_classes
+                    if c.in_family("ipv6")
                 ],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv6"),
                 **_packet_logging_override(bundle, "kea-dhcp6"),
@@ -639,6 +647,12 @@ class KeaDriver(DHCPDriver):
             for family in ("Dhcp4", "Dhcp6"):
                 if family in out:
                     out[family]["cache-max-age"] = bundle.lease_cache_max_age
+        # Kea's parser refuses an empty ``"client-classes": []`` as a syntax
+        # error (measured, kea-dhcp4/6 3.0.3), and a family filter (#1229) can
+        # leave one empty. The agent renderer already omits the key.
+        for family in ("Dhcp4", "Dhcp6"):
+            if family in out and not out[family].get("client-classes", True):
+                del out[family]["client-classes"]
         return json.dumps(out, indent=2, sort_keys=True)
 
     async def apply_config(self, server: Any, bundle: ConfigBundle) -> None:

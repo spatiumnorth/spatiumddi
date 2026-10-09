@@ -32,7 +32,7 @@ from spatium_dhcp_agent.config_apply import (
     ApplyStatus,
     Quarantine,
 )
-from spatium_dhcp_agent.kea_ctrl import KeaCtrlError
+from spatium_dhcp_agent.kea_ctrl import KeaConfigRejected
 from spatium_dhcp_agent.sync import SyncLoop
 
 
@@ -70,7 +70,7 @@ def _bundle(tag: str, subnet: str = "192.0.2.0/24") -> dict[str, Any]:
 @pytest.fixture
 def loop(agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch) -> SyncLoop:
     """A SyncLoop whose Kea control socket always answers happily."""
-    monkeypatch.setattr(sync_mod, "config_test", lambda s, d: {"result": 0})
+    monkeypatch.setattr(sync_mod, "config_check", lambda daemon, path: None)
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: {"result": 0})
     ensure_layout(agent_cfg.state_dir)
     return SyncLoop(agent_cfg, token_ref=[""], heartbeat=_FakeHeartbeat())
@@ -86,10 +86,10 @@ def _apply(loop: SyncLoop, tag: str, subnet: str = "192.0.2.0/24") -> bool:
 def _reject(monkeypatch: pytest.MonkeyPatch, message: str) -> None:
     """Kea refuses every config from here on — including a revert's."""
 
-    def bad(sock, doc):  # type: ignore[no-untyped-def]
-        raise KeaCtrlError(message)
+    def bad(daemon, path):  # type: ignore[no-untyped-def]
+        raise KeaConfigRejected(message)
 
-    monkeypatch.setattr(sync_mod, "config_test", bad)
+    monkeypatch.setattr(sync_mod, "config_check", bad)
 
 
 def _reject_containing(monkeypatch: pytest.MonkeyPatch, marker: str, message: str) -> None:
@@ -99,12 +99,11 @@ def _reject_containing(monkeypatch: pytest.MonkeyPatch, marker: str, message: st
     config still loads, which is what makes a revert possible at all.
     """
 
-    def selective(sock, doc):  # type: ignore[no-untyped-def]
-        if marker in json.dumps(doc):
-            raise KeaCtrlError(message)
-        return {"result": 0}
+    def selective(daemon, path):  # type: ignore[no-untyped-def]
+        if marker in path.read_text():
+            raise KeaConfigRejected(message)
 
-    monkeypatch.setattr(sync_mod, "config_test", selective)
+    monkeypatch.setattr(sync_mod, "config_check", selective)
 
 
 def test_rejected_config_reverts_the_files_on_disk(
@@ -112,7 +111,7 @@ def test_rejected_config_reverts_the_files_on_disk(
 ) -> None:
     """The crash-loop-on-restart bug.
 
-    Kea's ``config-test`` rejects without disturbing the running server, so
+    ``kea-dhcp4 -t`` rejects without disturbing the running server, so
     the daemon is fine either way — but ``_apply_bundle`` has already written
     the refused document to ``kea_config_path``, and THAT is what Kea reads
     on its next start. The revert has to rewrite the files, not just the
@@ -122,7 +121,7 @@ def test_rejected_config_reverts_the_files_on_disk(
     good_doc = json.loads(agent_cfg.kea_config_path.read_text())
 
     _reject_containing(
-        monkeypatch, "10.9.9.0/24", "config-test failed: pool not in subnet"
+        monkeypatch, "10.9.9.0/24", "kea-dhcp4 -t rejected the config: pool not in subnet"
     )
     assert _apply(loop, "bad", "10.9.9.0/24") is False
 
@@ -146,10 +145,10 @@ def test_unreachable_socket_does_not_revert(
     """
     assert _apply(loop, "good") is True
 
-    def unreachable(sock, doc):  # type: ignore[no-untyped-def]
+    def unreachable(sock):  # type: ignore[no-untyped-def]
         raise OSError("no such control socket")
 
-    monkeypatch.setattr(sync_mod, "config_test", unreachable)
+    monkeypatch.setattr(sync_mod, "config_reload", unreachable)
     assert _apply(loop, "next") is True
 
     assert loop.apply_status.status == STATUS_OK
@@ -190,7 +189,7 @@ def test_revert_failure_is_reported_distinctly(
     loop: SyncLoop, agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert _apply(loop, "good") is True
-    # Every config-test from here on fails, including the revert's.
+    # Every -t check from here on fails, including the revert's.
     _reject(monkeypatch, "boom")
     assert _apply(loop, "bad") is False
     assert loop.apply_status.status == STATUS_REVERT_FAILED
@@ -220,7 +219,7 @@ def test_bootstrap_skips_a_quarantined_bundle(
     agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A restart must not boot Kea into the config it already refused."""
-    monkeypatch.setattr(sync_mod, "config_test", lambda s, d: {"result": 0})
+    monkeypatch.setattr(sync_mod, "config_check", lambda daemon, path: None)
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: {"result": 0})
     ensure_layout(agent_cfg.state_dir)
 

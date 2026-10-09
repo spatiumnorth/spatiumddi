@@ -969,6 +969,13 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     match_expression: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Which Kea daemons the class is rendered into (#1229): ``ipv4``,
+    # ``ipv6`` or ``dual``. A class used to go into both, and a v4-only test
+    # token (``pkt4`` / ``relay4``) makes kea-dhcp6 reject the whole config.
+    # A ``dual`` class's options go to whichever family each one is valid in.
+    address_family: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="ipv4", server_default="ipv4"
+    )
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     # Provenance — set by the DHCP configuration importer (issue #129).

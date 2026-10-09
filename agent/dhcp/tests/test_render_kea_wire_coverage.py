@@ -213,7 +213,7 @@ def test_no_option_def_key_when_none_needed() -> None:
 def test_undefined_code_is_stripped_not_emitted() -> None:
     """Emitting a code with no definition fails the WHOLE config — Kea types it
     BINARY and rejects a non-hex value. Dropping one option is survivable; a
-    rejected config is not, and sync.py writes the file before config-test, so
+    rejected config is not, and sync.py writes the file before kea-dhcp4 -t, so
     a bad render outlives the process that made it."""
     doc = render(
         _bundle(

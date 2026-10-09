@@ -47,11 +47,20 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  // #1291 — "" is a local account; a provider id pre-creates one that signs
+  // in through that provider, which its first sign-in claims. That is how a
+  // provider with auto-create off admits a new user.
+  const [providerId, setProviderId] = useState("");
   const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [forceChange, setForceChange] = useState(true);
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const providers = useQuery({
+    queryKey: ["auth-providers"],
+    queryFn: authProvidersApi.list,
+  });
+  const external = providerId !== "";
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -59,9 +68,9 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
         username,
         email,
         display_name: displayName,
-        password,
+        ...(external ? { auth_provider_id: providerId } : { password }),
         is_superadmin: isSuperadmin,
-        force_password_change: forceChange,
+        force_password_change: external ? false : forceChange,
         ...(isSuperadmin ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
@@ -102,14 +111,35 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             onChange={(e) => setEmail(e.target.value)}
           />
         </Field>
-        <Field label="Password">
-          <input
+        <Field label="Signs in through">
+          <select
             className={inputCls}
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+            value={providerId}
+            onChange={(e) => setProviderId(e.target.value)}
+          >
+            <option value="">Local account (password)</option>
+            {(providers.data ?? []).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} ({p.type})
+              </option>
+            ))}
+          </select>
         </Field>
+        {external ? (
+          <p className="text-xs text-muted-foreground">
+            The account is claimed the first time this username signs in through
+            the provider, even with auto-create off. It has no password here.
+          </p>
+        ) : (
+          <Field label="Password">
+            <input
+              className={inputCls}
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+        )}
         <div className="flex flex-col gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-sm">
             <input
@@ -119,14 +149,16 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             />
             Superadmin
           </label>
-          <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={forceChange}
-              onChange={(e) => setForceChange(e.target.checked)}
-            />
-            Require password change on first login
-          </label>
+          {!external && (
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={forceChange}
+                onChange={(e) => setForceChange(e.target.checked)}
+              />
+              Require password change on first login
+            </label>
+          )}
         </div>
         {isSuperadmin && (
           <StepUpSection
@@ -153,7 +185,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             disabled={
               !username ||
               !email ||
-              !password ||
+              (!external && !password) ||
               (isSuperadmin && !stepPassword && !stepTotp) ||
               mutation.isPending
             }
