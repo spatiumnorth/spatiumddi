@@ -76,6 +76,7 @@ class Script:
 def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     """No real waiting: one poll, then the verdict."""
     monkeypatch.setattr(bind9, "_ZONE_LOAD_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(bind9, "_ZONE_DUMP_TIMEOUT_S", 0.0)
     monkeypatch.setattr(bind9, "_NAMED_START_TIMEOUT_S", 0.0)
     monkeypatch.setattr(bind9, "_SIGHUP_SETTLE_S", 0.0)
     monkeypatch.setattr(bind9.time, "sleep", lambda _s: None)
@@ -474,14 +475,22 @@ def test_only_changed_zones_are_verified(tmp_path: Path, monkeypatch, fast) -> N
     _zone(prev_live, "same.test", 1)
     _zone(prev_live, "edited.test", 1)
     _all_tools(monkeypatch)
-    run = Script(
-        lambda cmd: (0, "serial: 2\n", "") if "zonestatus" in cmd else (0, "", "")
-    )
+    serving = {"edited.test": 1}
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if "reload" in cmd:
+            serving[cmd[-1]] = 2
+        if "zonestatus" in cmd:
+            return (0, f"serial: {serving[cmd[-1]]}\n", "")
+        return (0, "", "")
+
+    run = Script(answer)
     monkeypatch.setattr(subprocess, "run", run)
 
     drv.swap_and_reload()
 
-    # Once before the reload, once after: only the zone that changed.
+    # Once frozen before the swap (#1407), once after the reload: only the zone
+    # that changed.
     assert [c[-1] for c in run.calls if "zonestatus" in c] == ["edited.test", "edited.test"]
 
 

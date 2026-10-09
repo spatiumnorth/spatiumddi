@@ -103,6 +103,45 @@ the formatter handles the rest.
   never uses, and a reconnect that met a dead Sentinel there exited the
   worker as an unrecoverable error.
 
+- **A record change no longer re-renders and reloads its zone on a DNS
+  group without views (#1373).** The BIND9 agent re-renders and reloads
+  named only when the bundle's structural fingerprint moves; a record
+  change is meant to stay out of it and reach named as an RFC 2136
+  update. Since #430 each zone's payload also carries its serial (for
+  the agent's zone-state report), and every record change bumps it, so
+  every record change on a group without views was followed by a full
+  render and a freeze, reload and thaw of its zone beside the update:
+  the reload the RFC 2136 path exists to avoid, a served value that no
+  longer followed the record op's state, and a manual `rndc freeze` that
+  lasted only until the next record change. The serial is now left out
+  of the fingerprint, with the records, and the bundle lists a group's
+  zones by name: they came in whatever order the database read them, and
+  the zone a record change touched could move in that order, which moved
+  the fingerprint of any group of two zones or more on its own. The
+  serial stays in the payload, and the agent now also reports the serial
+  a record change brings once the op that carries it has applied, beside
+  the report it sends after a reload. Groups with views are unchanged:
+  there every record change re-renders, by design.
+
+- **A change to a BIND9 zone is served even while named holds RFC 2136
+  updates for it (#1407).** named writes an RFC 2136 update into the
+  zone's file up to 15 minutes after taking it. A change to the zone
+  itself (its TTL, SOA timers or apex) reaches named as a new render of
+  the zone file, which the agent swapped in and then froze, reloaded and
+  thawed; the freeze made named write its own copy of the zone over the
+  new render, and the thaw loaded that copy. The change was not served
+  while the API, the zone page and the apply status said it was, and the
+  served serial could go backwards, which a secondary refuses. A zone
+  holds such updates after a record op that changes it (on a group
+  without views) or a third party's update (#641). The agent now freezes
+  each changed zone before the new render goes in and waits until named
+  has written it out, serves the render under a serial later than the
+  one named served, and fails the apply if named serves anything else.
+  On a zone that takes third-party updates, a record a third party added
+  after the ingest-back last copied the zone (at most three minutes
+  earlier) is now replaced with the rest of the zone, as on a full
+  re-render, instead of overriding the change.
+
 - **The upgrade preflight checks every node's `/var`, not the api pod's
   (#1234).** `disk_headroom` ran `shutil.disk_usage("/var")` inside the
   api container, which says nothing about the node where
