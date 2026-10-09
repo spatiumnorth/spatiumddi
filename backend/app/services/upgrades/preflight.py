@@ -110,15 +110,29 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 # ── Individual checks ─────────────────────────────────────────────────
 
 
-def check_inflight_conflict(*, namespace: str | None = None) -> PreflightResult:
+def check_inflight_conflict(
+    *, namespace: str | None = None, own_holder: str | None = None
+) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
     Reads the ``spatium-upgrade-lock`` Lease; if it's held + not
     expired we ``fail`` with the holder's identity. An expired lease
     is fine (the previous holder crashed before releasing — we'll
     take over on acquire).
+
+    ``own_holder`` is the identity of the run asking. The orchestrator
+    takes the lease at Start and then runs this preflight again for every
+    node, so without it each run failed its own first node on the lease
+    it had just taken (#1445).
     """
     state = mutex.get_state(namespace=namespace)
+    if state.held and not state.expired and own_holder and state.holder == own_holder:
+        return PreflightResult(
+            name="inflight_conflict",
+            level="ok",
+            message="the upgrade lease is held by this run",
+            detail={"holder": state.holder, "transitions": state.transitions},
+        )
     if state.held and not state.expired:
         return PreflightResult(
             name="inflight_conflict",
@@ -186,9 +200,27 @@ async def check_replication_lag(*, threshold_bytes: int = 16 * 1024) -> Prefligh
             message="no streaming replicas (single-node shape)",
             detail={"replicas": []},
         )
+    # #1445 — ``pg_stat_replication`` shows a replica's ``state`` and LSNs
+    # only to a superuser or a member of ``pg_monitor``; to anyone else the
+    # row is there but those columns are NULL. The app's role is neither on
+    # the appliance (CNPG manages it and reverts a manual GRANT), so every
+    # replica read as "not streaming" and the preflight refused to start a
+    # healthy cluster's upgrade. A NULL state is unverified, not broken.
+    unverified = [r for r in replicas if r["state"] is None]
+    if len(unverified) == len(replicas):
+        return PreflightResult(
+            name="replication_lag",
+            level="warn",
+            message=(
+                f"{len(replicas)} replica(s) connected; their streaming state "
+                "is not visible to the app's database role (needs pg_monitor), "
+                "so it was not verified"
+            ),
+            detail={"replicas": replicas, "unverified": True},
+        )
     streaming = [r for r in replicas if r["state"] == "streaming"]
     lagging = [r for r in streaming if r["lag_bytes"] > threshold_bytes]
-    not_streaming = [r for r in replicas if r["state"] != "streaming"]
+    not_streaming = [r for r in replicas if r["state"] is not None and r["state"] != "streaming"]
     if not_streaming:
         return PreflightResult(
             name="replication_lag",
@@ -773,8 +805,12 @@ async def run_all(
     *,
     target_version: str,
     namespace: str | None = None,
+    own_holder: str | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
+
+    ``own_holder`` is passed by a run that already holds the upgrade
+    lease (see :func:`check_inflight_conflict`); Plan passes nothing.
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
@@ -782,7 +818,7 @@ async def run_all(
     ``asyncio.gather``.
     """
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace),
+        check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
         await check_node_disk_headroom(),
         await check_mirror_disk_headroom(),

@@ -134,6 +134,12 @@ def classify_per_node_failure(
         return CATEGORY_PRIMARY_NOT_MOVED
     if failed_at == "drain":
         return CATEGORY_DRAIN_STUCK
+    if failed_at == "reboot":
+        # The apply failed on the host before it staged the slot, or never
+        # finished staging it. Either way the node was not rebooted.
+        if error and "supervisor reported upgrade failed" in error:
+            return CATEGORY_SUPERVISOR_FAILED
+        return CATEGORY_OTHER
     if failed_at == "health_gate":
         # health_gate has three failure modes — split by the error.
         if error and "supervisor reported upgrade failed" in error:

@@ -537,7 +537,9 @@ state on its heartbeat:
   technitium DaemonSets
   drop `hostNetwork` to sit behind, an L2 LoadBalancer Service with
   `externalTrafficPolicy: Local`, so the DNS server sees each client's
-  own address rather than the node's, #1487) and
+  own address rather than the node's, #1487; one `dns-vip` Service
+  selects every engine's pods, so the VIP follows an engine switch,
+  #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
   relay→server unicast forward — Kea keeps `hostNetwork` for
   direct-attached broadcast). Both live on the same `platform_settings`
@@ -3138,7 +3140,8 @@ Same-minor bumps are unaffected — revert the slot and you are done.
    3-node cluster; nodes go offline ~30-60 s each during reboot.
 ```
 
-**Required RBAC.** The api pod's ServiceAccount needs the
+**Required RBAC.** The api pod's ServiceAccount, and the worker's,
+which runs the orchestrator as a Celery task (#1445), need the
 `api.upgradeOrchestratorRBAC` grants (namespace-scoped Deployments
 + Jobs + CNPG Cluster patch + Lease CRUD; cluster-scoped Nodes +
 Pods + pods/eviction; helm.cattle.io HelmChartConfigs in
@@ -3147,8 +3150,8 @@ kube-system). Appliance installs flip this on at firstboot via
 HelmChart's `valuesContent` (committed in `spatiumddi-firstboot`).
 Docker / plain-k8s installs leave it off by default — the rolling
 upgrade flow doesn't apply there. If preflight surfaces
-`inflight_conflict: lease held by '<rbac-missing>'`, the api SA is
-missing this grant; the live appliance fix is one `kubectl patch`
+`inflight_conflict: lease held by '<rbac-missing>'`, the api or the
+worker SA is missing this grant; the live appliance fix is one `kubectl patch`
 on the seed `HelmChart spatium-control` (see #298 PR description
 for the one-liner).
 
