@@ -21,6 +21,8 @@ fallback-on-unreachable paths are enough here.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -296,6 +298,75 @@ def test_parse_lease_unparseable_time_treated_as_expired() -> None:
     }
     s = mutex._parse_lease(body)
     assert s.expired is True
+
+
+# ── per-node /var headroom (#1234) ────────────────────────────────────
+
+_GIB = 1024**3
+_NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+
+
+def _node(name: str, free_gib: int | None, *, age_s: int = 30) -> SimpleNamespace:
+    ch: dict[str, Any] = {}
+    if free_gib is not None:
+        ch = {
+            "host_disk_partitions": [
+                {"mount": "/", "total_bytes": 50 * _GIB, "used_bytes": 1 * _GIB},
+                {"mount": "/var", "total_bytes": 100 * _GIB, "used_bytes": (100 - free_gib) * _GIB},
+            ]
+        }
+    return SimpleNamespace(
+        id=name, hostname=name, cluster_health=ch, last_seen_at=_NOW - timedelta(seconds=age_s)
+    )
+
+
+def test_node_headroom_short_node_fails_naming_it() -> None:
+    r = preflight.judge_node_disk_headroom(
+        [_node("n1", 50), _node("n2", 2)], need_bytes=5 * _GIB, now=_NOW
+    )
+    assert r.level == "fail"
+    assert "n2" in r.message and "n1" not in r.message
+
+
+def test_node_headroom_all_have_room_ok() -> None:
+    r = preflight.judge_node_disk_headroom(
+        [_node("n1", 50), _node("n2", 6)], need_bytes=5 * _GIB, now=_NOW
+    )
+    assert r.level == "ok"
+
+
+def test_node_headroom_missing_report_warns_naming_node() -> None:
+    r = preflight.judge_node_disk_headroom(
+        [_node("n1", 50), _node("n2", None)], need_bytes=5 * _GIB, now=_NOW
+    )
+    assert r.level == "warn"
+    assert "n2" in r.message
+
+
+def test_node_headroom_stale_report_warns_naming_node() -> None:
+    r = preflight.judge_node_disk_headroom(
+        [_node("n1", 50), _node("n2", 50, age_s=3600)], need_bytes=5 * _GIB, now=_NOW
+    )
+    assert r.level == "warn"
+    assert "n2" in r.message and "stale" in r.message
+
+
+def test_node_headroom_short_beats_unknown() -> None:
+    r = preflight.judge_node_disk_headroom(
+        [_node("n1", 1), _node("n2", None)], need_bytes=5 * _GIB, now=_NOW
+    )
+    assert r.level == "fail"
+
+
+@pytest.mark.asyncio
+async def test_node_headroom_falls_back_to_local_check_without_appliances() -> None:
+    sentinel = preflight.PreflightResult(
+        name="disk_headroom", level="ok", message="local", detail={}
+    )
+    with patch.object(preflight, "check_disk_headroom", return_value=sentinel) as local:
+        r = await preflight.check_node_disk_headroom()
+    assert r is sentinel
+    local.assert_called_once()
 
 
 # ── run_all aggregator (with mocked individual checks) ────────────────

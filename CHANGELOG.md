@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The upgrade preflight checks every node's `/var`, not the api pod's
+  (#1234).** `disk_headroom` ran `shutil.disk_usage("/var")` inside the
+  api container, which says nothing about the node where
+  `spatium-upgrade-slot` stages the slot image, so it could pass while a
+  member had no room and the rolling upgrade then failed midway on that
+  node. It now judges the `/var` free space each approved appliance
+  reports against the slot image plus margin and names every node that
+  falls short (fail). A node with no disk report, or one older than ten
+  minutes, is a warn naming it, never a pass. Without appliance rows
+  (Compose / plain Kubernetes) the old local check still runs.
+
 - **The DNS VIP answers again after a DNS engine switch, and on a fresh
   install (#1510).** All three engine Services in the appliance chart
   (`dns-bind9`, `dns-powerdns`, `dns-technitium`) are rendered on every DNS
