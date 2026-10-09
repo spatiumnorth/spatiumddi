@@ -345,6 +345,7 @@ backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:2
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:285
 backend/alembic/versions/c2a7e4f81b69_logical_ownership_entities.py:drop_table:290
 backend/alembic/versions/c2e6a89d4b15_platform_settings_timezone.py:drop_column:40
+backend/alembic/versions/c2f7a94e1d58_dhcp_client_class_address_family.py:drop_column:66
 backend/alembic/versions/c3a1f9d24b80_appliance_host_interfaces.py:drop_column:35
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:72
 backend/alembic/versions/c3a81f9d6b42_oui_vendor_lookup.py:drop_column:73

@@ -168,10 +168,9 @@ Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
 equivalent and all raw codes, `opt-NN` on a Windows group included: the
-Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A client class renders into the DHCPv4
-config always, and into the DHCPv6 config when the group has v6 scopes, so
-its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
-refused, because Dhcp4 would reject it.
+Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A
+client class is checked against its own address family (§4); a `dual`
+class accepts an option either family accepts.
 Raw `option_data` is refused: it is for internal producers such as the
 E911 location options (#972).
 
@@ -728,9 +727,59 @@ DHCPClientClass
   match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
   description: str
+  address_family: ipv4 | ipv6 | dual   -- which Kea daemons get it (#1229)
 ```
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
+
+### Address family (#1229, #1295)
+
+Kea runs one daemon per family, and a class goes only into the daemons its
+`address_family` names. Every class used to go into both, and that broke
+things two ways. First, some test tokens exist in only one daemon: `pkt4` and
+`relay4` (option 82 matching) are DHCPv4-only, and `pkt6` and `relay6` are
+DHCPv6-only. kea-dhcp6 rejects the whole config over a `pkt4` test, and
+kea-dhcp4 does the same over `pkt6`. The agent then reverts the bundle for
+**both** daemons. Second, one options map cannot serve both:
+`dns-servers` is an IPv4 list in Dhcp4 and an IPv6 list in Dhcp6.
+
+- `ipv4` / `ipv6` — the class and all its options go to that daemon only.
+  The test may not use the other family's tokens; the API returns a 422
+  saying which token and which family would take it.
+- `dual` — the class goes to both daemons. The test may use neither
+  family's tokens. Each option goes to the daemon it is valid in: an IPv4
+  `dns-servers` to Dhcp4, `domain-search` to both, and `routers` to Dhcp4
+  only, as before. The control plane works out the split, because only it
+  holds the option tables, and ships it to the agent.
+
+Named option lookups in a test (`option[host-name]`) are family-specific
+as well, but by option name, which no short list covers. For those, Kea's
+own check and the agent's revert (#882) are the backstop.
+
+A pool that names a class its daemon does not define is fine to Kea, which
+is exactly the danger: the pool loads and silently matches no client. So
+the API refuses both ways of getting there. Changing a class's family is a
+`409` while a pool in the family it would leave still restricts to it, and
+the pools are named. Setting a pool's `class_restriction` to an operator
+class not rendered for the pool's family is a `422`. Names that are not
+operator classes are not checked: the generated PXE, phone and
+device-policy classes, and Kea's built-in `KNOWN`.
+
+The Kea importer keeps the daemon block each class came from. A class
+defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no
+conflicting options, becomes one `dual` class. Otherwise the second copy
+is flagged for manual review instead of being dropped.
+
+Upgrading backfills the column (migration `c2f7a94e1d58`):
+
+- A test using `pkt6` / `relay6` becomes `ipv6`.
+- A test using `pkt4` / `relay4` becomes `ipv4`, including one that also
+  uses a v6 token, which could never load in either daemon.
+- Any other class becomes `dual` if its group has a live DHCPv6 scope,
+  which is how it rendered before. Otherwise it becomes `ipv4`.
+
+A bundle from a control plane older than this carries no family, so the
+agent renders the class into both daemons as it always did.
 
 Hand-authoring a match expression is not the only way to get a class:
 [§17a](#17a-fingerprint-driven-device-policies-issue-700) compiles one
