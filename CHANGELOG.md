@@ -415,7 +415,22 @@ the formatter handles the rest.
   own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
   keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
   a string over 255 octets is split further. Control characters are
-  stripped. The Technitium TXT path is unchanged (#1694).
+  stripped. The Technitium agent serves the same strings since #1694
+  (next entry).
+
+- **The Technitium agent serves a TXT value as entered (#1694).**
+  The agent sent each TXT value to Technitium as one text string. A
+  value stored already quoted, the way providers print SPF, DMARC
+  and DKIM records (`"v=spf1 -all"`), was served with its quote
+  characters as part of the text, so receivers found no SPF record;
+  two quoted strings were served as one; and a trailing full stop
+  was cut off, as if the value were a host name. The agent now sends
+  Technitium the character-strings the BIND9 and PowerDNS agents
+  serve (the same `drivers/_txt.py` parse, through Technitium's
+  `characterStringsBase64`), keeps a trailing full stop, and compares
+  what the server holds string by string, so a steady zone does not
+  churn. A record an older agent served the old way is replaced once,
+  on the agent's first full reconcile after the upgrade.
 
 - **Rolling-upgrade preflight warns on a SemVer jump that skips a major
   version (#1182).** Between two CalVer releases the version check warns when
