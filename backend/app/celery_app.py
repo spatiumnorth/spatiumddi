@@ -839,9 +839,12 @@ celery_app.conf.update(
 #    reset a dead connection, which makes the socket readable-with-error and
 #    lets the worker's normal "Connection to broker lost" reconnect run.
 # ``socket_timeout`` MUST stay well above kombu's BRPOP block time
-# (``Transport.brpop_timeout`` = 1 s): in the synchronous (non-event-loop)
-# path, e.g. ``celery inspect``, BRPOP blocks that long on the socket and a
-# smaller timeout would turn every idle poll into an error. Unlike
+# (``Transport.brpop_timeout`` = 1 s): the one place a BRPOP reply is read
+# without waiting for the poller first is ``Channel.close()`` draining an
+# outstanding BRPOP, which a live server answers within that 1 s; a smaller
+# timeout would turn a clean close into a connection error. (Both the
+# worker's event loop and the synchronous ``drain_events`` used by
+# ``celery inspect`` poll before reading.) Unlike
 # ``core/redis_client.py`` (whose pub/sub reads are meant to be slow, #925),
 # nothing here parks a read on purpose: celery's result pub/sub consumer calls
 # ``get_message(timeout=…)`` with an explicit timeout, and kombu's fanout

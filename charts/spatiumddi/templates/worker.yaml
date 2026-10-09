@@ -99,12 +99,12 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
-            # 5 x 30 s (was 3): the ping is a broker round trip, and a Redis
-            # master lost with its node takes Sentinel down-after (5 s) +
-            # promotion + the worker noticing its dead sockets (keepalive,
-            # ~25 s, celery_app.py) before it answers again. 3 misses (~90 s)
-            # raced that and killed healthy workers (#1669). 150 s still
-            # catches a genuinely wedged worker.
+            # 5 x 30 s (was 3): the ping is a broker round trip, so it fails
+            # after a Redis master is lost with its node until Sentinel has
+            # promoted a replica AND the worker has noticed its dead sockets
+            # (kernel keepalive, ~25 s; celery_app.py) and reconnected: about
+            # 30-60 s in a blackholed-master test (#1669). 3 misses (60-90 s)
+            # left little margin; 150 s still catches a wedged worker.
             failureThreshold: 5
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
