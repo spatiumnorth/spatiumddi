@@ -100,16 +100,32 @@ def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     )
 
 
+def queued_after(
+    created: datetime, seq: int | None, other_created: datetime, other_seq: int | None
+) -> bool:
+    """Whether an op queued at ``(created, seq)`` came after one queued at
+    ``(other_created, other_seq)`` (#1489).
+
+    ``created_at`` is the transaction START, so ops of different transactions
+    compare by it as before. Ops one transaction queued tie on it and are
+    ordered by ``seq``, the order they were queued in. A row queued before
+    ``seq`` existed (NULL) says nothing about order within its transaction.
+    """
+    if created != other_created:
+        return created > other_created
+    return seq is not None and other_seq is not None and seq > other_seq
+
+
 async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uuid.UUID, uuid.UUID]:
     """For each op, the newest op queued STRICTLY after it for the same server
     and RRset, if any (#1232). One query per server per key chunk.
 
     That newer op carries the whole desired RRset as of a later moment, so it
     already delivers the older op's change; retrying the older one after it
-    would put the old state back. Strictly after: ``created_at`` is the
-    transaction START, so ops queued by one transaction tie, and a tie says
-    nothing about which was stamped last. A ``failed`` or ``superseded`` op is
-    not a successor.
+    would put the old state back. Strictly after, by ``queued_after``: within
+    one transaction that is the queue order (#1489), so a failed delete is
+    superseded by the create queued after it instead of retrying and removing
+    the record again. A ``failed`` or ``superseded`` op is not a successor.
     """
     out: dict[uuid.UUID, uuid.UUID] = {}
     by_server: dict[uuid.UUID, list[tuple[DNSRecordOp, tuple[str, str, str]]]] = {}
@@ -120,7 +136,7 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
     for server_id, keyed in by_server.items():
         earliest = min(op.created_at for op, _ in keyed)
         keys = sorted({k for _, k in keyed})
-        newest: dict[tuple[str, str, str], list[tuple[datetime, uuid.UUID]]] = {}
+        newest: dict[tuple[str, str, str], list[tuple[datetime, int | None, uuid.UUID]]] = {}
         for i in range(0, len(keys), RRSET_KEY_CHUNK):
             rows = (
                 await db.execute(
@@ -130,20 +146,30 @@ async def _successors(db: AsyncSession, ops: Collection[DNSRecordOp]) -> dict[uu
                         _op_name_sql(),
                         _op_type_sql(),
                         DNSRecordOp.created_at,
+                        DNSRecordOp.seq,
                     ).where(
                         DNSRecordOp.server_id == server_id,
-                        DNSRecordOp.created_at > earliest,
+                        # ``>=``: an op of the earliest op's own transaction
+                        # can follow it (#1489).
+                        DNSRecordOp.created_at >= earliest,
                         DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
                         rrset_match_where(keys[i : i + RRSET_KEY_CHUNK]),
                     )
                 )
             ).all()
-            for row_id, zone, name, rtype, created in rows:
-                newest.setdefault((zone, name, rtype), []).append((created, row_id))
+            for row_id, zone, name, rtype, created, seq in rows:
+                newest.setdefault((zone, name, rtype), []).append((created, seq, row_id))
         for op, key in keyed:
-            later = [(c, i) for c, i in newest.get(key, ()) if c > op.created_at]
+            later = [
+                (c, s, i)
+                for c, s, i in newest.get(key, ())
+                if queued_after(c, s, op.created_at, op.seq)
+            ]
             if later:
-                out[op.id] = max(later)[1]
+                # Newest by queue order; ``seq`` is NULL only on rows from
+                # before the column, which cannot share a transaction with
+                # one that has it.
+                out[op.id] = max(later, key=lambda t: (t[0], t[1] or 0))[2]
     return out
 
 

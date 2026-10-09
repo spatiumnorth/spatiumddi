@@ -33,13 +33,18 @@ from spatium_dns_agent.drivers.technitium import (
 
 
 class _FakeResponse:
-    """Stand-in for ``httpx.Response`` — the driver only ever calls
-    ``.json()`` on it."""
+    """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
+    body is a plain-text one (``blocked/export``), whose ``.json()`` raises
+    as httpx's does."""
 
-    def __init__(self, body: dict[str, Any]) -> None:
+    def __init__(self, body: dict[str, Any] | str) -> None:
         self._body = body
+        self.status_code = 200
+        self.text = body if isinstance(body, str) else ""
 
     def json(self) -> dict[str, Any]:
+        if isinstance(self._body, str):
+            raise ValueError("not JSON")
         return self._body
 
 
@@ -1310,6 +1315,88 @@ def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
     assert opt and opt[0][3]["catalog"] == ""
 
 
+# ── Catalog zone retirement (issue #1519) ─────────────────────────────
+
+
+def _deletes(calls) -> list[dict[str, Any]]:
+    return [c[3] for c in calls if c[2] == "zones/delete"]
+
+
+def test_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """Disabling catalog must delete the producer zone, not just clear
+    membership — and the name has to come from agent state, because a
+    disabled catalog block carries no zone name."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    payload = [{"zone": "p.test", "type": "Primary"}]
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, payload)
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    # State is cleared, so a later pass does not re-delete.
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == []
+
+
+def test_secondary_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """A consumer that is turned off keeps transferring from the old
+    producer until its SecondaryCatalog zone is deleted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    calls.clear()
+    d._apply_catalog("t", None, [])
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+
+
+def test_catalog_role_flip_deletes_old_zone_before_creating_new(
+    tmp_path: Path,
+) -> None:
+    """Producer → consumer under the same name: the old Catalog zone
+    must be deleted first, or the SecondaryCatalog create answers
+    "already exists" and the zone keeps its old type."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, [])
+    calls.clear()
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    paths = [c[2] for c in calls]
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    assert paths.index("zones/delete") < paths.index("zones/create")
+    assert next(c for c in calls if c[2] == "zones/create")[3]["type"] == (
+        "SecondaryCatalog"
+    )
+
+
+def test_catalog_same_role_reapply_deletes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    block = {"mode": "producer", "zone_name": "cat.test"}
+    d._apply_catalog("t", block, [])
+    calls.clear()
+    d._apply_catalog("t", block, [])
+    assert _deletes(calls) == []
+
+
+def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "old.test"}, [])
+    calls.clear()
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "new.test"}, [])
+    assert _deletes(calls) == [{"zone": "old.test"}]
+    assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 
 
@@ -1383,12 +1470,24 @@ def test_blocking_payload_collapses_per_view_lists() -> None:
     assert out["blocked"] == ["a.test", "b.test"]
 
 
+def _blocking_responder(live: dict[str, str] | None = None):
+    """``{kind}/export`` answers the plain-text ``live`` set (empty by
+    default); everything else answers ok."""
+    live = live or {}
+
+    def responder(path, params, n):
+        kind, _, op = path.partition("/")
+        if op == "export":
+            return live.get(kind, "")
+        return {"status": "ok"}
+
+    return responder
+
+
 def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
-    """Flush-then-rewrite, not diff: ``blocked/list`` is a one-level tree
-    browser whose intermediate nodes are not themselves blocked domains,
-    so reconciling against a flat read of it deletes whole subtrees."""
+    """A set that differs is flushed, then imported."""
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    calls = _install_fake_request(d, _blocking_responder())
     d._apply_blocking(
         "t",
         {"enabled": True, "blocked": ["a.test"], "allowed": ["b.test"],
@@ -1396,8 +1495,93 @@ def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
     )
     paths = [c[2] for c in calls]
     assert paths[0] == "settings/set"
-    assert paths.index("blocked/flush") < paths.index("blocked/add")
-    assert paths.index("allowed/flush") < paths.index("allowed/add")
+    assert paths.index("blocked/flush") < paths.index("blocked/import")
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+    # #1425: never one call per domain.
+    assert "blocked/add" not in paths and "allowed/add" not in paths
+
+
+def test_apply_blocking_imports_in_chunks_not_one_call_per_domain(tmp_path: Path) -> None:
+    """``blocked/add`` rewrote Technitium's zone file on every call, so a 16k
+    list took ~30 minutes (#1425). ``blocked/import`` takes a comma-separated
+    list and saves once per call."""
+    from spatium_dns_agent.drivers.technitium import _BLOCKING_IMPORT_CHUNK
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder())
+    domains = [f"d{i:05d}.test" for i in range(12001)]
+    d._apply_blocking(
+        "t", {"enabled": True, "blocked": domains, "blocking_type": "NxDomain"}
+    )
+    imports = [c for c in calls if c[2] == "blocked/import"]
+    assert len(imports) == -(-len(domains) // _BLOCKING_IMPORT_CHUNK)
+    sent = [x for c in imports for x in c[3]["blockedZones"].split(",")]
+    assert sorted(sent) == sorted(domains)
+    assert all(c[1] == "POST" for c in imports)  # form body, not a URL
+
+
+def test_apply_blocking_leaves_an_unchanged_set_alone(tmp_path: Path) -> None:
+    """A structural apply that did not touch a blocklist rewrites nothing:
+    no flush, so no window without blocking (#1425)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "b.test\na.test\n", "allowed": "c.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test", "B.test."], "allowed": ["c.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert not any(p.endswith(("/flush", "/import")) for p in paths)
+
+
+def test_apply_blocking_rewrites_only_the_set_that_changed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "a.test\n", "allowed": "old.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test"], "allowed": ["new.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" not in paths
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+
+
+def test_apply_blocking_rewrites_when_the_live_set_is_unreadable(tmp_path: Path) -> None:
+    """An error answer to export is not trusted as "already matches"."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path.endswith("/export"):
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(d, responder)
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert "blocked/import" in [c[2] for c in calls]
+
+
+def test_apply_blocking_empty_list_still_clears_the_daemon(tmp_path: Path) -> None:
+    """An emptied list has to actually clear on the daemon."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder({"blocked": "stale.test\n"}))
+    d._apply_blocking("t", {"enabled": True, "blocked": [], "blocking_type": "NxDomain"})
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" in paths
+    assert "blocked/import" not in paths
+
+
+def test_idn_entries_compare_in_their_ascii_form() -> None:
+    """Technitium stores and exports the IDNA form, so comparing the Unicode
+    spelling would read an IDN entry as changed on every apply."""
+    from spatium_dns_agent.drivers.technitium import _ascii_domain
+
+    assert _ascii_domain("Bücher.Test.") == "xn--bcher-kva.test"
+    assert _ascii_domain("plain.test") == "plain.test"
 
 
 def test_apply_blocking_rejects_unknown_blocking_type(tmp_path: Path) -> None:
@@ -1508,3 +1692,237 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── Zone apex: SOA + NS from the zone's own settings ───────────────────
+#
+# Technitium writes its own apex at zone create: one NS and an SOA MNAME
+# naming the server's host name (the pod name, under the DNS VIP) and a
+# placeholder RNAME. The SOA-update semantics below were checked against a
+# live technitium/dns-server:15.4.0: ``zones/records/update`` for type SOA
+# refuses a call without ``serial`` and stores current + 1, takes the RNAME
+# in either SOA or address form and reads it back as an address, and
+# ``zones/records/get`` without ``listZone`` returns the apex records only.
+
+
+def _render_zone(tmp_path: Path, zone: dict[str, Any]) -> dict[str, Any]:
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(_zone_bundle(zones=[zone]))
+    return _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())[0]
+
+
+def test_render_apex_from_primary_ns_and_admin_email(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "home.example.test.",
+            "type": "primary",
+            "ttl": 300,
+            "primary_ns": "ns.home.example.test.",
+            "admin_email": "hostmaster.example.test.",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+            "records": [{"name": "ns", "type": "A", "value": "192.0.2.53"}],
+        },
+    )
+    assert out["apex"] == {
+        "ns": ["ns.home.example.test"],
+        "soa": {
+            "primaryNameServer": "ns.home.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+        },
+        "ttl": 300,
+    }
+
+
+def test_render_apex_declared_ns_records_win(tmp_path: Path) -> None:
+    """The zone's own apex NS records are the NS set (#1153's precedence);
+    a relative target is relative to the zone, as in a zone file."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "example.test.",
+            "type": "primary",
+            "primary_ns": "ns0.elsewhere.test",
+            "records": [
+                {"name": "@", "type": "NS", "value": "ns1.example.test."},
+                {"name": "@", "type": "NS", "value": "ns2"},
+                {"name": "sub", "type": "NS", "value": "ns.sub.example.test."},
+            ],
+        },
+    )
+    assert out["apex"]["ns"] == ["ns1.example.test", "ns2.example.test"]
+    # MNAME is still the Primary NS when one is set.
+    assert out["apex"]["soa"]["primaryNameServer"] == "ns0.elsewhere.test"
+    # The delegation stays an ordinary record.
+    assert [r["domain"] for r in out["records"] if r["type"] == "NS"] == ["sub.example.test"]
+
+
+def test_render_apex_absent_when_zone_sets_nothing(tmp_path: Path) -> None:
+    """A zone with no Primary NS or Admin Email keeps the daemon's apex
+    untouched — the behaviour before the apex was managed. The bundle ships
+    every zone's SOA timers since #1171 (the defaults, here), so they alone
+    must not make an apex."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "plain.test.",
+            "type": "primary",
+            "ttl": 3600,
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 86400,
+            "minimum": 300,
+            "records": [],
+        },
+    )
+    assert "apex" not in out
+    out = _render_zone(
+        tmp_path, {"name": "bare.test.", "type": "primary", "ttl": 3600, "records": []}
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_only_for_primary_zones(tmp_path: Path) -> None:
+    """A secondary's apex comes from the transfer, so it is not ours."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "s.test.",
+            "type": "secondary",
+            "masters": ["192.0.2.1"],
+            "primary_ns": "ns.s.test.",
+        },
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_ignores_unusable_values(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "x.test.",
+            "type": "primary",
+            "primary_ns": "  ",
+            "admin_email": "nodots",
+            "minimum": True,  # a bool is not a timer
+            "refresh": -1,
+        },
+    )
+    assert "apex" not in out
+
+
+def test_responsible_person_forms() -> None:
+    from spatium_dns_agent.drivers.technitium import _responsible_person
+
+    assert _responsible_person("hostmaster.example.test.") == "hostmaster@example.test"
+    assert _responsible_person("first\\.last.example.test.") == "first.last@example.test"
+    assert _responsible_person("Admin@Example.test") == "admin@example.test"
+    assert _responsible_person("nodots") is None
+    assert _responsible_person("") is None
+    assert _responsible_person(None) is None
+
+
+def _apex_reconcile(
+    driver: TechnitiumDriver,
+    apex_records: list[dict[str, Any]],
+    apex: dict[str, Any],
+    fail_paths: set[str] = frozenset(),  # type: ignore[assignment]
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        if path == "zones/records/get":
+            if params.get("listZone") == "true":
+                return {"status": "ok", "response": {"records": []}}
+            return {"status": "ok", "response": {"records": apex_records}}
+        if path in fail_paths:
+            return {"status": "error", "errorMessage": "boom"}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(driver, _responder)
+    driver._reconcile_zones(
+        "tok-1", [{"zone": "example.test", "type": "Primary", "records": [], "apex": apex}]
+    )
+    return calls
+
+
+_DAEMON_APEX = [
+    {"name": "example.test", "type": "NS", "ttl": 14400,
+     "rData": {"nameServer": "dns-technitium-snw7c"}},
+    {"name": "example.test", "type": "SOA", "ttl": 900,
+     "rData": {"primaryNameServer": "dns-technitium-snw7c",
+               "responsiblePerson": "hostadmin@example.test", "serial": 41,
+               "refresh": 900, "retry": 300, "expire": 604800, "minimum": 900}},
+]
+
+_WANTED_APEX = {
+    "ns": ["ns.example.test"],
+    "soa": {"primaryNameServer": "ns.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300},
+    "ttl": 300,
+}
+
+
+def test_reconcile_apex_rewrites_daemon_soa_and_ns(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX)
+    writes = [(c[2], c[3]) for c in calls if c[2] != "zones/create" and c[2] != "zones/records/get"]
+
+    soa = [p for path, p in writes if path == "zones/records/update"]
+    assert len(soa) == 1
+    assert soa[0]["type"] == "SOA"
+    assert soa[0]["serial"] == 41  # the current serial, which the daemon requires
+    assert soa[0]["primaryNameServer"] == "ns.example.test"
+    assert soa[0]["responsiblePerson"] == "hostmaster@example.test"
+    assert (soa[0]["refresh"], soa[0]["retry"], soa[0]["minimum"], soa[0]["ttl"]) == (
+        3600, 600, 300, 300)
+
+    ns_ops = [(path, p["nameServer"]) for path, p in writes if p.get("type") == "NS"]
+    # The new name server goes in before the daemon's own comes out.
+    assert ns_ops == [
+        ("zones/records/add", "ns.example.test"),
+        ("zones/records/delete", "dns-technitium-snw7c"),
+    ]
+
+
+def test_reconcile_apex_is_a_noop_when_converged(tmp_path: Path) -> None:
+    """Every SOA write bumps the serial, so a converged apex must cost one
+    read and nothing else."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    converged = [
+        {"name": "example.test", "type": "NS", "ttl": 300,
+         "rData": {"nameServer": "ns.example.test"}},
+        {"name": "example.test", "type": "SOA", "ttl": 300,
+         "rData": {"primaryNameServer": "ns.example.test",
+                   "responsiblePerson": "hostmaster@example.test", "serial": 42,
+                   "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300}},
+    ]
+    calls = _apex_reconcile(d, converged, _WANTED_APEX)
+    assert [c[2] for c in calls if c[2] != "zones/create"] == [
+        "zones/records/get",  # the zone's records
+        "zones/records/get",  # its apex
+    ]
+
+
+def test_reconcile_apex_keeps_old_ns_when_the_add_fails(tmp_path: Path) -> None:
+    """Never leave the zone without a name server."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX, fail_paths={"zones/records/add"})
+    assert "zones/records/delete" not in [c[2] for c in calls]
+
+
+def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
+    """No ``apex`` in the payload (an older render, or a zone that sets
+    nothing): the daemon's own SOA and NS are not even read."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]

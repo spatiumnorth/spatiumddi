@@ -56,6 +56,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.backup.archive import (
+    MAX_ARCHIVE_BYTES,
     BackupArchiveError,
     _pg_env_from_url,
     _pg_subprocess_env,
@@ -709,7 +710,10 @@ async def _assert_audit_chain(
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
-        f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
+        f"; first at seq {first.seq} ({first.reason}: {first.action} "
+        f"{first.resource_type} {first.resource_id})"
+        if first is not None
+        else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
 
@@ -991,6 +995,21 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         Assertion("archive_available", PASS, f"{newest.filename} ({newest.size_bytes} bytes)")
     )
 
+    if newest.size_bytes > MAX_ARCHIVE_BYTES:
+        # Same destination-download cap as the API (#1568): the
+        # listing already declares the size, so refuse before the
+        # bytes are fetched into memory at all.
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=(
+                f"archive {newest.filename} declares {newest.size_bytes} bytes, "
+                f"which exceeds the {MAX_ARCHIVE_BYTES}-byte cap for "
+                "destination downloads"
+            ),
+        )
+
     try:
         # Bounded explicitly: the destination drivers impose no ceiling
         # of their own, and an unbounded fetch would make the sweep's
@@ -1077,7 +1096,9 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         )
 
     try:
-        payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        # Same off-loop derivation as the restore path (#1568): the
+        # PBKDF2 cost is deliberate CPU work, not event-loop work.
+        payload = await asyncio.to_thread(decrypt_secrets, secrets_enc, passphrase=passphrase)
     except BackupCryptoError as exc:
         assertions.append(
             Assertion(

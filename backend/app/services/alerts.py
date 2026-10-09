@@ -142,6 +142,12 @@ RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
 # above), not the generic evaluator — the task opens/resolves the
 # event itself off the version-vs-head comparison.
 RULE_TYPE_SCHEMA_BEHIND_HEAD = "schema_behind_head"
+# ACME auto-renewal cannot renew a certificate whose issuance shape
+# needs a person (manual DNS-01 for domains SpatiumDDI doesn't host).
+# The renewal sweep (``app.tasks.acme``) skips such certs and opens an
+# event against this rule instead of minting an order that can never
+# succeed (#1529). Managed directly by the sweep, not the evaluator.
+RULE_TYPE_ACME_MANUAL_RENEWAL = "acme_manual_renewal"
 # Voice-VLAN client-count drop — issue #112 phase 2. Counts active
 # DHCP leases on every subnet tagged ``subnet_role='voice'``; fires
 # when the count drops below ``threshold_percent`` (reused as a raw
@@ -617,6 +623,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_COMPLIANCE_CHANGE,
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         RULE_TYPE_SCHEMA_BEHIND_HEAD,
+        RULE_TYPE_ACME_MANUAL_RENEWAL,
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
@@ -669,6 +676,8 @@ _EXTERNALLY_DRIVEN_RULE_TYPES: frozenset[str] = frozenset(
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         # ``app.tasks.schema_check`` (#565).
         RULE_TYPE_SCHEMA_BEHIND_HEAD,
+        # ``app.tasks.acme.renew_due_certificates`` (#1529).
+        RULE_TYPE_ACME_MANUAL_RENEWAL,
         # The rolling-upgrade orchestrator (``services/upgrades/alerts.py``).
         _CLUSTER_UPGRADE_FAILED,
     }
@@ -3255,7 +3264,7 @@ async def _matching_secret_expiring_subjects(
         message = (
             f"API token '{t.name}' ({t.prefix}…) {_descriptor(days)} "
             f"({t.expires_at.isoformat()}, threshold {threshold_days} d). "
-            f"Rotate it from Settings → API Tokens."
+            f"Rotate it from Administration → API Tokens."
         )
         matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
 
@@ -3564,9 +3573,11 @@ async def _matching_agent_config_rejected_subjects(
     from app.models.dns import DNSServer  # noqa: PLC0415
     from app.services.agents.config_apply import (  # noqa: PLC0415
         FAILED_STATUSES,
+        PARTIAL_APPLY_PREFIX,
         SEVERITY_BY_STATUS,
         STATUS_NO_PREVIOUS,
         STATUS_REVERT_FAILED,
+        is_partial_apply,
     )
 
     matches: list[tuple[str, str, str, str | None]] = []
@@ -3583,6 +3594,7 @@ async def _matching_agent_config_rejected_subjects(
         )
         for row in rows:
             status = row.config_apply_status or ""
+            what: str | None
             if status == STATUS_NO_PREVIOUS:
                 what = (
                     "could not apply the configuration and had no previously-working "
@@ -3593,17 +3605,28 @@ async def _matching_agent_config_rejected_subjects(
                     "could not apply the configuration AND failed to roll back to the "
                     "previous one — its running state is unknown"
                 )
+            elif is_partial_apply(status, row.config_apply_error):
+                what = None
             else:
                 what = (
                     "rejected the configuration and rolled back to the last one that "
                     "worked, so it is healthy but NOT serving what is saved here"
                 )
             detail = (row.config_apply_error or "").strip()
-            message = (
-                f"{kind} server '{row.name}' {what}. "
-                f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
-                + (f" Daemon reported: {detail}" if detail else "")
-            )
+            if what is None:
+                # Nothing was rolled back: the bundle is live and every zone
+                # but the refused ones is served as saved.
+                refused = detail[len(PARTIAL_APPLY_PREFIX) :]
+                message = (
+                    f"{kind} server '{row.name}' applied the configuration, but {refused}. "
+                    "Nothing was rolled back; fix the refused zones' data."
+                )
+            else:
+                message = (
+                    f"{kind} server '{row.name}' {what}. "
+                    f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
+                    + (f" Daemon reported: {detail}" if detail else "")
+                )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append(
                 (subject_id, f"{row.name} ({kind})", message, SEVERITY_BY_STATUS.get(status))
@@ -4787,6 +4810,50 @@ async def seed_schema_behind_head_alert_rule() -> None:
         await session.commit()
 
 
+_ACME_MANUAL_RENEWAL_RULE_NAME = "acme-manual-renewal"
+
+
+async def seed_acme_manual_renewal_alert_rule() -> None:
+    """Seed the singleton ``acme-manual-renewal`` rule (#1529).
+
+    Enabled by default — a Let's Encrypt cert that auto-renewal must
+    skip because its issuance shape needs a person (manual DNS-01)
+    should page loudly instead of silently expiring while the sweep
+    mints orders that can never succeed. Keyed on ``name``; an operator
+    who disables / renames it is never overridden by a later boot.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _ACME_MANUAL_RENEWAL_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_ACME_MANUAL_RENEWAL_RULE_NAME,
+                description=(
+                    "Fires when the ACME auto-renewal sweep finds an active "
+                    "Let's Encrypt certificate inside its renewal window whose "
+                    "issuance shape cannot be renewed unattended (manual "
+                    "DNS-01 for domains SpatiumDDI does not host). The sweep "
+                    "skips the cert instead of creating an order that can "
+                    "never succeed; renew it by hand via a fresh ACME issue. "
+                    "Auto-resolves when the sweep next renews the cert."
+                ),
+                rule_type=RULE_TYPE_ACME_MANUAL_RENEWAL,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=True,
+            )
+        )
+        await session.commit()
+
+
 async def seed_firewall_apply_stalled_alert_rule() -> None:
     """Seed the singleton ``firewall.apply_stalled`` rule (issue #285 Phase 2d).
 
@@ -5680,7 +5747,8 @@ async def seed_bgp_hijack_alert_rules() -> None:
                 "critical when RPKI says the announcement is invalid, warning "
                 "when RPKI coverage is unknown. Auto-resolves when the "
                 "announcement delists or is acknowledged. Enable once BGP "
-                "monitoring (Settings → bgp_monitoring_enabled) is on."
+                "monitoring is on: the bgp_monitoring_enabled platform setting, "
+                "set through the settings API (the console has no switch for it)."
             ),
         ),
         (

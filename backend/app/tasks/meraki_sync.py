@@ -61,13 +61,16 @@ async def _run_sweep() -> dict[str, Any]:
                     if elapsed < timedelta(seconds=org.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                org_name = org.name  # a failed flush expires org
                 try:
                     summary = await reconcile_org(db, org)
                 except Exception as exc:  # noqa: BLE001 — one org shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{org.name}: {exc}")
-                    logger.warning("meraki_reconcile_crash", org=str(org.id), error=str(exc))
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next org still syncs.
                     await db.rollback()
+                    errors.append(f"{org_name}: {exc}")
+                    logger.warning("meraki_reconcile_crash", org=str(org_id), error=str(exc))
                     continue
                 ran += 1
                 if summary.ok:

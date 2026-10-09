@@ -1,4 +1,5 @@
 import contextvars
+import functools
 import importlib
 import sys
 from collections.abc import Mapping
@@ -18,6 +19,50 @@ from celery.signals import (
 
 from app.config import settings
 
+# ── Broker connection pool bounds (GHSA-c58p-8cq9-g3gm) ─────────────────
+#
+# Every ``.delay()`` and every ``inspect`` broadcast checks a connection out
+# of kombu's per-process pool, and both Celery and kombu acquire with
+# ``block=True`` and NO timeout — there is no Celery setting for one. A
+# broadcast holds one connection while it acquires a second for its
+# producer, so enough concurrent holders exhaust the pool and every later
+# acquire waits forever; in the api that wait ran on the event loop and hung
+# the whole process until restart. The limit is pinned explicitly (it is
+# kombu's default of 10, now a decision rather than an accident) and an
+# exhausted pool raises ``kombu.exceptions.LimitExceeded`` after
+# ``BROKER_POOL_ACQUIRE_TIMEOUT_S`` instead of blocking.
+BROKER_POOL_LIMIT = 10
+BROKER_POOL_ACQUIRE_TIMEOUT_S = 5.0
+
+
+def _install_pool_acquire_timeout() -> None:
+    """Give kombu's blocking pool acquires a default timeout.
+
+    ``kombu.resource.Resource.acquire`` is the one method both the
+    connection pool and the producer pool acquire through. Only a call that
+    would block forever (``block=True, timeout=None``) is changed; an
+    explicit timeout or a non-blocking acquire passes through untouched.
+    Idempotent, so a re-import does not wrap twice.
+    """
+    from kombu.resource import Resource  # noqa: PLC0415
+
+    original = Resource.acquire
+    if getattr(original, "_spatium_acquire_timeout", False):
+        return
+
+    @functools.wraps(original)
+    def acquire(self: Any, block: bool = False, timeout: float | None = None) -> Any:
+        if block and timeout is None:
+            # Read at call time so the bound stays a single module constant.
+            timeout = BROKER_POOL_ACQUIRE_TIMEOUT_S
+        return original(self, block=block, timeout=timeout)
+
+    acquire._spatium_acquire_timeout = True  # type: ignore[attr-defined]
+    Resource.acquire = acquire  # type: ignore[method-assign]
+
+
+_install_pool_acquire_timeout()
+
 celery_app = Celery(
     "spatiumddi",
     broker=settings.celery_broker_url,
@@ -26,6 +71,7 @@ celery_app = Celery(
         "app.tasks.ipam_dns_sync",
         "app.tasks.ipam_utilization_recount",
         "app.tasks.dns",
+        "app.tasks.blocklist_refresh_sweep",
         "app.tasks.dns_pull",
         "app.tasks.looking_glass",
         "app.tasks.dhcp_health",
@@ -101,10 +147,12 @@ celery_app.conf.update(
     task_acks_late=True,  # Required for idempotency — task not acked until complete
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
+    broker_pool_limit=BROKER_POOL_LIMIT,
     task_routes={
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.ipam_utilization_recount.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+        "app.tasks.blocklist_refresh_sweep.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
@@ -222,6 +270,13 @@ celery_app.conf.update(
         "lg-route-reresolve-sweep": {
             "task": "app.tasks.looking_glass.reresolve_route_links",
             "schedule": schedule(run_every=300.0),
+        },
+        # Every hour, queue a feed refresh for each enabled URL blocklist
+        # whose ``update_interval_hours`` has elapsed since its last sync
+        # (#1467). 0 = manual only. Hourly is the granularity, as for OUI.
+        "dns-blocklist-refresh": {
+            "task": "app.tasks.blocklist_refresh_sweep.dispatch_due_blocklists",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
@@ -423,6 +478,14 @@ celery_app.conf.update(
         "acme-renew-due": {
             "task": "app.tasks.acme.renew_due_certificates",
             "schedule": schedule(run_every=12 * 3600.0),
+        },
+        # Hourly, sweep stale ACME TXT records older than 24 h — the
+        # provider-path janitor plus the embedded client's stranded
+        # ``_acme-challenge`` records (#1530). The sweep function had
+        # no caller before this entry existed.
+        "acme-stale-txt-sweep": {
+            "task": "app.tasks.acme.sweep_stale_acme_txt_records",
+            "schedule": schedule(run_every=3600.0),
         },
         # Daily DNSBL / RBL reputation sweep of every public-facing
         # candidate IP against the enabled blocklists (issue #528). Gated

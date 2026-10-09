@@ -89,6 +89,7 @@ class FindTLSCertArgs(BaseModel):
 
 @register_tool(
     name="find_tls_cert",
+    permission=("read", "tls_cert"),
     description=(
         "List monitored TLS certificate targets. Each row carries host, "
         "state (ok / expiring / expired / mismatch / unreachable), subject "
@@ -141,6 +142,7 @@ class CountTLSCertsExpiringArgs(BaseModel):
 
 @register_tool(
     name="count_tls_certs_expiring",
+    permission=("read", "tls_cert"),
     description=(
         "Count monitored TLS certs expiring within N days (default 30), "
         "bucketed ≤7 / ≤14 / ≤30 / ≤90 days, plus the soonest-expiring "
@@ -201,6 +203,7 @@ class GetCertChainArgs(BaseModel):
 
 @register_tool(
     name="get_cert_chain",
+    permission=("read", "tls_cert"),
     description=(
         "Return the latest successful probe's parsed certificate for one "
         "target: subject / issuer CN, serial, validity window, SANs, key "
@@ -255,6 +258,7 @@ class CountTLSTargetsByStateArgs(BaseModel):
 
 @register_tool(
     name="count_tls_targets_by_state",
+    permission=("read", "tls_cert"),
     description=(
         "Coarse health rollup of monitored TLS endpoints grouped by state "
         "(ok / expiring / expired / mismatch / unreachable / unknown). Use "
@@ -286,6 +290,7 @@ class FindCTLogEntriesArgs(BaseModel):
 
 @register_tool(
     name="find_ct_log_entries",
+    permission=("read", "tls_cert"),
     description=(
         "Cross-reference a host/domain against public Certificate "
         "Transparency logs (crt.sh) — every CA-logged cert issued for the "
@@ -311,6 +316,7 @@ async def find_ct_log_entries(
 
 @register_tool(
     name="propose_run_cert_probe",
+    permission=("write", "tls_cert"),
     description=(
         "Prepare a proposal to probe a TLS cert target now. The operator "
         "must click Apply for the probe to run — it opens a real TLS "
