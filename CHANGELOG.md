@@ -84,6 +84,58 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One zone BIND's zone check refuses no longer stops record changes
+  in every zone on its server (#1403).** Since #1279 the BIND9 agent
+  runs `named-checkzone` on each zone file a render changes, and one
+  refused file failed the whole apply: the agent quarantined the
+  server's whole config bundle and returned before anything in it went
+  live. No record change in any zone of that server was served until
+  the bad data was removed, and the retry backed off to 300 s. An apex
+  NS naming a host inside the zone that has no address is one input
+  the API still accepts. A refused zone is now held back on its own,
+  the way named treats a zone file it cannot load: a zone already
+  served keeps its last good copy, a new one is not served, and
+  everything else in the bundle applies. The server reports the hold
+  as `reverted`, naming each zone and the zone check's reason, leaves
+  the zone out of its zone-state report, and re-renders the next
+  bundle, so the zone goes live as soon as its data loads (on a group
+  without views, deleting the bad record is enough). A zone check that
+  cannot run at all still fails the apply.
+
+- **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
+  TXT values are stored unquoted, and the BIND9 agent dropped them
+  into zone files and RFC 2136 updates verbatim — so a `;` in a
+  DMARC value started a zone-file comment and spaces in an SPF
+  value split it into character-strings resolvers join without the
+  spaces. The BIND9 and PowerDNS agent drivers and the backend
+  BIND9/PowerDNS drivers now share one quoting helper per package
+  (`drivers/_txt.py` in the agent, `drivers/dns/_txt.py` in the
+  backend). An unquoted value is one string, split into 255-*octet*
+  character-strings without splitting a UTF-8 character (the old
+  copies cut at 255 characters after escaping, which could split an
+  escape sequence and exceed the octet limit). An already-quoted
+  value is served exactly as entered: each quoted string stays its
+  own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
+  keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
+  a string over 255 octets is split further. Control characters are
+  stripped. The Technitium TXT path is unchanged (#1694).
+
+- **Rolling-upgrade preflight warns on a SemVer jump that skips a major
+  version (#1182).** Between two CalVer releases the version check warns when
+  the target is more than 90 days newer. SemVer tags carry no date, so between
+  two SemVer releases every forward jump passed silently, 1.2.0 to 4.0.0
+  included. It now warns when the jump crosses more than one major version
+  (1.x to 3.x) and suggests stopping at each major in between. 1.x to 2.x,
+  and minor and patch jumps, never warn, and the switch from CalVer to 1.0.0
+  is never a skip. A warning, not a refusal: two rolling upgrades back to back
+  stay supported.
+
+- **A CalVer release tag with a leading-zero release number is refused
+  (#1182).** `2026.10.07-01` parsed to the same release as `2026.10.07-1`, and
+  the chart-version rewrite published both as chart `2026.10.7-1`.
+  `scripts/release_version.py` now refuses it, and `-0`, the same way it
+  already refused `1.0.0-rc.01`.
+
 - **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
   with `is_active: false` only set the flag: the account's sessions
   were refused while it stayed disabled, but they stayed valid, so
@@ -1300,24 +1352,6 @@ the formatter handles the rest.
   65535s, communities must be `ASN:NN` or `large:A:B:C`, and the
   aggregation length 0–32. The "known issue" notes in `TOPOLOGIES.md`,
   `APPLIANCE.md` and `TROUBLESHOOTING.md` are removed.
-
-- **One zone BIND's zone check refuses no longer stops record changes
-  in every zone on its server (#1403).** Since #1279 the BIND9 agent
-  runs `named-checkzone` on each zone file a render changes, and one
-  refused file failed the whole apply: the agent quarantined the
-  server's whole config bundle and returned before anything in it went
-  live. No record change in any zone of that server was served until
-  the bad data was removed, and the retry backed off to 300 s. An apex
-  NS naming a host inside the zone that has no address is one input
-  the API still accepts. A refused zone is now held back on its own,
-  the way named treats a zone file it cannot load: a zone already
-  served keeps its last good copy, a new one is not served, and
-  everything else in the bundle applies. The server reports the hold
-  as `reverted`, naming each zone and the zone check's reason, leaves
-  the zone out of its zone-state report, and re-renders the next
-  bundle, so the zone goes live as soon as its data loads (on a group
-  without views, deleting the bad record is enough). A zone check that
-  cannot run at all still fails the apply.
 
 - **Replacing a dead control-plane node no longer uninstalls the control
   plane (#1313).** A Replace drops the node from the committed

@@ -37,6 +37,7 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
+from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
@@ -641,6 +642,12 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
     carries (#773), so a multi-value MX or SRV composes identically either way.
     """
     rtype_u = rtype.upper()
+    if rtype_u == "TXT":
+        # TXT must reach the wire quoted (issue #1514): an unquoted
+        # value is parsed by BIND as zone-file syntax, so a ``;``
+        # truncates SPF/DMARC at a comment and spaces split the value
+        # into separate character-strings resolvers concatenate wrong.
+        return _quote_txt(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -1728,7 +1735,10 @@ class Bind9Driver(DriverBase):
             # weight+port for SRV) before the target. The control plane
             # stores those in separate columns; compose the wire shape
             # here so ``named-checkzone`` parses the zone cleanly.
-            if rtype == "MX" and rec.get("priority") is not None:
+            if rtype == "TXT":
+                # Quote TXT (issue #1514) — see _wire_value.
+                value = _quote_txt(value)
+            elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
             elif (
@@ -2711,7 +2721,7 @@ class Bind9Driver(DriverBase):
         if exe is None:
             return None
         try:
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 [exe, "-v"],
                 capture_output=True,
                 text=True,
