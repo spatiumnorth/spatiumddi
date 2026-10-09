@@ -169,6 +169,21 @@ the formatter handles the rest.
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
 
+- **Records put into a zone by its zone-file import are served
+  (#1683).** Importing a zone file into an existing zone wrote the
+  new, changed and removed records to the database and stopped
+  there: it queued no record op and left the zone's serial alone. An
+  agent applies a record change from a record op (records stay out of
+  the bundle's structural fingerprint in a group without views), and
+  an agentless provider only through its driver, so the imported
+  records were not served until something else re-rendered the zone,
+  in the report the next record write in it. The import now queues
+  its changes as one batch of record ops on one serial bump, as the
+  record API does, removals first so a CNAME that replaces an A can
+  land. When an agentless provider does not take every change, the
+  response carries `provider_warning` and the import's audit entry
+  reads error (#1538).
+
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
   2026.10.02-1, where Plan → Start never got past the upgrade lease:
