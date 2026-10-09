@@ -30,6 +30,7 @@ strand the row in ``running`` forever.
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 
 import structlog
@@ -40,6 +41,11 @@ from app.db import task_session
 from app.services.upgrades.orchestrator import OrchestratorError, drive_upgrade
 
 logger = structlog.get_logger(__name__)
+
+# A handed-off drive that lands back on the node it is leaving is passed on
+# again, up to this many times, this many seconds apart (#1449).
+_MAX_HANDOFF_HOPS = 30
+_HANDOFF_HOP_DELAY_S = 5
 
 
 async def _async_drive(run_id: str) -> dict[str, str]:
@@ -60,7 +66,14 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # halt-on-failure handles step-level failures; this catches
             # the rarer "the loop itself crashed" case.
             from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
+            from app.services.upgrades import mutex  # noqa: PLC0415
 
+            # The failure may have left the session in a failed transaction
+            # (a flush that raised); without this every statement below
+            # raises PendingRollbackError, the row is never marked failed,
+            # and the run sits in ``planned`` / ``running`` with no error
+            # (#1449).
+            await db.rollback()
             row = await db.get(SystemUpgradeRun, rid)
             if row is not None and row.state in ("planned", "running"):
                 row.state = "failed"
@@ -69,6 +82,10 @@ async def _async_drive(run_id: str) -> dict[str, str]:
 
                 row.finished_at = datetime.now(UTC)
                 await db.commit()
+            # A failed run holds the lease for nothing; left held, the next
+            # Start is refused until it expires. Only ours, never another
+            # worker's that took it over.
+            mutex.release_if_held()
             logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 
@@ -91,7 +108,28 @@ async def _async_drive(run_id: str) -> dict[str, str]:
     # /resume endpoint with full agency.
     max_retries=2,
 )
-def drive_upgrade_run(self: object, run_id: str) -> dict[str, str]:  # type: ignore[type-arg]
+def drive_upgrade_run(  # type: ignore[type-arg]
+    self: object,
+    run_id: str,
+    avoid_node: str | None = None,
+    hops: int = 0,
+) -> dict[str, str]:
     """Celery entrypoint. ``run_id`` is the SystemUpgradeRun UUID as a
-    str (Celery's JSON serializer can't carry UUIDs directly)."""
+    str (Celery's JSON serializer can't carry UUIDs directly).
+
+    ``avoid_node`` is set by a drive handing itself off before the node its
+    worker runs on is drained (#1449). A worker on that node passes the task
+    on rather than running it, so a worker elsewhere takes it. After
+    ``_MAX_HANDOFF_HOPS`` passes (no other worker took it, say every other
+    worker is down) it runs here anyway: a drive evicted mid-chain is
+    redelivered later, which beats one that never runs."""
+    own = os.environ.get("NODE_NAME") or None
+    if avoid_node and own == avoid_node and hops < _MAX_HANDOFF_HOPS:
+        drive_upgrade_run.apply_async(  # type: ignore[attr-defined]
+            args=[run_id],
+            kwargs={"avoid_node": avoid_node, "hops": hops + 1},
+            countdown=_HANDOFF_HOP_DELAY_S,
+        )
+        logger.info("upgrade_drive_passed_on", run_id=run_id, node=own, hops=hops + 1)
+        return {"run_id": run_id, "state": "passed_on"}
     return asyncio.run(_async_drive(run_id))
