@@ -576,3 +576,66 @@ def test_capabilities_shape() -> None:
     assert caps["dnssec_online"] is False
     assert "CAA" in caps["record_types"]
     assert "HTTPS" not in caps["record_types"]
+
+
+# ── SRV split-form contract (#1526) ─────────────────────────────────────────
+
+
+async def test_apply_record_create_srv_packs_weight_port_into_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vultr has a priority field but no weight/port fields: SRV data is
+    "<weight> <port> <target>" with priority kept separate."""
+    fake = _FakeClient({"post": [_FakeResponse(201, {"record": {"id": "srv1"}})]})
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["data"] == "20 5060 sip.example.com"
+    assert post["json"]["priority"] == 10
+
+
+async def test_list_zone_records_splits_srv_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    records = _records_env(
+        [
+            {
+                "id": "r9",
+                "name": "_sip._tcp",
+                "type": "SRV",
+                "data": "20 5060 sip.example.com",
+                "ttl": 3600,
+                "priority": 10,
+            }
+        ]
+    )
+    fake = _FakeClient({"get": [_FakeResponse(200, records)]})
+    driver = _patch_client(monkeypatch, fake)
+
+    recs = await driver._list_zone_records(_Server(), _CREDS, "example.com.")
+
+    assert recs == [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    ]

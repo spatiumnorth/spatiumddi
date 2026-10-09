@@ -272,3 +272,50 @@ def test_a_dropped_redirect_leaves_the_owner_free(tmp_path: Path) -> None:
         ],
     )
     assert lines == ["dup.example.test CNAME ."]
+
+
+def test_streamed_file_is_byte_identical_to_the_joined_render(tmp_path: Path) -> None:
+    """#1109 Part 3 — the renderer streams to disk instead of building
+    ``"\\n".join(lines) + "\\n"``. The bytes must not change: this pins the
+    exact file the old implementation produced for an input covering
+    wildcards, both redirect shapes, a dropped redirect, a case-variant
+    duplicate across lists, an excepted entry and exceptions."""
+    entries = [
+        {"domain": "Ads.Example.test.", "action": "block", "is_wildcard": True},
+        {"domain": "ads.example.test", "action": "block", "block_mode": "sinkhole"},
+        {"domain": "sink.test", "block_mode": "sinkhole"},
+        {
+            "domain": "redir.test",
+            "action": "redirect",
+            "target": "safe.example.",
+            "is_wildcard": True,
+        },
+        {"domain": "redir-ip.test", "action": "redirect", "target": "192.0.2.7"},
+        {"domain": "bad.test", "action": "redirect", "target": "has space"},
+        {"domain": "excepted.test", "action": "block"},
+    ]
+    out = tmp_path / "sub" / "rpz.zone"
+    Bind9Driver(state_dir=tmp_path)._write_rpz_zone_file(
+        out,
+        {
+            "rpz_zone_name": "z.rpz.",
+            "entries": entries,
+            "exceptions": ["excepted.test", "Excepted.test.", "ok.test"],
+        },
+    )
+    expected = (
+        "$TTL 60\n"
+        "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )\n"
+        "@ IN NS localhost.\n"
+        "Ads.Example.test CNAME .\n"
+        "*.Ads.Example.test CNAME .\n"
+        "sink.test CNAME rpz-drop.\n"
+        "redir.test CNAME safe.example.\n"
+        "*.redir.test CNAME safe.example.\n"
+        "redir-ip.test A 192.0.2.7\n"
+        "excepted.test CNAME rpz-passthru.\n"
+        "*.excepted.test CNAME rpz-passthru.\n"
+        "ok.test CNAME rpz-passthru.\n"
+        "*.ok.test CNAME rpz-passthru.\n"
+    )
+    assert out.read_bytes() == expected.encode()

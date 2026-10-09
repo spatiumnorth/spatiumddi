@@ -149,6 +149,32 @@ def test_version_path_semver_ordering(current: str, target: str, level: str) -> 
     assert r.level == level, r.message
 
 
+@pytest.mark.parametrize(
+    ("current", "target", "level", "majors"),
+    [
+        ("1.0.0", "1.9.3", "ok", 0),  # minor and patch jumps never warn
+        ("1.4.2", "2.0.0", "ok", 1),  # one major at a time is the normal path
+        ("1.9.0", "2.0.0-rc.1", "ok", 1),
+        ("1.0.0", "3.0.0", "warn", 2),  # skips 2.x
+        ("1.0.0-rc.3", "3.1.0", "warn", 2),
+        ("2.5.0", "6.0.0", "warn", 4),
+    ],
+)
+def test_version_path_semver_skip_release_counts_majors(
+    current: str, target: str, level: str, majors: int
+) -> None:
+    """SemVer tags carry no date, so the 90-day CalVer rule cannot apply
+    between them; crossing more than one major version is the SemVer
+    skip-release warning instead (#1182). Never a fail: two rolling
+    upgrades back to back are supported."""
+    r = preflight.check_version_path(target_version=target, current_version=current)
+    assert r.level == level, r.message
+    assert r.detail["gap_majors"] == majors
+    assert r.detail["gap_days"] is None
+    if level == "warn":
+        assert "major versions newer" in r.message
+
+
 @pytest.mark.parametrize("current", ["latest", "dev-abc1234-x9", "0.1.0", "unknown"])
 def test_version_path_placeholder_current_warns(current: str) -> None:
     """Placeholders are unknown, never versions: ``latest`` used to be a

@@ -9457,6 +9457,9 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
+  // Which Kea daemons the class renders into (#1229). A `dual` class sends
+  // each option to whichever family it is valid in.
+  address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
@@ -10949,7 +10952,11 @@ export interface WebhookSubscription {
   // response when one was newly assigned (``secret_plaintext``).
   secret_set: boolean;
   event_types: string[] | null;
-  headers: Record<string, string> | null;
+  // Header values are credentials (#1579) — Fernet-encrypted at rest
+  // and never returned. Only their names come back, plus whether any
+  // are stored at all.
+  header_names: string[];
+  headers_set: boolean;
   timeout_seconds: number;
   max_attempts: number;
   created_at: string;
@@ -10969,6 +10976,8 @@ export interface WebhookSubscriptionWrite {
   // sent in plaintext + encrypted server-side.
   secret?: string | null;
   event_types?: string[] | null;
+  // Write-only (#1579): ``null``/omitted on edit = keep the stored
+  // headers, ``{}`` = clear them, any other dict replaces them.
   headers?: Record<string, string> | null;
   timeout_seconds?: number;
   max_attempts?: number;

@@ -57,6 +57,7 @@ live-pull + blocklist wiring (#744).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -70,9 +71,9 @@ from typing import Any
 import httpx
 import structlog
 
+from ..secure_io import write_private
 from ._process import find_running_daemon, is_zombie
 from .base import RRSET_OP_KINDS, DriverBase
-from ..secure_io import write_private
 
 log = structlog.get_logger(__name__)
 
@@ -161,6 +162,14 @@ _DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
 # writes a .pfx into its own state dir.
 _TLS_CERT_FILE = "technitium-tls.pfx"
 
+# Catalog-zone state (issue #1519). The catalog zone is not in the
+# bundle's zone list, so when catalog is turned off the bundle carries
+# no name for the zone that has to go — the previously applied
+# (zone_name, mode) pair is tracked in agent state instead, the same
+# approach #1497 takes for retired zones.
+_CATALOG_STATE_FILE = "technitium-catalog-state.json"
+_CATALOG_ZONE_TYPES = {"producer": "Catalog", "consumer": "SecondaryCatalog"}
+
 # Neutral forward_transport → Technitium's ``forwarderProtocol``.
 _FORWARDER_PROTOCOLS = {
     "do53": "Udp",
@@ -221,6 +230,38 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{bare}.{zone}"
 
 
+def _canonical_ip(value: str) -> str:
+    """Canonical form of an A/AAAA value via ``ipaddress`` (#1513).
+
+    Records are stored exactly as typed but Technitium returns addresses
+    in canonical form, so an expanded/upper-case AAAA
+    (``2001:DB8:0:0::1``) never string-matched and churned on every
+    structural reconcile. An unparseable value passes through unchanged
+    — it degrades to a comparison mismatch, not an exception.
+    """
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return value
+
+
+def _strip_bare_authority_slash(uri: str) -> str:
+    """Strip a single trailing slash ONLY when the URI has no path
+    beyond the authority (#1513).
+
+    ``https://host/`` → ``https://host`` (Technitium appends that slash
+    itself when storing a bare-authority URI, so both sides strip it),
+    while ``https://host/path/`` keeps its slash — it can change the
+    resource the URI points to, and the old ``rstrip("/")`` removed it.
+    """
+    if not uri.endswith("/"):
+        return uri
+    after_authority_marker = uri.split("://", 1)[-1]
+    if after_authority_marker.count("/") == 1:
+        return uri[:-1]
+    return uri
+
+
 def _svcb_params(value: str) -> tuple[int, str, str]:
     """Parse a BIND-zone-file-style SVCB/HTTPS rdata string into
     ``(priority, target, svcParams)`` for the Technitium API.
@@ -247,14 +288,28 @@ def _svcb_params(value: str) -> tuple[int, str, str]:
     # here. Technitium stores the target un-dotted, and leaving it on makes
     # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
     # keeps a bare apex target from becoming the empty string.
-    target = tokens[1].rstrip(".") or "."
-    parts = []
+    target = (tokens[1].rstrip(".") or ".").lower()
+    # Pairs are emitted SORTED BY KEY (#1513): the read-back side rebuilds
+    # svcParams sorted (``_normalize_rdata`` sorts the daemon's dict), so
+    # an operator-typed order never matched and the record was deleted
+    # and re-added on every structural reconcile.
+    #
+    # A valueless param (``no-default-alpn``) is emitted as ``key|`` —
+    # the empty-value form of the same wire pair — instead of being
+    # skipped, which silently changed the served answer. NOTE: the
+    # ``key|`` form has NOT been verified against a live daemon (the fix
+    # direction in #1513 asks for that check); if a daemon rejects it,
+    # the #1516 partial-refusal path now surfaces the refusal instead of
+    # the record silently never being served.
+    parsed: list[tuple[str, str]] = []
     for tok in tokens[2:]:
-        if "=" not in tok:
-            continue
-        key, _, raw_val = tok.partition("=")
-        parts.append(f"{key}|{raw_val}")
-    return (priority, target, ",".join(parts))
+        if "=" in tok:
+            key, _, raw_val = tok.partition("=")
+            parsed.append((key, f"{key}|{raw_val}"))
+        else:
+            parsed.append((tok, f"{tok}|"))
+    parsed.sort(key=lambda pair: pair[0])
+    return (priority, target, ",".join(pair for _, pair in parsed))
 
 
 # ── rData → add-param normalisation ────────────────────────────────────
@@ -303,6 +358,27 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
     delete built from it uses param names the API accepts."""
     out = dict(flat)
 
+    if rtype in ("A", "AAAA") and out.get("ipAddress"):
+        # #1513: canonicalise through ipaddress — the daemon returns
+        # canonical form while the desired side may be hand-typed
+        # expanded/upper-case, and the fingerprint compares strings.
+        out["ipAddress"] = _canonical_ip(str(out["ipAddress"]))
+    # Name-valued fields are case-insensitive; fold case on the
+    # read-back side (the desired side is folded in ``_record_params``)
+    # so a mixed-case target cannot churn (#1513 — the Technitium
+    # case-folding itself is unverified, but folding BOTH sides is
+    # correct regardless of what the daemon does).
+    _name_key = {
+        "CNAME": "cname",
+        "DNAME": "dname",
+        "NS": "nameServer",
+        "PTR": "ptrName",
+        "MX": "exchange",
+        "SRV": "target",
+    }.get(rtype)
+    if _name_key and out.get(_name_key):
+        out[_name_key] = str(out[_name_key]).lower()
+
     def _move(src: str, dst: str, conv: Any = None) -> None:
         if src in out:
             val = out.pop(src)
@@ -331,15 +407,18 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         _move("priority", "uriPriority")
         _move("weight", "uriWeight")
         # Technitium normalises a bare-authority URI by appending "/".
-        # Strip a single trailing slash on both sides rather than let
-        # that one character churn the record on every pass.
+        # Strip that one slash on both sides rather than let it churn
+        # the record — but ONLY that one: a path's trailing slash is
+        # significant (#1513).
         if "uri" in out:
-            out["uri"] = str(out["uri"]).rstrip("/")
+            out["uri"] = _strip_bare_authority_slash(str(out["uri"]))
     elif rtype in ("SVCB", "HTTPS"):
         # svcParams goes out as "k|v,k|v" and comes back as a dict.
         params = out.get("svcParams")
         if isinstance(params, dict):
             out["svcParams"] = ",".join(f"{k}|{v}" for k, v in sorted(params.items()))
+        if out.get("svcTargetName"):
+            out["svcTargetName"] = str(out["svcTargetName"]).lower()
         # An apex target "." is stored as the empty string.
         if out.get("svcTargetName") == "":
             out["svcTargetName"] = "."
@@ -674,23 +753,33 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
     """
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
-        return {"ipAddress": value}
+        # Canonicalised (#1513) so the desired side matches the daemon's
+        # canonical read-back regardless of how the operator typed it.
+        return {"ipAddress": _canonical_ip(value)}
+    # Name-valued targets are folded to lower case on BOTH sides of the
+    # fingerprint (#1513); DNS names are case-insensitive.
     if rtype == "CNAME":
-        return {"cname": value}
+        return {"cname": value.lower()}
     if rtype == "DNAME":
-        return {"dname": value}
+        return {"dname": value.lower()}
     if rtype == "NS":
-        return {"nameServer": value}
+        return {"nameServer": value.lower()}
     if rtype == "PTR":
-        return {"ptrName": value}
+        return {"ptrName": value.lower()}
     if rtype == "MX":
-        return {"exchange": value, "preference": rec.get("priority") or 10}
+        # Absence, not falsiness — preference 0 is the highest priority
+        # (Microsoft 365 publishes it), and ``or 10`` silently promoted
+        # it to a backup. Issue #1518.
+        return {
+            "exchange": value.lower(),
+            "preference": rec.get("priority") if rec.get("priority") is not None else 10,
+        }
     if rtype == "SRV":
         return {
-            "target": value,
-            "priority": rec.get("priority") or 0,
-            "weight": rec.get("weight") or 0,
-            "port": rec.get("port") or 0,
+            "target": value.lower(),
+            "priority": rec.get("priority") if rec.get("priority") is not None else 0,
+            "weight": rec.get("weight") if rec.get("weight") is not None else 0,
+            "port": rec.get("port") if rec.get("port") is not None else 0,
         }
     if rtype == "TXT":
         return {"text": value}
@@ -735,9 +824,12 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
         return {
             "uriPriority": tokens[0] if len(tokens) > 0 else "1",
             "uriWeight": tokens[1] if len(tokens) > 1 else "1",
-            # Trailing slash stripped on both sides — Technitium appends
-            # one to a bare-authority URI when it stores the record.
-            "uri": tokens[2].rstrip("/") if len(tokens) > 2 else "",
+            # Only a bare-authority trailing slash is stripped (#1513) —
+            # Technitium appends one there when it stores the record,
+            # but a path's trailing slash is part of the target.
+            "uri": (
+                _strip_bare_authority_slash(tokens[2]) if len(tokens) > 2 else ""
+            ),
         }
     if rtype in ("SVCB", "HTTPS"):
         priority, target, params = _svcb_params(value)
@@ -753,6 +845,23 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
 
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
+
+    # Per-apply refusal collector (#1516). ``swap_and_reload`` installs a
+    # list here; the log-and-continue helpers below append every step the
+    # daemon refused, and ``swap_and_reload`` hands the list to
+    # ``refused_zones()`` (#1280's partial apply). The apply still lands:
+    # the sync loop reports the refusals, commits the bundle and keeps
+    # draining record ops, instead of quarantining the whole bundle and
+    # holding back every later change behind the one refused record. A
+    # transport / auth failure is not a refusal — ``_call`` raises those,
+    # which fails the apply as before. ``None`` outside an apply (record
+    # ops, direct helper calls) means "log only", preserving the helpers'
+    # standalone behaviour.
+    _apply_failures: list[str] | None = None
+
+    def _note_apply_failure(self, what: str) -> None:
+        if self._apply_failures is not None:
+            self._apply_failures.append(what)
 
 
     # ── Render / validate / swap ────────────────────────────────────────────
@@ -818,11 +927,21 @@ class TechnitiumDriver(DriverBase):
                         # NS at zone create. Off-apex NS (delegations) are
                         # handled normally.
                         continue
+                    # Absence, not falsiness — a TTL of 0 means "never
+                    # cache" and must survive the structural reconcile
+                    # exactly as the incremental op path writes it.
+                    # Issue #1518.
+                    _rec_ttl = rec.get("ttl")
+                    _zone_ttl = zone.get("ttl")
                     records.append(
                         {
                             "domain": name,
                             "type": rtype,
-                            "ttl": rec.get("ttl") or zone.get("ttl") or 3600,
+                            "ttl": (
+                                _rec_ttl
+                                if _rec_ttl is not None
+                                else (_zone_ttl if _zone_ttl is not None else 3600)
+                            ),
                             **_record_params(rtype, rec.get("value") or "", rec),
                         }
                     )
@@ -914,44 +1033,81 @@ class TechnitiumDriver(DriverBase):
         zones_path = current / "zones.json"
         try:
             payload = json.loads(zones_path.read_text())
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error("technitium_zones_payload_unreadable", error=str(exc))
-            return
+            # #1516: returning normally here read as a successful apply —
+            # the sync loop advanced the etag, reported the serials as
+            # served and committed the bundle as last-known-good with
+            # nothing applied at all. Raise so the #882 quarantine /
+            # revert path engages and the bundle is retried — this is our
+            # own state failing, not the daemon refusing data.
+            raise RuntimeError(f"technitium zones.json unreadable: {exc}") from exc
 
         token = self._get_api_token()
         if token is None:
             log.error("technitium_reconcile_skipped_no_token")
-            return
+            raise RuntimeError("technitium reconcile skipped: no API token available")
 
         # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
         # even when it names a key the server does not have (verified — the
         # API stores it happily), and the failure only shows up later as a
         # refused transfer. Push the keys before anything references them.
-        server_path = current / "server.json"
-        server_state: dict[str, Any] = {}
-        if server_path.exists():
-            try:
-                server_state = json.loads(server_path.read_text())
-            except ValueError as exc:
-                log.error("technitium_server_payload_unreadable", error=str(exc))
-        if server_state.get("tsig_keys"):
-            self._sync_tsig_keys(token, server_state["tsig_keys"])
+        #
+        # Every step below still runs even when an earlier one is refused
+        # (#1516): attempt everything, collect the refusals, and report
+        # them through ``refused_zones()`` so the apply reads as a partial
+        # one rather than as success (#1280's model).
+        self._apply_failures = []
+        try:
+            server_path = current / "server.json"
+            server_state: dict[str, Any] = {}
+            server_state_known = False
+            if server_path.exists():
+                try:
+                    server_state = json.loads(server_path.read_text())
+                    server_state_known = True
+                except ValueError as exc:
+                    # Our own render, unreadable: the TSIG / transport /
+                    # blocking state is unknown rather than refused, so this
+                    # fails the apply outright.
+                    log.error("technitium_server_payload_unreadable", error=str(exc))
+                    raise RuntimeError(f"technitium server.json unreadable: {exc}") from exc
+            # #1517: unconditional whenever server.json was readable —
+            # an emptied key list is a real desired state and the callee
+            # clears every key on the daemon. Only an unreadable (or
+            # missing) server.json skips it: then the desired list is
+            # unknown, not empty, and clearing would be a guess.
+            if server_state_known:
+                self._sync_tsig_keys(token, server_state.get("tsig_keys") or [])
 
-        # Encrypted listeners + upstream forwarding (#741). Before the zone
-        # reconcile so a slow zone pass cannot delay bringing a listener up.
-        server_options = server_state.get("options") or {}
-        if server_options:
-            self._apply_transport_settings(
-                token, server_options, server_state.get("tls_cert")
+            # Encrypted listeners + upstream forwarding (#741). Before the zone
+            # reconcile so a slow zone pass cannot delay bringing a listener up.
+            server_options = server_state.get("options") or {}
+            if server_options:
+                self._apply_transport_settings(
+                    token, server_options, server_state.get("tls_cert")
+                )
+                self._apply_forwarders(token, server_options)
+
+            # Blocklists (#744). Always applied, even when empty — an emptied
+            # list has to actually clear on the daemon.
+            self._apply_blocking(token, server_state.get("blocking") or {})
+
+            self._reconcile_zones(token, payload)
+            self._apply_catalog(token, server_state.get("catalog"), payload)
+            failures = list(self._apply_failures)
+        finally:
+            self._apply_failures = None
+        # Partial apply, not a failure (#1280): every step the daemon took is
+        # live, and re-applying this bundle or the last-known-good cannot make
+        # it accept what it just refused — the QA walk of #1608 showed a
+        # raise here quarantining the bundle, holding back every later change
+        # to the group, and the revert deleting records it had just added.
+        self._refused_zones = tuple(failures)
+        if failures:
+            log.warning(
+                "technitium_apply_partly_refused", count=len(failures), refused=failures[:10]
             )
-            self._apply_forwarders(token, server_options)
-
-        # Blocklists (#744). Always applied, even when empty — an emptied
-        # list has to actually clear on the daemon.
-        self._apply_blocking(token, server_state.get("blocking") or {})
-
-        self._reconcile_zones(token, payload)
-        self._apply_catalog(token, server_state.get("catalog"), payload)
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -995,6 +1151,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_tsig_keys_apply_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"tsig keys: {body.get('errorMessage')}")
         else:
             log.info("technitium_tsig_keys_applied", count=len(tokens) // 3)
 
@@ -1014,6 +1171,15 @@ class TechnitiumDriver(DriverBase):
         **Neither** (catalog turned off) clears membership. Without that,
         disabling catalog zones would leave every member permanently
         enrolled, because nothing else ever touches the option.
+
+        The catalog zone itself is also deleted whenever it stops
+        being the desired one (issue #1519): catalog off, a renamed
+        catalog zone, or a producer↔consumer flip. A flip has to delete
+        first — creating the new role under the same name answers
+        "already exists", which the create path treats as success, so
+        the zone would silently keep its old type. The previously
+        applied role is read from agent state (``_CATALOG_STATE_FILE``)
+        because a disabled catalog block carries no zone name at all.
         """
         cat_name = (catalog or {}).get("zone_name") or ""
         cat_name = cat_name.rstrip(".")
@@ -1027,7 +1193,9 @@ class TechnitiumDriver(DriverBase):
                     zone=cat_name or None,
                     producer=producer,
                 )
+                self._note_apply_failure("catalog consumer: incomplete catalog block")
                 return
+            self._retire_stale_catalog_zone(token, cat_name, mode)
             self._ensure_zone_exists(
                 token,
                 {
@@ -1036,7 +1204,11 @@ class TechnitiumDriver(DriverBase):
                     "masters": [str(producer)],
                 },
             )
+            self._save_catalog_state({"zone_name": cat_name, "mode": mode})
             return
+
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        self._retire_stale_catalog_zone(token, cat_name, mode)
 
         if mode == "producer" and cat_name:
             self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
@@ -1059,6 +1231,65 @@ class TechnitiumDriver(DriverBase):
                     catalog=desired or None,
                     error=body.get("errorMessage"),
                 )
+                self._note_apply_failure(
+                    f"catalog membership {zone}: {body.get('errorMessage')}"
+                )
+        self._save_catalog_state(
+            {"zone_name": cat_name, "mode": mode} if desired_type else None
+        )
+
+    # ── Catalog-zone state (issue #1519) ───────────────────────────────
+
+    def _catalog_state_path(self) -> Path:
+        return self.state_dir / _CATALOG_STATE_FILE
+
+    def _load_catalog_state(self) -> dict[str, Any] | None:
+        try:
+            state = json.loads(self._catalog_state_path().read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict) or not state.get("zone_name"):
+            return None
+        return state
+
+    def _save_catalog_state(self, state: dict[str, Any] | None) -> None:
+        path = self._catalog_state_path()
+        if state is None:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(json.dumps(state))
+
+    def _retire_stale_catalog_zone(
+        self, token: str, cat_name: str, mode: str | None
+    ) -> None:
+        """Delete the previously applied catalog zone if it is no
+        longer the desired one (different name, different role, or
+        catalog now off)."""
+        prev = self._load_catalog_state()
+        if prev is None:
+            return
+        prev_name = str(prev.get("zone_name") or "").rstrip(".")
+        prev_type = _CATALOG_ZONE_TYPES.get(str(prev.get("mode") or ""))
+        if not prev_name or prev_type is None:
+            return
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        if prev_name == cat_name and prev_type == desired_type:
+            return
+        resp = self._call(token, "POST", "zones/delete", {"zone": prev_name})
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_catalog_zone_delete_failed",
+                zone=prev_name,
+                zone_type=prev_type,
+                error=body.get("errorMessage"),
+            )
+        else:
+            log.info(
+                "technitium_catalog_zone_retired",
+                zone=prev_name,
+                zone_type=prev_type,
+            )
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
@@ -1308,6 +1539,7 @@ class TechnitiumDriver(DriverBase):
                 value=blocking_type,
                 supported=sorted(_BLOCKING_TYPES),
             )
+            self._note_apply_failure(f"blocking: invalid type {blocking_type}")
             return
 
         settings: dict[str, Any] = {
@@ -1329,6 +1561,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_blocking_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"blocking settings: {body.get('errorMessage')}")
             return
 
         unchanged: list[str] = []
@@ -1346,6 +1579,9 @@ class TechnitiumDriver(DriverBase):
                     f"technitium_{kind}_flush_failed",
                     error=flushed.get("errorMessage"),
                 )
+                self._note_apply_failure(
+                    f"blocking {kind} flush: {flushed.get('errorMessage')}"
+                )
                 continue
             for start in range(0, len(desired), _BLOCKING_IMPORT_CHUNK):
                 chunk = desired[start : start + _BLOCKING_IMPORT_CHUNK]
@@ -1358,6 +1594,10 @@ class TechnitiumDriver(DriverBase):
                         first=chunk[0],
                         count=len(chunk),
                         error=imported.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"blocking {kind} import ({len(chunk)} from {chunk[0]}): "
+                        f"{imported.get('errorMessage')}"
                     )
         log.info(
             "technitium_blocking_applied",
@@ -1465,6 +1705,7 @@ class TechnitiumDriver(DriverBase):
         if wants_tls:
             if not cert_path:
                 log.error("technitium_encrypted_transport_skipped_no_cert")
+                self._note_apply_failure("encrypted transport: no usable TLS cert")
                 cert_ok = False
             else:
                 body = self._call(
@@ -1475,6 +1716,9 @@ class TechnitiumDriver(DriverBase):
                         "technitium_tls_cert_path_rejected",
                         path=cert_path,
                         error=body.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"tls cert path: {body.get('errorMessage')}"
                     )
                     cert_ok = False
 
@@ -1517,6 +1761,9 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_transport_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(
+                f"transport settings: {body.get('errorMessage')}"
+            )
             return
         log.info(
             "technitium_transport_settings_applied",
@@ -1546,6 +1793,7 @@ class TechnitiumDriver(DriverBase):
         protocol = _FORWARDER_PROTOCOLS.get(transport)
         if protocol is None:
             log.warning("technitium_forward_transport_unsupported", transport=transport)
+            self._note_apply_failure(f"forwarders: unsupported transport {transport}")
             return
 
         if not forwarders:
@@ -1560,6 +1808,9 @@ class TechnitiumDriver(DriverBase):
             if body.get("status") != "ok":
                 log.error(
                     "technitium_forwarders_clear_failed", error=body.get("errorMessage")
+                )
+                self._note_apply_failure(
+                    f"forwarders clear: {body.get('errorMessage')}"
                 )
             else:
                 log.info("technitium_forwarders_cleared")
@@ -1583,6 +1834,9 @@ class TechnitiumDriver(DriverBase):
                     transport=transport,
                     hint="forward_tls_hostname is required for tls/https/quic",
                 )
+                self._note_apply_failure(
+                    f"forwarders: no forward_tls_hostname for {transport}"
+                )
                 return
 
         resp = self._call(
@@ -1598,6 +1852,7 @@ class TechnitiumDriver(DriverBase):
                 protocol=protocol,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(f"forwarders: {body.get('errorMessage')}")
             return
         log.info(
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
@@ -1796,6 +2051,10 @@ class TechnitiumDriver(DriverBase):
                             record=rec,
                             error=body.get("errorMessage"),
                         )
+                        self._note_apply_failure(
+                            f"{zone}: record delete {rec.get('domain')} {rec.get('type')}: "
+                            f"{body.get('errorMessage')}"
+                        )
                 else:
                     deleted += 1
 
@@ -1817,6 +2076,10 @@ class TechnitiumDriver(DriverBase):
                             zone=zone,
                             record=rec,
                             error=body.get("errorMessage"),
+                        )
+                        self._note_apply_failure(
+                            f"{zone}: record add {rec.get('domain')} {rec.get('type')}: "
+                            f"{body.get('errorMessage')}"
                         )
                     continue
                 added += 1
@@ -2005,6 +2268,9 @@ class TechnitiumDriver(DriverBase):
                 zone_type=ztype,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(
+                f"{zone}: zone create: {body.get('errorMessage')}"
+            )
 
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
@@ -2024,6 +2290,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
+            )
+            self._note_apply_failure(
+                f"{zone}: zone upstream: {body.get('errorMessage')}"
             )
 
     def _apply_zone_options(
@@ -2049,6 +2318,7 @@ class TechnitiumDriver(DriverBase):
                 value=transfer,
                 supported=sorted(_ZONE_TRANSFER_VALUES),
             )
+            self._note_apply_failure(f"{zone}: zone options: bad zoneTransfer {transfer}")
             return
 
         params: dict[str, Any] = {"zone": zone}
@@ -2064,6 +2334,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(
+                f"{zone}: zone options: {body.get('errorMessage')}"
+            )
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
         resp = self._call(
@@ -2075,8 +2348,15 @@ class TechnitiumDriver(DriverBase):
         try:
             body = resp.json()
         except ValueError:
+            self._note_apply_failure(f"{zone}: zone records get: non-JSON response")
             return []
         if body.get("status") != "ok":
+            # Reading an empty/error body as "zone is empty" would make
+            # the reconcile re-add everything and report the refused
+            # reads as churn (#1516).
+            self._note_apply_failure(
+                f"{zone}: zone records get: {body.get('errorMessage') or body.get('status')}"
+            )
             return []
         out = []
         for rec in body.get("response", {}).get("records") or []:
@@ -2157,9 +2437,12 @@ class TechnitiumDriver(DriverBase):
         """
         password = self.admin_bootstrap_password()
         try:
-            resp = httpx.get(
+            # A form body, never query parameters: a URL is logged (httpx
+            # writes every request line at INFO) and the password must not be
+            # (GHSA-x4gw-9gqx-vr4m).
+            resp = httpx.post(
                 f"{_API_BASE}/user/createToken",
-                params={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
+                data={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
                 timeout=_API_TIMEOUT,
             )
             body = resp.json()
@@ -2227,6 +2510,15 @@ class TechnitiumDriver(DriverBase):
             if fresh is not None:
                 log.info("technitium_api_token_reprovisioned", path=path)
                 resp = self._request(fresh, method, path, params)
+        # A daemon that cannot authenticate us or answers 5xx has not
+        # REFUSED anything — it is unusable. Raise, so a structural apply
+        # fails (and is quarantined / reverted) instead of reading every
+        # step as a per-item refusal and reporting a partial apply (#1608).
+        if self._is_invalid_token(resp):
+            raise RuntimeError(f"Technitium API {path}: token rejected (auth failure)")
+        status_code = getattr(resp, "status_code", 200)
+        if isinstance(status_code, int) and status_code >= 500:
+            raise RuntimeError(f"Technitium API {path}: HTTP {status_code}")
         return resp
 
     def _request(

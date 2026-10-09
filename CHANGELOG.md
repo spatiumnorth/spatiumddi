@@ -95,6 +95,335 @@ the formatter handles the rest.
   minutes, is a warn naming it, never a pass. Without appliance rows
   (Compose / plain Kubernetes) the old local check still runs.
 
+- **The BIND9 agent streams the RPZ zone file to disk instead of
+  holding it three times over (#1109, Part 3).** `_write_rpz_zone_file`
+  built every line into a list, joined it, then encoded it, so a large
+  blocklist kept three full copies alive on a node also running named.
+  Lines now go through a buffered writer as they are produced; the
+  `seen` owner-name collision ledger (#878) is unchanged. The file is
+  byte-identical (a test pins the exact bytes, and passes on the old
+  renderer too). Measured on a synthetic 600k-domain wildcard list
+  (1.2M records, 49 MB zone): added peak RSS 263 MB to 61 MB, render
+  time ~0.35 s both before and after. The PowerDNS agent has no
+  equivalent renderer.
+
+- **A DHCPv4-only client class no longer takes down a group's DHCPv6
+  config, or the other way round (#1229, #1295).** Every client class was
+  rendered into both Kea daemons. A test using `pkt4` or `relay4`
+  (option 82 matching) makes kea-dhcp6 reject the whole config, and
+  `pkt6` / `relay6` does the same to kea-dhcp4. The agent then reverts
+  the bundle for both daemons, so one such class froze every change to
+  any group that also had a DHCPv6 scope. Separately, one options map
+  cannot serve both daemons: an IPv4 `dns-servers` on a class reached
+  Dhcp6 as option 23, which Kea rejects as malformed.
+  Client classes now have an `address_family`: `ipv4`, `ipv6` or `dual`.
+  A class is rendered only into the daemons it names. A `dual` class's
+  options each go to the daemon they are valid in. The API refuses a test
+  that uses a token the class's family cannot parse, naming the token, and
+  checks options against the family. Upgrading sets the family from what
+  each class already did: a `pkt6` / `relay6` test becomes `ipv6`, a
+  `pkt4` / `relay4` test becomes `ipv4`, and any other class becomes
+  `dual` if its group has a DHCPv6 scope and `ipv4` otherwise. The class
+  editor has a family picker and the class list shows the family. A pool
+  cannot restrict to a class its daemon no longer defines: Kea would load
+  it and match no client. Changing a class's family is refused while such
+  a pool exists, and so is setting a pool's class to one of the wrong
+  family. The DHCP importer keeps the daemon block a Kea class came from,
+  and merges a class defined identically in both blocks into one `dual`
+  class. An agent receiving a bundle from an older control plane renders
+  classes as before. An older agent receiving a new bundle gets only the
+  options Dhcp4 can take. Verified with `kea-dhcp4 -t` and `kea-dhcp6 -t` against the
+  agent's rendered config. Migration `c2f7a94e1d58` (one column with a
+  default, and a backfill).
+
+- **One zone BIND's zone check refuses no longer stops record changes
+  in every zone on its server (#1403).** Since #1279 the BIND9 agent
+  runs `named-checkzone` on each zone file a render changes, and one
+  refused file failed the whole apply: the agent quarantined the
+  server's whole config bundle and returned before anything in it went
+  live. No record change in any zone of that server was served until
+  the bad data was removed, and the retry backed off to 300 s. An apex
+  NS naming a host inside the zone that has no address is one input
+  the API still accepts. A refused zone is now held back on its own,
+  the way named treats a zone file it cannot load: a zone already
+  served keeps its last good copy, a new one is not served, and
+  everything else in the bundle applies. The server reports the hold
+  as `reverted`, naming each zone and the zone check's reason, leaves
+  the zone out of its zone-state report, and re-renders the next
+  bundle, so the zone goes live as soon as its data loads (on a group
+  without views, deleting the bad record is enough). A zone check that
+  cannot run at all still fails the apply.
+
+- **DNS server groups and agentless zone pushes stop lying about
+  what landed (#1540, #1537, #1533).** A server create (or driver
+  change) could put a second driver into a group that already had
+  one, leaving the group's zones with no coherent sync target —
+  group membership now enforces one driver per group. Agentless
+  zone pushes went to disabled servers and reported success when
+  only some servers applied; disabled servers are excluded from
+  the push and a partial failure is compensated and surfaced
+  instead of acked. Rolling back a delete (including a zone move's
+  delete from the source group) re-creates the zone **and pushes its
+  records back** on each server where the delete had succeeded —
+  re-creating the zone alone left that server answering for an empty
+  zone — and if a record cannot be restored the error says so and
+  points at Sync with Servers rather than reporting a clean rollback.
+  The error also names the system that refused (Technitium, Route 53,
+  …) instead of always saying "Windows DNS", and a refused Technitium
+  connection names its cause instead of ending at "request failed:".
+  And the sync record-type filter is derived
+  from each driver's declared capabilities, so CAA records (and
+  any other type a driver supports) are actually pulled and pushed
+  instead of being filtered out by a hardcoded list.
+
+- **Technitium records stop churning and silently diverging (#1518,
+  #1517, #1516, #1513).** A record TTL of 0 came back as the zone
+  TTL and an MX preference of 0 as 10 — both now round-trip as
+  written, on the agent and control-plane paths. The agent always
+  syncs TSIG keys, including an empty bundle, so removing the last
+  key actually clears it on the daemon. A Technitium apply the
+  daemon partly refuses is now reported instead of reading as
+  success — as a partial apply, the model #1280 introduced for
+  PowerDNS: the server shows "Zones refused", naming each refused
+  zone, record or setting with Technitium's own reason, while
+  everything else in the bundle is applied and kept. Nothing is
+  rolled back and the bundle is not retried, so one record the
+  daemon rejects no longer holds back the group's later changes
+  (records in the same zone, TSIG keys); the refused record's own
+  record op is returned as failed, and the verdict clears once a
+  structural apply lands with nothing refused. A daemon that cannot
+  be reached, rejects the agent's token or answers 5xx still fails
+  the apply and falls back to the last-known-good. A refused
+  blocklist import no longer crashes the apply with a `NameError`.
+  The partial-apply summary now counts "item(s)" rather than
+  "zone(s)", since a Technitium refusal is per record. And rdata normalization is
+  round-trip safe: SVCB/HTTPS parameters survive, URI records keep
+  their trailing-slash semantics, and A/AAAA values are compared in
+  canonical form on both sides, so a hand-typed expanded IPv6
+  address no longer reads back as perpetual drift.
+
+- **Agent registration and appliance role assignment stop silently
+  dropping operator intent (#1567, #1562, #1566).** Agent register /
+  re-register accepted any driver string — including agentless
+  drivers no agent can serve — and wrote a junk active server row;
+  the register schemas now validate against the agent-capable driver
+  sets (bind9/powerdns/technitium for DNS, kea for DHCP) and 422
+  instead. Choosing Fleet's "(unassigned)" for an appliance's
+  DNS/DHCP group sent an explicit `null` the roles API ignored
+  (non-None was the only signal); presence in the payload now
+  decides — omitted leaves the assignment alone, `null` unassigns —
+  in both the REST roles endpoint and the AI operations path. And
+  the appliance supervisor no longer drops bootstrap agent keys that
+  aren't 32–128 lowercase hex (a shape nothing else in the system
+  requires): the key pattern is now an env-file injection defence
+  only, rejecting whitespace, quotes, backtick, `$` and `\`.
+
+- **Batched IPAM→DNS sync no longer reports failed agentless creates
+  as created (#1536).** The batched path collected record ops per
+  zone and flushed them without ever looking at the outcomes: a
+  create the provider rejected kept the `ip.dns_record_id` stamp the
+  singular path carefully removes (#428), so DDNS idempotency never
+  retried it, and the sync's created/failed accounting never saw it.
+  Collected ops now carry the stamped address with them, the flush
+  returns one result per op, a `failed` batched create gets the same
+  un-stamp as the inline path, and callers can fold failed batched
+  ops into their error counts.
+
+- **Cloud DNS drivers write MX/SRV records whole, and drift can
+  see their parts (#1526, #1525).** MX and SRV records were written
+  wrong or not at all by several of the Route 53 / Google / Azure /
+  Cloudflare / Linode / Vultr drivers — priority, weight and port
+  were dropped or folded into the target string — so a correct
+  record in SpatiumDDI landed mangled at the provider. The shared
+  cloud base and all six drivers now carry the structured fields
+  through. And because drift compared only name/type/target, a
+  priority, weight or port change at the provider read as
+  "no change"; those fields are now part of a record's drift and
+  sync identity in drift detection, cutover parity and pull.
+
+- **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
+  TXT values are stored unquoted, and the BIND9 agent dropped them
+  into zone files and RFC 2136 updates verbatim — so a `;` in a
+  DMARC value started a zone-file comment and spaces in an SPF
+  value split it into character-strings resolvers join without the
+  spaces. The BIND9 and PowerDNS agent drivers and the backend
+  BIND9/PowerDNS drivers now share one quoting helper per package
+  (`drivers/_txt.py` in the agent, `drivers/dns/_txt.py` in the
+  backend). An unquoted value is one string, split into 255-*octet*
+  character-strings without splitting a UTF-8 character (the old
+  copies cut at 255 characters after escaping, which could split an
+  escape sequence and exceed the octet limit). An already-quoted
+  value is served exactly as entered: each quoted string stays its
+  own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
+  keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
+  a string over 255 octets is split further. Control characters are
+  stripped. The Technitium TXT path is unchanged (#1694).
+
+- **Rolling-upgrade preflight warns on a SemVer jump that skips a major
+  version (#1182).** Between two CalVer releases the version check warns when
+  the target is more than 90 days newer. SemVer tags carry no date, so between
+  two SemVer releases every forward jump passed silently, 1.2.0 to 4.0.0
+  included. It now warns when the jump crosses more than one major version
+  (1.x to 3.x) and suggests stopping at each major in between. 1.x to 2.x,
+  and minor and patch jumps, never warn, and the switch from CalVer to 1.0.0
+  is never a skip. A warning, not a refusal: two rolling upgrades back to back
+  stay supported.
+
+- **A CalVer release tag with a leading-zero release number is refused
+  (#1182).** `2026.10.07-01` parsed to the same release as `2026.10.07-1`, and
+  the chart-version rewrite published both as chart `2026.10.7-1`.
+  `scripts/release_version.py` now refuses it, and `-0`, the same way it
+  already refused `1.0.0-rc.01`.
+
+- **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
+  with `is_active: false` only set the flag: the account's sessions
+  were refused while it stayed disabled, but they stayed valid, so
+  re-enabling it brought every one back (an attacker's included), and
+  a refused request still showed as activity in Sessions. A change of
+  `is_active` now revokes every session the account holds, as an admin
+  password reset does, and the audit row says how many; a re-enabled
+  account starts with none, and a disabled account's refused requests
+  no longer move a session's last-seen time.
+
+- **SAML metadata no longer advertises a single logout endpoint that
+  does not exist (#1420).** Every SAML provider's service-provider
+  metadata named a `SingleLogoutService` at
+  `/api/v1/auth/{provider_id}/slo`, which no route served: an IdP
+  configured from the metadata sent its LogoutRequests to a 404,
+  reported a partial logout, and the SpatiumDDI session outlived the
+  user's IdP logout. SpatiumDDI does not take part in SAML single
+  logout, so the metadata now advertises only the ACS it serves, and
+  docs/features/AUTH.md says what logging out does and does not end.
+
+- **A member joining a multi-node appliance no longer stops DNS and DHCP
+  on every node (#1439).** A member's promotion changes its role apply
+  key (the agents' control-plane URL, #1350), so its first heartbeat
+  after the join re-applied the cluster's one role chart with the roles
+  it held at that moment: none. Every agent was rendered off, and the
+  helm upgrade deleted every agent DaemonSet on every node, the seed's
+  included, until a node holding the roles wrote the chart again (its
+  watchdog, every five minutes). Forming a cluster, adding a member and
+  a Replace each left the cluster without DNS and DHCP for one to four
+  minutes. A node that holds no agent key now keeps an agent on while
+  another node is labelled for its role, with that role's key and
+  server group taken from the live chart and everything else from its
+  own render; a node list or chart it cannot read fails the apply
+  instead of writing it blind.
+
+- **Giving a cluster node some of the roles, or taking one back, no
+  longer stops that role's agents on every node (#1427).** A node
+  renders an agent only when it holds that role's key, so a member given
+  DNS alone, or a node DHCP was taken back from, wrote the DHCP agent off
+  in the cluster's one role chart, and Kea was killed on every node still
+  assigned DHCP until a watchdog wrote the chart again (89 seconds without
+  DHCP on a three-node cluster; about 3.5 minutes on a field cluster of
+  2026.10.02-1). Every agent a node does not hold now stays on while
+  another node is labelled for its role, so a role change is a node label
+  again, as the chart intends.
+
+- **A cluster member that held the Redis master and rebooted before
+  Sentinel failed over no longer leaves Redis without a master (#1442).**
+  Each Redis pod's init container wrote a fixed topology on every start:
+  redis-0 the master, every other pod a replica of redis-0, every
+  sentinel monitoring redis-0. After any failover the master can sit on
+  another pod, and when that pod was re-created before Sentinel had
+  failed over (its node rebooted, as in a rolling upgrade) it came back
+  as a replica of redis-0 while redis-0 was still its replica. No pod was
+  master, Sentinel aborted every failover (`no-good-slave`), and the api
+  and the workers stayed down until someone intervened by hand. The init
+  container now asks the running sentinels which pod is the master and
+  follows it, or starts as master when they name the pod itself, and
+  renders the same master into the pod's sentinel.conf; the highest
+  config epoch wins when they disagree, and the question is retried for
+  up to 60 s before the ordinal rule applies, which it now does only
+  when no sentinel answers (the whole set starting cold). The script
+  moved to `charts/spatiumddi/files/redis-sentinel-render-config.sh`,
+  where `appliance/tests` runs it.
+
+- **Cloud DNS zone creates and deletes no longer duplicate or wedge
+  (#1527, #1528, #1534).** Creating a Route 53 zone whose name
+  already exists in the account is refused with a conflict error
+  naming the existing hosted zone id and pointing at **Import
+  existing zones** — SpatiumDDI never silently adopts a zone it did
+  not create; a retried create of the same zone row still dedupes
+  via the deterministic `CallerReference`. Deleting a populated
+  Route 53 or Google Cloud DNS zone first removes only the records
+  SpatiumDDI manages (those in its DB) instead of failing with
+  `HostedZoneNotEmpty` / `containerNotEmpty`; records the provider
+  holds that SpatiumDDI never managed are left untouched, and if
+  they block the provider-side delete that refusal now surfaces
+  instead of the records being silently wiped. A zone that is
+  already absent counts as deleted, so permanent delete, the trash
+  purge and zone moves can complete. An Azure
+  DNS server now requires all five credential fields, including
+  `resource_group`, at save time and in the driver: a missing field
+  is a named error instead of a raw `KeyError`, and zone listing
+  (the connection probe) is scoped to the same resource group the
+  record paths use instead of passing subscription-wide while every
+  record op failed.
+
+- **Changing an appliance's DNS or DHCP group in Fleet moves its server
+  too (#1565).** `PUT /appliance/appliances/{id}/roles` changed only the
+  appliance's group pointer. The supervisor's env and firewall followed it,
+  while the appliance's already-registered server stayed in the old group
+  and kept serving that group's zones or scopes (re-registration never
+  moves a server, by design), and the firewall could open listeners for a
+  configuration the agent wasn't running. The PUT now moves the
+  appliance's own DNS server(s) through the #934 move and its DHCP
+  server(s) with the DHCP server PUT's checks, in the same transaction. A
+  move it refuses (a name clash, a mixed-driver group) refuses the whole
+  change, naming the server.
+
+- **DNS record ops reach every server in the order they were queued
+  (#1489).** Reported by @stefanriegel on a three-server Technitium
+  group: after a UniFi sync, records were missing on single servers
+  while SpatiumDDI showed them and every op read `applied`. The sync
+  queued a delete and a create of the same record in one transaction,
+  and ops shipped ordered by `(created_at, id)`: `created_at` is the
+  transaction's start, so the pair tied, and `id` is a random UUID, so
+  each server got the pair in its own random order. Where the delete
+  landed last, the record was gone until the next full zone reconcile.
+  Each op now gets a queue position from a sequence (`seq`), and ops
+  ship in `(created_at, seq)` order. The #1232 supersede rule uses the
+  same order, so a delete that fails is superseded by the create queued
+  after it instead of retrying and removing the record again. Ops from
+  different transactions compare exactly as before.
+
+- **Five low-severity follow-ups from the 2026-10-06 QA walks.**
+  - **A resource-scoped API token can no longer read a DNS server's
+    recent events or `rndc status` (GHSA-c4v7-2235-v88h).** Neither
+    belongs to any zone, so there is nothing to narrow them to; a
+    zone- or subnet-scoped token now gets 403 on both. Sessions,
+    unscoped tokens and wildcard-granted tokens are unaffected.
+  - **An IPAM write can no longer publish into a DNS zone the token
+    holds no grant on (GHSA-875w-8f2h-9mw6).** Address create,
+    update, next-IP and bulk allocate, bulk edit, and subnet create
+    and update took the zone from the request body and checked only
+    the subnet. A zone named there must now be one of the subnet's
+    own effective zones, the row's current zone, or a zone the token
+    is granted; otherwise 403 (bulk edit skips the row, as it does
+    for any row the caller may not touch).
+  - **Deleting an IPAM address, or purging orphans, no longer removes
+    a DHCP reservation for a caller without `delete` on
+    `dhcp_static` (GHSA-hxpx-gjqf-6p4f).** It is refused with 403,
+    matching the rule #1629 applied to every other IPAM path. When
+    the delete goes ahead, each reservation it removes now writes its
+    own `dhcp_static_assignment` audit row.
+  - **The Technitium DNS agent no longer writes the daemon's admin
+    password to its log (GHSA-x4gw-9gqx-vr4m).** `createToken` is
+    now a POST with a form body instead of a GET with the password in
+    the query string, and every agent keeps the `httpx` / `httpcore`
+    loggers at WARNING, so no request URL reaches the log. A
+    Technitium agent's log from before this release may still hold
+    the password, from the agent's first start; if those logs were
+    shipped off the appliance, treat the daemon's admin password as
+    exposed.
+  - **`redact()` now matches a webhook secret in any mixture of
+    `%HH` (either hex case) and JSON `\u00HH` encodings
+    (GHSA-rc6p-vq45-64v3).** .NET collectors write lower-case
+    percent-encoding and escape `+` as `+`, so a base64 token
+    they echoed back was still logged in clear.
+
 - **The k3s join token is published whenever k3s writes it, not only in
   the first 60 s after boot (#1509).** `spatiumddi-publish-k3s-token` ran
   once at boot and polled for the token for 60 s. On a fresh seed k3s can
@@ -1494,6 +1823,18 @@ the formatter handles the rest.
 
 ### Security
 
+- **Typed-webhook subscription headers are encrypted at rest
+  (#1579).** Subscription `headers` (Authorization tokens and the
+  like) were stored in clear and rode along in "exclude secrets"
+  backups — unlike the webhook signing secret and the forward-target
+  credentials fixed in #1506. They now live in a Fernet-encrypted
+  `headers_encrypted` column (migration encrypts existing rows in
+  place; registered for backup exclusion and key-rotation rewrap),
+  API responses return only header names plus a `headers_set` flag,
+  backups no longer carry the values, and the admin UI treats
+  headers as write-only: blank keeps the stored set, typed lines
+  replace it, an explicit clear removes it.
+
 - **A failed backup run's audit row no longer carries the destination's
   error text (#1617).** The `backup_target_run_failed` row is forwarded
   as-is, to syslog, webhook and SMTP forward targets and as the
@@ -1620,7 +1961,6 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
-
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
@@ -1996,6 +2336,14 @@ the formatter handles the rest.
   group switches to serving them. Downgrade moves the serial of each zone
   whose group served its own timers (its SOA changes back) and drops the
   two columns.
+- `6293ba5af00e` — #1489: `dns_record_op.seq`, nullable, filled from
+  the new sequence `dns_record_op_seq_seq` on insert. No backfill and no
+  table rewrite: ops queued before the upgrade keep NULL and their old
+  order. Downgrade drops the column and the sequence.
+- `c2f7a94e1d58` — #1229, #1295: adds `dhcp_client_class.address_family`
+  (`ipv4` | `ipv6` | `dual`), backfilled from each class's test
+  expression and whether its group has a DHCPv6 scope. Downgrade drops
+  the column.
 
 ## 2026.10.02-1 — 2026-10-02
 

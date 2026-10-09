@@ -308,14 +308,22 @@ Flow:
    (ACS endpoint).
 3. Backend consumes the assertion and redirects to `/auth/callback#token=…`.
 4. `GET /auth/{provider_id}/metadata` returns SP metadata XML so admins
-   can register SpatiumDDI at the IdP.
+   can register SpatiumDDI at the IdP. It advertises one endpoint, the ACS
+   above (HTTP-POST).
+
+**No single logout.** SpatiumDDI does not take part in SAML single logout
+(SLO): its metadata advertises no `SingleLogoutService`, it sends no
+LogoutRequest, and signing out of SpatiumDDI ends only its own session. A
+logout at the IdP does not end a SpatiumDDI session, which lasts until it
+expires or the user signs out (#1420: the metadata used to advertise an
+`/auth/{provider_id}/slo` endpoint that no route served).
 
 Key config fields:
 
 | Field | Notes |
 |---|---|
 | `idp_metadata_url` | Optional — backend can pull IdP details automatically. |
-| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. |
+| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. `idp_slo_url` is stored but not used: see "No single logout" above. |
 | `idp_x509_cert` | Base64 or PEM — used to verify the assertion. |
 | `sp_entity_id` | Defaults to the app URL. |
 | `attr_username` / `attr_email` / `attr_display_name` / `attr_groups` | SAML attribute names. |
@@ -540,6 +548,14 @@ per-token resource-instance binding (`resource_grants`, #374) can narrow
 further to specific `{action, resource_type, resource_id}` grants, validated
 at create time to be a subset of what the issuing user holds.
 
+A resource-scoped token is held to its grants beyond the URL path too. An
+IPAM write that names a DNS zone in its body (`dns_zone_id`,
+`extra_zone_ids`, a subnet's zone bindings) may name only one of the
+subnet's own effective zones, the row's current zone, or a zone the token
+holds a `dns_zone` grant on (GHSA-875w). Reads that belong to no grantable
+resource at all, such as a DNS server's recent events and `rndc status`,
+are refused to a resource-scoped token (GHSA-c4v7).
+
 **Wire format.** Raw tokens start with `sddi_` followed by 40 bytes of
 url-safe base64 entropy (`secrets.token_urlsafe(40)`). Operators typically see only the first
 10 characters (`sddi_AbCdE`) in the UI as an identifier — this is
@@ -711,10 +727,15 @@ rather than swallowing the failure. Permission-related rejections
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or
   has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
-- **User deactivated mid-session.** A refresh request from a disabled
-  user returns `401` even if the refresh token itself is still valid
-  — deactivating a user revokes their session on the next refresh.
-  `backend/app/api/v1/auth/router.py`.
+- **Disabling an account ends its sessions (#1383).** `PUT
+  /api/v1/users/{id}` that changes `is_active` revokes every session
+  the account holds, as an admin password reset does, and its audit row
+  records how many (`sessions_revoked`). Re-enabling revokes any that are
+  left, so a re-enabled account starts with no sessions, even one disabled
+  before this change. While an account is disabled, a request on one of
+  its sessions is refused with `403` and is not recorded as activity
+  (`last_seen_at` stays), and a refresh returns `401`.
+  `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
 
 ### Password management
 

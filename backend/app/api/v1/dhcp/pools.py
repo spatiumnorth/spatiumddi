@@ -18,7 +18,7 @@ from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
-from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
+from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
@@ -150,6 +150,32 @@ def _validate_pd(
     return net, str(net.network_address)
 
 
+async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | None) -> None:
+    """422 when a pool restricts to an operator client class its daemon does
+    not define (#1229). Kea accepts the reference, so the pool would silently
+    match no one. A name that is not an operator class (a generated PXE /
+    phone / device-policy class, or Kea's built-in ``KNOWN``) is not checked."""
+    if not name:
+        return
+    cc = (
+        await db.execute(
+            select(DHCPClientClass).where(
+                DHCPClientClass.group_id == scope.group_id, DHCPClientClass.name == name
+            )
+        )
+    ).scalar_one_or_none()
+    family = scope.address_family or "ipv4"
+    if cc is not None and cc.address_family not in (family, "dual"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Client class '{name}' is {cc.address_family}-only, so it is not "
+                f"defined in this {family} scope's daemon and the pool would match "
+                "no client. Change the class's address family first."
+            ),
+        )
+
+
 async def _check_pool_overlap(
     db: AsyncSession,
     scope_id: uuid.UUID,
@@ -224,6 +250,7 @@ async def create_pool(
             group_id=None,  # rendered by Kea / FortiGate only (#1296)
             address_family=scope.address_family or "ipv4",
         )
+    await _check_class_family(db, scope, body.class_restriction)
 
     if body.pool_type == "pd":
         # DHCPv6 prefix-delegation pool (issue #368). No v4 range / overlap
@@ -323,6 +350,8 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
         non_nullable={"name", "start_ip", "end_ip", "pool_type"},
     )
     scope = await db.get(DHCPScope, pool.scope_id)
+    if scope is not None and changes.get("class_restriction") not in (None, pool.class_restriction):
+        await _check_class_family(db, scope, changes["class_restriction"])
     if changes.get("options_override"):
         changes["options_override"] = normalize_options(changes["options_override"])
         await validate_dhcp_options(
