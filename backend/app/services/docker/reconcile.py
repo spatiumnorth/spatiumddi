@@ -41,11 +41,16 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.docker import DockerHost
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.docker.client import (
     DockerClient,
     DockerClientError,
 )
-from app.services.integration_ownership import address_taken, owned_by_other_integration
+from app.services.integration_ownership import (
+    address_taken,
+    owned_by_other_integration,
+    subnet_has_surviving_addresses,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -109,6 +114,9 @@ class _DesiredAddress:
     status: str  # docker-container | docker-gateway
     hostname: str
     description: str
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
@@ -331,6 +339,13 @@ async def _apply_blocks_and_subnets(
 
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
+            # #1558: don't cascade-delete operator / foreign /
+            # operator-edited addresses with the subnet — un-claim it
+            # instead when any survive, like the OPNsense reconciler.
+            if await subnet_has_surviving_addresses(db, row.id, "docker_host_id"):
+                row.docker_host_id = None
+                summary.subnets_updated += 1
+                continue
             await db.delete(row)
             summary.subnets_deleted += 1
 

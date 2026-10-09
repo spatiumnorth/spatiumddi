@@ -323,16 +323,40 @@ async def test_drive_loop_happy_path_two_nodes(monkeypatch: pytest.MonkeyPatch) 
         calls.append(kwargs["node_name"])
         return _good_result(kwargs["node_name"])
 
-    release_mock = MagicMock(return_value=(True, None))
+    # The run releases only its own lease, retrying an unanswered API (#1449).
+    release_mock = MagicMock(return_value=True)
     monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
-    monkeypatch.setattr(orchestrator.mutex, "release", release_mock)
+    monkeypatch.setattr(orchestrator.mutex, "release_if_held", release_mock)
     monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
 
     await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]
     assert calls == ["node-a", "node-b"]
     assert run.state == "succeeded"
     assert run.finished_at is not None
-    release_mock.assert_called()
+    release_mock.assert_called_once_with(attempts=orchestrator._LEASE_RELEASE_ATTEMPTS)
+
+
+@pytest.mark.asyncio
+async def test_drive_loop_passes_its_lease_holder_to_each_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node chain's preflight must know the lease is this run's (#1445)."""
+    run = _FakeRun(state="running")
+    run.lease_holder = "worker-0"
+    run.plan = {"node_order": ["node-a"], "slot_image_url": "http://mirror/x"}
+    db = _db_for_state_test(run)
+    holders: list[Any] = []
+
+    async def _fake_per_node(*args: Any, **kwargs: Any) -> per_node.SingleNodeResult:
+        holders.append(kwargs.get("lease_holder"))
+        return _good_result(kwargs["node_name"])
+
+    monkeypatch.setattr(per_node, "single_node_upgrade", _fake_per_node)
+    monkeypatch.setattr(orchestrator.mutex, "release", lambda **_kw: (True, None))
+    monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
+
+    await orchestrator._drive_loop(db, run, asyncio.Event())  # type: ignore[arg-type]
+    assert holders == ["worker-0"]
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ Per-driver credential dict shapes (decrypted from
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,73 @@ class CloudDNSError(Exception):
     Raised so the record-ops + import + probe paths surface a clean
     operator-facing message instead of a raw SDK traceback.
     """
+
+
+class CloudDNSConflictError(CloudDNSError):
+    """The provider already holds a resource SpatiumDDI must not take over.
+
+    Raised e.g. when a zone create names a hosted zone that already
+    exists in the provider account: silently adopting it would put a
+    zone SpatiumDDI never created under management (and a later delete
+    would tear it down). Callers map this to HTTP 409; the remedy is
+    the explicit "Import existing zones" flow, which is the one
+    sanctioned adoption path.
+    """
+
+
+def provider_value_candidates(record: RecordData) -> set[str]:
+    """Spellings a cloud provider may store for one DB record's value.
+
+    Most providers store the value verbatim, but MX / SRV bake the
+    numeric fields into the rdata string (``"10 mail.example.com."``,
+    ``"0 5 5060 sip.example.com."``) while a SpatiumDDI DB row keeps
+    them in separate columns — so a managed-record match has to try
+    both shapes. Trailing-dot variants are included because providers
+    normalise host targets to FQDNs while DB rows may not.
+    """
+    value = record.value
+    candidates = {value, value.rstrip(".")}
+    rtype = record.record_type.upper()
+    if record.priority is not None and rtype == "MX":
+        baked = f"{record.priority} {value}"
+        candidates.update({baked, baked.rstrip(".")})
+    elif (
+        record.priority is not None
+        and record.weight is not None
+        and record.port is not None
+        and rtype == "SRV"
+    ):
+        baked = f"{record.priority} {record.weight} {record.port} {value}"
+        candidates.update({baked, baked.rstrip(".")})
+    if rtype in ("MX", "SRV"):
+        # Exactly what the write path sends, defaults included (#1526):
+        # an MX with no stored priority went out as "10 <target>".
+        composed = compose_structured_rdata(record)
+        candidates.update({composed, composed.rstrip(".")})
+    return candidates
+
+
+def managed_value_index(
+    records: list[RecordData],
+    apex: str,
+    absolutize: Callable[[str, str], str],
+) -> dict[tuple[str, str], set[str]]:
+    """Index managed (DB) records by (absolute name, type) → value spellings.
+
+    Used by zone-delete emptying: a provider rrset value may only be
+    deleted when it appears in this index — anything else belongs to
+    whoever else writes to the zone and must be left untouched.
+    """
+    index: dict[tuple[str, str], set[str]] = {}
+    for rec in records:
+        key = (normalize_fqdn(absolutize(rec.name, apex)), rec.record_type.upper())
+        index.setdefault(key, set()).update(provider_value_candidates(rec))
+    return index
+
+
+def value_is_managed(live_value: str, candidates: set[str]) -> bool:
+    """True when a provider-side rrset value matches a managed spelling."""
+    return live_value in candidates or live_value.rstrip(".") in candidates
 
 
 @dataclass(frozen=True)
@@ -99,6 +167,54 @@ def normalize_fqdn(name: str) -> str:
     if not n.endswith("."):
         n += "."
     return n
+
+
+def compose_structured_rdata(record: RecordData) -> str:
+    """Compose the provider rdata string for one record from the split form.
+
+    The record API stores MX / SRV split: ``value`` is the bare target and
+    priority / weight / port live in their own columns (#1526). Providers
+    whose rdata is a single string (Route 53, Google Cloud DNS) need the
+    composed wire form — ``"<pref> <target>"`` for MX,
+    ``"<priority> <weight> <port> <target>"`` for SRV. Defaults mirror the
+    agent renderers: MX preference 10, SRV fields 0. Every other type's
+    rdata is the value verbatim.
+    """
+    rtype = record.record_type.upper()
+    if rtype == "MX":
+        pref = record.priority if record.priority is not None else 10
+        return f"{pref} {record.value}"
+    if rtype == "SRV":
+        prio = record.priority if record.priority is not None else 0
+        weight = record.weight if record.weight is not None else 0
+        port = record.port if record.port is not None else 0
+        return f"{prio} {weight} {port} {record.value}"
+    return record.value
+
+
+def split_structured_rdata(
+    record_type: str, rdata: str
+) -> tuple[str, int | None, int | None, int | None]:
+    """Split a provider rdata string into ``(value, priority, weight, port)``.
+
+    The inverse of :func:`compose_structured_rdata`, for MX / SRV reads so
+    imports + drift store the same split shape the record API writes. A
+    value that doesn't parse as the structured form is returned verbatim
+    with all three fields ``None`` rather than failing the whole pull.
+    """
+    rtype = record_type.upper()
+    raw = (rdata or "").strip()
+    if rtype == "MX":
+        head, sep, rest = raw.partition(" ")
+        if sep and head.isdigit() and rest.strip():
+            return rest.strip(), int(head), None, None
+        return raw, None, None, None
+    if rtype == "SRV":
+        parts = raw.split(None, 3)
+        if len(parts) == 4 and all(p.isdigit() for p in parts[:3]):
+            return parts[3].strip(), int(parts[0]), int(parts[1]), int(parts[2])
+        return raw, None, None, None
+    return raw, None, None, None
 
 
 class CloudDNSDriverBase(DNSDriver):
@@ -173,17 +289,35 @@ class CloudDNSDriverBase(DNSDriver):
             rtype=change.record.record_type,
         )
 
-    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
+    async def apply_zone_change(
+        self,
+        server: Any,
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         """Create / delete a hosted zone on the provider.
 
         Called by the zone-CRUD service helper for agentless drivers. ``op``
         is ``create`` | ``delete``. Cloud providers have no rename — the
         caller sends delete+create.
+
+        ``managed_records`` (delete only) is the zone's record set as
+        SpatiumDDI's DB knows it, loaded by the caller while the rows
+        still exist. A provider that must empty a zone before deleting
+        it scopes that emptying to these records: provider-side records
+        SpatiumDDI never managed are left untouched, and if they keep
+        the provider from deleting the zone, the provider's refusal
+        surfaces as the error (an honest failure, never a silent wipe).
+        ``None`` means "no scoping information" — the provider must
+        not delete ANY record on the way out, only attempt the zone
+        delete itself.
         """
         if op not in {"create", "delete"}:
             raise ValueError(f"{self.name}.apply_zone_change: unsupported op {op!r}")
         creds = self._load_credentials(server)
-        await self._apply_zone(server, creds, zone, op)
+        await self._apply_zone(server, creds, zone, op, managed_records=managed_records)
         logger.info(
             "cloud_dns.apply_zone_change",
             driver=self.name,
@@ -298,8 +432,21 @@ class CloudDNSDriverBase(DNSDriver):
         """Create / update / delete one record on the provider."""
 
     @abstractmethod
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
-        """Create / delete one hosted zone on the provider."""
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
+        """Create / delete one hosted zone on the provider.
+
+        ``managed_records`` is threaded through from
+        :meth:`apply_zone_change` — see its docstring for the
+        delete-scoping contract.
+        """
 
     @abstractmethod
     def capabilities(self) -> dict[str, Any]:
@@ -308,8 +455,14 @@ class CloudDNSDriverBase(DNSDriver):
 
 __all__ = [
     "CloudDNSDriverBase",
+    "CloudDNSConflictError",
     "CloudDNSError",
     "CloudDNSProbe",
     "CloudDNSZone",
+    "compose_structured_rdata",
+    "managed_value_index",
     "normalize_fqdn",
+    "provider_value_candidates",
+    "split_structured_rdata",
+    "value_is_managed",
 ]

@@ -89,6 +89,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("dns_server_group", "id", "tsig_key_secret_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
+    ("event_subscription", "id", "headers_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
     ("firewall_feed", "id", "token_encrypted"),
     ("fortinet_firewall", "id", "api_token_encrypted"),
@@ -320,6 +321,10 @@ LEGACY_PLAINTEXT_SECRET_COLUMNS: frozenset[tuple[str, str]] = frozenset(
     {
         # #1364 — moved to ``tsig_key_secret_encrypted``.
         ("dns_server_group", "tsig_key_secret"),
+        # #1579 — moved to ``headers_encrypted``. JSONB, not text, but
+        # the scrubber writes NULL for these columns either way, which
+        # a nullable JSONB column accepts.
+        ("event_subscription", "headers"),
         # #1502 — moved to ``url_encrypted`` / ``auth_header_encrypted``.
         # Made nullable by that migration so the scrubber's NULL restores.
         ("audit_forward_target", "url"),

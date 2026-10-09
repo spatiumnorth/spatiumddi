@@ -19,6 +19,9 @@ export function CreateClientClassModal({
   const [name, setName] = useState(klass?.name ?? "");
   const [description, setDescription] = useState(klass?.description ?? "");
   const [matchExpr, setMatchExpr] = useState(klass?.match_expression ?? "");
+  const [family, setFamily] = useState<DHCPClientClass["address_family"]>(
+    klass?.address_family ?? "ipv4",
+  );
   const initialOptions: DHCPOption[] = optionsFromMap(klass?.options);
   const [options, setOptions] = useState<DHCPOption[]>(initialOptions);
   const [error, setError] = useState("");
@@ -30,6 +33,7 @@ export function CreateClientClassModal({
         name,
         description,
         match_expression: matchExpr,
+        address_family: family,
         options: optionsDict,
       };
       return editing
@@ -70,6 +74,22 @@ export function CreateClientClassModal({
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
+        </Field>
+        <Field
+          label="Address family"
+          hint="Which Kea daemons get this class. A test using pkt4 / relay4 is IPv4-only, pkt6 / relay6 IPv6-only. Both sends each option to whichever family it is valid in."
+        >
+          <select
+            className={inputCls}
+            value={family}
+            onChange={(e) =>
+              setFamily(e.target.value as DHCPClientClass["address_family"])
+            }
+          >
+            <option value="ipv4">IPv4 (kea-dhcp4)</option>
+            <option value="ipv6">IPv6 (kea-dhcp6)</option>
+            <option value="dual">Both</option>
+          </select>
         </Field>
         <Field
           label="Match Expression"

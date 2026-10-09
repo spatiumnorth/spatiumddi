@@ -72,6 +72,7 @@ from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
     op_rrset_key,
+    queued_after,
     rrset_match_where,
     supersede,
 )
@@ -1192,7 +1193,9 @@ async def page_pending_ops(
     op_res = await db.execute(
         select(DNSRecordOp)
         .where(*conds)
-        .order_by(DNSRecordOp.created_at, DNSRecordOp.id)
+        # #1489 — ``seq`` keeps one transaction's ops in the order they were
+        # queued; ``id`` only breaks ties between rows from before it.
+        .order_by(DNSRecordOp.created_at, DNSRecordOp.seq, DNSRecordOp.id)
         .limit(batch)
     )
     ops_to_dispatch = list(op_res.scalars().all())
@@ -1236,8 +1239,8 @@ async def _supersede_backed_off_ops(
     candidates — anything older and ready ships ahead in the same page — and
     only those for an RRset in this page, matched in SQL: a bulk backlog that
     failed can leave hundreds of thousands of ops backing off, and loading
-    them on every page is what paging exists to avoid. Strictly older only;
-    ops queued by one transaction share ``created_at``.
+    them on every page is what paging exists to avoid. Strictly older only,
+    by ``queued_after`` (#1489).
     """
     newest: dict[tuple[str, str, str], DNSRecordOp] = {}
     for op in shipping:
@@ -1265,7 +1268,9 @@ async def _supersede_backed_off_ops(
         for op in waiting:
             key = op_rrset_key(op)
             successor = newest.get(key) if key is not None else None
-            if successor is not None and successor.created_at > op.created_at:
+            if successor is not None and queued_after(
+                successor.created_at, successor.seq, op.created_at, op.seq
+            ):
                 supersede(op, successor.id, now)
 
 
