@@ -41,14 +41,15 @@ from typing import Any
 import httpx
 import structlog
 
+from ..secure_io import harden_mode, write_private
 from ._process import (
     find_running_daemon,
     is_zombie,
     spawn_guard,
     wait_for_daemon,
 )
+from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, DriverBase
-from ..secure_io import harden_mode, write_private
 
 log = structlog.get_logger(__name__)
 
@@ -103,16 +104,6 @@ def _safe_alias_resolver(value: Any) -> str:
         log.warning("powerdns_alias_resolver_refused", value=value[:200])
         return ""
     return ",".join(entries)
-
-
-def _quote_txt(value: str) -> str:
-    """RFC 1035 TXT quoting — chunk into ≤255-byte strings."""
-    s = value
-    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-        s = s[1:-1]
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
-    return " ".join(f'"{c}"' for c in chunks)
 
 
 def _record_content(rec: dict[str, Any]) -> str:
@@ -1427,7 +1418,7 @@ class PowerDNSDriver(DriverBase):
         if exe is None:
             return None
         try:
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 [exe, "--version"],
                 capture_output=True,
                 text=True,

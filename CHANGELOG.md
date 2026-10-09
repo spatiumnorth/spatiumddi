@@ -84,6 +84,117 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cloud DNS drivers write MX/SRV records whole, and drift can
+  see their parts (#1526, #1525).** MX and SRV records were written
+  wrong or not at all by several of the Route 53 / Google / Azure /
+  Cloudflare / Linode / Vultr drivers — priority, weight and port
+  were dropped or folded into the target string — so a correct
+  record in SpatiumDDI landed mangled at the provider. The shared
+  cloud base and all six drivers now carry the structured fields
+  through. And because drift compared only name/type/target, a
+  priority, weight or port change at the provider read as
+  "no change"; those fields are now part of a record's drift and
+  sync identity in drift detection, cutover parity and pull.
+
+- **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
+  TXT values are stored unquoted, and the BIND9 agent dropped them
+  into zone files and RFC 2136 updates verbatim — so a `;` in a
+  DMARC value started a zone-file comment and spaces in an SPF
+  value split it into character-strings resolvers join without the
+  spaces. The BIND9 and PowerDNS agent drivers and the backend
+  BIND9/PowerDNS drivers now share one quoting helper per package
+  (`drivers/_txt.py` in the agent, `drivers/dns/_txt.py` in the
+  backend). An unquoted value is one string, split into 255-*octet*
+  character-strings without splitting a UTF-8 character (the old
+  copies cut at 255 characters after escaping, which could split an
+  escape sequence and exceed the octet limit). An already-quoted
+  value is served exactly as entered: each quoted string stays its
+  own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
+  keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
+  a string over 255 octets is split further. Control characters are
+  stripped. The Technitium TXT path is unchanged (#1694).
+
+- **Rolling-upgrade preflight warns on a SemVer jump that skips a major
+  version (#1182).** Between two CalVer releases the version check warns when
+  the target is more than 90 days newer. SemVer tags carry no date, so between
+  two SemVer releases every forward jump passed silently, 1.2.0 to 4.0.0
+  included. It now warns when the jump crosses more than one major version
+  (1.x to 3.x) and suggests stopping at each major in between. 1.x to 2.x,
+  and minor and patch jumps, never warn, and the switch from CalVer to 1.0.0
+  is never a skip. A warning, not a refusal: two rolling upgrades back to back
+  stay supported.
+
+- **A CalVer release tag with a leading-zero release number is refused
+  (#1182).** `2026.10.07-01` parsed to the same release as `2026.10.07-1`, and
+  the chart-version rewrite published both as chart `2026.10.7-1`.
+  `scripts/release_version.py` now refuses it, and `-0`, the same way it
+  already refused `1.0.0-rc.01`.
+
+- **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
+  with `is_active: false` only set the flag: the account's sessions
+  were refused while it stayed disabled, but they stayed valid, so
+  re-enabling it brought every one back (an attacker's included), and
+  a refused request still showed as activity in Sessions. A change of
+  `is_active` now revokes every session the account holds, as an admin
+  password reset does, and the audit row says how many; a re-enabled
+  account starts with none, and a disabled account's refused requests
+  no longer move a session's last-seen time.
+
+- **SAML metadata no longer advertises a single logout endpoint that
+  does not exist (#1420).** Every SAML provider's service-provider
+  metadata named a `SingleLogoutService` at
+  `/api/v1/auth/{provider_id}/slo`, which no route served: an IdP
+  configured from the metadata sent its LogoutRequests to a 404,
+  reported a partial logout, and the SpatiumDDI session outlived the
+  user's IdP logout. SpatiumDDI does not take part in SAML single
+  logout, so the metadata now advertises only the ACS it serves, and
+  docs/features/AUTH.md says what logging out does and does not end.
+
+- **A member joining a multi-node appliance no longer stops DNS and DHCP
+  on every node (#1439).** A member's promotion changes its role apply
+  key (the agents' control-plane URL, #1350), so its first heartbeat
+  after the join re-applied the cluster's one role chart with the roles
+  it held at that moment: none. Every agent was rendered off, and the
+  helm upgrade deleted every agent DaemonSet on every node, the seed's
+  included, until a node holding the roles wrote the chart again (its
+  watchdog, every five minutes). Forming a cluster, adding a member and
+  a Replace each left the cluster without DNS and DHCP for one to four
+  minutes. A node that holds no agent key now keeps an agent on while
+  another node is labelled for its role, with that role's key and
+  server group taken from the live chart and everything else from its
+  own render; a node list or chart it cannot read fails the apply
+  instead of writing it blind.
+
+- **Giving a cluster node some of the roles, or taking one back, no
+  longer stops that role's agents on every node (#1427).** A node
+  renders an agent only when it holds that role's key, so a member given
+  DNS alone, or a node DHCP was taken back from, wrote the DHCP agent off
+  in the cluster's one role chart, and Kea was killed on every node still
+  assigned DHCP until a watchdog wrote the chart again (89 seconds without
+  DHCP on a three-node cluster; about 3.5 minutes on a field cluster of
+  2026.10.02-1). Every agent a node does not hold now stays on while
+  another node is labelled for its role, so a role change is a node label
+  again, as the chart intends.
+
+- **A cluster member that held the Redis master and rebooted before
+  Sentinel failed over no longer leaves Redis without a master (#1442).**
+  Each Redis pod's init container wrote a fixed topology on every start:
+  redis-0 the master, every other pod a replica of redis-0, every
+  sentinel monitoring redis-0. After any failover the master can sit on
+  another pod, and when that pod was re-created before Sentinel had
+  failed over (its node rebooted, as in a rolling upgrade) it came back
+  as a replica of redis-0 while redis-0 was still its replica. No pod was
+  master, Sentinel aborted every failover (`no-good-slave`), and the api
+  and the workers stayed down until someone intervened by hand. The init
+  container now asks the running sentinels which pod is the master and
+  follows it, or starts as master when they name the pod itself, and
+  renders the same master into the pod's sentinel.conf; the highest
+  config epoch wins when they disagree, and the question is retried for
+  up to 60 s before the ordinal rule applies, which it now does only
+  when no sentinel answers (the whole set starting cold). The script
+  moved to `charts/spatiumddi/files/redis-sentinel-render-config.sh`,
+  where `appliance/tests` runs it.
+
 - **Cloud DNS zone creates and deletes no longer duplicate or wedge
   (#1527, #1528, #1534).** Creating a Route 53 zone whose name
   already exists in the account is refused with a conflict error
@@ -1108,18 +1219,6 @@ the formatter handles the rest.
   closed by the generic evaluator's auto-resolve passes; the
   conformity engine owns them.
 
-- **Cloud DNS drivers write MX/SRV records whole, and drift can
-  see their parts (#1526, #1525).** MX and SRV records were written
-  wrong or not at all by several of the Route 53 / Google / Azure /
-  Cloudflare / Linode / Vultr drivers — priority, weight and port
-  were dropped or folded into the target string — so a correct
-  record in SpatiumDDI landed mangled at the provider. The shared
-  cloud base and all six drivers now carry the structured fields
-  through. And because drift compared only name/type/target, a
-  priority, weight or port change at the provider read as
-  "no change"; those fields are now part of a record's drift and
-  sync identity in drift detection, cutover parity and pull.
-
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
@@ -1579,6 +1678,18 @@ the formatter handles the rest.
 
 ### Security
 
+- **Typed-webhook subscription headers are encrypted at rest
+  (#1579).** Subscription `headers` (Authorization tokens and the
+  like) were stored in clear and rode along in "exclude secrets"
+  backups — unlike the webhook signing secret and the forward-target
+  credentials fixed in #1506. They now live in a Fernet-encrypted
+  `headers_encrypted` column (migration encrypts existing rows in
+  place; registered for backup exclusion and key-rotation rewrap),
+  API responses return only header names plus a `headers_set` flag,
+  backups no longer carry the values, and the admin UI treats
+  headers as write-only: blank keeps the stored set, typed lines
+  replace it, an explicit clear removes it.
+
 - **A failed backup run's audit row no longer carries the destination's
   error text (#1617).** The `backup_target_run_failed` row is forwarded
   as-is, to syslog, webhook and SMTP forward targets and as the
@@ -1705,7 +1816,6 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
-
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already

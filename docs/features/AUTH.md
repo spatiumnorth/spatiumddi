@@ -308,14 +308,22 @@ Flow:
    (ACS endpoint).
 3. Backend consumes the assertion and redirects to `/auth/callback#token=…`.
 4. `GET /auth/{provider_id}/metadata` returns SP metadata XML so admins
-   can register SpatiumDDI at the IdP.
+   can register SpatiumDDI at the IdP. It advertises one endpoint, the ACS
+   above (HTTP-POST).
+
+**No single logout.** SpatiumDDI does not take part in SAML single logout
+(SLO): its metadata advertises no `SingleLogoutService`, it sends no
+LogoutRequest, and signing out of SpatiumDDI ends only its own session. A
+logout at the IdP does not end a SpatiumDDI session, which lasts until it
+expires or the user signs out (#1420: the metadata used to advertise an
+`/auth/{provider_id}/slo` endpoint that no route served).
 
 Key config fields:
 
 | Field | Notes |
 |---|---|
 | `idp_metadata_url` | Optional — backend can pull IdP details automatically. |
-| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. |
+| `idp_entity_id` / `idp_sso_url` / `idp_slo_url` | Set these when you don't provide a metadata URL. `idp_slo_url` is stored but not used: see "No single logout" above. |
 | `idp_x509_cert` | Base64 or PEM — used to verify the assertion. |
 | `sp_entity_id` | Defaults to the app URL. |
 | `attr_username` / `attr_email` / `attr_display_name` / `attr_groups` | SAML attribute names. |
@@ -719,10 +727,15 @@ rather than swallowing the failure. Permission-related rejections
 - **Refresh token invalid or expired.** Refresh is rejected with `401`
   when the token is not in the sessions table, has been revoked, or
   has passed `expires_at`. `backend/app/api/v1/auth/router.py`.
-- **User deactivated mid-session.** A refresh request from a disabled
-  user returns `401` even if the refresh token itself is still valid
-  — deactivating a user revokes their session on the next refresh.
-  `backend/app/api/v1/auth/router.py`.
+- **Disabling an account ends its sessions (#1383).** `PUT
+  /api/v1/users/{id}` that changes `is_active` revokes every session
+  the account holds, as an admin password reset does, and its audit row
+  records how many (`sessions_revoked`). Re-enabling revokes any that are
+  left, so a re-enabled account starts with no sessions, even one disabled
+  before this change. While an account is disabled, a request on one of
+  its sessions is refused with `403` and is not recorded as activity
+  (`last_seen_at` stays), and a refresh returns `401`.
+  `backend/app/api/v1/users/router.py`, `backend/app/api/deps.py`.
 
 ### Password management
 
