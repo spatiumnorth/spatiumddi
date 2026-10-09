@@ -174,6 +174,14 @@ the formatter handles the rest.
   - A run that ended while the API was not answering kept the upgrade
     lease until it expired. The end of a run now retries the release,
     and releases only a lease it still holds.
+  - After a node's apply failed once, the next run failed that node's
+    `reboot` step in the same second it stamped the new image, because
+    the node still reported the old `failed`; the supervisor then ran
+    the new apply with no drive watching. A new stamp now clears the
+    node's last upgrade outcome, as the Fleet clear does (without the
+    clear's host command, which would remove the trigger it just
+    produced), and the reboot step and health gate ignore a `failed`
+    written before this run's stamp, which the host can re-report.
   The other points in that report are #1446, #1447 and #1448.
 
 - **Technitium records stop churning and silently diverging (#1518,

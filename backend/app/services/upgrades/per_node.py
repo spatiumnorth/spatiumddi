@@ -456,16 +456,39 @@ async def _step_trigger_slot_apply(
         # the reason, not that the whole run dies at whichever node
         # happened to be scheduled first.
         return step.finish(False, error=str(exc))
-    await db.flush()
-    # Flushed, not committed: ``single_node_upgrade`` commits straight after
-    # this step, before the reboot step waits on the supervisor (#1445).
-    #
     # ``fresh_stamp`` is False when the row already carried this exact URL: a
     # re-driven node, whose apply the supervisor's fire-once marker will not
     # repeat. The reboot step then takes the staged state as it stands
     # instead of waiting for a new apply that is never coming.
     fresh = appliance.desired_slot_image_url != previous_url
+    if fresh:
+        _forget_previous_attempt(appliance)
+    await db.flush()
+    # Flushed, not committed: ``single_node_upgrade`` commits straight after
+    # this step, before the reboot step waits on the supervisor (#1445).
     return step.finish(True, appliance_id=str(appliance.id), fresh_stamp=fresh)
+
+
+def _forget_previous_attempt(appliance: Appliance) -> None:
+    """Drop our copy of the last upgrade's outcome when a new one is stamped.
+
+    The stamp does not touch the ``last_upgrade_*`` columns, so a node whose
+    previous apply failed still read ``failed`` the instant this run stamped
+    a new image, and the reboot step failed it in the same second while the
+    supervisor went on to run the apply with no drive watching (ddi-pg on
+    #1449). Same four columns the Fleet clear resets (#786).
+
+    Deliberately NOT the clear's host command (``clear_upgrade_requested``):
+    that command removes the slot-upgrade trigger and the fire-once marker,
+    and it stays raised until a later heartbeat, so it would delete or
+    re-fire the trigger this stamp is about to produce. Without it the next
+    heartbeat may re-publish the host's old ``failed``, with its old
+    timestamp, which is why ``_stale_failure`` also guards the reads.
+    """
+    appliance.last_upgrade_state = None
+    appliance.last_upgrade_state_at = None
+    appliance.last_upgrade_progress = None
+    appliance.last_upgrade_log_tail = None
 
 
 # ── Step 8: reboot into the staged slot ──────────────────────────────
@@ -509,6 +532,21 @@ def _slot_staged(appliance: Appliance, target_version: str, stamped_at: datetime
     return True
 
 
+def _stale_failure(appliance: Appliance, stamped_at: datetime | None) -> bool:
+    """Whether a ``failed`` state belongs to an attempt before this run's stamp.
+
+    The counterpart of the stale-``done`` test in ``_slot_staged``: when this
+    invocation stamped a new image URL (``stamped_at`` set), a failure written
+    before the stamp (or with no timestamp at all) describes a previous
+    attempt, and the supervisor is still about to run this one. Without a
+    stamp this run (a re-driven node) every ``failed`` counts, as before.
+    """
+    if appliance.last_upgrade_state != "failed" or stamped_at is None:
+        return False
+    failed_at = _aware(appliance.last_upgrade_state_at)
+    return failed_at is None or failed_at < stamped_at
+
+
 async def _step_reboot(
     db: AsyncSession,
     node_name: str,
@@ -544,7 +582,7 @@ async def _step_reboot(
         if appliance.installed_appliance_version == target_version:
             # A resumed run whose node already rebooted into the new slot.
             return step.finish(True, already_running_target=True)
-        if appliance.last_upgrade_state == "failed":
+        if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
             return step.finish(False, error="supervisor reported upgrade failed")
         if appliance.reboot_requested:
             # A request is already outstanding (a resumed run, or an
@@ -590,6 +628,7 @@ async def _step_health_gate(
     node_name: str,
     target_version: str,
     *,
+    stamped_at: datetime | None = None,
     timeout_s: float = DEFAULT_HEALTH_GATE_TIMEOUT_S,
 ) -> StepResult:
     """Wait for the appliance's heartbeat to report
@@ -597,7 +636,10 @@ async def _step_health_gate(
     ``last_upgrade_state == 'done'``.
 
     Failure paths we surface:
-      * ``last_upgrade_state == 'failed'`` — the apply itself failed.
+      * ``last_upgrade_state == 'failed'`` — the apply itself failed. A
+        failure older than this run's stamp (``stamped_at``) is a previous
+        attempt's and is waited past, not reported: the reboot step's early
+        exits hand over without having seen a fresh state (#1449).
       * Health-gate auto-revert (#138 Phase 8c): the host reboots back
         into the OLD slot, so installed_version never matches +
         ``last_upgrade_state`` may be 'done' on the OLD slot. We
@@ -627,7 +669,7 @@ async def _step_health_gate(
         # Refresh so we see the supervisor's heartbeat updates.
         await db.refresh(appliance)
         last_installed = appliance.installed_appliance_version
-        if appliance.last_upgrade_state == "failed":
+        if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
             return step.finish(
                 False,
                 error="supervisor reported upgrade failed",
@@ -897,7 +939,10 @@ async def single_node_upgrade(
             stamped_at = datetime.now(UTC)
     if not await _run("reboot", _step_reboot(db, node_name, target_version, stamped_at=stamped_at)):
         return _failed(node_name, target_version, "reboot", results)
-    if not await _run("health_gate", _step_health_gate(db, node_name, target_version)):
+    if not await _run(
+        "health_gate",
+        _step_health_gate(db, node_name, target_version, stamped_at=stamped_at),
+    ):
         return _failed(node_name, target_version, "health_gate", results)
     if not await _run("convergence", _step_convergence(node_name)):
         return _failed(node_name, target_version, "convergence", results)
