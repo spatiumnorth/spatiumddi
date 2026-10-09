@@ -45,6 +45,7 @@ class ListConformityPoliciesArgs(BaseModel):
 
 @register_tool(
     name="list_conformity_policies",
+    permission=("read", "conformity"),
     description=(
         "List declarative conformity policies. Each policy carries a "
         "framework label (PCI-DSS / HIPAA / NIST / SOC2 / custom), "
@@ -110,6 +111,7 @@ class FindConformityResultsArgs(BaseModel):
 
 @register_tool(
     name="find_conformity_results",
+    permission=("read", "conformity"),
     description=(
         "List recent conformity evaluation results — append-only "
         "history of every (policy × resource × pass). Operator uses "
@@ -158,6 +160,7 @@ class GetConformitySummaryArgs(BaseModel):
 
 @register_tool(
     name="get_conformity_summary",
+    permission=("read", "conformity"),
     description=(
         "Per-framework rollup of policy + result counts. Returns a "
         "list of ``{framework, policy_count, enabled_count, "

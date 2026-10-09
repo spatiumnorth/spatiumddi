@@ -73,6 +73,7 @@ class ListNmapScansArgs(BaseModel):
 
 @register_tool(
     name="list_nmap_scans",
+    permission=("read", "manage_nmap_scans"),
     module="tools.nmap",
     description=(
         "List nmap scans from the on-demand scanner history. Filter "
@@ -143,6 +144,7 @@ class GetNmapScanResultsArgs(BaseModel):
 
 @register_tool(
     name="get_nmap_scan_results",
+    permission=("read", "manage_nmap_scans"),
     module="tools.nmap",
     description=(
         "Return full results for one nmap scan: alive / down state, "

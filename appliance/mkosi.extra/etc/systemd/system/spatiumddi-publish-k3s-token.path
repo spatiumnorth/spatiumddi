@@ -1,0 +1,20 @@
+[Unit]
+Description=Re-publish the k3s join token whenever k3s writes it (#1509)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/1509
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# The service's own boot run polls for the token for 60 s only. On a fresh
+# seed k3s can write it later than that (firstboot, airgap import, restarts),
+# and nothing published it until the next reboot, so a promote answered 409.
+#
+# PathChanged= is edge-triggered: it fires on close-after-write and on a
+# rename into place, once per write. PathExists= would be level-triggered and
+# re-start the oneshot every time it exits while the file exists, until the
+# start limit takes the unit down. systemd watches the nearest existing parent
+# until /var/lib/rancher/k3s/server/ appears, so a fresh install is covered.
+PathChanged=/var/lib/rancher/k3s/server/token
+Unit=spatiumddi-publish-k3s-token.service
+
+[Install]
+WantedBy=multi-user.target

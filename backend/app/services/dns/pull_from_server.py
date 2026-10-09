@@ -123,13 +123,35 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     return f"{v}.".lower()
 
 
-def _key(r: RecordData | DNSRecord, zone_name: str) -> tuple[str, str, str]:
-    """Identity key for dedup: (name, type, canonical-value). TTL-only
-    differences don't count — neither does relative-vs-FQDN storage for
-    name-valued records."""
+#: Identity key for pull/sync dedup: (name, type, canonical value,
+#: priority, weight, port) — see :func:`_key`. The structured fields are
+#: only non-None for MX / SRV, whose priority (and weight/port) live in
+#: their own columns rather than in the value (#1525).
+RecordKey = tuple[str, str, str, int | None, int | None, int | None]
+
+
+def _key(r: RecordData | DNSRecord, zone_name: str) -> RecordKey:
+    """Identity key for dedup: (name, type, canonical-value, priority,
+    weight, port). TTL-only differences don't count — neither does
+    relative-vs-FQDN storage for name-valued records.
+
+    The structured fields only participate for MX / SRV (#1525): those
+    types carry priority (and, for SRV, weight + port) in their own
+    columns, not in the value, so a priority-only edit made directly on
+    the server used to compare equal to the DB row and drift / sync
+    reported the record as in sync. Every other type keys them as None.
+    """
     name = (r.name or "").strip().lower()
     rtype = r.record_type.upper()
-    return (name, rtype, _normalize_value(rtype, r.value, zone_name))
+    if rtype in ("MX", "SRV"):
+        struct: tuple[int | None, int | None, int | None] = (
+            getattr(r, "priority", None),
+            getattr(r, "weight", None),
+            getattr(r, "port", None),
+        )
+    else:
+        struct = (None, None, None)
+    return (name, rtype, _normalize_value(rtype, r.value, zone_name), *struct)
 
 
 #: The address record the BIND9 agent writes into every primary zone file,
@@ -143,7 +165,7 @@ def without_agent_ns_glue(
     on_wire: list[RecordData],
     server: Any,
     zone_name: str,
-    db_keys: set[tuple[str, str, str]],
+    db_keys: set[RecordKey],
 ) -> list[RecordData]:
     """``on_wire`` minus the agent's own NS glue, when ``server`` is agent-managed BIND9.
 
@@ -221,7 +243,7 @@ def _additive_import(
     db: AsyncSession,
     zone: DNSZone,
     on_wire: list[RecordData],
-    db_keys: set[tuple[str, str, str]],
+    db_keys: set[RecordKey],
     *,
     apply: bool,
 ) -> PullResult:

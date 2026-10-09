@@ -42,6 +42,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-host rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each host (#333).
+            host_ids = [host.id for host in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -50,20 +53,27 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for host in rows:
+            for host_id in host_ids:
+                host = await db.get(DockerHost, host_id)
+                if host is None:
+                    continue
                 if host.last_synced_at is not None:
                     elapsed = now - host.last_synced_at
                     if elapsed < timedelta(seconds=host.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                host_name = host.name  # a failed flush expires host
                 try:
                     summary = await reconcile_host(db, host)
                 except Exception as exc:  # noqa: BLE001 — one host shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{host.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next host still syncs.
+                    await db.rollback()
+                    errors.append(f"{host_name}: {exc}")
                     logger.warning(
                         "docker_reconcile_crash",
-                        host=str(host.id),
+                        host=str(host_id),
                         error=str(exc),
                     )
                     continue

@@ -75,6 +75,11 @@ from app.services.dns.agent_token import (
 )
 from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
+from app.services.dns.soa_timers import (
+    AGENT_FEATURES_HEADER,
+    reconcile_soa_timers,
+    renders_soa_timers,
+)
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
@@ -243,6 +248,23 @@ async def _auth_agent(
     return server, payload
 
 
+async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
+    """#1171 — after an agent says what it renders, bring its group's SOA
+    timers in line, in a transaction of its own (the caller's has committed).
+
+    Never fails the request: register and heartbeat carry the agent's token
+    and op acks, and the next heartbeat of any agent in the group retries the
+    switch. The rollback expires every instance in the session, so the caller
+    must have read what it returns before calling this.
+    """
+    try:
+        if await reconcile_soa_timers(db, group_id) is not None:
+            await db.commit()
+    except Exception:  # noqa: BLE001 — see the docstring
+        await db.rollback()
+        logger.exception("dns_group_soa_timers_failed", group_id=str(group_id))
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
@@ -251,6 +273,9 @@ async def agent_register(
     body: AgentRegisterRequestV2,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
+    # #1171 — what the agent renders (``soa-timers``: each zone's own SOA
+    # timers). A header so an older control plane ignores it.
+    agent_features: str | None = Header(default=None, alias=AGENT_FEATURES_HEADER),
 ) -> AgentRegisterResponseV2:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
@@ -264,7 +289,7 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DNS subsystem is disabled on this control plane, so new "
-                "agents cannot register. Enable it under Settings → Features."
+                "agents cannot register. Enable it on the Features & Integrations page."
             ),
         )
     # Resolve or create group
@@ -375,6 +400,7 @@ async def agent_register(
     )
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
+    server.agent_renders_soa_timers = renders_soa_timers(agent_features)
 
     db.add(
         AuditLog(
@@ -403,7 +429,7 @@ async def agent_register(
         pending_approval=pending_approval,
     )
 
-    return AgentRegisterResponseV2(
+    response = AgentRegisterResponseV2(
         server_id=str(server.id),
         agent_id=str(server.agent_id),
         agent_token=token,
@@ -411,6 +437,11 @@ async def agent_register(
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
     )
+    # Before the agent's first poll: an agent of an older release joining a
+    # group that serves the zones' own timers switches it to the literal here,
+    # so its first bundle already carries a serial nobody served them under.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 _BODY_CHUNK = 64 * 1024
@@ -773,6 +804,10 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #1171 — on every heartbeat, from the header: the same server row is run
+    # by an older agent until the upgrade replaces its pod, and by an older one
+    # again if a node is rolled back.
+    server.agent_renders_soa_timers = renders_soa_timers(request.headers.get(AGENT_FEATURES_HEADER))
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents
@@ -855,13 +890,18 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
-    return AgentHeartbeatResponseV2(
+    response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
         acknowledged_at=now,
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
+    # now renders the zones' own SOA timers), or brings an older agent back,
+    # switches the group and moves the serials.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 @router.get("/record-ops")

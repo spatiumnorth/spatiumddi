@@ -892,12 +892,15 @@ class OPNsenseClient:
             if not addr or mac is None:
                 continue
             host = str(r.get("host") or "").strip()
-            domain = str(r.get("domain") or "").strip()
+            # The row's ``domain`` is deliberately NOT appended (#1557).
             out.append(
                 _OPNReservation(
                     address=addr,
                     mac=mac,
-                    hostname=f"{host}.{domain}" if host and domain else host,
+                    # Host label only (#1557): ``host`` + ``domain`` is
+                    # an FQDN, and IPAM publishing appends the zone to
+                    # hostname, which doubled the suffix.
+                    hostname=host,
                     description=str(r.get("descr") or "").strip(),
                 )
             )

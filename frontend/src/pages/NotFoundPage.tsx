@@ -186,7 +186,7 @@ export function NotFoundPage() {
           renamed. Pages for features that are turned off are left out of the
           suggestions below; an administrator can turn them on under{" "}
           <Link to="/admin/features" className="text-primary hover:underline">
-            Settings → Features
+            Features & Integrations
           </Link>
           .
         </span>
