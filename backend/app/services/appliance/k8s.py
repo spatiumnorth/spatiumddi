@@ -729,6 +729,20 @@ def get_lease(
     return status, None
 
 
+def _micro_time(at: float | None = None) -> str:
+    """A Lease's ``acquireTime`` / ``renewTime``: a Kubernetes MicroTime.
+
+    The apiserver parses MicroTime strictly, as RFC 3339 with exactly six
+    fractional digits (``2006-01-02T15:04:05.000000Z07:00``), and answers
+    400 "cannot be handled as a Lease" to whole seconds. Every lease write
+    used whole seconds, so the rolling-upgrade orchestrator could never
+    take its lease on a real cluster (#1445).
+    """
+    stamp = time.time() if at is None else at
+    micros = int((stamp % 1) * 1_000_000)
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(stamp))}.{micros:06d}Z"
+
+
 def create_lease(
     name: str,
     holder: str,
@@ -748,7 +762,7 @@ def create_lease(
     if cfg is None:
         return False, "ServiceAccount not mounted"
     ns = namespace or cfg.namespace
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     payload = json.dumps(
         {
             "apiVersion": "coordination.k8s.io/v1",
@@ -803,7 +817,7 @@ def update_lease(
     ns = namespace or cfg.namespace
     # We do a server-side merge patch on ``spec`` only — the
     # metadata is owned by k8s + the controller-manager.
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     spec: dict[str, Any] = {
         "holderIdentity": holder,
         "leaseDurationSeconds": lease_duration_seconds,
@@ -850,7 +864,7 @@ def clear_lease_holder(
     ns = namespace or cfg.namespace
     # Two-hour-ago renewTime is well beyond any sane
     # leaseDurationSeconds → next read treats this as expired.
-    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+    old = _micro_time(time.time() - 7200)
     payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
@@ -1071,6 +1085,22 @@ def evict_pod(
 # centralised here so the rolling-upgrade primitive can read +
 # mutate the Cluster's maintenance window without duplicating the
 # CR path math.
+
+
+def get_pod(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read one pod. Returns (status, parsed_body_or_None), like
+    ``get_cnpg_cluster``: a non-200 comes back as status + None."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    status, body = _request("GET", f"/api/v1/namespaces/{quote(ns)}/pods/{quote(name)}")
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
 
 
 def get_cnpg_cluster(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
