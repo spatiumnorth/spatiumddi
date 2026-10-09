@@ -530,6 +530,12 @@ Assignments** tab lists every reservation across the group's scopes.
   but the reservation is left untouched and the response carries the
   permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
   still requires a superadmin, as above.
+- **Deleting the address follows the same rule.** Deleting an IPAM row (or
+  purging orphans) removes the reservations linked to it, on the DHCP server
+  too, so it needs `delete` on `dhcp_static`. Without it the delete is
+  refused with 403 rather than leaving a reservation behind a row that no
+  longer exists (GHSA-hxpx). Each reservation a delete removes writes its own
+  `dhcp_static_assignment` audit row.
 - **No backfill for rows from before the server-side sync.** A `static_dhcp`
   row created before #1628 that never got its reservation is not repaired
   in the background: it gets one the next time it is saved, or when it is
@@ -1064,14 +1070,20 @@ whichever bundle came before this one — that rotation destroyed the fallback
 after two poll cycles), and `quarantine.json` records an etag whose apply
 failed so it is not re-rendered on every poll.
 
-Kea's `config-test` is what makes the distinction usable: a rejection is a
+The preflight (`kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file, in a
+separate process) is what makes the distinction usable: a rejection is a
 verdict about the config, whereas an unreachable control socket says nothing
-about it — Kea may simply be restarting. Only a rejection reverts; reverting
-on an unreachable socket would discard a good bundle because of a timing
-accident.
+about it — Kea may simply be restarting. A rejection reverts; reverting on an
+unreachable socket would discard a good bundle because of a timing accident.
+A check that could not run at all (missing binary, 30 s timeout, crash) is
+not a verdict either, but it is not an acceptance: the reload is skipped and
+the apply fails in the `validate` phase, so it is reverted on disk,
+quarantined and retried on the backoff. The agent does not use Kea's
+`config-test` command: on Kea 3.0.3 it leaves the running daemon unable to
+start the HA listener (#1447).
 
 The revert rewrites the on-disk `kea-dhcp4.conf` / `kea-dhcp6.conf`, not just
-the agent's bookkeeping. `config-test` rejects *without* disturbing the
+the agent's bookkeeping. The `-t` check rejects *without* disturbing the
 running daemon, so Kea itself is fine either way — but the refused document
 has already been written to those paths, and that file is what Kea reads on
 its next start. Leaving it turns a rejected apply into a crash loop the next
@@ -1091,7 +1103,7 @@ unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
 read by nothing before), is exposed on the server row, drives a chip and a
 detail banner, and feeds the `agent_daemon_degraded` alert rule once a
 daemon that is not serving has stayed that way past a five-minute grace. A
-rejected config is not that: `config-test` refuses without disturbing the
+rejected config is not that: the `-t` check refuses without disturbing the
 running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
 Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
 reported by `agent_config_rejected`. The server response's
@@ -1839,7 +1851,7 @@ but Kea rejects a malformed config **whole**, so an unbalanced paren
 would stop every other class, scope and reservation in the group
 converging, not just this policy. Same blast radius `named.conf`
 validation exists for in #876 / #899. The agent still runs Kea's own
-`config-test` before applying, and #882's quarantine means a rejected
+`kea-dhcp4 -t` check before applying, and #882's quarantine means a rejected
 bundle is reverted rather than re-applied in a loop.
 
 ### Rendering

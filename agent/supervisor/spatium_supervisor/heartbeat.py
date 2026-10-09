@@ -1174,7 +1174,7 @@ def heartbeat_once(
                 release_size,
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
-                mem_total_mib=k8s_api.node_memory_mib(),
+                mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
                 cnpg_instances=cnpg_instances,
             )
             if cp_changed:
