@@ -20,6 +20,9 @@ def request_reboot(row: Appliance) -> None:
     """Mark ``row`` as having a reboot requested now."""
     row.reboot_requested = True
     row.reboot_requested_at = datetime.now(UTC)
+    # Recorded from the next heartbeat, so a new request never inherits the
+    # boot an earlier one was waiting on (#1446).
+    row.reboot_requested_boot_id = None
 
 
 __all__ = ["request_reboot"]
