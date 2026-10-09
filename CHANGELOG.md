@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Cloud DNS drivers write MX/SRV records whole, and drift can
+  see their parts (#1526, #1525).** MX and SRV records were written
+  wrong or not at all by several of the Route 53 / Google / Azure /
+  Cloudflare / Linode / Vultr drivers — priority, weight and port
+  were dropped or folded into the target string — so a correct
+  record in SpatiumDDI landed mangled at the provider. The shared
+  cloud base and all six drivers now carry the structured fields
+  through. And because drift compared only name/type/target, a
+  priority, weight or port change at the provider read as
+  "no change"; those fields are now part of a record's drift and
+  sync identity in drift detection, cutover parity and pull.
+
 - **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
   TXT values are stored unquoted, and the BIND9 agent dropped them
   into zone files and RFC 2136 updates verbatim — so a `;` in a

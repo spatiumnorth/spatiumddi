@@ -45,6 +45,11 @@ class DriftRecord:
     record_type: str
     value: str
     ttl: int | None = None
+    # Structured MX / SRV fields (#1525) — carried so a priority-only
+    # difference is visible in the report, not just counted.
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
 
 
 @dataclass
@@ -80,6 +85,9 @@ def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
         record_type=r.record_type,
         value=r.value,
         ttl=r.ttl,
+        priority=getattr(r, "priority", None),
+        weight=getattr(r, "weight", None),
+        port=getattr(r, "port", None),
     )
 
 
