@@ -169,6 +169,20 @@ the formatter handles the rest.
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
 
+- **An SCP / SFTP backup target can check a pinned host key and sign
+  in with a private key again (#1692).** paramiko 4.0 removed DSA
+  (`paramiko.DSSKey`), the backend's `paramiko>=3.4.0` has no upper
+  bound, and the image installs 5.x, but the driver still named
+  `DSSKey` in two places that run on every connect. Every
+  `known_hosts` line raised and was skipped, so the checked host-key
+  modes (`known_hosts`, the default, and `strict`) refused every
+  server as "not found in known_hosts", even one whose key was
+  pinned; and a target with a private key answered Test connection
+  with a 500. Only `insecure_skip` with a password worked. DSA keys
+  are no longer offered (OpenSSH dropped them too), and new tests load
+  real known_hosts lines and private keys and complete a real SSH
+  handshake with the installed paramiko.
+
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
   2026.10.02-1, where Plan → Start never got past the upgrade lease:

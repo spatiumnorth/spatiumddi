@@ -1,8 +1,8 @@
 """SCP / SFTP backup destination (issue #117 Phase 1d).
 
 Writes archives to a remote host via SSH. Authentication is
-either password or private-key (ED25519 / ECDSA / RSA / DSS —
-whatever paramiko supports). Both creds are Fernet-wrapped at
+either password or private-key (ED25519 / ECDSA / RSA; not DSA,
+which paramiko 4.0 removed — #1692). Both creds are Fernet-wrapped at
 rest via :mod:`secrets_config` because they're declared
 ``secret=True`` in the config-fields spec.
 
@@ -139,7 +139,7 @@ class ScpDestination(BackupDestination):
             required=False,
             secret=True,
             description=(
-                "ED25519 / ECDSA / RSA / DSS. Paste the entire "
+                "ED25519 / ECDSA / RSA. Paste the entire "
                 "PEM-encoded key including BEGIN / END lines."
             ),
         ),
@@ -477,6 +477,11 @@ def _load_private_key(pem: str, passphrase: str | None):
     """Load a PEM-encoded SSH private key. paramiko's
     ``RSAKey.from_private_key`` / ``Ed25519Key.from_private_key`` /
     etc. each only handle one algo, so we try them in turn.
+
+    No DSA (#1692): paramiko 4.0 removed ``DSSKey``, and the backend's
+    unbounded ``paramiko>=3.4.0`` installs 4.0 or later, so naming it
+    raised ``AttributeError`` before any key was tried. OpenSSH dropped
+    DSA as well.
     """
     import paramiko  # noqa: PLC0415
 
@@ -486,7 +491,6 @@ def _load_private_key(pem: str, passphrase: str | None):
         paramiko.Ed25519Key,
         paramiko.ECDSAKey,
         paramiko.RSAKey,
-        paramiko.DSSKey,
     ):
         text_io.seek(0)
         try:
@@ -495,13 +499,15 @@ def _load_private_key(pem: str, passphrase: str | None):
             last_exc = exc
             continue
     raise BackupDestinationError(
-        f"could not parse private key (tried Ed25519 / ECDSA / RSA / DSS): {last_exc}"
+        f"could not parse private key (tried Ed25519 / ECDSA / RSA): {last_exc}"
     )
 
 
 def _decode_pubkey(keytype: str, b64: str):
     """Best-effort decoder for known_hosts pubkey lines.
-    Returns a paramiko PKey subclass or None on parse failure.
+    Returns a paramiko PKey subclass or None on parse failure, or for a
+    key type this driver does not take (``ssh-dss``: no ``DSSKey`` in
+    paramiko 4.0 and later, #1692).
     """
     import base64  # noqa: PLC0415
 
@@ -513,7 +519,6 @@ def _decode_pubkey(keytype: str, b64: str):
         return None
     cls_map = {
         "ssh-rsa": paramiko.RSAKey,
-        "ssh-dss": paramiko.DSSKey,
         "ssh-ed25519": paramiko.Ed25519Key,
         "ecdsa-sha2-nistp256": paramiko.ECDSAKey,
         "ecdsa-sha2-nistp384": paramiko.ECDSAKey,
