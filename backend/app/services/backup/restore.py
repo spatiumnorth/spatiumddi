@@ -15,7 +15,8 @@ Two shapes:
   sections' tables, both in one transaction (#1693). The closure matters
   because CASCADE empties every table holding a foreign key into a
   truncated one; restoring only the selection deleted the difference
-  (#781).
+  (#781). The closure's foreign keys are set aside for the load and put
+  back, checked, before it commits, so it needs no superuser.
 
 Safety rails:
 
@@ -386,7 +387,9 @@ async def _saw_token(stream: asyncio.StreamReader, token: bytes) -> bool:
     return seen
 
 
-async def _replay_clean(source, db_url: str, *, producer=None, prelude: str | None = None) -> None:
+async def _replay_clean(
+    source, db_url: str, *, producer=None, prelude: str | None = None, postlude: str = ""
+) -> None:
     r"""Clear the schema and replay a SQL script, in ONE transaction (#1363).
 
     ``source`` yields the script's bytes: a plain dump read from disk, or
@@ -397,7 +400,8 @@ async def _replay_clean(source, db_url: str, *, producer=None, prelude: str | No
     psql 15+ wraps several in one transaction. The prelude is
     :data:`_CLEAR_PUBLIC_SCHEMA_SQL` for a full restore (read when called, not
     bound at import); a selective restore passes its own, which empties only
-    the tables it reloads (#1693).
+    the tables it reloads (#1693), and a ``postlude`` that runs after the
+    script, in the same transaction.
 
     The script is streamed, not staged: an install's dump can be larger than
     the api pod's scratch space. The cost of streaming is that psql reaching
@@ -472,7 +476,7 @@ async def _replay_clean(source, db_url: str, *, producer=None, prelude: str | No
                 stdin.write(chunk)
                 await stdin.drain()
             # On its own line: the script need not end with a newline.
-            stdin.write(b"\n\\echo " + token + b"\n")
+            stdin.write(b"\n" + postlude.encode("utf-8") + b"\\echo " + token + b"\n")
             await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             return False
@@ -584,6 +588,63 @@ async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
         await _stop(producer)
 
 
+# #1693 — the foreign keys of the tables a selective restore reloads are set
+# aside for the load and put back before it commits, all in its one
+# transaction. ``pg_restore --data-only`` loads tables in the archive's order,
+# not in foreign-key order, and no order could do: ``ip_address`` and
+# ``dns_record`` (with ``nmap_scan``), and ``asn`` and ``provider``, reference
+# each other. ``--disable-triggers`` got past that by turning the foreign keys'
+# triggers off, which PostgreSQL allows only a superuser, and the appliance
+# connects as the app role, which owns the tables but is not one. Dropping a
+# foreign key and adding it back needs only ownership, and adding it back
+# checks every row it covers, which the disabled triggers never did: rows
+# pointing at something that no longer exists end the restore with the
+# constraint named, and the transaction rolls back.
+#
+# The definitions are read with an empty search_path, so they name every
+# table with its schema: ``pg_restore``'s script empties the search_path
+# before the put-back runs. The temporary table goes with the transaction.
+_SET_ASIDE_FOREIGN_KEYS_SQL = """\
+SELECT pg_catalog.set_config('search_path', '', false);
+CREATE TEMPORARY TABLE spatium_restore_fkey ON COMMIT DROP AS
+SELECT format('%I.%I', n.nspname, c.relname) AS tbl,
+       k.conname,
+       pg_catalog.pg_get_constraintdef(k.oid) AS def
+FROM pg_catalog.pg_constraint k
+JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE k.contype = 'f'
+  AND n.nspname = 'public'
+  AND c.relname = ANY ({tables});
+DO $setaside$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT tbl, conname FROM pg_temp.spatium_restore_fkey ORDER BY tbl, conname LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tbl, r.conname);
+    END LOOP;
+END
+$setaside$;
+"""
+
+_PUT_BACK_FOREIGN_KEYS_SQL = """\
+DO $putback$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT tbl, conname, def FROM pg_temp.spatium_restore_fkey ORDER BY tbl, conname LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.tbl, r.conname, r.def);
+    END LOOP;
+END
+$putback$;
+"""
+
+
+def _sql_text_array(values: list[str]) -> str:
+    """``ARRAY['a', 'b']::text[]`` with each value quoted as a literal."""
+    return "ARRAY[" + ", ".join("'" + v.replace("'", "''") + "'" for v in values) + "]::text[]"
+
+
 def _selective_prelude(tables: list[str]) -> str:
     """What a selective replay runs before the archive's rows, in the same
     transaction: take the locks the way the full restore's clearing does,
@@ -599,7 +660,13 @@ def _selective_prelude(tables: list[str]) -> str:
     :func:`_terminate_other_db_connections` has run, and the emptying now
     holds its locks until the load commits, so a session that read one of
     these tables and then waited on another would otherwise close a cycle
-    with it and end the restore in "deadlock detected".
+    with it and end the restore in "deadlock detected". Setting the foreign
+    keys aside also locks the tables they point into, which the lock block
+    has already taken.
+
+    Last, the foreign keys of ``tables`` are set aside
+    (:data:`_SET_ASIDE_FOREIGN_KEYS_SQL`) after the TRUNCATE, whose CASCADE
+    follows them.
     """
     quoted = ", ".join(f'"public"."{t}"' for t in tables)
     return (
@@ -607,6 +674,7 @@ def _selective_prelude(tables: list[str]) -> str:
         "SET client_min_messages = warning;\n"
         + _LOCK_PUBLIC_TABLES_SQL
         + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
+        + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=_sql_text_array(tables))
     )
 
 
@@ -618,7 +686,14 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
     --data-only --table=…`` turns their rows into a script (``--file=-``,
     which never connects), and :func:`_replay_clean` runs it through one
     ``psql --single-transaction`` after :func:`_selective_prelude` has
-    emptied them.
+    emptied them and set their foreign keys aside, then puts the foreign
+    keys back (:data:`_PUT_BACK_FOREIGN_KEYS_SQL`), which checks every row
+    loaded.
+
+    Nothing here needs a superuser. ``--disable-triggers`` did: it emits
+    ``ALTER TABLE … DISABLE TRIGGER ALL``, which PostgreSQL refuses to the
+    app role an appliance connects as on any table with a foreign key, so
+    every selective restore on an appliance failed (#1693).
 
     The emptying used to be a psql transaction of its own, which committed
     before the load started, so a load that failed for any reason left every
@@ -634,7 +709,6 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
     cmd = [
         "pg_restore",
         "--data-only",
-        "--disable-triggers",
         "--no-owner",
         "--no-acl",
         "--file=-",
@@ -657,7 +731,13 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
             yield chunk
 
     try:
-        await _replay_clean(script(), db_url, producer=producer, prelude=_selective_prelude(tables))
+        await _replay_clean(
+            script(),
+            db_url,
+            producer=producer,
+            prelude=_selective_prelude(tables),
+            postlude=_PUT_BACK_FOREIGN_KEYS_SQL,
+        )
     finally:
         # As in _run_pg_restore: reap the producer on a failure before the
         # replay owned it.
@@ -887,8 +967,8 @@ async def _apply_backup_restore_inner(
     overwrite of every table). When ``sections`` is a non-empty
     list of section keys (from
     :mod:`app.services.backup.sections`) → **selective restore**:
-    TRUNCATE CASCADE followed by
-    ``pg_restore --data-only --disable-triggers --table=…``, in one
+    TRUNCATE CASCADE followed by ``pg_restore --data-only --table=…`` with
+    the tables' foreign keys set aside and put back, in one
     transaction (#1693), over the
     **FK-cascade closure** of the selected sections' tables rather than
     the selection alone. ``platform_internal`` is always included
@@ -1032,9 +1112,9 @@ async def _apply_backup_restore_inner(
 
     # Phase 5: replay. Three paths:
     #  - selective restore (sections supplied) — TRUNCATE +
-    #    ``pg_restore --data-only --disable-triggers --table=…``, in one
-    #    transaction. Requires custom format; plain archives can't be
-    #    selective.
+    #    ``pg_restore --data-only --table=…``, foreign keys set aside and
+    #    put back, in one transaction. Requires custom format; plain
+    #    archives can't be selective.
     #  - full restore against custom format → ``pg_restore``.
     #  - full restore against plain format → ``psql``. Phase 1
     #    archives stay restorable through this path forever.

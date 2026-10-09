@@ -351,3 +351,80 @@ async def test_the_selective_replay_hands_its_tools_the_allowlisted_env(
     for program, env in envs:
         assert env, f"{program} inherited the api's whole environment"
         assert "SPATIUM_TEST_SECRET_SENTINEL" not in env, program
+
+
+async def test_a_selective_restore_as_the_app_role_brings_the_section_back(
+    appliance_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported case: restore ``ipam`` as a role that is not a superuser.
+    Writes made after the backup are undone, the rows come back with their
+    records, the schema pin is back, and every foreign key is as it was."""
+    url, archive, archived = appliance_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        await conn.execute("DELETE FROM dns_record WHERE name = 'alpha'")
+        await conn.execute("DELETE FROM ip_address WHERE hostname = 'alpha'")
+        await conn.execute("UPDATE subnet SET name = 'renamed after the backup'")
+    finally:
+        await conn.close()
+    keys_before = await _foreign_keys(url)
+
+    outcome = await _restore(url, archive, monkeypatch)
+
+    assert outcome.selective
+    assert "ipam" in (outcome.restored_sections or [])
+    assert "dns_record" in outcome.cascade_widened_tables
+    assert await _state(url) == archived
+    assert await _foreign_keys(url) == keys_before
+
+
+async def test_rows_that_point_at_something_gone_are_refused_and_change_nothing(
+    appliance_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive's zone belongs to a DNS server group deleted since the
+    backup, outside what a restore of ``ipam`` reloads. Loading it would leave
+    a zone pointing at nothing, so the restore is refused with the foreign
+    key named, after the closure was emptied and reloaded inside the same
+    transaction, and the database is left exactly as it was."""
+    url, archive, _archived = appliance_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        await conn.execute("DELETE FROM dns_server_group")
+    finally:
+        await conn.close()
+    before = await _state(url)
+    keys_before = await _foreign_keys(url)
+
+    with pytest.raises(restore.BackupRestoreError, match="violates foreign key constraint"):
+        await _restore(url, archive, monkeypatch)
+
+    assert await _state(url) == before
+    assert await _foreign_keys(url) == keys_before
+
+
+@pytest.mark.parametrize("section", ["dns", "dhcp", "auth"])
+async def test_other_sections_restore_as_the_app_role_too(
+    appliance_db, monkeypatch: pytest.MonkeyPatch, section: str
+) -> None:
+    """Every large section's closure holds a reference cycle (``auth``'s holds
+    both: ``ip_address``/``dns_record``/``nmap_scan`` and ``asn``/``provider``),
+    so each needs what ``ipam`` needs."""
+    url, archive, archived = appliance_db
+    keys_before = await _foreign_keys(url)
+
+    async def _no_safety_dump(_db: object) -> None:
+        return None
+
+    monkeypatch.setattr(restore, "_write_pre_restore_safety_dump", _no_safety_dump)
+    outcome = await restore.apply_backup_restore(
+        _RequestSession(),
+        archive_bytes=archive,
+        passphrase=_PASSPHRASE,
+        confirmation_phrase=restore.CONFIRM_PHRASE,
+        db_url=url,
+        sections=[section],
+    )
+
+    assert outcome.selective
+    assert await _state(url) == archived
+    assert await _foreign_keys(url) == keys_before
