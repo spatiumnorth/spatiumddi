@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.agent_wake import collect_wake, dns_group_channel
-from app.drivers.dns import get_driver, is_agentless
+from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.models.ipam import IPAddress
@@ -433,9 +433,15 @@ async def _apply_agentless(
             type=record["type"],
         )
     except Exception as exc:  # noqa: BLE001 — surface any wire / config error
-        op_row.state = "failed"
-        op_row.attempts = 1
-        op_row.last_error = str(exc)[:500]
+        # #1538 — a transient provider error (429, 5xx, WinRM timeout) used
+        # to be terminal: ``failed`` at ``attempts=1`` with nothing ever
+        # retrying it, while the caller reported success. Route it through
+        # the same retry accounting as agent ops (#1232): back to
+        # ``pending`` with backoff until the attempt budget is spent (or
+        # ``superseded`` by a newer op for the RRset), and the beat sweep
+        # :func:`apply_pending_agentless_ops` replays it — the op carries
+        # its whole RRset (#783), so a replay is idempotent.
+        message = str(exc)[:500]
         logger.warning(
             "record_op_failed_agentless",
             server=str(server.id),
@@ -444,6 +450,8 @@ async def _apply_agentless(
             op=op,
             error=str(exc),
         )
+        await db.flush()
+        await fail_attempts(db, [(op_row, message)], now=datetime.now(UTC))
 
     await db.flush()
     return op_row
@@ -1028,25 +1036,28 @@ async def _apply_agentless_batch(
             count=len(op_rows),
             error=str(exc),
         )
+        # #1538 — same retry accounting as the singular path: a whole-batch
+        # transient failure reschedules every row instead of terminally
+        # failing the batch at attempt 1.
         err = str(exc)[:500]
-        for row in op_rows:
-            row.state = "failed"
-            row.attempts = 1
-            row.last_error = err
+        await db.flush()
+        await fail_attempts(db, [(row, err) for row in op_rows], now=datetime.now(UTC))
         await db.flush()
         return list(op_rows)
 
     applied_count = 0
+    failures: list[tuple[DNSRecordOp, str]] = []
     for row, result in zip(op_rows, results, strict=True):
-        row.attempts = 1
         if result.ok:
+            row.attempts = 1
             row.state = "applied"
             row.applied_at = datetime.now(UTC)
             row.last_error = None
             applied_count += 1
         else:
-            row.state = "failed"
-            row.last_error = (result.error or "unknown")[:500]
+            failures.append((row, (result.error or "unknown")[:500]))
+    if failures:
+        await fail_attempts(db, failures, now=datetime.now(UTC))
     await db.flush()
 
     logger.info(
@@ -1059,6 +1070,96 @@ async def _apply_agentless_batch(
         failed=len(results) - applied_count,
     )
     return list(op_rows)
+
+
+def _change_from_op_row(op_row: DNSRecordOp) -> RecordChange | None:
+    """Rebuild the driver change an agentless op row describes, for replay.
+
+    The row carries its complete desired RRset (#783), so replaying it is
+    the same whole-RRset write the original attempt made. Returns ``None``
+    for rows that carry no replayable record payload (the DNSSEC signal
+    op has no ``value``; it is driven by zone state, not by replay).
+    """
+    record = op_row.record or {}
+    if "name" not in record or "type" not in record or "value" not in record:
+        return None
+    return RecordChange(
+        op=op_row.op,  # type: ignore[arg-type]
+        zone_name=op_row.zone_name,
+        record=RecordData(
+            name=record["name"],
+            record_type=record["type"],
+            value=record["value"],
+            ttl=record.get("ttl"),
+            priority=record.get("priority"),
+            weight=record.get("weight"),
+            port=record.get("port"),
+        ),
+        target_serial=op_row.target_serial or 0,
+        rrset=_rrset_from_payload(record),
+    )
+
+
+async def apply_pending_agentless_ops(
+    db: AsyncSession, *, now: datetime | None = None, limit: int = 200
+) -> dict[str, int]:
+    """Replay due ``pending`` agentless ops (#1538).
+
+    Agentless failures now go through :func:`fail_attempts`, which leaves
+    the op ``pending`` with a ``next_attempt_at`` backoff — but an agentless
+    server has no agent heartbeat to drain its queue, so without this sweep
+    (run from a Celery beat task) the rescheduled op would sit forever.
+    Each due op is re-applied through its server's driver; success marks it
+    ``applied``, another failure goes back through :func:`fail_attempts`
+    (which terminally ``failed``s it once the budget is spent, or
+    ``superseded``es it when a newer op for the RRset exists).
+
+    Also the recovery half of the after-commit ordering (#1539): an op row
+    that committed as ``pending`` — however it got there — is drained here
+    rather than lost. Returns counts for the caller's log line.
+    """
+    now = now or datetime.now(UTC)
+    rows = (
+        await db.execute(
+            select(DNSRecordOp, DNSServer)
+            .join(DNSServer, DNSServer.id == DNSRecordOp.server_id)
+            .where(
+                DNSRecordOp.state == "pending",
+                DNSServer.driver.in_(sorted(AGENTLESS_DRIVERS)),
+                DNSServer.is_enabled.is_(True),
+                (DNSRecordOp.next_attempt_at.is_(None)) | (DNSRecordOp.next_attempt_at <= now),
+            )
+            .order_by(DNSRecordOp.created_at)
+            .limit(limit)
+        )
+    ).all()
+    counts = {"applied": 0, "rescheduled": 0, "skipped": 0}
+    failures: list[tuple[DNSRecordOp, str]] = []
+    for op_row, server in rows:
+        change = _change_from_op_row(op_row)
+        if change is None:
+            counts["skipped"] += 1
+            continue
+        try:
+            driver = get_driver(server.driver)
+            await driver.apply_record_change(server, change)
+        except Exception as exc:  # noqa: BLE001 — one bad op must not stop the sweep
+            failures.append((op_row, str(exc)[:500]))
+            continue
+        op_row.attempts += 1
+        op_row.state = "applied"
+        op_row.applied_at = now
+        op_row.last_error = None
+        op_row.next_attempt_at = None
+        op_row.updated_at = now
+        counts["applied"] += 1
+    if failures:
+        await fail_attempts(db, failures, now=now)
+        counts["rescheduled"] = len(failures)
+    await db.flush()
+    if counts["applied"] or counts["rescheduled"]:
+        logger.info("agentless_record_op_retry_sweep", **counts)
+    return counts
 
 
 async def apply_acks(
