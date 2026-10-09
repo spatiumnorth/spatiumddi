@@ -1435,8 +1435,31 @@ class RecordResponse(BaseModel):
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
+    # #1538 — set when the record's agentless provider op did not land on
+    # its first attempt (it is rescheduled with backoff, or terminally
+    # failed): the DB change saved, but the provider does not have it yet.
+    # Always None for agent-based groups (their ops apply asynchronously
+    # by design) and on a clean agentless apply.
+    provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+def _agentless_op_warning(op: Any) -> str | None:
+    """The provider warning for a record op whose first agentless attempt
+    did not land (#1538), or None when it applied / was queued for an
+    agent. A failed attempt leaves the op ``pending`` with ``last_error``
+    set (retry budget left) or ``failed`` (budget spent)."""
+    if op is None:
+        return None
+    if getattr(op, "state", None) not in ("pending", "failed"):
+        return None
+    error = getattr(op, "last_error", None)
+    if not error:
+        return None
+    if op.state == "failed":
+        return f"DNS provider rejected this change and retries are exhausted: {error}"
+    return f"DNS provider did not accept this change yet; it is scheduled for retry: {error}"
 
 
 def _normalize_record_struct_fields(
@@ -7113,7 +7136,7 @@ async def create_record(
     db.add(record)
     target_serial = bump_zone_serial(zone)
     await db.flush()
-    await enqueue_record_op(
+    op = await enqueue_record_op(
         db,
         zone,
         "create",
@@ -7128,6 +7151,11 @@ async def create_record(
         },
         target_serial=target_serial,
     )
+    # #1538 — an agentless op that did not land must not read as a clean
+    # success: surface it on the response and audit it as an error (the op
+    # itself is rescheduled with backoff; see record_ops).
+    provider_warning = _agentless_op_warning(op)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -7137,11 +7165,12 @@ async def create_record(
             resource_type="dns_record",
             resource_id=str(record.id),
             resource_display=fqdn,
-            result="success",
+            result="error" if provider_warning else "success",
         )
     )
     await db.commit()
     await db.refresh(record)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
 
@@ -7232,8 +7261,9 @@ async def update_record(
             exclude_id=record.id,
         )
     target_serial = bump_zone_serial(zone) if zone is not None else None
+    op = None
     if zone is not None:
-        await enqueue_record_op(
+        op = await enqueue_record_op(
             db,
             zone,
             "update",
@@ -7248,6 +7278,10 @@ async def update_record(
             },
             target_serial=target_serial,
         )
+    # #1538 — as create: a failed first agentless attempt is surfaced, not
+    # silently audited as success.
+    provider_warning = _agentless_op_warning(op)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
 
     db.add(
         AuditLog(
@@ -7259,11 +7293,12 @@ async def update_record(
             resource_id=str(record.id),
             resource_display=record.fqdn,
             changed_fields=list(changes.keys()),
-            result="success",
+            result="error" if provider_warning else "success",
         )
     )
     await db.commit()
     await db.refresh(record)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
 

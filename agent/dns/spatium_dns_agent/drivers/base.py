@@ -122,7 +122,9 @@ class DriverBase(ABC):
 
         A non-empty list means the apply DID land — every other zone is
         served — but the daemon refused the data of the zones named here
-        (one ``"<zone>: <daemon's reason>"`` string each). The sync loop
+        (one ``"<zone>: <daemon's reason>"`` string each; Technitium, which
+        takes records one call at a time, reports one per refused record or
+        setting). The sync loop
         reports that as a degraded apply and does NOT revert: re-applying
         the last-known-good bundle cannot make the daemon accept data it
         just refused, and would take the zones it did accept down with it.

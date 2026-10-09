@@ -4054,6 +4054,8 @@ class ApplianceRolesUpdate(BaseModel):
             "mutually exclusive — one engine per appliance."
         ),
     )
+    # ``dns_group_id`` / ``dhcp_group_id``: omitted leaves the current
+    # group alone; an explicit ``null`` unassigns it (#1562).
     dns_group_id: uuid.UUID | None = None
     dhcp_group_id: uuid.UUID | None = None
     tags: dict[str, str] | None = None
@@ -4139,80 +4141,91 @@ async def update_appliance_roles(
                 )
         row.assigned_roles = list(body.roles)
 
-    if body.dns_group_id is not None:
-        # Best-effort existence check — wrong group_id → 422.
-        from app.models.dns import DNSServerGroup
+    # #1562 — presence in the payload decides, not non-None: an
+    # explicit ``null`` (the Fleet "(unassigned)" option) clears the
+    # assignment, an omitted field leaves it alone. The downstream
+    # role_assignment builder already handles a group-less role (no
+    # AGENT_GROUP shipped), so clearing is a supported state.
+    if "dns_group_id" in body.model_fields_set:
+        if body.dns_group_id is None:
+            row.assigned_dns_group_id = None
+        else:
+            # Best-effort existence check — wrong group_id → 422.
+            from app.models.dns import DNSServerGroup
 
-        dns_group = await db.get(DNSServerGroup, body.dns_group_id)
-        if dns_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DNS server group {body.dns_group_id} not found.",
-            )
-        # #1468 — the supervisor drops a name it won't put in the role env.
-        problem = group_name_problem("dns", dns_group.name)
-        if problem is not None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
-        # #1565 — the pointer alone moved the appliance's env and firewall
-        # to the new group while its registered server kept serving the old
-        # one (re-registration never moves a row, by design). Move the
-        # appliance's own DNS server(s) with it, through #934's move, in this
-        # transaction; a move it refuses (a name clash, a mixed-driver group)
-        # refuses the whole PUT, so the pointer and the server can't disagree.
-        from app.models.dns import DNSServer
-        from app.services.dns.server_move import ServerMoveError, move_server_to_group
-
-        for server in (
-            (await db.execute(select(DNSServer).where(DNSServer.appliance_id == row.id)))
-            .scalars()
-            .all()
-        ):
-            try:
-                await move_server_to_group(db, server, dns_group)
-            except ServerMoveError as exc:
+            dns_group = await db.get(DNSServerGroup, body.dns_group_id)
+            if dns_group is None:
                 raise HTTPException(
-                    status_code=exc.status_code,
-                    detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
-                ) from exc
-        row.assigned_dns_group_id = dns_group.id
-    if body.dhcp_group_id is not None:
-        from app.models.dhcp import DHCPServer, DHCPServerGroup
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {body.dns_group_id} not found.",
+                )
+            # #1468 — the supervisor drops a name it won't put in the role env.
+            problem = group_name_problem("dns", dns_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — the pointer alone moved the appliance's env and firewall
+            # to the new group while its registered server kept serving the old
+            # one (re-registration never moves a row, by design). Move the
+            # appliance's own DNS server(s) with it, through #934's move, in this
+            # transaction; a move it refuses (a name clash, a mixed-driver group)
+            # refuses the whole PUT, so the pointer and the server can't disagree.
+            from app.models.dns import DNSServer
+            from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
-        dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
-        if dhcp_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DHCP server group {body.dhcp_group_id} not found.",
-            )
-        problem = group_name_problem("dhcp", dhcp_group.name)
-        if problem is not None:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
-        # #1565 — likewise the appliance's DHCP server(s), with the checks
-        # the DHCP server PUT applies to a group change.
-        from app.api.v1.dhcp.servers import (
-            _assert_driver_mix_allowed,
-            _assert_no_v6_scopes_for_windows,
-        )
-        from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+            for server in (
+                (await db.execute(select(DNSServer).where(DNSServer.appliance_id == row.id)))
+                .scalars()
+                .all()
+            ):
+                try:
+                    await move_server_to_group(db, server, dns_group)
+                except ServerMoveError as exc:
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
+                    ) from exc
+            row.assigned_dns_group_id = dns_group.id
+    if "dhcp_group_id" in body.model_fields_set:
+        if body.dhcp_group_id is None:
+            row.assigned_dhcp_group_id = None
+        else:
+            from app.models.dhcp import DHCPServer, DHCPServerGroup
 
-        for dserver in (
-            (await db.execute(select(DHCPServer).where(DHCPServer.appliance_id == row.id)))
-            .scalars()
-            .all()
-        ):
-            if dserver.server_group_id == dhcp_group.id:
-                continue
-            await _assert_driver_mix_allowed(
-                db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
+            dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
+            if dhcp_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DHCP server group {body.dhcp_group_id} not found.",
+                )
+            problem = group_name_problem("dhcp", dhcp_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — likewise the appliance's DHCP server(s), with the checks
+            # the DHCP server PUT applies to a group change.
+            from app.api.v1.dhcp.servers import (
+                _assert_driver_mix_allowed,
+                _assert_no_v6_scopes_for_windows,
             )
-            await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
-            old_gid = dserver.server_group_id
-            dserver.server_group_id = dhcp_group.id
-            collect_wake(dhcp_server_channel(dserver.id))
-            for gid in (old_gid, dhcp_group.id):
-                if gid is not None:
-                    collect_wake(dhcp_group_channel(gid))
-        row.assigned_dhcp_group_id = dhcp_group.id
+            from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+
+            for dserver in (
+                (await db.execute(select(DHCPServer).where(DHCPServer.appliance_id == row.id)))
+                .scalars()
+                .all()
+            ):
+                if dserver.server_group_id == dhcp_group.id:
+                    continue
+                await _assert_driver_mix_allowed(
+                    db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
+                )
+                await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
+                old_gid = dserver.server_group_id
+                dserver.server_group_id = dhcp_group.id
+                collect_wake(dhcp_server_channel(dserver.id))
+                for gid in (old_gid, dhcp_group.id):
+                    if gid is not None:
+                        collect_wake(dhcp_group_channel(gid))
+            row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
         # Coerce every value to string — JSONB will accept anything
