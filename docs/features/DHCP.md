@@ -530,6 +530,12 @@ Assignments** tab lists every reservation across the group's scopes.
   but the reservation is left untouched and the response carries the
   permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
   still requires a superadmin, as above.
+- **Deleting the address follows the same rule.** Deleting an IPAM row (or
+  purging orphans) removes the reservations linked to it, on the DHCP server
+  too, so it needs `delete` on `dhcp_static`. Without it the delete is
+  refused with 403 rather than leaving a reservation behind a row that no
+  longer exists (GHSA-hxpx). Each reservation a delete removes writes its own
+  `dhcp_static_assignment` audit row.
 - **No backfill for rows from before the server-side sync.** A `static_dhcp`
   row created before #1628 that never got its reservation is not repaired
   in the background: it gets one the next time it is saved, or when it is

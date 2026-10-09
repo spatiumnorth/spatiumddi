@@ -8,6 +8,7 @@ import itertools
 import re
 import string
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -58,7 +59,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
-from app.services.dhcp.static_ipam import sync_static_for_ipam_row
+from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
@@ -783,6 +784,65 @@ def _token_subnet_scope_uuids(user: Any) -> set[uuid.UUID] | None:
     return out
 
 
+async def _enforce_zone_token_scope(
+    db: AsyncSession,
+    user: Any,
+    subnet: Subnet | None,
+    zone_ids: Iterable[Any],
+    *,
+    already: Iterable[Any] = (),
+) -> None:
+    """403 when a resource-scoped token names a DNS zone it holds no grant on
+    (GHSA-875w-8f2h-9mw6).
+
+    IPAM writes take the zone to publish into from the request body
+    (``dns_zone_id``, ``extra_zone_ids``, a subnet's own zone bindings). The
+    router gate only sees the path, and ``ipam:write`` never evaluates the DNS
+    write it causes, so a token bound to one subnet could publish into any zone
+    whose id it knew. A zone passes when it is one of ``subnet``'s effective
+    zones (what that subnet publishes into anyway), one already in ``already``
+    (the row's current binding, so a re-save is not refused), or a zone the
+    token holds a ``dns_zone`` grant on. Sessions, unscoped tokens and tokens
+    with a wildcard ``dns_zone`` grant are not checked.
+    """
+    wanted = {str(z) for z in zone_ids if z}
+    if not wanted or token_scoped_resource_ids(user, "dns_zone") is None:
+        return
+    allowed = {str(z) for z in already if z}
+    if subnet is not None:
+        _, primary, additional = await _resolve_effective_dns(db, subnet)
+        allowed |= {str(z) for z in (additional or []) if z}
+        if primary is not None:
+            allowed.add(str(primary))
+    for zid in sorted(wanted - allowed):
+        if not token_scope_allows(user, "dns_zone", zid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"API token is not scoped to DNS zone {zid}",
+            )
+
+
+def _require_static_delete(user: Any, statics: list[DHCPStaticAssignment], what: str) -> None:
+    """403 when an IPAM delete would remove DHCP reservations the caller may
+    not delete (GHSA-hxpx-gjqf-6p4f).
+
+    Deleting an address (or purging orphans) removes the reservations linked
+    to it, on the DHCP server too. The statics endpoints require ``delete`` on
+    ``dhcp_static`` for that, and #1629's IPAM sync applies the same rule, so
+    this path must as well, or subnet write alone removes a reservation. The
+    delete is refused rather than half-done: the reservation must not outlive
+    a row the caller asked to remove, and a 204 has nowhere to put a warning.
+    """
+    if statics and not user_has_permission(user, "delete", "dhcp_static"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"{what} is linked to {len(statics)} DHCP reservation(s); removing "
+                "them needs 'delete' permission on DHCP reservations (dhcp_static)."
+            ),
+        )
+
+
 # ── DHCP pool awareness ───────────────────────────────────────────────────────
 #
 # An IP that falls inside a ``dynamic`` DHCP pool is handed out by the DHCP
@@ -1104,8 +1164,8 @@ async def _resolve_reverse_zone(
 # trip per zone instead of one per record (issue #341). A contextvar avoids
 # threading a parameter through ``_sync_dns_record``'s dozen enqueue calls;
 # it is task-local so concurrent requests never share a collector.
-_dns_op_collector: contextvars.ContextVar[list[tuple[DNSZone, dict[str, Any]]] | None] = (
-    contextvars.ContextVar("_dns_op_collector", default=None)
+_dns_op_collector: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "_dns_op_collector", default=None
 )
 
 
@@ -1143,6 +1203,9 @@ async def _enqueue_dns_op(
     value: str,
     ttl: int | None,
     record_id: uuid.UUID | None = None,
+    *,
+    ip: IPAddress | None = None,
+    stamped_record_id: uuid.UUID | None = None,
 ) -> Any:
     """Wrapper to enqueue a record op against the zone's primary server.
     Imported lazily to avoid circular import.
@@ -1150,7 +1213,12 @@ async def _enqueue_dns_op(
     Returns the ``DNSRecordOp`` (or None in batch mode / when nothing was
     enqueued). For an agentless primary (Windows DNS) the op is applied
     synchronously and its ``state`` is ``applied`` / ``failed`` on return —
-    callers use that to avoid stamping a record that didn't land (#428)."""
+    callers use that to avoid stamping a record that didn't land (#428).
+
+    In batch mode the return is always None, so a caller that stamped
+    ``ip.dns_record_id`` for the record this op creates passes ``ip`` +
+    ``stamped_record_id``: the flush then applies the #428 un-stamp itself
+    when the batched op comes back ``failed`` (#1536)."""
     from app.drivers.dns import is_agentless
     from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
     from app.services.dns.serial import bump_zone_serial
@@ -1186,15 +1254,22 @@ async def _enqueue_dns_op(
         # Batch mode — defer; the enclosing ``_batched_dns_ops`` flushes per
         # zone. The serial bump above still happens per op exactly as the
         # inline path does, so ``target_serial`` snapshots match.
-        collector.append((zone, {"op": op, "record": record, "target_serial": target_serial}))
+        collector.append(
+            {
+                "zone": zone,
+                "op": {"op": op, "record": record, "target_serial": target_serial},
+                "ip": ip,
+                "stamped_record_id": stamped_record_id,
+            }
+        )
         return None
 
     return await enqueue_record_op(db, zone, op, record, target_serial=target_serial)
 
 
 async def _flush_dns_op_collector(
-    db: AsyncSession, collector: list[tuple[DNSZone, dict[str, Any]]]
-) -> None:
+    db: AsyncSession, collector: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Flush deferred record ops, one batched driver call per zone.
 
     ``enqueue_record_ops_batch`` already does the right thing per driver: an
@@ -1203,21 +1278,45 @@ async def _flush_dns_op_collector(
     is safe for every group shape — no ``is_agentless`` gate needed here.
     Zone order is preserved so a delete-then-recreate (address-family swap)
     applies in the same order it was collected.
+
+    Returns one result per collected op — ``{ip, op, op_row, zone}`` — so
+    callers can do error accounting the inline path does via the returned
+    op's ``state`` (#1536). A collected op that carried ``ip`` +
+    ``stamped_record_id`` and came back ``failed`` gets the #428 un-stamp
+    here: ``ip.dns_record_id`` is cleared (only while it still points at
+    the record this op was creating) so DDNS idempotency retries it.
     """
+    results: list[dict[str, Any]] = []
     if not collector:
-        return
+        return results
     from app.services.dns.record_ops import enqueue_record_ops_batch
 
     by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
     order: list[uuid.UUID] = []
-    for zone, op in collector:
+    for entry in collector:
+        zone = entry["zone"]
         if zone.id not in by_zone:
             by_zone[zone.id] = (zone, [])
             order.append(zone.id)
-        by_zone[zone.id][1].append(op)
+        by_zone[zone.id][1].append(entry)
     for zid in order:
-        zone, ops = by_zone[zid]
-        await enqueue_record_ops_batch(db, zone, ops)
+        zone, entries = by_zone[zid]
+        op_rows = await enqueue_record_ops_batch(db, zone, [e["op"] for e in entries])
+        for entry, op_row in zip(entries, op_rows, strict=True):
+            ip = entry.get("ip")
+            stamped = entry.get("stamped_record_id")
+            if (
+                ip is not None
+                and stamped is not None
+                and getattr(op_row, "state", None) == "failed"
+                and ip.dns_record_id == stamped
+            ):
+                # #428 / #1536 — the batched twin of the singular-path guard
+                # in ``_sync_dns_record``: the provider rejected the create,
+                # so the stamp must not stand or nothing will ever retry it.
+                ip.dns_record_id = None
+            results.append({"ip": ip, "op": entry["op"], "op_row": op_row, "zone": zone})
+    return results
 
 
 @contextlib.asynccontextmanager
@@ -1226,13 +1325,19 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
     grouped by zone on a clean exit. On an exception the partial collector is
     dropped unflushed — the flush sits on the success path inside ``try`` so
     an aborting body never half-applies a batch (callers also handle per-row
-    failures inside the loop so the happy path stays exception-free)."""
-    collector: list[tuple[DNSZone, dict[str, Any]]] = []
+    failures inside the loop so the happy path stays exception-free).
+
+    Yields the flush results (see :func:`_flush_dns_op_collector`) so a
+    caller that counts outcomes can fold failed batched ops into its error
+    accounting after the block (#1536); callers that don't need them just
+    don't bind the ``as`` target."""
+    collector: list[dict[str, Any]] = []
     token = _dns_op_collector.set(collector)
+    results: list[dict[str, Any]] = []
     try:
-        yield
+        yield results
         # Reached only when the block body completed without raising.
-        await _flush_dns_op_collector(db, collector)
+        results.extend(await _flush_dns_op_collector(db, collector))
     finally:
         _dns_op_collector.reset(token)
 
@@ -1664,6 +1769,8 @@ async def _sync_dns_record(
                     forward_rtype,
                     str(ip.address),
                     ttl,
+                    ip=ip,
+                    stamped_record_id=new_rec.id,
                 )
                 # #428 — for an agentless (Windows DNS) primary the op
                 # applies synchronously; if it failed, don't leave
@@ -1714,6 +1821,8 @@ async def _sync_dns_record(
                     forward_rtype,
                     str(ip.address),
                     ttl,
+                    ip=ip,
+                    stamped_record_id=new_rec.id,
                 )
             else:
                 old_name = existing.name
@@ -1774,6 +1883,8 @@ async def _sync_dns_record(
                         forward_rtype,
                         str(ip.address),
                         existing.ttl,
+                        ip=ip,
+                        stamped_record_id=existing.id,
                     )
                 elif value_changed:
                     await _enqueue_dns_op(
@@ -4391,6 +4502,11 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             detail="API token is bound to a specific subnet and cannot create new subnets",
         )
     _require_type_write(current_user, "subnet")
+    # GHSA-875w — a zone the new subnet is bound to must be one the token may
+    # write (zones it inherits from its block are not named here).
+    await _enforce_zone_token_scope(
+        db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
+    )
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
@@ -5465,6 +5581,15 @@ async def update_subnet(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — rebinding the subnet's zones would make every later address
+    # write publish there: a zone it names must be one the token may write
+    # (its current effective zones pass, so a re-save is not refused).
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        subnet,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+    )
     _require_type_write(current_user, "subnet")
 
     old_block_id = subnet.block_id
@@ -6747,7 +6872,7 @@ async def _apply_dns_sync(
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
-        async with _batched_dns_ops(db):
+        async with _batched_dns_ops(db) as flush_results:
             for ip in ips_res.scalars().all():
                 sn = subnet_cache.get(ip.subnet_id)
                 if sn is None and ip.subnet_id not in subnet_cache:
@@ -6764,6 +6889,28 @@ async def _apply_dns_sync(
                         updated += 1
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
+        # #1536 — a batched agentless op that came back ``failed`` was
+        # invisible above: batch mode returns no op, so the loop counted the
+        # IP as synced. Fold the flagged (primary forward create) failures
+        # back in: the flush already un-stamped ``dns_record_id``; here the
+        # IP must not count as created/updated and the failure is an error.
+        failed_sync_ips: set[uuid.UUID] = set()
+        for result in flush_results:
+            fip = result.get("ip")
+            op_row = result.get("op_row")
+            if fip is None or getattr(op_row, "state", None) != "failed":
+                continue
+            if fip.id in failed_sync_ips:
+                continue
+            failed_sync_ips.add(fip.id)
+            errors.append(
+                f"{fip.address}: DNS create failed — "
+                f"{getattr(op_row, 'last_error', None) or 'unknown'}"
+            )
+            if fip.id in body.create_for_ip_ids:
+                created = max(0, created - 1)
+            elif fip.id in ip_ids_to_sync:
+                updated = max(0, updated - 1)
 
     if body.delete_stale_record_ids:
         from app.services.dns.record_ops import (  # noqa: PLC0415
@@ -6779,6 +6926,17 @@ async def _apply_dns_sync(
             .options(selectinload(DNSRecord.zone))
         )
         stale_records = list(stale_res.scalars().all())
+
+        # #1554 re-check: a stale ID handed to us (by the auto-sync task
+        # or a manual apply) may name a record owned by an integration
+        # mirror, the DNS pool pipeline, or ACME — those are not IPAM
+        # sync output and must never be deleted here, whatever the
+        # report that produced the ID said.
+        from app.services.integration_ownership import (  # noqa: PLC0415
+            dns_record_owned_elsewhere,
+        )
+
+        stale_records = [r for r in stale_records if not dns_record_owned_elsewhere(r)]
 
         # Group by zone so each zone's primary server gets a single
         # batched driver call (critical for agentless Windows DNS — one
@@ -7479,6 +7637,11 @@ async def create_address(
             detail=f"Address {body.address} is already allocated in this subnet",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
+
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
@@ -7838,6 +8001,19 @@ async def update_address(
     # would match it. The ``exclude_ip_id`` filter prevents this IP from
     # colliding with its own current state.
     touched = body.model_dump(exclude_unset=True)
+    # GHSA-875w — a zone this edit names must be one the token may write; the
+    # row's current bindings pass, so a re-save is not refused.
+    if "dns_zone_id" in touched or "extra_zone_ids" in touched:
+        await _enforce_zone_token_scope(
+            db,
+            current_user,
+            await db.get(Subnet, ip.subnet_id),
+            [
+                body.dns_zone_id if "dns_zone_id" in touched else None,
+                *((body.extra_zone_ids or []) if "extra_zone_ids" in touched else []),
+            ],
+            already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
+        )
     hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
     mac_touched = "mac_address" in touched
     # Effective role for the collision check — pending value if the
@@ -8350,11 +8526,13 @@ async def delete_address(
             _static_conds.append(DHCPStaticAssignment.id == uuid.UUID(str(ip.static_assignment_id)))
     statics_res = await db.execute(select(DHCPStaticAssignment).where(or_(*_static_conds)))
     statics_rows = list(statics_res.scalars().all())
+    _require_static_delete(current_user, statics_rows, f"Address {ip.address}")
     # Batched push on windows_dhcp servers (one WinRM round trip per
     # server instead of one per row); ABC default loops sequentially for
     # Kea / ISC. Typically one row — the batch overhead is negligible.
     await push_statics_bulk_delete(db, statics_rows)
     for static in statics_rows:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     if permanent:
@@ -8445,8 +8623,10 @@ async def purge_orphans(
         )
     )
     lingering_statics = list(stat_res.scalars().all())
+    _require_static_delete(current_user, lingering_statics, "This purge")
     await push_statics_bulk_delete(db, lingering_statics)
     for static in lingering_statics:
+        audit_static_removed(db, current_user, static)
         await db.delete(static)
 
     for ip in rows:
@@ -8805,6 +8985,8 @@ async def bulk_allocate_commit(
     # Token-scope parity with the other address handlers (this one historically
     # lacked the check).
     _enforce_subnet_token_scope(current_user, subnet_id)
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(db, current_user, subnet, [body.dns_zone_id])
     if subnet.kind == "multicast":
         raise HTTPException(
             status_code=422,
@@ -9086,6 +9268,10 @@ async def allocate_next_ip(
             detail="mac_address is required when status is 'static_dhcp'",
         )
 
+    # GHSA-875w — a zone named in the body must be one the token may write.
+    await _enforce_zone_token_scope(
+        db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
+    )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
     if not body.force:
@@ -9969,6 +10155,24 @@ async def bulk_edit_addresses(
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
                 continue
+            # GHSA-875w — nor move an IP into a zone the token holds no grant
+            # on (the IP's own subnet zones and its current zone pass).
+            if new_zone_id is not None:
+                if ip.subnet_id not in subnet_cache:
+                    loaded = await db.get(Subnet, ip.subnet_id)
+                    if loaded is not None:
+                        subnet_cache[ip.subnet_id] = loaded
+                try:
+                    await _enforce_zone_token_scope(
+                        db,
+                        current_user,
+                        subnet_cache.get(ip.subnet_id),
+                        [new_zone_id],
+                        already=[ip.forward_zone_id],
+                    )
+                except HTTPException:
+                    skipped.append(ip.id)
+                    continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
             subnet_writable, set_ranges = await _gate_for(ip.subnet_id)

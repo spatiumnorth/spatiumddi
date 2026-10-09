@@ -249,6 +249,14 @@ celery_app.conf.update(
             "task": "app.tasks.dns.agent_stale_sweep",
             "schedule": schedule(run_every=60.0),
         },
+        # Every 60 s, replay agentless DNS record ops a transient provider
+        # error rescheduled (#1538) — agentless servers have no agent
+        # heartbeat to drain their queue, so the retry budget the agent
+        # path has had since #1232 needs this sweep to fire at all.
+        "dns-agentless-op-retry-sweep": {
+            "task": "app.tasks.dns.agentless_op_retry_sweep",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 60s, flip a Looking Glass collector to ``unreachable`` when its
         # heartbeat has gone silent past the staleness window (#566).
         "lg-collector-stale-sweep": {

@@ -162,6 +162,14 @@ _DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
 # writes a .pfx into its own state dir.
 _TLS_CERT_FILE = "technitium-tls.pfx"
 
+# Catalog-zone state (issue #1519). The catalog zone is not in the
+# bundle's zone list, so when catalog is turned off the bundle carries
+# no name for the zone that has to go — the previously applied
+# (zone_name, mode) pair is tracked in agent state instead, the same
+# approach #1497 takes for retired zones.
+_CATALOG_STATE_FILE = "technitium-catalog-state.json"
+_CATALOG_ZONE_TYPES = {"producer": "Catalog", "consumer": "SecondaryCatalog"}
+
 # Neutral forward_transport → Technitium's ``forwarderProtocol``.
 _FORWARDER_PROTOCOLS = {
     "do53": "Udp",
@@ -1163,6 +1171,15 @@ class TechnitiumDriver(DriverBase):
         **Neither** (catalog turned off) clears membership. Without that,
         disabling catalog zones would leave every member permanently
         enrolled, because nothing else ever touches the option.
+
+        The catalog zone itself is also deleted whenever it stops
+        being the desired one (issue #1519): catalog off, a renamed
+        catalog zone, or a producer↔consumer flip. A flip has to delete
+        first — creating the new role under the same name answers
+        "already exists", which the create path treats as success, so
+        the zone would silently keep its old type. The previously
+        applied role is read from agent state (``_CATALOG_STATE_FILE``)
+        because a disabled catalog block carries no zone name at all.
         """
         cat_name = (catalog or {}).get("zone_name") or ""
         cat_name = cat_name.rstrip(".")
@@ -1178,6 +1195,7 @@ class TechnitiumDriver(DriverBase):
                 )
                 self._note_apply_failure("catalog consumer: incomplete catalog block")
                 return
+            self._retire_stale_catalog_zone(token, cat_name, mode)
             self._ensure_zone_exists(
                 token,
                 {
@@ -1186,7 +1204,11 @@ class TechnitiumDriver(DriverBase):
                     "masters": [str(producer)],
                 },
             )
+            self._save_catalog_state({"zone_name": cat_name, "mode": mode})
             return
+
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        self._retire_stale_catalog_zone(token, cat_name, mode)
 
         if mode == "producer" and cat_name:
             self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
@@ -1212,6 +1234,62 @@ class TechnitiumDriver(DriverBase):
                 self._note_apply_failure(
                     f"catalog membership {zone}: {body.get('errorMessage')}"
                 )
+        self._save_catalog_state(
+            {"zone_name": cat_name, "mode": mode} if desired_type else None
+        )
+
+    # ── Catalog-zone state (issue #1519) ───────────────────────────────
+
+    def _catalog_state_path(self) -> Path:
+        return self.state_dir / _CATALOG_STATE_FILE
+
+    def _load_catalog_state(self) -> dict[str, Any] | None:
+        try:
+            state = json.loads(self._catalog_state_path().read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict) or not state.get("zone_name"):
+            return None
+        return state
+
+    def _save_catalog_state(self, state: dict[str, Any] | None) -> None:
+        path = self._catalog_state_path()
+        if state is None:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(json.dumps(state))
+
+    def _retire_stale_catalog_zone(
+        self, token: str, cat_name: str, mode: str | None
+    ) -> None:
+        """Delete the previously applied catalog zone if it is no
+        longer the desired one (different name, different role, or
+        catalog now off)."""
+        prev = self._load_catalog_state()
+        if prev is None:
+            return
+        prev_name = str(prev.get("zone_name") or "").rstrip(".")
+        prev_type = _CATALOG_ZONE_TYPES.get(str(prev.get("mode") or ""))
+        if not prev_name or prev_type is None:
+            return
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        if prev_name == cat_name and prev_type == desired_type:
+            return
+        resp = self._call(token, "POST", "zones/delete", {"zone": prev_name})
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_catalog_zone_delete_failed",
+                zone=prev_name,
+                zone_type=prev_type,
+                error=body.get("errorMessage"),
+            )
+        else:
+            log.info(
+                "technitium_catalog_zone_retired",
+                zone=prev_name,
+                zone_type=prev_type,
+            )
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
@@ -2359,9 +2437,12 @@ class TechnitiumDriver(DriverBase):
         """
         password = self.admin_bootstrap_password()
         try:
-            resp = httpx.get(
+            # A form body, never query parameters: a URL is logged (httpx
+            # writes every request line at INFO) and the password must not be
+            # (GHSA-x4gw-9gqx-vr4m).
+            resp = httpx.post(
                 f"{_API_BASE}/user/createToken",
-                params={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
+                data={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
                 timeout=_API_TIMEOUT,
             )
             body = resp.json()

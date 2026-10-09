@@ -1352,6 +1352,88 @@ def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
     assert opt and opt[0][3]["catalog"] == ""
 
 
+# ── Catalog zone retirement (issue #1519) ─────────────────────────────
+
+
+def _deletes(calls) -> list[dict[str, Any]]:
+    return [c[3] for c in calls if c[2] == "zones/delete"]
+
+
+def test_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """Disabling catalog must delete the producer zone, not just clear
+    membership — and the name has to come from agent state, because a
+    disabled catalog block carries no zone name."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    payload = [{"zone": "p.test", "type": "Primary"}]
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, payload)
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    # State is cleared, so a later pass does not re-delete.
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == []
+
+
+def test_secondary_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """A consumer that is turned off keeps transferring from the old
+    producer until its SecondaryCatalog zone is deleted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    calls.clear()
+    d._apply_catalog("t", None, [])
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+
+
+def test_catalog_role_flip_deletes_old_zone_before_creating_new(
+    tmp_path: Path,
+) -> None:
+    """Producer → consumer under the same name: the old Catalog zone
+    must be deleted first, or the SecondaryCatalog create answers
+    "already exists" and the zone keeps its old type."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, [])
+    calls.clear()
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    paths = [c[2] for c in calls]
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    assert paths.index("zones/delete") < paths.index("zones/create")
+    assert next(c for c in calls if c[2] == "zones/create")[3]["type"] == (
+        "SecondaryCatalog"
+    )
+
+
+def test_catalog_same_role_reapply_deletes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    block = {"mode": "producer", "zone_name": "cat.test"}
+    d._apply_catalog("t", block, [])
+    calls.clear()
+    d._apply_catalog("t", block, [])
+    assert _deletes(calls) == []
+
+
+def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "old.test"}, [])
+    calls.clear()
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "new.test"}, [])
+    assert _deletes(calls) == [{"zone": "old.test"}]
+    assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 
 
