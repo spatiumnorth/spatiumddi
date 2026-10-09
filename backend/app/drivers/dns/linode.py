@@ -238,6 +238,7 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                 for rec in body.get("data") or []:
                     raw_ttl = rec.get("ttl_sec")
                     ttl = None if raw_ttl in (None, _TTL_DEFAULT) else raw_ttl
+                    is_srv = str(rec["type"]).upper() == "SRV"
                     records.append(
                         RecordData(
                             name=self._relativize(rec.get("name") or "", zone_fqdn),
@@ -245,6 +246,10 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                             value=rec["target"],
                             ttl=ttl,
                             priority=rec.get("priority"),
+                            # SRV weight/port are their own Linode fields
+                            # (#1526); other types don't carry them.
+                            weight=rec.get("weight") if is_srv else None,
+                            port=rec.get("port") if is_srv else None,
                         )
                     )
                 total_pages = int(body.get("pages") or 1)
@@ -265,6 +270,13 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         }
         if rec.priority is not None:
             payload["priority"] = rec.priority
+        if rec.record_type.upper() == "SRV":
+            # Linode carries SRV weight/port as their own fields (#1526) —
+            # without them the SRV write is malformed.
+            if rec.weight is not None:
+                payload["weight"] = rec.weight
+            if rec.port is not None:
+                payload["port"] = rec.port
         return payload
 
     async def _find_record_id(

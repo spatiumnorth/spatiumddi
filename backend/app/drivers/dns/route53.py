@@ -18,11 +18,11 @@ when the caller only knows the name.
 
 A couple of Route-53-specific wrinkles the hooks paper over:
 
-* **MX / SRV priority is baked into the record value.** Route 53's
+* **MX / SRV structured fields are split in ``RecordData``.** Route 53's
   ``ResourceRecords[].Value`` for an MX record is the full
-  ``"10 mail.example.com."`` string. We keep that raw string in
-  ``RecordData.value`` and leave ``priority`` / ``weight`` / ``port``
-  ``None`` so the value isn't double-encoded on the way back out.
+  ``"10 mail.example.com."`` string, so the driver composes it from
+  ``priority`` / ``weight`` / ``port`` + the bare-target ``value`` on
+  write and splits it back into those columns on read (#1526).
 * **ALIAS records** (``AliasTarget``) have no ``ResourceRecords`` and no
   TTL (Route 53 inherits the target's TTL). We surface them as a record
   whose ``value`` is the alias target DNS name and ``ttl`` is ``None``.
@@ -41,8 +41,10 @@ from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
     managed_value_index,
     normalize_fqdn,
+    split_structured_rdata,
     value_is_managed,
 )
 from app.drivers.dns.base import RecordChange, RecordData
@@ -180,15 +182,19 @@ class Route53DNSDriver(CloudDNSDriverBase):
             value = rr.get("Value")
             if value is None:
                 continue
-            # MX / SRV values keep priority baked into the string
-            # ("10 mail.example.com.") — leave priority/weight/port None to
-            # avoid re-encoding it on the write path.
+            # MX / SRV rdata arrives composed ("10 mail.example.com.") —
+            # split it into the structured columns so the stored shape
+            # matches the record API's split contract (#1526).
+            bare, priority, weight, port = split_structured_rdata(rtype, str(value))
             out.append(
                 RecordData(
                     name=name,
                     record_type=rtype,
-                    value=str(value),
+                    value=bare,
                     ttl=int(ttl) if ttl is not None else None,
+                    priority=priority,
+                    weight=weight,
+                    port=port,
                 )
             )
         return out
@@ -244,11 +250,11 @@ class Route53DNSDriver(CloudDNSDriverBase):
             # the common single-value rrset (CNAME, a host with one A/TXT),
             # and unchanged from before.
             values = (
-                [{"Value": m.value} for m in change.rrset.members]
+                [{"Value": compose_structured_rdata(m)} for m in change.rrset.as_records(rr)]
                 if change.rrset is not None and change.rrset.members
-                # MX / SRV: ``value`` already carries the priority/target, so
-                # a single ResourceRecords entry is correct.
-                else [{"Value": rr.value}]
+                # MX / SRV: compose the provider rdata from the split
+                # structured columns + bare target (#1526).
+                else [{"Value": compose_structured_rdata(rr)}]
             )
             ttl = int(
                 (change.rrset.ttl if change.rrset else None) or (rr.ttl if rr.ttl else 0) or 300
@@ -264,6 +270,10 @@ class Route53DNSDriver(CloudDNSDriverBase):
 
         # Read the provider's current rrset for {name, type} so we can merge.
         existing = await self._read_rrset(server, client, zone_id, absolute, rtype)
+        # The op's value in provider form — MX / SRV compose the structured
+        # columns into the rdata string Route 53 stores (#1526). The live
+        # rrset's values are already in that form.
+        composed = compose_structured_rdata(rr)
 
         if change.op == "create":
             if existing is not None and existing.get("AliasTarget"):
@@ -272,7 +282,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 # Replace it with the new value-bearing rrset instead.
                 existing = None
             existing_values = self._existing_values(existing)
-            if rr.value in existing_values:
+            if composed in existing_values:
                 # Value already present — the desired set is unchanged, so
                 # this is an idempotent no-op.
                 logger.info(
@@ -283,7 +293,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                     rtype=rtype,
                 )
                 return
-            merged_values = existing_values + [rr.value]
+            merged_values = existing_values + [composed]
             ttl = self._merge_ttl(rr.ttl, existing, default_ttl)
             rrset = {
                 "Name": absolute,
@@ -307,7 +317,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
             )
             return
         existing_values = self._existing_values(existing)
-        if rr.value not in existing_values:
+        if composed not in existing_values:
             # Value isn't in the rrset — idempotent no-op.
             logger.info(
                 "route53.apply_record.delete_noop",
@@ -317,7 +327,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 rtype=rtype,
             )
             return
-        remaining = [v for v in existing_values if v != rr.value]
+        remaining = [v for v in existing_values if v != composed]
         if remaining:
             # Other values survive — UPSERT the reduced set, keeping the
             # rrset's live TTL.
@@ -770,7 +780,8 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 "Agentless Amazon Route 53 driver. Zone + record CRUD via "
                 "the boto3 SDK from the control plane (no agent). Route 53 "
                 "is a global service — no region to configure. MX/SRV "
-                "priority is carried inside the record value; ALIAS records "
+                "structured fields are composed into the provider rdata on "
+                "write and split back out on read; ALIAS records "
                 "(AliasTarget) surface with a null TTL."
             ),
         }

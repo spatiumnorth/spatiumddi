@@ -462,7 +462,7 @@ def test_both_kinds_of_unserved_zone_are_named_in_one_verdict() -> None:
     names both rather than dropping one."""
     text = _partial_apply_error((HELD,), ["other.test: HTTP 422 bad rrset"])
     assert text.startswith(PARTIAL_APPLY_PREFIX + "named-checkzone refused a zone file")
-    assert "the daemon refused 1 zone(s); every other zone is served: other.test" in text
+    assert "the daemon refused 1 item(s); everything else is served: other.test" in text
 
 
 class _Http:

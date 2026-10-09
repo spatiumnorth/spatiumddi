@@ -83,7 +83,8 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
     """The operator-facing account of the zones an apply left unserved.
 
     ``held``: zones the BIND9 zone check held back (#1403). ``refused``: zones
-    the daemon refused the data of, one ``"<zone>: <reason>"`` each (#1280).
+    or records the daemon refused, one ``"<zone>: <reason>"`` each (#1280,
+    and per record on Technitium, #1608).
     No driver produces both today; if one ever did, both are named here.
     """
     parts: list[str] = []
@@ -101,7 +102,7 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
         )
     if refused:
         parts.append(
-            f"the daemon refused {len(refused)} zone(s); every other zone is served: "
+            f"the daemon refused {len(refused)} item(s); everything else is served: "
             + "; ".join(refused)
         )
     return truncate_error(PARTIAL_APPLY_PREFIX + "; and ".join(parts))
@@ -544,9 +545,10 @@ class SyncLoop:
     def _report_partial_apply(self, etag: str | None) -> bool:
         """Report an apply that landed with some zones unserved. True if so.
 
-        Two drivers get there two ways. PowerDNS takes zones one at a time, so
-        it can accept most of a bundle and refuse a few zones' data (see
-        ``DriverBase.refused_zones``, #1280). BIND9's zone check holds back a
+        Drivers get there two ways. PowerDNS takes zones one at a time, and
+        Technitium records one at a time, so either can accept most of a
+        bundle and refuse a few zones' data or individual records (see
+        ``DriverBase.refused_zones``, #1280, #1608). BIND9's zone check holds back a
         zone ``named-checkzone`` refuses and applies the rest
         (``DriverBase.held_back``, #1403). Either way that is neither ``ok`` —
         those zones are not served as saved — nor a reason to revert:
