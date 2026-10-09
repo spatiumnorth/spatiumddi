@@ -3,7 +3,7 @@
 
 A ``type: LoadBalancer`` Service allocates a NodePort for every port
 unless ``allocateLoadBalancerNodePorts: false`` is set. The Services
-fronted by MetalLB on purpose — the appliance chart's DNS VIPs and
+fronted by MetalLB on purpose — the appliance chart's DNS VIP and
 DHCP relay VIP, and the umbrella chart's frontend control-plane VIP —
 are announced by MetalLB in L2 or BGP mode, which never routes via
 NodePorts. Each VIP port was therefore also opened as a random
@@ -33,7 +33,13 @@ from pathlib import Path
 
 import yaml
 
-APPLIANCE_VIP_SERVICES = {"dns-bind9", "dns-powerdns", "dns-technitium", "dhcp-kea-relay"}
+APPLIANCE_VIP_SERVICES = {
+    "dns-vip",
+    "dns-bind9",
+    "dns-powerdns",
+    "dns-technitium",
+    "dhcp-kea-relay",
+}
 
 
 def _is_vip_service(doc: dict) -> bool:

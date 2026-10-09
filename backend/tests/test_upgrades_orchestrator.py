@@ -215,6 +215,10 @@ class _FakeRun:
 def _db_for_state_test(run: _FakeRun) -> MagicMock:
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # drive_upgrade re-reads the row FOR UPDATE (#1512).
+    locked = MagicMock()
+    locked.scalar_one_or_none.return_value = run
+    db.execute = AsyncMock(return_value=locked)
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -329,11 +333,14 @@ async def test_drive_loop_happy_path_two_nodes(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(orchestrator.mutex, "release_if_held", release_mock)
     monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
 
-    await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]
+    await orchestrator._drive_loop(db, run, stop, "api-0_drive")  # type: ignore[arg-type]
     assert calls == ["node-a", "node-b"]
     assert run.state == "succeeded"
     assert run.finished_at is not None
-    release_mock.assert_called_once_with(attempts=orchestrator._LEASE_RELEASE_ATTEMPTS)
+    # Released under this drive's own identity (#1512), never the pod's.
+    release_mock.assert_called_once_with(
+        holder="api-0_drive", attempts=orchestrator._LEASE_RELEASE_ATTEMPTS
+    )
 
 
 @pytest.mark.asyncio
@@ -490,7 +497,7 @@ async def test_lease_renewal_loop_stops_on_renew_failure(
     monkeypatch.setattr(orchestrator, "_LEASE_RENEW_INTERVAL_S", 0.01)
     monkeypatch.setattr(orchestrator.mutex, "renew", lambda **_kw: (False, "lease taken over"))
 
-    await orchestrator._lease_renewal_loop(stop)
+    await orchestrator._lease_renewal_loop(stop, "api-test_x")
     assert stop.is_set()
 
 
@@ -516,7 +523,7 @@ async def test_lease_renewal_loop_renews_until_stop(
         stop.set()
 
     await asyncio.gather(
-        orchestrator._lease_renewal_loop(stop),
+        orchestrator._lease_renewal_loop(stop, "api-test_x"),
         _stop_after_a_few_renews(),
     )
     assert renew_count >= 2
@@ -541,7 +548,9 @@ async def test_drive_upgrade_planned_acquires_lease(monkeypatch: pytest.MonkeyPa
 
     await orchestrator.drive_upgrade(db, run.id)
     acquire.assert_called_once()
-    assert run.lease_holder == "api-test"
+    # #1512 — one identity per drive: <pod>_<random>, never the bare pod name.
+    assert run.lease_holder.startswith("api-test_")
+    assert acquire.call_args.kwargs["holder"] == run.lease_holder
     # Empty node_order → loop transitions immediately to succeeded.
     assert run.state == "succeeded"
 

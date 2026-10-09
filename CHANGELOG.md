@@ -123,6 +123,52 @@ the formatter handles the rest.
   earlier) is now replaced with the rest of the zone, as on a full
   re-render, instead of overriding the change.
 
+- **The upgrade preflight checks every node's `/var`, not the api pod's
+  (#1234).** `disk_headroom` ran `shutil.disk_usage("/var")` inside the
+  api container, which says nothing about the node where
+  `spatium-upgrade-slot` stages the slot image, so it could pass while a
+  member had no room and the rolling upgrade then failed midway on that
+  node. It now judges the `/var` free space each approved appliance
+  reports against the slot image plus margin and names every node that
+  falls short (fail). A node with no disk report, or one older than ten
+  minutes, is a warn naming it, never a pass. Without appliance rows
+  (Compose / plain Kubernetes) the old local check still runs.
+
+- **The DNS VIP answers again after a DNS engine switch, and on a fresh
+  install (#1510).** All three engine Services in the appliance chart
+  (`dns-bind9`, `dns-powerdns`, `dns-technitium`) are rendered on every DNS
+  appliance, and under `dns.useMetalLBVIP` each one asked MetalLB for the
+  same `dns.vip`. MetalLB gives an address to one Service only, the one
+  created first, and leaves the others `<pending>`. On a fresh install that
+  could be an engine with no pods. After switching the engine (Technitium
+  to BIND9, say) the VIP stayed on the old engine's Service, which had no
+  endpoints left, so the resolver address answered nothing. A single
+  `dns-vip` LoadBalancer Service now holds the VIP and selects on
+  `spatium.io/dns-vip`, a label every engine's pods carry, so it follows
+  whichever engine runs, with the client-address policy (#1487) and no
+  NodePorts (#1550) the engine Services used to carry. The engine
+  Services are always ClusterIP. On upgrade the old engine Service turns
+  ClusterIP and releases the address, and `dns-vip` takes it over; the DNS
+  pods restart once for the new label.
+  A render gate (`chart-lb-address-single-owner.py`) now fails any chart
+  render in which two Services ask for the same MetalLB address.
+
+- **A rolling upgrade is driven by one orchestrator loop at a time, and its
+  lock holds under contention (#1512).** Every task in a worker pod used
+  the pod's hostname as its upgrade-lease identity, so a second drive of
+  the same run (Start clicked twice, a second tab, an API or MCP caller,
+  Start racing Resume, a Celery redelivery) "renewed" the first one's lease
+  and ran a second cordon / drain loop beside it, which could take two
+  nodes of a three-node cluster down at once. The lease is now held under
+  one identity per drive, and the run row is re-read `FOR UPDATE` before
+  it moves to `running`. `POST /upgrades/{id}/start` answers 409 on a
+  running run whose driver is alive. The lease writes are now real
+  compare-and-swaps on the version read: two takeovers of an expired lease
+  no longer both win, a renewal no longer writes its name back over a
+  takeover, and Abort's release is no longer renewed away (the aborted
+  drive's next renewal sees it lost the lease and stops). A halted run's
+  drive releases its lease on exit, so Resume can take it at once.
+
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
   2026.10.02-1, where Plan → Start never got past the upgrade lease:
@@ -1525,6 +1571,23 @@ the formatter handles the rest.
   warnings per 60 s tick, the bulk of its warnings on an appliance. The
   three types now share one set the evaluator skips silently, and a rule
   type the evaluator really does not know still warns.
+
+- **A zone deleted in SpatiumDDI is removed from its Technitium
+  servers (#1496).** The agent created every zone in the bundle and
+  never deleted one, so a deleted zone kept answering authoritatively on
+  every server with its last records, and a deleted child zone kept
+  shadowing its parent. The agent now remembers the zones it created
+  from a bundle and deletes the ones a later bundle drops. Zones it
+  never created, such as one made on the daemon directly, are never
+  touched. The first run after the upgrade picks up the zones of the
+  previous bundle; zones orphaned before that have to be removed by
+  hand (`zones/delete` on each server). An empty zone list, which the
+  control plane sends only for a group with no zones, retires every
+  zone like BIND9 does. A bundle with no zone list at all, and a zone
+  the bundle still has that the driver skipped (a secondary with no
+  primaries, say), retire nothing and log
+  `technitium_zone_retire_held_back`. PowerDNS has the same gap and is
+  not changed here.
 
 - **Editing a record's value on Cloudflare replaces it instead of adding
   a second record (#1494).** The driver handled `update` by looking up
