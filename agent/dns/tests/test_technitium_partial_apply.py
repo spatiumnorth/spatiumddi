@@ -203,7 +203,7 @@ def test_a_refused_record_does_not_hold_back_the_rest_of_the_zone(
     later = {"name": "later", "type": "A", "value": "10.0.0.10", "ttl": 300}
     _poll(loop, monkeypatch, _bundle("e2", "s1", [WWW, SVCB], ops=[_op("op-later", later)]))
     assert _acks(loop)["op-later"]["result"] == "ok"
-    assert "later.example.com" in [p["domain"] for p in daemon.added("A")]
+    assert any(p["domain"] == "later.example.com" for p in daemon.added("A"))
     assert loop.apply_status.status == STATUS_REVERTED
 
 
