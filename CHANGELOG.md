@@ -168,6 +168,17 @@ the formatter handles the rest.
   takeover, and Abort's release is no longer renewed away (the aborted
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
+- **An ACME order whose CA cannot be reached now ends, and says why
+  (#1686).** A refused, timed-out or reset connection to the CA left
+  the order `processing` for the Celery task's retries, and nothing
+  settled it once the last retry failed. It stayed `processing` with
+  no error for good, the UI polled it forever, and the renewal sweep
+  skipped every certificate with the same domains as "already being
+  (re)issued", so the certificate could expire behind it. The task's
+  last attempt now ends the order `invalid` with `last_error` naming
+  the error and the host it could not reach. Each retry before that
+  leaves a `retrying: …` note, which the Certificates tab shows under
+  the processing order.
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to

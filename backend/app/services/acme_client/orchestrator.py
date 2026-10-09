@@ -67,7 +67,9 @@ logger = structlog.get_logger(__name__)
 _CERT_KEY_TYPE = "ec-p256"
 
 
-async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
+async def run_order(
+    db: AsyncSession, order_id: uuid.UUID | str, *, final_attempt: bool = False
+) -> str:
     """Drive a single ACME order to completion.
 
     Returns the terminal order status (``"valid"`` / ``"invalid"``).
@@ -75,6 +77,14 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
     protocol/DNS failure — those are recorded on the order row so the
     UI can surface them; only genuinely unexpected errors propagate
     (so Celery can log + retry).
+
+    A network error (``httpx.TransportError``: the CA refused, timed out,
+    reset) is retried by the Celery task, so it propagates with the order
+    left ``processing`` and a ``retrying: …`` note in ``last_error``.
+    ``final_attempt`` is the task's word that no retry follows: the order
+    then ends ``invalid`` like any other failure. Left ``processing``, it
+    would never finish and would block the renewal of every certificate
+    with its domains for good (#1686).
 
     The passed ``db`` session is used for the cert + order bookkeeping;
     the DNS-01 solver opens / commits through the same session so the
@@ -97,8 +107,12 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
     if account is None:
         return await _fail(db, oid, "ACME account row not found")
 
+    # A retry after a network error (below) finds the order already
+    # ``processing`` with its "retrying: …" note. Keep the note until this
+    # attempt settles the order, so the UI can say why it is still waiting.
+    if order.status != ACME_ORDER_PROCESSING:
+        order.last_error = None
     order.status = ACME_ORDER_PROCESSING
-    order.last_error = None
     await db.commit()
 
     handles: list[dns01.DNS01Handle] = []
@@ -274,10 +288,17 @@ async def run_order(db: AsyncSession, order_id: uuid.UUID | str) -> str:
         return await _fail(db, oid, str(exc))
     except httpx.TransportError as exc:
         # Transient network blip talking to the CA. Do NOT mark the order
-        # terminally ``invalid`` — leave it ``processing`` and re-raise so
-        # the Celery task autoretries (httpx.TransportError is in its
-        # autoretry_for); the retry reuses the persisted order (above).
+        # terminally ``invalid`` — leave it ``processing``, say why on it,
+        # and re-raise so the Celery task autoretries (httpx.TransportError
+        # is in its autoretry_for); the retry reuses the persisted order
+        # (above). On the task's last attempt no retry follows: end the
+        # order like any other failure, or it stays ``processing`` for good
+        # and blocks the renewal of every cert with its domains (#1686).
         logger.warning("acme_client_transient_ca_error", order_id=str(oid), error=str(exc))
+        detail = _network_error_detail(exc)
+        if final_attempt:
+            return await _fail(db, oid, f"{detail} (no retries left)")
+        await _note_retrying(db, oid, f"retrying: {detail}")
         raise
     except Exception as exc:  # noqa: BLE001 — record + re-raise for Celery retry
         await _fail(db, oid, f"unexpected: {exc}")
@@ -351,6 +372,44 @@ async def _fail(db: AsyncSession, order_id: uuid.UUID, message: str) -> str:
         logger.warning("acme_client_fail_persist_failed", order_id=str(order_id), error=str(exc))
     logger.warning("acme_client_order_invalid", order_id=str(order_id), error=message)
     return ACME_ORDER_INVALID
+
+
+async def _note_retrying(db: AsyncSession, order_id: uuid.UUID, message: str) -> None:
+    """Persist why a ``processing`` order waits on a retry (#1686).
+
+    ``last_error`` only; the status stays ``processing``. Rolls back and
+    re-reads the row by id, as ``_fail`` does, so nothing the failed attempt
+    left uncommitted is persisted with the note. A row that is no longer
+    ``processing`` (cancelled meanwhile) is left as it is. Best-effort: a DB
+    error here must not mask the network error the caller re-raises.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 — already-clean session
+        pass
+    try:
+        fresh = await db.get(ACMEOrder, order_id)
+        if fresh is not None and fresh.status == ACME_ORDER_PROCESSING:
+            fresh.last_error = message[:2000]
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("acme_client_retry_note_failed", order_id=str(order_id), error=str(exc))
+
+
+def _network_error_detail(exc: httpx.TransportError) -> str:
+    """``network error talking to https://ca.example: ConnectError: …``.
+
+    Names the exception type (a ``ReadTimeout`` can carry no message) and
+    the origin the request went to, which tells a wrong or blocked
+    directory URL apart from a DNS provider the solve could not reach.
+    Scheme, host and port only: never a path or a query string.
+    """
+    kind = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    try:
+        url = exc.request.url
+    except RuntimeError:  # raised without a request attached
+        return f"network error: {kind}"
+    return f"network error talking to {url.scheme}://{url.netloc.decode('ascii')}: {kind}"
 
 
 async def _store_certificate(
