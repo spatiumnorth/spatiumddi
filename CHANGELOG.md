@@ -176,26 +176,6 @@ the formatter handles the rest.
     and releases only a lease it still holds.
   The other points in that report are #1446, #1447 and #1448.
 
-# ⚠️ Upgrading an appliance from 2026.09.04-1: back up the app Secret first
-
-> **Before you upgrade an appliance from 2026.09.04-1, back up the
-> Secret that holds `SECRET_KEY`:**
-> `kubectl -n spatium get secret spatium-control-spatiumddi-app -o yaml > spatium-control-app-secret.yaml`,
-> and keep the file off the appliance. 2026.09.04-1's chart does not
-> mark that Secret to be kept (#1042 fixed that in this release), so if
-> the first `spatium-control` helm install on the new slot fails and
-> helm reinstalls the release, a new key is generated and every
-> credential encrypted at rest (TLS certificates, integration and
-> provider secrets) becomes unreadable. Restoring the saved Secret
-> recovers them. This was reported on a real upgrade (#1445, #1448).
-
-> **The built-in rolling upgrade (Rolling Upgrade tab, Plan → Start)
-> does not complete on a multi-node cluster in this release (#1445).**
-> The orchestrator cannot take its upgrade lease. A fix is in progress;
-> until it ships, follow #1445 before upgrading a multi-node control
-> plane. On a multi-node cluster, Kea HA pairs may also fail to come up
-> after the upgrade (#1447).
-
 - **Technitium records stop churning and silently diverging (#1518,
   #1517, #1516, #1513).** A record TTL of 0 came back as the zone
   TTL and an MX preference of 0 as 10 — both now round-trip as
@@ -2379,6 +2359,26 @@ the formatter handles the rest.
 > rollback can mint a new `SECRET_KEY` and leave every credential
 > encrypted at rest unreadable. If you must go back, restore the
 > backup you took before the upgrade alongside the older release.
+
+# ⚠️ Upgrading an appliance from 2026.09.04-1: back up the app Secret first
+
+> **Before you upgrade an appliance from 2026.09.04-1, back up the
+> Secret that holds `SECRET_KEY`:**
+> `kubectl -n spatium get secret spatium-control-spatiumddi-app -o yaml > spatium-control-app-secret.yaml`,
+> and keep the file off the appliance. 2026.09.04-1's chart does not
+> mark that Secret to be kept (#1042 fixed that in this release), so if
+> the first `spatium-control` helm install on the new slot fails and
+> helm reinstalls the release, a new key is generated and every
+> credential encrypted at rest (TLS certificates, integration and
+> provider secrets) becomes unreadable. Restoring the saved Secret
+> recovers them. This was reported on a real upgrade (#1445, #1448).
+
+> **The built-in rolling upgrade (Rolling Upgrade tab, Plan → Start)
+> does not complete on a multi-node cluster in this release (#1445).**
+> The orchestrator cannot take its upgrade lease. A fix is in progress;
+> until it ships, follow #1445 before upgrading a multi-node control
+> plane. On a multi-node cluster, Kea HA pairs may also fail to come up
+> after the upgrade (#1447).
 
 **This is not 1.0.0.** 1.0.0 is still being worked on, and this
 release is a waypoint on the way there: a month of QA on the ddi-pg
