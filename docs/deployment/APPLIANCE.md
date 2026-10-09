@@ -537,7 +537,9 @@ state on its heartbeat:
   technitium DaemonSets
   drop `hostNetwork` to sit behind, an L2 LoadBalancer Service with
   `externalTrafficPolicy: Local`, so the DNS server sees each client's
-  own address rather than the node's, #1487) and
+  own address rather than the node's, #1487; one `dns-vip` Service
+  selects every engine's pods, so the VIP follows an engine switch,
+  #1510) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
   relay→server unicast forward — Kea keeps `hostNetwork` for
   direct-attached broadcast). Both live on the same `platform_settings`

@@ -129,6 +129,10 @@ render() { # name chart [helm --set args...]
     # address (externalTrafficPolicy: Local); see the script's docstring.
     python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
         || failures=$((failures + 1))
+    # #1510 — no two Services may ask MetalLB for the same address; only the
+    # one created first would get it.
+    python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" "$file" \
+        || failures=$((failures + 1))
     # A MetalLB VIP must keep the client's source address (the DNS VIP's
     # rate limits, query logs and RPZ hits are all per client). The DHCP
     # relay VIP is exempt: Kea answers the relay at giaddr, so the packet's
@@ -290,6 +294,7 @@ APPLIANCE_ALL_ON=(
     --set observability.kubeStateMetrics.enabled=true
     --set observability.nodeExporter.enabled=true
     --set dns.useMetalLBVIP=true
+    --set dns.vip=10.0.0.53
     --set cnpg.enabled=true
     # #1281 — the off-cluster shape: an external control-plane URL renders
     # the pinned-certificate env, mount and hostPath volume in every role
@@ -309,6 +314,11 @@ lint "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 POSTURE_ARGS="--require-priority --allow-no-priority agent-landing"
 render appliance-defaults "$APPLIANCE"
 render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
+# #1510 — all three DNS engines on with a DNS VIP: exactly one Service may ask
+# for it, and its selector must reach every engine's pods, so an engine switch
+# never leaves the VIP on a Service without endpoints.
+python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" --require \
+    --dns-vip 10.0.0.53 "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
