@@ -1117,14 +1117,18 @@ class TechnitiumDriver(DriverBase):
             # list has to actually clear on the daemon.
             self._apply_blocking(token, server_state.get("blocking") or {})
 
-            self._reconcile_zones(token, payload)
-            self._apply_catalog(token, server_state.get("catalog"), payload)
+            # Retire before reconciling: Technitium files a parent's record
+            # under the closest zone it hosts, so a dropped child zone that
+            # shadows it takes the record along on delete. The reconcile
+            # below then puts it back in the parent in the same pass.
             self._retire_dropped_zones(
                 token,
                 payload,
                 backup / "zones.json",
                 bundle_zone_names=server_state.get("bundle_zone_names"),
             )
+            self._reconcile_zones(token, payload)
+            self._apply_catalog(token, server_state.get("catalog"), payload)
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None

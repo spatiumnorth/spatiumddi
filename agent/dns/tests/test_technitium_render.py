@@ -1949,6 +1949,59 @@ def test_zone_the_render_skipped_is_not_retired_end_to_end(tmp_path: Path) -> No
     assert ledger == ["a.test", "sec.test"]
 
 
+def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -> None:
+    """QA walk on #1497: Technitium files a record added to ``p1`` under the
+    closest zone it hosts, here ``kid.p1``, and ``zones/delete`` of the child
+    takes it along. The parent's reconcile has to run after the retire, or
+    the name is NXDOMAIN until the next structural pass."""
+    zones: dict[str, list[dict[str, Any]]] = {}
+
+    def _daemon(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        zone = params.get("zone", "")
+        if path == "zones/create":
+            zones.setdefault(zone, [])
+        elif path == "zones/delete":
+            zones.pop(zone, None)
+        elif path == "zones/records/add":
+            domain = params["domain"]
+            home = max((z for z in zones if domain == z or domain.endswith("." + z)), key=len)
+            zones[home].append(params)
+        elif path == "zones/records/get":
+            records = [
+                {
+                    "name": r["domain"],
+                    "type": r["type"],
+                    "ttl": r.get("ttl"),
+                    "rData": {"ipAddress": r.get("ipAddress")},
+                }
+                for r in zones.get(zone, [])
+            ]
+            return {"status": "ok", "response": {"records": records}}
+        return {"status": "ok"}
+
+    def _apply(bundle: dict[str, Any]) -> None:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        d.daemon_running = lambda: True  # type: ignore[method-assign]
+        d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+        _install_fake_request(d, _daemon)
+        d.render(bundle)
+        d.validate()
+        d.swap_and_reload()
+
+    parent = {
+        "name": "p1.",
+        "type": "primary",
+        "records": [{"name": "www.kid", "type": "A", "value": "192.0.2.11"}],
+    }
+    _apply({"zones": [{"name": "kid.p1.", "type": "primary", "records": []}, parent]})
+    assert [r["domain"] for r in zones["kid.p1"]] == ["www.kid.p1"]
+
+    _apply({"zones": [parent]})
+    assert "kid.p1" not in zones
+    assert [r["domain"] for r in zones["p1"]] == ["www.kid.p1"]
+
+
 # ── swap_and_reload: TSIG sync (#1517) + partial refusal (#1516) ────────
 
 
