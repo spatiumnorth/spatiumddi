@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The BIND9 agent streams the RPZ zone file to disk instead of
+  holding it three times over (#1109, Part 3).** `_write_rpz_zone_file`
+  built every line into a list, joined it, then encoded it, so a large
+  blocklist kept three full copies alive on a node also running named.
+  Lines now go through a buffered writer as they are produced; the
+  `seen` owner-name collision ledger (#878) is unchanged. The file is
+  byte-identical (a test pins the exact bytes, and passes on the old
+  renderer too). Measured on a synthetic 600k-domain wildcard list
+  (1.2M records, 49 MB zone): added peak RSS 263 MB to 61 MB, render
+  time ~0.35 s both before and after. The PowerDNS agent has no
+  equivalent renderer.
+
 - **A DHCPv4-only client class no longer takes down a group's DHCPv6
   config, or the other way round (#1229, #1295).** Every client class was
   rendered into both Kea daemons. A test using `pkt4` or `relay4`

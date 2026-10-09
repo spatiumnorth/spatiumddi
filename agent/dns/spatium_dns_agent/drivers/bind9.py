@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -1754,7 +1755,7 @@ class Bind9Driver(DriverBase):
         return apex.notes + timer_notes
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
-        """Render an RPZ zone file.
+        """Render an RPZ zone file, streaming it to disk.
 
         RPZ uses CNAME trigger records to tell BIND9 how to rewrite responses:
           - CNAME .            → synthesize NXDOMAIN
@@ -1783,73 +1784,23 @@ class Bind9Driver(DriverBase):
         Nothing upstream catches it: ``validate()`` runs named-checkconf,
         which does not read zone files.
         """
+        # Streamed (#1109 Part 3): building a list of every line, joining
+        # it and encoding the result kept three full copies of a ~1.2M
+        # record zone alive beside a running named. Lines now go straight
+        # through a buffered writer; the output is byte-identical to the
+        # old ``"\n".join(lines) + "\n"``. The caller renders into a
+        # staging directory that is swapped in whole, so writing in place
+        # here gives up no atomicity.
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
-        lines = [
-            "$TTL 60",
-            "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
-            "@ IN NS localhost.",
-        ]
-        # Exceptions are emitted as passthru below, so an entry for the
-        # same name must not also be emitted. Matches the control-plane
-        # renderer, which already skips excluded domains.
-        excluded = {
-            str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x
-        }
-        # First writer of an owner name wins. The choice between two
-        # disagreeing lists is arbitrary — what is NOT arbitrary is that
-        # the zone must load, since the alternative is enforcing nothing
-        # at all. Collisions are logged so the operator can reconcile the
-        # lists rather than wonder which one is in effect.
+        # ``seen`` is the owner-name collision ledger (#878) and must stay.
         seen: dict[str, str] = {}
         collisions: list[str] = []
         bad_targets: list[str] = []
-        for e in bl.get("entries") or []:
-            domain = e["domain"].rstrip(".")
-            key = domain.lower()
-            if key in excluded:
-                continue
-            action = e.get("action") or "block"
-            block_mode = e.get("block_mode") or "nxdomain"
-            is_wildcard = bool(e.get("is_wildcard"))
-            target = e.get("target")
-            if action == "redirect" and target:
-                # An unusable target means the rewrite cannot be expressed.
-                # Dropping the entry is the honest outcome — a redirect is
-                # a rewrite, so not rewriting is the same as no rule, while
-                # substituting a block would invent policy the operator
-                # never asked for.
-                rewrite = _redirect_rdata(str(target))
-                if rewrite is None:
-                    bad_targets.append(domain)
-                    continue
-                rdata = rewrite
-            elif block_mode == "sinkhole":
-                rdata = "CNAME rpz-drop."
-            else:  # default: nxdomain
-                rdata = "CNAME ."
-            if key in seen:
-                # An identical repeat is harmless duplication (BIND loads
-                # it); only a differing one would have killed the zone.
-                if seen[key] != rdata:
-                    collisions.append(domain)
-                continue
-            seen[key] = rdata
-            lines.append(f"{domain} {rdata}")
-            if is_wildcard:
-                lines.append(f"*.{domain} {rdata}")
-        # Exceptions → passthrough (never blocked even if a broader rule
-        # matches). Deduped on the same lowercased key so two spellings of
-        # one name cannot land twice either.
-        emitted_exceptions: set[str] = set()
-        for exc in bl.get("exceptions") or []:
-            d = str(exc).rstrip(".")
-            if not d or d.lower() in emitted_exceptions:
-                continue
-            emitted_exceptions.add(d.lower())
-            lines.append(f"{d} CNAME rpz-passthru.")
-            lines.append(f"*.{d} CNAME rpz-passthru.")
-        path.write_text("\n".join(lines) + "\n")
+        with path.open("w", encoding="utf-8", buffering=1 << 20) as fh:
+            for line in self._rpz_zone_lines(bl, seen, collisions, bad_targets):
+                fh.write(line)
+                fh.write("\n")
         if bad_targets:
             log.warning(
                 "bind9_rpz_redirect_target_unusable",
@@ -1882,6 +1833,74 @@ class Bind9Driver(DriverBase):
             entries=len(bl.get("entries") or []),
             owners=len(seen),
         )
+
+    def _rpz_zone_lines(
+        self,
+        bl: dict[str, Any],
+        seen: dict[str, str],
+        collisions: list[str],
+        bad_targets: list[str],
+    ) -> Iterator[str]:
+        """Yield the RPZ zone file's lines; see ``_write_rpz_zone_file``."""
+        yield "$TTL 60"
+        yield "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )"
+        yield "@ IN NS localhost."
+        # Exceptions are emitted as passthru below, so an entry for the
+        # same name must not also be emitted. Matches the control-plane
+        # renderer, which already skips excluded domains.
+        excluded = {
+            str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x
+        }
+        # First writer of an owner name wins. The choice between two
+        # disagreeing lists is arbitrary — what is NOT arbitrary is that
+        # the zone must load, since the alternative is enforcing nothing
+        # at all. Collisions are logged so the operator can reconcile the
+        # lists rather than wonder which one is in effect.
+        for e in bl.get("entries") or []:
+            domain = e["domain"].rstrip(".")
+            key = domain.lower()
+            if key in excluded:
+                continue
+            action = e.get("action") or "block"
+            block_mode = e.get("block_mode") or "nxdomain"
+            is_wildcard = bool(e.get("is_wildcard"))
+            target = e.get("target")
+            if action == "redirect" and target:
+                # An unusable target means the rewrite cannot be expressed.
+                # Dropping the entry is the honest outcome — a redirect is
+                # a rewrite, so not rewriting is the same as no rule, while
+                # substituting a block would invent policy the operator
+                # never asked for.
+                rewrite = _redirect_rdata(str(target))
+                if rewrite is None:
+                    bad_targets.append(domain)
+                    continue
+                rdata = rewrite
+            elif block_mode == "sinkhole":
+                rdata = "CNAME rpz-drop."
+            else:  # default: nxdomain
+                rdata = "CNAME ."
+            if key in seen:
+                # An identical repeat is harmless duplication (BIND loads
+                # it); only a differing one would have killed the zone.
+                if seen[key] != rdata:
+                    collisions.append(domain)
+                continue
+            seen[key] = rdata
+            yield f"{domain} {rdata}"
+            if is_wildcard:
+                yield f"*.{domain} {rdata}"
+        # Exceptions → passthrough (never blocked even if a broader rule
+        # matches). Deduped on the same lowercased key so two spellings of
+        # one name cannot land twice either.
+        emitted_exceptions: set[str] = set()
+        for exc in bl.get("exceptions") or []:
+            d = str(exc).rstrip(".")
+            if not d or d.lower() in emitted_exceptions:
+                continue
+            emitted_exceptions.add(d.lower())
+            yield f"{d} CNAME rpz-passthru."
+            yield f"*.{d} CNAME rpz-passthru."
 
     def validate(self) -> None:
         # What this apply holds back (#1403); refilled by _check_zone_files.
