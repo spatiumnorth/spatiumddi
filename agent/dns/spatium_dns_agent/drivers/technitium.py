@@ -754,6 +754,9 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
     ``delete`` requires the exact same value params to identify the record.
     """
+    if rtype == "TXT":
+        # Text, not a name: it keeps a trailing full stop (#1694).
+        return {"text": value}
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
@@ -784,8 +787,6 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
             "weight": rec.get("weight") if rec.get("weight") is not None else 0,
             "port": rec.get("port") if rec.get("port") is not None else 0,
         }
-    if rtype == "TXT":
-        return {"text": value}
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)

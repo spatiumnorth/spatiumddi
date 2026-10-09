@@ -154,6 +154,42 @@ def test_record_params_txt() -> None:
     assert _record_params("TXT", "v=spf1 -all", {}) == {"text": "v=spf1 -all"}
 
 
+def test_record_params_txt_keeps_a_trailing_full_stop() -> None:
+    """#1694: the trailing-dot strip is for name-valued targets. It cut
+    the last character off a TXT value that ends in a full stop."""
+    assert _record_params("TXT", "this value ends with a full stop.", {}) == {
+        "text": "this value ends with a full stop."
+    }
+    # The name-valued types still lose theirs.
+    assert _record_params("CNAME", "target.example.com.", {}) == {"cname": "target.example.com"}
+
+
+def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -> None:
+    """A value the driver served one character short before #1694 is
+    replaced once, and the next pass changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [{"domain": "note.example.com", "type": "TXT", "ttl": 300,
+                **_record_params("TXT", "a full stop.", {})}]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": {"text": "a full stop"}}],
+        desired=desired,
+    )
+    assert [(c[2], c[3]["text"]) for c in calls if c[2].startswith("zones/records/")
+            and c[2] != "zones/records/get"] == [
+        ("zones/records/delete", "a full stop"),
+        ("zones/records/add", "a full stop."),
+    ]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": {"text": "a full stop."}}],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
 def test_record_params_caa() -> None:
     out = _record_params("CAA", '0 issue "letsencrypt.org"', {})
     assert out == {"flags": 0, "tag": "issue", "value": "letsencrypt.org"}
