@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Batched IPAM→DNS sync no longer reports failed agentless creates
+  as created (#1536).** The batched path collected record ops per
+  zone and flushed them without ever looking at the outcomes: a
+  create the provider rejected kept the `ip.dns_record_id` stamp the
+  singular path carefully removes (#428), so DDNS idempotency never
+  retried it, and the sync's created/failed accounting never saw it.
+  Collected ops now carry the stamped address with them, the flush
+  returns one result per op, a `failed` batched create gets the same
+  un-stamp as the inline path, and callers can fold failed batched
+  ops into their error counts.
+
 - **Cloud DNS drivers write MX/SRV records whole, and drift can
   see their parts (#1526, #1525).** MX and SRV records were written
   wrong or not at all by several of the Route 53 / Google / Azure /
