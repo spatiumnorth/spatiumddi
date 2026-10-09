@@ -1666,6 +1666,18 @@ the formatter handles the rest.
 
 ### Security
 
+- **Typed-webhook subscription headers are encrypted at rest
+  (#1579).** Subscription `headers` (Authorization tokens and the
+  like) were stored in clear and rode along in "exclude secrets"
+  backups — unlike the webhook signing secret and the forward-target
+  credentials fixed in #1506. They now live in a Fernet-encrypted
+  `headers_encrypted` column (migration encrypts existing rows in
+  place; registered for backup exclusion and key-rotation rewrap),
+  API responses return only header names plus a `headers_set` flag,
+  backups no longer carry the values, and the admin UI treats
+  headers as write-only: blank keeps the stored set, typed lines
+  replace it, an explicit clear removes it.
+
 - **A failed backup run's audit row no longer carries the destination's
   error text (#1617).** The `backup_target_run_failed` row is forwarded
   as-is, to syslog, webhook and SMTP forward targets and as the
@@ -1792,7 +1804,6 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
-
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
