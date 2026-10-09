@@ -255,6 +255,53 @@ backup_and_wipe_identity() {
     printf '%s\n' "$bak"
 }
 
+# #1682 — the pod networks this node routed while it was a member. Flannel
+# runs host-gw (config.yaml), so each other node's pod subnet is a kernel route
+# `<subnet> via <that node's address>`, and nothing removes those routes when
+# k3s stops. Read from flannel's subnet.env, which the identity wipe removes,
+# so this must run before the wipe. Without that file: the cluster-cidr k3s was
+# configured with (a comma-joined pair when dual-stack), else k3s's default.
+_pod_networks() {
+    local v4="" v6="" cidr
+    if [ -f "$FLANNEL_SUBNET_ENV" ]; then
+        v4="$(sed -n 's/^FLANNEL_NETWORK=//p' "$FLANNEL_SUBNET_ENV" | head -n 1)"
+        v6="$(sed -n 's/^FLANNEL_IPV6_NETWORK=//p' "$FLANNEL_SUBNET_ENV" | head -n 1)"
+    fi
+    if [ -z "$v4$v6" ]; then
+        cidr="$(cat "$K3S_DROPIN_DIR"/*.yaml "$K3S_CONFIG" 2>/dev/null \
+            | sed -n 's/^cluster-cidr:[[:space:]]*//p' | head -n 1 | tr -d "\"' ")"
+        printf '%s\n' "${cidr:-10.42.0.0/16}" | tr ',' '\n'
+        return 0
+    fi
+    printf '%s\n' $v4 $v6
+}
+
+# #1682 — remove the routes flannel installed to the old cluster's peers. A
+# node reset to a fresh single-node cluster takes the first subnet of the pod
+# network for itself, which was the seed's, so the stale `<seed subnet> via
+# <seed>` route shadows the node's own cni0 route: every reply to its pods
+# goes to the seed, its pods never reach their own API (10.43.0.1:443 ->
+# :6443), no supervisor starts, and the control plane never hears `left`.
+# A fresh node has no peers, so no route into the pod network may go through
+# a gateway. Only gateway routes are removed: cni0's own route has none. Runs
+# while k3s is stopped, so flannel cannot put them back.
+clear_stale_pod_routes() {
+    local net fam dst rest gw
+    for net in $(_pod_networks); do
+        case "$net" in *:*) fam=-6 ;; *) fam=-4 ;; esac
+        ip "$fam" route show root "$net" 2>/dev/null | while read -r dst rest; do
+            case " $rest " in *" via "*) ;; *) continue ;; esac
+            gw="${rest#*via }"
+            gw="${gw%% *}"
+            if ip "$fam" route del "$dst" via "$gw" 2>/dev/null; then
+                log "removed the old cluster's pod route $dst via $gw"
+            else
+                log "could not remove the old cluster's pod route $dst via $gw"
+            fi
+        done
+    done
+}
+
 # #555 — prune stale identity backups. Each one holds the etcd db + tls/
 # private keys (CA material) and lives in the release-state dir; the
 # old code left every join/leave backup forever ("a later sweep can prune"
@@ -718,6 +765,8 @@ do_leave() {
 
     systemctl stop k3s || true
     clean_k3s_runtime
+    # #1682 — before the wipe removes flannel's subnet.env, which names them.
+    clear_stale_pod_routes
     rm -f "$JOIN_DROPIN"
     # Drop the join coordinates + restore cluster-init so the node
     # re-initialises its OWN etcd as a fresh standalone seed.
