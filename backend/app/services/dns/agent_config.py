@@ -121,6 +121,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+# The zone-payload keys a record change moves: kept out of the structural
+# fingerprint of a group without views, so a record-only change reaches the
+# agent as RFC 2136 ops, not as a re-render (#1373). See ``zones_structural``.
+_RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
+
 
 def _compute_etag(payload: dict[str, Any]) -> str:
     """SHA-256 of the canonicalized payload (sorted keys)."""
@@ -338,8 +343,17 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     )
     acls = acls_res.scalars().all()
 
-    # Zones (+ records for primary only)
-    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
+    # Zones (+ records for primary only), by name like every other list the
+    # structural fingerprint hashes, then by id (two views may each hold a
+    # zone of the same name). Unordered, Postgres returned them in whatever
+    # order its plan read them, and the UPDATE a record change makes to its
+    # zone (``last_serial``) moved that zone in it, so a record change moved
+    # the structural etag of any group of two zones or more (#1373).
+    zones_res = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id == server.group_id)
+        .order_by(DNSZone.name, DNSZone.id)
+    )
     zones = zones_res.scalars().all()
 
     # Dynamic-update ACLs (issue #641). One JOIN across every ACL row in the
@@ -981,8 +995,17 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         # view, so records are folded in here — any record/view change then
         # shifts the structural etag and triggers a full, view-correct
         # re-render. ``view_name`` is always retained either way.
+        #
+        # #1373 — ``serial`` is left out with the records, for the same reason:
+        # every record change bumps it, so while it was in here (since #430
+        # shipped it for the agent's zone-state reporter) every record change
+        # on a flat group re-rendered the zone and froze/reloaded/thawed it
+        # beside the RFC 2136 update. A change that should re-render moves a
+        # field of its own (the TTL, the SOA timers, the apex); the serial bump
+        # that comes with it is never the only difference.
         "zones_structural": [
-            {k: val for k, val in z.items() if (k != "records" or has_views)} for z in zone_payload
+            {k: val for k, val in z.items() if has_views or k not in _RECORD_DRIVEN_KEYS}
+            for z in zone_payload
         ],
         # DNSSEC signing intent / policy params rewrite named.conf, so a
         # change must trigger a full reload (issue #49).
