@@ -169,6 +169,24 @@ the formatter handles the rest.
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
 
+- **The DNS agent bundle render streams a blocklist instead of holding
+  it whole (#1662).** The render of a server whose group carries a
+  blocklist built every entry as a row, an `EffectiveEntry` and a dict,
+  then serialised the whole payload three times (the structural ETag,
+  the ETag, the body) and kept the body. With the catalog's Hagezi
+  Gambling feed (~582k domains, a 60.8 MB body) the Celery child grew
+  ~400 MB, the render took the whole 1 GiB worker of an appliance at
+  the sizing floor, and once the kernel OOM-killed the worker with
+  every DHCP, DNS, IPAM and default task beside it. The render now
+  reads each list through a server-side cursor, 5,000 entries at a
+  time, and writes them straight into the two running ETag hashes and
+  the gzip stream, so it holds one batch whatever the list's length.
+  The stored body, its ETag and its structural ETag are byte-identical
+  (a test pins them to the values before the change), so no agent
+  re-renders and no renderer revision bump is owed. In the backend
+  tests the render's peak grew ~826 bytes per entry before and ~3
+  after (133 MB to 8 MB at 160k entries).
+
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
   2026.10.02-1, where Plan → Start never got past the upgrade lease:

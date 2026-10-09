@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
-from dataclasses import dataclass
+import secrets
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -50,6 +51,7 @@ from app.models.dns import (
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
 from app.services.dns.named_conf_validation import (
     UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
@@ -81,6 +83,11 @@ from app.services.dns.tsig import legacy_group_key, view_transfer_key
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
+    effective_lists_for_group,
+    effective_lists_for_view,
+    exception_domains,
+    has_entries,
+    stream_entries,
 )
 
 try:  # pragma: no cover - seam with parallel driver-abstraction agent
@@ -127,10 +134,28 @@ logger = structlog.get_logger(__name__)
 _RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
 
 
+#: How an ETag's payload is serialised before it is hashed. The streamed
+#: render (#1662) hashes each batch of blocklist entries with these too.
+_ETAG_JSON: dict[str, Any] = {"sort_keys": True, "default": str}
+
+
 def _compute_etag(payload: dict[str, Any]) -> str:
     """SHA-256 of the canonicalized payload (sorted keys)."""
-    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    blob = json.dumps(payload, **_ETAG_JSON).encode()
     return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def _entry_dict(
+    domain: str, action: str, block_mode: str, target: str | None, is_wildcard: bool
+) -> dict[str, Any]:
+    """One blocklist entry as the bundle ships it."""
+    return {
+        "domain": domain,
+        "action": action,
+        "block_mode": block_mode,
+        "target": target,
+        "is_wildcard": is_wildcard,
+    }
 
 
 def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
@@ -298,14 +323,238 @@ class RenderedBody:
     has_views: bool
 
 
+@dataclass(frozen=True)
+class EncodedBody:
+    """``RenderedBody`` as the store keeps it (#1662): the body serialised
+    (``agent_bundle_store.WIRE_JSON``) and gzipped (``compress_body``'s
+    bytes), with its uncompressed length, instead of the dict."""
+
+    body_gz: bytes
+    body_bytes: int
+    etag: str
+    structural_etag: str
+    records: int
+    has_views: bool
+
+
+#: Blocklist entries read, serialised and hashed per step of the streamed
+#: render (#1662). What the render holds of a list is one batch, whatever the
+#: list's length: ~1.5 KB per entry with its row and its text, so ~8 MB here.
+BLOCKLIST_RENDER_BATCH = 5000
+
+
+@dataclass(frozen=True)
+class _StreamedEntries:
+    """One RPZ zone whose entries the streamed render writes in itself: the
+    zone's dict carries ``mark`` in place of its ``entries`` list."""
+
+    mark: str
+    lists: list[Any]
+
+
+@dataclass
+class _Assembled:
+    """Everything ``render_bundle_body`` builds before it hashes: the body
+    (without ``structural_etag``) and the structural payload, plus the RPZ
+    zones whose entries are left out of both when streaming."""
+
+    body: dict[str, Any]
+    structural: dict[str, Any]
+    records: int
+    has_views: bool
+    streamed: list[_StreamedEntries] = field(default_factory=list)
+
+
+def _placeholder() -> str:
+    """A string no rendered value can equal: it stands in for a value that is
+    written into the serialised body later. The NULs keep it out of anything
+    an operator can store."""
+    return f"\x00spatium-bundle-placeholder:{secrets.token_hex(16)}\x00"
+
+
 async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBody:
     """Build everything in the bundle except the ops page, from DB state.
 
     This is the assembly ``build_config_bundle`` always did. The worker
-    render (#1111) calls it once per (server, watermark) and stores the
-    result; the long-poll serves the stored bytes and splices the ops page
+    render (#1111) stores the same bundle through ``encode_bundle_body``,
+    which streams the blocklist entries instead of building them here
+    (#1662); the long-poll serves the stored bytes and splices the ops page
     in per request.
     """
+    return _finish_whole(await _assemble(db, server, stream=False))
+
+
+def _finish_whole(assembled: _Assembled) -> RenderedBody:
+    """Hash an assembly with nothing left out: both ETags, the structural one
+    into the body."""
+    bundle_body = assembled.body
+    structural_etag = _compute_etag(assembled.structural)
+    bundle_body["structural_etag"] = structural_etag
+
+    # The canonical payload the inline build always hashed had the ops keys
+    # present (and, with nothing pending, empty). Hashing that shape keeps a
+    # stored bundle's ETag identical to the pre-#1111 ETag for the same
+    # state whenever nothing is pending.
+    etag = _compute_etag({**bundle_body, "pending_record_ops": [], "pending_ops_remaining": 0})
+    return RenderedBody(
+        body=bundle_body,
+        etag=etag,
+        structural_etag=structural_etag,
+        records=assembled.records,
+        has_views=assembled.has_views,
+    )
+
+
+def _cut(text: str, marks: list[str], kwargs: dict[str, Any]) -> list[bytes]:
+    """``text`` (serialised with ``kwargs``) cut where each of ``marks`` was
+    serialised, in order, each exactly once; the parts UTF-8 encoded."""
+    parts: list[bytes] = []
+    at = 0
+    for mark in marks:
+        quoted = json.dumps(mark, **kwargs)
+        hit = text.find(quoted, at)
+        if hit < 0 or text.find(quoted, hit + len(quoted)) >= 0:
+            raise RuntimeError("a bundle placeholder did not serialise exactly once")
+        parts.append(text[at:hit].encode("utf-8"))
+        at = hit + len(quoted)
+    parts.append(text[at:].encode("utf-8"))
+    return parts
+
+
+async def _stream_zone_entries(
+    db: AsyncSession,
+    lists: list[Any],
+    hashes: tuple[Callable[[bytes], None], ...],
+    write: Callable[[bytes], None],
+) -> None:
+    """Write one RPZ zone's ``entries`` list, a batch at a time: into the ETag
+    hashes as ``json.dumps`` with ``_ETAG_JSON`` would serialise it, and into
+    the body as ``WIRE_JSON`` would. A JSON list is its items joined by the
+    item separator, so a batch serialised on its own, minus its brackets,
+    joins the next one exactly where the whole list would have."""
+    first = True
+    for update in hashes:
+        update(b"[")
+    write(b"[")
+    async for batch in stream_entries(db, lists, BLOCKLIST_RENDER_BATCH):
+        items = [_entry_dict(*entry) for entry in batch]
+        hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+        wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+        del items
+        if not first:
+            # json.dumps's item separators: ", " by default, "," on the wire.
+            hashed = b", " + hashed
+            wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
+        for update in hashes:
+            update(hashed)
+        write(wire)
+        first = False
+    for update in hashes:
+        update(b"]")
+    write(b"]")
+
+
+async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody:
+    """``render_bundle_body``, serialised and gzipped as the store keeps it:
+    the same bytes, ETag and structural ETag, without ever holding a
+    blocklist whole (#1662).
+
+    The entries of the catalog's largest feed (~582k) are most of a bundle
+    that carries one, and building them as dicts, then serialising the
+    payload three times over (the structural ETag, the ETag, the body), took
+    the whole 1 GiB worker. Here every RPZ zone's ``entries`` is a placeholder
+    while the rest is serialised once per document; each document is cut
+    where its placeholders landed, and the entries are read from the
+    database a batch at a time (``stream_entries``, a server-side cursor per
+    list) and written into all three at once — two running SHA-256 hashes and
+    the gzip stream. The structural ETag is placeholdered too: it goes into
+    the body and the ETag's payload, and is known only once every entry has
+    been hashed.
+
+    Placeholders serialise exactly once each and in the same order in all
+    three documents: the zones are one list in every one of them, each zone
+    holds one ``entries``, and ``structural_etag`` sorts after
+    ``blocklists`` and is the body's last key.
+    """
+    assembled = await _assemble(db, server, stream=True)
+    body = assembled.body
+    if not assembled.streamed:
+        rendered = _finish_whole(assembled)
+        body_json = json.dumps(rendered.body, **WIRE_JSON).encode("utf-8")
+        writer = BodyWriter()
+        writer.write(body_json)
+        del body_json
+        return EncodedBody(
+            body_gz=writer.finish(),
+            body_bytes=writer.size,
+            etag=rendered.etag,
+            structural_etag=rendered.structural_etag,
+            records=rendered.records,
+            has_views=rendered.has_views,
+        )
+
+    marks = [zone.mark for zone in assembled.streamed]
+    structural_mark = _placeholder()
+    body["structural_etag"] = structural_mark
+    structural_hash = hashlib.sha256()
+    etag_hash = hashlib.sha256()
+    writer = BodyWriter()
+    # One document at a time, each part consumed (and dropped) as soon as the
+    # stream reaches it: the body's records come before its blocklists.
+    structural_parts = _cut(json.dumps(assembled.structural, **_ETAG_JSON), marks, _ETAG_JSON)
+    structural_hash.update(structural_parts[0])
+    structural_parts[0] = b""
+    etag_parts = _cut(
+        json.dumps({**body, "pending_record_ops": [], "pending_ops_remaining": 0}, **_ETAG_JSON),
+        [*marks, structural_mark],
+        _ETAG_JSON,
+    )
+    etag_hash.update(etag_parts[0])
+    etag_parts[0] = b""
+    wire_parts = _cut(json.dumps(body, **WIRE_JSON), [*marks, structural_mark], WIRE_JSON)
+    writer.write(wire_parts[0])
+    wire_parts[0] = b""
+    # All of it but the entries is serialised now: the dicts (a large group's
+    # records among them) go before the entries are read.
+    body.clear()
+    assembled.structural.clear()
+
+    for i, zone in enumerate(assembled.streamed):
+        if i:
+            structural_hash.update(structural_parts[i])
+            etag_hash.update(etag_parts[i])
+            writer.write(wire_parts[i])
+        await _stream_zone_entries(
+            db, zone.lists, (structural_hash.update, etag_hash.update), writer.write
+        )
+
+    last = len(marks)
+    structural_hash.update(structural_parts[last])
+    structural_etag = "sha256:" + structural_hash.hexdigest()
+    etag_hash.update(
+        etag_parts[last]
+        + json.dumps(structural_etag, **_ETAG_JSON).encode("utf-8")
+        + etag_parts[last + 1]
+    )
+    writer.write(
+        wire_parts[last]
+        + json.dumps(structural_etag, **WIRE_JSON).encode("utf-8")
+        + wire_parts[last + 1]
+    )
+    return EncodedBody(
+        body_gz=writer.finish(),
+        body_bytes=writer.size,
+        etag="sha256:" + etag_hash.hexdigest(),
+        structural_etag=structural_etag,
+        records=assembled.records,
+        has_views=assembled.has_views,
+    )
+
+
+async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _Assembled:
+    """Build everything in the bundle except the ops page and the two
+    ETags. ``stream``: leave each RPZ zone's entries out, for
+    ``encode_bundle_body`` to write in."""
     # Options (per group)
     opts_res = await db.execute(
         select(DNSServerOptions).where(DNSServerOptions.group_id == server.group_id)
@@ -750,13 +999,7 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     # with exceptions already applied by `build_effective_for_{view,group}`.
     def _entries_payload(eff_entries: list[Any]) -> list[dict[str, Any]]:
         return [
-            {
-                "domain": e.domain,
-                "action": e.action,
-                "block_mode": e.block_mode,
-                "target": e.target,
-                "is_wildcard": e.is_wildcard,
-            }
+            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard)
             for e in eff_entries
         ]
 
@@ -816,8 +1059,38 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
                 }
 
     blocklists_payload: list[dict[str, Any]] = []
+    streamed: list[_StreamedEntries] = []
+
+    async def _streamed_zone(
+        lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
+    ) -> None:
+        # #1662 — the zone exactly as below, with a placeholder for its
+        # entries, which ``encode_bundle_body`` streams in. A zone with no
+        # entry is left out, as below; an entry deleted between this check and
+        # the stream leaves a zone with none, and the delete has marked the
+        # bundle, so the next render drops it.
+        if not lists or not await has_entries(db, lists):
+            return
+        mark = _placeholder()
+        streamed.append(_StreamedEntries(mark=mark, lists=lists))
+        blocklists_payload.append(
+            {
+                "rpz_zone_name": rpz_zone_name,
+                "entries": mark,
+                "exceptions": sorted(await exception_domains(db, lists)),
+                "view_name": view_name,
+            }
+        )
+
     if views:
         for v in views:
+            if stream:
+                await _streamed_zone(
+                    await effective_lists_for_view(db, v.id),
+                    f"spatium-blocklist-{v.name}.rpz.",
+                    v.name,
+                )
+                continue
             eff_v = await build_effective_for_view(db, v.id)
             if eff_v.entries:
                 blocklists_payload.append(
@@ -831,19 +1104,24 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
                         "view_name": v.name,
                     }
                 )
-    eff_g = await build_effective_for_group(db, server.group_id)
-    if eff_g.entries:
-        blocklists_payload.append(
-            {
-                "rpz_zone_name": "spatium-blocklist.rpz.",
-                "entries": _entries_payload(eff_g.entries),
-                "exceptions": sorted(eff_g.exceptions),
-                # Group-level blocklist. With views, it applies to EVERY
-                # view (rendered into each); with no views it's the single
-                # global RPZ as before. ``view_name=None`` marks it global.
-                "view_name": None,
-            }
+    if stream:
+        await _streamed_zone(
+            await effective_lists_for_group(db, server.group_id), "spatium-blocklist.rpz.", None
         )
+    else:
+        eff_g = await build_effective_for_group(db, server.group_id)
+        if eff_g.entries:
+            blocklists_payload.append(
+                {
+                    "rpz_zone_name": "spatium-blocklist.rpz.",
+                    "entries": _entries_payload(eff_g.entries),
+                    "exceptions": sorted(eff_g.exceptions),
+                    # Group-level blocklist. With views, it applies to EVERY
+                    # view (rendered into each); with no views it's the single
+                    # global RPZ as before. ``view_name=None`` marks it global.
+                    "view_name": None,
+                }
+            )
 
     # Phase 8f-3 — fleet upgrade intent. Only set when the operator
     # stamped a desired_appliance_version on this server row from the
@@ -1021,21 +1299,12 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
-    structural_etag = _compute_etag(structural)
-    bundle_body["structural_etag"] = structural_etag
-
-    # The canonical payload the inline build always hashed had the ops keys
-    # present (and, with nothing pending, empty). Hashing that shape keeps a
-    # stored bundle's ETag identical to the pre-#1111 ETag for the same
-    # state whenever nothing is pending.
-    etag = _compute_etag({**bundle_body, "pending_record_ops": [], "pending_ops_remaining": 0})
-    records = sum(len(z["records"]) for z in zone_payload)
-    return RenderedBody(
+    return _Assembled(
         body=bundle_body,
-        etag=etag,
-        structural_etag=structural_etag,
-        records=records,
+        structural=structural,
+        records=sum(len(z["records"]) for z in zone_payload),
         has_views=has_views,
+        streamed=streamed,
     )
 
 

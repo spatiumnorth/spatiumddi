@@ -273,16 +273,16 @@ async def test_the_agent_never_drops_an_applied_op_across_stale_bodies_and_a_str
     # before it reads, committed after.
     await _change(db_session, server, zone, "a")
     async with _straddling_write(server_id, zone, "c") as t:
-        real = agent_bundle_render.render_bundle_body
+        real = agent_bundle_render.encode_bundle_body
 
         async def _read_then_commit(db, srv):  # noqa: ANN001, ANN202
             rendered = await real(db, srv)
             await t.commit()
             return rendered
 
-        monkeypatch.setattr(agent_bundle_render, "render_bundle_body", _read_then_commit)
+        monkeypatch.setattr(agent_bundle_render, "encode_bundle_body", _read_then_commit)
         b3 = await _render(db_session, server)
-        monkeypatch.setattr(agent_bundle_render, "render_bundle_body", real)
+        monkeypatch.setattr(agent_bundle_render, "encode_bundle_body", real)
     await db_session.refresh(server)
     assert not store.is_current(server), "C's commit left b3 behind"
 
