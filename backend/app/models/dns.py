@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Sequence,
     String,
     Table,
     Text,
@@ -461,6 +462,14 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dns_server_group_name"),)
 
 
+# #1489 — the order ops were queued in. ``created_at`` is the transaction
+# START, so every op one transaction queues ties on it, and ``id`` is a random
+# UUID: a delete + create of one record could reach each server in either
+# order. Rows queued before the column existed keep NULL (no table rewrite on
+# upgrade) and the old ``id`` tie-break.
+DNS_RECORD_OP_SEQ = Sequence("dns_record_op_seq_seq", metadata=Base.metadata)
+
+
 class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     """Per-record mutation queued for an agent to apply via RFC 2136."""
 
@@ -510,6 +519,16 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         BigInteger,
         nullable=True,
         server_default=sa_text("(pg_current_xact_id()::text)::bigint"),
+    )
+    # #1489 — queue order; see ``DNS_RECORD_OP_SEQ``. Ops ship and supersede in
+    # ``(created_at, seq)`` order, so one transaction's ops keep the order they
+    # were queued in while ops of different transactions compare exactly as
+    # before.
+    seq: Mapped[int | None] = mapped_column(
+        BigInteger,
+        DNS_RECORD_OP_SEQ,
+        server_default=DNS_RECORD_OP_SEQ.next_value(),
+        nullable=True,
     )
 
 
