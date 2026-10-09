@@ -28,6 +28,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import (
     DHCPPhoneProfile,
     DHCPPhoneProfileScope,
@@ -295,7 +296,13 @@ async def update_profile(
     if prof is None:
         raise HTTPException(status_code=404, detail="Phone profile not found")
 
-    payload = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears vendor / vendor_class_match; null for
+    # a NOT NULL column is a 422.
+    payload = resolve_update_changes(
+        body,
+        clearable={"vendor", "vendor_class_match"},
+        non_nullable={"name", "description", "enabled", "option_set", "tags"},
+    )
     if "name" in payload and payload["name"] != prof.name:
         clash = await db.execute(
             select(DHCPPhoneProfile).where(
@@ -332,7 +339,7 @@ async def update_profile(
         resource_id=str(prof.id),
         resource_display=prof.name,
         changed_fields=list(payload.keys()),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
     )
     collect_wake(dhcp_group_channel(prof.group_id))
     await db.commit()

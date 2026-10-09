@@ -54,7 +54,13 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.kubernetes import KubernetesCluster
-from app.services.integration_ownership import address_taken, owned_by_other_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.integration_ownership import (
+    address_taken,
+    owned_by_other_integration,
+    subnet_has_surviving_addresses,
+)
 from app.services.kubernetes.client import (
     KubernetesClient,
     KubernetesClientError,
@@ -140,6 +146,9 @@ class _DesiredAddress:
     status: str  # kubernetes-node | kubernetes-lb | kubernetes-service | kubernetes-pod
     hostname: str
     description: str
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass(frozen=True)
@@ -466,9 +475,16 @@ async def _apply_blocks_and_subnets(
     # owned NOT in here becomes a deletion candidate.
     used_wrapper_cidrs: set[str] = set()
 
-    # Deletes first: current subnets we no longer want.
+    # Deletes first: current subnets we no longer want. #1558: a blind
+    # delete cascades to every address in the subnet — un-claim instead
+    # when operator / foreign / operator-edited addresses survive in it,
+    # like the OPNsense reconciler does.
     for net_str, row in current_subnets.items():
         if net_str not in desired_map:
+            if await subnet_has_surviving_addresses(db, row.id, "kubernetes_cluster_id"):
+                row.kubernetes_cluster_id = None
+                summary.subnets_updated += 1
+                continue
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -753,6 +769,24 @@ async def _apply_records(
             if changed:
                 summary.records_updated += 1
         else:
+            # #1561: never insert beside a non-owned record at this
+            # name (operator A, another cluster's record, a CNAME) —
+            # the API would 409 it and BIND refuses a CNAME conflict.
+            conflict = await find_record_insert_conflict(
+                db,
+                zone.id,
+                name=label,
+                record_type=d.record_type,
+                own_fk="kubernetes_cluster_id",
+                own_id=cluster.id,
+            )
+            if conflict is not None:
+                summary.warnings.append(
+                    f"record {full_fqdn} ({d.record_type}) conflicts with existing "
+                    f"{conflict.record_type} record at the same name, not owned by "
+                    f"this cluster; skipping insert"
+                )
+                continue
             db.add(
                 DNSRecord(
                     zone_id=zone.id,

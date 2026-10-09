@@ -425,7 +425,7 @@ the recovery. BIND renders and validates into `rendered.new`, so a
 state a revert would produce, and re-rendering the previous bundle there would
 bounce a healthy server for nothing. Only a swap/reload failure, where the
 live config directory has already been replaced, re-renders the previous
-bundle. Kea is the mirror image — `config-test` rejects without disturbing the
+bundle. Kea is the mirror image — `kea-dhcp4 -t` rejects without disturbing the
 running server, but the refused document has already been written to
 `kea_config_path`, and that file is what Kea reads on its next start, so a
 rejection there always rewrites the files even though the daemon is fine.
@@ -910,6 +910,14 @@ dns-bind9-ns1:
 > [`DNS.md` §1](../features/DNS.md)). Naming a group that does not exist
 > still auto-creates an empty one, so a stale value here is untidy rather
 > than harmful.
+>
+> On an appliance, changing the DNS or DHCP group in **Fleet** is that move:
+> it moves the appliance's own registered DNS / DHCP server into the new
+> group in the same request, and refuses the change (409 / 422, naming the
+> server) when the move itself is refused — a name clash or a mixed-driver
+> group (#1565). Before, Fleet moved only the appliance's pointer, so its
+> env and firewall followed the new group while the server kept serving the
+> old one.
 
 ---
 

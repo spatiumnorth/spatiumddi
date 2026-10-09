@@ -471,6 +471,14 @@ celery_app.conf.update(
             "task": "app.tasks.acme.renew_due_certificates",
             "schedule": schedule(run_every=12 * 3600.0),
         },
+        # Hourly, sweep stale ACME TXT records older than 24 h — the
+        # provider-path janitor plus the embedded client's stranded
+        # ``_acme-challenge`` records (#1530). The sweep function had
+        # no caller before this entry existed.
+        "acme-stale-txt-sweep": {
+            "task": "app.tasks.acme.sweep_stale_acme_txt_records",
+            "schedule": schedule(run_every=3600.0),
+        },
         # Daily DNSBL / RBL reputation sweep of every public-facing
         # candidate IP against the enabled blocklists (issue #528). Gated
         # inside the task on the ``security.dnsbl`` module + the
