@@ -23,6 +23,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 
 from app.core.dns_names import strip_control_chars
 from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -49,18 +50,6 @@ def _env() -> Environment:
         trim_blocks=False,
         lstrip_blocks=False,
     )
-
-
-def _quote_txt(value: str) -> str:
-    """Quote a TXT record value per RFC 1035 (split long strings into chunks ≤255)."""
-    # Strip any caller-supplied outer quotes.
-    s = value
-    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-        s = s[1:-1]
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    # Chunk into 255-byte pieces
-    chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
-    return " ".join(f'"{c}"' for c in chunks)
 
 
 def _render_record(zone: ZoneData, r: RecordData) -> str:
