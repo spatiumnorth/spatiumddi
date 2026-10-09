@@ -14,6 +14,10 @@ def configure_logging(level: str = "INFO") -> None:
         stream=sys.stdout,
         level=getattr(logging, level.upper(), logging.INFO),
     )
+    # httpx logs every request line, full URL included, at INFO; a URL can
+    # carry a credential (GHSA-x4gw-9gqx-vr4m), so keep it to warnings.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

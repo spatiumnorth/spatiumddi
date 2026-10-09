@@ -44,6 +44,19 @@ metadata:
     metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
 spec:
   type: LoadBalancer
+  # Keep the client's source address. With the default ``Cluster`` policy
+  # kube-proxy SNATs every query that lands on the VIP to the node (or the
+  # CNI gateway), so the daemon sees two or three addresses for the whole
+  # network: per-client rate limits throttle everyone at once, and query
+  # logs, RPZ hits and ACLs all key on the wrong address. ``Local`` makes
+  # MetalLB announce the VIP from a node that runs a DNS pod and keeps the
+  # query there — every DNS node runs one engine pod, so failover is
+  # unchanged. Same reasoning as the control-plane VIP in frontend.yaml.
+  externalTrafficPolicy: Local
+  # #1550 — MetalLB (L2/BGP) never routes via NodePorts; without this
+  # every VIP port is also opened as a random NodePort on every node,
+  # served through the forward path instead of the scoped input chain.
+  allocateLoadBalancerNodePorts: false
   selector:
     spatium.io/dns-vip: "true"
   ports:

@@ -317,8 +317,8 @@ the installer's SSH-key fetch in §3.4 is a separate use),
 `www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
-`bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
-identifier in a Teams-format webhook payload — a namespace URI, not a
+`bacnet.org`, `kea.readthedocs.io`, `adaptivecards.io` (the `$schema`
+identifier in a Teams-format webhook payload — a schema URI, not a
 URL that is dereferenced), `www.opengis.net` (the GML namespace in the
 E911 PIDF-LO renderer — likewise an XML namespace identifier, written
 into the document we *emit* and never fetched; the accompanying
