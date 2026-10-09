@@ -184,6 +184,87 @@ the formatter handles the rest.
     written before this run's stamp, which the host can re-report.
   The other points in that report are #1446, #1447 and #1448.
 
+- **The BIND9 agent streams the RPZ zone file to disk instead of
+  holding it three times over (#1109, Part 3).** `_write_rpz_zone_file`
+  built every line into a list, joined it, then encoded it, so a large
+  blocklist kept three full copies alive on a node also running named.
+  Lines now go through a buffered writer as they are produced; the
+  `seen` owner-name collision ledger (#878) is unchanged. The file is
+  byte-identical (a test pins the exact bytes, and passes on the old
+  renderer too). Measured on a synthetic 600k-domain wildcard list
+  (1.2M records, 49 MB zone): added peak RSS 263 MB to 61 MB, render
+  time ~0.35 s both before and after. The PowerDNS agent has no
+  equivalent renderer.
+
+- **A DHCPv4-only client class no longer takes down a group's DHCPv6
+  config, or the other way round (#1229, #1295).** Every client class was
+  rendered into both Kea daemons. A test using `pkt4` or `relay4`
+  (option 82 matching) makes kea-dhcp6 reject the whole config, and
+  `pkt6` / `relay6` does the same to kea-dhcp4. The agent then reverts
+  the bundle for both daemons, so one such class froze every change to
+  any group that also had a DHCPv6 scope. Separately, one options map
+  cannot serve both daemons: an IPv4 `dns-servers` on a class reached
+  Dhcp6 as option 23, which Kea rejects as malformed.
+  Client classes now have an `address_family`: `ipv4`, `ipv6` or `dual`.
+  A class is rendered only into the daemons it names. A `dual` class's
+  options each go to the daemon they are valid in. The API refuses a test
+  that uses a token the class's family cannot parse, naming the token, and
+  checks options against the family. Upgrading sets the family from what
+  each class already did: a `pkt6` / `relay6` test becomes `ipv6`, a
+  `pkt4` / `relay4` test becomes `ipv4`, and any other class becomes
+  `dual` if its group has a DHCPv6 scope and `ipv4` otherwise. The class
+  editor has a family picker and the class list shows the family. A pool
+  cannot restrict to a class its daemon no longer defines: Kea would load
+  it and match no client. Changing a class's family is refused while such
+  a pool exists, and so is setting a pool's class to one of the wrong
+  family. The DHCP importer keeps the daemon block a Kea class came from,
+  and merges a class defined identically in both blocks into one `dual`
+  class. An agent receiving a bundle from an older control plane renders
+  classes as before. An older agent receiving a new bundle gets only the
+  options Dhcp4 can take. Verified with `kea-dhcp4 -t` and `kea-dhcp6 -t` against the
+  agent's rendered config. Migration `c2f7a94e1d58` (one column with a
+  default, and a backfill).
+
+- **One zone BIND's zone check refuses no longer stops record changes
+  in every zone on its server (#1403).** Since #1279 the BIND9 agent
+  runs `named-checkzone` on each zone file a render changes, and one
+  refused file failed the whole apply: the agent quarantined the
+  server's whole config bundle and returned before anything in it went
+  live. No record change in any zone of that server was served until
+  the bad data was removed, and the retry backed off to 300 s. An apex
+  NS naming a host inside the zone that has no address is one input
+  the API still accepts. A refused zone is now held back on its own,
+  the way named treats a zone file it cannot load: a zone already
+  served keeps its last good copy, a new one is not served, and
+  everything else in the bundle applies. The server reports the hold
+  as `reverted`, naming each zone and the zone check's reason, leaves
+  the zone out of its zone-state report, and re-renders the next
+  bundle, so the zone goes live as soon as its data loads (on a group
+  without views, deleting the bad record is enough). A zone check that
+  cannot run at all still fails the apply.
+
+- **DNS server groups and agentless zone pushes stop lying about
+  what landed (#1540, #1537, #1533).** A server create (or driver
+  change) could put a second driver into a group that already had
+  one, leaving the group's zones with no coherent sync target —
+  group membership now enforces one driver per group. Agentless
+  zone pushes went to disabled servers and reported success when
+  only some servers applied; disabled servers are excluded from
+  the push and a partial failure is compensated and surfaced
+  instead of acked. Rolling back a delete (including a zone move's
+  delete from the source group) re-creates the zone **and pushes its
+  records back** on each server where the delete had succeeded —
+  re-creating the zone alone left that server answering for an empty
+  zone — and if a record cannot be restored the error says so and
+  points at Sync with Servers rather than reporting a clean rollback.
+  The error also names the system that refused (Technitium, Route 53,
+  …) instead of always saying "Windows DNS", and a refused Technitium
+  connection names its cause instead of ending at "request failed:".
+  And the sync record-type filter is derived
+  from each driver's declared capabilities, so CAA records (and
+  any other type a driver supports) are actually pulled and pushed
+  instead of being filtered out by a hardcoded list.
+
 - **Technitium records stop churning and silently diverging (#1518,
   #1517, #1516, #1513).** A record TTL of 0 came back as the zone
   TTL and an MX preference of 0 as 10 — both now round-trip as
@@ -2348,6 +2429,10 @@ the formatter handles the rest.
   the new sequence `dns_record_op_seq_seq` on insert. No backfill and no
   table rewrite: ops queued before the upgrade keep NULL and their old
   order. Downgrade drops the column and the sequence.
+- `c2f7a94e1d58` — #1229, #1295: adds `dhcp_client_class.address_family`
+  (`ipv4` | `ipv6` | `dual`), backfilled from each class's test
+  expression and whether its group has a DHCPv6 scope. Downgrade drops
+  the column.
 
 ## 2026.10.02-1 — 2026-10-02
 

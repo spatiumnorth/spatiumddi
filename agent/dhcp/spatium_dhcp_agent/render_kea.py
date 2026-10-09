@@ -384,6 +384,28 @@ def _options_from_mapping_v6(options: dict[str, Any] | None) -> list[dict[str, A
     return out
 
 
+def _class_in_family(c: dict[str, Any], family: str) -> bool:
+    """Does an operator client class belong in ``family``'s daemon (#1229)?
+
+    A class whose test uses ``pkt4`` / ``relay4`` makes kea-dhcp6 reject the
+    WHOLE config (and ``pkt6`` / ``relay6`` does the same to kea-dhcp4), which
+    reverts the bundle for both daemons. The control plane says which family a
+    class is for; a bundle from a control plane older than #1229 carries no
+    ``address_family``, and the class goes into both, as it always did.
+    """
+    return c.get("address_family", "dual") in (family, "dual")
+
+
+def _class_options(c: dict[str, Any], family: str) -> dict[str, Any] | None:
+    """The options a class delivers in ``family`` (#1295). ``dns-servers`` is
+    an IPv4 list in Dhcp4 and an IPv6 one in Dhcp6, so one map cannot serve
+    both; the control plane splits it. An older control plane sends only
+    ``options``, used for both as before."""
+    if "address_family" not in c:
+        return c.get("options")
+    return c.get("options_v6" if family == "ipv6" else "options_v4")
+
+
 def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     """Render a single Dhcp6 host reservation.
 
@@ -1246,12 +1268,13 @@ def render(
                 else {}
             ),
             **(
-                {"option-data": _options_from_mapping(c.get("options"))}
-                if c.get("options")
+                {"option-data": _options_from_mapping(_class_options(c, "ipv4"))}
+                if _class_options(c, "ipv4")
                 else {}
             ),
         }
         for c in classes
+        if _class_in_family(c, "ipv4")
     ]
 
     # #858 — PXE + phone classes. Both were folded into the bundle ETag and
@@ -1414,12 +1437,13 @@ def render(
                     else {}
                 ),
                 **(
-                    {"option-data": _options_from_mapping_v6(c.get("options"))}
-                    if c.get("options")
+                    {"option-data": _options_from_mapping_v6(_class_options(c, "ipv6"))}
+                    if _class_options(c, "ipv6")
                     else {}
                 ),
             }
             for c in classes
+            if _class_in_family(c, "ipv6")
         ]
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
