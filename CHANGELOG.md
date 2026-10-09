@@ -113,6 +113,145 @@ the formatter handles the rest.
   agent's rendered config. Migration `c2f7a94e1d58` (one column with a
   default, and a backfill).
 
+- **One zone BIND's zone check refuses no longer stops record changes
+  in every zone on its server (#1403).** Since #1279 the BIND9 agent
+  runs `named-checkzone` on each zone file a render changes, and one
+  refused file failed the whole apply: the agent quarantined the
+  server's whole config bundle and returned before anything in it went
+  live. No record change in any zone of that server was served until
+  the bad data was removed, and the retry backed off to 300 s. An apex
+  NS naming a host inside the zone that has no address is one input
+  the API still accepts. A refused zone is now held back on its own,
+  the way named treats a zone file it cannot load: a zone already
+  served keeps its last good copy, a new one is not served, and
+  everything else in the bundle applies. The server reports the hold
+  as `reverted`, naming each zone and the zone check's reason, leaves
+  the zone out of its zone-state report, and re-renders the next
+  bundle, so the zone goes live as soon as its data loads (on a group
+  without views, deleting the bad record is enough). A zone check that
+  cannot run at all still fails the apply.
+
+- **DNS server groups and agentless zone pushes stop lying about
+  what landed (#1540, #1537, #1533).** A server create (or driver
+  change) could put a second driver into a group that already had
+  one, leaving the group's zones with no coherent sync target —
+  group membership now enforces one driver per group. Agentless
+  zone pushes went to disabled servers and reported success when
+  only some servers applied; disabled servers are excluded from
+  the push and a partial failure is compensated and surfaced
+  instead of acked. Rolling back a delete (including a zone move's
+  delete from the source group) re-creates the zone **and pushes its
+  records back** on each server where the delete had succeeded —
+  re-creating the zone alone left that server answering for an empty
+  zone — and if a record cannot be restored the error says so and
+  points at Sync with Servers rather than reporting a clean rollback.
+  The error also names the system that refused (Technitium, Route 53,
+  …) instead of always saying "Windows DNS", and a refused Technitium
+  connection names its cause instead of ending at "request failed:".
+  And the sync record-type filter is derived
+  from each driver's declared capabilities, so CAA records (and
+  any other type a driver supports) are actually pulled and pushed
+  instead of being filtered out by a hardcoded list.
+
+- **Technitium records stop churning and silently diverging (#1518,
+  #1517, #1516, #1513).** A record TTL of 0 came back as the zone
+  TTL and an MX preference of 0 as 10 — both now round-trip as
+  written, on the agent and control-plane paths. The agent always
+  syncs TSIG keys, including an empty bundle, so removing the last
+  key actually clears it on the daemon. A Technitium apply the
+  daemon partly refuses is now reported instead of reading as
+  success — as a partial apply, the model #1280 introduced for
+  PowerDNS: the server shows "Zones refused", naming each refused
+  zone, record or setting with Technitium's own reason, while
+  everything else in the bundle is applied and kept. Nothing is
+  rolled back and the bundle is not retried, so one record the
+  daemon rejects no longer holds back the group's later changes
+  (records in the same zone, TSIG keys); the refused record's own
+  record op is returned as failed, and the verdict clears once a
+  structural apply lands with nothing refused. A daemon that cannot
+  be reached, rejects the agent's token or answers 5xx still fails
+  the apply and falls back to the last-known-good. A refused
+  blocklist import no longer crashes the apply with a `NameError`.
+  The partial-apply summary now counts "item(s)" rather than
+  "zone(s)", since a Technitium refusal is per record. And rdata normalization is
+  round-trip safe: SVCB/HTTPS parameters survive, URI records keep
+  their trailing-slash semantics, and A/AAAA values are compared in
+  canonical form on both sides, so a hand-typed expanded IPv6
+  address no longer reads back as perpetual drift.
+
+- **Agent registration and appliance role assignment stop silently
+  dropping operator intent (#1567, #1562, #1566).** Agent register /
+  re-register accepted any driver string — including agentless
+  drivers no agent can serve — and wrote a junk active server row;
+  the register schemas now validate against the agent-capable driver
+  sets (bind9/powerdns/technitium for DNS, kea for DHCP) and 422
+  instead. Choosing Fleet's "(unassigned)" for an appliance's
+  DNS/DHCP group sent an explicit `null` the roles API ignored
+  (non-None was the only signal); presence in the payload now
+  decides — omitted leaves the assignment alone, `null` unassigns —
+  in both the REST roles endpoint and the AI operations path. And
+  the appliance supervisor no longer drops bootstrap agent keys that
+  aren't 32–128 lowercase hex (a shape nothing else in the system
+  requires): the key pattern is now an env-file injection defence
+  only, rejecting whitespace, quotes, backtick, `$` and `\`.
+
+- **Batched IPAM→DNS sync no longer reports failed agentless creates
+  as created (#1536).** The batched path collected record ops per
+  zone and flushed them without ever looking at the outcomes: a
+  create the provider rejected kept the `ip.dns_record_id` stamp the
+  singular path carefully removes (#428), so DDNS idempotency never
+  retried it, and the sync's created/failed accounting never saw it.
+  Collected ops now carry the stamped address with them, the flush
+  returns one result per op, a `failed` batched create gets the same
+  un-stamp as the inline path, and callers can fold failed batched
+  ops into their error counts.
+
+- **Cloud DNS drivers write MX/SRV records whole, and drift can
+  see their parts (#1526, #1525).** MX and SRV records were written
+  wrong or not at all by several of the Route 53 / Google / Azure /
+  Cloudflare / Linode / Vultr drivers — priority, weight and port
+  were dropped or folded into the target string — so a correct
+  record in SpatiumDDI landed mangled at the provider. The shared
+  cloud base and all six drivers now carry the structured fields
+  through. And because drift compared only name/type/target, a
+  priority, weight or port change at the provider read as
+  "no change"; those fields are now part of a record's drift and
+  sync identity in drift detection, cutover parity and pull.
+
+- **TXT records are quoted properly on BIND9 and PowerDNS (#1514).**
+  TXT values are stored unquoted, and the BIND9 agent dropped them
+  into zone files and RFC 2136 updates verbatim — so a `;` in a
+  DMARC value started a zone-file comment and spaces in an SPF
+  value split it into character-strings resolvers join without the
+  spaces. The BIND9 and PowerDNS agent drivers and the backend
+  BIND9/PowerDNS drivers now share one quoting helper per package
+  (`drivers/_txt.py` in the agent, `drivers/dns/_txt.py` in the
+  backend). An unquoted value is one string, split into 255-*octet*
+  character-strings without splitting a UTF-8 character (the old
+  copies cut at 255 characters after escaping, which could split an
+  escape sequence and exceed the octet limit). An already-quoted
+  value is served exactly as entered: each quoted string stays its
+  own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
+  keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
+  a string over 255 octets is split further. Control characters are
+  stripped. The Technitium TXT path is unchanged (#1694).
+
+- **Rolling-upgrade preflight warns on a SemVer jump that skips a major
+  version (#1182).** Between two CalVer releases the version check warns when
+  the target is more than 90 days newer. SemVer tags carry no date, so between
+  two SemVer releases every forward jump passed silently, 1.2.0 to 4.0.0
+  included. It now warns when the jump crosses more than one major version
+  (1.x to 3.x) and suggests stopping at each major in between. 1.x to 2.x,
+  and minor and patch jumps, never warn, and the switch from CalVer to 1.0.0
+  is never a skip. A warning, not a refusal: two rolling upgrades back to back
+  stay supported.
+
+- **A CalVer release tag with a leading-zero release number is refused
+  (#1182).** `2026.10.07-01` parsed to the same release as `2026.10.07-1`, and
+  the chart-version rewrite published both as chart `2026.10.7-1`.
+  `scripts/release_version.py` now refuses it, and `-0`, the same way it
+  already refused `1.0.0-rc.01`.
+
 - **Disabling a user ends its sessions (#1383).** `PUT /users/{id}`
   with `is_active: false` only set the flag: the account's sessions
   were refused while it stayed disabled, but they stayed valid, so
@@ -1661,6 +1800,18 @@ the formatter handles the rest.
 
 ### Security
 
+- **Typed-webhook subscription headers are encrypted at rest
+  (#1579).** Subscription `headers` (Authorization tokens and the
+  like) were stored in clear and rode along in "exclude secrets"
+  backups — unlike the webhook signing secret and the forward-target
+  credentials fixed in #1506. They now live in a Fernet-encrypted
+  `headers_encrypted` column (migration encrypts existing rows in
+  place; registered for backup exclusion and key-rotation rewrap),
+  API responses return only header names plus a `headers_set` flag,
+  backups no longer carry the values, and the admin UI treats
+  headers as write-only: blank keeps the stored set, typed lines
+  replace it, an explicit clear removes it.
+
 - **A failed backup run's audit row no longer carries the destination's
   error text (#1617).** The `backup_target_run_failed` row is forwarded
   as-is, to syslog, webhook and SMTP forward targets and as the
@@ -1787,7 +1938,6 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
-
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already

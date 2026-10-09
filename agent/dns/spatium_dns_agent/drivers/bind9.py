@@ -37,7 +37,8 @@ from ._process import (
     spawn_guard,
     wait_for_daemon,
 )
-from .base import RRSET_OP_KINDS, DriverBase
+from ._txt import quote_txt as _quote_txt
+from .base import RRSET_OP_KINDS, DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
@@ -641,6 +642,12 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
     carries (#773), so a multi-value MX or SRV composes identically either way.
     """
     rtype_u = rtype.upper()
+    if rtype_u == "TXT":
+        # TXT must reach the wire quoted (issue #1514): an unquoted
+        # value is parsed by BIND as zone-file syntax, so a ``;``
+        # truncates SPF/DMARC at a comment and spaces split the value
+        # into separate character-strings resolvers concatenate wrong.
+        return _quote_txt(value)
     if rtype_u == "MX":
         pri = fields.get("priority")
         if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
@@ -1728,7 +1735,10 @@ class Bind9Driver(DriverBase):
             # weight+port for SRV) before the target. The control plane
             # stores those in separate columns; compose the wire shape
             # here so ``named-checkzone`` parses the zone cleanly.
-            if rtype == "MX" and rec.get("priority") is not None:
+            if rtype == "TXT":
+                # Quote TXT (issue #1514) — see _wire_value.
+                value = _quote_txt(value)
+            elif rtype == "MX" and rec.get("priority") is not None:
                 if not value.lstrip().split(" ", 1)[0].isdigit():
                     value = f"{rec['priority']} {value}"
             elif (
@@ -1874,6 +1884,8 @@ class Bind9Driver(DriverBase):
         )
 
     def validate(self) -> None:
+        # What this apply holds back (#1403); refilled by _check_zone_files.
+        self.held_back = ()
         new_dir = self.state_dir / "rendered.new"
         conf = new_dir / "named.conf"
         # Fail closed (#1224). Skipping validation because the checker is
@@ -1907,12 +1919,33 @@ class Bind9Driver(DriverBase):
         self._check_zone_files(new_dir)
 
     def _check_zone_files(self, new_dir: Path) -> None:
-        """``named-checkzone`` every zone file this render added or changed (#1224).
+        """``named-checkzone`` every zone file this render added or changed (#1224),
+        and hold back each one it refuses instead of failing the apply (#1403).
 
         ``named-checkconf`` never reads zone files, so a zone named cannot
         load used to pass validation. named then kept serving the OLD copy of
         an existing zone and answered SERVFAIL for a new one, while the
         apply reported OK and was committed as last-known-good.
+
+        A refused file then failed the WHOLE apply, and the sync loop
+        quarantined the server's whole config bundle with it: one zone with
+        data named will not load stopped every record change in every zone
+        the server holds, until the bad data was removed (#1403). Each
+        refused zone is held back instead, which is what named itself does
+        with a zone file it cannot load, and the rest of the bundle applies:
+
+        * a zone named already serves keeps that copy. The live file is
+          copied over the staged one, so after the swap the zone is
+          byte-identical, and is neither reloaded nor verified;
+        * a zone with no live copy (a new zone) has its staged file removed.
+          Its stanza stays in named.conf, so named does not load the zone and
+          answers SERVFAIL for it; leaving the stanza out instead would hand
+          its names to recursion.
+
+        Every hold is recorded in ``held_back`` for the sync loop to report,
+        and the next bundle is re-rendered, so the zone goes live as soon as
+        its data loads. A checker that cannot run at all (missing, or timed
+        out) still fails the apply: that is not a verdict on the zone.
 
         Not ``named-checkconf -z``: the rendered conf names zone files by
         absolute path under the LIVE tree, so it would test the files already
@@ -1944,8 +1977,9 @@ class Bind9Driver(DriverBase):
                 "named-checkzone is not installed, so the zone files cannot be "
                 "validated; refusing to apply them unchecked"
             )
-        failures: list[str] = []
+        held: list[HeldZone] = []
         for zname, view in targets:
+            rel = _zone_rel(zname, view)
             res = subprocess.run(
                 [
                     "named-checkzone",
@@ -1954,23 +1988,37 @@ class Bind9Driver(DriverBase):
                     "-k",
                     "fail",
                     zname,
-                    str(new_dir / _zone_rel(zname, view)),
+                    str(new_dir / rel),
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=300,
             )
-            if res.returncode != 0:
-                detail = _first_line(
-                    res.stdout, res.stderr, skip_warnings=True
-                ).replace(f"{new_dir}/", "")
-                failures.append(f"{_zone_label(zname, view)}: {detail}")
-        if failures:
-            more = f" (and {len(failures) - 5} more)" if len(failures) > 5 else ""
-            raise RuntimeError(
-                "zone file rejected by named-checkzone: " + "; ".join(failures[:5]) + more
+            if res.returncode == 0:
+                continue
+            detail = _first_line(res.stdout, res.stderr, skip_warnings=True).replace(
+                f"{new_dir}/", ""
             )
+            last_good = live / rel
+            served = last_good.is_file()
+            if served:
+                shutil.copyfile(last_good, new_dir / rel)
+            else:
+                (new_dir / rel).unlink()
+            held.append(HeldZone(zname, view, detail, served))
+        if held:
+            log.warning(
+                "bind9_zones_held_back",
+                count=len(held),
+                sample=[f"{_zone_label(h.zone, h.view)}: {h.reason}" for h in held[:5]],
+                detail=(
+                    "named-checkzone refused these zones' new files. A zone named "
+                    "already served keeps its last good copy; a new one is not "
+                    "served. Every other change in the config applied."
+                ),
+            )
+        self.held_back = tuple(held)
 
     def swap_and_reload(self) -> None:
         """Put the staged tree live and confirm named is serving it.
@@ -2673,7 +2721,7 @@ class Bind9Driver(DriverBase):
         if exe is None:
             return None
         try:
-            proc = subprocess.run(  # noqa: S603
+            proc = subprocess.run(
                 [exe, "-v"],
                 capture_output=True,
                 text=True,

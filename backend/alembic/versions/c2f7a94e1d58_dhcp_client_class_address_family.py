@@ -19,7 +19,7 @@ A test naming both families' tokens could never load anywhere; it becomes
 ``ipv4`` so the Dhcp4 half at least is back in the operator's hands.
 
 Revision ID: c2f7a94e1d58
-Revises: 6293ba5af00e
+Revises: d27e1d8716bd
 Create Date: 2026-09-29
 """
 
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c2f7a94e1d58"
-down_revision = "6293ba5af00e"
+down_revision = "d27e1d8716bd"
 branch_labels = None
 depends_on = None
 

@@ -243,11 +243,11 @@ async def test_list_zone_records_expand_and_relativize(monkeypatch: pytest.Monke
     assert www.value == "10.0.0.1"
     assert www.ttl == 300
 
-    # MX keeps priority baked into the value.
+    # MX rdata is split on read (#1526): bare target + preference column.
     mx = next(r for r in records if r.record_type == "MX")
-    assert mx.value == "10 mail.example.com."
+    assert mx.value == "mail.example.com."
     assert mx.name == "@"
-    assert mx.priority is None
+    assert mx.priority == 10
 
 
 @pytest.mark.asyncio
@@ -452,7 +452,9 @@ async def test_apply_record_create_uses_change_ttl_on_merge(
     change = RecordChange(
         op="create",
         zone_name="example.com.",
-        record=RecordData(name="@", record_type="MX", value="20 mail2.example.com.", ttl=600),
+        record=RecordData(
+            name="@", record_type="MX", value="mail2.example.com.", ttl=600, priority=20
+        ),
         target_serial=1,
     )
     await driver._apply_record(_server(), CREDS, change)
@@ -780,3 +782,63 @@ def test_credential_fields() -> None:
     driver = GoogleCloudDNSDriver()
     assert driver.name == "google_dns"
     assert driver.credential_fields == ("service_account_json", "project_id")
+
+
+# ── MX / SRV split-form contract (#1526) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_record_create_srv_composes_all_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An API-shaped SRV (bare target + priority/weight/port columns) goes
+    out as the composed rdata string Cloud DNS stores."""
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone("example-com", "example.com.", rrsets=[])
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+    await driver._apply_record(_server(), CREDS, change)
+
+    assert zone.built_rrsets == [
+        ("_sip._tcp.example.com.", "SRV", 600, ["10 20 5060 sip.example.com."])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_zone_records_splits_srv(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone = _StubZone(
+        "example-com",
+        "example.com.",
+        rrsets=[_rrset("_sip._tcp.example.com.", "SRV", 3600, ["10 20 5060 sip.example.com."])],
+    )
+    client = _client_with_zones(zone)
+    _patch_client(monkeypatch, driver, client)
+
+    records = await driver._list_zone_records(_server(), CREDS, "example.com.")
+    assert records == [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    ]

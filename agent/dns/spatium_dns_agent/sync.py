@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
     PHASE_RELOAD,
+    PHASE_VALIDATE,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -30,7 +32,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
-from .drivers.base import DriverBase
+from .drivers.base import DriverBase, HeldZone
 
 log = structlog.get_logger(__name__)
 
@@ -67,12 +69,43 @@ def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[st
         ack["dispatch"] = op["dispatch"]
     return ack
 
-# Starts the error of an apply that landed with zones the daemon refused. The
-# control plane has no "partial" status (it reports ``reverted``), so the chip,
-# banner and ``agent_config_rejected`` alert read this prefix to say what really
+
+# Starts the error of an apply that landed with zones left unserved: refused by
+# the daemon (#1280) or held back by BIND9's zone check (#1403). The control
+# plane has no "partial" status (it reports ``reverted``), so the chip, banner
+# and ``agent_config_rejected`` alert read this prefix to say what really
 # happened: nothing rolled back, every other zone served. Mirrored in
 # backend/app/services/agents/config_apply.py and frontend/src/lib/configApply.ts.
 PARTIAL_APPLY_PREFIX = "partial apply: "
+
+
+def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> str:
+    """The operator-facing account of the zones an apply left unserved.
+
+    ``held``: zones the BIND9 zone check held back (#1403). ``refused``: zones
+    or records the daemon refused, one ``"<zone>: <reason>"`` each (#1280,
+    and per record on Technitium, #1608).
+    No driver produces both today; if one ever did, both are named here.
+    """
+    parts: list[str] = []
+    if held:
+        zones = "; ".join(
+            f"{h.zone}{f' (view {h.view})' if h.view else ''}: {h.reason} ("
+            + ("still served from its last good copy" if h.served else "not served")
+            + ")"
+            for h in held
+        )
+        count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+        parts.append(
+            f"named-checkzone refused {count}, held back until the data loads; "
+            f"every other change in this config is live: {zones}"
+        )
+    if refused:
+        parts.append(
+            f"the daemon refused {len(refused)} item(s); everything else is served: "
+            + "; ".join(refused)
+        )
+    return truncate_error(PARTIAL_APPLY_PREFIX + "; and ".join(parts))
 
 
 class SyncLoop:
@@ -96,10 +129,10 @@ class SyncLoop:
         # ``apply_status`` is what the heartbeat reports upward.
         self._quarantine = Quarantine(self.cfg.state_dir)
         self.apply_status = ApplyStatus()
-        # True while the live bundle applied with zones the daemon refused
-        # (see ``_report_refused_zones``). Those zones stay refused until the
-        # next structural apply, so a record-op-only poll must not read the
-        # degraded verdict as stale and clear it.
+        # True while the live bundle applied with zones the daemon refused or
+        # the zone check held back (see ``_report_partial_apply``). Those zones
+        # stay unserved until the next structural apply, so a record-op-only
+        # poll must not read the degraded verdict as stale and clear it.
         self._zones_refused = False
         self.heartbeat.config_apply = self.apply_status
 
@@ -132,12 +165,12 @@ class SyncLoop:
             self._current_etag = etag
             try:
                 self.driver.apply_config(bundle)
-                self._current_structural_etag = bundle.get("structural_etag")
+                self._current_structural_etag = self._applied_fingerprint(bundle)
                 if not booting_from_previous:
-                    # Zones the daemon refused are reported, not reverted —
-                    # see ``_report_refused_zones`` — and the bundle is still
+                    # Zones refused or held back are reported, not reverted —
+                    # see ``_report_partial_apply`` — and the bundle is still
                     # committed: everything else in it is being served.
-                    self._report_refused_zones(etag)
+                    self._report_partial_apply(etag)
                     # #882 — ``current`` demonstrably works, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
                     # ``previous``: committing there would copy the still-bad
@@ -226,7 +259,7 @@ class SyncLoop:
             log.exception("bootstrap_last_known_good_apply_failed")
             return
         self._current_etag = prev_etag
-        self._current_structural_etag = prev_bundle.get("structural_etag")
+        self._current_structural_etag = self._applied_fingerprint(prev_bundle)
         self.apply_status = ApplyStatus(
             status=STATUS_REVERTED,
             etag=prev_etag,
@@ -350,13 +383,17 @@ class SyncLoop:
                 self._current_etag = etag
                 self._return_unapplied_ops(bundle, "the structural apply failed")
                 return
-            self._current_structural_etag = new_structural
+            self._current_structural_etag = self._applied_fingerprint(bundle)
             log.info("structural_reload_applied", structural_etag=new_structural)
 
             # Post the serials we just rendered so the control plane can
             # show per-server drift. Best-effort — a failed POST doesn't
-            # roll back the apply (we already serve the new config).
-            self._report_zone_state(bundle)
+            # roll back the apply (we already serve the new config). A zone
+            # held back (#1403) is not serving the serial it was rendered
+            # with, so it is left out and keeps the serial it last reported.
+            self._report_zone_state(
+                bundle, skip={h.zone.lower() for h in self.driver.held_back}
+            )
 
             # DNSSEC (issue #49): BIND9 signs inline from the rendered
             # config, so after a structural reload we read each signed
@@ -412,10 +449,13 @@ class SyncLoop:
         # re-render, so whatever the control plane is serving is what we are
         # running. Clear a stale ``reverted`` verdict: the operator's fix has
         # landed and leaving the chip up would report a divergence that no
-        # longer exists.
+        # longer exists. Not while zones are held back (#1403) or refused
+        # (#1280): that verdict was set by this very apply, and is true until
+        # they load.
         if (
             self._quarantine.etag is None
             and not self.apply_status.healthy
+            and not self.driver.held_back
             and not self._zones_refused
         ):
             self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
@@ -474,24 +514,46 @@ class SyncLoop:
         # being served, as far as the daemon allows, and the last-known-good
         # must not lag behind it.
         commit_config(self.cfg.state_dir, etag)
-        if self._report_refused_zones(etag):
-            return True
+        self._report_applied(etag)
+        return True
+
+    def _report_applied(self, etag: str | None) -> None:
+        """The verdict on a bundle the daemon took: whole, or partially."""
+        if self._report_partial_apply(etag):
+            return
         self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
         self.heartbeat.config_apply = self.apply_status
         if self.heartbeat.daemon_status.get("status") == "degraded":
             # Clear a degraded verdict this loop set on a previous cycle;
             # leaving it would make a recovered server look broken forever.
             self.heartbeat.daemon_status = {"status": "ok"}
-        return True
 
-    def _report_refused_zones(self, etag: str | None) -> bool:
-        """Report an apply that landed with some zones refused. True if so.
+    def _applied_fingerprint(self, bundle: dict[str, Any]) -> str | None:
+        """The structural etag to record for a bundle the driver just applied.
 
-        PowerDNS takes zones one at a time, so it can accept most of a bundle
-        and refuse a few zones' data (see ``DriverBase.refused_zones``). That
-        is neither ``ok`` — those zones are not served — nor a reason to
-        revert: re-applying the last-known-good cannot make the daemon accept
-        data it refused, and it would undo the zones it did accept.
+        ``None`` while the apply held zones back (#1403): the daemon is not
+        running that bundle whole, so the next bundle must re-render even
+        when its structural etag is the same one. On a group without views,
+        deleting the record that made a zone unloadable is a record-only
+        change that moves no structural etag, and would otherwise leave the
+        zone held, and reported held, until some unrelated structural edit.
+        """
+        if self.driver.held_back:
+            return None
+        return bundle.get("structural_etag")
+
+    def _report_partial_apply(self, etag: str | None) -> bool:
+        """Report an apply that landed with some zones unserved. True if so.
+
+        Drivers get there two ways. PowerDNS takes zones one at a time, and
+        Technitium records one at a time, so either can accept most of a
+        bundle and refuse a few zones' data or individual records (see
+        ``DriverBase.refused_zones``, #1280, #1608). BIND9's zone check holds back a
+        zone ``named-checkzone`` refuses and applies the rest
+        (``DriverBase.held_back``, #1403). Either way that is neither ``ok`` —
+        those zones are not served as saved — nor a reason to revert:
+        re-applying the last-known-good cannot make the data load, and it
+        would undo the zones that did.
 
         #882's vocabulary has no "partial" status, and the control plane
         ignores one it does not know, so this reports ``reverted``: the
@@ -499,24 +561,25 @@ class SyncLoop:
         everything the operator saved" — is the honest one here, and whose
         severity (warning) and ``agent_config_rejected`` alert fit. Unlike a
         real revert, ``etag`` is the NEW bundle (it is live) and so is
-        ``failed_etag``; the error names each refused zone with the daemon's
-        own reason.
+        ``failed_etag``; the error starts with :data:`PARTIAL_APPLY_PREFIX`,
+        which is how the UI and the alert tell it from a rollback, and names
+        each zone with the checker's or the daemon's own reason.
         """
+        held = tuple(self.driver.held_back)
         fn = getattr(self.driver, "refused_zones", None)
         refused = [str(z) for z in (fn() if callable(fn) else [])]
-        if not refused:
+        if not held and not refused:
             self._zones_refused = False
             return False
-        error = truncate_error(
-            f"{PARTIAL_APPLY_PREFIX}the daemon refused {len(refused)} zone(s); "
-            "every other zone is served: " + "; ".join(refused)
-        )
+        error = _partial_apply_error(held, refused)
         self._zones_refused = True
         self.apply_status = ApplyStatus(
             status=STATUS_REVERTED,
             etag=etag,
             failed_etag=etag,
-            phase=PHASE_RELOAD,
+            # A held zone was stopped at validation; a refused one by the
+            # daemon as it loaded the bundle.
+            phase=PHASE_RELOAD if refused else PHASE_VALIDATE,
             error=error,
         )
         self.heartbeat.config_apply = self.apply_status
@@ -527,7 +590,12 @@ class SyncLoop:
             "status": "degraded",
             "reason": f"config_apply_{STATUS_REVERTED}: {error}",
         }
-        log.warning("sync_apply_zones_refused", etag=etag, count=len(refused), zones=refused[:5])
+        log.warning(
+            "sync_apply_partial",
+            etag=etag,
+            held_back=[f"{h.zone} ({h.view})" if h.view else h.zone for h in held][:5],
+            refused=refused[:5],
+        )
         return True
 
     def _return_unapplied_ops(self, bundle: dict[str, Any], reason: str) -> None:
@@ -619,7 +687,7 @@ class SyncLoop:
                 )
                 log.exception("sync_revert_failed", failed_etag=etag)
             else:
-                self._current_structural_etag = prev_bundle.get("structural_etag")
+                self._current_structural_etag = self._applied_fingerprint(prev_bundle)
                 status = ApplyStatus(
                     status=STATUS_REVERTED,
                     etag=prev_etag,
@@ -641,17 +709,22 @@ class SyncLoop:
             "reason": f"config_apply_{status.status}: {status.error}",
         }
 
-    def _report_zone_state(self, bundle: dict[str, Any]) -> None:
+    def _report_zone_state(
+        self, bundle: dict[str, Any], skip: set[str] | None = None
+    ) -> None:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
 
         Best-effort. A dead control plane or transient 5xx never blocks
-        the daemon — the next structural reload will try again.
+        the daemon — the next structural reload will try again. ``skip``:
+        zone names (lowercase, no trailing dot) the apply held back (#1403).
         """
         entries: list[dict[str, Any]] = []
         for z in bundle.get("zones") or []:
             name = z.get("name")
             serial = z.get("serial")
             if not name or serial is None:
+                continue
+            if skip and str(name).rstrip(".").lower() in skip:
                 continue
             entries.append({"zone_name": str(name), "serial": int(serial)})
         if not entries:
