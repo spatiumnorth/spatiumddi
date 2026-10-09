@@ -98,7 +98,10 @@ the formatter handles the rest.
   Sentinel queries and plain `redis://` URLs, so the worker reconnects
   to the promoted master and a warm shutdown finishes instead of
   waiting for SIGKILL. The worker liveness probe tolerates 5 misses
-  instead of 3.
+  instead of 3, and the worker starts with `--without-mingle`: mingle's
+  startup handshake only syncs revoked-task lists, which SpatiumDDI
+  never uses, and a reconnect that met a dead Sentinel there exited the
+  worker as an unrecoverable error.
 - **The DNS VIP answers again after a DNS engine switch, and on a fresh
   install (#1510).** All three engine Services in the appliance chart
   (`dns-bind9`, `dns-powerdns`, `dns-technitium`) are rendered on every DNS

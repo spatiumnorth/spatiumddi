@@ -61,6 +61,11 @@ spec:
             - worker
             - --loglevel=info
             - --concurrency=4
+            # --without-mingle (#1669): mingle's startup handshake syncs revoked-task
+            # lists between workers, and SpatiumDDI never revokes a task. On a
+            # reconnect mid-failover it can hit a dead Sentinel, and celery treats
+            # that OperationalError as unrecoverable and exits the worker.
+            - --without-mingle
             - -Q
             - ipam,dns,dhcp,default,bundles
           env:
