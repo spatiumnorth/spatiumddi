@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One zone BIND's zone check refuses no longer stops record changes
+  in every zone on its server (#1403).** Since #1279 the BIND9 agent
+  runs `named-checkzone` on each zone file a render changes, and one
+  refused file failed the whole apply: the agent quarantined the
+  server's whole config bundle and returned before anything in it went
+  live. No record change in any zone of that server was served until
+  the bad data was removed, and the retry backed off to 300 s. An apex
+  NS naming a host inside the zone that has no address is one input
+  the API still accepts. A refused zone is now held back on its own,
+  the way named treats a zone file it cannot load: a zone already
+  served keeps its last good copy, a new one is not served, and
+  everything else in the bundle applies. The server reports the hold
+  as `reverted`, naming each zone and the zone check's reason, leaves
+  the zone out of its zone-state report, and re-renders the next
+  bundle, so the zone goes live as soon as its data loads (on a group
+  without views, deleting the bad record is enough). A zone check that
+  cannot run at all still fails the apply.
+
 - **DNS server groups and agentless zone pushes stop lying about
   what landed (#1540, #1537, #1533).** A server create (or driver
   change) could put a second driver into a group that already had

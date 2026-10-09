@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from ..config_apply import (
     PHASE_RELOAD,
@@ -25,6 +25,20 @@ from ..config_apply import (
 RRSET_OP_KINDS = frozenset({"create", "update", "delete"})
 
 
+class HeldZone(NamedTuple):
+    """A zone the last apply left off the new config, and why (#1403)."""
+
+    #: The zone's name as rendered, without the trailing dot.
+    zone: str
+    #: The view it was rendered into; ``None`` on a group without views.
+    view: str | None
+    #: The checker's own diagnostic, first line.
+    reason: str
+    #: True: the daemon keeps serving the zone's last good copy. False: the
+    #: zone never loaded, so it is not served at all.
+    served: bool
+
+
 class DriverBase(ABC):
     #: PID of the daemon this driver spawned or adopted; ``None`` until then.
     #: Every driver sets it at its spawn / adopt points (``start_daemon`` and
@@ -36,6 +50,13 @@ class DriverBase(ABC):
     #: daemon refused their data, each with the daemon's own reason. Reset at
     #: the start of every apply; read through :meth:`refused_zones`.
     _refused_zones: tuple[str, ...] = ()
+
+    #: Zones the last successful :meth:`apply_config` held back rather than
+    #: failing the whole apply for them (#1403): the rest of the bundle is
+    #: live, these are not. Set by every apply of a driver that holds zones
+    #: back (the BIND9 driver's zone check); always empty for the others. The
+    #: sync loop reports them and re-renders the next bundle while any remain.
+    held_back: tuple[HeldZone, ...] = ()
 
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
@@ -129,9 +150,10 @@ class DriverBase(ABC):
         the last-known-good bundle cannot make the daemon accept data it
         just refused, and would take the zones it did accept down with it.
 
-        Drivers whose daemon loads all zones or none (BIND9 validates the
-        whole tree with ``named-checkconf``) keep the empty default and
-        fail the apply instead.
+        Drivers whose daemon loads all zones or none keep the empty default.
+        BIND9 is one, but its zone check holds back a zone ``named-checkzone``
+        refuses before the daemon sees it (:attr:`held_back`, #1403); the sync
+        loop reports both kinds as the same partial apply.
         """
         return list(self._refused_zones)
 
