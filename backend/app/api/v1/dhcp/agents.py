@@ -78,6 +78,13 @@ LONGPOLL_POLL_INTERVAL = 2.0
 # ── Schemas ─────────────────────────────────────────────────────────────────
 
 
+# #1567 — the only driver an agent binary can serve. The DHCP registry
+# also names agentless drivers (windows_dhcp, fortigate) that the
+# operator API accepts but no agent can register as; accepting one here
+# only wrote a junk ``active`` server row before the agent crash-looped.
+AGENT_CAPABLE_DRIVERS = frozenset({"kea"})
+
+
 class AgentRegisterRequest(BaseModel):
     # Bounds mirror the columns these land in (DHCPServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DHCPServerGroup.name 255) — an
@@ -90,6 +97,15 @@ class AgentRegisterRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
+
+    @field_validator("driver")
+    @classmethod
+    def validate_driver(cls, v: str) -> str:
+        if v not in AGENT_CAPABLE_DRIVERS:
+            raise ValueError(
+                f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
+            )
+        return v
 
 
 class AgentRegisterResponse(BaseModel):
@@ -795,7 +811,18 @@ async def agent_config_longpoll(
                             {
                                 "name": c.name,
                                 "match_expression": c.match_expression,
-                                "options": c.options,
+                                # ``options`` stays for an agent older than
+                                # #1229, which renders it into both daemons.
+                                # A newer agent reads ``address_family`` and
+                                # the per-family maps instead. It carries the
+                                # Dhcp4 share, not the whole map: an ``ipv6``
+                                # or ``dual`` class may now hold an IPv6
+                                # ``dns-servers``, which an old agent would
+                                # put into Dhcp4 and have the config refused.
+                                "options": c.options_v4,
+                                "address_family": c.address_family,
+                                "options_v4": c.options_v4,
+                                "options_v6": c.options_v6,
                             }
                             for c in bundle.client_classes
                         ],

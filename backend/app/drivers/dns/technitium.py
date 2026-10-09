@@ -116,7 +116,7 @@ def _record_payload(zone: ZoneData, rr: RecordData) -> dict[str, Any]:
     """
     rtype = rr.record_type.upper()
     value = strip_control_chars(rr.value).rstrip(".")
-    payload: dict[str, Any] = {"ttl": rr.ttl or zone.ttl}
+    payload: dict[str, Any] = {"ttl": rr.ttl if rr.ttl is not None else zone.ttl}
     if rtype in ("A", "AAAA"):
         payload["ipAddress"] = value
     elif rtype == "CNAME":

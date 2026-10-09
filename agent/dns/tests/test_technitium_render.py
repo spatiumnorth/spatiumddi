@@ -20,6 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
     TechnitiumDriver,
     _blocking_payload,
@@ -101,6 +104,40 @@ def test_record_params_mx_uses_priority() -> None:
 
 def test_record_params_mx_default_priority() -> None:
     assert _record_params("MX", "mail.example.com.", {})["preference"] == 10
+
+
+def test_record_params_mx_zero_priority_is_preserved() -> None:
+    # #1518: preference 0 is a real value (highest priority), not "unset".
+    assert _record_params("MX", "mail.example.com.", {"priority": 0}) == {
+        "exchange": "mail.example.com",
+        "preference": 0,
+    }
+
+
+def test_render_preserves_record_ttl_zero(tmp_path: Path) -> None:
+    # #1518: a TTL of 0 ("never cache") must not be rewritten to the
+    # zone TTL by the structural render.
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle = {
+        "zones": [
+            {
+                "name": "example.com.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [
+                    {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 0},
+                    {"name": "mail", "type": "A", "value": "10.0.0.2"},
+                ],
+            }
+        ]
+    }
+    d.render(bundle)
+    import json
+
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    by_domain = {r["domain"]: r for r in payload[0]["records"]}
+    assert by_domain["www.example.com"]["ttl"] == 0
+    assert by_domain["mail.example.com"]["ttl"] == 3600
 
 
 def test_record_params_srv() -> None:
@@ -1315,6 +1352,88 @@ def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
     assert opt and opt[0][3]["catalog"] == ""
 
 
+# ── Catalog zone retirement (issue #1519) ─────────────────────────────
+
+
+def _deletes(calls) -> list[dict[str, Any]]:
+    return [c[3] for c in calls if c[2] == "zones/delete"]
+
+
+def test_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """Disabling catalog must delete the producer zone, not just clear
+    membership — and the name has to come from agent state, because a
+    disabled catalog block carries no zone name."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    payload = [{"zone": "p.test", "type": "Primary"}]
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, payload)
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    # State is cleared, so a later pass does not re-delete.
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == []
+
+
+def test_secondary_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """A consumer that is turned off keeps transferring from the old
+    producer until its SecondaryCatalog zone is deleted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    calls.clear()
+    d._apply_catalog("t", None, [])
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+
+
+def test_catalog_role_flip_deletes_old_zone_before_creating_new(
+    tmp_path: Path,
+) -> None:
+    """Producer → consumer under the same name: the old Catalog zone
+    must be deleted first, or the SecondaryCatalog create answers
+    "already exists" and the zone keeps its old type."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, [])
+    calls.clear()
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    paths = [c[2] for c in calls]
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    assert paths.index("zones/delete") < paths.index("zones/create")
+    assert next(c for c in calls if c[2] == "zones/create")[3]["type"] == (
+        "SecondaryCatalog"
+    )
+
+
+def test_catalog_same_role_reapply_deletes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    block = {"mode": "producer", "zone_name": "cat.test"}
+    d._apply_catalog("t", block, [])
+    calls.clear()
+    d._apply_catalog("t", block, [])
+    assert _deletes(calls) == []
+
+
+def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "old.test"}, [])
+    calls.clear()
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "new.test"}, [])
+    assert _deletes(calls) == [{"zone": "old.test"}]
+    assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 
 
@@ -1483,6 +1602,25 @@ def test_apply_blocking_rewrites_when_the_live_set_is_unreadable(tmp_path: Path)
     assert "blocked/import" in [c[2] for c in calls]
 
 
+def test_a_refused_blocklist_import_is_recorded_not_a_name_error(tmp_path: Path) -> None:
+    """A refused ``{kind}/import`` chunk is a refusal like any other. The
+    #1516 note for it referenced names from the per-domain loop the chunked
+    import (#1425) replaced, so it raised NameError and failed the apply."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "blocked/import":
+            return {"status": "error", "errorMessage": "Access was denied."}
+        if path.endswith("/export"):
+            return "stale.test\n"
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert d._apply_failures == ["blocking blocked import (1 from a.test): Access was denied."]
+
+
 def test_apply_blocking_empty_list_still_clears_the_daemon(tmp_path: Path) -> None:
     """An emptied list has to actually clear on the daemon."""
     d = TechnitiumDriver(state_dir=tmp_path)
@@ -1610,6 +1748,192 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── swap_and_reload: TSIG sync (#1517) + partial refusal (#1516) ────────
+
+
+def _ok_responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+    if path == "zones/records/get":
+        return {"status": "ok", "response": {"records": []}}
+    return {"status": "ok"}
+
+
+def _prep_swap(driver: TechnitiumDriver, responder: Any) -> list:
+    """Stub out the daemon/token plumbing so swap_and_reload runs
+    entirely against the fake ``_request``."""
+    driver.daemon_running = lambda: True  # type: ignore[method-assign]
+    driver._wait_for_api_up = lambda: None  # type: ignore[method-assign]
+    driver._get_api_token = lambda: "tok-1"  # type: ignore[method-assign]
+    return _install_fake_request(driver, responder)
+
+
+_ONE_ZONE_BUNDLE = {
+    "zones": [
+        {
+            "name": "example.com.",
+            "type": "primary",
+            "ttl": 3600,
+            "records": [
+                {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 300},
+            ],
+        }
+    ]
+}
+
+
+def test_swap_syncs_empty_tsig_key_list(tmp_path: Path) -> None:
+    """#1517: a bundle with NO keys must still call settings/set with an
+    empty tsigKeys value, clearing keys the daemon already holds. The old
+    truthiness guard never called the sync at all in that state."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()
+    tsig_calls = [
+        c for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3]
+    ]
+    assert len(tsig_calls) == 1
+    assert tsig_calls[0][3]["tsigKeys"] == ""
+
+
+def test_swap_succeeds_when_every_step_is_accepted(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()  # must not raise
+
+
+def test_swap_reports_a_refused_record_add_as_a_partial_apply(tmp_path: Path) -> None:
+    """#1516 / #1608: a refused record add used to be a log line and a
+    reported success, then (first cut of #1608) a raise that quarantined
+    the whole bundle. It is a partial apply now (#1280's model): the apply
+    lands and ``refused_zones()`` names the zone, record and the daemon's
+    reason."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "invalid record name"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    d.apply_config(_ONE_ZONE_BUNDLE)  # must not raise
+    assert any(c[2] == "zones/records/add" for c in calls)
+    (refusal,) = d.refused_zones()
+    assert refusal.startswith("example.com: record add www.example.com A: ")
+    assert "invalid record name" in refusal
+
+
+def test_swap_reports_a_refused_zone_create_but_still_reconciles(
+    tmp_path: Path,
+) -> None:
+    """#1516: one refused zone must not stop the rest of the apply —
+    every zone is attempted, and the refusal is reported, not raised."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "no SOA from primary"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    d.apply_config(_ONE_ZONE_BUNDLE)
+    # Records for the (missing) zone were still attempted.
+    assert any(c[2] == "zones/records/add" for c in calls)
+    assert any("zone create: no SOA from primary" in r for r in d.refused_zones())
+
+
+def test_swap_reports_a_refused_tsig_sync(tmp_path: Path) -> None:
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "settings/set" and "tsigKeys" in params:
+            return {"status": "error", "errorMessage": "bad key"}
+        return _ok_responder(path, params, _n)
+
+    bundle = {
+        **_ONE_ZONE_BUNDLE,
+        "tsig_keys": [
+            {"name": "xfer.example.com.", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}
+        ],
+    }
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d.apply_config(bundle)
+    assert d.refused_zones() == ["tsig keys: bad key"]
+
+
+def test_swap_fails_when_the_daemon_rejects_our_token(tmp_path: Path) -> None:
+    """An auth failure is not a refusal of the operator's data: nothing can
+    be applied at all, so the apply fails (and #882 quarantines / reverts)
+    rather than reporting every step as a refused item."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        return {"status": "invalid-token"}
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d._reprovision_token = lambda stale: None  # type: ignore[method-assign]
+    with pytest.raises(ConfigApplyError) as excinfo:
+        d.apply_config(_ONE_ZONE_BUNDLE)
+    assert excinfo.value.phase == "reload"
+    assert "auth failure" in str(excinfo.value.cause)
+
+
+# ── #1513: rdata round-trip canonicalisation ────────────────────────────
+
+
+def test_svcb_params_sorted_by_key() -> None:
+    """Read-back rebuilds svcParams sorted; the write side must sort
+    too or the record churns on every structural reconcile."""
+    _, _, params = _svcb_params('1 . port=443 alpn="h2"')
+    assert params == "alpn|h2,port|443"
+
+
+def test_svcb_params_valueless_key_is_emitted_not_dropped() -> None:
+    _, _, params = _svcb_params('1 . no-default-alpn alpn="h2"')
+    assert params == "alpn|h2,no-default-alpn|"
+
+
+def test_svcb_round_trip_no_churn() -> None:
+    desired = _record_params("SVCB", '1 . port=443 alpn="h2" no-default-alpn', {})
+    from_daemon = _normalize_rdata(
+        "SVCB",
+        {
+            "svcPriority": 1,
+            "svcTargetName": ".",
+            "svcParams": {"alpn": "h2", "port": "443", "no-default-alpn": ""},
+        },
+    )
+    assert desired == from_daemon
+
+
+def test_record_params_uri_preserves_path_trailing_slash() -> None:
+    out = _record_params("URI", "1 1 https://example.com/path/", {})
+    assert out["uri"] == "https://example.com/path/"
+    out = _record_params("URI", "1 1 https://example.com/", {})
+    assert out["uri"] == "https://example.com"
+
+
+def test_normalize_rdata_uri_preserves_path_trailing_slash() -> None:
+    out = _normalize_rdata(
+        "URI", {"priority": 1, "weight": 1, "uri": "https://example.test/path/"}
+    )
+    assert out["uri"] == "https://example.test/path/"
+
+
+def test_aaaa_canonical_form_no_churn() -> None:
+    """A hand-typed expanded/upper-case AAAA must match the daemon's
+    canonical read-back instead of being deleted and re-added."""
+    desired = _record_params("AAAA", "2001:DB8:0:0::1", {})
+    assert desired == {"ipAddress": "2001:db8::1"}
+    from_daemon = _normalize_rdata("AAAA", {"ipAddress": "2001:db8::1"})
+    assert desired == from_daemon
+
+
+def test_name_valued_case_fold_no_churn() -> None:
+    desired = _record_params("CNAME", "WWW.Example.COM.", {})
+    from_daemon = _normalize_rdata("CNAME", {"cname": "www.example.com"})
+    assert desired == from_daemon
 
 
 # ── Zone apex: SOA + NS from the zone's own settings ───────────────────

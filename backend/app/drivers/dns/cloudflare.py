@@ -35,9 +35,11 @@ from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
     normalize_fqdn,
+    split_structured_rdata,
 )
-from app.drivers.dns.base import RecordChange, RecordData, RRsetData
+from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the
@@ -86,6 +88,53 @@ def _content_key(record_type: str, content: str) -> str:
     if rtype in _NAME_CONTENT_TYPES:
         return value.rstrip(".").lower()
     return value
+
+
+def _srv_member_key(member: RRsetMember) -> tuple[int, int, int, str]:
+    """``(priority, weight, port, target)`` for a desired SRV member.
+
+    Missing numeric fields default to 0, as the ``data`` payload sends them.
+    """
+    return (
+        member.priority if member.priority is not None else 0,
+        member.weight if member.weight is not None else 0,
+        member.port if member.port is not None else 0,
+        member.value.rstrip(".").lower(),
+    )
+
+
+def _srv_row_key(row: dict[str, Any]) -> tuple[int, int, int, str] | None:
+    """``(priority, weight, port, target)`` for a live Cloudflare SRV row.
+
+    Read from the ``data`` object when present, otherwise split out of the
+    composed ``content`` string. ``None`` when neither parses, so the row is
+    never mistaken for a member.
+    """
+    data = row.get("data") or {}
+    if data:
+        try:
+            return (
+                int(data.get("priority") or 0),
+                int(data.get("weight") or 0),
+                int(data.get("port") or 0),
+                str(data.get("target") or "").rstrip(".").lower(),
+            )
+        except (TypeError, ValueError):
+            return None
+    content = str(row.get("content") or "")
+    target, priority, weight, port = split_structured_rdata("SRV", content)
+    if priority is not None and weight is not None and port is not None:
+        return (priority, weight, port, target.rstrip(".").lower())
+    # Cloudflare's own SRV content omits the priority ("<weight> <port>
+    # <target>") and carries it as the row's top-level ``priority``.
+    parts = content.split(None, 2)
+    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+        try:
+            prio = int(row.get("priority") or 0)
+        except (TypeError, ValueError):
+            return None
+        return (prio, int(parts[0]), int(parts[1]), parts[2].strip().rstrip(".").lower())
+    return None
 
 
 class CloudflareDNSDriver(CloudDNSDriverBase):
@@ -224,13 +273,31 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 for rec in body.get("result") or []:
                     raw_ttl = rec.get("ttl")
                     ttl = None if raw_ttl == _TTL_AUTO else raw_ttl
+                    rtype = str(rec["type"]).upper()
+                    value = rec.get("content") or ""
+                    priority = rec.get("priority")
+                    weight: int | None = None
+                    port: int | None = None
+                    if rtype == "SRV":
+                        # SRV components live in the ``data`` object
+                        # (#1526); ``content`` is the composed string.
+                        data = rec.get("data") or {}
+                        if data:
+                            value = str(data.get("target") or value)
+                            priority = data.get("priority", priority)
+                            weight = data.get("weight")
+                            port = data.get("port")
+                        else:
+                            value, priority, weight, port = split_structured_rdata(rtype, value)
                     records.append(
                         RecordData(
                             name=self._relativize(rec["name"], zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["content"],
+                            value=value,
                             ttl=ttl,
-                            priority=rec.get("priority"),
+                            priority=priority,
+                            weight=weight,
+                            port=port,
                         )
                     )
                 info = body.get("result_info") or {}
@@ -261,10 +328,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         payload: dict[str, Any] = {
             "type": rec.record_type,
             "name": self._absolute_name(rec.name, zone_fqdn),
-            "content": rec.value,
             # Cloudflare's "automatic" TTL is the sentinel 1.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "SRV":
+            # Cloudflare takes SRV components as a ``data`` object, not a
+            # content string (#1526): priority / weight / port / target.
+            payload["data"] = {
+                "priority": rec.priority if rec.priority is not None else 0,
+                "weight": rec.weight if rec.weight is not None else 0,
+                "port": rec.port if rec.port is not None else 0,
+                "target": rec.value,
+            }
+            return payload
+        payload["content"] = rec.value
         if rec.priority is not None:
             payload["priority"] = rec.priority
         return payload
@@ -380,25 +457,34 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         unmatched = await self._list_rrset(client, zone_id, name, rtype)
         proxied = any(r.get("proxied") for r in unmatched)
         to_create: list[dict[str, Any]] = []
+        is_srv = rtype.upper() == "SRV"
         for member in rrset.members:
-            payload: dict[str, Any] = {
-                "type": rtype,
-                "name": name,
-                "content": member.value,
-                "ttl": wire_ttl,
-            }
-            if member.priority is not None:
-                payload["priority"] = member.priority
-            key = _content_key(rtype, member.value)
-            match = next(
-                (
-                    r
-                    for r in unmatched
-                    if _content_key(rtype, str(r.get("content") or "")) == key
-                    and (not keyed_priority or r.get("priority") == member.priority)
-                ),
-                None,
-            )
+            payload: dict[str, Any] = {"type": rtype, "name": name, "ttl": wire_ttl}
+            if is_srv:
+                # SRV goes out as a ``data`` object (#1526), matched on all
+                # four components rather than on ``content``.
+                srv_key = _srv_member_key(member)
+                payload["data"] = {
+                    "priority": srv_key[0],
+                    "weight": srv_key[1],
+                    "port": srv_key[2],
+                    "target": member.value,
+                }
+                match = next((r for r in unmatched if _srv_row_key(r) == srv_key), None)
+            else:
+                payload["content"] = member.value
+                if member.priority is not None:
+                    payload["priority"] = member.priority
+                key = _content_key(rtype, member.value)
+                match = next(
+                    (
+                        r
+                        for r in unmatched
+                        if _content_key(rtype, str(r.get("content") or "")) == key
+                        and (not keyed_priority or r.get("priority") == member.priority)
+                    ),
+                    None,
+                )
             if match is None:
                 if proxied:
                     payload["proxied"] = True
@@ -424,8 +510,9 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 # any row above, so it is one of the rows still unmatched.
                 # Deleting them now could delete the very record that was
                 # just reported as present: stop before the delete pass.
+                shown = payload.get("content", payload.get("data"))
                 raise CloudDNSError(
-                    f"Cloudflare: {name} {rtype} {payload['content']!r} exists in a form "
+                    f"Cloudflare: {name} {rtype} {shown!r} exists in a form "
                     "this driver does not recognise; left the existing records in place."
                 ) from exc
 
@@ -458,7 +545,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if existing is None:
@@ -484,7 +575,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if rid is None:
