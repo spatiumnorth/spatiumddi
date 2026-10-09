@@ -143,7 +143,7 @@ class _FakeLease:
         }
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mutex.k8s, "get_config", lambda: object())
+        monkeypatch.setattr(mutex.k8s, "get_config", object)
         monkeypatch.setattr(mutex.k8s, "get_lease", lambda *_a, **_k: (200, self.body()))
         monkeypatch.setattr(mutex.k8s, "update_lease", self.update)
         monkeypatch.setattr(mutex.k8s, "clear_lease_holder", self.clear)

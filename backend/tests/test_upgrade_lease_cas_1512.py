@@ -33,7 +33,7 @@ def _lease(holder: str, *, rv: str = "41", renewed: str = "2099-01-01T00:00:00Z"
 def k8s_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     calls: dict[str, Any] = {"update": [], "clear": [], "body": None}
     monkeypatch.setattr(mutex.k8s, "get_lease", lambda *_a, **_kw: (200, calls["body"]))
-    monkeypatch.setattr(mutex.k8s, "get_config", lambda: object())
+    monkeypatch.setattr(mutex.k8s, "get_config", object)
 
     def _update(name: str, holder: str, **kw: Any) -> tuple[bool, str | None]:
         calls["update"].append({"holder": holder, **kw})
