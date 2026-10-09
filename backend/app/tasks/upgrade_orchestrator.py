@@ -55,9 +55,14 @@ async def _async_drive(run_id: str) -> dict[str, str]:
     except ValueError as exc:
         raise OrchestratorError(f"invalid run_id {run_id!r}") from exc
 
+    # This drive's lease identity, chosen here so the crash handler below can
+    # release the lease this drive took and never another drive's (#1512).
+    from app.services.upgrades import mutex  # noqa: PLC0415
+
+    me = mutex.drive_identity()
     async with task_session() as db:
         try:
-            run = await drive_upgrade(db, rid)
+            run = await drive_upgrade(db, rid, holder=me)
         except OrchestratorError:
             raise
         except Exception as exc:  # noqa: BLE001 — surface ANY error to the row
@@ -66,7 +71,6 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # halt-on-failure handles step-level failures; this catches
             # the rarer "the loop itself crashed" case.
             from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
-            from app.services.upgrades import mutex  # noqa: PLC0415
 
             # The failure may have left the session in a failed transaction
             # (a flush that raised); without this every statement below
@@ -83,9 +87,9 @@ async def _async_drive(run_id: str) -> dict[str, str]:
                 row.finished_at = datetime.now(UTC)
                 await db.commit()
             # A failed run holds the lease for nothing; left held, the next
-            # Start is refused until it expires. Only ours, never another
-            # worker's that took it over.
-            mutex.release_if_held()
+            # Start is refused until it expires. Only this drive's, never
+            # another drive's that took it over.
+            mutex.release_if_held(holder=me)
             logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 

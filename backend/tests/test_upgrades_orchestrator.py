@@ -333,11 +333,14 @@ async def test_drive_loop_happy_path_two_nodes(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(orchestrator.mutex, "release_if_held", release_mock)
     monkeypatch.setattr(orchestrator, "_BETWEEN_NODES_PAUSE_S", 0.01)
 
-    await orchestrator._drive_loop(db, run, stop)  # type: ignore[arg-type]
+    await orchestrator._drive_loop(db, run, stop, "api-0_drive")  # type: ignore[arg-type]
     assert calls == ["node-a", "node-b"]
     assert run.state == "succeeded"
     assert run.finished_at is not None
-    release_mock.assert_called_once_with(attempts=orchestrator._LEASE_RELEASE_ATTEMPTS)
+    # Released under this drive's own identity (#1512), never the pod's.
+    release_mock.assert_called_once_with(
+        holder="api-0_drive", attempts=orchestrator._LEASE_RELEASE_ATTEMPTS
+    )
 
 
 @pytest.mark.asyncio

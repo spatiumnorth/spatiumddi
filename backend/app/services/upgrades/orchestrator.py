@@ -522,6 +522,8 @@ async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
 async def drive_upgrade(
     db: AsyncSession,
     run_id: uuid.UUID,
+    *,
+    holder: str | None = None,
 ) -> SystemUpgradeRun:
     """Drive a planned / halted-and-resumed / partially-completed run
     through to terminal state.
@@ -531,6 +533,11 @@ async def drive_upgrade(
 
     Acquires the upgrade lease for the duration; spawns the renewal
     task; releases on terminal transition.
+
+    ``holder`` is this drive's lease identity (default: a fresh
+    ``mutex.drive_identity()``). The Celery task passes its own so that its
+    crash handler can release the lease this drive took, and only that one
+    (#1449, #1512).
     """
     # #1512 — the row under FOR UPDATE, re-read: two drives of one run (a
     # second Start, a second tab, Celery redelivery) used to both pass the
@@ -549,7 +556,7 @@ async def drive_upgrade(
     # One identity per drive, not per pod: a worker pod runs several tasks,
     # and a second task under the pod's name renewed the first one's lease
     # and ran a second drive loop beside it.
-    me = mutex.drive_identity()
+    me = holder or mutex.drive_identity()
     if run.state == "planned":
         # First call — acquire the lease.
         ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
@@ -643,10 +650,8 @@ async def _drive_loop(
             )
             # #1512 — give up the lease on a halt too, so Resume's drive (a
             # new identity) can take it at once instead of waiting out the
-            # expiry. Only ours is released.
-            ok, err = mutex.release(holder=holder)
-            if not ok:
-                logger.warning("upgrade_lease_release_failed", error=err)
+            # expiry. Only ours is released, retried like every other exit.
+            _release_lease(run, holder)
             return
 
         per_node_progress = dict(run.progress.get("per_node") or {})
@@ -665,8 +670,11 @@ async def _drive_loop(
             # The new drive takes the lease over and resumes at this node.
             await _record_event(db, run, "drive_handoff", node=next_node)
             await db.commit()
-            # Stop the renewal loop first: a renew after the release would
-            # write this pod back in as the holder.
+            # Stop the renewal loop first. A renew after the release would
+            # fail anyway (it re-reads the holder, #1512), but it would also
+            # end this drive as "lease lost" instead of as a hand-off. The
+            # release clears this drive's own identity only, as a
+            # compare-and-swap, so the new drive's takeover is never undone.
             stop_event.set()
             _release_lease(run, holder)
             _enqueue_drive(run.id, avoid_node=own_node)
