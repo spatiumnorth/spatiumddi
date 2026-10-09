@@ -813,20 +813,117 @@ celery_app.conf.update(
 )
 
 
-# ── Redis Sentinel broker/backend (#272 Phase 3) ────────────────────────
+# ── Redis broker/backend transport (#272 Phase 3, #1669) ────────────────
 #
-# When the broker / result-backend URLs carry the ``sentinel://``
-# scheme (umbrella chart with ``redis.kind=sentinel``), Celery's
-# kombu transport needs the master name in transport options to know
-# which Sentinel-monitored master to resolve. The Sentinel auth
-# password (when the data nodes require auth) rides in
-# ``sentinel_kwargs``. Plain ``redis://`` URLs need none of this.
-if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
-    _sentinel_opts: dict = {"master_name": settings.redis_sentinel_master}
-    if settings.redis_sentinel_password:
-        _sentinel_opts["sentinel_kwargs"] = {"password": settings.redis_sentinel_password}
-    celery_app.conf.broker_transport_options = _sentinel_opts
-    celery_app.conf.result_backend_transport_options = dict(_sentinel_opts)
+# Sentinel: with ``sentinel://`` URLs (umbrella chart ``redis.kind=sentinel``)
+# kombu needs the master name in transport options, and the Sentinel auth
+# password (when set) rides in ``sentinel_kwargs``.
+#
+# Timeouts (#1669): kombu 5.6.2's Redis transport defaults ``socket_timeout``,
+# ``socket_connect_timeout`` and ``socket_keepalive`` to None, and celery's
+# sentinel result backend takes ``sentinel_kwargs`` from transport options
+# verbatim (an absent key means NO timeouts on the Sentinel queries too). A
+# peer that vanishes without closing its sockets (node power-off, partition)
+# then never produces an error: the worker's idle BRPOP socket just stays
+# silent, the worker is deaf after Sentinel promotes a replica, its liveness
+# ``inspect ping`` fails and the pod is killed. Worse, ``Channel.close()`` does
+# a blocking ``_brpop_read()`` on the dead socket while a BRPOP is
+# outstanding, so a warm shutdown blocked until SIGKILL.
+#
+# Two mechanisms, because they cover different reads:
+#  * ``socket_timeout`` bounds a synchronous request/response read (publish,
+#    ack, health-check PING, Sentinel queries, shutdown's ``_brpop_read``).
+#    It does NOT cover the worker's idle BRPOP wait: the event loop only
+#    reads once epoll says the socket is readable, so silence is never timed.
+#  * TCP keepalive (+ TCP_USER_TIMEOUT for unacked writes) makes the kernel
+#    reset a dead connection, which makes the socket readable-with-error and
+#    lets the worker's normal "Connection to broker lost" reconnect run.
+# ``socket_timeout`` MUST stay well above kombu's BRPOP block time
+# (``Transport.brpop_timeout`` = 1 s): in the synchronous (non-event-loop)
+# path, e.g. ``celery inspect``, BRPOP blocks that long on the socket and a
+# smaller timeout would turn every idle poll into an error. Unlike
+# ``core/redis_client.py`` (whose pub/sub reads are meant to be slow, #925),
+# nothing here parks a read on purpose: celery's result pub/sub consumer calls
+# ``get_message(timeout=…)`` with an explicit timeout, and kombu's fanout
+# LISTEN is only read after the poller reports readable.
+REDIS_SOCKET_TIMEOUT_S = 10.0  # > BRPOP 1 s; < the 25 s keepalive detection; bounds shutdown I/O
+REDIS_SOCKET_CONNECT_TIMEOUT_S = 5.0  # > a LAN SYN round trip; < Sentinel down-after + promotion
+REDIS_KEEPALIVE_IDLE_S = 10  # first probe after 10 s idle
+REDIS_KEEPALIVE_INTERVAL_S = 5  # then every 5 s
+REDIS_KEEPALIVE_PROBES = 3  # dead after 10 + 3*5 = 25 s of silence
+REDIS_TCP_USER_TIMEOUT_MS = 25_000  # unacked data (keepalive does not run) gives up in 25 s
+
+
+def _redis_keepalive_options() -> dict[int, int]:
+    """Per-platform keepalive tuning. Only options the platform defines are
+    returned (Linux has all four; macOS lacks TCP_USER_TIMEOUT)."""
+    import socket
+
+    opts: dict[int, int] = {}
+    for name, value in (
+        ("TCP_KEEPIDLE", REDIS_KEEPALIVE_IDLE_S),
+        ("TCP_KEEPINTVL", REDIS_KEEPALIVE_INTERVAL_S),
+        ("TCP_KEEPCNT", REDIS_KEEPALIVE_PROBES),
+        ("TCP_USER_TIMEOUT", REDIS_TCP_USER_TIMEOUT_MS),
+    ):
+        const = getattr(socket, name, None)
+        if const is not None:
+            opts[const] = value
+    return opts
+
+
+def build_redis_transport_options(
+    broker_url: str, sentinel_master: str, sentinel_password: str | None
+) -> dict[str, Any]:
+    """Broker transport options for ``broker_url`` (empty for ``socket://``)."""
+    if broker_url.startswith(("unix://", "socket://")):
+        return {}
+    opts: dict[str, Any] = {
+        "socket_timeout": REDIS_SOCKET_TIMEOUT_S,
+        "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT_S,
+        "socket_keepalive": True,
+        "socket_keepalive_options": _redis_keepalive_options(),
+    }
+    if broker_url.startswith(("sentinel://", "redis+sentinel://")):
+        opts["master_name"] = sentinel_master
+        # A Sentinel query to a lost Sentinel must not hang either; redis-py
+        # only copies socket_* into sentinel connections when this is None.
+        sentinel_kwargs: dict[str, Any] = {
+            "socket_timeout": REDIS_SOCKET_TIMEOUT_S,
+            "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT_S,
+            "socket_keepalive": True,
+            "socket_keepalive_options": _redis_keepalive_options(),
+        }
+        if sentinel_password:
+            sentinel_kwargs["password"] = sentinel_password
+        opts["sentinel_kwargs"] = sentinel_kwargs
+    return opts
+
+
+if settings.celery_broker_url.startswith(
+    ("redis://", "rediss://", "sentinel://", "redis+sentinel://")
+):
+    _redis_opts = build_redis_transport_options(
+        settings.celery_broker_url,
+        settings.redis_sentinel_master,
+        settings.redis_sentinel_password,
+    )
+    celery_app.conf.broker_transport_options = _redis_opts
+    # The result backend reads sentinel_kwargs/master_name from these, but its
+    # own connection timeouts from the ``redis_socket_*`` settings (celery
+    # 5.6.3 backends/redis.py ``RedisBackend.__init__``), which accept no
+    # keepalive *options*: plain ``socket_keepalive`` uses the kernel's 2 h idle
+    # default, so it is the socket timeout that bounds the (synchronous) result
+    # backend, not keepalive.
+    celery_app.conf.result_backend_transport_options = {
+        k: v for k, v in _redis_opts.items() if k in ("master_name", "sentinel_kwargs")
+    }
+    if settings.celery_result_backend.startswith(
+        ("redis://", "rediss://", "sentinel://", "redis+sentinel://")
+    ):
+        celery_app.conf.redis_socket_timeout = REDIS_SOCKET_TIMEOUT_S
+        celery_app.conf.redis_socket_connect_timeout = REDIS_SOCKET_CONNECT_TIMEOUT_S
+        celery_app.conf.redis_socket_keepalive = True
 
 
 # ── Diagnostics — Celery task_failure capture (issue #123) ──────────────

@@ -123,7 +123,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
-            failureThreshold: 3
+            # 5 x 30 s (was 3): the ping is a broker round trip, and a Redis
+            # master lost with its node takes Sentinel down-after (5 s) +
+            # promotion + the worker noticing its dead sockets (keepalive,
+            # ~25 s, celery_app.py) before it answers again. 3 misses (~90 s)
+            # raced that and killed healthy workers (#1669). 150 s still
+            # catches a genuinely wedged worker.
+            failureThreshold: 5
 ---
 # Beat runs as a singleton — only 1 replica allowed
 apiVersion: apps/v1

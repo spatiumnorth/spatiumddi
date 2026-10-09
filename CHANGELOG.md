@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Losing the node that held the Redis master no longer restarts
+  every Celery worker (#1669).** kombu leaves `socket_timeout`,
+  `socket_connect_timeout` and `socket_keepalive` unset, and the
+  sentinel result backend took no timeouts on its Sentinel queries
+  either, so a connection to a vanished peer never errored: the
+  worker stayed deaf after Sentinel promoted a replica, its
+  `inspect ping` liveness probe failed three times, and the warm
+  shutdown then blocked in `Channel.close()` reading the dead socket
+  until SIGKILL. The broker and result backend now set a 10 s socket
+  timeout, 5 s connect timeout and TCP keepalive (dead peer detected
+  in 25 s), including on Sentinel queries and plain `redis://`
+  URLs. The worker liveness probe tolerates 5 misses instead of 3.
 - **The DNS VIP answers again after a DNS engine switch, and on a fresh
   install (#1510).** All three engine Services in the appliance chart
   (`dns-bind9`, `dns-powerdns`, `dns-technitium`) are rendered on every DNS
