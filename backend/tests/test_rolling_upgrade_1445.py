@@ -409,7 +409,7 @@ async def test_the_started_transition_commits_against_postgres(
     async def _no_loop(*_a: Any, **_k: Any) -> None:
         return None
 
-    async def _no_renewal(stop: Any) -> None:
+    async def _no_renewal(stop: Any, *_a: Any) -> None:
         await stop.wait()
 
     monkeypatch.setattr(orch, "_drive_loop", _no_loop)
@@ -471,7 +471,7 @@ async def test_a_crashed_drive_marks_the_run_failed_after_a_failed_flush(
     async def _session() -> Any:
         yield db_session
 
-    async def _drive(db: Any, _rid: Any) -> Any:
+    async def _drive(db: Any, _rid: Any, **_k: Any) -> Any:
         # What the original bug did: a NOT NULL violation at flush time.
         db.add(
             AuditLog(

@@ -69,11 +69,13 @@ async def test_the_drive_hands_off_instead_of_draining_its_own_node(
     run = await _running_run(db_session, done=["node-b", "node-c"])
     monkeypatch.setenv("NODE_NAME", "node-a")
     released: list[int] = []
+    holders: list[str | None] = []
     enqueued: list[tuple[Any, Any]] = []
     driven: list[str] = []
 
     def _release(**kw: Any) -> bool:
         released.append(kw.get("attempts", 1))
+        holders.append(kw.get("holder"))
         return True
 
     async def _single(*_a: Any, node_name: str, **_k: Any) -> Any:
@@ -87,11 +89,13 @@ async def test_the_drive_hands_off_instead_of_draining_its_own_node(
     monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
 
     stop = asyncio.Event()
-    await orch._drive_loop(db_session, run, stop)
+    await orch._drive_loop(db_session, run, stop, "node-a-pod_mine")
 
     assert driven == []
     assert enqueued == [(run.id, "node-a")]
     assert released == [orch._LEASE_RELEASE_ATTEMPTS]
+    # The drive releases its OWN per-drive identity (#1512), never the pod's.
+    assert holders == ["node-a-pod_mine"]
     # The renewal loop is stopped before the release, or a renew would write
     # this pod back in as the holder.
     assert stop.is_set()
@@ -277,7 +281,9 @@ def test_release_retries_a_timed_out_read(monkeypatch: pytest.MonkeyPatch) -> No
         return 200, _lease_body("worker-a")
 
     monkeypatch.setattr(mutex.k8s, "get_lease", _get)
-    monkeypatch.setattr(mutex, "release", lambda **_k: cleared.append("x") or (True, None))
+    monkeypatch.setattr(
+        mutex.k8s, "clear_lease_holder", lambda *_a, **_k: cleared.append("x") or (True, None)
+    )
 
     assert mutex.release_if_held(attempts=3, retry_delay_s=0) is True
     assert cleared == ["x"]
@@ -287,7 +293,7 @@ def test_release_retries_a_timed_out_read(monkeypatch: pytest.MonkeyPatch) -> No
 def test_release_retries_a_server_error(monkeypatch: pytest.MonkeyPatch) -> None:
     answers = iter([(503, None), (200, _lease_body("worker-a"))])
     monkeypatch.setattr(mutex.k8s, "get_lease", lambda *_a, **_k: next(answers))
-    monkeypatch.setattr(mutex, "release", lambda **_k: (True, None))
+    monkeypatch.setattr(mutex.k8s, "clear_lease_holder", lambda *_a, **_k: (True, None))
 
     assert mutex.release_if_held(attempts=3, retry_delay_s=0) is True
 
@@ -298,10 +304,11 @@ def test_release_never_clears_a_lease_another_worker_holds(
 ) -> None:
     monkeypatch.setattr(mutex.k8s, "get_lease", lambda *_a, **_k: (200, _lease_body("worker-b")))
 
-    def _must_not_clear(**_k: Any) -> tuple[bool, None]:
+    def _must_not_clear(*_a: Any, **_k: Any) -> tuple[bool, None]:
         raise AssertionError("cleared another worker's lease")
 
     monkeypatch.setattr(mutex, "release", _must_not_clear)
+    monkeypatch.setattr(mutex.k8s, "clear_lease_holder", _must_not_clear)
 
     assert mutex.release_if_held(attempts=3, retry_delay_s=0) is False
 
