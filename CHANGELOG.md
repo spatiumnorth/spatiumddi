@@ -429,8 +429,11 @@ the formatter handles the rest.
   serve (the same `drivers/_txt.py` parse, through Technitium's
   `characterStringsBase64`), keeps a trailing full stop, and compares
   what the server holds string by string, so a steady zone does not
-  churn. A record an older agent served the old way is replaced once,
-  on the agent's first full reconcile after the upgrade.
+  churn. Technitium cannot hold an empty string: the agent leaves one
+  out, and a value that is nothing but empty strings (`""`) is served
+  as its text, as before. A record an older agent served the old way
+  is replaced once, on the agent's first full reconcile after the
+  upgrade.
 
 - **Rolling-upgrade preflight warns on a SemVer jump that skips a major
   version (#1182).** Between two CalVer releases the version check warns when

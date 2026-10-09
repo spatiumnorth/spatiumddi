@@ -208,6 +208,34 @@ def test_record_params_txt_long_value_splits_on_a_character_boundary() -> None:
     assert b"".join(strings) == value.encode("utf-8")
 
 
+def test_record_params_txt_leaves_out_an_empty_string() -> None:
+    """Technitium (15.4) cannot hold an empty character-string: it drops
+    one from the list it is sent. The driver leaves them out itself, so
+    the strings it compares are the strings the server holds and a value
+    with an empty string in it does not churn."""
+    assert _record_params("TXT", '"" "a"', {}) == {
+        "characterStringsBase64": _b64s(b"a")
+    }
+    assert _record_params("TXT", '"a" "" "b"', {}) == {
+        "characterStringsBase64": _b64s(b"a", b"b")
+    }
+
+
+def test_record_params_txt_never_asks_for_a_record_with_no_string() -> None:
+    """A TXT record with no string at all is served as a malformed packet
+    (Technitium 15.4 stores one when every string it is sent is empty). A
+    value that is nothing but empty strings is sent as its text, as it was
+    before #1694, and an empty value is refused by the server, as before."""
+    assert _record_params("TXT", '""', {}) == {"characterStringsBase64": _b64s(b'""')}
+    assert _record_params("TXT", '"" ""', {}) == {
+        "characterStringsBase64": _b64s(b'"" ""')
+    }
+    assert _record_params("TXT", "", {}) == {"text": ""}
+    for value in ('""', '"" ""', '"" "a"', '"a" ""', "", "a"):
+        sent = _record_params("TXT", value, {}).get("characterStringsBase64")
+        assert sent is None or all(sent.split(",")), value
+
+
 def _txt_rdata(*strings: bytes) -> dict[str, Any]:
     """A TXT ``rData`` as Technitium 15.4's records/get returns it."""
     return {
@@ -223,6 +251,9 @@ def test_normalize_rdata_txt_compares_the_character_strings() -> None:
         ('"a" "b"', (b"a", b"b")),
         ("v=spf1 -all", (b"v=spf1 -all",)),
         ('"a\\255b"', (b"a\xffb",)),
+        # What Technitium holds for a value with an empty string in it.
+        ('"" "a"', (b"a",)),
+        ('""', (b'""',)),
     ):
         assert _normalize_rdata("TXT", _txt_rdata(*strings)) == _record_params("TXT", value, {})
 

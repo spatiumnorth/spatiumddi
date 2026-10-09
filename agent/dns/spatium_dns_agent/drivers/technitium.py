@@ -772,10 +772,24 @@ def _txt_params(value: str) -> dict[str, Any]:
     the BIND9 and PowerDNS drivers render (``_txt.txt_strings``), so the
     three engines serve the same strings, and the record GET hands the same
     list back for ``_normalize_rdata`` to compare and delete by.
+
+    Technitium cannot hold an empty character-string: it drops one from the
+    list, and a record left with no string at all is served as a malformed
+    packet. So empty strings are left out here as well, and what is compared
+    is what the server holds. A value that is nothing but empty strings
+    (``""``) goes as its text, as it did before #1694, and an empty value is
+    refused by the server, as before.
     """
+    strings = [s for s in txt_strings(value) if s]
+    if not strings:
+        if not value:
+            return {"text": ""}
+        # As the ``text`` param took it: one string, cut every 255 octets.
+        raw = value.encode("utf-8")
+        strings = [raw[i : i + 255] for i in range(0, len(raw), 255)]
     return {
         "characterStringsBase64": ",".join(
-            base64.b64encode(s).decode("ascii") for s in txt_strings(value)
+            base64.b64encode(s).decode("ascii") for s in strings
         )
     }
 
