@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS server groups and agentless zone pushes stop lying about
+  what landed (#1540, #1537, #1533).** A server create (or driver
+  change) could put a second driver into a group that already had
+  one, leaving the group's zones with no coherent sync target —
+  group membership now enforces one driver per group. Agentless
+  zone pushes went to disabled servers and reported success when
+  only some servers applied; disabled servers are excluded from
+  the push and a partial failure is compensated and surfaced
+  instead of acked. Rolling back a delete (including a zone move's
+  delete from the source group) re-creates the zone **and pushes its
+  records back** on each server where the delete had succeeded —
+  re-creating the zone alone left that server answering for an empty
+  zone — and if a record cannot be restored the error says so and
+  points at Sync with Servers rather than reporting a clean rollback.
+  The error also names the system that refused (Technitium, Route 53,
+  …) instead of always saying "Windows DNS", and a refused Technitium
+  connection names its cause instead of ending at "request failed:".
+  And the sync record-type filter is derived
+  from each driver's declared capabilities, so CAA records (and
+  any other type a driver supports) are actually pulled and pushed
+  instead of being filtered out by a hardcoded list.
+
 - **Technitium records stop churning and silently diverging (#1518,
   #1517, #1516, #1513).** A record TTL of 0 came back as the zone
   TTL and an MX preference of 0 as 10 — both now round-trip as
