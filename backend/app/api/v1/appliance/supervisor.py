@@ -121,6 +121,7 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
     archive_path,
@@ -151,6 +152,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
 
@@ -4432,6 +4434,8 @@ async def promote_control_plane(
     odd total member count (etcd quorum hygiene).
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane promote")
 
     members = await _effective_cp_members(db)
     primary = await _resolve_primary(db, members)
@@ -4565,6 +4569,8 @@ async def demote_control_plane(
     count, and refuses demoting the seed (use a dedicated seed-migration
     flow for that — out of scope for Phase 7)."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
 
     members = await _effective_cp_members(db)
     current_count = len(members)
@@ -4677,6 +4683,8 @@ async def replace_control_plane_member(
     stays ``evicting``, with the seed's reason.
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane replace")
 
     from app.api.v1.appliance.pairing import _generate_code, _hash_code  # noqa: PLC0415
     from app.models.appliance import PairingCode  # noqa: PLC0415
@@ -5056,6 +5064,8 @@ async def restore_etcd_snapshot(
     last-reported inventory + ``confirm_hostname`` must match the seed's
     hostname exactly. Refuses a second restore while one is in flight."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="an etcd snapshot restore")
     seed = await _find_seed_row(db)
     if seed is None:
         raise HTTPException(
@@ -5623,6 +5633,8 @@ async def schedule_appliance_upgrade(
     ``desired_slot_image_url``. The control plane composes the
     authenticated internal URL the supervisor pulls from."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance slot upgrade")
     if (body.desired_slot_image_url is None) == (body.slot_image_id is None):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5896,6 +5908,8 @@ async def schedule_appliance_set_next_boot(
     either reboots manually (``/reboot`` endpoint) or waits for the
     next planned reboot window."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance next-boot slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -5963,6 +5977,8 @@ async def schedule_appliance_set_default_slot(
       slot for good (not just one boot). Calls this against the
       previous slot."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance default-slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -6034,8 +6050,7 @@ async def schedule_appliance_reboot(
                 "appliance OS."
             ),
         )
-    row.reboot_requested = True
-    row.reboot_requested_at = datetime.now(UTC)
+    request_reboot(row)
     db.add(
         AuditLog(
             user_id=current_user.id,

@@ -173,9 +173,11 @@ class PlanRequest(BaseModel):
         default="",
         max_length=128,
         description=(
-            "Name of the CNPG Cluster CR. Empty disables CNPG-related "
-            "steps for non-CNPG deploys; on the appliance shape this is "
-            "the chart's ``<release>-postgresql`` resource."
+            "Name of the CNPG Cluster CR. Empty detects it from the "
+            "database connection (the chart's ``<cluster>-rw`` Service, "
+            "confirmed by reading the Cluster); a deploy with no CNPG "
+            "cluster detects nothing and skips the CNPG-related steps. On "
+            "the appliance shape it is the chart's ``<release>-postgresql``."
         ),
     )
     cnpg_namespace: str | None = Field(

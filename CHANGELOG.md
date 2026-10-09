@@ -100,6 +100,221 @@ the formatter handles the rest.
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
 
+- **The rolling upgrade can run on a multi-node cluster (#1445).**
+  Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
+  2026.10.02-1, where Plan → Start never got past the upgrade lease:
+  - Every Lease write sent whole-second `acquireTime` / `renewTime`,
+    and the apiserver requires a MicroTime (six fractional digits), so
+    it answered 400 and the orchestrator never took its lease. All
+    three writes now send a MicroTime.
+  - The orchestrator runs in the Celery worker, and only the api's
+    ServiceAccount held its RBAC. With `api.upgradeOrchestratorRBAC`
+    on, the worker now gets the same grants: its own namespaced Role
+    carrying only the orchestrator's rules (not the api's Secret or
+    Deployment patch), plus the orchestrator ClusterRole and the
+    kube-system HelmChartConfig Role.
+  - `verify_primary_moved` passed whenever CNPG named any primary,
+    including one still on the cordoned node, so the drain could evict
+    the primary. It now waits until the primary pod runs on another
+    node, and treats a pod it cannot read as unproven.
+  - The slot-apply stamp was only flushed before the health gate
+    waited on the supervisor, which reads it from another session, so
+    the gate could only time out. `single_node_upgrade` now commits it
+    first.
+  - The `replication_lag` preflight and post-node check read
+    `pg_stat_replication` as the app's database role, which sees a
+    replica's state as NULL, and reported every replica as not
+    streaming. A state the role cannot see is now a warning
+    ("unverified"), not a failure; a replica visibly not streaming
+    still fails.
+  - Once the lease could be taken, every run would have failed its own
+    first node: each node's chain re-runs the full preflight, and its
+    in-flight check failed on any held lease, including the one the run
+    had just taken. The check now passes a lease held by the run asking.
+  - Plan took the CNPG cluster name only from its form field, which is
+    empty by default, so a default run skipped the CNPG maintenance
+    window and the primary-moved check above. Left empty, the name is
+    now detected from the database connection (the chart's
+    `<cluster>-rw` Service, confirmed by reading the Cluster).
+  - With the lease working, a run still could not leave `planned`: the
+    orchestrator's own transitions wrote an audit row with no actor
+    into a NOT NULL column, so the `started` transition failed. The
+    catch-all then reused the failed session, so the run was never
+    marked failed, and the lease stayed held for its full 10 minutes,
+    refusing Celery's retry and the next Start. Those transitions now
+    record `system:upgrade-orchestrator`, a crashed drive rolls back
+    before marking the run failed, and a failed start or crashed drive
+    releases the lease if it still holds it.
+  - Nothing rebooted the node into the slot it staged. The host runner
+    writes the new slot, arms the next boot and stops there, so the
+    health gate timed out on every node with the old version still
+    running. A new `reboot` step waits until the host reports this run's
+    slot staged, then requests the reboot through the same flag as the
+    Fleet reboot action (audited as `system:upgrade-orchestrator`). A
+    `done` left by an earlier upgrade does not count, so the node is not
+    restarted in the middle of the apply, and a request already
+    outstanding is not stamped twice. On a control-plane member the
+    request depends on #1446's fix.
+  - The run's database session did not survive the CNPG switchover it
+    waits for: the next query failed with "connection is closed". Task
+    sessions now ping their connection on checkout, and the reboot and
+    health-gate waits end their transaction on every poll.
+  - Draining a node evicted the worker running the drive whenever the
+    drive ran there, and the run sat in `running` with nothing driving
+    it until Celery redelivered the task an hour later; a three-node
+    roll took over two hours. The node the drive's worker runs on now
+    goes last, and before it is drained the drive hands itself to a
+    worker on another node: it releases the lease and enqueues itself
+    asking to run elsewhere, and the new drive takes the lease over and
+    resumes at that node. A worker on the node being left passes the
+    task on rather than running it.
+  - `convergence` ended as a crash on the first API timeout, which is
+    when a node rejoining after its reboot is most likely to cause one.
+    It now keeps polling until its window ends.
+  - A run that ended while the API was not answering kept the upgrade
+    lease until it expired. The end of a run now retries the release,
+    and releases only a lease it still holds.
+  The other points in that report are #1446, #1447 and #1448.
+
+- **The Teams webhook flavor sends an Adaptive Card for a Workflows
+  webhook (#1504).** It posted a legacy Office 365 `MessageCard`, and
+  the form asked for a `…webhook.office.com/webhookb2/…` URL, but
+  Microsoft retired that "Incoming Webhook" connector in May 2026, so
+  nothing reached the channel. A `teams` target now sends an Adaptive
+  Card 1.4 in the `{"type": "message", "attachments": […]}` envelope
+  the Workflows webhooks document (*Send webhook alerts to a channel*,
+  *When a Teams webhook request is received*); severity colours the
+  title, and a long digest is cut to stay under Teams' 28 KB message
+  limit. The form's label, placeholder and help text, and
+  OBSERVABILITY.md §5.1, now point at Workflows. The flavor value stays
+  `teams`, no migration. **An existing Teams target still on a
+  `webhook.office.com` URL needs a new Workflows URL**; a flow built
+  around the old MessageCard body must read `attachments` instead.
+  Note that a Workflows webhook answers 202 before the flow runs, so
+  **Test** succeeding does not prove the card was posted; the flow's
+  run history does.
+
+- **ACME DNS-01 puts the challenge into the public zone when an
+  internal split-horizon subzone also covers the name (#1454).** The
+  challenge zone was picked by longest suffix over every primary zone,
+  so an internal-only `home.example.com` won over the public
+  `example.com` and a public CA could never see the TXT. Zones in an
+  `external` group or served by a cloud DNS driver now go first;
+  internal zones are only used when nothing public covers the name.
+  `/preview` notes when an internal zone was skipped, and shows
+  `_acme-challenge.example.com` for `*.example.com` instead of
+  `_acme-challenge.*.example.com`.
+
+- **Feed-backed blocklists refresh on their update interval (#1467).**
+  `update_interval_hours` was stored and shown but never read, so a URL
+  list was fetched once and then only on a manual Refresh; lists created
+  through `POST /dns/blocklists` (not the catalog) weren't fetched at all.
+  A new hourly beat sweep (`dns-blocklist-refresh`) queues
+  `refresh_blocklist_feed` for every enabled URL list whose last sync is
+  at least `update_interval_hours` old, never-synced lists first, queued a
+  minute apart and at most 55 per sweep, so none is queued twice before it
+  has run. `0` stays manual-only. A failed fetch counts as a sync, so
+  a broken feed is retried once per interval; Refresh still retries at
+  once. The API now refuses an interval below 0 or above 8760 (422).
+
+- **A cloud or Windows DNS import no longer pushes the imported records
+  back to the server it read them from (#1456).** Importing a Cloudflare
+  account (or a Windows DNS server) into the group that holds that server
+  enqueued a `create` op per imported record, which the agentless path
+  applies at once: one create call per record to the provider the records
+  had just been read from. Cloudflare refused them as duplicates, leaving
+  a `failed` op per record; a provider that accepts duplicates would have
+  stored them twice. The preview now carries the server it pulled from
+  (`source_server_id`), and the commit skips the record ops when that
+  server is the zone's primary. A zone renamed on the way in, an import
+  into another provider's group, and records created after the import
+  still go out as before. The commit refuses a `source_server_id` that
+  isn't a server of the plan's own source. Failed ops left by an earlier
+  import are not cleaned up.
+
+- **Kubernetes, Docker, Tailscale, NetBird and Cloud syncs no longer fail
+  on an address another integration already mirrors (#1677).** Same gap
+  as Proxmox in #1622: the reconciler logged "owned by another
+  integration; not claiming" and then inserted its own row at that
+  address anyway, or moved one of its rows onto it. That hit
+  `uq_ip_address_subnet_address`, and nothing from that cluster, host,
+  tenant or endpoint synced, with no `last_sync_error`. A Kubernetes node
+  whose LAN address UniFi, OPNsense or Proxmox already mirrors was enough.
+  These mirrors now leave such an address to its owner and sync the rest.
+  The Kubernetes, Docker, Tailscale, NetBird and UniFi sweeps also roll
+  back after a failed target now, and no integration sweep reads the
+  target's name off the expired row any more: a failed flush used to end
+  the whole sweep with `PendingRollbackError`, so every target after the
+  broken one was skipped too.
+
+- **Cluster health reads the database from CNPG, not a pod count (#1387).**
+  A pod count cannot see how many instances CNPG wants: a replica join that
+  failed for good leaves only `Failed` Job pods, which are skipped, so a
+  cluster wanting three instances read 2/2 healthy indefinitely, and during
+  first bootstrap, before any instance pod exists, there was no database row
+  at all. The database row now reads the CNPG Cluster's `readyInstances` of
+  `spec.instances` (the check the rolling upgrade already makes), so those
+  read 2/3 degraded and 0/3 down. The Cluster is found from the
+  `cnpg.io/cluster` label on its pods. When it cannot be read (a 403, a
+  non-CNPG install) the pod count stands, and the row's new `source` field
+  (`cnpg` / `pods`) and its tooltip say which.
+
+- **Cluster-reshaping actions are refused while a rolling upgrade is in
+  flight (#1543).** `assert_no_upgrade_in_flight` was written for exactly
+  these paths, but only backup and factory reset called it. Promote,
+  demote and replace of control-plane members, the guided etcd restore
+  (which cluster-resets the seed and wipes the etcd holding the upgrade
+  Lease), and the per-appliance slot upgrade, next-boot and default-slot
+  endpoints now answer 409 while a `system_upgrade_run` is planned,
+  running or halted, naming the run and how to abort it.
+
+- **IPAM writes no PTR naming a CNAME, and a skipped name no longer reads
+  as published (#1493).** Since #1441 IPAM and DHCP DDNS skip the A / AAAA
+  when the hostname already holds a CNAME, but the PTR was still written,
+  naming the alias: a reverse lookup led forward to the CNAME's target
+  instead of back to the address (RFC 1912 section 2.4 asks a PTR to name an
+  A record). The PTR is now skipped too, and one an address had before
+  being renamed onto the CNAME's name is retracted. Such a sync now reports
+  that it published nothing, so the DDNS path logs `ddns_skipped_cname`
+  rather than `ddns_applied`, and `ipam_dns_record_skipped_cname` is logged
+  at warning once per address, hostname and zone instead of on every lease
+  renewal.
+
+- **A DNS record with TTL 0 is served with TTL 0 by BIND9 (#1382).** The
+  BIND9 agent's full zone render took a TTL of 0 for "unset" and wrote the
+  zone's TTL instead, so a record set not to be cached for a cut-over or
+  a failover was cached for the zone TTL, often an hour. In a group with
+  views every such record was served that way; without views the RFC 2136
+  update wrote 0 until the zone's next full render. Only a record with no
+  TTL of its own now takes the zone's.
+
+- **BIND9 serves each zone's own SOA timers, and changing them moves the
+  zone's serial (#1171).** A zone's refresh, retry, expire and minimum were
+  stored, editable and exported, but never sent to the BIND9 agent, which
+  served `3600 600 86400 300` for every zone: secondaries checked hourly
+  and stopped serving a zone after a day without its primary, and
+  resolvers cached negative answers for five minutes, whatever the zone
+  said. They now ship in the agent bundle and are written into the SOA,
+  and an edit of any of them, or of the zone's TTL, bumps the zone's
+  serial so its secondaries transfer the change. **At upgrade a timer
+  changes on the wire only where someone set it:** each timer still at
+  its old stored default (refresh 86400, retry 7200, expire 3600000,
+  minimum 3600, none of them ever served) is set to the value it serves
+  today (3600, 600, 86400, 300) by migration `ff32b91acad8`, and new
+  zones default to those values too, keeping the 5-minute negative TTL
+  a DDNS-driven estate relies on. A zone with an edited timer starts
+  serving it, under a new serial so its secondaries transfer it, and
+  reloads once. **A group switches to the zones' own timers only once
+  every BIND9 agent in it renders them:** until then, through an upgrade
+  (on a cluster, until its last DNS pod is replaced) or while an agent of
+  an older release stays in the group, it keeps serving
+  `3600 600 86400 300`, and the edited zones' serials move at the switch.
+  So no serial is ever served with two different SOAs, and no DNS change
+  is held back meanwhile. The zone API refuses a timer outside 0 to
+  2147483647, and a stored one BIND would refuse is served as before and
+  logged rather than taking the zone down. PowerDNS and Technitium
+  manage their own SOA and are unchanged.
+
 - **Imported `static_dhcp` IPAM records now get their Kea
   reservation without a manual re-save (#1628).** Only the UI ever
   created the DHCP reservation behind a reservation-style IPAM row —
@@ -327,6 +542,21 @@ the formatter handles the rest.
   dropped, with no update sent, the next time IPAM syncs or deletes the
   address.
 
+- **IPAM writes forward records only into a zone it serves as primary
+  (#1633).** A subnet could be bound to a conditional forwarder, a
+  secondary or a stub as its DNS zone, and an address could pick one as
+  its own zone or list one in its extra zones. IPAM wrote every host's
+  A/AAAA record and every alias into such a zone, and the record updates
+  went to a zone that cannot take them, so nobody served the record. The
+  drift check expected the record in that zone and showed the subnet in
+  sync. Such a zone still names the host (its FQDN, and the PTR IPAM
+  writes into a reverse zone it serves), but IPAM now writes no A/AAAA or
+  alias into it and queues nothing, the drift check expects none, and
+  adding an alias there answers 409 saying why. The same holds once a
+  zone in use is changed to a secondary. A record an earlier release
+  wrote into such a zone is dropped, with no update sent, the next time
+  IPAM syncs the address.
+
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
   and restore drills no longer pick a pre-restore safety dump (it
@@ -359,6 +589,20 @@ the formatter handles the rest.
   window early, and keep-days deleted rollback copies on the backups'
   schedule. Retention now splits the listing: backups follow the
   target's policy, safety dumps keep their own last 3.
+
+- **A refused restore no longer blocks every later one as "already in
+  progress" (#1648).** The restore lock added for #1571 was taken on
+  the request's database session, which hands its connection back to
+  the pool at every commit, so the unlock ran on a different
+  connection and did nothing. The lock stayed on an idle pooled
+  connection: after one refused restore (a mistyped passphrase, an
+  invalid archive) the next could be refused with "another restore is
+  already in progress" until the api recycled that connection or
+  restarted. The same flaw could let a second restore in while one was
+  running, and the pool reset before the replay dropped the lock. The
+  lock now lives on a connection of its own for the whole restore,
+  which the restore spares when it ends the other sessions, and it is
+  released however the restore ends, a cancelled request included.
 
 - **A Proxmox sync no longer fails on an address another integration
   already mirrors (#1622).** When a guest reported an IP that UniFi (or any
@@ -897,6 +1141,21 @@ the formatter handles the rest.
 
 ### Security
 
+- **A failed backup run's audit row no longer carries the destination's
+  error text (#1617).** The `backup_target_run_failed` row is forwarded
+  as-is, to syslog, webhook and SMTP forward targets and as the
+  `system.backup_failed` event, and a driver's error text routinely names
+  where the backups live: the NFS server and export, the SMB share, the S3
+  bucket, the SCP host and path. `new_value.error` is gone; the row carries
+  a fixed `failure_category` instead (`unreachable`, `timeout`,
+  `permission_denied`, `auth_failed`, `no_space`, `not_found`,
+  `config_invalid`, `retention_locked`, `secret_unreadable`,
+  `archive_error`, `destination_error`, `unexpected`, and `run_died` for a
+  run the stale-run reaper stamped). The full text is unchanged on the
+  target (`last_run_error`, superadmin-only) and in the row's
+  `error_detail`, which no forwarder emits. A consumer that parsed
+  `new_value.error` should switch to `failure_category`.
+
 - **A cleared or replaced webhook secret no longer lives on in its
   old plaintext column, and a collector echoing part of a secret no
   longer leaks it into the log (GHSA-g9gv-9qp2-3qwm,
@@ -1369,6 +1628,17 @@ the formatter handles the rest.
   nullable. It does not drop them; the next release does. Downgrade
   copies the current values back into the plaintext columns and drops
   the encrypted ones.
+- `ff32b91acad8` — #1171: each `dns_zone` SOA timer still at its old
+  default (refresh 86400, retry 7200, expire 3600000, minimum 3600) gets
+  the value the BIND9 agent has always served (3600, 600, 86400, 300),
+  timer by timer, so rendering the stored timers changes nothing on the
+  wire for a timer nobody set. Adds `dns_server.agent_renders_soa_timers`
+  (false) and `dns_server_group.serves_soa_timers` (true; false for every
+  group with a BIND9 agent, whose agents are the previous release's). It
+  moves no serial: a zone with other timers moves its serial when its
+  group switches to serving them. Downgrade moves the serial of each zone
+  whose group served its own timers (its SOA changes back) and drops the
+  two columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
@@ -1388,6 +1658,26 @@ the formatter handles the rest.
 > rollback can mint a new `SECRET_KEY` and leave every credential
 > encrypted at rest unreadable. If you must go back, restore the
 > backup you took before the upgrade alongside the older release.
+
+# ⚠️ Upgrading an appliance from 2026.09.04-1: back up the app Secret first
+
+> **Before you upgrade an appliance from 2026.09.04-1, back up the
+> Secret that holds `SECRET_KEY`:**
+> `kubectl -n spatium get secret spatium-control-spatiumddi-app -o yaml > spatium-control-app-secret.yaml`,
+> and keep the file off the appliance. 2026.09.04-1's chart does not
+> mark that Secret to be kept (#1042 fixed that in this release), so if
+> the first `spatium-control` helm install on the new slot fails and
+> helm reinstalls the release, a new key is generated and every
+> credential encrypted at rest (TLS certificates, integration and
+> provider secrets) becomes unreadable. Restoring the saved Secret
+> recovers them. This was reported on a real upgrade (#1445, #1448).
+
+> **The built-in rolling upgrade (Rolling Upgrade tab, Plan → Start)
+> does not complete on a multi-node cluster in this release (#1445).**
+> The orchestrator cannot take its upgrade lease. A fix is in progress;
+> until it ships, follow #1445 before upgrading a multi-node control
+> plane. On a multi-node cluster, Kea HA pairs may also fail to come up
+> after the upgrade (#1447).
 
 **This is not 1.0.0.** 1.0.0 is still being worked on, and this
 release is a waypoint on the way there: a month of QA on the ddi-pg

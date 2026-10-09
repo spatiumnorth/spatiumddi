@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -257,6 +258,64 @@ def renew(
         lease_duration_seconds=lease_duration_seconds,
         resource_version=version,
     )
+
+
+def release_if_held(
+    *,
+    holder: str | None = None,
+    namespace: str | None = None,
+    attempts: int = 1,
+    retry_delay_s: float = 2.0,
+) -> bool:
+    """Release the lease only if ``holder`` holds it (default: this pod's
+    hostname; a drive passes its ``drive_identity()``); True if released.
+
+    For failure and hand-off paths: a crashed or departing drive must never
+    drop a lease another drive has since taken over (#1445, #1512). The clear
+    is a compare-and-swap on the ``resourceVersion`` read alongside the holder,
+    so a takeover landing between the read and the write makes the write fail
+    rather than clear the new holder's lease.
+
+    ``attempts`` > 1 retries a release the API did not answer: a run often
+    ends while a node is rebooting, which is when the API times out, and a
+    lease left held refuses the next Start until it expires (#1449). The
+    holder and version are re-read on every attempt, so a retry never clears a
+    lease another drive took meanwhile."""
+    if k8s.get_config() is None:
+        # docker-compose: no Lease exists to release.
+        return False
+    me = holder or _identity()
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(retry_delay_s)
+        # Read the Lease directly rather than through _read / get_state, which
+        # report an unanswered read as "not held" (or held by "<unreachable>"):
+        # either would end the retry on exactly the failure it exists for.
+        try:
+            status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+        except k8s.KubeapiUnavailableError:
+            continue
+        if status == 404:
+            return False
+        if status != 200 or body is None:
+            continue
+        state = _parse_lease(body)
+        if not state.held or state.holder != me:
+            return False
+        version = (body.get("metadata") or {}).get("resourceVersion")
+        try:
+            ok, _err = k8s.clear_lease_holder(
+                LEASE_NAME,
+                namespace=namespace,
+                resource_version=str(version) if version else None,
+            )
+        except k8s.KubeapiUnavailableError:
+            continue
+        if ok:
+            return True
+        # A 409 (the lease moved since the read) or an unanswered write: the
+        # next attempt re-reads and finds out whether it is still ours.
+    return False
 
 
 def release(*, holder: str | None = None, namespace: str | None = None) -> tuple[bool, str | None]:

@@ -3121,7 +3121,8 @@ Same-minor bumps are unaffected — revert the slot and you are done.
    3-node cluster; nodes go offline ~30-60 s each during reboot.
 ```
 
-**Required RBAC.** The api pod's ServiceAccount needs the
+**Required RBAC.** The api pod's ServiceAccount, and the worker's,
+which runs the orchestrator as a Celery task (#1445), need the
 `api.upgradeOrchestratorRBAC` grants (namespace-scoped Deployments
 + Jobs + CNPG Cluster patch + Lease CRUD; cluster-scoped Nodes +
 Pods + pods/eviction; helm.cattle.io HelmChartConfigs in
@@ -3130,8 +3131,8 @@ kube-system). Appliance installs flip this on at firstboot via
 HelmChart's `valuesContent` (committed in `spatiumddi-firstboot`).
 Docker / plain-k8s installs leave it off by default — the rolling
 upgrade flow doesn't apply there. If preflight surfaces
-`inflight_conflict: lease held by '<rbac-missing>'`, the api SA is
-missing this grant; the live appliance fix is one `kubectl patch`
+`inflight_conflict: lease held by '<rbac-missing>'`, the api or the
+worker SA is missing this grant; the live appliance fix is one `kubectl patch`
 on the seed `HelmChart spatium-control` (see #298 PR description
 for the one-liner).
 

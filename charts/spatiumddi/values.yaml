@@ -179,6 +179,10 @@ api:
   # (nodeMaintenanceWindow); manage the orchestrator's Lease in the
   # api's own namespace; GET+PATCH HelmChartConfigs in kube-system
   # (chart image-tag bump after every node is on the new slot).
+  # The orchestrator itself runs in the Celery worker, so when
+  # ``worker.serviceAccount.enabled`` is also on, the worker's SA gets
+  # the same grants (its own Role carries only the orchestrator's
+  # namespaced rules, not the api's Secret / Deployment patch) (#1445).
   # Plain docker/k8s deploys that don't run the rolling upgrade flow
   # leave this off — the api stays scoped to namespace-only Pod /
   # Secret / Deployment grants and can't touch cluster-scoped
