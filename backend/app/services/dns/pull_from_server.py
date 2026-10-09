@@ -40,6 +40,7 @@ from app.services.dns.tsig import (
     resolve_view_transfer_key,
     transfer_needs_tsig,
 )
+from app.services.technitium.rdata import canonical_ip, strip_bare_authority_slash
 
 logger = structlog.get_logger(__name__)
 
@@ -108,6 +109,14 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
       where case doesn't matter either).
     """
     v = (value or "").strip().lower()
+    if rtype in ("A", "AAAA"):
+        # Canonical form (#1513): an expanded/upper-case address as
+        # typed must key the same as the canonical form on the wire.
+        return canonical_ip(v)
+    if rtype == "URI":
+        # #1513: fold away the bare-authority trailing slash a server
+        # may append when storing the record; a path's slash stays.
+        return strip_bare_authority_slash(v)
     if rtype not in _NAME_VALUED_TYPES:
         return v
     # "@" means the zone apex.

@@ -44,6 +44,7 @@ here, change it there and run both.
 
 from __future__ import annotations
 
+import ipaddress
 import shlex
 from typing import Any
 
@@ -112,6 +113,37 @@ def int_or(value: Any, default: int) -> int:
         return default
 
 
+def canonical_ip(value: str) -> str:
+    """Canonical form of an A/AAAA value via ``ipaddress`` (#1513).
+
+    Technitium returns addresses in canonical form while a record may
+    be stored exactly as typed (``2001:DB8:0:0::1``), so string compares
+    in drift/pull see a difference that is not one. An unparseable value
+    passes through unchanged.
+    """
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return value
+
+
+def strip_bare_authority_slash(uri: str) -> str:
+    """Strip a single trailing slash ONLY when the URI has no path
+    beyond the authority (#1513).
+
+    ``https://host/`` → ``https://host`` (Technitium appends that slash
+    itself when storing a bare-authority URI), while
+    ``https://host/path/`` keeps its slash — it can change the resource
+    the URI points to, and the old ``rstrip("/")`` removed it.
+    """
+    if not uri.endswith("/"):
+        return uri
+    after_authority_marker = uri.split("://", 1)[-1]
+    if after_authority_marker.count("/") == 1:
+        return uri[:-1]
+    return uri
+
+
 def normalize_fqdn(name: str) -> str:
     """Ensure a single trailing dot."""
     return name if name.endswith(".") else name + "."
@@ -177,14 +209,23 @@ def svcb_params(value: str) -> tuple[int, str, str]:
     # Technitium stores the target un-dotted; leaving a root dot on makes
     # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
     # keeps a bare apex target from collapsing to the empty string.
-    target = tokens[1].rstrip(".") or "."
-    parts = []
+    target = (tokens[1].rstrip(".") or ".").lower()
+    # Pairs are emitted SORTED BY KEY (#1513): the read direction
+    # rebuilds the presentation string sorted, so an operator-typed
+    # order would never match and would read as drift/churn. A valueless
+    # param (``no-default-alpn``) is emitted as ``key|`` — the
+    # empty-value form of the same wire pair — instead of being
+    # skipped. NOTE: the ``key|`` form has not been verified against a
+    # live daemon; #1513 asks for that check.
+    parsed: list[tuple[str, str]] = []
     for tok in tokens[2:]:
-        if "=" not in tok:
-            continue
-        key, _, raw_val = tok.partition("=")
-        parts.append(f"{key}|{raw_val}")
-    return (priority, target, ",".join(parts))
+        if "=" in tok:
+            key, _, raw_val = tok.partition("=")
+            parsed.append((key, f"{key}|{raw_val}"))
+        else:
+            parsed.append((tok, f"{tok}|"))
+    parsed.sort(key=lambda pair: pair[0])
+    return (priority, target, ",".join(pair for _, pair in parsed))
 
 
 # ── Read direction: Technitium rData → stored value ────────────────────
@@ -200,7 +241,7 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
     extra: dict[str, int] = {}
 
     if rtype in ("A", "AAAA"):
-        return str(rdata.get("ipAddress") or ""), extra
+        return canonical_ip(str(rdata.get("ipAddress") or "")), extra
     if rtype == "CNAME":
         return str(rdata.get("cname") or ""), extra
     if rtype == "DNAME":
@@ -258,13 +299,14 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
     if rtype == "URI":
         return (
             f"{int_or(rdata.get('priority'), 1)} "
-            f"{int_or(rdata.get('weight'), 1)} {rdata.get('uri') or ''}",
+            f"{int_or(rdata.get('weight'), 1)} "
+            f"{strip_bare_authority_slash(str(rdata.get('uri') or ''))}",
             extra,
         )
     if rtype in ("SVCB", "HTTPS"):
         params = rdata.get("svcParams") or {}
         rendered = " ".join(f'{k}="{v}"' for k, v in sorted(params.items()))
-        target = rdata.get("svcTargetName") or "."
+        target = str(rdata.get("svcTargetName") or ".").lower()
         return (
             f"{int_or(rdata.get('svcPriority'), 1)} {target}"
             + (f" {rendered}" if rendered else ""),
@@ -299,7 +341,7 @@ def record_params(
     """
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
-        return {"ipAddress": value}
+        return {"ipAddress": canonical_ip(value)}
     if rtype == "CNAME":
         return {"cname": value}
     if rtype == "DNAME":
@@ -358,9 +400,10 @@ def record_params(
         return {
             "uriPriority": tokens[0] if len(tokens) > 0 else "1",
             "uriWeight": tokens[1] if len(tokens) > 1 else "1",
-            # Trailing slash stripped on both sides — Technitium appends one
-            # to a bare-authority URI when it stores the record.
-            "uri": tokens[2].rstrip("/") if len(tokens) > 2 else "",
+            # Only a bare-authority trailing slash is stripped (#1513) —
+            # Technitium appends one there when it stores the record,
+            # but a path's trailing slash is part of the target.
+            "uri": (strip_bare_authority_slash(tokens[2]) if len(tokens) > 2 else ""),
         }
     if rtype in ("SVCB", "HTTPS"):
         prio, target, params = svcb_params(value)
@@ -377,6 +420,7 @@ def record_params(
 __all__ = [
     "DNSSEC_RECORD_TYPES",
     "SUPPORTED_RECORD_TYPES",
+    "canonical_ip",
     "classify_zone",
     "int_or",
     "normalize_fqdn",
@@ -384,5 +428,6 @@ __all__ = [
     "rdata_to_value",
     "record_params",
     "rel_name",
+    "strip_bare_authority_slash",
     "svcb_params",
 ]
