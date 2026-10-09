@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Agent registration and appliance role assignment stop silently
+  dropping operator intent (#1567, #1562, #1566).** Agent register /
+  re-register accepted any driver string — including agentless
+  drivers no agent can serve — and wrote a junk active server row;
+  the register schemas now validate against the agent-capable driver
+  sets (bind9/powerdns/technitium for DNS, kea for DHCP) and 422
+  instead. Choosing Fleet's "(unassigned)" for an appliance's
+  DNS/DHCP group sent an explicit `null` the roles API ignored
+  (non-None was the only signal); presence in the payload now
+  decides — omitted leaves the assignment alone, `null` unassigns —
+  in both the REST roles endpoint and the AI operations path. And
+  the appliance supervisor no longer drops bootstrap agent keys that
+  aren't 32–128 lowercase hex (a shape nothing else in the system
+  requires): the key pattern is now an env-file injection defence
+  only, rejecting whitespace, quotes, backtick, `$` and `\`.
+
 - **Batched IPAM→DNS sync no longer reports failed agentless creates
   as created (#1536).** The batched path collected record ops per
   zone and flushed them without ever looking at the outcomes: a
