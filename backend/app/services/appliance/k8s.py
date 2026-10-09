@@ -729,6 +729,20 @@ def get_lease(
     return status, None
 
 
+def _micro_time(at: float | None = None) -> str:
+    """A Lease's ``acquireTime`` / ``renewTime``: a Kubernetes MicroTime.
+
+    The apiserver parses MicroTime strictly, as RFC 3339 with exactly six
+    fractional digits (``2006-01-02T15:04:05.000000Z07:00``), and answers
+    400 "cannot be handled as a Lease" to whole seconds. Every lease write
+    used whole seconds, so the rolling-upgrade orchestrator could never
+    take its lease on a real cluster (#1445).
+    """
+    stamp = time.time() if at is None else at
+    micros = int((stamp % 1) * 1_000_000)
+    return f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(stamp))}.{micros:06d}Z"
+
+
 def create_lease(
     name: str,
     holder: str,
@@ -748,7 +762,7 @@ def create_lease(
     if cfg is None:
         return False, "ServiceAccount not mounted"
     ns = namespace or cfg.namespace
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     payload = json.dumps(
         {
             "apiVersion": "coordination.k8s.io/v1",
@@ -781,6 +795,7 @@ def update_lease(
     lease_duration_seconds: int = 60,
     bump_transitions: bool = False,
     expected_transitions: int | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Update a Lease's renewTime + holderIdentity.
 
@@ -790,12 +805,14 @@ def update_lease(
     Acquisition (after a previous holder's lease expired): caller
     passes their own identity as ``holder`` + sets ``bump_transitions=
     True`` so ``leaseTransitions`` increments (this is how k8s
-    leader-election detects a takeover).
+    leader-election detects a takeover). ``expected_transitions`` is the
+    value the caller read; the patch writes it plus one.
 
-    ``expected_transitions`` lets callers do an optimistic-concurrency
-    update — if set, we read first and refuse the patch when the
-    server's value drifted (another holder beat us to the takeover).
-    Returns (ok, error). 409 reports an explicit conflict.
+    ``resource_version`` makes the update a compare-and-swap (#1512): the
+    patch carries the ``metadata.resourceVersion`` the caller read, and the
+    apiserver answers 409 when the lease changed since. Without it two
+    takeovers of one expired lease both succeeded. Returns (ok, error);
+    409 reports the conflict.
     """
     cfg = get_config()
     if cfg is None:
@@ -803,7 +820,7 @@ def update_lease(
     ns = namespace or cfg.namespace
     # We do a server-side merge patch on ``spec`` only — the
     # metadata is owned by k8s + the controller-manager.
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = _micro_time()
     spec: dict[str, Any] = {
         "holderIdentity": holder,
         "leaseDurationSeconds": lease_duration_seconds,
@@ -813,7 +830,10 @@ def update_lease(
         if expected_transitions is not None:
             spec["leaseTransitions"] = expected_transitions + 1
         spec["acquireTime"] = now
-    payload = json.dumps({"spec": spec}).encode("utf-8")
+    patch: dict[str, Any] = {"spec": spec}
+    if resource_version:
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
@@ -835,6 +855,7 @@ def clear_lease_holder(
     name: str,
     *,
     namespace: str | None = None,
+    resource_version: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mark a lease as released without deleting it.
 
@@ -850,8 +871,12 @@ def clear_lease_holder(
     ns = namespace or cfg.namespace
     # Two-hour-ago renewTime is well beyond any sane
     # leaseDurationSeconds → next read treats this as expired.
-    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
-    payload = json.dumps({"spec": {"holderIdentity": "", "renewTime": old}}).encode("utf-8")
+    old = _micro_time(time.time() - 7200)
+    patch: dict[str, Any] = {"spec": {"holderIdentity": "", "renewTime": old}}
+    if resource_version:
+        # #1512 — only clear the lease the caller read (see update_lease).
+        patch["metadata"] = {"resourceVersion": resource_version}
+    payload = json.dumps(patch).encode("utf-8")
     path = f"/apis/coordination.k8s.io/v1/namespaces/{quote(ns)}/leases/{quote(name)}"
     try:
         status, body = _request(
@@ -1071,6 +1096,22 @@ def evict_pod(
 # centralised here so the rolling-upgrade primitive can read +
 # mutate the Cluster's maintenance window without duplicating the
 # CR path math.
+
+
+def get_pod(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
+    """Read one pod. Returns (status, parsed_body_or_None), like
+    ``get_cnpg_cluster``: a non-200 comes back as status + None."""
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    status, body = _request("GET", f"/api/v1/namespaces/{quote(ns)}/pods/{quote(name)}")
+    if status == 200:
+        try:
+            return status, json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+    return status, None
 
 
 def get_cnpg_cluster(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:

@@ -83,6 +83,9 @@ _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
 _TOKEN_NAME = "spatiumddi-agent"
+# Zones this agent created from a bundle — the only ones it may delete when
+# the bundle drops them (see ``_retire_dropped_zones``).
+_MANAGED_ZONES_FILE = "technitium-managed-zones.json"
 
 # Record types whose zone-apex form is daemon-managed (SOA always; NS only
 # at the apex — an off-apex NS is a legitimate delegation record and IS
@@ -880,8 +883,28 @@ class TechnitiumDriver(DriverBase):
             shutil.rmtree(new_dir)
         new_dir.mkdir(parents=True)
 
+        raw_zones = bundle.get("zones")
+        if not isinstance(raw_zones, list):
+            raw_zones = None
+        # Every zone name the bundle carries, including the ones skipped
+        # below: ``_retire_dropped_zones`` must not delete a zone SpatiumDDI
+        # still has just because this driver could not render it. ``None``
+        # when the bundle has no zone list at all, which is not the same
+        # claim as an empty one and retires nothing.
+        bundle_zone_names = (
+            None
+            if raw_zones is None
+            else sorted(
+                {
+                    str(z.get("name") or "").rstrip(".").lower()
+                    for z in raw_zones
+                    if isinstance(z, dict) and str(z.get("name") or "").rstrip(".")
+                }
+            )
+        )
+
         zones_payload = []
-        for zone in bundle.get("zones", []) or []:
+        for zone in raw_zones or []:
             zname = (zone.get("name") or "").rstrip(".")
             if not zname:
                 continue
@@ -990,6 +1013,7 @@ class TechnitiumDriver(DriverBase):
                 if (k.get("name") or "").rstrip(".")
             ],
             "catalog": catalog,
+            "bundle_zone_names": bundle_zone_names,
         }
         self._write_secret(
             new_dir / "server.json", json.dumps(server_payload, indent=2)
@@ -1093,6 +1117,16 @@ class TechnitiumDriver(DriverBase):
             # list has to actually clear on the daemon.
             self._apply_blocking(token, server_state.get("blocking") or {})
 
+            # Retire before reconciling: Technitium files a parent's record
+            # under the closest zone it hosts, so a dropped child zone that
+            # shadows it takes the record along on delete. The reconcile
+            # below then puts it back in the parent in the same pass.
+            self._retire_dropped_zones(
+                token,
+                payload,
+                backup / "zones.json",
+                bundle_zone_names=server_state.get("bundle_zone_names"),
+            )
             self._reconcile_zones(token, payload)
             self._apply_catalog(token, server_state.get("catalog"), payload)
             failures = list(self._apply_failures)
@@ -1108,6 +1142,98 @@ class TechnitiumDriver(DriverBase):
             log.warning(
                 "technitium_apply_partly_refused", count=len(failures), refused=failures[:10]
             )
+
+    def _managed_zones_path(self) -> Path:
+        return self.state_dir / _MANAGED_ZONES_FILE
+
+    def _retire_dropped_zones(
+        self,
+        token: str,
+        payload: list[dict[str, Any]],
+        previous_render: Path,
+        *,
+        bundle_zone_names: list[str] | None,
+    ) -> None:
+        """Delete the zones this agent put on the daemon that the bundle dropped.
+
+        ``_reconcile_zones`` creates every zone in the bundle and never
+        deletes one, so a zone deleted in SpatiumDDI kept answering on every
+        Technitium server, authoritatively, with the records it last had.
+        BIND9 has no such gap: a zone that leaves the bundle leaves
+        ``named.conf``.
+
+        Only zones in the ledger are candidates, and the ledger holds only
+        names this agent got from a bundle. A zone an operator created on
+        the daemon directly is never in it, so it is never touched. The
+        ledger is seeded from the previous render the first time (an agent
+        upgraded from a version without it), so a zone dropped by the very
+        bundle that brought the upgrade is still retired; anything orphaned
+        before that is left for the operator. A delete that fails keeps its
+        name in the ledger so the next pass retries it.
+
+        Retirement follows the zone list the control plane sent, not what
+        this driver managed to render, so two cases hold it back:
+
+        * ``bundle_zone_names`` is ``None``: the bundle had no zone list
+          (key absent, ``null``, not a list) or ``server.json`` could not be
+          read. Nothing is deleted and the ledger is kept. An explicit empty
+          list is different: it is what a group with no zones sends, and
+          every zone in the ledger is retired, as BIND9 empties
+          ``named.conf``.
+        * A zone the bundle still names but the render skipped (a type
+          Technitium cannot serve, a secondary with no primaries, a
+          forwarder with no upstream) stays, and stays in the ledger.
+        """
+        desired = {str(z.get("zone") or "").lower() for z in payload if z.get("zone")}
+        path = self._managed_zones_path()
+        managed: set[str]
+        try:
+            managed = {str(n).lower() for n in json.loads(path.read_text())}
+        except FileNotFoundError:
+            managed = set()
+            try:
+                previous = json.loads(previous_render.read_text())
+                managed = {str(z.get("zone") or "").lower() for z in previous if z.get("zone")}
+            except (OSError, ValueError, AttributeError):
+                pass
+        except (OSError, ValueError, TypeError) as exc:
+            # An unreadable ledger must not turn into "delete nothing ever"
+            # silently, nor into a guess. Rebuild it from this bundle.
+            log.warning("technitium_managed_zones_unreadable", error=str(exc))
+            managed = set()
+
+        if not isinstance(bundle_zone_names, list):
+            if managed - desired:
+                log.warning(
+                    "technitium_zone_retire_held_back",
+                    reason="bundle_has_no_zone_list",
+                    zones=sorted(managed - desired),
+                )
+            self._write_secret(path, json.dumps(sorted(managed | desired)))
+            return
+
+        named = {str(n).lower() for n in bundle_zone_names}
+        held = (managed - desired) & named
+        if held:
+            log.warning(
+                "technitium_zone_retire_held_back",
+                reason="zone_still_in_bundle",
+                zones=sorted(held),
+            )
+
+        kept: set[str] = set()
+        for zone in sorted(managed - desired - named):
+            body = self._call(token, "POST", "zones/delete", {"zone": zone}).json()
+            error = body.get("errorMessage") or ""
+            if body.get("status") == "ok":
+                log.info("technitium_zone_retired", zone=zone)
+            elif "no such zone" in error.lower() or "does not exist" in error.lower():
+                pass  # already gone, e.g. removed by hand
+            else:
+                kept.add(zone)
+                log.warning("technitium_zone_retire_failed", zone=zone, error=error)
+
+        self._write_secret(path, json.dumps(sorted(desired | held | kept)))
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -1971,10 +2097,9 @@ class TechnitiumDriver(DriverBase):
         records present on the daemon but absent from desired state and
         add records present in desired state but absent on the daemon.
 
-        Zones present on the daemon but absent from ``payload`` are NOT
-        deleted — same safety stance as the other drivers (operators
-        delete a zone explicitly, it doesn't disappear from a sync
-        glitch).
+        Zones absent from ``payload`` are not deleted here. A zone this
+        agent created and the bundle has since dropped is retired by
+        ``_retire_dropped_zones``; a zone it never managed is left alone.
         """
         for zone_payload in payload:
             zone = zone_payload["zone"]
