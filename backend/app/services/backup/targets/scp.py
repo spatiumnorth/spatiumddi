@@ -16,11 +16,16 @@ Config shape:
 * ``private_key`` — optional, PEM-encoded. **Secret.**
 * ``private_key_passphrase`` — optional, **secret.** Only set
   when the key itself is passphrase-protected.
-* ``host_key_check`` — ``"strict"`` (default — refuse
-  unknown hosts), ``"known_hosts"`` (use the operator-supplied
-  ``known_hosts_pem``), or ``"insecure_skip"`` (homelab/lab
-  shortcut, *not* recommended for production).
-* ``known_hosts`` — optional, the OpenSSH known_hosts content.
+* ``host_key_check`` — ``"known_hosts"`` (default — refuse
+  hosts not in the operator-supplied ``known_hosts``),
+  ``"strict"`` (the same check under its historical name;
+  also uses the supplied ``known_hosts``), or
+  ``"insecure_skip"`` (homelab/lab shortcut, *not*
+  recommended for production).
+* ``known_hosts`` — the OpenSSH known_hosts content. Required
+  for the checked modes: the driver loads no system host keys,
+  so a checked mode with no supplied keys has an empty store
+  and would refuse every server (#1569).
 
 Implementation notes:
 
@@ -73,6 +78,20 @@ _HOST_KEY_MODES = {"strict", "known_hosts", "insecure_skip"}
 # build_backup_archive timeout).
 _SSH_CONNECT_TIMEOUT = 30
 _SSH_BANNER_TIMEOUT = 30
+# Per-operation ceiling on the SFTP channel (#1515). connect / banner /
+# auth timeouts were set, but the channel itself had none, so a server
+# that stalls mid-transfer hung the backup run indefinitely — the
+# runner's row sat ``in_progress`` with no process-level bound at all.
+_SFTP_CHANNEL_TIMEOUT = 300
+
+
+def _open_sftp(client):  # type: ignore[no-untyped-def]
+    """Open the SFTP subsystem with a channel timeout set (#1515)."""
+    sftp = client.open_sftp()
+    channel = sftp.get_channel()
+    if channel is not None:
+        channel.settimeout(_SFTP_CHANNEL_TIMEOUT)
+    return sftp
 
 
 class ScpDestination(BackupDestination):
@@ -138,8 +157,8 @@ class ScpDestination(BackupDestination):
             type="text",
             required=False,
             description=(
-                "'strict' (default; refuse unknown hosts), "
-                "'known_hosts' (use the supplied list), or "
+                "'known_hosts' (default; refuse hosts not in the supplied "
+                "known_hosts), 'strict' (same check, historical name), or "
                 "'insecure_skip' (homelab shortcut, not recommended)."
             ),
         ),
@@ -149,8 +168,8 @@ class ScpDestination(BackupDestination):
             type="text",
             required=False,
             description=(
-                "OpenSSH known_hosts file content. Only used when "
-                "host_key_check = 'known_hosts'."
+                "OpenSSH known_hosts file content. Required when "
+                "host_key_check = 'known_hosts' (the default) or 'strict'."
             ),
         ),
     )
@@ -175,15 +194,25 @@ class ScpDestination(BackupDestination):
         remote_path = config["remote_path"]
         if not remote_path.startswith("/"):
             raise DestinationConfigError("'remote_path' must be absolute")
-        host_key_check = config.get("host_key_check") or "strict"
+        host_key_check = config.get("host_key_check") or "known_hosts"
         if host_key_check not in _HOST_KEY_MODES:
             raise DestinationConfigError(
                 f"'host_key_check' must be one of {sorted(_HOST_KEY_MODES)} "
                 f"(got {host_key_check!r})"
             )
-        if host_key_check == "known_hosts" and not config.get("known_hosts"):
+        if host_key_check in {"known_hosts", "strict"} and not config.get("known_hosts"):
+            # The driver loads no system host keys, so a checked mode
+            # without supplied keys checks against an EMPTY store and
+            # refuses every server (#1569). The old default was
+            # exactly that ("strict" with nothing loaded), which
+            # pushed operators to insecure_skip. Refuse the config
+            # here, where the fix is obvious, instead of at connect
+            # time, where it looks like a server problem.
             raise DestinationConfigError(
-                "host_key_check='known_hosts' requires 'known_hosts' to be set"
+                f"host_key_check={host_key_check!r} requires 'known_hosts' to be "
+                "set — paste the server's known_hosts line(s) (e.g. the output of "
+                "`ssh-keyscan <host>`), or set host_key_check='insecure_skip' "
+                "(not recommended: it accepts any host key)"
             )
 
     def _connect(self, config: dict[str, Any]):
@@ -191,41 +220,17 @@ class ScpDestination(BackupDestination):
         import paramiko  # noqa: PLC0415
 
         client = paramiko.SSHClient()
-        host_key_check = config.get("host_key_check") or "strict"
+        host_key_check = config.get("host_key_check") or "known_hosts"
         if host_key_check == "insecure_skip":
             # Equivalent to ``StrictHostKeyChecking no`` — only
             # appropriate for trusted lab networks.
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        elif host_key_check == "known_hosts":
-            known = config.get("known_hosts") or ""
-            for line in known.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    parts = line.split()
-                    # paramiko's add_host_keys consumes a file path,
-                    # so we feed lines manually via load_host_keys's
-                    # internals.
-                    if len(parts) < 3:
-                        continue
-                    hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
-                    key_obj = paramiko.RSAKey if keytype == "ssh-rsa" else None
-                    if not key_obj:
-                        # Try the generic loader for non-RSA types.
-                        # paramiko's HostKeys handles parsing better
-                        # than a hand-rolled mapping.
-                        host_keys = paramiko.HostKeys()
-                        host_keys.add(hostnames, keytype, _decode_pubkey(keytype, key_b64))
-                        client._host_keys.update(host_keys)  # noqa: SLF001
-                    else:
-                        decoded = _decode_pubkey(keytype, key_b64)
-                        if decoded is not None:
-                            client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
-                except Exception:  # noqa: BLE001
-                    continue
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        else:  # strict
+        else:
+            # "known_hosts" and "strict" are the same check (#1569):
+            # load the operator-supplied keys, then refuse anything
+            # not among them. ``strict`` used to skip the load, which
+            # left the store empty and made the mode unusable.
+            _load_supplied_host_keys(client, config.get("known_hosts") or "")
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         port = int(config.get("port") or 22)
@@ -267,7 +272,10 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                try:
+                    sftp = _open_sftp(client)
+                except Exception as exc:  # noqa: BLE001
+                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
@@ -279,10 +287,24 @@ class ScpDestination(BackupDestination):
                     except OSError:
                         pass  # didn't exist
                     sftp.rename(tmp, remote)
+                except Exception as exc:  # noqa: BLE001
+                    # Best-effort cleanup of the staged file (#1570),
+                    # mirroring the NFS driver: listing and retention
+                    # only match ``*.zip``, so a leftover ``.tmp`` is
+                    # invisible and is never pruned.
+                    try:
+                        sftp.remove(tmp)
+                    except FileNotFoundError:
+                        pass  # the failure predates the staged file
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        logger.warning(
+                            "scp_partial_cleanup_failed",
+                            path=tmp,
+                            error=str(cleanup_exc),
+                        )
+                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
                 finally:
                     sftp.close()
-            except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
             finally:
                 client.close()
 
@@ -294,7 +316,7 @@ class ScpDestination(BackupDestination):
         def _do() -> list[ArchiveListing]:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     entries = sftp.listdir_attr(remote_path)
                 except FileNotFoundError as exc:
@@ -334,7 +356,7 @@ class ScpDestination(BackupDestination):
         def _do() -> bytes:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     with sftp.file(remote, "rb") as fh:
                         return fh.read()
@@ -356,7 +378,7 @@ class ScpDestination(BackupDestination):
         def _do() -> None:
             client = self._connect(config)
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     sftp.remove(remote)
                 except FileNotFoundError:
@@ -385,7 +407,7 @@ class ScpDestination(BackupDestination):
             except BackupDestinationError as exc:
                 return {"ok": False, "error": str(exc)}
             try:
-                sftp = client.open_sftp()
+                sftp = _open_sftp(client)
                 try:
                     # Sanity-check the path exists + is a directory.
                     stat = sftp.stat(remote_path)
@@ -415,6 +437,40 @@ class ScpDestination(BackupDestination):
             }
 
         return await asyncio.to_thread(_do)
+
+
+def _load_supplied_host_keys(client, known: str) -> None:
+    """Load operator-supplied known_hosts lines into the client's
+    host-key store. Malformed lines are skipped, as before.
+    """
+    import paramiko  # noqa: PLC0415
+
+    for line in known.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = line.split()
+            # paramiko's add_host_keys consumes a file path,
+            # so we feed lines manually via load_host_keys's
+            # internals.
+            if len(parts) < 3:
+                continue
+            hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
+            key_obj = paramiko.RSAKey if keytype == "ssh-rsa" else None
+            if not key_obj:
+                # Try the generic loader for non-RSA types.
+                # paramiko's HostKeys handles parsing better
+                # than a hand-rolled mapping.
+                host_keys = paramiko.HostKeys()
+                host_keys.add(hostnames, keytype, _decode_pubkey(keytype, key_b64))
+                client._host_keys.update(host_keys)  # noqa: SLF001
+            else:
+                decoded = _decode_pubkey(keytype, key_b64)
+                if decoded is not None:
+                    client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _load_private_key(pem: str, passphrase: str | None):

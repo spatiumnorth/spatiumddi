@@ -142,6 +142,12 @@ RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
 # above), not the generic evaluator — the task opens/resolves the
 # event itself off the version-vs-head comparison.
 RULE_TYPE_SCHEMA_BEHIND_HEAD = "schema_behind_head"
+# ACME auto-renewal cannot renew a certificate whose issuance shape
+# needs a person (manual DNS-01 for domains SpatiumDDI doesn't host).
+# The renewal sweep (``app.tasks.acme``) skips such certs and opens an
+# event against this rule instead of minting an order that can never
+# succeed (#1529). Managed directly by the sweep, not the evaluator.
+RULE_TYPE_ACME_MANUAL_RENEWAL = "acme_manual_renewal"
 # Voice-VLAN client-count drop — issue #112 phase 2. Counts active
 # DHCP leases on every subnet tagged ``subnet_role='voice'``; fires
 # when the count drops below ``threshold_percent`` (reused as a raw
@@ -527,6 +533,25 @@ RULE_TYPE_IP_BLOCKLISTED = "ip_blocklisted"
 # passes.
 RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
 
+# Scheduled backups (issue #1262). Before these, a failed nightly backup
+# wrote an audit row and nothing else, so on a default install it could
+# fail for weeks unnoticed. Subject is the **backup target**, and only
+# enabled targets with a schedule are watched. Both decided by
+# ``services/backup/health.evaluate_backup_health``, shared with the
+# ``get_backup_health`` copilot tool.
+#   * ``backup_failed`` — the last finished run failed. Resolves on the
+#     next success.
+#   * ``backup_stale`` — no successful run within N scheduled runs plus a
+#     grace (N = ``threshold_percent``, reused as a count, default 2). Also
+#     catches the cases where nothing runs at all: beat or worker down, or
+#     a run left ``in_progress`` by a dead process, which the sweep then
+#     skips forever.
+# A run that is genuinely in progress neither opens nor resolves either
+# event, so a target that keeps failing holds one event instead of
+# resolving and re-firing around every attempt.
+RULE_TYPE_BACKUP_FAILED = "backup_failed"
+RULE_TYPE_BACKUP_STALE = "backup_stale"
+
 # ``dns_tunneling_suspected`` (issue #699) — a client's DNS behaviour
 # scored above the tunneling threshold in a recent hourly window.
 # Subject is the **client IP**, so a host tunnelling for six hours holds
@@ -598,6 +623,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_COMPLIANCE_CHANGE,
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         RULE_TYPE_SCHEMA_BEHIND_HEAD,
+        RULE_TYPE_ACME_MANUAL_RENEWAL,
         RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
         RULE_TYPE_K3S_API_CERT_EXPIRING,
         RULE_TYPE_STALE_IP_COUNT,
@@ -632,6 +658,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
         RULE_TYPE_IP_BLOCKLISTED,
         RULE_TYPE_RESTORE_DRILL_FAILED,
+        RULE_TYPE_BACKUP_FAILED,
+        RULE_TYPE_BACKUP_STALE,
         RULE_TYPE_DNS_TUNNELING,
         RULE_TYPE_DNS_BEACONING,
         RULE_TYPE_DNS_DGA,
@@ -648,6 +676,8 @@ _EXTERNALLY_DRIVEN_RULE_TYPES: frozenset[str] = frozenset(
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
         # ``app.tasks.schema_check`` (#565).
         RULE_TYPE_SCHEMA_BEHIND_HEAD,
+        # ``app.tasks.acme.renew_due_certificates`` (#1529).
+        RULE_TYPE_ACME_MANUAL_RENEWAL,
         # The rolling-upgrade orchestrator (``services/upgrades/alerts.py``).
         _CLUSTER_UPGRADE_FAILED,
     }
@@ -738,6 +768,10 @@ _COMPLIANCE_CHANGE_AUTO_RESOLVE_HOURS = 24
 # watermark advances by however many rows we processed, so the next
 # tick picks up where this one left off.
 _COMPLIANCE_CHANGE_SCAN_LIMIT = 1000
+
+# Rule ids already warned about for a missing/unknown classification
+# (#1580) — log once per rule per process instead of every 60 s tick.
+_COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED: set[str] = set()
 
 # Resource types in audit_log we know how to map back to a Subnet for
 # classification lookup. Anything outside this set is skipped with a
@@ -1295,6 +1329,125 @@ async def _matching_restore_drill_failed_subjects(
                 f"recovery path — investigate before you need it."
             )
         matches.append((str(target_id), target_name, message))
+    return matches
+
+
+def _fmt_utc(dt: datetime | None) -> str:
+    if dt is None:
+        return "unknown time"
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+async def _open_event_severities(db: AsyncSession, rule: AlertRule) -> dict[str, str]:
+    """Open events of ``rule`` keyed by subject_id, for matchers that
+    hold an event standing while their subject is in an undecided state."""
+    rows = (
+        (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {ev.subject_id: ev.severity for ev in rows}
+
+
+async def _matching_backup_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str | None]]:
+    """Watched backup targets whose last finished run failed (#1262).
+
+    A run in progress says nothing new, so it holds an open event at its
+    current severity (a no-op for the shared loop) instead of resolving
+    it. Without that, a target failing every night would resolve and
+    re-fire, and notify again, around every attempt.
+
+    The message deliberately leaves out ``last_run_error``: driver errors
+    can carry hosts, paths or bucket names, and alert payloads leave the
+    install by syslog / webhook / SMTP.
+    """
+    from app.services.backup.health import evaluate_backup_health  # noqa: PLC0415
+
+    held = await _open_event_severities(db, rule)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await evaluate_backup_health(db, now=now):
+        if not h.watched:
+            continue
+        subject_id = str(h.target_id)
+        if h.failed:
+            since = (
+                f"Last successful run: {_fmt_utc(h.last_success_at)}."
+                if h.last_success_at is not None
+                else "It has never completed a successful run."
+            )
+            message = (
+                f"Scheduled backup FAILED for target '{h.name}' ({h.kind}): the "
+                f"run started {_fmt_utc(h.last_run_at)} did not complete. {since} "
+                "The error is on the Backup page and in the audit log."
+            )
+            matches.append((subject_id, h.name, message, None))
+        elif h.last_run_status == "in_progress" and subject_id in held:
+            matches.append((subject_id, h.name, "", held[subject_id]))
+    return matches
+
+
+async def _matching_backup_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str | None]]:
+    """Watched backup targets with no successful run within N scheduled
+    runs plus the grace (#1262). N is ``threshold_percent``, reused as a
+    count.
+
+    A run that is genuinely in progress holds an open event rather than
+    resolving it, same as ``backup_failed``. A run presumed dead does
+    not: it counts as no run, which is the case this rule exists for.
+    """
+    from app.services.backup.health import (  # noqa: PLC0415
+        STALE_AFTER_RUNS_DEFAULT,
+        evaluate_backup_health,
+    )
+
+    runs = rule.threshold_percent or STALE_AFTER_RUNS_DEFAULT
+    held = await _open_event_severities(db, rule)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await evaluate_backup_health(db, now=now, stale_after_runs=runs):
+        if not h.watched:
+            continue
+        subject_id = str(h.target_id)
+        if h.run_in_progress:
+            if subject_id in held:
+                matches.append((subject_id, h.name, "", held[subject_id]))
+            continue
+        if not h.stale:
+            continue
+        since = f"since {_fmt_utc(h.last_success_at)}" if h.last_success_at is not None else "ever"
+        if h.run_presumed_dead:
+            why = (
+                f"A run has been marked in progress since {_fmt_utc(h.last_run_at)}; "
+                "the process running it has most likely died, and the scheduler skips "
+                "the target until it clears. Run it now from the Backup page."
+            )
+        elif h.failed:
+            why = "The last run failed."
+        else:
+            due = f" (due {_fmt_utc(h.next_run_at)})" if h.next_run_at is not None else ""
+            why = (
+                f"The scheduled run{due} has not started. "
+                "Check that the Celery worker and beat are running."
+            )
+        message = (
+            f"Backup target '{h.name}' ({h.kind}) has had no successful run {since}, "
+            f"across {runs} scheduled run(s) ({h.schedule_cron}). {why}"
+        )
+        matches.append((subject_id, h.name, message, None))
     return matches
 
 
@@ -3111,7 +3264,7 @@ async def _matching_secret_expiring_subjects(
         message = (
             f"API token '{t.name}' ({t.prefix}…) {_descriptor(days)} "
             f"({t.expires_at.isoformat()}, threshold {threshold_days} d). "
-            f"Rotate it from Settings → API Tokens."
+            f"Rotate it from Administration → API Tokens."
         )
         matches.append((f"api_token:{t.id}", f"{t.name} API token", message, sev))
 
@@ -3420,9 +3573,11 @@ async def _matching_agent_config_rejected_subjects(
     from app.models.dns import DNSServer  # noqa: PLC0415
     from app.services.agents.config_apply import (  # noqa: PLC0415
         FAILED_STATUSES,
+        PARTIAL_APPLY_PREFIX,
         SEVERITY_BY_STATUS,
         STATUS_NO_PREVIOUS,
         STATUS_REVERT_FAILED,
+        is_partial_apply,
     )
 
     matches: list[tuple[str, str, str, str | None]] = []
@@ -3439,6 +3594,7 @@ async def _matching_agent_config_rejected_subjects(
         )
         for row in rows:
             status = row.config_apply_status or ""
+            what: str | None
             if status == STATUS_NO_PREVIOUS:
                 what = (
                     "could not apply the configuration and had no previously-working "
@@ -3449,17 +3605,28 @@ async def _matching_agent_config_rejected_subjects(
                     "could not apply the configuration AND failed to roll back to the "
                     "previous one — its running state is unknown"
                 )
+            elif is_partial_apply(status, row.config_apply_error):
+                what = None
             else:
                 what = (
                     "rejected the configuration and rolled back to the last one that "
                     "worked, so it is healthy but NOT serving what is saved here"
                 )
             detail = (row.config_apply_error or "").strip()
-            message = (
-                f"{kind} server '{row.name}' {what}. "
-                f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
-                + (f" Daemon reported: {detail}" if detail else "")
-            )
+            if what is None:
+                # Nothing was rolled back: the bundle is live and every zone
+                # but the refused ones is served as saved.
+                refused = detail[len(PARTIAL_APPLY_PREFIX) :]
+                message = (
+                    f"{kind} server '{row.name}' applied the configuration, but {refused}. "
+                    "Nothing was rolled back; fix the refused zones' data."
+                )
+            else:
+                message = (
+                    f"{kind} server '{row.name}' {what}. "
+                    f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
+                    + (f" Daemon reported: {detail}" if detail else "")
+                )
             subject_id = f"{model.__tablename__}:{row.id}"
             matches.append(
                 (subject_id, f"{row.name} ({kind})", message, SEVERITY_BY_STATUS.get(status))
@@ -3550,15 +3717,14 @@ async def _matching_dns_record_op_failed_subjects(
     rule: AlertRule,  # noqa: ARG001
     now: datetime | None = None,
 ) -> list[tuple[str, str, str, str | None]]:
-    """``dns_record_op_failed`` — every agent-based DNS server with a record op
+    """``dns_record_op_failed`` — every DNS server with a record op
     that gave up (``failed``) within :data:`_DNS_OP_FAILED_WINDOW` (#1232).
 
-    Agent-based only: an agentless driver (Windows, cloud, ``technitium_api``)
-    applies an op once, inline, and returns the failure to the caller who made
-    the change, and the retry, backoff and "until a render or agent restart"
-    this rule describes do not apply to it.
+    Agentless servers are included since #1538: their ops now go through
+    the same retry budget as agent ops, so a ``failed`` agentless op really
+    does mean "after every retry" — a transient error that will recover
+    sits in ``pending``, not here.
     """
-    from app.drivers.dns import AGENTLESS_DRIVERS  # noqa: PLC0415
     from app.models.dns import DNSRecordOp, DNSServer  # noqa: PLC0415
 
     now = now or datetime.now(UTC)
@@ -3569,7 +3735,6 @@ async def _matching_dns_record_op_failed_subjects(
             .where(
                 DNSRecordOp.state == "failed",
                 DNSRecordOp.updated_at >= now - _DNS_OP_FAILED_WINDOW,
-                DNSServer.driver.not_in(sorted(AGENTLESS_DRIVERS)),
             )
             .order_by(DNSRecordOp.updated_at.desc())
         )
@@ -4360,11 +4525,17 @@ async def _evaluate_compliance_change_rule(
 
     classification = rule.classification or ""
     if classification not in COMPLIANCE_CLASSIFICATIONS:
-        logger.warning(
-            "alert_compliance_unknown_classification",
-            rule=str(rule.id),
-            classification=classification,
-        )
+        # #1580 — warn once per rule, not on every 60 s tick. Rules
+        # created before the API required a classification (or with
+        # an unknown one) are dead until fixed; one warning says so.
+        rule_key = str(rule.id)
+        if rule_key not in _COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED:
+            _COMPLIANCE_UNKNOWN_CLASSIFICATION_WARNED.add(rule_key)
+            logger.warning(
+                "alert_compliance_unknown_classification",
+                rule=rule_key,
+                classification=classification,
+            )
         return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
 
     actions = _COMPLIANCE_CHANGE_SCOPE_ACTIONS.get(
@@ -4381,6 +4552,10 @@ async def _evaluate_compliance_change_rule(
         )
     )
     for ev in open_res.scalars().all():
+        # #1578 — conformity events are owned by the conformity
+        # engine; this window must not auto-resolve them.
+        if ev.subject_type == "conformity":
+            continue
         if ev.fired_at < auto_resolve_cutoff:
             ev.resolved_at = now
             resolved += 1
@@ -4626,6 +4801,50 @@ async def seed_schema_behind_head_alert_rule() -> None:
                 ),
                 rule_type=RULE_TYPE_SCHEMA_BEHIND_HEAD,
                 severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=True,
+            )
+        )
+        await session.commit()
+
+
+_ACME_MANUAL_RENEWAL_RULE_NAME = "acme-manual-renewal"
+
+
+async def seed_acme_manual_renewal_alert_rule() -> None:
+    """Seed the singleton ``acme-manual-renewal`` rule (#1529).
+
+    Enabled by default — a Let's Encrypt cert that auto-renewal must
+    skip because its issuance shape needs a person (manual DNS-01)
+    should page loudly instead of silently expiring while the sweep
+    mints orders that can never succeed. Keyed on ``name``; an operator
+    who disables / renames it is never overridden by a later boot.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _ACME_MANUAL_RENEWAL_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_ACME_MANUAL_RENEWAL_RULE_NAME,
+                description=(
+                    "Fires when the ACME auto-renewal sweep finds an active "
+                    "Let's Encrypt certificate inside its renewal window whose "
+                    "issuance shape cannot be renewed unattended (manual "
+                    "DNS-01 for domains SpatiumDDI does not host). The sweep "
+                    "skips the cert instead of creating an order that can "
+                    "never succeed; renew it by hand via a fresh ACME issue. "
+                    "Auto-resolves when the sweep next renews the cert."
+                ),
+                rule_type=RULE_TYPE_ACME_MANUAL_RENEWAL,
+                severity="warning",
                 enabled=True,
                 notify_syslog=True,
                 notify_webhook=True,
@@ -5528,7 +5747,8 @@ async def seed_bgp_hijack_alert_rules() -> None:
                 "critical when RPKI says the announcement is invalid, warning "
                 "when RPKI coverage is unknown. Auto-resolves when the "
                 "announcement delists or is acknowledged. Enable once BGP "
-                "monitoring (Settings → bgp_monitoring_enabled) is on."
+                "monitoring is on: the bgp_monitoring_enabled platform setting, "
+                "set through the settings API (the console has no switch for it)."
             ),
         ),
         (
@@ -5746,6 +5966,10 @@ async def _deliver(
     Per-target ``min_severity`` / ``resource_types`` filters still
     apply via ``_deliver_to_target``. A dead target isolates to its
     own row; the others still see the event.
+
+    A kind's flag is set only when at least one target of that kind
+    reports ``delivered`` (#1577) — a filtered target, a misconfigured
+    one, or one whose transport failed must not stamp the receipt.
     """
     delivered_syslog = False
     delivered_webhook = False
@@ -5773,7 +5997,9 @@ async def _deliver(
         if kind == "smtp" and not rule.notify_smtp:
             continue
         try:
-            await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            outcome = await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            if outcome != audit_forward.DELIVERED:
+                continue
             if kind == "syslog":
                 delivered_syslog = True
             elif kind == "webhook":
@@ -6006,6 +6232,73 @@ async def seed_restore_drill_failed_alert_rule() -> None:
             )
         )
         await session.commit()
+
+
+_BACKUP_RULE_SEEDS: tuple[dict[str, Any], ...] = (
+    {
+        "rule_type": RULE_TYPE_BACKUP_FAILED,
+        "name": "Scheduled backup failed",
+        "description": (
+            "Fires when the last run of an enabled, scheduled backup target "
+            "failed. Subject is the target. Auto-resolves when its next run "
+            "succeeds. Manual-only and disabled targets are not watched."
+        ),
+        "severity": "warning",
+        "threshold_percent": None,
+    },
+    {
+        "rule_type": RULE_TYPE_BACKUP_STALE,
+        "name": "Scheduled backup stale",
+        "description": (
+            "Fires when an enabled, scheduled backup target has had no "
+            "successful run within N scheduled runs plus one hour (N = "
+            "threshold_percent, used as a count). Catches backups that "
+            "stopped running at all: worker or beat down, or a run left "
+            "in progress by a dead process. Auto-resolves on the next "
+            "successful run."
+        ),
+        "severity": "critical",
+        "threshold_percent": 2,
+    },
+)
+
+
+async def seed_backup_alert_rules() -> None:
+    """Seed ``backup_failed`` + ``backup_stale`` (#1262), ENABLED.
+
+    Enabled for the same reason as ``restore_drill_failed``: both rules
+    only watch enabled targets with a schedule, so they are silent on an
+    install that has none, and an operator who scheduled a backup wants
+    to know when it stops working. Keyed on ``rule_type``; an operator who
+    disables, renames or re-thresholds one is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        added = False
+        for seed in _BACKUP_RULE_SEEDS:
+            existing = await session.scalar(
+                select(AlertRule).where(AlertRule.rule_type == seed["rule_type"])
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    severity=seed["severity"],
+                    threshold_percent=seed["threshold_percent"],
+                    enabled=True,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+            added = True
+        if added:
+            await session.commit()
 
 
 async def seed_dns_tunneling_alert_rule() -> None:
@@ -6300,6 +6593,12 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_restore_drill_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "backup_target"
+            elif rule.rule_type == RULE_TYPE_BACKUP_FAILED:
+                matches = await _matching_backup_failed_subjects(db, rule, now)
+                subject_type = "backup_target"
+            elif rule.rule_type == RULE_TYPE_BACKUP_STALE:
+                matches = await _matching_backup_stale_subjects(db, rule, now)
+                subject_type = "backup_target"
             elif rule.rule_type == RULE_TYPE_DNS_TUNNELING:
                 base = await _matching_dns_tunneling_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
@@ -6560,7 +6859,15 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 )
             )
             open_events = list(open_res.scalars().all())
-            open_by_subject = {ev.subject_id: ev for ev in open_events}
+            # #1578 — conformity events (subject_type="conformity") are
+            # opened by the conformity engine against an ordinary rule;
+            # no matcher here ever produces that subject_type, so the
+            # resolve-if-unmatched pass below would close them within
+            # a tick and the engine would not re-fire while the policy
+            # keeps failing. They are not this evaluator's to manage.
+            open_by_subject = {
+                ev.subject_id: ev for ev in open_events if ev.subject_type != "conformity"
+            }
 
             match_ids = {sid for sid, _, _, _ in matches}
 

@@ -77,6 +77,7 @@ from app.services.ai.tools.base import (
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
     ToolRegistry,
     effective_tool_names,
     register_tool,
@@ -89,6 +90,7 @@ __all__ = [
     "ToolNotFound",
     "ToolArgumentError",
     "ToolDisabled",
+    "ToolPermissionDenied",
     "register_tool",
     "effective_tool_names",
 ]

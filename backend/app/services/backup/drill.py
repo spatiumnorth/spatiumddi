@@ -56,6 +56,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.backup.archive import (
+    MAX_ARCHIVE_BYTES,
     BackupArchiveError,
     _pg_env_from_url,
     _pg_subprocess_env,
@@ -68,6 +69,7 @@ from app.services.backup.targets import (
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
 )
 
 logger = structlog.get_logger(__name__)
@@ -708,7 +710,10 @@ async def _assert_audit_chain(
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
-        f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
+        f"; first at seq {first.seq} ({first.reason}: {first.action} "
+        f"{first.resource_type} {first.resource_id})"
+        if first is not None
+        else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
 
@@ -932,11 +937,18 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     except DrillError as exc:
         return DrillOutcome(state="error", error=str(exc))
 
-    # 1. Fetch the newest archive from the destination.
+    # 1. Fetch the newest archive from the destination. Pre-restore
+    #    safety dumps are not this target's backups (#1574): they are
+    #    encrypted with the public constant passphrase, so drilling one
+    #    would report a healthy target's archive as unrestorable.
     try:
         driver = get_destination(target.kind)
         plain_config = decrypt_config_secrets(driver, target.config)
-        listings = await driver.list_archives(config=plain_config)
+        listings = [
+            listing
+            for listing in await driver.list_archives(config=plain_config)
+            if not is_pre_restore_archive(listing.filename)
+        ]
     except (BackupDestinationError, SecretFieldError, ValueError) as exc:
         if target.write_only:
             # A write-only target whose credential cannot list is the
@@ -982,6 +994,21 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     assertions.append(
         Assertion("archive_available", PASS, f"{newest.filename} ({newest.size_bytes} bytes)")
     )
+
+    if newest.size_bytes > MAX_ARCHIVE_BYTES:
+        # Same destination-download cap as the API (#1568): the
+        # listing already declares the size, so refuse before the
+        # bytes are fetched into memory at all.
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=(
+                f"archive {newest.filename} declares {newest.size_bytes} bytes, "
+                f"which exceeds the {MAX_ARCHIVE_BYTES}-byte cap for "
+                "destination downloads"
+            ),
+        )
 
     try:
         # Bounded explicitly: the destination drivers impose no ceiling
@@ -1069,7 +1096,9 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         )
 
     try:
-        payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        # Same off-loop derivation as the restore path (#1568): the
+        # PBKDF2 cost is deliberate CPU work, not event-loop work.
+        payload = await asyncio.to_thread(decrypt_secrets, secrets_enc, passphrase=passphrase)
     except BackupCryptoError as exc:
         assertions.append(
             Assertion(

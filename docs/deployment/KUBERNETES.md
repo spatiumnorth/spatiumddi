@@ -240,11 +240,16 @@ registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
 [`k8s/README.md` → How servers register](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md#how-servers-register).
 
 > **DHCPv4 needs broadcast reception on the client LAN.** Run the pod with
-> `hostNetwork: true`, or front it with a DHCP relay (option 82). The static
-> manifests under `k8s/dhcp/` expose UDP/67 via `NodePort` for lab use only.
+> `hostNetwork: true`, or front it with a DHCP relay (option 82) pointed
+> at a LoadBalancer Service on UDP/67. The static manifests under
+> `k8s/dhcp/` use that LoadBalancer Service: on a `NodePort` Service the
+> declared `port: 67` is in-cluster only, and the node-facing port is a
+> random 30000–32767 pick. Pinning it (`service.nodePort` in the chart)
+> only helps a relay that can forward to a non-standard port; most,
+> including `ip helper-address`, send to UDP/67 only.
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `service.type`,
-`hostNetwork`, `resources`) are documented in the
+`service.nodePort`, `hostNetwork`, `resources`) are documented in the
 [chart README → Agents](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#agents) table.
 
 ---
@@ -381,9 +386,11 @@ steps in [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/
 ### Redis — Sentinel
 
 Set `redis.kind: sentinel` to render a StatefulSet where each pod runs a
-`redis-server` + a `redis-sentinel` sidecar. Pod-0 starts as master; the rest
-replicate from it; the sentinels elect a new master and fail over
-automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
+`redis-server` + a `redis-sentinel` sidecar. A starting pod asks the running
+sentinels which pod is the master and replicates from it (or starts as master
+when they name the pod itself); only when no sentinel answers, the whole set
+starting cold, does pod-0 start as master with the rest replicating from it.
+The sentinels elect a new master and fail over automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
 the live master through the sentinels — no static master Service needed.
 
 ```yaml

@@ -32,8 +32,13 @@ from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.backup.archive import MAX_ARCHIVE_BYTES
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
-from app.services.backup.runner import run_backup_for_target
+from app.services.backup.runner import (
+    BackupRunBusyError,
+    reap_stale_backup_run,
+    run_backup_for_target,
+)
 from app.services.backup.schedule import (
     InvalidCronExpression,
     compute_next_run,
@@ -49,6 +54,7 @@ from app.services.backup.targets import (
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
+    is_pre_restore_archive,
     list_destination_kinds,
     merge_config_for_update,
     redact_config_secrets,
@@ -57,6 +63,26 @@ from app.services.backup.targets import (
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+
+
+def _enforce_download_size(size_bytes: int, *, filename: str) -> None:
+    """Refuse a destination download past the archive size cap (#1568).
+
+    The 2 GB ceiling used to apply only to archives uploaded TO the
+    api; an archive fetched FROM a destination had no cap, so a
+    shared or compromised destination could serve an unbounded
+    payload into api memory (and into restore). Callers with a
+    listing check the declared size before downloading and the
+    actual length after.
+    """
+    if size_bytes > MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"archive {filename!r} is {size_bytes} bytes, which exceeds the "
+                f"{MAX_ARCHIVE_BYTES}-byte cap for destination downloads"
+            ),
+        )
 
 
 # Pulled from the driver registry rather than hardcoded so new
@@ -546,7 +572,17 @@ async def update_target(
             user_id=current_user.id,
             user_display_name=current_user.username,
             result="success",
-            new_value={k: v for k, v in payload.items() if k != "passphrase"},
+            # Never the raw payload: ``config`` carries credentials, and
+            # ``url`` can too (a presigned query string). Record which
+            # config keys changed, not their values.
+            new_value={
+                **{k: v for k, v in payload.items() if k not in ("passphrase", "config")},
+                **(
+                    {"config_keys_changed": sorted(payload["config"] or {})}
+                    if "config" in payload
+                    else {}
+                ),
+            },
         )
     )
     await db.commit()
@@ -607,13 +643,23 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
         raise HTTPException(status_code=404, detail="backup target not found")
     if not row.enabled:
         raise HTTPException(status_code=409, detail="target is disabled — enable it first")
-    result = await run_backup_for_target(
-        db,
-        target=row,
-        triggered_by="manual",
-        actor_id=current_user.id,
-        actor_display=current_user.username,
-    )
+    # A run stranded by a dead process (#1515) is reaped to ``failed``
+    # first — otherwise a manual-only target (which the schedule
+    # sweep never visits) would 409 here forever.
+    await reap_stale_backup_run(db, target=row, actor_display=current_user.username)
+    try:
+        result = await run_backup_for_target(
+            db,
+            target=row,
+            triggered_by="manual",
+            actor_id=current_user.id,
+            actor_display=current_user.username,
+        )
+    except BackupRunBusyError as exc:
+        # The runner's atomic claim lost to a run already in flight
+        # (a double-click, or the schedule sweep) (#1571). 409, not a
+        # second concurrent run.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunNowResponse(**result)
 
 
@@ -739,7 +785,16 @@ async def download_latest_target_archive(
     if not archives:
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
-    newest = archives[0]
+    # "Latest" means the newest real BACKUP (#1574): a pre-restore
+    # safety dump shares this listing on the recommended local-volume
+    # path, is newest by mtime right after a restore, and is encrypted
+    # with the public constant passphrase rather than this target's —
+    # serving it here hands the puller an archive their passphrase
+    # cannot open. Safety dumps stay listed and downloadable by name.
+    real_archives = [a for a in archives if not is_pre_restore_archive(a.filename)]
+    if not real_archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    newest = real_archives[0]
     # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
     # than a local pair: that module already handles ``*``, comma lists,
     # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
@@ -757,10 +812,12 @@ async def download_latest_target_archive(
                 "Cache-Control": "private, no-cache",
             },
         )
+    _enforce_download_size(newest.size_bytes, filename=newest.filename)
     try:
         archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _enforce_download_size(len(archive_bytes), filename=newest.filename)
 
     def _iter():
         yield archive_bytes
@@ -800,8 +857,8 @@ async def download_target_archive(
     the driver's ``download(filename)`` method does the heavy
     lifting; we wrap the bytes in a ``StreamingResponse`` with
     ``Content-Disposition: attachment``. For large archives this
-    fetches into memory before streaming; the existing 2 GB hard
-    cap on the api process catches anything pathological.
+    fetches into memory before streaming; downloads past the
+    archive size cap are refused (#1568).
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
@@ -836,6 +893,7 @@ async def download_target_archive(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _enforce_download_size(len(archive_bytes), filename=safe_name)
 
     # The archive exists and is readable — only now is a precondition
     # meaningful.
@@ -908,6 +966,7 @@ async def restore_from_archive(
             status_code=502,
             detail=f"archive {body.filename!r} fetched empty from destination",
         )
+    _enforce_download_size(len(archive_bytes), filename=body.filename)
 
     # Reuse the Phase 1a restore path so the safety dump +
     # passphrase verify + psql replay + post-replay audit row all

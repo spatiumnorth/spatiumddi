@@ -77,17 +77,19 @@ function SubscriptionEditor({
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const [url, setUrl] = useState(existing?.url ?? "");
   const [secret, setSecret] = useState("");
+  // Edit only: send `secret: ""`, which the API reads as "store no secret".
+  // An empty field is `null` ("keep"), so without this the console could
+  // not remove a webhook's secret at all (#1397).
+  const [removeSecret, setRemoveSecret] = useState(false);
   const [eventTypes, setEventTypes] = useState<string[]>(
     existing?.event_types ?? [],
   );
   const [eventFilter, setEventFilter] = useState("");
-  const [headers, setHeaders] = useState<string>(
-    existing?.headers
-      ? Object.entries(existing.headers)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join("\n")
-      : "",
-  );
+  // Header values are never returned by the API (#1579) — the editor
+  // starts blank on edit: blank = keep the stored headers, typed lines
+  // replace them, and the checkbox below clears them.
+  const [headers, setHeaders] = useState<string>("");
+  const [clearHeaders, setClearHeaders] = useState(false);
   const [timeoutSeconds, setTimeoutSeconds] = useState(
     existing?.timeout_seconds ?? 10,
   );
@@ -123,15 +125,25 @@ function SubscriptionEditor({
         enabled,
         url: url.trim(),
         event_types: eventTypes.length > 0 ? eventTypes : null,
-        headers: parseHeaders(),
+        // Write-only headers (#1579): on edit, an explicit ``{}``
+        // clears, typed lines replace, and blank (``null``) keeps the
+        // stored values the server never shows us.
+        headers: existing
+          ? clearHeaders
+            ? {}
+            : parseHeaders()
+          : parseHeaders(),
         timeout_seconds: timeoutSeconds,
         max_attempts: maxAttempts,
         // ``null`` on edit when the operator didn't retype it = keep
-        // existing. On create we let the server auto-generate.
+        // existing; ``""`` = remove it. On create we let the server
+        // auto-generate.
         secret: existing
-          ? secret.length > 0
-            ? secret
-            : null
+          ? removeSecret
+            ? ""
+            : secret.length > 0
+              ? secret
+              : null
           : secret.length > 0
             ? secret
             : undefined,
@@ -266,7 +278,9 @@ function SubscriptionEditor({
           label={existing ? "Rotate secret (optional)" : "Secret (optional)"}
           hint={
             existing
-              ? "Leave blank to keep the stored secret. Type a new one to rotate; clearing the field stores no secret (HMAC header omitted)."
+              ? existing.secret_set
+                ? "Leave blank to keep the stored secret, or type a new one to rotate it."
+                : "No secret is stored, so deliveries go unsigned. Type one to sign them."
               : "Leave blank and the server will auto-generate a 32-byte secret. We surface it once after create — copy and store it on your receiver."
           }
         >
@@ -274,10 +288,24 @@ function SubscriptionEditor({
             type="password"
             autoComplete="new-password"
             className={cn(inputCls, "font-mono")}
-            value={secret}
+            value={removeSecret ? "" : secret}
+            disabled={removeSecret}
             onChange={(e) => setSecret(e.target.value)}
-            placeholder={existing && existing.secret_set ? "(stored)" : ""}
+            placeholder={
+              existing && existing.secret_set && !removeSecret ? "(stored)" : ""
+            }
           />
+          {existing?.secret_set && (
+            <label className="flex cursor-pointer items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={removeSecret}
+                onChange={(e) => setRemoveSecret(e.target.checked)}
+              />
+              Remove the stored secret: deliveries then go unsigned, with no
+              X-SpatiumDDI-Signature header.
+            </label>
+          )}
         </Field>
 
         <div className="rounded-md border p-3">
@@ -324,14 +352,33 @@ function SubscriptionEditor({
 
         <Field
           label="Custom headers (optional)"
-          hint="One header per line, ``Key: value`` format. ``X-SpatiumDDI-*`` reserved for the platform."
+          hint={
+            existing && existing.headers_set
+              ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
+              : "One header per line, ``Key: value`` format. Values are encrypted at rest and never shown again. ``X-SpatiumDDI-*`` reserved for the platform."
+          }
         >
           <textarea
             className={cn(inputCls, "font-mono min-h-[60px]")}
             value={headers}
+            disabled={clearHeaders}
             onChange={(e) => setHeaders(e.target.value)}
-            placeholder={`Authorization: Bearer …\nX-Custom: value`}
+            placeholder={
+              existing && existing.headers_set
+                ? "(stored — leave blank to keep)"
+                : `Authorization: Bearer …\nX-Custom: value`
+            }
           />
+          {existing && existing.headers_set && (
+            <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={clearHeaders}
+                onChange={(e) => setClearHeaders(e.target.checked)}
+              />
+              Remove all stored headers
+            </label>
+          )}
         </Field>
 
         <div className="grid grid-cols-2 gap-3">

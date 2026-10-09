@@ -28,8 +28,10 @@ kubectl apply -f k8s/dhcp/service-dhcp.yaml
 
 DHCPv4 requires broadcast reception on the client LAN. In most clusters you
 either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
-only.
+(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
+manifests use that LoadBalancer Service: on a `NodePort` Service the
+declared `port: 67` is in-cluster only and the node-facing port is a
+random 30000–32767 pick, which a relay cannot target.
 
 
 ## Quick Start (single-node / dev)
@@ -40,6 +42,7 @@ kubectl apply -f k8s/base/namespace.yaml
 kubectl create secret generic spatiumddi-secrets \
   --from-literal=postgres-password=CHANGEME \
   --from-literal=secret-key=$(openssl rand -hex 32) \
+  --from-literal=redis-password=$(openssl rand -hex 32) \
   --from-literal=metrics-token=$(openssl rand -hex 32) \
   -n spatiumddi
 # metrics-token is the bearer token /metrics accepts (#1159). It's optional:
@@ -54,6 +57,14 @@ kubectl run postgres --image=postgres:16-alpine -n spatiumddi \
   --env=POSTGRES_USER=spatiumddi \
   --env=POSTGRES_PASSWORD=CHANGEME \
   --env=POSTGRES_DB=spatiumddi
+# Give it a Service under the name DATABASE_URL expects. In the HA
+# path CNPG creates `postgres-rw` itself; here the expose creates it
+# (#1547 — a bare `kubectl run` pod has no Service at all).
+kubectl expose pod postgres --name=postgres-rw --port=5432 -n spatiumddi
+
+# 2b. Deploy a standalone Redis (not HA — for dev/test only)
+kubectl run redis --image=redis:8-alpine -n spatiumddi
+kubectl expose pod redis --port=6379 -n spatiumddi
 
 # 3. Run migrations
 kubectl apply -f k8s/base/migrate-job.yaml
@@ -63,6 +74,15 @@ kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --tim
 kubectl apply -f k8s/base/configmap.yaml
 kubectl apply -f k8s/base/api.yaml
 kubectl apply -f k8s/base/worker.yaml
+# The stock api / worker / beat env targets the HA Sentinel topology
+# (k8s/ha/redis-sentinel.yaml, #1547): sentinel:// URLs with the
+# Secret's redis-password interpolated in. For this standalone
+# (no-auth) Redis, override the env on the Deployments instead:
+kubectl -n spatiumddi set env deployment/api deployment/worker deployment/beat \
+  REDIS_URL="redis://redis:6379/0" \
+  CELERY_BROKER_URL="redis://redis:6379/1" \
+  CELERY_RESULT_BACKEND="redis://redis:6379/2" \
+  REDIS_SENTINEL_PASSWORD="" REDIS_PASSWORD=""
 kubectl apply -f k8s/base/frontend.yaml
 ```
 
@@ -130,9 +150,13 @@ kubectl apply --server-side -f \
 kubectl apply -f k8s/ha/postgres-cluster.yaml
 ```
 
-The operator creates two Services automatically:
-- `postgres-primary` → always points to the current primary (read/write)
-- `postgres-replica` → load-balances across read replicas
+The operator creates three Services automatically, named after the
+Cluster (`postgres`):
+- `postgres-rw` → always points to the current primary (read/write)
+- `postgres-ro` → load-balances across read replicas
+- `postgres-r` → any instance (primary or replica)
+
+`DATABASE_URL` in `k8s/base/` uses `postgres-rw`.
 
 ### PostgreSQL HA — Patroni (Docker Compose): not supported in 1.0
 
@@ -151,6 +175,17 @@ kubectl apply -f k8s/ha/redis-sentinel.yaml
 ```
 
 Three Redis nodes with Sentinel provides automatic failover with quorum of 2.
+
+The control plane finds the current master through Sentinel (#1547):
+the api / worker / beat env in `k8s/base/` builds `sentinel://` URLs —
+`REDIS_URL` lists every Sentinel by its per-pod headless DNS name, the
+Celery URLs go through the `redis-sentinel` Service the manifest
+creates, and the password in the URLs is interpolated from the
+`redis-password` key of the `spatiumddi-secrets` Secret — the same
+key the manifest's init container renders into `redis.conf` as the
+`requirepass`, so there is exactly one place to rotate. A plain
+`redis://` URL against the headless Service would land on a replica
+~2 times in 3 and fail with `READONLY` / `NOAUTH`.
 
 **Surviving a hard node loss (#590).** Three properties of the manifest are
 load-bearing, and all three were learned the hard way:

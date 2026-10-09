@@ -190,8 +190,14 @@ PowerShell paths and as an RFC 2136 `replace` on its Path A path; Route 53,
 Azure DNS and Google Cloud DNS apply it on their `update` path, which
 previously replaced the whole RRset with the op's single value (their
 create/delete paths already read-merged and were never affected).
-Cloudflare addresses individual records by provider id and never collapsed.
-A driver that sees `rrset=None` keeps its previous per-value behaviour.
+Cloudflare stores one row per value and applies it on create and update as
+a set write (#1494): rows matching a member are kept, missing members are
+created, then the remaining rows at that name + type are deleted. That
+includes a row added in the Cloudflare dashboard, by design: SpatiumDDI
+owns the RRsets it manages, so a value it does not know is removed on the
+next create or update at that name + type, as with the other drivers that
+write whole RRsets. A delete stays a single-value delete. A driver that sees
+`rrset=None` keeps its previous per-value behaviour.
 
 ### TSIG Authentication
 
@@ -485,7 +491,7 @@ The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` wit
 | Add / update / delete record | `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch | Idempotent; one HTTP call per rrset; PowerDNS handles serial bump internally. |
 | Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. |
 | Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
-| Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
+| Reconcile zone (full sync) | `GET .../zones/<zone>`, then one `PATCH` that `DELETE`s rrsets absent from the bundle and `REPLACE`s every rrset it carries (a `POST .../zones` for a zone PowerDNS does not have yet) | Runs on agent start and every structural change. Verdict is per zone: a zone whose data PowerDNS refuses (400/409/422) keeps what it held and is reported as a degraded apply (`reverted`, with PowerDNS's reason), every other zone is still served, and nothing is rolled back. Identical records in one rrset are sent once (#1379). The absent-rrset sweep never touches the apex SOA/NS or DNSSEC types, and skips zones with a dynamic-update ACL (#1380). |
 | Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
 | Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
 | Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer mode is not wired up in the agent (Phase 5 polish). |
@@ -685,10 +691,11 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 
-- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. `update` is create-on-miss.
+- **Cloudflare** — every reply is wrapped in a `{success, errors, result, result_info}` envelope; `_unwrap` raises `CloudDNSError` on non-2xx *or* a `success: false` (the API returns 200 with `success: false` for some validation failures). The opaque zone id is resolved by name per call. "Automatic" TTL is the sentinel `1`, surfaced as `ttl=None`. A create or update with its RRset is a set write (see the #783 section above; dashboard-added rows at that name + type are removed); without one, `update` is create-on-miss. SpatiumDDI does not model `proxied`, but no write drops it: a PUT carries the row's own flag, a proxied row's TTL (always auto) is never "corrected", and a row created at a name whose rows are proxied is created proxied.
 - **Route 53** — MX / SRV priority is baked into the record value (`"10 mail.example.com."`), kept raw so it isn't double-encoded on write. ALIAS rrsets (`AliasTarget`) have no TTL → surfaced with `ttl=None`. Writes are `UPSERT`/`DELETE` change batches; a `DELETE` of a non-existent rrset (`InvalidChangeBatch`) is treated as an idempotent no-op. Hosted-zone id resolved from the FQDN via `list_hosted_zones_by_name` with an exact-name match.
 - **Azure DNS** — records live in *record sets*, one per `(name, type)`, each with a typed list (`a_records`, `mx_records`, …); each set expands into one neutral `RecordData` per contained record. Create and update are both a `create_or_update` PUT of the full set. SOA is Azure-managed and dropped on read.
 - **Google Cloud DNS** — calls scope by the managed-zone *id* (a slug like `example-com`), not the DNS name, so the hooks re-resolve the managed zone by matching `dns_name`. A single rrset carries one or more `rrdatas` (one `RecordData` each on read, collapsed to a single-value rrset on write). Writes are transactional change sets (`changes.create()`); the op polls `changes.status` until `done` (bounded ~60 s) so it only returns once Cloud DNS has applied it.
+- **Hetzner** — talks to the **Hetzner Cloud API** (`https://api.hetzner.cloud/v1`, `Authorization: Bearer` with a Cloud *project* token, Read & Write to apply changes). Hetzner retired the standalone DNS Console API (`dns.hetzner.com/api/v1`), which now answers every call with a `301` to the Cloud Console; `_unwrap` names that case instead of reporting a bare "HTTP 301". The API is RRset-oriented like Route 53 / Azure: an op carrying a resolved `RRsetData` (#783) becomes one `set_records` (plus `change_ttl` when the TTL moved), an empty set deletes the RRset, and the per-value fallback uses `add_records` / `remove_records` against the live set. Every write returns an `action` that may still be `running`; the driver polls `/zones/actions/{id}` (backing off from 1 s to 5 s, bounded at ~60 s) before reporting success, so a change the API later rejects is not reported as applied. The backoff matters because the Cloud API allows 3600 requests per hour per project: a write answered `423 locked` (another action still running on the zone) is retried for up to 60 s, and a `429` is reported with the time the limit resets. Values are zone-file presentation format: TXT is quoted (split into 255-byte strings) on write and joined on read, and CNAME / NS / PTR / MX / SRV targets are absolutised so a value stored without the trailing dot is not read as zone-relative. Only `mode: primary` zones are listed — a secondary zone is AXFR'd by Hetzner from the operator's primaries and has no RRsets to manage.
 
 ### 4A.5 Probe
 
@@ -707,7 +714,7 @@ Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/record
 - **Bulk reconcile** (`swap_and_reload`, fired on structural config changes): fetch the zone's full record set via `GET /api/zones/records/get?listZone=true`, diff by `(domain, type, params)` fingerprint against the desired bundle state, then `POST` deletes for what's extra and adds for what's missing. No `update` endpoint call needed — a changed value is just delete-old + add-new, computed from the full diff.
 - **Dropped zones** ([#1496](https://github.com/spatiumnorth/spatiumddi/issues/1496)): after the reconcile, `_retire_dropped_zones` deletes the zones this agent created from a bundle that the current bundle no longer has. The agent keeps their names in `technitium-managed-zones.json` in its state directory, and only names in that ledger are ever deleted, so a zone created on the daemon directly is left alone. The first run after an upgrade seeds the ledger from the previous render. A delete that fails stays in the ledger and is retried on the next pass. Retirement follows the zone list the control plane sent, not what the driver could render: an explicit empty `zones` list (a group with no zones, which is the only way the control plane produces one) retires every ledger zone, the same as BIND9 emptying `named.conf`; a bundle with no zone list at all (key absent, `null` or not a list) retires nothing and keeps the ledger; and a zone the bundle still names but the driver skipped (a secondary with no primaries, a forwarder with no upstream, an unsupported type) is kept. Both hold-backs log `technitium_zone_retire_held_back` with a `reason`.
 - **Incremental ops** (`apply_record_op`, fired per live edit): the op carries the complete desired `rrset` (see §2, [#773](https://github.com/spatiumnorth/spatiumddi/issues/773)), so `create`/`update` is member 0 with `overwrite=true` — which clears — followed by an `add` per remaining member with `overwrite=false`, and `delete` is a single value-scoped `delete` of the op's own value (the survivors are already on the server; wiping and rebuilding them would open a window where the name serves less than it should). Before #773 this path was one `add` with `overwrite=true`, which is what collapsed every multi-value RRset to its last value.
-- Zone apex `NS`/`SOA` are **daemon-managed** — Technitium auto-creates its own SOA + one NS pointing at its own hostname on `/api/zones/create`, so the bundle's apex NS/SOA are intentionally excluded from every reconcile pass (pushing them would create duplicate/foreign records). Off-apex `NS` (delegations) reconcile normally.
+- Zone apex `NS`/`SOA` are **reconciled as an apex, not record by record** ([#1490](https://github.com/spatiumnorth/spatiumddi/issues/1490)). Technitium auto-creates its own SOA + one NS pointing at its own host name on `/api/zones/create` (under the DNS VIP that is the pod name). `_reconcile_zone_apex` then applies the zone's own apex with the BIND9 precedence ([#1153](https://github.com/spatiumnorth/spatiumddi/issues/1153)): the NS set is the zone's apex NS records, else its Primary NS; the SOA takes MNAME (Primary NS, else the first NS), RNAME (Admin Email) and the timers the bundle ships, at the zone's TTL. Each is written only when it differs from what the daemon serves, because a SOA write bumps the serial (`zones/records/update` requires the current serial and stores current + 1). New NS targets are added before the old ones are removed. A primary zone that sets neither Primary NS nor Admin Email nor apex NS keeps the daemon's apex untouched (the bundle ships every zone's timers since [#1171](https://github.com/spatiumnorth/spatiumddi/issues/1171), so they alone do not count as set). Off-apex `NS` (delegations) reconcile normally.
 
 ### 4B.2 Auth — agent-provisioned bearer token
 
@@ -826,7 +833,7 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 
 Per-view blocklists **collapse into one flat set**: Technitium's native blocking is server-wide with no view concept, and the driver declines views outright. Collapsing is the honest reading of "block these names on this server" — the alternative would be silently applying one view's list to every client. `is_wildcard` is likewise dropped: Technitium blocks a domain *and* its subdomains by default, so exact-match and wildcard land identically.
 
-The apply is **flush-then-rewrite, not a diff**, and that is deliberate. `blocked/list` is a one-level *tree browser*: `domain=""` returns top-level nodes, `domain="foo.test"` returns its children, and only a leaf carries the actual block under `records`. Intermediate nodes therefore appear in a listing without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of the root wiped every entry in testing. Flush-and-rewrite needs no read model, so it cannot be subtly wrong that way; the cost is a brief window with no blocking on each structural apply, which record CRUD does not trigger.
+The apply **reads the live set with `blocked/export` / `allowed/export`** and leaves a set alone when it already matches the bundle, so a structural apply that did not touch a blocklist rewrites nothing and opens no window without blocking (#1425). `export` is a flat list, one name per line, which `blocked/list` is not: `list` is a one-level *tree browser* whose intermediate nodes appear without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of its root wiped every entry in testing. A set that differs is **flushed, then written with `{kind}/import`** in chunks of 5,000 comma-separated names. Never per-domain `blocked/add` or `delete`: each of those rewrites Technitium's zone file, so a 16k-entry list took about 30 minutes and grew roughly quadratically, while `import` saves once per call. Names compare in their IDNA form, which is how Technitium stores and exports them; an error answer to `export` is treated as a difference and rewritten, never as a match.
 
 **Live-pull importer** (`services/dns_import/technitium.py`) — one-shot migration off an existing Technitium install, feeding the same canonical IR and commit pipeline as the BIND9 / Windows / PowerDNS importers.
 
@@ -1171,10 +1178,13 @@ PowerDNS is coarse-only — no per-name / per-type / `deny`, so
    `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
    zone whose dynamic updates were turned off stops accepting them.
 
-**Drift** — the pdns reconciler is additive per-rrset (`REPLACE` per managed
-`name+type`, never a blanket zone replace), so externally-injected records
-(new names) **already survive** a reconcile, and a conflicting managed
-`name+type` is re-asserted (control-plane wins). An active ingest-back for
+**Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
+additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
+replace), so records RFC 2136 clients injected (new names) **survive** a
+reconcile, and a conflicting managed `name+type` is re-asserted
+(control-plane wins). A zone *without* an ACL is reconciled exactly: an rrset
+the bundle no longer carries is deleted (#1380), apex SOA/NS and DNSSEC types
+excepted. An active ingest-back for
 *visibility* (mirroring external records into the control-plane DB, like the
 BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
 

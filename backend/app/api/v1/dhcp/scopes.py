@@ -29,15 +29,15 @@ from app.models.ipam import Subnet
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteScopeArgs
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.option_spelling import group_raw_codes
 from app.services.dhcp.option_validation import (
     RAW_CODES_KEA,
-    RAW_CODES_NONE,
-    RAW_CODES_WINDOWS,
     changes_raw_code,
     normalize_options,
     option_key_code,
     validate_options,
 )
+from app.services.dhcp.radvd import validate_ra_interface
 from app.services.dhcp.windows_failover_report import scope_serving_report
 from app.services.dhcp.windows_writethrough import (
     WindowsPlacement,
@@ -63,25 +63,6 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 }
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
-
-
-async def group_raw_codes(db: AsyncSession, group_id: Any) -> str:
-    """The raw option-code spelling ``group_id``'s servers read (#1296).
-
-    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate read
-    ``code:NN`` and drop ``opt-NN``. A group with no servers yet follows Kea:
-    a Windows scope cannot exist without a Windows server to write it to.
-    """
-    if group_id is None:
-        return RAW_CODES_KEA
-    drivers = set(
-        (await db.execute(select(DHCPServer.driver).where(DHCPServer.server_group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    if "windows_dhcp" not in drivers:
-        return RAW_CODES_KEA
-    return RAW_CODES_WINDOWS if drivers == {"windows_dhcp"} else RAW_CODES_NONE
 
 
 async def _group_has_windows(db: AsyncSession, group_id: Any) -> bool:
@@ -369,6 +350,12 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str) -> str:
+        v = (v or "").strip()
+        return validate_ra_interface(v) if v else ""
+
     @field_validator("v6_address_mode")
     @classmethod
     def _v6mode(cls, v: str | None) -> str:
@@ -445,6 +432,14 @@ class ScopeUpdate(BaseModel):
             self.model_fields_set,
         )
         return self
+
+    @field_validator("ra_interface")
+    @classmethod
+    def _ra_iface(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_ra_interface(v) if v else ""
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -726,7 +721,7 @@ async def create_scope(
                 "members."
             ),
         )
-    _create_options = normalize_options(body.options)
+    _create_options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
     )
@@ -889,7 +884,9 @@ async def update_scope(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
-        normalized = normalize_options(changes["options"])
+        normalized = normalize_options(
+            changes["options"], raw_codes=await group_raw_codes(db, scope.group_id)
+        )
         # Validate only options that CHANGED from the stored value (#597
         # review, #1228) — the scope form round-trips the full options dict,
         # so re-validating an unchanged grandfathered value would block an

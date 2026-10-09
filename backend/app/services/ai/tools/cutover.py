@@ -266,6 +266,7 @@ class FindCutoverPlansArgs(BaseModel):
 
 @register_tool(
     name="find_cutover_plans",
+    permission="superadmin",
     description=(
         "List Windows → SpatiumDDI cutover plans (superadmin only). Each row "
         "carries the plan's lifecycle status, its source Windows DNS / DHCP "
@@ -355,6 +356,7 @@ class FindCutoverPlanStatusArgs(BaseModel):
 
 @register_tool(
     name="find_cutover_plan_status",
+    permission="superadmin",
     description=(
         "Full status of one cutover plan (superadmin only) — the per-item "
         "detail behind find_cutover_plans. Identify the plan by plan_id or "
@@ -469,6 +471,7 @@ class CountCutoverBlockersArgs(BaseModel):
 
 @register_tool(
     name="count_cutover_blockers",
+    permission="superadmin",
     description=(
         "Roll up cutover readiness blockers (superadmin only) — across every "
         "plan, or one plan identified by plan_id / name. Returns how many "
@@ -694,6 +697,7 @@ async def _parity_for_item(
 
 @register_tool(
     name="find_cutover_parity_check",
+    permission="superadmin",
     description=(
         "Run a LIVE parity check for cutover plan items (superadmin only; "
         "makes an off-prem WinRM pull from the source Windows server). "

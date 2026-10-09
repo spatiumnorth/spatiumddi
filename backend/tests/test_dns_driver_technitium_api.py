@@ -681,6 +681,30 @@ async def test_zone_create_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refused_connection_names_a_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1613 QA — ``httpx.ConnectError`` for a refused connection stringifies
+    to ``""``, so the error read "request failed: " with nothing after it.
+    The exception class is always named; its text follows when present."""
+    import httpx
+
+    class _Zone:
+        name = "new.example.com."
+        zone_type = "primary"
+
+    def _refuse() -> Any:
+        raise httpx.ConnectError("")
+
+    drv, _ = _driver(monkeypatch, [_refuse])
+    with pytest.raises(CloudDNSError) as excinfo:
+        await drv.apply_zone_change(
+            _Server({"api_url": "https://x.test", "api_token": "t"}), _Zone(), "create"
+        )
+    message = str(excinfo.value)
+    assert "request failed: ConnectError" in message
+    assert not message.rstrip().endswith("failed:")
+
+
+@pytest.mark.asyncio
 async def test_unsupported_zone_op_is_refused_before_any_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

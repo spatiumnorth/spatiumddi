@@ -141,6 +141,25 @@ rendered by Kea and FortiGate only, never by Windows, so they always take
 An option stored before this check (an imported `opt-NN` on a Kea group,
 say) stays editable as long as it is left unchanged.
 
+The spelling is checked on the other ways in as well (#1347):
+
+- **A server joining a group.** Creating a server in a group, or moving
+  one into it, is refused (422) when the group's servers would then drop
+  a raw option already stored on one of its scopes: a Windows server
+  joining a group whose scopes hold `code:43`, say. The refusal names the
+  scopes and keys, so they can be re-keyed or removed first.
+- **The importer.** Options arrive in the source server's spelling (the
+  Windows importer keeps an unmapped option as `opt-NN`). They are re-keyed
+  to the target group's spelling on commit, and any no server in the group
+  can serve (a code Kea has no definition for, or any raw code in a mixed
+  group) are dropped, each named in the import's warnings.
+- **The option editor.** A pick from the option-code catalogue is keyed in
+  the group's spelling: `opt-43` on a Windows group, `code:43` elsewhere.
+
+Each DHCP driver declares the spelling it reads
+(`DHCPDriver.raw_option_spelling`), so a new driver states its own rather
+than inheriting Kea's.
+
 **A DHCPv6 scope cannot share a group with a Windows DHCP server (#1480).**
 SpatiumDDI manages Windows DHCP over DHCPv4 only, so creating a v6 scope in
 a group with a Windows member is refused, and so is creating or moving a
@@ -148,10 +167,10 @@ Windows server into a group that has v6 scopes. Keep DHCPv6 in a Kea group.
 
 DHCPv6 scopes accept `dns-servers`, `ntp-servers` (IPv6 addresses),
 `domain-search` and `bootfile-name`. They refuse options with no DHCPv6
-equivalent and all raw codes. A client class renders into the DHCPv4
-config always, and into the DHCPv6 config when the group has v6 scopes, so
-its options are checked as DHCPv4: an IPv6 `dns-servers` in a class is
-refused, because Dhcp4 would reject it.
+equivalent and all raw codes, `opt-NN` on a Windows group included: the
+Windows driver writes options with `Set-DhcpServerv4OptionValue` only. A
+client class is checked against its own address family (§4); a `dual`
+class accepts an option either family accepts.
 Raw `option_data` is refused: it is for internal producers such as the
 E911 location options (#972).
 
@@ -469,13 +488,21 @@ reservation requires a **superadmin**.
 1. **IPAM → select the subnet → "Allocate IP"** (the primary header button; also
    reachable from a free-range gap row or the subnet context menu).
 2. In the **Allocate IP Address** modal set **Type / Status = `static_dhcp`**.
-   This reveals the **DHCP Scope** picker.
-3. Pick the **DHCP Scope**, enter the **MAC address** (required — see caveat
-   below), and set the hostname. If no scope exists for the subnet yet, the
-   picker offers a **Create a scope** button that opens the scope modal inline.
+3. Enter the **MAC address** (required — see caveat below) and set the
+   hostname. There is no scope picker: the server puts the reservation on
+   the subnet's sole matching-family scope itself. If no scope exists for
+   the subnet yet, the modal says so and offers a **Create a scope** button
+   that opens the scope modal inline.
 4. Click **Allocate**. IPAM creates the address row with
-   `IPAddress.status = static_dhcp` and mirrors it into the scope as a
-   `DHCPStaticAssignment` (via `POST /api/v1/dhcp/scopes/{scope_id}/statics`).
+   `IPAddress.status = static_dhcp` and the server syncs a
+   `DHCPStaticAssignment` behind it in the same request
+   (`sync_static_for_ipam_row`, #1628) — no second call from the browser.
+
+The same sync runs on **Edit**, on **bulk-edit**, and in the **address
+importer**: flipping a row into `static_dhcp` creates its reservation,
+changing its MAC / hostname updates the reservation in place, and flipping
+it away (or clearing the reservation state) removes the reservation. A save
+never overwrites a reservation's description with the IPAM row's empty one.
 
 Either way, the Kea agent picks up the new `ConfigBundle` (a group wake fires +
 the ETag shifts) and renders the host reservation within seconds. The **Static
@@ -487,18 +514,31 @@ Assignments** tab lists every reservation across the group's scopes.
   `static_dhcp` address without a `mac_address` returns **422**
   (`mac_address is required when status is 'static_dhcp'`) from both the
   `create` and `next-address` endpoints, so **nothing is created** — neither the
-  IPAM row nor the reservation.
-- **`static_dhcp` with a MAC but no scope creates the IPAM row and silently skips
-  the reservation.** If no DHCP scope is selected (e.g. none exists for the
-  subnet yet), the IPAM address is created but the mirror to Kea is **not
-  attempted** — this is the real "I set it static but nothing happened" trap.
-  Create a scope first (see the prerequisite above).
-- **Editing an existing IPAM row to `static_dhcp` does not create a reservation.**
-  Flipping an *existing* IP to `static_dhcp` via **Edit** (or bulk-edit) updates
-  the IPAM row but does **not** mirror it to Kea. Add the reservation from the
-  DHCP **Static Assignments** tab, or delete and re-allocate via the IPAM flow.
-- **Creating a static currently requires a superadmin.** A non-superadmin who
-  allocates a `static_dhcp` IP gets the IPAM row but the mirror call returns 403.
+  IPAM row nor the reservation. The same 422 answers an edit that sends
+  `mac_address: null` for a row that is (or is becoming) `static_dhcp`.
+- **`static_dhcp` with a MAC but no unambiguous scope creates the IPAM row and
+  warns.** If no DHCP scope serves the subnet, or several scopes match, the
+  IPAM address is created but no reservation is — the server does not guess —
+  and the response (or import result) carries a `dhcp_static_warning` saying
+  so instead of silently skipping it. Create exactly one scope for the
+  subnet, then re-save the row.
+- **The sync needs the `dhcp_static` permission.** Creating or updating a
+  reservation through IPAM requires the acting user's `write` grant on
+  `dhcp_static`; removing one requires `delete` — the same grants the DHCP
+  statics endpoints enforce. Without the grant the IPAM write still succeeds
+  but the reservation is left untouched and the response carries the
+  permission warning (GHSA-44ph). Direct reservation CRUD on the DHCP side
+  still requires a superadmin, as above.
+- **Deleting the address follows the same rule.** Deleting an IPAM row (or
+  purging orphans) removes the reservations linked to it, on the DHCP server
+  too, so it needs `delete` on `dhcp_static`. Without it the delete is
+  refused with 403 rather than leaving a reservation behind a row that no
+  longer exists (GHSA-hxpx). Each reservation a delete removes writes its own
+  `dhcp_static_assignment` audit row.
+- **No backfill for rows from before the server-side sync.** A `static_dhcp`
+  row created before #1628 that never got its reservation is not repaired
+  in the background: it gets one the next time it is saved, or when it is
+  re-imported with `overwrite`.
 
 ### Troubleshooting — reservations render empty in Kea
 
@@ -511,8 +551,9 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
   `GET /api/v1/dhcp/scopes/{scope_id}/statics` or the group's Static Assignments
   tab. If it's absent, distinguish two cases: the allocation was
   **rejected** (a blank MAC 422s the whole allocation — nothing was created), or
-  it **succeeded without mirroring** (a MAC was given but no scope was selected,
-  or a non-superadmin hit 403 on the mirror call). See the caveats above.
+  it **succeeded without mirroring** (a MAC was given but there was no scope —
+  or several — or the acting user lacked the `dhcp_static` grant; the response
+  carried a `dhcp_static_warning` naming which). See the caveats above.
 - **The scope is inactive.** Only `is_active = true` scopes (and the statics
   under them) are assembled into the config bundle — a disabled scope silently
   drops every reservation it holds.
@@ -645,6 +686,20 @@ is skipped by the agent's lease-mirror refresh, so it would shadow a future
 dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
 repairs the rows already stranded by pre-existing hard-deletes.
 
+### Deleting a server group (#1399)
+
+A group that still holds a live scope cannot be deleted: `DELETE
+/api/v1/dhcp/server-groups/{id}` answers `409`, as it does while the group
+holds servers, and so do the two-person approval queue and the Copilot,
+which read the same preview. Delete the group's scopes first. The console's
+Delete Server Group reads the group's servers and scopes before it offers
+the delete: while the group holds either, the dialog says what it holds and
+offers no delete, so the `409` is only the backstop. A scope already in
+Trash does not block the group, but it goes with it: deleting the group
+deletes its scopes in Trash for good, with their pools and reservations, and
+the console's dialog and the approval preview say so. A DNS server group
+behaves the same way for its zones.
+
 ### Known gap — Windows scope sync (issue #620)
 
 `services/dhcp/pull_leases.py::_upsert_scope` still Core-`DELETE`s a Windows
@@ -672,9 +727,59 @@ DHCPClientClass
   match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
   description: str
+  address_family: ipv4 | ipv6 | dual   -- which Kea daemons get it (#1229)
 ```
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
+
+### Address family (#1229, #1295)
+
+Kea runs one daemon per family, and a class goes only into the daemons its
+`address_family` names. Every class used to go into both, and that broke
+things two ways. First, some test tokens exist in only one daemon: `pkt4` and
+`relay4` (option 82 matching) are DHCPv4-only, and `pkt6` and `relay6` are
+DHCPv6-only. kea-dhcp6 rejects the whole config over a `pkt4` test, and
+kea-dhcp4 does the same over `pkt6`. The agent then reverts the bundle for
+**both** daemons. Second, one options map cannot serve both:
+`dns-servers` is an IPv4 list in Dhcp4 and an IPv6 list in Dhcp6.
+
+- `ipv4` / `ipv6` — the class and all its options go to that daemon only.
+  The test may not use the other family's tokens; the API returns a 422
+  saying which token and which family would take it.
+- `dual` — the class goes to both daemons. The test may use neither
+  family's tokens. Each option goes to the daemon it is valid in: an IPv4
+  `dns-servers` to Dhcp4, `domain-search` to both, and `routers` to Dhcp4
+  only, as before. The control plane works out the split, because only it
+  holds the option tables, and ships it to the agent.
+
+Named option lookups in a test (`option[host-name]`) are family-specific
+as well, but by option name, which no short list covers. For those, Kea's
+own check and the agent's revert (#882) are the backstop.
+
+A pool that names a class its daemon does not define is fine to Kea, which
+is exactly the danger: the pool loads and silently matches no client. So
+the API refuses both ways of getting there. Changing a class's family is a
+`409` while a pool in the family it would leave still restricts to it, and
+the pools are named. Setting a pool's `class_restriction` to an operator
+class not rendered for the pool's family is a `422`. Names that are not
+operator classes are not checked: the generated PXE, phone and
+device-policy classes, and Kea's built-in `KNOWN`.
+
+The Kea importer keeps the daemon block each class came from. A class
+defined in both the `Dhcp4` and `Dhcp6` blocks, with the same test and no
+conflicting options, becomes one `dual` class. Otherwise the second copy
+is flagged for manual review instead of being dropped.
+
+Upgrading backfills the column (migration `c2f7a94e1d58`):
+
+- A test using `pkt6` / `relay6` becomes `ipv6`.
+- A test using `pkt4` / `relay4` becomes `ipv4`, including one that also
+  uses a v6 token, which could never load in either daemon.
+- Any other class becomes `dual` if its group has a live DHCPv6 scope,
+  which is how it rendered before. Otherwise it becomes `ipv4`.
+
+A bundle from a control plane older than this carries no family, so the
+agent renders the class into both daemons as it always did.
 
 Hand-authoring a match expression is not the only way to get a class:
 [§17a](#17a-fingerprint-driven-device-policies-issue-700) compiles one
@@ -1014,14 +1119,20 @@ whichever bundle came before this one — that rotation destroyed the fallback
 after two poll cycles), and `quarantine.json` records an etag whose apply
 failed so it is not re-rendered on every poll.
 
-Kea's `config-test` is what makes the distinction usable: a rejection is a
+The preflight (`kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file, in a
+separate process) is what makes the distinction usable: a rejection is a
 verdict about the config, whereas an unreachable control socket says nothing
-about it — Kea may simply be restarting. Only a rejection reverts; reverting
-on an unreachable socket would discard a good bundle because of a timing
-accident.
+about it — Kea may simply be restarting. A rejection reverts; reverting on an
+unreachable socket would discard a good bundle because of a timing accident.
+A check that could not run at all (missing binary, 30 s timeout, crash) is
+not a verdict either, but it is not an acceptance: the reload is skipped and
+the apply fails in the `validate` phase, so it is reverted on disk,
+quarantined and retried on the backoff. The agent does not use Kea's
+`config-test` command: on Kea 3.0.3 it leaves the running daemon unable to
+start the HA listener (#1447).
 
 The revert rewrites the on-disk `kea-dhcp4.conf` / `kea-dhcp6.conf`, not just
-the agent's bookkeeping. `config-test` rejects *without* disturbing the
+the agent's bookkeeping. The `-t` check rejects *without* disturbing the
 running daemon, so Kea itself is fine either way — but the refused document
 has already been written to those paths, and that file is what Kea reads on
 its next start. Leaving it turns a rejected apply into a crash loop the next
@@ -1041,7 +1152,7 @@ unreachable or a config was rejected — lands on `dhcp_server.daemon_status`
 read by nothing before), is exposed on the server row, drives a chip and a
 detail banner, and feeds the `agent_daemon_degraded` alert rule once a
 daemon that is not serving has stayed that way past a five-minute grace. A
-rejected config is not that: `config-test` refuses without disturbing the
+rejected config is not that: the `-t` check refuses without disturbing the
 running Kea, so a `degraded` whose reason is `config_apply_reverted: …` or
 Kea's own `dhcp4_config_rejected: …` / `dhcp6_…` is the verdict above,
 reported by `agent_config_rejected`. The server response's
@@ -1789,7 +1900,7 @@ but Kea rejects a malformed config **whole**, so an unbalanced paren
 would stop every other class, scope and reservation in the group
 converging, not just this policy. Same blast radius `named.conf`
 validation exists for in #876 / #899. The agent still runs Kea's own
-`config-test` before applying, and #882's quarantine means a rejected
+`kea-dhcp4 -t` check before applying, and #882's quarantine means a rejected
 bundle is reverted rather than re-applied in a loop.
 
 ### Rendering

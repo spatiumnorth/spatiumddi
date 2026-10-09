@@ -4,7 +4,7 @@ Layout (matches the spec in the issue body):
 
 .. code-block:: text
 
-    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip
+    spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip
     ├── manifest.json     # version, schema head, hostname, created_at
     ├── database.sql      # pg_dump --format=plain
     ├── secrets.enc       # passphrase-wrapped SECRET_KEY + metadata
@@ -31,6 +31,7 @@ import asyncio
 import io
 import json
 import os
+import secrets
 import socket
 import tempfile
 import zipfile
@@ -53,6 +54,19 @@ logger = structlog.get_logger(__name__)
 # realistic SpatiumDDI install (single-digit GB at the absolute
 # top end); operators with bigger fleets need to revisit this.
 _PG_DUMP_TIMEOUT_SECONDS = 30 * 60
+
+# Ceiling on a backup archive as downloaded from a destination, in
+# compressed bytes — the same 2 GB the upload endpoints enforce
+# (``app.api.v1.backup.router._MAX_UPLOAD_BYTES``). Destination
+# downloads used to have no cap at all (#1568).
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+
+# Ceiling on the database member's DECLARED uncompressed size
+# (``ZipInfo.file_size``) that ``extract_archive_members`` will read
+# into memory (#1568). Same 20 GiB the restore drill allows a scratch
+# database (``SPATIUM_DRILL_MAX_DB_BYTES`` default): far above any
+# realistic dump, far below "crafted zip header OOMs the api".
+_MAX_DUMP_MEMBER_BYTES = 20 * 1024**3
 
 
 class BackupArchiveError(Exception):
@@ -424,7 +438,7 @@ async def build_backup_archive(
 
     Caller (the API endpoint) streams the bytes back to the
     operator. Filename pattern:
-    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip``.
+    ``spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}-{random}.zip``.
 
     ``exclude_secrets`` (Phase 3 diagnostic mode): every
     Fernet-encrypted column + every ``__enc__:`` JSONB field is
@@ -545,7 +559,13 @@ async def build_backup_archive(
         "".join(c if c.isalnum() or c in "-_" else "-" for c in hostname).strip("-") or "spatiumddi"
     )
     timestamp = created_at.strftime("%Y%m%d-%H%M%S")
-    filename = f"spatiumddi-backup-{safe_host}-{timestamp}.zip"
+    # One-second resolution alone collided (#1571): two runs in the
+    # same second — two targets sharing a destination, or a manual
+    # run racing the schedule — wrote the SAME filename with
+    # different passphrases, and the survivor would not decrypt with
+    # the overwritten target's passphrase while both runs reported
+    # success. A short random suffix makes each name unique.
+    filename = f"spatiumddi-backup-{safe_host}-{timestamp}-{secrets.token_hex(3)}.zip"
     logger.info(
         "backup_archive_built",
         bytes=len(archive_bytes),
@@ -618,6 +638,18 @@ def extract_archive_members(
                 raise BackupArchiveError(
                     f"archive declares dump_format={dump_format!r} but "
                     f"member {dump_member!r} is missing"
+                )
+            # Refuse on the DECLARED size before inflating anything
+            # (#1568): the archive is untrusted until the passphrase
+            # check passes, and ``zf.read`` would materialise the
+            # whole member in memory — a crafted header is a zip bomb
+            # aimed at the api.
+            declared_size = zf.getinfo(dump_member).file_size
+            if declared_size > _MAX_DUMP_MEMBER_BYTES:
+                raise BackupArchiveError(
+                    f"archive's database member {dump_member!r} declares "
+                    f"{declared_size} bytes uncompressed, which exceeds the "
+                    f"{_MAX_DUMP_MEMBER_BYTES}-byte cap — refusing to read it"
                 )
             db_bytes = zf.read(dump_member)
             secrets_enc = zf.read("secrets.enc")

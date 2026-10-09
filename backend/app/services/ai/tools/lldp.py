@@ -35,6 +35,7 @@ class FindLLDPSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_lldp_settings",
+    permission="authenticated",
     description=(
         "Return the appliance LLDP configuration — master toggle, transmit "
         "interval + hold (and the advertised TTL = interval × hold), which "
@@ -83,6 +84,7 @@ class FindLLDPNeighborsArgs(BaseModel):
 
 @register_tool(
     name="find_lldp_neighbors",
+    permission=("read", "appliance"),
     description=(
         "List LLDP neighbours discovered by SpatiumDDI appliance hosts via their "
         "local lldpd — local interface, the remote switch/device's chassis-id, "

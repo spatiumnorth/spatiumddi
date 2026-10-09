@@ -40,6 +40,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import owned_by_other_integration, owning_integration
 from app.services.opnsense.client import (
     OPNsenseClient,
@@ -83,6 +84,9 @@ class _DesiredAddress:
     description: str
     mac: str | None = None
     auto_from_lease: bool = False
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
@@ -474,6 +478,9 @@ async def _apply_addresses(
     router: OPNsenseRouter,
     desired: list[_DesiredAddress],
     summary: ReconcileSummary,
+    *,
+    protect_leases: bool = False,
+    protect_reservations: bool = False,
 ) -> None:
     subnet_rows = (
         (await db.execute(select(Subnet).where(Subnet.space_id == router.ipam_space_id)))
@@ -549,6 +556,20 @@ async def _apply_addresses(
 
     for addr, row in current.items():
         if addr not in desired_map:
+            # #1556 — a category whose backend REFUSED the API user
+            # (403) contributed nothing to ``desired`` this pass, so its
+            # rows' absence proves nothing. Freeze them (no delete, no
+            # un-claim) for this pass, mirroring the Cloud reconciler's
+            # ``allow_delete`` partial-pull guard. The all-404 case is
+            # untouched: an absent backend sets no protection, and its
+            # rows are deleted as before. Lease rows are identified by
+            # ``auto_from_lease``; reservation rows by ``reserved``
+            # status (interface-gateway rows share that status but are
+            # in ``desired_map`` whenever their interface still exists).
+            if protect_leases and row.auto_from_lease:
+                continue
+            if protect_reservations and row.status == "reserved" and not row.auto_from_lease:
+                continue
             dirty_subnets.add(row.subnet_id)
             if row.user_modified_at is not None:
                 # Operator has invested edits — un-claim, leave the row
@@ -715,6 +736,26 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     leases = lease_result.leases if lease_result is not None else []
     reservations = reservation_result.reservations if reservation_result is not None else []
     _warn_on_dhcp_backends(router, lease_result, reservation_result, summary)
+    # #1556 — any 403 in a category freezes that category's rows for
+    # this pass (see _apply_addresses). ``sources_found == []`` caused
+    # purely by refusals is covered by the same check: every refused
+    # backend lands in ``sources_forbidden``.
+    leases_refused = lease_result is not None and bool(lease_result.sources_forbidden)
+    reservations_refused = reservation_result is not None and bool(
+        reservation_result.sources_forbidden
+    )
+    if leases_refused:
+        summary.warnings.append(
+            "DHCP leases: a backend refused the API user — absence-delete is "
+            "suspended for mirrored lease rows this pass so they are frozen, "
+            "not deleted, until access is restored"
+        )
+    if reservations_refused:
+        summary.warnings.append(
+            "static reservations: a backend refused the API user — absence-delete "
+            "is suspended for mirrored reservation rows this pass so they are "
+            "frozen, not deleted, until access is restored"
+        )
     if not interfaces:
         # Every mirrored address needs an enclosing subnet, and subnets
         # come only from interfaces — so zero interfaces silently zeroes
@@ -738,7 +779,14 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     )
 
     await _apply_blocks_and_subnets(db, router, desired_subnets, summary)
-    await _apply_addresses(db, router, desired_addresses, summary)
+    await _apply_addresses(
+        db,
+        router,
+        desired_addresses,
+        summary,
+        protect_leases=leases_refused,
+        protect_reservations=reservations_refused,
+    )
 
     router.last_synced_at = datetime.now(UTC)
     router.last_sync_error = None

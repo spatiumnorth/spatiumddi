@@ -812,6 +812,10 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // #1628 — transient, only set on create/update responses when a
+  // ``static_dhcp`` row could not be mirrored into a DHCP reservation
+  // server-side (no scope, several scopes, or a conflict).
+  dhcp_static_warning?: string | null;
   // True when this row is a dynamic-lease mirror created by the DHCP
   // lease-pull task. Such rows are read-only in the UI — the DHCP server
   // owns their state and any edit would get overwritten on the next pull.
@@ -2463,7 +2467,9 @@ export const usersApi = {
       username: string;
       email: string;
       display_name: string;
-      password: string;
+      // A local account. Omitted for one bound to a provider (#1291).
+      password?: string;
+      auth_provider_id?: string;
       is_superadmin: boolean;
       force_password_change: boolean;
     } & StepUp,
@@ -2598,6 +2604,9 @@ export interface AuditChainBreak {
   expected_hash: string;
   actual_hash: string;
   reason: "row_hash_mismatch" | "prev_hash_mismatch";
+  action: string;
+  resource_type: string;
+  resource_id: string;
 }
 
 export interface AuditIntegrity {
@@ -3612,8 +3621,11 @@ export interface PlatformSettings {
   audit_forward_syslog_protocol: string;
   audit_forward_syslog_facility: number;
   audit_forward_webhook_enabled: boolean;
-  audit_forward_webhook_url: string;
-  audit_forward_webhook_auth_header: string;
+  // The legacy webhook's URL and header are write-only (#1502): the server
+  // returns whether each is set, and the URL's scheme + host only.
+  audit_forward_webhook_url_set: boolean;
+  audit_forward_webhook_url_display: string;
+  audit_forward_webhook_auth_header_set: boolean;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -4068,7 +4080,11 @@ export interface AuditForwardTarget {
   protocol: AuditForwardProtocol;
   facility: number;
   ca_cert_pem: string | null;
-  url: string;
+  // The webhook URL and Authorization header are Fernet-encrypted at rest
+  // and never returned (#1502). ``url_display`` is scheme + host only, e.g.
+  // ``https://hooks.slack.com/…``.
+  url_set: boolean;
+  url_display: string;
   auth_header_set: boolean;
   webhook_flavor: AuditForwardWebhookFlavor;
   smtp_host: string;
@@ -4096,8 +4112,10 @@ export interface AuditForwardTargetWrite {
   protocol?: AuditForwardProtocol;
   facility?: number;
   ca_cert_pem?: string | null;
-  url?: string;
-  auth_header?: string;
+  // Same contract as ``smtp_password``: omitted or ``null`` keeps the stored
+  // value, ``""`` clears it, any other string replaces it.
+  url?: string | null;
+  auth_header?: string | null;
   webhook_flavor?: AuditForwardWebhookFlavor;
   smtp_host?: string;
   smtp_port?: number;
@@ -4289,13 +4307,14 @@ export interface AuthGroupMapping {
   modified_at: string;
 }
 
-export interface AuthGroupMappingCreate {
+// #1476 — a mapping into a group that grants superadmin needs the step-up.
+export interface AuthGroupMappingCreate extends StepUp {
   external_group: string;
   internal_group_id: string;
   priority?: number;
 }
 
-export interface AuthGroupMappingUpdate {
+export interface AuthGroupMappingUpdate extends StepUp {
   external_group?: string;
   internal_group_id?: string;
   priority?: number;
@@ -4317,7 +4336,7 @@ export interface InternalGroup {
   user_ids?: string[];
 }
 
-export interface InternalGroupCreate {
+export interface InternalGroupCreate extends StepUp {
   name: string;
   description?: string;
   auth_source?: string;
@@ -4326,7 +4345,7 @@ export interface InternalGroupCreate {
   user_ids?: string[];
 }
 
-export interface InternalGroupUpdate {
+export interface InternalGroupUpdate extends StepUp {
   name?: string;
   description?: string;
   external_dn?: string | null;
@@ -4361,7 +4380,7 @@ export interface TimeBoundGrant {
   created_at: string;
 }
 
-export interface TimeBoundGrantCreate {
+export interface TimeBoundGrantCreate extends StepUp {
   group_id: string;
   action: string;
   resource_type: string;
@@ -4412,7 +4431,7 @@ export interface RoleCreate {
   permissions?: PermissionEntry[];
 }
 
-export interface RoleUpdate {
+export interface RoleUpdate extends StepUp {
   name?: string;
   description?: string;
   permissions?: PermissionEntry[];
@@ -9438,6 +9457,9 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
+  // Which Kea daemons the class renders into (#1229). A `dual` class sends
+  // each option to whichever family it is valid in.
+  address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
@@ -10303,7 +10325,9 @@ export type AlertRuleType =
   | "dhcp_pool_exhaustion"
   | "secret_expiring"
   | "decom_expiring"
-  | "node_pressure";
+  | "node_pressure"
+  | "backup_failed"
+  | "backup_stale";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -10928,7 +10952,11 @@ export interface WebhookSubscription {
   // response when one was newly assigned (``secret_plaintext``).
   secret_set: boolean;
   event_types: string[] | null;
-  headers: Record<string, string> | null;
+  // Header values are credentials (#1579) — Fernet-encrypted at rest
+  // and never returned. Only their names come back, plus whether any
+  // are stored at all.
+  header_names: string[];
+  headers_set: boolean;
   timeout_seconds: number;
   max_attempts: number;
   created_at: string;
@@ -10948,6 +10976,8 @@ export interface WebhookSubscriptionWrite {
   // sent in plaintext + encrypted server-side.
   secret?: string | null;
   event_types?: string[] | null;
+  // Write-only (#1579): ``null``/omitted on edit = keep the stored
+  // headers, ``{}`` = clear them, any other dict replaces them.
   headers?: Record<string, string> | null;
   timeout_seconds?: number;
   max_attempts?: number;
@@ -11827,6 +11857,8 @@ export interface ACMEDomainResolution {
   zone_name: string | null;
   record_name: string | null;
   driver: string | null;
+  // e.g. a more specific internal zone was skipped for a public one
+  note?: string | null;
 }
 
 // A manual TXT the operator must publish for an allow_manual order to
@@ -13469,6 +13501,9 @@ export interface ClusterWorkloadHealth {
    *  replica join. Not in ready / total; keeps the status off healthy. */
   jobs_running: number;
   status: string;
+  /** #1387 — database row only: "cnpg" when ready / total are the CNPG
+   *  Cluster's ready / wanted instances, "pods" when it is a pod count. */
+  source?: string | null;
 }
 
 /** The resolve probe's verdict (#985). */
