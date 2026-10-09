@@ -639,6 +639,49 @@ END
 $putback$;
 """
 
+# ``TRUNCATE … RESTART IDENTITY`` sends every sequence the emptied tables own
+# back to its start, and ``pg_restore --data-only --table`` reloads their rows
+# but never their sequences. Left there, each sequence hands out values its
+# restored rows already hold: ``audit_log.seq`` has a unique index, so every
+# audited write after a restore of ``audit`` (a login is one) failed with a
+# duplicate key and answered 409, and a restore of ``dns`` did the same to the
+# DHCP log ingest. So after the load, still in its one transaction, each
+# sequence a reloaded table owns (a serial's or an identity's) is set to the
+# largest value its column now holds, unless that is below where the sequence
+# already stands (``setval`` would refuse one under the sequence's minimum).
+# An empty table keeps the fresh start.
+_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL = """\
+DO $sequences$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT format('%I.%I', sn.nspname, s.relname) AS seq,
+               format('%I.%I', n.nspname, c.relname) AS tbl,
+               a.attname AS col
+        FROM pg_catalog.pg_depend d
+        JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+        JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+        JOIN pg_catalog.pg_class c ON c.oid = d.refobjid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid
+        WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND d.deptype IN ('a', 'i')
+          AND n.nspname = 'public'
+          AND c.relname = ANY ({tables})
+        ORDER BY 1
+    LOOP
+        EXECUTE format(
+            'SELECT pg_catalog.setval(%L, m) FROM (SELECT max(%I) AS m FROM %s) AS t '
+            'WHERE m >= (SELECT last_value FROM %s)',
+            r.seq, r.col, r.tbl, r.seq
+        );
+    END LOOP;
+END
+$sequences$;
+"""
+
 
 def _sql_text_array(values: list[str]) -> str:
     """``ARRAY['a', 'b']::text[]`` with each value quoted as a literal."""
@@ -678,6 +721,17 @@ def _selective_prelude(tables: list[str]) -> str:
     )
 
 
+def _selective_postlude(tables: list[str]) -> str:
+    """What a selective replay runs after the archive's rows, before its one
+    transaction commits: put the foreign keys back, which checks every row
+    loaded (:data:`_PUT_BACK_FOREIGN_KEYS_SQL`), then set each sequence the
+    reloaded tables own past their rows
+    (:data:`_PUT_SEQUENCES_PAST_THEIR_ROWS_SQL`)."""
+    return _PUT_BACK_FOREIGN_KEYS_SQL + _PUT_SEQUENCES_PAST_THEIR_ROWS_SQL.format(
+        tables=_sql_text_array(tables)
+    )
+
+
 async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]) -> None:
     """Empty ``tables`` and reload their rows from a custom-format archive,
     in ONE transaction (#1693).
@@ -687,8 +741,8 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
     which never connects), and :func:`_replay_clean` runs it through one
     ``psql --single-transaction`` after :func:`_selective_prelude` has
     emptied them and set their foreign keys aside, then puts the foreign
-    keys back (:data:`_PUT_BACK_FOREIGN_KEYS_SQL`), which checks every row
-    loaded.
+    keys back, which checks every row loaded, and sets the sequences the
+    TRUNCATE restarted past the rows it reloaded (:func:`_selective_postlude`).
 
     Nothing here needs a superuser. ``--disable-triggers`` did: it emits
     ``ALTER TABLE … DISABLE TRIGGER ALL``, which PostgreSQL refuses to the
@@ -736,7 +790,7 @@ async def _run_selective_restore(dump_path: Path, db_url: str, tables: list[str]
             db_url,
             producer=producer,
             prelude=_selective_prelude(tables),
-            postlude=_PUT_BACK_FOREIGN_KEYS_SQL,
+            postlude=_selective_postlude(tables),
         )
     finally:
         # As in _run_pg_restore: reap the producer on a failure before the

@@ -171,7 +171,12 @@ class _RequestSession:
         return None
 
 
-async def _restore(url: str, archive: bytes, monkeypatch: pytest.MonkeyPatch) -> Any:
+async def _restore(
+    url: str,
+    archive: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    sections: tuple[str, ...] = ("ipam",),
+) -> Any:
     async def _no_safety_dump(_db: object) -> None:
         # The safety dump reads the app's own DATABASE_URL, not this database.
         return None
@@ -183,8 +188,39 @@ async def _restore(url: str, archive: bytes, monkeypatch: pytest.MonkeyPatch) ->
         passphrase=_PASSPHRASE,
         confirmation_phrase=restore.CONFIRM_PHRASE,
         db_url=url,
-        sections=["ipam"],
+        sections=list(sections),
     )
+
+
+# An audited write, as far as the database sees one: ``seq`` comes from its
+# sequence, and ``row_hash`` is not checked here.
+_AUDIT_INSERT = (
+    "INSERT INTO audit_log (id, user_display_name, auth_source, action, resource_type, "
+    "resource_id, resource_display, result, row_hash) "
+    "VALUES ($1, 'admin', 'local', 'create', 'subnet', $2, 'x', 'success', 'h') RETURNING seq"
+)
+
+
+async def _sequences_behind_their_rows(conn: asyncpg.Connection) -> list[tuple[str, int, int]]:
+    """Every sequence a table owns (a serial's or an identity's) whose next
+    value is not past the largest value its column holds: (sequence, next, max)."""
+    owned = await conn.fetch(
+        "SELECT s.oid::regclass::text AS seq, c.oid::regclass::text AS tbl, a.attname AS col "
+        "FROM pg_depend d "
+        "JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' "
+        "JOIN pg_class c ON c.oid = d.refobjid "
+        "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid "
+        "WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass "
+        "AND d.deptype IN ('a', 'i') ORDER BY 1"
+    )
+    behind = []
+    for r in owned:
+        last_value, is_called = await conn.fetchrow(f"SELECT last_value, is_called FROM {r['seq']}")
+        largest = await conn.fetchval(f'SELECT max("{r["col"]}") FROM {r["tbl"]}')
+        next_value = last_value + 1 if is_called else last_value
+        if largest is not None and next_value <= largest:
+            behind.append((r["seq"], next_value, largest))
+    return behind
 
 
 @pytest.fixture
@@ -428,3 +464,49 @@ async def test_other_sections_restore_as_the_app_role_too(
     assert outcome.selective
     assert await _state(url) == archived
     assert await _foreign_keys(url) == keys_before
+
+
+async def test_a_selective_restore_leaves_each_sequence_it_reloads_past_its_rows(
+    appliance_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TRUNCATE … RESTART IDENTITY`` sends every sequence the emptied
+    tables own back to its start, and ``pg_restore --data-only --table``
+    brings back their rows, not their sequences. ``audit_log.seq`` is one,
+    under a unique index, so the next audited write (a login is one)
+    collided with a restored row and answered 409, and so did every one
+    after it until the sequence had climbed past the rows.
+
+    Writes audited after the backup move the sequence on, and the restore
+    undoes them. Afterwards no sequence may sit behind its rows, and the
+    next audited write lands after the restored chain."""
+    url, _fixture_archive, _archived = appliance_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        # What migration d92f4a18c763 makes on an appliance; create_all does not.
+        await conn.execute("ALTER SEQUENCE audit_log_seq_seq OWNED BY audit_log.seq")
+        await conn.execute("CREATE UNIQUE INDEX ix_audit_log_seq ON audit_log (seq)")
+        for i in range(5):
+            await conn.fetchval(_AUDIT_INSERT, uuid.uuid4(), f"archived-{i}")
+    finally:
+        await conn.close()
+    archive = _archive(await _pg_dump(url))
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        for i in range(3):
+            await conn.fetchval(_AUDIT_INSERT, uuid.uuid4(), f"after-the-backup-{i}")
+    finally:
+        await conn.close()
+
+    outcome = await _restore(url, archive, monkeypatch, sections=("audit",))
+
+    assert outcome.selective
+    assert "audit" in (outcome.restored_sections or [])
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        assert await conn.fetchval("SELECT count(*) FROM audit_log") == 5
+        assert await _sequences_behind_their_rows(conn) == []
+        # Raises UniqueViolationError on ix_audit_log_seq if the sequence is behind.
+        seq = await conn.fetchval(_AUDIT_INSERT, uuid.uuid4(), "after-the-restore")
+        assert seq > await conn.fetchval("SELECT max(seq) FROM audit_log WHERE seq <> $1", seq)
+    finally:
+        await conn.close()
