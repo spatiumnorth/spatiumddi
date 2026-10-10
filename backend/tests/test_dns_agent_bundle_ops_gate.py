@@ -147,14 +147,14 @@ async def _straddling_write(
 def _commit_after_the_read(monkeypatch: pytest.MonkeyPatch, t: AsyncSession) -> None:
     """Commit ``t`` right after the render has read the records, before it
     stores (and, under split-horizon, retires)."""
-    real = agent_bundle_render.render_bundle_body
+    real = agent_bundle_render.encode_bundle_body
 
     async def _read_then_commit(db, server):  # noqa: ANN001, ANN202
         rendered = await real(db, server)
         await t.commit()
         return rendered
 
-    monkeypatch.setattr(agent_bundle_render, "render_bundle_body", _read_then_commit)
+    monkeypatch.setattr(agent_bundle_render, "encode_bundle_body", _read_then_commit)
 
 
 def _gate(bundle: DNSAgentBundle) -> dict[str, Any]:
