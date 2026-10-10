@@ -1930,10 +1930,12 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     #590 — the leave is exactly as destructive as the join (``do_leave``
     runs the same full ``backup_and_wipe_identity`` + k3s restart) and the
     runner renames a failed leave trigger to ``.failed.<ts>`` just like the
-    join. So it gets the same per-target attempt ceiling; without it a
-    demote that can never come Ready re-wipes this node's k3s state on
-    every heartbeat, forever, whenever the control plane isn't around to
-    clear the desired-state.
+    join. So it gets the same kind of per-target attempt ceiling (its own,
+    ``_CLUSTER_LEAVE_MAX_ATTEMPTS``, with none of the join's #1212 retry
+    spacing: the backend clears a failed leave at once, so there is no
+    window to spread attempts across); without it a demote that can never
+    come Ready re-wipes this node's k3s state on every heartbeat, forever,
+    whenever the control plane isn't around to clear the desired-state.
     """
     if detect_deployment_kind() != "appliance":
         return False
