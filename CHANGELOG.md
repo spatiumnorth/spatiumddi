@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An SCP / SFTP backup target can check a pinned host key and sign
+  in with a private key again (#1692).** paramiko 4.0 removed DSA
+  (`paramiko.DSSKey`), the backend's `paramiko>=3.4.0` has no upper
+  bound, and the image installs 5.x, but the driver still named
+  `DSSKey` in two places that run on every connect. Every
+  `known_hosts` line raised and was skipped, so the checked host-key
+  modes (`known_hosts`, the default, and `strict`) refused every
+  server as "not found in known_hosts", even one whose key was
+  pinned; and a target with a private key answered Test connection
+  with a 500. Only `insecure_skip` with a password worked. DSA keys
+  are no longer offered (OpenSSH dropped them too), and new tests load
+  real known_hosts lines and private keys and complete a real SSH
+  handshake with the installed paramiko. Two more found validating the
+  fix: a known_hosts line the driver cannot decode (`ssh-dss`, a FIDO
+  `sk-*` key, bad base64) no longer drops a valid pin for the same host
+  on a later line, and an OpenSSH-format DSA key, a PKCS#8 key, or an
+  encrypted key with no passphrase is now a Test-connection error that
+  says which, rather than a 500 or a misleading "not a valid RSA key".
+
 - **A member whose join fails for a transient reason keeps retrying for
   the whole retry window (#1212).** After a transient join failure the
   backend keeps the member's desired role for 15 minutes (#961), so that
