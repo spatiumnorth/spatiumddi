@@ -397,7 +397,7 @@ async def _note_retrying(db: AsyncSession, order_id: uuid.UUID, message: str) ->
 
 
 def _network_error_detail(exc: httpx.TransportError) -> str:
-    """``network error talking to https://ca.example: ConnectError: …``.
+    """``network error talking to <scheme>://<host>[:<port>]: <ExceptionType>: <message>``.
 
     Names the exception type (a ``ReadTimeout`` can carry no message) and
     the origin the request went to, which tells a wrong or blocked

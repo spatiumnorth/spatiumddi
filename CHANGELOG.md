@@ -168,6 +168,7 @@ the formatter handles the rest.
   takeover, and Abort's release is no longer renewed away (the aborted
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
+
 - **An ACME order whose CA cannot be reached now ends, and says why
   (#1686).** A refused, timed-out or reset connection to the CA left
   the order `processing` for the Celery task's retries, and nothing

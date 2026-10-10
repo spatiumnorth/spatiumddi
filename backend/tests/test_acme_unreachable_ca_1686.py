@@ -198,3 +198,127 @@ async def test_an_order_that_could_not_reach_the_ca_no_longer_blocks_renewal(
     assert result == "renewed=1", result
     delay.assert_called_once()
     assert delay.call_args.args[0] != str(oid)
+
+
+# ── Every shape of "the CA cannot be reached", through the real client ──
+#
+# The tests above fake the client. These drive the real ``ACMEClient``, with
+# only its HTTP transport replaced, so the exception each shape raises is the
+# one httpx really raises for it, and assert the order ends with an error that
+# names what went wrong on every one of them.
+
+
+def _account_key_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return (
+        ec.generate_private_key(ec.SECP256R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def _raising(exc_type: type[httpx.TransportError], message: str):  # type: ignore[no-untyped-def]
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc_type(message, request=request)
+
+    return handler
+
+
+def _answering(status: int):  # type: ignore[no-untyped-def]
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="upstream unavailable")
+
+    return handler
+
+
+_SHAPES = [
+    # (id, handler, substrings the final last_error must carry)
+    (
+        "dns-failure",
+        _raising(httpx.ConnectError, "[Errno -2] Name or service not known"),
+        ("ConnectError", "Name or service not known", "ca.unreachable.test", "no retries left"),
+    ),
+    (
+        "connection-refused",
+        _raising(httpx.ConnectError, "[Errno 111] Connection refused"),
+        ("ConnectError", "Connection refused", "ca.unreachable.test", "no retries left"),
+    ),
+    (
+        "tls-error",
+        _raising(httpx.ConnectError, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"),
+        ("ConnectError", "CERTIFICATE_VERIFY_FAILED", "ca.unreachable.test", "no retries left"),
+    ),
+    (
+        "connect-timeout",
+        _raising(httpx.ConnectTimeout, ""),
+        ("ConnectTimeout", "ca.unreachable.test", "no retries left"),
+    ),
+    (
+        "read-timeout",
+        _raising(httpx.ReadTimeout, ""),
+        ("ReadTimeout", "ca.unreachable.test", "no retries left"),
+    ),
+    (
+        "connection-reset",
+        _raising(httpx.RemoteProtocolError, "Server disconnected without sending a response."),
+        ("RemoteProtocolError", "ca.unreachable.test", "no retries left"),
+    ),
+    # A CA that answers, but with a 5xx, is a protocol failure: no retry, the
+    # order ends on the first attempt with the status code.
+    ("http-503", _answering(503), ("directory fetch failed", "HTTP 503")),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "expected"),
+    [pytest.param(h, e, id=i) for i, h, e in _SHAPES],
+)
+async def test_every_unreachable_ca_shape_ends_the_order_with_its_error(
+    db_session: AsyncSession, handler, expected  # type: ignore[no-untyped-def]
+) -> None:
+    oid = await _seed_order(db_session)
+    seeded = await db_session.get(ACMEOrder, oid)
+    assert seeded is not None
+    account = await db_session.get(ACMEClientAccount, seeded.account_id)
+    assert account is not None
+    # The real client parses the account key in its constructor.
+    account.account_key_encrypted = encrypt_str(_account_key_pem())
+    await db_session.commit()
+
+    real_async_client = httpx.AsyncClient
+    calls: list[str] = []
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return handler(request)
+
+    def client_factory(*a: object, **kw: object) -> httpx.AsyncClient:
+        kw["transport"] = httpx.MockTransport(counting)
+        return real_async_client(*a, **kw)  # type: ignore[arg-type]
+
+    from app.services.acme_client import engine
+
+    with (
+        patch.object(engine.httpx, "AsyncClient", client_factory),
+        patch.object(orchestrator, "AsyncSessionLocal", task_session),
+    ):
+        await asyncio.to_thread(acme_tasks.run_acme_order.apply, args=[str(oid)])
+
+    db_session.expire_all()
+    order = await db_session.get(ACMEOrder, oid)
+    assert order is not None
+    assert order.status == ACME_ORDER_INVALID, (order.status, order.last_error)
+    assert order.last_error is not None
+    assert not order.last_error.startswith("retrying"), order.last_error
+    for needle in expected:
+        assert needle in order.last_error, (needle, order.last_error)
+    # Only the origin is named, never the directory path.
+    assert "/directory" not in order.last_error, order.last_error
+    assert calls, "the CA was never contacted"
