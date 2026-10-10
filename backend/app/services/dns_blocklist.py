@@ -12,7 +12,7 @@ this module.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -255,7 +255,7 @@ async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[
 
 async def stream_entries(
     db: AsyncSession, lists: list[DNSBlockList], batch: int
-) -> AsyncIterator[list[RenderEntry]]:
+) -> AsyncGenerator[list[RenderEntry], None]:
     """Every entry ``_collect_lists`` collects for ``lists``, in the same order,
     at most ``batch`` at a time: one server-side cursor per list, so neither
     the driver nor this process ever holds more than a batch of a list."""

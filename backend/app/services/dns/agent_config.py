@@ -22,6 +22,7 @@ import hashlib
 import json
 import secrets
 from collections.abc import Callable, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -436,19 +437,24 @@ async def _stream_zone_entries(
     for update in hashes:
         update(b"[")
     write(b"[")
-    async for batch in stream_entries(db, lists, BLOCKLIST_RENDER_BATCH):
-        items = [_entry_dict(*entry) for entry in batch]
-        hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
-        wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
-        del items
-        if not first:
-            # json.dumps's item separators: ", " by default, "," on the wire.
-            hashed = b", " + hashed
-            wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
-        for update in hashes:
-            update(hashed)
-        write(wire)
-        first = False
+    # ``aclosing``: a failure here (not in the generator) must close the
+    # list's server-side cursor now, on this connection, rather than leave it
+    # to the event loop's async-generator finaliser after the caller has
+    # already rolled the session back or reused it.
+    async with aclosing(stream_entries(db, lists, BLOCKLIST_RENDER_BATCH)) as batches:
+        async for batch in batches:
+            items = [_entry_dict(*entry) for entry in batch]
+            hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+            wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+            del items
+            if not first:
+                # json.dumps's item separators: ", " by default, "," on the wire.
+                hashed = b", " + hashed
+                wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
+            for update in hashes:
+                update(hashed)
+            write(wire)
+            first = False
     for update in hashes:
         update(b"]")
     write(b"]")
