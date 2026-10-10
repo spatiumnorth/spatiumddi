@@ -84,6 +84,44 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A selective restore works on an appliance, and one that fails
+  leaves the database as it was (#1693).** A restore with `sections`
+  emptied the selected sections' FK-cascade closure in one transaction,
+  which committed, and loaded the archive's rows in a second with
+  `pg_restore --data-only --disable-triggers`. That flag emits
+  `ALTER TABLE … DISABLE TRIGGER ALL`, which PostgreSQL refuses to a
+  non-superuser on any table with a foreign key, and an appliance
+  connects as the app role, which is not one. So every selective
+  restore on an appliance answered 400 after emptying the closure
+  (71 tables for `ipam`), `alembic_version` among them: the api stayed
+  not ready and the UI that could undo it answered 502. CI never saw
+  it, because its Postgres connects as a superuser. The emptying and
+  the load now run in one transaction, through the same streamed psql
+  replay the full restore uses, so a failure of any kind rolls the
+  emptying back. The closure's foreign keys are dropped for the load
+  and added back from their own definitions before it commits, which
+  needs only ownership and checks every row loaded. Two behaviour
+  changes: an archive whose rows point at something deleted since the
+  backup, outside the restored sections, is now refused with the
+  constraint named (a superuser used to load them pointing at nothing),
+  and a selective restore holds every table's lock for the length of
+  its load, as the full restore does (#1648). A restore whose
+  `TRUNCATE … CASCADE` would reach a table outside the closure (a
+  foreign key a migration created and no model declares) is refused
+  too, instead of emptying a table it never reloads.
+
+- **A selective restore no longer restarts the sequences of the tables
+  it reloads (#1720).** `TRUNCATE … RESTART IDENTITY` sent every
+  sequence the closure owns back to its start, and
+  `pg_restore --data-only --table` reloads rows, not sequences. After a
+  restore of `audit`, every audited write, logins included, answered
+  409 on a duplicate `audit_log.seq` until as many had failed as the
+  restored log had rows; after a restore of `dns`, every DHCP log post
+  failed the same way on `dhcp_log_entry`. Each sequence a reloaded
+  table owns is now set past the largest value its column holds, in
+  the restore's one transaction. As after a full restore, values that
+  rows written after the backup had held can be handed out again.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
