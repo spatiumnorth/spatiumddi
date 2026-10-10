@@ -48,7 +48,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # Stated in the PAST tense on purpose: Dependabot bumps the ``FROM`` line but
 # cannot touch this comment, so any wording that names the CURRENT pin goes
 # stale on the very next bump — which is exactly what happened at 1.26.6.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS gobgp-build
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH
@@ -85,15 +85,15 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # GoBGP version: a comment naming the pinned release goes stale on
 # the next bump and then asserts something false (#975 found it had).
 #
-# At v4.10.0 upstream pins x/net v0.58.0 (indirect), x/text v0.41.0 and
-# grpc v1.83.2 — exactly the versions the overrides used to force — so
-# there are no `go get` override lines right now: the build takes
-# upstream's go.mod as-is. Reinstate an override only when upstream
-# lags a CVE fix again, and only as a strict upgrade per the rule above.
+# Upstream's go.mod lagged a CVE fix again (#1729): x/net below 0.60.0
+# carries CVE-2026-78669 (HIGH, net/http/internal/http2), so x/net is
+# raised past upstream's pin below — a strict upgrade, per the rule above.
+# Drop the line once upstream's go.mod reaches it.
 #
 # Dependabot does not see these: they are `go get` arguments in a Dockerfile,
 # not a tracked manifest, which is why they live in versions.json's orbit and
 # why `make trivy IMAGE=looking-glass` is what surfaces the next one.
+RUN go get golang.org/x/net@v0.60.0 && go mod tidy
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
