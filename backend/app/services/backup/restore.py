@@ -139,7 +139,7 @@ async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
     enough on their own (no other connections present) the replay
     proceeds normally.
     """
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
         "WHERE datname = current_database() AND pid <> pg_backend_pid() "
@@ -592,7 +592,7 @@ async def _truncate_tables(tables: list[str], db_url: str) -> None:
     if not tables:
         return
     pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     quoted = ", ".join(f'"{t}"' for t in tables)
     cmd = [
         "psql",
@@ -634,7 +634,7 @@ async def _run_pg_restore_data_only(dump_path: Path, db_url: str, tables: list[s
         raise BackupRestoreError("selective restore: no tables to load")
     pg_env, dbname = _pg_env_from_url(db_url)
     await _terminate_other_db_connections(pg_env)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     cmd = [
         "pg_restore",
         "--dbname",
@@ -743,7 +743,7 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     much registrar work is queued up.
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
-    full_env = {**os.environ, **pg_env}
+    full_env = _pg_subprocess_env(pg_env)  # allowlisted env, not the full api env (#1572)
     sql = (
         "SELECT z.name FROM dns_zone z "
         "JOIN dns_server_group g ON g.id = z.group_id "
@@ -942,8 +942,12 @@ async def _apply_backup_restore_inner(
 
     # Phase 2: passphrase verify. Decrypt secrets.enc up front so
     # we fail with "wrong passphrase" before deleting anything.
+    # The PBKDF2 derivation is ~0.3 s of CPU by design; run it off
+    # the event loop so a restore can't stall the api (#1568).
     try:
-        secrets_payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
+        secrets_payload = await asyncio.to_thread(
+            decrypt_secrets, secrets_enc, passphrase=passphrase
+        )
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
 

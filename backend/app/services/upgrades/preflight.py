@@ -97,8 +97,10 @@ class PreflightResult:
     detail: dict[str, Any]
 
 
-# The skip-release warning's threshold, in days between two CalVer tags.
+# The skip-release warning's thresholds: days between two CalVer tags,
+# and major versions between two SemVer ones (#1182).
 _SKIP_RELEASE_WARN_DAYS = 90
+_SKIP_RELEASE_WARN_MAJORS = 1
 
 # How old the newest successful backup may be before the pre-upgrade backup
 # row warns (#1227). A day, matching the common nightly schedule.
@@ -108,15 +110,29 @@ _PRE_UPGRADE_BACKUP_MAX_AGE_HOURS = 24
 # ── Individual checks ─────────────────────────────────────────────────
 
 
-def check_inflight_conflict(*, namespace: str | None = None) -> PreflightResult:
+def check_inflight_conflict(
+    *, namespace: str | None = None, own_holder: str | None = None
+) -> PreflightResult:
     """Refuses if another upgrade is already in flight cluster-wide.
 
     Reads the ``spatium-upgrade-lock`` Lease; if it's held + not
     expired we ``fail`` with the holder's identity. An expired lease
     is fine (the previous holder crashed before releasing — we'll
     take over on acquire).
+
+    ``own_holder`` is the identity of the run asking. The orchestrator
+    takes the lease at Start and then runs this preflight again for every
+    node, so without it each run failed its own first node on the lease
+    it had just taken (#1445).
     """
     state = mutex.get_state(namespace=namespace)
+    if state.held and not state.expired and own_holder and state.holder == own_holder:
+        return PreflightResult(
+            name="inflight_conflict",
+            level="ok",
+            message="the upgrade lease is held by this run",
+            detail={"holder": state.holder, "transitions": state.transitions},
+        )
     if state.held and not state.expired:
         return PreflightResult(
             name="inflight_conflict",
@@ -184,9 +200,27 @@ async def check_replication_lag(*, threshold_bytes: int = 16 * 1024) -> Prefligh
             message="no streaming replicas (single-node shape)",
             detail={"replicas": []},
         )
+    # #1445 — ``pg_stat_replication`` shows a replica's ``state`` and LSNs
+    # only to a superuser or a member of ``pg_monitor``; to anyone else the
+    # row is there but those columns are NULL. The app's role is neither on
+    # the appliance (CNPG manages it and reverts a manual GRANT), so every
+    # replica read as "not streaming" and the preflight refused to start a
+    # healthy cluster's upgrade. A NULL state is unverified, not broken.
+    unverified = [r for r in replicas if r["state"] is None]
+    if len(unverified) == len(replicas):
+        return PreflightResult(
+            name="replication_lag",
+            level="warn",
+            message=(
+                f"{len(replicas)} replica(s) connected; their streaming state "
+                "is not visible to the app's database role (needs pg_monitor), "
+                "so it was not verified"
+            ),
+            detail={"replicas": replicas, "unverified": True},
+        )
     streaming = [r for r in replicas if r["state"] == "streaming"]
     lagging = [r for r in streaming if r["lag_bytes"] > threshold_bytes]
-    not_streaming = [r for r in replicas if r["state"] != "streaming"]
+    not_streaming = [r for r in replicas if r["state"] is not None and r["state"] != "streaming"]
     if not_streaming:
         return PreflightResult(
             name="replication_lag",
@@ -275,6 +309,151 @@ def check_disk_headroom(
     )
 
 
+# A node whose last heartbeat is older than this has a /var reading that no
+# longer says anything about now (#1234). The supervisor heartbeats every
+# ~30 s, so ten minutes is many missed beats, not jitter.
+_NODE_DISK_REPORT_MAX_AGE_SECONDS = 10 * 60
+
+
+def _node_var_free_bytes(cluster_health: Any) -> int | None:
+    """Free bytes on a node's ``/var`` from its reported partitions.
+
+    ``None`` = no usable reading (key absent, entry absent, malformed) —
+    UNKNOWN, never zero and never "plenty".
+    """
+    if not isinstance(cluster_health, dict):
+        return None
+    parts = cluster_health.get("host_disk_partitions")
+    if not isinstance(parts, list):
+        return None
+    for p in parts:
+        if not isinstance(p, dict) or p.get("mount") != "/var":
+            continue
+        total, used = p.get("total_bytes"), p.get("used_bytes")
+        if (
+            isinstance(total, int)
+            and isinstance(used, int)
+            and not isinstance(total, bool)
+            and not isinstance(used, bool)
+            and total > 0
+        ):
+            return max(total - used, 0)
+    return None
+
+
+def judge_node_disk_headroom(
+    nodes: list[Any],
+    *,
+    need_bytes: int,
+    now: datetime,
+    max_age_seconds: int = _NODE_DISK_REPORT_MAX_AGE_SECONDS,
+) -> PreflightResult:
+    """Judge each appliance node's reported ``/var`` headroom (#1234).
+
+    ``spatium-upgrade-slot`` stages the slot image under the NODE's
+    ``/var``, so the api pod's own filesystem says nothing about whether a
+    member can take the upgrade. ``fail`` names every node short of
+    ``need_bytes``; a node with no reading, or one older than
+    ``max_age_seconds``, is ``warn`` and named (NULL = unknown, never ok).
+    """
+    short: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    checked: list[dict[str, Any]] = []
+    for n in nodes:
+        label = getattr(n, "hostname", None) or str(getattr(n, "id", "?"))
+        seen = getattr(n, "last_seen_at", None)
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        free = _node_var_free_bytes(getattr(n, "cluster_health", None))
+        if free is None:
+            unknown.append({"node": label, "reason": "no /var disk report"})
+            continue
+        if seen is None or (now - seen).total_seconds() > max_age_seconds:
+            unknown.append({"node": label, "reason": "disk report is stale", "free_bytes": free})
+            continue
+        entry = {"node": label, "free_bytes": free}
+        checked.append(entry)
+        if free < need_bytes:
+            short.append(entry)
+    detail: dict[str, Any] = {
+        "needed_bytes": need_bytes,
+        "nodes": checked,
+        "short": short,
+        "unverified": unknown,
+    }
+    gib = 1024**3
+    if short:
+        names = ", ".join(f"{e['node']} ({e['free_bytes'] // gib} GiB free)" for e in short)
+        return PreflightResult(
+            name="disk_headroom",
+            level="fail",
+            message=(
+                f"/var too small on {names}; need {need_bytes // gib} GiB "
+                "(slot image + margin) — free space before upgrading"
+            ),
+            detail=detail,
+        )
+    if unknown:
+        names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message=f"/var headroom unverified on {names}",
+            detail=detail,
+        )
+    return PreflightResult(
+        name="disk_headroom",
+        level="ok",
+        message=f"/var has room on all {len(checked)} node(s) (need {need_bytes // gib} GiB)",
+        detail=detail,
+    )
+
+
+async def check_node_disk_headroom(
+    *,
+    slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
+    safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
+) -> PreflightResult:
+    """Per-node ``/var`` headroom for appliance fleets (#1234).
+
+    Falls back to :func:`check_disk_headroom` (the api container's own
+    ``/var``) when there are no approved appliance rows — docker-compose /
+    plain k8s — which is the only place that check is meaningful.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(Appliance).where(
+                            Appliance.state == APPLIANCE_STATE_APPROVED,
+                            Appliance.deployment_kind == "appliance",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_node_disk_query_failed", error=str(e))
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message="Could not read per-node disk reports — check /var headroom manually.",
+            detail={"error": str(e)},
+        )
+    if not rows:
+        return check_disk_headroom(
+            slot_image_size_bytes=slot_image_size_bytes,
+            safety_margin_bytes=safety_margin_bytes,
+        )
+    return judge_node_disk_headroom(
+        rows,
+        need_bytes=slot_image_size_bytes + safety_margin_bytes,
+        now=datetime.now(UTC),
+    )
+
+
 async def check_mirror_disk_headroom(
     *,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
@@ -285,9 +464,8 @@ async def check_mirror_disk_headroom(
     Phase B-only check — only fires when ``settings.slot_image_mirror_url``
     is set. Queries the mirror's ``/api/v1/appliance/internal/slot-
     images/_/disk-usage`` endpoint over the in-cluster Service to get
-    the real PVC volume's free space; ``check_disk_headroom`` above
-    looks at the api pod's /var which isn't where the slot image
-    actually lands in mirror mode.
+    the real PVC volume's free space; ``check_node_disk_headroom`` above
+    covers each node's /var (#1234), which is not the mirror's volume.
 
     On docker-compose / non-mirror shapes returns ``ok`` with detail
     noting "no mirror configured" so the operator-facing report still
@@ -382,9 +560,12 @@ def check_version_path(
       the target, which is a rollback and fails.
     * Skip-release: warn when two CalVer tags are more than 90 days
       apart. We don't refuse because the appliance supports it via two
-      rolling upgrades back to back, but the operator should know. A
-      jump that involves a SemVer version has no dates to compare, so
-      it gets no such warning (#1182).
+      rolling upgrades back to back, but the operator should know.
+      SemVer tags carry no date, so between two SemVer releases the
+      same warning fires when the jump crosses more than one major
+      version (1.x to 3.x): 1.x to 2.x is the normal path, and minor
+      and patch jumps never warn (#1182). The switch from CalVer to
+      SemVer is never a skip.
     """
     current = current_version or settings.version or "dev"
     base_detail: dict[str, Any] = {"current": current, "target": target_version}
@@ -433,20 +614,37 @@ def check_version_path(
             ),
             detail=base_detail,
         )
-    if running.tagged_on is None or target.tagged_on is None:
-        # At least one side is SemVer: there is no date to measure a gap
-        # with. What should count as skipping releases under SemVer is
-        # still open (#1182); until then the jump is reported as forward.
-        crossing = running.tagged_on is not None
+    if running.tagged_on is not None and target.tagged_on is None:
+        # The bridge to 1.0.0 (or later): every SemVer release is newer
+        # than every CalVer one, and there is no date on the SemVer side
+        # to measure a gap with.
         return PreflightResult(
             name="version_path",
             level="ok",
-            message=(
-                "forward jump across the switch from CalVer to SemVer"
-                if crossing
-                else f"forward jump from {current} to {target_version}"
-            ),
+            message="forward jump across the switch from CalVer to SemVer",
             detail={**base_detail, "gap_days": None},
+        )
+    if target.tagged_on is None:
+        # Both SemVer (a target newer than a SemVer release is SemVer
+        # too). key is (1, major, minor, patch, pre).
+        majors = target.key[1] - running.key[1]
+        detail = {**base_detail, "gap_days": None, "gap_majors": majors}
+        if majors > _SKIP_RELEASE_WARN_MAJORS:
+            return PreflightResult(
+                name="version_path",
+                level="warn",
+                message=(
+                    f"target {target_version} is {majors} major versions newer "
+                    f"than current {current}; consider stopping at each major "
+                    "version in between"
+                ),
+                detail=detail,
+            )
+        return PreflightResult(
+            name="version_path",
+            level="ok",
+            message=f"forward jump from {current} to {target_version}",
+            detail=detail,
         )
     gap_days = (target.tagged_on - running.tagged_on).days
     if gap_days > _SKIP_RELEASE_WARN_DAYS:
@@ -607,8 +805,12 @@ async def run_all(
     *,
     target_version: str,
     namespace: str | None = None,
+    own_holder: str | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
+
+    ``own_holder`` is passed by a run that already holds the upgrade
+    lease (see :func:`check_inflight_conflict`); Plan passes nothing.
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
@@ -616,9 +818,9 @@ async def run_all(
     ``asyncio.gather``.
     """
     results: list[PreflightResult] = [
-        check_inflight_conflict(namespace=namespace),
+        check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
-        check_disk_headroom(),
+        await check_node_disk_headroom(),
         await check_mirror_disk_headroom(),
         check_version_path(target_version=target_version),
         check_quorum(),

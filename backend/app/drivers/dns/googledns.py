@@ -52,7 +52,11 @@ from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
+    managed_value_index,
     normalize_fqdn,
+    split_structured_rdata,
+    value_is_managed,
 )
 from app.drivers.dns.base import RecordChange, RecordData
 
@@ -186,12 +190,19 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             name = self._relativize(str(rrset.name), apex)
             ttl = rrset.ttl
             for rdata in rrset.rrdatas:
+                # MX / SRV rdata arrives composed ("10 mail.example.com.")
+                # — split it into the structured columns so the stored
+                # shape matches the record API's split contract (#1526).
+                bare, priority, weight, port = split_structured_rdata(rtype, str(rdata))
                 records.append(
                     RecordData(
                         name=name,
                         record_type=rtype,
-                        value=str(rdata),
+                        value=bare,
                         ttl=int(ttl) if ttl is not None else None,
+                        priority=priority,
+                        weight=weight,
+                        port=port,
                     )
                 )
         return records
@@ -235,6 +246,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         rr = change.record
         rtype = rr.record_type.upper()
         absolute = self._absolutize(rr.name, apex)
+        # The op's value in provider form — MX / SRV compose the structured
+        # columns into the rdata string Cloud DNS stores (#1526). The live
+        # rrset's rrdatas are already in that form.
+        composed = compose_structured_rdata(rr)
 
         # Cloud DNS groups every same-{name,type} value under a single
         # rrset (round-robin A, multiple MX/NS/TXT, …) but SpatiumDDI
@@ -248,7 +263,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
 
             if change.op == "create":
                 existing = self._find_rrset(zone, absolute, rtype)
-                merged, ttl = self._merge_create(existing, rr.value, rr.ttl)
+                merged, ttl = self._merge_create(existing, composed, rr.ttl)
                 if existing is not None and self._rrdatas(existing) == merged:
                     # Value already present with an unchanged set — no-op.
                     return None
@@ -263,12 +278,12 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
 
             if change.op == "delete":
                 existing = self._find_rrset(zone, absolute, rtype)
-                if existing is None or rr.value not in self._rrdatas(existing):
+                if existing is None or composed not in self._rrdatas(existing):
                     # Value (or whole rrset) already gone — idempotent
                     # no-op. Skip the commit so we don't fire an empty
                     # change set (Cloud DNS rejects those).
                     return None
-                reduced = [v for v in self._rrdatas(existing) if v != rr.value]
+                reduced = [v for v in self._rrdatas(existing) if v != composed]
                 changes.delete_record_set(existing)
                 if reduced:
                     # Siblings remain — re-add the reduced rrset rather
@@ -289,10 +304,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             # ``rrset_action``) the single-value replace is kept — right for
             # the common single-value rrset (CNAME, a host with one A/TXT).
             if change.rrset is not None and change.rrset.members:
-                values = [m.value for m in change.rrset.members]
+                values = [compose_structured_rdata(m) for m in change.rrset.as_records(rr)]
                 ttl = int(change.rrset.ttl or (rr.ttl if rr.ttl else 0) or 300)
             else:
-                values = [rr.value]
+                values = [composed]
                 ttl = int(rr.ttl) if rr.ttl else 300
             existing = self._find_rrset(zone, absolute, rtype)
             if existing is not None:
@@ -380,7 +395,15 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         )
 
     # ── Zone write ──────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         client = self._client(creds)
         name = normalize_fqdn(getattr(zone, "name", "") or "")
         if name == ".":
@@ -399,11 +422,107 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             return
 
         if op == "delete":
-            managed = await self._resolve_zone(client, name)
-            await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
+            try:
+                managed = await self._resolve_zone(client, name)
+            except CloudDNSError as exc:
+                # #1528 — an already-absent zone is the desired end state;
+                # treat it as success so trash purge / permanent delete /
+                # move don't retry forever.
+                if "not found" in str(exc):
+                    logger.info(
+                        "google_dns.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=name,
+                    )
+                    return
+                raise
+            # #1528 — Cloud DNS refuses to delete a populated zone
+            # (containerNotEmpty); empty OUR records first. Records the
+            # provider holds that SpatiumDDI never managed are left in
+            # place — if they keep the zone non-empty, the delete below
+            # fails honestly instead of wiping them.
+            await self._empty_zone(managed, name, managed_records)
+            try:
+                await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
+            except CloudDNSError as exc:
+                if "not found" in str(exc).lower() or "404" in str(exc):
+                    return
+                raise
             return
 
         raise CloudDNSError(f"google_dns._apply_zone: unsupported op {op!r}")
+
+    async def _empty_zone(
+        self, managed: Any, apex: str, managed_records: list[RecordData] | None
+    ) -> None:
+        """Delete the rrsets SpatiumDDI manages ahead of a zone delete (#1528).
+
+        Scoped to ``managed_records`` (the zone's records as our DB knows
+        them): an rrdata is removed only when SpatiumDDI manages it. An
+        rrset whose values are ALL managed is deleted wholesale; a mixed
+        rrset is replaced (delete old + add reduced, one transactional
+        change) with just its unmanaged values, so a foreign value
+        sharing a name/type with ours survives. SOA and apex NS are
+        always skipped — Cloud DNS owns them and allows the zone delete
+        with only those present.
+
+        ``managed_records is None`` means the caller supplied no scoping
+        information: delete NOTHING. The subsequent zone delete then
+        either succeeds or fails ``containerNotEmpty``, which the
+        caller surfaces — an honest failure, never a guessed-at wipe.
+        """
+        if managed_records is None:
+            logger.info(
+                "google_dns.apply_zone.delete_unscoped_no_empty",
+                zone=apex,
+            )
+            return
+        index = managed_value_index(managed_records, apex, self._absolutize)
+        apex_fqdn = normalize_fqdn(apex)
+        rrsets = await asyncio.to_thread(
+            self._wrap_call,
+            "list_resource_record_sets",
+            lambda: list(managed.list_resource_record_sets()),
+        )
+        # (rrset, remaining-values | None) — None means delete wholesale.
+        ops: list[tuple[Any, list[str] | None]] = []
+        for rrset in rrsets:
+            rtype = str(rrset.record_type).upper()
+            if rtype == "SOA":
+                continue
+            if rtype == "NS" and normalize_fqdn(str(rrset.name)) == apex_fqdn:
+                continue
+            candidates = index.get((normalize_fqdn(str(rrset.name)), rtype))
+            if not candidates:
+                continue
+            rrdatas = self._rrdatas(rrset)
+            kept = [v for v in rrdatas if not value_is_managed(v, candidates)]
+            if len(kept) == len(rrdatas):
+                continue  # none of this rrset's values are ours
+            ops.append((rrset, kept or None))
+
+        for start in range(0, len(ops), 100):
+            batch = ops[start : start + 100]
+
+            def _commit(batch: list[tuple[Any, list[str] | None]] = batch) -> Any:
+                changes = managed.changes()
+                for rrset, remaining in batch:
+                    changes.delete_record_set(rrset)
+                    if remaining is not None:
+                        ttl = int(rrset.ttl) if rrset.ttl is not None else 300
+                        changes.add_record_set(
+                            managed.resource_record_set(
+                                str(rrset.name),
+                                str(rrset.record_type).upper(),
+                                ttl,
+                                remaining,
+                            )
+                        )
+                changes.create()
+                return changes
+
+            committed = await asyncio.to_thread(self._wrap_call, "delete_zone_records", _commit)
+            await self._wait_for_change(committed)
 
     # ── Managed-zone resolution ─────────────────────────────────────────
     async def _resolve_zone(self, client: Any, zone_name: str) -> Any:
@@ -451,7 +570,8 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 "Calls scope by the managed-zone id (slug) resolved from the "
                 "zone DNS name; writes go through transactional change sets "
                 "and the op blocks until the change reaches 'done'. MX/SRV "
-                "priority is carried inside the record value."
+                "structured fields are composed into the provider rdata on "
+                "write and split back out on read."
             ),
         }
 

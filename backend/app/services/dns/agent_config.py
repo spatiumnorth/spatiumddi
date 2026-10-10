@@ -72,6 +72,7 @@ from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
     op_rrset_key,
+    queued_after,
     rrset_match_where,
     supersede,
 )
@@ -119,6 +120,11 @@ if TYPE_CHECKING:
 
 
 logger = structlog.get_logger(__name__)
+
+# The zone-payload keys a record change moves: kept out of the structural
+# fingerprint of a group without views, so a record-only change reaches the
+# agent as RFC 2136 ops, not as a re-render (#1373). See ``zones_structural``.
+_RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
 
 
 def _compute_etag(payload: dict[str, Any]) -> str:
@@ -337,8 +343,17 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
     )
     acls = acls_res.scalars().all()
 
-    # Zones (+ records for primary only)
-    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
+    # Zones (+ records for primary only), by name like every other list the
+    # structural fingerprint hashes, then by id (two views may each hold a
+    # zone of the same name). Unordered, Postgres returned them in whatever
+    # order its plan read them, and the UPDATE a record change makes to its
+    # zone (``last_serial``) moved that zone in it, so a record change moved
+    # the structural etag of any group of two zones or more (#1373).
+    zones_res = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id == server.group_id)
+        .order_by(DNSZone.name, DNSZone.id)
+    )
     zones = zones_res.scalars().all()
 
     # Dynamic-update ACLs (issue #641). One JOIN across every ACL row in the
@@ -980,8 +995,17 @@ async def render_bundle_body(db: AsyncSession, server: DNSServer) -> RenderedBod
         # view, so records are folded in here — any record/view change then
         # shifts the structural etag and triggers a full, view-correct
         # re-render. ``view_name`` is always retained either way.
+        #
+        # #1373 — ``serial`` is left out with the records, for the same reason:
+        # every record change bumps it, so while it was in here (since #430
+        # shipped it for the agent's zone-state reporter) every record change
+        # on a flat group re-rendered the zone and froze/reloaded/thawed it
+        # beside the RFC 2136 update. A change that should re-render moves a
+        # field of its own (the TTL, the SOA timers, the apex); the serial bump
+        # that comes with it is never the only difference.
         "zones_structural": [
-            {k: val for k, val in z.items() if (k != "records" or has_views)} for z in zone_payload
+            {k: val for k, val in z.items() if has_views or k not in _RECORD_DRIVEN_KEYS}
+            for z in zone_payload
         ],
         # DNSSEC signing intent / policy params rewrite named.conf, so a
         # change must trigger a full reload (issue #49).
@@ -1169,7 +1193,9 @@ async def page_pending_ops(
     op_res = await db.execute(
         select(DNSRecordOp)
         .where(*conds)
-        .order_by(DNSRecordOp.created_at, DNSRecordOp.id)
+        # #1489 — ``seq`` keeps one transaction's ops in the order they were
+        # queued; ``id`` only breaks ties between rows from before it.
+        .order_by(DNSRecordOp.created_at, DNSRecordOp.seq, DNSRecordOp.id)
         .limit(batch)
     )
     ops_to_dispatch = list(op_res.scalars().all())
@@ -1213,8 +1239,8 @@ async def _supersede_backed_off_ops(
     candidates — anything older and ready ships ahead in the same page — and
     only those for an RRset in this page, matched in SQL: a bulk backlog that
     failed can leave hundreds of thousands of ops backing off, and loading
-    them on every page is what paging exists to avoid. Strictly older only;
-    ops queued by one transaction share ``created_at``.
+    them on every page is what paging exists to avoid. Strictly older only,
+    by ``queued_after`` (#1489).
     """
     newest: dict[tuple[str, str, str], DNSRecordOp] = {}
     for op in shipping:
@@ -1242,7 +1268,9 @@ async def _supersede_backed_off_ops(
         for op in waiting:
             key = op_rrset_key(op)
             successor = newest.get(key) if key is not None else None
-            if successor is not None and successor.created_at > op.created_at:
+            if successor is not None and queued_after(
+                successor.created_at, successor.seq, op.created_at, op.seq
+            ):
                 supersede(op, successor.id, now)
 
 

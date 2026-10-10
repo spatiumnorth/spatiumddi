@@ -528,7 +528,15 @@ class HetznerDNSDriver(CloudDNSDriverBase):
             await self._set_ttl_if_needed(client, zone_fqdn, name, rtype, current, rec.ttl)
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         async with self._client(token) as client:

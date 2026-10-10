@@ -48,8 +48,10 @@ from app.core.permissions import (
     _token_grants_for,
     require_any_resource_permission,
     token_scope_allows,
+    token_scoped_resource_ids,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
+from app.core.update_nulls import resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -88,6 +90,10 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
+from app.services.appliance.group_names import (
+    group_assigned_to_appliance,
+    group_name_problem,
+)
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -135,7 +141,11 @@ from app.services.dns.resolver_presets import (
     find_forwarder_conflict,
 )
 from app.services.dns.serial import bump_zone_serial
-from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.server_move import (
+    ServerMoveError,
+    ensure_group_single_driver,
+    move_server_to_group,
+)
 from app.services.dns.tld_registry import (
     SOURCE_URL,
     TldFetchError,
@@ -343,8 +353,8 @@ class ServerGroupResponse(BaseModel):
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
-    # is a group that got mixed through the create path, which does not
-    # enforce homogeneity (only the move and the driver-gated operations do).
+    # is a group that was mixed before create / driver-change enforcement
+    # landed (#1540) — those paths now 422 like the move does.
     # Exposed so a client can tell which groups a given server may move into
     # without fetching every group's server list to find out.
     server_drivers: list[str] = []
@@ -1429,8 +1439,31 @@ class RecordResponse(BaseModel):
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
+    # #1538 — set when the record's agentless provider op did not land on
+    # its first attempt (it is rescheduled with backoff, or terminally
+    # failed): the DB change saved, but the provider does not have it yet.
+    # Always None for agent-based groups (their ops apply asynchronously
+    # by design) and on a clean agentless apply.
+    provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+def _agentless_op_warning(op: Any) -> str | None:
+    """The provider warning for a record op whose first agentless attempt
+    did not land (#1538), or None when it applied / was queued for an
+    agent. A failed attempt leaves the op ``pending`` with ``last_error``
+    set (retry budget left) or ``failed`` (budget spent)."""
+    if op is None:
+        return None
+    if getattr(op, "state", None) not in ("pending", "failed"):
+        return None
+    error = getattr(op, "last_error", None)
+    if not error:
+        return None
+    if op.state == "failed":
+        return f"DNS provider rejected this change and retries are exhausted: {error}"
+    return f"DNS provider did not accept this change yet; it is scheduled for retry: {error}"
 
 
 def _normalize_record_struct_fields(
@@ -1698,7 +1731,33 @@ async def update_group(
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
 
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears default_view (nullable); null for a
+    # NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"default_view"},
+        non_nullable={
+            "name",
+            "description",
+            "group_type",
+            "is_recursive",
+            "catalog_zones_enabled",
+            "catalog_zone_name",
+            "is_public_facing",
+        },
+    )
+    # #1468 — an appliance's supervisor gets this group by NAME and drops a
+    # name it won't put in its role env, so don't rename an assigned group
+    # into one. Only on an actual change: re-saving a legacy name is fine.
+    new_name = changes.get("name")
+    if (
+        new_name is not None
+        and new_name != group.name
+        and await group_assigned_to_appliance(db, "dns", group.id)
+    ):
+        problem = group_name_problem("dns", new_name)
+        if problem is not None:
+            raise HTTPException(status_code=422, detail=problem)
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -1836,8 +1895,7 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
     which the operator may legitimately skip. The point here is to turn
     "saved fine, then every sync fails" into a 422 on save.
 
-    ``technitium_api`` (#810) is the only driver with anything to check
-    today, and it has two things worth catching:
+    ``technitium_api`` (#810) has two things worth catching:
 
     * the API URL must carry an explicit scheme. Guessing ``http`` for a
       bare host would silently put the bearer token on the wire in
@@ -1848,7 +1906,31 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
       co-located Technitium on the appliance's own loopback is a legitimate
       target, and this module's contract is to log those rather than refuse
       them.
+
+    ``azure_dns`` (#1534) validates that all five credential fields are
+    present — an empty ``resource_group`` used to pass the probe (which
+    listed zones subscription-wide) while every record op failed.
     """
+    if driver == "azure_dns":
+        from app.drivers.dns.azuredns import AzureDNSDriver  # noqa: PLC0415
+
+        missing = [
+            field
+            for field in AzureDNSDriver.credential_fields
+            if not str(creds.get(field) or "").strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "azure_dns credentials are missing required field(s): "
+                    + ", ".join(missing)
+                    + ". All of tenant_id, client_id, client_secret, "
+                    "subscription_id and resource_group are required."
+                ),
+            )
+        return
+
     if driver != "technitium_api":
         return
 
@@ -1881,7 +1963,22 @@ async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> No
 async def create_server(
     group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
 ) -> ServerResponse:
-    await _require_group(group_id, db)
+    group = await _require_group(group_id, db)
+    # #1540 — a group is single-driver (DNS_DRIVERS.md §5.1). The move path
+    # has always enforced it; create did not, and a mixed group silently
+    # diverges: record fan-out follows the primary's driver while zone
+    # create/delete fan out to every agentless server. Fail closed here
+    # with the move path's check instead of manufacturing that state.
+    try:
+        await ensure_group_single_driver(
+            db,
+            group_id,
+            body.driver,
+            group_name=group.name,
+            hint=f"create it in a {body.driver}-only group, or an empty one.",
+        )
+    except ServerMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
@@ -1969,8 +2066,47 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
-    changes = body.model_dump(
-        exclude_none=True,
+    # #1540 — a driver change on update is the other path that used to
+    # manufacture a mixed group. Enforce single-driver against the OTHER
+    # members of the group the server stays in. When the same request
+    # also moves the server to a different group, the move path runs its
+    # own check against the target group with the new driver applied, so
+    # checking here too would refuse a legitimate combined change.
+    if (
+        body.driver is not None
+        and body.driver != server.driver
+        and (body.group_id is None or body.group_id == server.group_id)
+    ):
+        group = await _require_group(server.group_id, db)
+        try:
+            await ensure_group_single_driver(
+                db,
+                server.group_id,
+                body.driver,
+                group_name=group.name,
+                hint=(
+                    f"change the driver only in a group whose other servers "
+                    f"all run {body.driver}, or an empty one."
+                ),
+                exclude_server_id=server.id,
+            )
+        except ServerMoveError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    # #1563 — explicit null clears api_port; null for a NOT NULL column
+    # is a 422. The excluded fields keep their own contracts below.
+    changes = resolve_update_changes(
+        body,
+        clearable={"api_port"},
+        non_nullable={
+            "name",
+            "driver",
+            "host",
+            "port",
+            "roles",
+            "status",
+            "notes",
+            "is_enabled",
+        },
         # ``group_id`` / ``is_primary`` (#934) are NOT plain column writes —
         # each has cross-row consequences the generic loop below can't have.
         exclude={
@@ -4306,7 +4442,20 @@ async def update_view(
     current_user: SuperAdmin,
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears allow_query / allow_query_cache (null
+    # = inherit server options, #430); null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"allow_query", "allow_query_cache"},
+        non_nullable={
+            "name",
+            "description",
+            "match_clients",
+            "match_destinations",
+            "recursion",
+            "order",
+        },
+    )
     changes.update(await _validated_view_fields(group_id, body, db))
     for k, v in changes.items():
         setattr(view, k, v)
@@ -4624,6 +4773,9 @@ class DriftRecordEntry(BaseModel):
     record_type: str
     value: str
     ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
 
 
 class ServerDriftEntry(BaseModel):
@@ -4684,13 +4836,25 @@ async def get_zone_drift(
                 drift_count=s.drift_count,
                 extra_on_server=[
                     DriftRecordEntry(
-                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        ttl=r.ttl,
+                        priority=r.priority,
+                        weight=r.weight,
+                        port=r.port,
                     )
                     for r in s.extra_on_server
                 ],
                 missing_on_server=[
                     DriftRecordEntry(
-                        name=r.name, record_type=r.record_type, value=r.value, ttl=r.ttl
+                        name=r.name,
+                        record_type=r.record_type,
+                        value=r.value,
+                        ttl=r.ttl,
+                        priority=r.priority,
+                        weight=r.weight,
+                        port=r.port,
                     )
                     for r in s.missing_on_server
                 ],
@@ -4863,7 +5027,10 @@ async def get_server_pending_ops(
     counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
 
     ops_res = await db.execute(
-        select(DNSRecordOp).where(*op_filter).order_by(DNSRecordOp.created_at.desc()).limit(limit)
+        select(DNSRecordOp)
+        .where(*op_filter)
+        .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.seq.desc().nulls_last())
+        .limit(limit)
     )
     items = [
         PendingOpEntry(
@@ -4909,19 +5076,36 @@ class ServerEventsResponse(BaseModel):
     items: list[ServerEventEntry]
 
 
+def _refuse_resource_scoped_token(user: Any) -> None:
+    """Server-level reads are not any token grant's resource (GHSA-c4v7-2235-v88h).
+
+    A resource-scoped token passes the router's DNS gate on its ``dns_zone``
+    grant, but a server's audit history and ``rndc status`` belong to no zone,
+    so there is nothing to narrow them to. Refuse them for such a token;
+    sessions, unscoped tokens and wildcard-granted tokens are unaffected
+    (``token_scoped_resource_ids`` answers ``None`` for those).
+    """
+    if token_scoped_resource_ids(user, "dns_server") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="API token is not scoped to this DNS server",
+        )
+
+
 @router.get(
     "/servers/{server_id}/recent-events",
     response_model=ServerEventsResponse,
 )
 async def get_server_recent_events(
-    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser, limit: int = 50
 ) -> ServerEventsResponse:
     """Audit-log rows where ``resource_id`` matches this server.
 
     The audit log keys ``resource_id`` as text, so we filter on the
     string form of the UUID. Drives the "Events" tab on the Server
-    Detail modal.
+    Detail modal. Refused for a resource-scoped API token.
     """
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -5018,9 +5202,11 @@ class RndcStatusResponse(BaseModel):
     response_model=RndcStatusResponse,
 )
 async def get_server_rndc_status(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> RndcStatusResponse:
-    """Latest agent-pushed ``rndc status`` output for this server."""
+    """Latest agent-pushed ``rndc status`` output for this server. Refused for
+    a resource-scoped API token."""
+    _refuse_resource_scoped_token(current_user)
     server = await db.get(DNSServer, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -5044,16 +5230,44 @@ async def update_zone(
 ) -> ZoneResponse:
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
-    changes = body.model_dump(exclude_none=True)
-    # ``color`` is the one field on this schema where NULL is a meaningful
-    # user intent ("clear the color"). Re-inject it when explicitly set to
-    # None in the incoming payload — exclude_none would otherwise drop it.
-    if "color" in body.model_fields_set and body.color is None:
-        changes["color"] = None
-    # Same NULL-is-meaningful treatment for the DNSSEC policy (issue #49):
-    # explicit null ⇒ fall back to BIND's built-in "default" policy.
-    if "dnssec_policy_id" in body.model_fields_set and body.dnssec_policy_id is None:
-        changes["dnssec_policy_id"] = None
+    # #1563 — explicit null CLEARS the nullable zone fields: view_id,
+    # linked_subnet_id, domain_id, customer_id and notify_enabled (the
+    # UI's unlink / "none" actions sent null and exclude_none silently
+    # kept the old value), plus color / dnssec_policy_id, whose
+    # NULL-is-meaningful re-injections this replaces (issue #49), and the
+    # nullable named.conf ACL lists. Null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={
+            "view_id",
+            "linked_subnet_id",
+            "domain_id",
+            "customer_id",
+            "notify_enabled",
+            "color",
+            "dnssec_policy_id",
+            "allow_query",
+            "allow_transfer",
+            "also_notify",
+        },
+        non_nullable={
+            "name",
+            "zone_type",
+            "kind",
+            "ttl",
+            "refresh",
+            "retry",
+            "expire",
+            "minimum",
+            "primary_ns",
+            "admin_email",
+            "dnssec_enabled",
+            "auto_tls_probe",
+            "dynamic_update_enabled",
+            "forward_only",
+            "tags",
+        },
+    )
     # Secondary / stub zones need at least one master to render loadable
     # BIND9 config (issue #336). Validate against the *effective* state —
     # the new zone_type/masters from this payload OR what's already on the
@@ -6624,11 +6838,31 @@ async def _push_zone_to_agentless_servers(
     drivers (bind9 / powerdns / technitium) get zone changes through the
     ConfigBundle long-poll, not here.
 
-    Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
-    — the DB row stays in an uncommitted state and the session rollback
-    cleans it up. Matches the DHCP write-through pattern.
+    Disabled servers are excluded (#1537): the record path deliberately
+    skips a paused agentless server, and a paused zone target must not
+    receive writes — or, when unreachable, block every zone create,
+    delete and move in the group with its 502.
+
+    Failure surfaces as a 502 (409 when every failure was a provider
+    conflict, #1607 — raised only after the compensation below) so the
+    caller's ``db.commit()`` never runs — the DB row stays in an uncommitted state and the session rollback
+    cleans it up. Matches the DHCP write-through pattern. The rollback
+    only covers the DB, though: a server that already applied the change
+    keeps it. So before raising, the servers that succeeded get the
+    inverse op as compensation (create → delete, delete → create),
+    best-effort, so a partial fan-out converges back instead of leaving
+    the zone live on some servers and absent on others (#1537). Rolling
+    back a delete re-creates the zone AND pushes its records back, since a
+    re-created zone is otherwise empty; a record that cannot be restored is
+    named in the 502 rather than reported as a clean rollback (#1613).
+    The zone move's source-group delete goes through here too.
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import (  # noqa: PLC0415
+        CloudDNSConflictError,
+        CloudDNSDriverBase,
+    )
+    from app.drivers.dns.base import RecordData  # noqa: PLC0415
 
     # ``group_id`` overrides the zone's own when the caller needs to drive
     # a group the zone is not (yet / no longer) in — the #935 move pushes a
@@ -6638,37 +6872,198 @@ async def _push_zone_to_agentless_servers(
         select(DNSServer).where(
             DNSServer.group_id == (group_id if group_id is not None else zone.group_id),
             DNSServer.credentials_encrypted.isnot(None),
+            DNSServer.is_enabled.is_(True),
         )
     )
     targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
     if not targets:
         return
 
+    # On delete, cloud providers that must empty a zone before deleting
+    # it scope that emptying to the records SpatiumDDI manages — the
+    # zone's DB rows, loaded NOW while they still exist in every delete
+    # flow (permanent delete pushes before the row delete; the trash
+    # purge's record pass deliberately skips in-zone records so they
+    # are still here; a zone move keeps its rows). ``include_deleted``
+    # because the purge path works on soft-deleted rows by definition.
+    # An empty list is meaningful: "we manage nothing here — remove
+    # nothing"; only a non-delete op leaves this as None.
+    managed_records: list[RecordData] | None = None
+    if op == "delete":
+        managed_records = await _managed_zone_records(db, zone)
+
+    async def _apply(server: DNSServer, driver: Any, this_op: str) -> None:
+        if isinstance(driver, CloudDNSDriverBase):
+            # The compensating delete of a rolled-back create needs the
+            # same scoping as a real delete, or a cloud driver would empty
+            # nothing and the provider refuse a zone holding our records.
+            records = managed_records
+            if this_op == "delete" and records is None:
+                records = await _managed_zone_records(db, zone)
+            await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+        else:
+            await driver.apply_zone_change(server, zone, this_op)
+
     errors: list[str] = []
+    failed_drivers: set[str] = set()
+    succeeded: list[DNSServer] = []
+    # A CloudDNSConflictError is recorded like any other failure rather
+    # than raised from inside the loop: raising here would skip the
+    # compensation below, leaving servers that already took the change
+    # holding it while SpatiumDDI reports that nothing was saved. The 409
+    # is chosen once every server has been tried and rolled back.
+    conflicts = 0
     for server in targets:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
-            await driver.apply_zone_change(server, zone, op)
+            await _apply(server, driver, op)
+            succeeded.append(server)
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
-            errors.append(f"{server.name}: {exc}")
+            if isinstance(exc, CloudDNSConflictError):
+                # The provider already holds a zone/record this op would
+                # have to take over (e.g. a same-name Route 53 hosted zone
+                # SpatiumDDI did not create). The remedy is the explicit
+                # import flow named in the message.
+                conflicts += 1
+            errors.append(f"{server.name}: {_exc_text(exc)}")
+            failed_drivers.add(server.driver)
             logger.warning(
                 "dns.zone.push_agentless_failed",
                 server=str(server.id),
                 zone=zone.name,
                 op=op,
-                error=str(exc),
+                error=_exc_text(exc),
             )
 
-    if errors:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Failed to {op} zone on Windows DNS: {'; '.join(errors)}. "
-                "Zone state in SpatiumDDI was not changed."
-            ),
+    if not errors:
+        return
+
+    from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        restore_zone_records_to_server,
+    )
+
+    compensated: list[str] = []
+    records_unrestored: list[str] = []
+    compensation_failed: list[str] = []
+    inverse = {"create": "delete", "delete": "create"}.get(op)
+    if inverse is not None:
+        for server in succeeded:
+            driver = get_driver(server.driver)
+            try:
+                await _apply(server, driver, inverse)
+            except Exception as exc:  # noqa: BLE001 — best effort; reported below
+                compensation_failed.append(f"{server.name}: {_exc_text(exc)}")
+                logger.warning(
+                    "dns.zone.push_agentless_compensation_failed",
+                    server=str(server.id),
+                    zone=zone.name,
+                    op=inverse,
+                    error=_exc_text(exc),
+                )
+                continue
+            if inverse != "create":
+                compensated.append(server.name)
+                continue
+            # The inverse of a delete is a create, and a create gives back an
+            # EMPTY zone — so the records go back too, or the server that
+            # did nothing wrong is left answering for the zone with none of
+            # its data until someone runs Sync with Servers (#1613 QA).
+            try:
+                restored = await restore_zone_records_to_server(db, server, driver, zone)
+                problems = list(restored.push_errors)
+                if restored.pushed < restored.candidates and not problems:
+                    problems = [f"{restored.candidates - restored.pushed} record(s) not written"]
+            except Exception as exc:  # noqa: BLE001 — reported below
+                problems = [_exc_text(exc)]
+            if problems:
+                records_unrestored.append(f"{server.name} ({'; '.join(problems)})")
+                logger.warning(
+                    "dns.zone.push_agentless_record_restore_failed",
+                    server=str(server.id),
+                    zone=zone.name,
+                    errors=problems,
+                )
+            else:
+                compensated.append(server.name)
+
+    kinds = ", ".join(sorted(_agentless_driver_label(d) for d in failed_drivers))
+    detail = (
+        f"Failed to {op} zone {zone.name} on {kinds}: {'; '.join(errors)}. "
+        "The change was not saved in SpatiumDDI."
+    )
+    if compensated:
+        detail += f" Rolled back on: {', '.join(compensated)}."
+    if records_unrestored:
+        detail += (
+            f" Zone re-created on {'; '.join(records_unrestored)}, but its records "
+            "could not all be restored — run Sync with Servers on the zone."
         )
+    if compensation_failed:
+        state = "still hold" if op == "create" else "no longer hold"
+        detail += (
+            f" Rollback failed on: {'; '.join(compensation_failed)} — "
+            f"those servers may {state} the zone; reconcile manually."
+        )
+    # 409 only when every failure was a conflict — the remedy is then the
+    # import flow the message names. A mix with a provider / network
+    # failure is still a 502: the conflict text rides in the detail, but
+    # resolving it alone would not make a retry succeed.
+    status_code = 409 if conflicts == len(errors) else 502
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+async def _managed_zone_records(db: DB, zone: DNSZone) -> list[Any]:
+    """The zone's DB records as driver ``RecordData`` — the set a cloud
+    driver may remove when it empties a zone before deleting it (#1607).
+    ``include_deleted`` because the trash purge works on soft-deleted rows."""
+    from app.drivers.dns.base import RecordData  # noqa: PLC0415
+
+    rec_res = await db.execute(
+        select(DNSRecord)
+        .where(DNSRecord.zone_id == zone.id)
+        .execution_options(include_deleted=True)
+    )
+    return [
+        RecordData(
+            name=r.name,
+            record_type=r.record_type,
+            value=r.value,
+            ttl=r.ttl,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+        )
+        for r in rec_res.scalars().all()
+    ]
+
+
+# Display names for the agentless drivers, so a failure names the system
+# that refused rather than calling every one of them "Windows DNS".
+_AGENTLESS_DRIVER_LABELS: dict[str, str] = {
+    "windows_dns": "Windows DNS",
+    "technitium_api": "Technitium",
+    "cloudflare": "Cloudflare",
+    "route53": "Route 53",
+    "azure_dns": "Azure DNS",
+    "google_dns": "Google Cloud DNS",
+    "digitalocean": "DigitalOcean",
+    "hetzner": "Hetzner DNS",
+    "linode": "Linode",
+    "vultr": "Vultr",
+}
+
+
+def _agentless_driver_label(driver: str) -> str:
+    return _AGENTLESS_DRIVER_LABELS.get(driver, driver)
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``str(exc)``, or the exception's class name when that is empty —
+    an ``httpx.ConnectError`` for a refused connection stringifies to ``""``
+    and would otherwise leave the cause blank in the 502."""
+    return str(exc) or type(exc).__name__
 
 
 # ── Record endpoints ────────────────────────────────────────────────────────
@@ -6924,7 +7319,7 @@ async def create_record(
     db.add(record)
     target_serial = bump_zone_serial(zone)
     await db.flush()
-    await enqueue_record_op(
+    op = await enqueue_record_op(
         db,
         zone,
         "create",
@@ -6939,6 +7334,11 @@ async def create_record(
         },
         target_serial=target_serial,
     )
+    # #1538 — an agentless op that did not land must not read as a clean
+    # success: surface it on the response and audit it as an error (the op
+    # itself is rescheduled with backoff; see record_ops).
+    provider_warning = _agentless_op_warning(op)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -6948,11 +7348,12 @@ async def create_record(
             resource_type="dns_record",
             resource_id=str(record.id),
             resource_display=fqdn,
-            result="success",
+            result="error" if provider_warning else "success",
         )
     )
     await db.commit()
     await db.refresh(record)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
 
@@ -6972,7 +7373,14 @@ async def update_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
-    changes = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears view_id and ttl (ttl null = inherit
+    # the zone TTL; exclude_none dropped both, so the clear never
+    # landed); null for a NOT NULL column is a 422.
+    changes = resolve_update_changes(
+        body,
+        clearable={"view_id", "ttl"},
+        non_nullable={"name", "value", "tags"},
+    )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     for k, v in changes.items():
@@ -7036,8 +7444,9 @@ async def update_record(
             exclude_id=record.id,
         )
     target_serial = bump_zone_serial(zone) if zone is not None else None
+    op = None
     if zone is not None:
-        await enqueue_record_op(
+        op = await enqueue_record_op(
             db,
             zone,
             "update",
@@ -7052,6 +7461,10 @@ async def update_record(
             },
             target_serial=target_serial,
         )
+    # #1538 — as create: a failed first agentless attempt is surfaced, not
+    # silently audited as success.
+    provider_warning = _agentless_op_warning(op)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
 
     db.add(
         AuditLog(
@@ -7063,11 +7476,12 @@ async def update_record(
             resource_id=str(record.id),
             resource_display=record.fqdn,
             changed_fields=list(changes.keys()),
-            result="success",
+            result="error" if provider_warning else "success",
         )
     )
     await db.commit()
     await db.refresh(record)
+    record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
 

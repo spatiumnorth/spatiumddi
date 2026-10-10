@@ -3,7 +3,8 @@
 Uses ``python3-saml`` (OneLogin's toolkit) for XML signing + assertion
 validation. Only the SP-side of the flow is implemented: AuthnRequest
 generation (HTTP-Redirect binding) and ACS assertion consumption
-(HTTP-POST binding).
+(HTTP-POST binding). There is no single logout: the SP metadata advertises
+no ``SingleLogoutService``, because no route serves one (#1420).
 """
 
 from __future__ import annotations
@@ -53,7 +54,6 @@ class SAMLConfig:
     # SP
     sp_entity_id: str
     sp_acs_url: str
-    sp_slo_url: str
     sp_x509_cert: str | None  # optional — only needed for signed requests
     sp_private_key: str | None
     # Claim mapping (attribute names as sent by IdP)
@@ -76,7 +76,6 @@ class SAMLConfig:
             or f"{base_url.rstrip('/')}/saml/{provider.id}"
         )
         sp_acs_url = f"{base_url.rstrip('/')}/api/v1/auth/{provider.id}/callback"
-        sp_slo_url = f"{base_url.rstrip('/')}/api/v1/auth/{provider.id}/slo"
 
         idp_entity_id = str(cfg.get("idp_entity_id") or "").strip()
         idp_sso_url = str(cfg.get("idp_sso_url") or "").strip()
@@ -93,7 +92,6 @@ class SAMLConfig:
             idp_x509_cert=idp_x509_cert,
             sp_entity_id=sp_entity_id,
             sp_acs_url=sp_acs_url,
-            sp_slo_url=sp_slo_url,
             sp_x509_cert=str(cfg.get("sp_x509_cert") or "").strip() or None,
             sp_private_key=str(secrets_data.get("sp_private_key") or "").strip() or None,
             attr_username=str(cfg.get("attr_username") or "NameID"),
@@ -114,10 +112,10 @@ def _settings_dict(cfg: SAMLConfig) -> dict[str, Any]:
                 "url": cfg.sp_acs_url,
                 "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
             },
-            "singleLogoutService": {
-                "url": cfg.sp_slo_url,
-                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
-            },
+            # No ``singleLogoutService`` (#1420): SpatiumDDI serves no single
+            # logout endpoint, and the SP metadata is built from these
+            # settings, so advertising one sent every IdP's LogoutRequests to
+            # a 404 and left the user's SpatiumDDI session standing.
             "NameIDFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
             "x509cert": cfg.sp_x509_cert or "",
             "privateKey": cfg.sp_private_key or "",

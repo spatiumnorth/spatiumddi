@@ -249,6 +249,14 @@ celery_app.conf.update(
             "task": "app.tasks.dns.agent_stale_sweep",
             "schedule": schedule(run_every=60.0),
         },
+        # Every 60 s, replay agentless DNS record ops a transient provider
+        # error rescheduled (#1538) — agentless servers have no agent
+        # heartbeat to drain their queue, so the retry budget the agent
+        # path has had since #1232 needs this sweep to fire at all.
+        "dns-agentless-op-retry-sweep": {
+            "task": "app.tasks.dns.agentless_op_retry_sweep",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 60s, flip a Looking Glass collector to ``unreachable`` when its
         # heartbeat has gone silent past the staleness window (#566).
         "lg-collector-stale-sweep": {
@@ -470,6 +478,14 @@ celery_app.conf.update(
         "acme-renew-due": {
             "task": "app.tasks.acme.renew_due_certificates",
             "schedule": schedule(run_every=12 * 3600.0),
+        },
+        # Hourly, sweep stale ACME TXT records older than 24 h — the
+        # provider-path janitor plus the embedded client's stranded
+        # ``_acme-challenge`` records (#1530). The sweep function had
+        # no caller before this entry existed.
+        "acme-stale-txt-sweep": {
+            "task": "app.tasks.acme.sweep_stale_acme_txt_records",
+            "schedule": schedule(run_every=3600.0),
         },
         # Daily DNSBL / RBL reputation sweep of every public-facing
         # candidate IP against the enabled blocklists (issue #528). Gated

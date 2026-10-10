@@ -491,7 +491,7 @@ The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` wit
 | Add / update / delete record | `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch | Idempotent; one HTTP call per rrset; PowerDNS handles serial bump internally. |
 | Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. |
 | Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
-| Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
+| Reconcile zone (full sync) | `GET .../zones/<zone>`, then one `PATCH` that `DELETE`s rrsets absent from the bundle and `REPLACE`s every rrset it carries (a `POST .../zones` for a zone PowerDNS does not have yet) | Runs on agent start and every structural change. Verdict is per zone: a zone whose data PowerDNS refuses (400/409/422) keeps what it held and is reported as a degraded apply (`reverted`, with PowerDNS's reason), every other zone is still served, and nothing is rolled back. Identical records in one rrset are sent once (#1379). The absent-rrset sweep never touches the apex SOA/NS or DNSSEC types, and skips zones with a dynamic-update ACL (#1380). |
 | Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
 | Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
 | Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer mode is not wired up in the agent (Phase 5 polish). |
@@ -712,8 +712,9 @@ Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated s
 Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/records/add` **appends** at a given `(name, type)` by default (round-robin A records coexist without a GET-merge-PATCH dance) and only wipes the rrset when `overwrite=true` is passed explicitly. The agent driver exploits this:
 
 - **Bulk reconcile** (`swap_and_reload`, fired on structural config changes): fetch the zone's full record set via `GET /api/zones/records/get?listZone=true`, diff by `(domain, type, params)` fingerprint against the desired bundle state, then `POST` deletes for what's extra and adds for what's missing. No `update` endpoint call needed — a changed value is just delete-old + add-new, computed from the full diff.
+- **Dropped zones** ([#1496](https://github.com/spatiumnorth/spatiumddi/issues/1496)): after the reconcile, `_retire_dropped_zones` deletes the zones this agent created from a bundle that the current bundle no longer has. The agent keeps their names in `technitium-managed-zones.json` in its state directory, and only names in that ledger are ever deleted, so a zone created on the daemon directly is left alone. The first run after an upgrade seeds the ledger from the previous render. A delete that fails stays in the ledger and is retried on the next pass. Retirement follows the zone list the control plane sent, not what the driver could render: an explicit empty `zones` list (a group with no zones, which is the only way the control plane produces one) retires every ledger zone, the same as BIND9 emptying `named.conf`; a bundle with no zone list at all (key absent, `null` or not a list) retires nothing and keeps the ledger; and a zone the bundle still names but the driver skipped (a secondary with no primaries, a forwarder with no upstream, an unsupported type) is kept. Both hold-backs log `technitium_zone_retire_held_back` with a `reason`.
 - **Incremental ops** (`apply_record_op`, fired per live edit): the op carries the complete desired `rrset` (see §2, [#773](https://github.com/spatiumnorth/spatiumddi/issues/773)), so `create`/`update` is member 0 with `overwrite=true` — which clears — followed by an `add` per remaining member with `overwrite=false`, and `delete` is a single value-scoped `delete` of the op's own value (the survivors are already on the server; wiping and rebuilding them would open a window where the name serves less than it should). Before #773 this path was one `add` with `overwrite=true`, which is what collapsed every multi-value RRset to its last value.
-- Zone apex `NS`/`SOA` are **daemon-managed** — Technitium auto-creates its own SOA + one NS pointing at its own hostname on `/api/zones/create`, so the bundle's apex NS/SOA are intentionally excluded from every reconcile pass (pushing them would create duplicate/foreign records). Off-apex `NS` (delegations) reconcile normally.
+- Zone apex `NS`/`SOA` are **reconciled as an apex, not record by record** ([#1490](https://github.com/spatiumnorth/spatiumddi/issues/1490)). Technitium auto-creates its own SOA + one NS pointing at its own host name on `/api/zones/create` (under the DNS VIP that is the pod name). `_reconcile_zone_apex` then applies the zone's own apex with the BIND9 precedence ([#1153](https://github.com/spatiumnorth/spatiumddi/issues/1153)): the NS set is the zone's apex NS records, else its Primary NS; the SOA takes MNAME (Primary NS, else the first NS), RNAME (Admin Email) and the timers the bundle ships, at the zone's TTL. Each is written only when it differs from what the daemon serves, because a SOA write bumps the serial (`zones/records/update` requires the current serial and stores current + 1). New NS targets are added before the old ones are removed. A primary zone that sets neither Primary NS nor Admin Email nor apex NS keeps the daemon's apex untouched (the bundle ships every zone's timers since [#1171](https://github.com/spatiumnorth/spatiumddi/issues/1171), so they alone do not count as set). Off-apex `NS` (delegations) reconcile normally.
 
 ### 4B.2 Auth — agent-provisioned bearer token
 
@@ -1177,10 +1178,13 @@ PowerDNS is coarse-only — no per-name / per-type / `deny`, so
    `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
    zone whose dynamic updates were turned off stops accepting them.
 
-**Drift** — the pdns reconciler is additive per-rrset (`REPLACE` per managed
-`name+type`, never a blanket zone replace), so externally-injected records
-(new names) **already survive** a reconcile, and a conflicting managed
-`name+type` is re-asserted (control-plane wins). An active ingest-back for
+**Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
+additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
+replace), so records RFC 2136 clients injected (new names) **survive** a
+reconcile, and a conflicting managed `name+type` is re-asserted
+(control-plane wins). A zone *without* an ACL is reconciled exactly: an rrset
+the bundle no longer carries is deleted (#1380), apex SOA/NS and DNSSEC types
+excepted. An active ingest-back for
 *visibility* (mirroring external records into the control-plane DB, like the
 BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
 

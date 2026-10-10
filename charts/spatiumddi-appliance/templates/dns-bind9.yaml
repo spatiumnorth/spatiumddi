@@ -46,6 +46,9 @@ spec:
         {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: dns-bind9
         app.kubernetes.io/component: dns-bind9
+        # #1510 — every DNS engine's pods carry this, and the one ``dns-vip``
+        # Service selects on it, so the DNS VIP follows whichever engine runs.
+        spatium.io/dns-vip: "true"
     spec:
       {{- with .Values.dnsBind9.priorityClassName }}
       priorityClassName: {{ . | quote }}
@@ -58,8 +61,8 @@ spec:
       {{- if not .Values.dns.useMetalLBVIP }}
       # #272 Phase 5 — default path: bind on the node IP so non-cluster
       # clients resolve against the appliance directly. When a DNS VIP
-      # is enabled the Pod drops hostNetwork and sits behind the
-      # LoadBalancer Service below instead.
+      # is enabled the Pod drops hostNetwork and sits behind the shared
+      # ``dns-vip`` LoadBalancer Service (dns-vip.yaml) instead.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -212,18 +215,11 @@ metadata:
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-bind9
-  {{- if .Values.dns.useMetalLBVIP }}
-  annotations:
-    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
-    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
-    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
-  {{- end }}
 spec:
-  {{- if .Values.dns.useMetalLBVIP }}
-  type: LoadBalancer
-  {{- else }}
+  # #1510 — always ClusterIP. The DNS VIP lives on the single ``dns-vip``
+  # Service (dns-vip.yaml): three LoadBalancers asking MetalLB for the same
+  # address let the oldest one keep it, even after its engine was switched off.
   type: ClusterIP
-  {{- end }}
   selector:
     app.kubernetes.io/name: dns-bind9
   ports:
