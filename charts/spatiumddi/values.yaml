@@ -366,12 +366,21 @@ slotImageMirror:
     # appliance uses ``local-path`` (k3s default), which is RWO +
     # node-pinned — exactly the property we want here.
     storageClass: ""
-  resources:
-    # Mostly idle process serving multipart streams. Resources match
-    # the api defaults so we can reuse the image without surprise
-    # OOM behaviour during a large upload.
-    requests: { cpu: 50m, memory: 128Mi }
-    limits:   { cpu: 500m, memory: 256Mi }
+  # #1174 — empty: the mirror takes ``api.resources``. It runs the api's
+  # image and imports the whole application before it serves a byte
+  # (about 280 MiB resident once started, on the 2026-10-02 image), so it
+  # is sized as the api: the chart's api defaults here, and on an
+  # appliance the limit the supervisor sizes from the node's RAM. The
+  # 256Mi / 500m it used to carry OOMKilled it during that import on every
+  # multi-node control plane. Keys set here are laid over the api's
+  # (e.g. ``limits: { memory: 2Gi }``); keep its limits at or above the
+  # api's, which the Charts job's ``chart-slot-image-mirror.py`` enforces.
+  resources: {}
+  # #1174 — empty: the mirror's liveness and readiness probes take
+  # ``api.probes`` (#1051), because they probe the same process. Keys set
+  # here are laid over the api's, e.g. ``liveness: { periodSeconds: 60 }``;
+  # the Charts job refuses a timeout or a failure budget below the api's.
+  probes: {}
   nodeSelector: {}
   tolerations: []
   auth:
