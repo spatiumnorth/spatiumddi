@@ -382,7 +382,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 rdata = rec.get("rData")
                 if not isinstance(rdata, dict):
                     continue
-                value, extra = rdata_to_value(rtype, rdata, bare)
+                value, extra = rdata_to_value(rtype, rdata)
                 if not value:
                     continue
                 records.append(

@@ -57,6 +57,8 @@ live-pull + blocklist wiring (#744).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import json
 import os
@@ -265,9 +267,38 @@ def _strip_bare_authority_slash(uri: str) -> str:
     return uri
 
 
-# RFC 9460 §14.3 key numbers: canonical param order is by NUMBER. This is
-# the agent's own copy of ``app.services.technitium.rdata`` (the agent image
-# cannot import ``app``) - keep the two in step.
+# ── SVCB / HTTPS (RFC 9460) ────────────────────────────────────────────
+#
+# Three forms meet here, and every comparison reduces them to one:
+#
+# * PRESENTATION, what an operator stores and BIND renders verbatim:
+#   ``1 svc alpn=h2,h3 port=443``. A target without a trailing dot is
+#   RELATIVE to the zone (RFC 1035 §5.1), exactly as BIND reads it.
+# * TECHNITIUM WIRE, what ``zones/records/{add,delete}`` parses
+#   (``WebServiceZonesApi.cs``, 15.4.0): ``svcTargetName`` is trimmed of
+#   dots and stored verbatim, so Technitium has no relative names at all —
+#   ``svc`` is served as ``svc.``, never as ``svc.<zone>.``. ``svcParams``
+#   is split on ``|`` and walked two tokens at a time (``alpn|h2,h3|port|443``),
+#   or is the literal ``false`` for none — the parameter is required, so
+#   omitting it is "Parameter 'svcParams' missing.". The key is
+#   ``Enum.Parse<DnsSvcParamKey>`` on the name, so ``keyNNNNN`` must go as
+#   its NUMBER; ``ech`` and every unnamed key fall through to
+#   ``DnsSvcUnknownParamValue``, which parses HEX, not base64.
+# * TECHNITIUM READ-BACK (``zones/records/get``): ``svcTargetName`` as
+#   stored (no dot, ``""`` for the root), and ``svcParams`` as an object of
+#   ``key -> ToString()`` in the order the record was added — ``null`` for
+#   ``no-default-alpn``, ``61:62`` colon-hex for ``ech`` and unnamed keys,
+#   and an unnamed key reported by its number (``"65000"``).
+#
+# Canonical form: params in key-NUMBER order, ``mandatory`` sorted, hint
+# addresses canonical, ``ech`` as normalised base64, unnamed keys as
+# ``keyN`` with an RFC 1035-escaped value, values unquoted unless they hold
+# whitespace. ``alpn`` order is significant and kept.
+#
+# This block is duplicated byte-for-byte in
+# ``backend/app/services/technitium/rdata.py`` (the agent image cannot
+# import ``app``). Keep the two identical.
+
 _SVCB_KEY_NUM = {
     "mandatory": 0,
     "alpn": 1,
@@ -278,10 +309,34 @@ _SVCB_KEY_NUM = {
     "ipv6hint": 6,
     "dohpath": 7,
 }
-# Technitium ignores the value of ``no-default-alpn`` but its ``|`` splitter
-# walks tokens two at a time, so a valueless key still needs a token after
-# it. Source: DnsSvcParamValue.Parse in TechnitiumLibrary; not live-verified.
+_SVCB_KEY_NAME = {num: name for name, num in _SVCB_KEY_NUM.items()}
+# Technitium ignores the value it is given for ``no-default-alpn``
+# (``DnsSvcParamValue.Parse`` returns an empty ALPN value) but its splitter
+# still needs a token in the value slot, and an empty one is refused.
 _SVCB_VALUELESS_PLACEHOLDER = "true"
+# Technitium's own spelling of "no SvcParams" (AliasMode, or a bare
+# ServiceMode record).
+_SVCB_NO_PARAMS = "false"
+
+
+def _svcb_ip(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return value.strip()
+
+
+def _svcb_norm_key(key: str) -> str:
+    """``ALPN`` / ``key1`` / ``1`` -> ``alpn``; ``key065000`` / ``65000`` ->
+    ``key65000``. Technitium reports an unnamed key by its bare number."""
+    k = key.strip().lower().replace("_", "-")
+    if k.isdigit():
+        num = int(k)
+    elif k.startswith("key") and k[3:].isdigit():
+        num = int(k[3:])
+    else:
+        return k
+    return _SVCB_KEY_NAME.get(num, f"key{num}")
 
 
 def _svcb_key_num(key: str) -> int:
@@ -292,9 +347,16 @@ def _svcb_key_num(key: str) -> int:
     return 65536
 
 
+def _svcb_is_generic(key: str) -> bool:
+    return key.startswith("key") and key[3:].isdigit()
+
+
 def _svcb_split(value: str) -> list[str]:
-    """Split on whitespace outside double quotes, keeping backslash escapes
-    verbatim (``shlex.split`` would eat the backslash of an escaped comma)."""
+    """Split presentation-format rdata on whitespace outside double quotes.
+
+    Backslash escapes are kept verbatim (``alpn=h2\\,x`` keeps its escaped
+    comma), unlike ``shlex.split``, which eats the backslash.
+    """
     tokens: list[str] = []
     cur: list[str] = []
     in_quote = False
@@ -317,75 +379,195 @@ def _svcb_split(value: str) -> list[str]:
     return tokens
 
 
-def _svcb_param_list(items: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
-    """Canonical params: lower-case keys, empty value == valueless, sorted
-    by key number, ``mandatory`` key list sorted, hint addresses canonical."""
-    out: list[tuple[str, str | None]] = []
-    for key, val in items:
-        key = key.lower().replace("_", "-")
-        if key == "mandatory" and val:
-            names = [n.strip().lower().replace("_", "-") for n in val.split(",") if n.strip()]
-            val = ",".join(sorted(names, key=lambda n: (_svcb_key_num(n), n)))
-        elif key in ("ipv4hint", "ipv6hint") and val:
-            val = ",".join(_canonical_ip(a.strip()) for a in val.split(",") if a.strip())
-        out.append((key, val or None))
-    out.sort(key=lambda kv: (_svcb_key_num(kv[0]), kv[0]))
-    return out
+def _svcb_unquote(raw: str) -> str:
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    return raw
+
+
+def _svcb_unescape(text: str) -> bytes:
+    """RFC 1035 §5.1 character-string -> bytes (``\\DDD`` and ``\\X``)."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            digits = text[i + 1 : i + 4]
+            if len(digits) == 3 and digits.isdigit() and int(digits) < 256:
+                out.append(int(digits))
+                i += 4
+                continue
+            out.extend(text[i + 1].encode("utf-8"))
+            i += 2
+            continue
+        out.extend(ch.encode("utf-8"))
+        i += 1
+    return bytes(out)
+
+
+def _svcb_escape(data: bytes) -> str:
+    """bytes -> an RFC 1035 character-string needing no quotes."""
+    out: list[str] = []
+    for b in data:
+        if b in (0x22, 0x5C):
+            out.append("\\" + chr(b))
+        elif 0x21 <= b <= 0x7E:
+            out.append(chr(b))
+        else:
+            out.append(f"\\{b:03d}")
+    return "".join(out)
+
+
+def _svcb_hex_bytes(value: str) -> bytes | None:
+    try:
+        return bytes.fromhex(value.replace(":", "").replace("-", ""))
+    except ValueError:
+        return None
+
+
+def _svcb_b64_bytes(value: str) -> bytes | None:
+    try:
+        return base64.b64decode(value.strip(), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _svcb_canon_value(key: str, val: str | None, from_daemon: bool) -> str | None:
+    """One param value in canonical presentation form (``None`` = valueless).
+
+    ``from_daemon`` says ``val`` is Technitium's read-back ``ToString()``
+    (colon-hex for ``ech`` / unnamed keys) rather than presentation text.
+    """
+    if val is None or val == "":
+        return None
+    if key == "mandatory":
+        names = {_svcb_norm_key(n) for n in val.split(",") if n.strip()}
+        return ",".join(sorted(names, key=lambda n: (_svcb_key_num(n), n))) or None
+    if key in ("ipv4hint", "ipv6hint"):
+        return ",".join(_svcb_ip(a) for a in val.split(",") if a.strip())
+    if key == "port":
+        return str(int(val)) if val.strip().isdigit() else val
+    if key == "ech":
+        data = _svcb_hex_bytes(val) if from_daemon else _svcb_b64_bytes(val)
+        return base64.b64encode(data).decode("ascii") if data is not None else val
+    if _svcb_is_generic(key):
+        data = _svcb_hex_bytes(val) if from_daemon else _svcb_unescape(val)
+        if data is None:
+            return val
+        return _svcb_escape(data) or None
+    return val
+
+
+def _svcb_param_list(
+    items: list[tuple[str, str | None]], from_daemon: bool
+) -> list[tuple[str, str | None]]:
+    """Canonical ``(key, value-or-None)`` list, in key-number order."""
+    out: dict[str, str | None] = {}
+    for raw_key, raw_val in items:
+        key = _svcb_norm_key(raw_key)
+        out[key] = _svcb_canon_value(key, raw_val, from_daemon)
+    return sorted(out.items(), key=lambda kv: (_svcb_key_num(kv[0]), kv[0]))
+
+
+def _svcb_wire_key(key: str) -> str:
+    return key[3:] if _svcb_is_generic(key) else key
+
+
+def _svcb_wire_value(key: str, val: str | None) -> str:
+    if key == "mandatory" and val:
+        return ",".join(_svcb_wire_key(n) for n in val.split(","))
+    if key == "ech" and val:
+        data = _svcb_b64_bytes(val)
+        return data.hex().upper() if data is not None else val
+    if _svcb_is_generic(key):
+        return _svcb_unescape(val).hex().upper() if val else ""
+    if val is None:
+        # Only ``no-default-alpn`` is valueless by definition; anything else
+        # sent empty is the operator's empty value, not a made-up one.
+        return _SVCB_VALUELESS_PLACEHOLDER if key == "no-default-alpn" else ""
+    return val
 
 
 def _svcb_wire(params: list[tuple[str, str | None]]) -> str:
+    """Technitium's ``svcParams`` for an already-canonical list."""
+    if not params:
+        return _SVCB_NO_PARAMS
     parts: list[str] = []
     for key, val in params:
-        parts.append(key)
-        parts.append(val if val is not None else _SVCB_VALUELESS_PLACEHOLDER)
+        parts.append(_svcb_wire_key(key))
+        parts.append(_svcb_wire_value(key, val))
     return "|".join(parts)
 
 
+def _svcb_render(params: list[tuple[str, str | None]]) -> str:
+    def _q(v: str) -> str:
+        return f'"{v}"' if any(c.isspace() for c in v) else v
+
+    return " ".join(k if v is None else f"{k}={_q(v)}" for k, v in params)
+
+
 def _svcb_target(name: str, origin: str | None) -> str:
-    """Absolute, lower-case, dot-less target (``.`` stays ``.``): a trailing
-    dot is absolute, anything else is relative to ``origin`` (RFC 1035
-    §5.1), so ``svc`` in ``example.net`` is ``svc.example.net``."""
+    """A presentation-format target -> Technitium's form: absolute, lower
+    case, no trailing dot, ``.`` for the root.
+
+    A trailing dot means absolute and is honoured whatever the label count
+    (``localhost.`` stays ``localhost``). Without one the name is relative
+    to ``origin`` (``svc`` in ``example.net`` is ``svc.example.net``), as in
+    a zone file; with no origin it is left as written.
+    """
     name = name.strip()
     if name in ("", "."):
         return "."
-    zone = (origin or "").strip().rstrip(".").lower()
     if name.endswith("."):
-        return name.rstrip(".").lower()
+        return name.rstrip(".").lower() or "."
+    zone = (origin or "").strip().rstrip(".").lower()
     if name == "@":
         return zone or "."
     return f"{name}.{zone}".lower() if zone else name.lower()
+
+
+def _svcb_daemon_target(name: Any) -> str:
+    """Technitium's read-back target, which is always absolute, in the same
+    form ``_svcb_target`` produces. ``""`` is the root."""
+    bare = str(name or "").strip().rstrip(".").lower()
+    return bare or "."
+
+
+def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[str, str | None]]]:
+    tokens = _svcb_split(value)
+    if len(tokens) < 2:
+        return (1, ".", [])
+    priority = int(tokens[0]) if tokens[0].isdigit() else 1
+    items: list[tuple[str, str | None]] = []
+    for tok in tokens[2:]:
+        key, eq, raw = tok.partition("=")
+        items.append((key, _svcb_unquote(raw) if eq else None))
+    return (priority, _svcb_target(tokens[1], origin), _svcb_param_list(items, False))
+
+
+def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
+    """Technitium's read-back ``svcParams`` object, canonical."""
+    if not isinstance(raw, dict):
+        return []
+    return _svcb_param_list(
+        [(str(k), None if v in (None, "") else str(v)) for k, v in raw.items()], True
+    )
+# ── end of the block shared with the agent ──────────────────────────────
 
 
 def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
     """Parse a BIND-zone-file-style SVCB/HTTPS rdata string into
     ``(priority, target, svcParams)`` for the Technitium API.
 
-    Input shape (matches what the control-plane driver + BIND9 render,
-    e.g. ``'1 . alpn="h2,h3"'``): priority, target, then space-separated
-    ``key=value`` params with optionally-quoted values.
-
-    Technitium's ``svcParams`` wire format is ``key|value`` tokens all
-    separated by ``|`` (``alpn|h2,h3|port|53443`` in its API docs; the API
-    splits on ``|`` and walks two at a time). The old comma-joined pairs
-    only ever worked for ONE param (#1698). A multi-value param keeps its
-    commas inside the value (``alpn|h2,h3``). Params go out in key-number
-    order, so what Technitium reads back compares equal (#1513).
+    The target is relative to ``origin`` unless it ends in a dot (a
+    zone-file rule; Technitium itself has no relative names, so ``svc``
+    sent as-is would be served as ``svc.``). ``svcParams`` goes out in
+    key-number order and ``|``-separated (``alpn|h2,h3|port|443``) — the
+    comma-joined pairs this sent before #1698 only ever parsed for ONE
+    param — or as ``false`` when there are none, since the API requires it.
     """
-    tokens = _svcb_split(value)
-    if len(tokens) < 2:
-        return (1, ".", "")
-    priority = int(tokens[0]) if tokens[0].isdigit() else 1
-    items: list[tuple[str, str | None]] = []
-    for tok in tokens[2:]:
-        key, eq, raw = tok.partition("=")
-        if eq and len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
-            raw = raw[1:-1]
-        items.append((key, raw if eq else None))
-    return (
-        priority,
-        _svcb_target(tokens[1], origin),
-        _svcb_wire(_svcb_param_list(items)),
-    )
+    priority, target, params = _svcb_parse(value, origin)
+    return (priority, target, _svcb_wire(params))
 
 
 # ── rData → add-param normalisation ────────────────────────────────────
@@ -489,24 +671,11 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         if "uri" in out:
             out["uri"] = _strip_bare_authority_slash(str(out["uri"]))
     elif rtype in ("SVCB", "HTTPS"):
-        # The daemon reports each param as ``key: ToString()`` - a string,
-        # null/empty for a valueless one. Rebuild the exact wire string the
-        # desired side sends (same order, same separators).
-        params = out.get("svcParams")
-        if isinstance(params, dict):
-            wire = _svcb_wire(
-                _svcb_param_list(
-                    [(str(k), None if v in (None, "") else str(v)) for k, v in params.items()]
-                )
-            )
-            if wire:
-                out["svcParams"] = wire
-            else:
-                out.pop("svcParams", None)
-        elif params is None:
-            out.pop("svcParams", None)
-        if "svcTargetName" in out:
-            out["svcTargetName"] = _svcb_target(str(out["svcTargetName"] or ""), None)
+        # Rebuild the exact params the desired side sends (#1513): the
+        # daemon reports ``svcParams`` as ``key -> ToString()`` and the
+        # target as stored, which is always absolute.
+        out["svcParams"] = _svcb_wire(_svcb_daemon_params(out.get("svcParams")))
+        out["svcTargetName"] = _svcb_daemon_target(out.get("svcTargetName"))
     return out
 
 
@@ -841,11 +1010,9 @@ def _record_params(
     if rtype in ("SVCB", "HTTPS"):
         # Before the blanket rstrip: a trailing dot on the TARGET is what
         # says it is absolute (a bare one is relative to the zone).
+        # ``svcParams`` is always sent: the API requires it (``false`` = none).
         priority, target, params = _svcb_params(value, origin)
-        out: dict[str, Any] = {"svcPriority": priority, "svcTargetName": target}
-        if params:
-            out["svcParams"] = params
-        return out
+        return {"svcPriority": priority, "svcTargetName": target, "svcParams": params}
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
@@ -2219,16 +2386,6 @@ class TechnitiumDriver(DriverBase):
                 # are strings, and a bare type mismatch would make every
                 # such record look "changed" on every single pass.
                 ttl = rec.get("ttl")
-                if rec.get("type") in ("SVCB", "HTTPS"):
-                    # A single-label target on either side is origin-relative
-                    # (QA saw ``svc`` read back for ``svc.<zone>``), so
-                    # qualify it before comparing (#1513).
-                    tgt = str(rec.get("svcTargetName") or ".")
-                    if tgt != "." and "." not in tgt:
-                        extra = tuple(
-                            (k, f"{tgt}.{zone.rstrip('.').lower()}" if k == "svcTargetName" else v)
-                            for k, v in extra
-                        )
                 return (
                     rec.get("domain"),
                     rec.get("type"),

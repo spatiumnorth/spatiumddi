@@ -206,7 +206,8 @@ def test_svcb_params_no_params() -> None:
     # Root dot stripped — the daemon stores the target un-dotted. See
     # test_svcb_target_root_dot_is_stripped.
     assert target == "svc.example.com"
-    assert params == ""
+    # The API requires svcParams; ``false`` is its spelling of "none".
+    assert params == "false"
 
 
 def test_record_params_svcb() -> None:
@@ -214,9 +215,14 @@ def test_record_params_svcb() -> None:
     assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "alpn|h2"}
 
 
-def test_record_params_https_no_params_omits_svcparams() -> None:
+def test_record_params_https_no_params_sends_false() -> None:
+    """``svcParams`` is a required API parameter (``GetQueryOrForm`` with no
+    default, WebServiceZonesApi.cs 15.4.0); omitting it is refused with
+    "Parameter 'svcParams' missing." for add AND delete. ``false`` = none."""
     out = _record_params("HTTPS", "1 .", {})
-    assert out == {"svcPriority": 1, "svcTargetName": "."}
+    assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "false"}
+    live = _normalize_rdata("HTTPS", {"svcPriority": 1, "svcTargetName": "", "svcParams": {}})
+    assert live == out
 
 
 def test_admin_bootstrap_password_persists(tmp_path: Path) -> None:
@@ -2449,11 +2455,12 @@ def test_svcb_relative_and_absolute_in_zone_target_agree() -> None:
         d = _record_params("SVCB", typed, {}, "example.net")
         assert d["svcTargetName"] == "svc.example.net"
     assert _svcb_params("1 . alpn=h2", "example.net")[1] == "."
-    # A daemon reading back the relative label still compares equal.
+    # Technitium has no relative names: a daemon holding ``svc`` serves
+    # ``svc.``, so it is NOT the same record as ``svc.example.net``.
     live = _normalize_rdata(
         "SVCB", {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}}
     )
-    assert live["svcTargetName"] == "svc"  # qualified in the fingerprint, below
+    assert live["svcTargetName"] == "svc"
 
 
 def test_svcb_valueless_and_mandatory_and_order() -> None:
@@ -2539,7 +2546,10 @@ def _reconcile_calls(
     [
         ("1 . alpn=h2", ".", {"alpn": "h2"}),
         ('1 . alpn="h2"', "", {"alpn": "h2"}),
-        ("1 svc.example.net. alpn=h2", "svc", {"alpn": "h2"}),
+        ("1 svc.example.net. alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        # A trailing dot is absolute whatever the label count: never
+        # qualified, so a single-label absolute target is stable.
+        ("1 localhost. alpn=h2", "localhost", {"alpn": "h2"}),
         ("1 svc alpn=h2", "svc.example.net", {"alpn": "h2"}),
         ("1 . port=8443 alpn=h2,h3", ".", {"alpn": "h2,h3", "port": "8443"}),
         ("1 . no-default-alpn alpn=h2", ".", {"alpn": "h2", "no-default-alpn": None}),
@@ -2563,3 +2573,44 @@ def test_svcb_reconcile_still_replaces_a_different_record(tmp_path: Path) -> Non
         {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}},
     )
     assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_single_label_left_by_the_old_agent_is_repaired(tmp_path: Path) -> None:
+    """The old agent sent a relative ``svc`` verbatim, and Technitium served
+    it as ``svc.``. Desired is now ``svc.example.net``, so the record is
+    replaced once instead of being matched and left wrong forever."""
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 svc alpn=h2",
+        {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_param_less_record_does_not_churn(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path, "0 cdn.other.net.", {"svcPriority": 0, "svcTargetName": "cdn.other.net", "svcParams": {}}
+    )
+    assert hit == []
+
+
+def test_svcb_ech_and_unnamed_keys_go_as_hex_and_read_back_equal() -> None:
+    """``ech`` and an unnamed key reach ``DnsSvcUnknownParamValue.Parse``,
+    which reads HEX; an unnamed key is ``Enum.Parse``d, so it goes by number.
+    The daemon reports both as colon-hex, the unnamed key by number."""
+    out = _record_params("HTTPS", '1 . alpn=h2 ech="AAEC" key65000="a b"', {}, "z")
+    assert out["svcParams"] == "alpn|h2|ech|000102|65000|612062"
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {"65000": "61:20:62", "ech": "00:01:02", "alpn": "h2"},
+        },
+    )
+    assert live == out
+
+
+def test_svcb_mandatory_naming_an_unnamed_key_goes_by_number() -> None:
+    _, _, params = _svcb_params("1 . mandatory=key65000,alpn alpn=h2 key65000=x")
+    assert params == "mandatory|alpn,65000|alpn|h2|65000|78"

@@ -855,7 +855,7 @@ A refused transfer is surfaced as an error on the drift row rather than an empty
 
 ### 4B.4 Record type mapping
 
-Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.
+Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams`. `svcParams` is every key and value separated by `|` (`alpn|h2,h3|port|443`, a multi-value param keeping its commas), or `false` for none; `ech` and unnamed `keyNNNNN` params go as hex and by key number. Technitium has no relative names, so a target without a trailing dot is qualified against the zone before it is sent, as a zone file would read it (#1513, #1698).
 
 ### 4B.5 Still outstanding
 

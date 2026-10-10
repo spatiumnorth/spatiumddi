@@ -130,7 +130,7 @@ def _build_imported_zone(zone_name: str, records_payload: list[dict[str, Any]]) 
             continue
 
         try:
-            value, extra = _rdata_to_value(rtype, rdata, zone_name)
+            value, extra = _rdata_to_value(rtype, rdata)
         except (TypeError, ValueError) as exc:
             warnings.append(f"Unparseable {rtype} at {rec.get('name')!r}: {exc}")
             continue

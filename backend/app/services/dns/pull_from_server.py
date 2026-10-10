@@ -182,9 +182,10 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
         return canonical_ip(v)
     if rtype in ("SVCB", "HTTPS"):
         # #1513: quoting, param order, key case and an in-zone target
-        # written relative / absolute are all one record. ``v`` is already
-        # lower-cased; the canonical form is case-insensitive anyway.
-        return svcb_canonical(v, zone_name)
+        # written relative / absolute are all one record. Given the value
+        # as stored, not ``v``: ``ech`` base64 is case-sensitive, and the
+        # canonical form already folds what is case-insensitive.
+        return svcb_canonical((value or "").strip(), zone_name)
     if rtype == "URI":
         # #1513: fold away the bare-authority trailing slash a server
         # may append when storing the record; a path's slash stays.
