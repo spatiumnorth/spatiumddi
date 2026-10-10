@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A stored Technitium SVCB / HTTPS record no longer churns, and a
+  record with two or more SvcParams is now accepted (#1513, #1698).**
+  A record stored as `1 . alpn=h2` read back as `1 . alpn="h2"`, and an
+  in-zone target read back relative, so the structural reconcile deleted
+  and re-added it on every pass and the drift view listed it as both
+  missing and extra. Both sides now compare on one canonical form per
+  RFC 9460: unquoted values, params in key-number order, valueless and
+  `mandatory` params normalised, and a target made absolute against the
+  zone (`svc`, `svc.zone` and `svc.zone.` are one name; `.` stays `.`).
+  Drift and Sync with Servers use the same form, so a record that is on
+  the daemon exactly as stored stops reading as drift. Technitium's API
+  separates every key and value with `|` (`alpn|h2|port|8443`), where the
+  agent and the agentless driver joined pairs with commas, so a second
+  param was refused; that is fixed in the same line. A trailing dot on a
+  target is no longer stripped before the record is parsed. Not verified
+  against a live daemon: the valueless `no-default-alpn` form.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record

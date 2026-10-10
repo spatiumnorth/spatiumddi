@@ -125,7 +125,7 @@ def test_rdata_to_value_svcb_params_dict_to_presentation() -> None:
     value, _ = _rdata_to_value(
         "HTTPS", {"svcPriority": 1, "svcTargetName": ".", "svcParams": {"alpn": "h2,h3"}}
     )
-    assert value == '1 . alpn="h2,h3"'
+    assert value == "1 . alpn=h2,h3"
 
 
 def test_build_imported_zone_hoists_soa_and_skips_dnssec() -> None:
@@ -230,9 +230,9 @@ def test_svcb_params_sorted_by_key_and_valueless_keys_kept() -> None:
     from app.services.technitium.rdata import svcb_params
 
     _, _, params = svcb_params('1 . port=443 alpn="h2"')
-    assert params == "alpn|h2,port|443"
+    assert params == "alpn|h2|port|443"
     _, _, params = svcb_params('1 . no-default-alpn alpn="h2"')
-    assert params == "alpn|h2,no-default-alpn|"
+    assert params == "alpn|h2|no-default-alpn|true"
 
 
 def test_record_params_uri_and_aaaa_canonicalisation() -> None:
@@ -258,3 +258,70 @@ def test_pull_normalize_value_uri_and_aaaa() -> None:
         "1 1 https://example.test/path/"
     )
     assert _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.") == "2001:db8::1"
+
+
+# ── #1513 / #1698: SVCB/HTTPS compare canonically ──────────────────────
+
+
+def _key_of(value: str, rtype: str = "SVCB", zone: str = "example.net."):
+    from app.drivers.dns.base import RecordData
+    from app.services.dns.pull_from_server import _key
+
+    return _key(RecordData(name="svc", record_type=rtype, value=value), zone)
+
+
+def test_svcb_quoting_is_one_record() -> None:
+    """The exact QA case: stored ``alpn=h2`` vs read back ``alpn="h2"``."""
+    assert _key_of("1 . alpn=h2") == _key_of('1 . alpn="h2"')
+
+
+def test_svcb_in_zone_target_relative_or_absolute_is_one_record() -> None:
+    a = _key_of("1 svc.example.net. alpn=h2")
+    assert a == _key_of("1 svc alpn=h2")
+    assert a == _key_of("1 SVC.Example.Net. alpn=h2")
+
+
+def test_svcb_param_order_valueless_and_mandatory() -> None:
+    a = _key_of('1 . port=443 no-default-alpn mandatory="port,alpn" alpn=h2', "HTTPS")
+    b = _key_of("1 . mandatory=alpn,port alpn=h2 no-default-alpn port=443", "HTTPS")
+    assert a == b
+
+
+def test_svcb_different_records_stay_different() -> None:
+    base = _key_of("1 . alpn=h2")
+    assert base != _key_of("1 . alpn=h3")
+    assert base != _key_of("2 . alpn=h2")
+    assert base != _key_of("1 . alpn=h2 port=443")
+    assert base != _key_of("1 other.example.net. alpn=h2")
+    assert _key_of("1 . alpn=h2,h3") != _key_of("1 . alpn=h3,h2")
+
+
+def test_rdata_to_value_round_trips_to_the_same_key() -> None:
+    """What the agentless driver reads back keys the same as what was
+    stored — quoting, relative target and valueless param included."""
+    stored = "1 svc.example.net. alpn=h2 no-default-alpn port=8443"
+    value, _ = _rdata_to_value(
+        "SVCB",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "svc",
+            "svcParams": {"port": "8443", "no-default-alpn": None, "alpn": "h2"},
+        },
+        "example.net",
+    )
+    assert value == "1 svc.example.net. alpn=h2 no-default-alpn port=8443"
+    assert _key_of(value) == _key_of(stored)
+
+
+def test_record_params_svcb_two_params_is_pipe_separated() -> None:
+    from app.services.technitium.rdata import record_params
+
+    out = record_params("SVCB", "1 svc port=8443 alpn=h2", origin="example.net")
+    assert out == {
+        "svcPriority": 1,
+        "svcTargetName": "svc.example.net",
+        "svcParams": "alpn|h2|port|8443",
+    }
+    # Absolute target's trailing dot is no longer eaten before parsing.
+    out = record_params("SVCB", "1 cdn.other.net.", origin="example.net")
+    assert out["svcTargetName"] == "cdn.other.net"

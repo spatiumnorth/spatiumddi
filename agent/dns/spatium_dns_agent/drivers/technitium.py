@@ -265,7 +265,98 @@ def _strip_bare_authority_slash(uri: str) -> str:
     return uri
 
 
-def _svcb_params(value: str) -> tuple[int, str, str]:
+# RFC 9460 §14.3 key numbers: canonical param order is by NUMBER. This is
+# the agent's own copy of ``app.services.technitium.rdata`` (the agent image
+# cannot import ``app``) - keep the two in step.
+_SVCB_KEY_NUM = {
+    "mandatory": 0,
+    "alpn": 1,
+    "no-default-alpn": 2,
+    "port": 3,
+    "ipv4hint": 4,
+    "ech": 5,
+    "ipv6hint": 6,
+    "dohpath": 7,
+}
+# Technitium ignores the value of ``no-default-alpn`` but its ``|`` splitter
+# walks tokens two at a time, so a valueless key still needs a token after
+# it. Source: DnsSvcParamValue.Parse in TechnitiumLibrary; not live-verified.
+_SVCB_VALUELESS_PLACEHOLDER = "true"
+
+
+def _svcb_key_num(key: str) -> int:
+    if key in _SVCB_KEY_NUM:
+        return _SVCB_KEY_NUM[key]
+    if key.startswith("key") and key[3:].isdigit():
+        return int(key[3:])
+    return 65536
+
+
+def _svcb_split(value: str) -> list[str]:
+    """Split on whitespace outside double quotes, keeping backslash escapes
+    verbatim (``shlex.split`` would eat the backslash of an escaped comma)."""
+    tokens: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+    it = iter(value)
+    for ch in it:
+        if ch == "\\":
+            cur.append(ch)
+            cur.append(next(it, ""))
+        elif ch == '"':
+            in_quote = not in_quote
+            cur.append(ch)
+        elif ch.isspace() and not in_quote:
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _svcb_param_list(items: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    """Canonical params: lower-case keys, empty value == valueless, sorted
+    by key number, ``mandatory`` key list sorted, hint addresses canonical."""
+    out: list[tuple[str, str | None]] = []
+    for key, val in items:
+        key = key.lower().replace("_", "-")
+        if key == "mandatory" and val:
+            names = [n.strip().lower().replace("_", "-") for n in val.split(",") if n.strip()]
+            val = ",".join(sorted(names, key=lambda n: (_svcb_key_num(n), n)))
+        elif key in ("ipv4hint", "ipv6hint") and val:
+            val = ",".join(_canonical_ip(a.strip()) for a in val.split(",") if a.strip())
+        out.append((key, val or None))
+    out.sort(key=lambda kv: (_svcb_key_num(kv[0]), kv[0]))
+    return out
+
+
+def _svcb_wire(params: list[tuple[str, str | None]]) -> str:
+    parts: list[str] = []
+    for key, val in params:
+        parts.append(key)
+        parts.append(val if val is not None else _SVCB_VALUELESS_PLACEHOLDER)
+    return "|".join(parts)
+
+
+def _svcb_target(name: str, origin: str | None) -> str:
+    """Absolute, lower-case, dot-less target (``.`` stays ``.``): a trailing
+    dot is absolute, anything else is relative to ``origin`` (RFC 1035
+    §5.1), so ``svc`` in ``example.net`` is ``svc.example.net``."""
+    name = name.strip()
+    if name in ("", "."):
+        return "."
+    zone = (origin or "").strip().rstrip(".").lower()
+    if name.endswith("."):
+        return name.rstrip(".").lower()
+    if name == "@":
+        return zone or "."
+    return f"{name}.{zone}".lower() if zone else name.lower()
+
+
+def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
     """Parse a BIND-zone-file-style SVCB/HTTPS rdata string into
     ``(priority, target, svcParams)`` for the Technitium API.
 
@@ -273,46 +364,28 @@ def _svcb_params(value: str) -> tuple[int, str, str]:
     e.g. ``'1 . alpn="h2,h3"'``): priority, target, then space-separated
     ``key=value`` params with optionally-quoted values.
 
-    Multi-value params pass through intact: Technitium's ``svcParams``
-    wire format is ``key|value`` pairs comma-joined, and a single param
-    whose value itself contains commas (``alpn|h2,h3``) is accepted and
-    stored as ``{"alpn": "h2,h3"}`` — verified against a live
-    ``technitium/dns-server:15.4.0``. What it rejects is splitting the
-    values into separate pairs (``alpn|h2|h3`` and ``alpn|h2,alpn|h3``
-    both fail with "Requested value 'h3' was not found"), so join on
-    the value, never on the key. Issue #745.
+    Technitium's ``svcParams`` wire format is ``key|value`` tokens all
+    separated by ``|`` (``alpn|h2,h3|port|53443`` in its API docs; the API
+    splits on ``|`` and walks two at a time). The old comma-joined pairs
+    only ever worked for ONE param (#1698). A multi-value param keeps its
+    commas inside the value (``alpn|h2,h3``). Params go out in key-number
+    order, so what Technitium reads back compares equal (#1513).
     """
-    tokens = shlex.split(value)
+    tokens = _svcb_split(value)
     if len(tokens) < 2:
         return (1, ".", "")
     priority = int(tokens[0]) if tokens[0].isdigit() else 1
-    # The caller's leading ``value.rstrip(".")`` cannot reach this target —
-    # it is mid-string, with the svcParams after it — so strip the root dot
-    # here. Technitium stores the target un-dotted, and leaving it on makes
-    # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
-    # keeps a bare apex target from becoming the empty string.
-    target = (tokens[1].rstrip(".") or ".").lower()
-    # Pairs are emitted SORTED BY KEY (#1513): the read-back side rebuilds
-    # svcParams sorted (``_normalize_rdata`` sorts the daemon's dict), so
-    # an operator-typed order never matched and the record was deleted
-    # and re-added on every structural reconcile.
-    #
-    # A valueless param (``no-default-alpn``) is emitted as ``key|`` —
-    # the empty-value form of the same wire pair — instead of being
-    # skipped, which silently changed the served answer. NOTE: the
-    # ``key|`` form has NOT been verified against a live daemon (the fix
-    # direction in #1513 asks for that check); if a daemon rejects it,
-    # the #1516 partial-refusal path now surfaces the refusal instead of
-    # the record silently never being served.
-    parsed: list[tuple[str, str]] = []
+    items: list[tuple[str, str | None]] = []
     for tok in tokens[2:]:
-        if "=" in tok:
-            key, _, raw_val = tok.partition("=")
-            parsed.append((key, f"{key}|{raw_val}"))
-        else:
-            parsed.append((tok, f"{tok}|"))
-    parsed.sort(key=lambda pair: pair[0])
-    return (priority, target, ",".join(pair for _, pair in parsed))
+        key, eq, raw = tok.partition("=")
+        if eq and len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            raw = raw[1:-1]
+        items.append((key, raw if eq else None))
+    return (
+        priority,
+        _svcb_target(tokens[1], origin),
+        _svcb_wire(_svcb_param_list(items)),
+    )
 
 
 # ── rData → add-param normalisation ────────────────────────────────────
@@ -416,15 +489,24 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         if "uri" in out:
             out["uri"] = _strip_bare_authority_slash(str(out["uri"]))
     elif rtype in ("SVCB", "HTTPS"):
-        # svcParams goes out as "k|v,k|v" and comes back as a dict.
+        # The daemon reports each param as ``key: ToString()`` - a string,
+        # null/empty for a valueless one. Rebuild the exact wire string the
+        # desired side sends (same order, same separators).
         params = out.get("svcParams")
         if isinstance(params, dict):
-            out["svcParams"] = ",".join(f"{k}|{v}" for k, v in sorted(params.items()))
-        if out.get("svcTargetName"):
-            out["svcTargetName"] = str(out["svcTargetName"]).lower()
-        # An apex target "." is stored as the empty string.
-        if out.get("svcTargetName") == "":
-            out["svcTargetName"] = "."
+            wire = _svcb_wire(
+                _svcb_param_list(
+                    [(str(k), None if v in (None, "") else str(v)) for k, v in params.items()]
+                )
+            )
+            if wire:
+                out["svcParams"] = wire
+            else:
+                out.pop("svcParams", None)
+        elif params is None:
+            out.pop("svcParams", None)
+        if "svcTargetName" in out:
+            out["svcTargetName"] = _svcb_target(str(out["svcTargetName"] or ""), None)
     return out
 
 
@@ -749,11 +831,21 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any]:
+def _record_params(
+    rtype: str, value: str, rec: dict[str, Any], origin: str | None = None
+) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
     ``delete`` requires the exact same value params to identify the record.
     """
+    if rtype in ("SVCB", "HTTPS"):
+        # Before the blanket rstrip: a trailing dot on the TARGET is what
+        # says it is absolute (a bare one is relative to the zone).
+        priority, target, params = _svcb_params(value, origin)
+        out: dict[str, Any] = {"svcPriority": priority, "svcTargetName": target}
+        if params:
+            out["svcParams"] = params
+        return out
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
@@ -834,12 +926,6 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
                 _strip_bare_authority_slash(tokens[2]) if len(tokens) > 2 else ""
             ),
         }
-    if rtype in ("SVCB", "HTTPS"):
-        priority, target, params = _svcb_params(value)
-        out: dict[str, Any] = {"svcPriority": priority, "svcTargetName": target}
-        if params:
-            out["svcParams"] = params
-        return out
     # Unrecognised type — pass the raw value through under a best-guess key
     # so the API's own error message tells us what's missing, rather than
     # silently dropping the record.
@@ -965,7 +1051,7 @@ class TechnitiumDriver(DriverBase):
                                 if _rec_ttl is not None
                                 else (_zone_ttl if _zone_ttl is not None else 3600)
                             ),
-                            **_record_params(rtype, rec.get("value") or "", rec),
+                            **_record_params(rtype, rec.get("value") or "", rec, zname),
                         }
                     )
 
@@ -1506,7 +1592,7 @@ class TechnitiumDriver(DriverBase):
             "domain": name,
             "zone": zone,
             "type": rtype,
-            **_record_params(rtype, rec.get("value") or "", rec),
+            **_record_params(rtype, rec.get("value") or "", rec, zone),
         }
 
         # #773 — the control plane ships the complete desired RRset. Technitium's
@@ -1551,7 +1637,7 @@ class TechnitiumDriver(DriverBase):
                             "type": rtype,
                             "ttl": rrset_ttl,
                             "overwrite": "true" if index == 0 else "false",
-                            **_record_params(rtype, member.get("value") or "", member),
+                            **_record_params(rtype, member.get("value") or "", member, zone),
                         },
                         zone,
                         name,
@@ -2133,6 +2219,16 @@ class TechnitiumDriver(DriverBase):
                 # are strings, and a bare type mismatch would make every
                 # such record look "changed" on every single pass.
                 ttl = rec.get("ttl")
+                if rec.get("type") in ("SVCB", "HTTPS"):
+                    # A single-label target on either side is origin-relative
+                    # (QA saw ``svc`` read back for ``svc.<zone>``), so
+                    # qualify it before comparing (#1513).
+                    tgt = str(rec.get("svcTargetName") or ".")
+                    if tgt != "." and "." not in tgt:
+                        extra = tuple(
+                            (k, f"{tgt}.{zone.rstrip('.').lower()}" if k == "svcTargetName" else v)
+                            for k, v in extra
+                        )
                 return (
                     rec.get("domain"),
                     rec.get("type"),
