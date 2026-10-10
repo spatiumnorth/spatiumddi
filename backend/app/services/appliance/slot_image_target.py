@@ -188,6 +188,19 @@ def new_refire_nonce() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def desired_slot_image_url(row: Appliance, target: SlotImageTarget) -> str:
+    """The URL ``stamp_desired_slot_image`` writes onto ``row`` for ``target``.
+
+    The target's URL, with the re-fire nonce appended when the appliance's
+    runner is known to strip the fragment (#419). When it equals the row's
+    current ``desired_slot_image_url`` the stamp repeats the node's last
+    request, which the supervisor's fire-once marker does not act on again.
+    """
+    if target.nonce and supervisor_strips_url_fragment(row):
+        return f"{target.url}#a={target.nonce}"
+    return target.url
+
+
 def stamp_desired_slot_image(
     row: Appliance,
     target: SlotImageTarget,
@@ -205,9 +218,7 @@ def stamp_desired_slot_image(
     are known to be built for different architectures (#1026) — nothing
     is written to ``row`` in that case.
     """
-    url = target.url
-    if target.nonce and supervisor_strips_url_fragment(row):
-        url = f"{url}#a={target.nonce}"
+    url = desired_slot_image_url(row, target)
 
     if architecture_conflict(target.architecture, row.architecture):
         # #1026. The download would verify (the SHA matches — it is a
@@ -237,6 +248,7 @@ __all__ = [
     "SlotImageArchitectureMismatch",
     "SlotImageResolutionError",
     "SlotImageTarget",
+    "desired_slot_image_url",
     "new_refire_nonce",
     "resolve_slot_image_target",
     "stamp_desired_slot_image",

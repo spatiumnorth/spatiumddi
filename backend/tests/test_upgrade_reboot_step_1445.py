@@ -253,6 +253,7 @@ async def test_the_chain_passes_the_stamp_time_only_for_a_fresh_stamp(
     for name in (
         "preflight",
         "etcd_snapshot",
+        "stage",
         "cordon",
         "drain",
         "health_gate",

@@ -110,6 +110,7 @@ CATEGORY_SUPERVISOR_FAILED = "supervisor_reported_failed"
 CATEGORY_CONVERGENCE_TIMEOUT = "node_did_not_rejoin"
 CATEGORY_CHART_BUMP = "chart_bump_failed"
 CATEGORY_UNCORDON_FAIL = "uncordon_fail"
+CATEGORY_MIRROR_NOT_READY = "slot_image_mirror_not_ready"
 CATEGORY_OTHER = "other"
 
 
@@ -128,15 +129,20 @@ def classify_per_node_failure(
     """
     if failed_at == "preflight":
         return CATEGORY_PREFLIGHT
+    if failed_at == "mirror_ready":
+        return CATEGORY_MIRROR_NOT_READY
     if failed_at == "cordon":
         return CATEGORY_CORDON_FAIL
     if failed_at == "verify_primary_moved":
         return CATEGORY_PRIMARY_NOT_MOVED
     if failed_at == "drain":
         return CATEGORY_DRAIN_STUCK
-    if failed_at == "reboot":
+    if failed_at in ("stage", "reboot"):
         # The apply failed on the host before it staged the slot, or never
-        # finished staging it. Either way the node was not rebooted.
+        # finished staging it. Either way the node was not rebooted. A
+        # ``stage`` failure comes before the cordon (#1463), so the node is
+        # also still in service; ``reboot`` waits the same way for a run
+        # resumed there.
         if error and "supervisor reported upgrade failed" in error:
             return CATEGORY_SUPERVISOR_FAILED
         return CATEGORY_OTHER
@@ -185,20 +191,26 @@ def operator_hint(category: str) -> str:
         return (
             "Drain timed out — a workload pod blocked eviction. Check "
             "PodDisruptionBudgets + per-pod status; once unblocked, abort + "
-            "plan a fresh run (drain doesn't auto-retry mid-run)."
+            "plan a fresh run (drain doesn't auto-retry mid-run). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_CORDON_FAIL:
         return (
             "kubectl cordon failed — likely an RBAC issue. Verify the api "
             "ServiceAccount has cluster-scoped patch on nodes "
-            "(api.upgradeOrchestratorRBAC.enabled=true in chart values)."
+            "(api.upgradeOrchestratorRBAC.enabled=true in chart values). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_PRIMARY_NOT_MOVED:
         return (
             "CNPG primary didn't switch off the cordoned node within the "
             "switchover timeout. Check Cluster.status + replica replay lag; "
             "the cordon-triggered switchover only works with a caught-up "
-            "replica."
+            "replica. "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_AUTO_REVERTED:
         return (
@@ -230,6 +242,14 @@ def operator_hint(category: str) -> str:
             "Every node committed the new slot but the post-loop chart bump "
             "failed (Deployment rollout / migrate Job). Forward-fix: helm "
             "rollback the chart, debug, re-apply the bump."
+        )
+    if category == CATEGORY_MIRROR_NOT_READY:
+        return (
+            "The slot-image mirror, which serves the uploaded image to every "
+            "node, had no Ready pod, so this node was not told to fetch and is "
+            "still in service. Its volume pins it to one node: check that node "
+            "is up and uncordoned and read the mirror pod's events, then plan "
+            "the upgrade again."
         )
     if category == CATEGORY_UNCORDON_FAIL:
         return (

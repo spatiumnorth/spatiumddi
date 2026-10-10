@@ -326,3 +326,33 @@ def test_release_gives_up_after_its_attempts(monkeypatch: pytest.MonkeyPatch) ->
 def test_release_without_a_service_account_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(k8s, "get_config", lambda: None)
     assert mutex.release_if_held(attempts=3, retry_delay_s=0) is False
+
+
+@pytest.mark.asyncio
+async def test_the_drive_names_the_mirror_from_the_plans_chart(
+    db_session: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1463 — each node waits for the slot-image mirror of THIS release."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _running_run(db_session, done=[])
+    run.plan = {**run.plan, "chart_name": "acme"}
+    await db_session.commit()
+    seen: list[Any] = []
+
+    async def _single(*_a: Any, node_name: str, **kw: Any) -> Any:
+        seen.append(kw.get("mirror_deployment"))
+        return per_node.SingleNodeResult(
+            node_name=node_name, target_version="x", ok=False, failed_at="stage", steps=[]
+        )
+
+    async def _no_alert(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
+    monkeypatch.setattr(orch.upgrade_alerts, "emit_upgrade_failed_alert", _no_alert)
+    monkeypatch.setattr(orch.mutex, "release_if_held", lambda **_k: True)
+
+    await orch._drive_loop(db_session, run, asyncio.Event())
+
+    assert seen == ["acme-spatiumddi-slot-image-mirror"]

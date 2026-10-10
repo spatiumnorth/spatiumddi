@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade from an uploaded image no longer drains the
+  slot-image mirror before a node fetches from it (#1463).** On a
+  multi-node appliance an uploaded image reaches every node through the
+  slot-image mirror, one pod whose local volume pins it to one node. The
+  per-node chain cordoned and drained each node before telling it to
+  fetch, so the mirror's own node evicted its image source first: the
+  replacement could not schedule on the cordoned node, every download
+  answered 502, and the run failed there with the node cordoned and its
+  CNPG maintenance window open. The chain now stamps the node and waits
+  for the host to stage the new slot while the node is still in service,
+  and cordons, drains and reboots it only after that; a fetch that fails
+  leaves the node uncordoned and serving. Before a node is stamped the
+  run also waits, up to 10 minutes, for the mirror to have a Ready pod
+  again, since it comes back only once its own node is uncordoned after
+  the reboot; a mirror that never returns fails that node before it is
+  touched, under its own alert category. A cordon, switchover or drain
+  failure now happens with the new slot already staged and armed for the
+  node's next boot, and its alert hint says so. An upgrade from an
+  operator-supplied URL, or on a cluster with no mirror, is unchanged.
+  Also: the database connection is released before the node leaves
+  service, so the CNPG switchover the cordon triggers can no longer
+  leave the reboot step committing on a closed connection.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
