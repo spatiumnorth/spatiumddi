@@ -723,24 +723,124 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     monkeypatch.setattr(per_node, "_step_cordon", _fail_cordon)
     monkeypatch.setattr(per_node, "_step_drain", _track_drain)
 
-    result = await per_node.single_node_upgrade(
-        MagicMock(commit=AsyncMock()),
-        node_name="node-1",
-        target_version="2026.06.01-1",
-        slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
-        cnpg_cluster_name="pg-cluster",
-    )
+    with (
+        patch.object(per_node.k8s, "uncordon_node") as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
     assert result.ok is False
     assert result.failed_at == "cordon"
     assert "403" in result.error
     assert drain_called is False
-    # Steps after cordon never ran.
+    # Steps after cordon never ran; the window this run set was released.
     assert [s.name for s in result.steps] == [
         "preflight",
         "etcd_snapshot",
         "cnpg_maintenance_on",
         "cordon",
+        "release_node",
     ]
+    # #1542: the window set before the failed cordon is cleared, and the
+    # node — which this run never cordoned — is not uncordoned.
+    release = result.steps[-1]
+    assert release.ok is True
+    assert release.detail["maintenance_window_cleared"] is True
+    assert release.detail["uncordon_skipped"] == "the run never cordoned the node"
+    mw.assert_called_once_with("pg-cluster", in_progress=False, reuse_pvc=True, namespace=None)
+    un.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_cordon_failure_without_window_releases_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No CNPG cluster → no window was set; a failed cordon holds nothing,
+    so no release step runs at all."""
+    _patch_chain_ok(monkeypatch, cordon=_failing("cordon", "kubeapi status 403"))
+    with (
+        patch.object(per_node.k8s, "uncordon_node") as un,
+        patch.object(per_node.k8s, "patch_cnpg_maintenance_window") as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+        )
+    assert result.failed_at == "cordon"
+    assert result.steps[-1].name == "cordon"
+    un.assert_not_called()
+    mw.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_step_cordon_records_pre_upgrade_unschedulable() -> None:
+    node = {"spec": {"unschedulable": True}}
+    with (
+        patch.object(per_node.k8s, "get_node", return_value=(200, node)),
+        patch.object(per_node.k8s, "cordon_node", return_value=(True, None)),
+    ):
+        step = await per_node._step_cordon("node-1")
+    assert step.ok is True
+    assert step.detail["was_unschedulable"] is True
+
+
+@pytest.mark.asyncio
+async def test_step_cordon_unknown_pre_state_when_node_unreadable() -> None:
+    with (
+        patch.object(
+            per_node.k8s, "get_node", side_effect=per_node.k8s.KubeapiUnavailableError("down")
+        ),
+        patch.object(per_node.k8s, "cordon_node", return_value=(True, None)),
+    ):
+        step = await per_node._step_cordon("node-1")
+    assert step.ok is True
+    assert step.detail["was_unschedulable"] is None
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_does_not_uncordon_a_pre_cordoned_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node an operator had cordoned before the upgrade stays cordoned
+    when a later step fails; the window is still cleared."""
+
+    async def _cordon(_node: str, **_kw: Any) -> per_node.StepResult:
+        return per_node.StepResult(
+            name="cordon", started_at="t", detail={"was_unschedulable": True}
+        ).finish(True)
+
+    _patch_chain_ok(monkeypatch, cordon=_cordon, drain=_failing("drain", "drain timed out"))
+    with (
+        patch.object(per_node.k8s, "uncordon_node") as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
+    assert result.failed_at == "drain"
+    release = result.steps[-1]
+    assert release.name == "release_node" and release.ok is True
+    assert release.detail["uncordon_skipped"] == (
+        "the node was already cordoned before the upgrade"
+    )
+    assert release.detail["maintenance_window_cleared"] is True
+    un.assert_not_called()
+    mw.assert_called_once()
 
 
 @pytest.mark.asyncio

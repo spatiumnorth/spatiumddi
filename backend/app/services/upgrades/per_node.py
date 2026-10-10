@@ -249,6 +249,18 @@ async def _step_cnpg_maintenance_on(cluster_name: str, namespace: str | None) ->
 
 async def _step_cordon(node_name: str) -> StepResult:
     step = StepResult(name="cordon", started_at=_now_iso(), detail={"node": node_name})
+    # Record whether the node was already unschedulable BEFORE this cordon,
+    # so a failure's release (#1542) does not uncordon a node an operator
+    # had cordoned on purpose. ``None`` = could not tell; the release then
+    # uncordons, as it did before this was recorded.
+    was_unschedulable: bool | None = None
+    try:
+        status, node = k8s.get_node(node_name)
+    except k8s.KubeapiUnavailableError:
+        status, node = 0, None
+    if status == 200 and node is not None:
+        was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+    step.detail["was_unschedulable"] = was_unschedulable
     ok, err = k8s.cordon_node(node_name)
     if not ok:
         return step.finish(False, error=err or "cordon failed")
@@ -853,7 +865,7 @@ async def _step_uncordon(
     return step.finish(True)
 
 
-# ── Compensation: release the node after a post-cordon failure ───────
+# ── Compensation: release the node after a failure ───────────────────
 
 
 async def _step_release_node(
@@ -862,9 +874,10 @@ async def _step_release_node(
     namespace: str | None,
     *,
     clear_window: bool,
+    uncordon_skip_reason: str | None = None,
 ) -> StepResult:
     """Compensating step for #1542 — best-effort release of a node
-    whose upgrade failed after the cordon.
+    whose upgrade failed once this run had started holding it.
 
     Uncordons the node and, when this run set the CNPG maintenance
     window, clears it. Both actions are idempotent (uncordoning an
@@ -874,17 +887,30 @@ async def _step_release_node(
     its own step in the per-node progress, so the operator can see
     whether the node was released or is still cordoned with the
     window on and needs a manual release.
+
+    ``uncordon_skip_reason`` set means the uncordon must not happen: the
+    run never cordoned the node (it failed at or before the cordon with
+    the window already set), or the node was already unschedulable before
+    the upgrade cordoned it, so uncordoning would undo an operator's
+    cordon. The window clear still runs.
     """
     step = StepResult(
         name="release_node",
         started_at=_now_iso(),
         detail={"node": node_name, "cluster": cluster_name},
     )
-    ok, err = k8s.uncordon_node(node_name)
-    if not ok:
-        return step.finish(False, error=f"compensating uncordon failed: {err}", uncordon_ok=False)
+    done: dict[str, Any] = {}
+    if uncordon_skip_reason is not None:
+        done["uncordon_skipped"] = uncordon_skip_reason
+    else:
+        ok, err = k8s.uncordon_node(node_name)
+        if not ok:
+            return step.finish(
+                False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
+            )
+        done["uncordon_ok"] = True
     if not (clear_window and cluster_name):
-        return step.finish(True, uncordon_ok=True, maintenance_window_clear_skipped=True)
+        return step.finish(True, maintenance_window_clear_skipped=True, **done)
     ok, err = k8s.patch_cnpg_maintenance_window(
         cluster_name,
         in_progress=False,
@@ -892,12 +918,13 @@ async def _step_release_node(
         namespace=namespace,
     )
     if not ok:
+        prefix = "uncordon ok, " if done.get("uncordon_ok") else ""
         return step.finish(
             False,
-            error=f"uncordon ok, compensating maintenance-window clear failed: {err}",
-            uncordon_ok=True,
+            error=f"{prefix}compensating maintenance-window clear failed: {err}",
+            **done,
         )
-    return step.finish(True, uncordon_ok=True, maintenance_window_cleared=True)
+    return step.finish(True, maintenance_window_cleared=True, **done)
 
 
 # ── Step 12: cluster verify ──────────────────────────────────────────
@@ -997,28 +1024,38 @@ async def single_node_upgrade(
 
     results: list[StepResult] = []
 
-    # #1542 — compensation state for a failure after the cordon. On a
-    # resume past a step, the earlier invocation already did it, so
-    # seed the flags from start_index; the step runs below flip them
-    # as they complete in this invocation.
+    # #1542 — compensation state for a failure once this run holds the
+    # node (window set and/or cordoned). On a resume past a step, the
+    # earlier invocation already did it, so seed the flags from
+    # start_index; the step runs below flip them as they complete in this
+    # invocation.
     cordon_done = start_index > steps_in_order.index("cordon")
     window_set = bool(cnpg_cluster_name) and start_index > steps_in_order.index(
         "cnpg_maintenance_on"
     )
     released = start_index > steps_in_order.index("uncordon")
+    # Set from the cordon step's pre-cordon read. A resumed run did not
+    # read it, so it falls back to uncordoning, as before.
+    pre_cordoned = False
 
     async def _fail(step: StepName) -> SingleNodeResult:
-        """Fail the chain, first releasing the node if this run left
-        it cordoned (#1542). Without the compensation the node stays
-        cordoned and the CNPG maintenance window stays on until an
-        operator releases it by hand."""
-        if cordon_done and not released:
+        """Fail the chain, first releasing what this run holds (#1542):
+        the CNPG maintenance window it set, and the cordon it applied.
+        Without the compensation the node stays cordoned and the window
+        stays on until an operator releases them by hand."""
+        if (cordon_done or window_set) and not released:
+            skip: str | None = None
+            if not cordon_done:
+                skip = "the run never cordoned the node"
+            elif pre_cordoned:
+                skip = "the node was already cordoned before the upgrade"
             try:
                 comp = await _step_release_node(
                     node_name,
                     cnpg_cluster_name,
                     cnpg_namespace,
                     clear_window=window_set,
+                    uncordon_skip_reason=skip,
                 )
             except Exception as exc:  # noqa: BLE001 — never mask the real failure
                 # The compensation is best-effort: an exception here must
@@ -1061,7 +1098,11 @@ async def single_node_upgrade(
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
         window_set = True
     if not await _run("cordon", _step_cordon(node_name)):
-        return _failed(node_name, target_version, "cordon", results)
+        # The window may already be set — release it (#1542). The node is
+        # not uncordoned: this run did not cordon it.
+        return await _fail("cordon")
+    if start_index <= steps_in_order.index("cordon"):
+        pre_cordoned = results[-1].detail.get("was_unschedulable") is True
     cordon_done = True
     if cnpg_cluster_name:
         if not await _run(

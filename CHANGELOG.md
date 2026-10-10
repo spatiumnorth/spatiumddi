@@ -1527,7 +1527,10 @@ the formatter handles the rest.
   the cordon (the reboot step included, and in a run resumed past the
   cordon) now runs a compensating release — uncordon the node and
   clear the CNPG maintenance window this run set — instead of leaving
-  the node cordoned with the window on. When the run has no CNPG
+  the node cordoned with the window on. A failure at the cordon itself,
+  after the window was set, clears the window without uncordoning a
+  node the run never cordoned; and a node that was already cordoned
+  before the upgrade is left cordoned. When the run has no CNPG
   cluster (none configured and none detected), the maintenance-window
   clear at uncordon time is skipped instead of failing every node's
   uncordon. The drain step
