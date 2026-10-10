@@ -1466,6 +1466,18 @@ def _agentless_op_warning(op: Any) -> str | None:
     return f"DNS provider did not accept this change yet; it is scheduled for retry: {error}"
 
 
+def _agentless_batch_warning(ops: list[Any]) -> str | None:
+    """:func:`_agentless_op_warning` for a batch of ops (#1683): None when
+    every op landed or was queued for an agent, else the first warning,
+    prefixed with how many of the batch's changes it stands for."""
+    warnings = [w for w in (_agentless_op_warning(op) for op in ops) if w]
+    if not warnings:
+        return None
+    if len(ops) == 1:
+        return warnings[0]
+    return f"{len(warnings)} of {len(ops)} record changes: {warnings[0]}"
+
+
 def _normalize_record_struct_fields(
     record_type: str,
     priority: int | None,
@@ -8059,6 +8071,12 @@ class ImportCommitResponse(BaseModel):
     deleted: int
     unchanged: int
     conflict_strategy: str
+    # #1683 — as on RecordResponse (#1538): set when the zone's agentless
+    # provider did not take every change on the first attempt (rescheduled
+    # with backoff, or failed for good). The import saved; the provider does
+    # not hold all of it yet. Always None for an agent-served zone, whose
+    # ops apply asynchronously by design.
+    provider_warning: str | None = None
 
 
 def _resolve_zone_name(body: ImportPreviewRequest, existing_zone: DNSZone | None) -> str:
@@ -8166,6 +8184,15 @@ async def import_zone_commit(
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing)
 
+    # #1683 — now that the import's changes reach the servers, it is refused
+    # where the record API refuses them: a reconciler-owned zone (the next sync
+    # would overwrite the change, after it was pushed to the wire), and a
+    # record type the group's drivers cannot serve (the provider would reject
+    # the op and keep retrying it, rather than the operator getting a 422).
+    _reject_if_synthesised_zone(zone, "import")
+    for rtype in sorted({c.record_type for c in diff.to_create}):
+        await _check_driver_gated_record_type(rtype, group_id, db)
+
     batch_id = uuid.uuid4()
     created = 0
     updated = 0
@@ -8174,23 +8201,32 @@ async def import_zone_commit(
 
     existing_by_id: dict[str, DNSRecord] = {str(r.id): r for r in existing}
 
+    # #1683 — the rows alone never reach a server. Records are not part of
+    # an agent bundle's structural etag (in a group without views), so a
+    # committed record only reaches the daemon as a record op (#707), and
+    # an agentless provider only through its driver. Every change below is
+    # queued once the rows are written, as the record API does it.
+    create_rows: list[DNSRecord] = []
+    update_rows: list[DNSRecord] = []
+    delete_payloads: list[dict[str, Any]] = []
+
     # Creates run under merge, replace, and append.
     for change in diff.to_create:
         fqdn = f"{change.name}.{zone.name}" if change.name != "@" else zone.name
-        db.add(
-            DNSRecord(
-                zone_id=zone.id,
-                name=change.name,
-                fqdn=fqdn,
-                record_type=change.record_type,
-                value=change.value,
-                ttl=change.ttl,
-                priority=change.priority,
-                weight=change.weight,
-                port=change.port,
-                created_by_user_id=current_user.id,
-            )
+        row = DNSRecord(
+            zone_id=zone.id,
+            name=change.name,
+            fqdn=fqdn,
+            record_type=change.record_type,
+            value=change.value,
+            ttl=change.ttl,
+            priority=change.priority,
+            weight=change.weight,
+            port=change.port,
+            created_by_user_id=current_user.id,
         )
+        db.add(row)
+        create_rows.append(row)
         created += 1
 
     # Updates only under merge + replace.
@@ -8203,6 +8239,7 @@ async def import_zone_commit(
             row.priority = change.priority
             row.weight = change.weight
             row.port = change.port
+            update_rows.append(row)
             updated += 1
 
     # Deletes only under replace.
@@ -8211,8 +8248,32 @@ async def import_zone_commit(
             row = existing_by_id.get(change.existing_id or "")
             if row is None:
                 continue
+            # The payload before the row goes: it names the row (#1230).
+            delete_payloads.append(record_op_payload(row))
             await db.delete(row)
             deleted += 1
+
+    # One serial bump and one batch for the whole import, as
+    # bulk_create_records does. Deletes go first, in the order the agent
+    # drains them: a CNAME that replaces an A at one name can only land once
+    # the A is gone. Each op carries the RRset as the whole import leaves it
+    # (#773), read after the flush.
+    target_serial: int | None = None
+    provider_warning: str | None = None
+    if create_rows or update_rows or delete_payloads:
+        target_serial = bump_zone_serial(zone)
+        await db.flush()
+        ops = [
+            *({"op": "delete", "record": p} for p in delete_payloads),
+            *({"op": "update", "record": record_op_payload(r)} for r in update_rows),
+            *({"op": "create", "record": record_op_payload(r)} for r in create_rows),
+        ]
+        op_rows = await enqueue_record_ops_batch(
+            db, zone, [{**o, "target_serial": target_serial} for o in ops]
+        )
+        # #1538 — a change the agentless provider did not take is surfaced,
+        # not audited as a clean success.
+        provider_warning = _agentless_batch_warning(op_rows)
 
     db.add(
         AuditLog(
@@ -8230,6 +8291,7 @@ async def import_zone_commit(
                 "updated": updated,
                 "deleted": deleted,
                 "unchanged": unchanged_count,
+                "target_serial": target_serial,
                 "changes": {
                     "create": [
                         {"name": c.name, "type": c.record_type, "value": c.value}
@@ -8253,7 +8315,7 @@ async def import_zone_commit(
                     ),
                 },
             },
-            result="success",
+            result="error" if provider_warning else "success",
         )
     )
 
@@ -8270,6 +8332,7 @@ async def import_zone_commit(
         updated=updated,
         deleted=deleted,
         unchanged=unchanged_count,
+        target_serial=target_serial,
     )
 
     return ImportCommitResponse(
@@ -8280,6 +8343,7 @@ async def import_zone_commit(
         deleted=deleted,
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
+        provider_warning=provider_warning,
     )
 
 
