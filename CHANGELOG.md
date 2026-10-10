@@ -1998,6 +1998,14 @@ the formatter handles the rest.
 
 ### Security
 
+- **The Looking Glass image is rebuilt past three Go CVEs (#1729).**
+  GoBGP is built from source, so its binaries carry the Go standard
+  library and `golang.org/x/net` statically. The builder moves from Go
+  1.27.1 to 1.27.2 (CVE-2026-78667, CVE-2026-78669 and CVE-2026-97031,
+  all HIGH), and `golang.org/x/net` is raised from GoBGP's pinned
+  0.58.0 to 0.60.0 (CVE-2026-78669) until GoBGP's own go.mod catches
+  up.
+
 - **Typed-webhook subscription headers are encrypted at rest
   (#1579).** Subscription `headers` (Authorization tokens and the
   like) were stored in clear and rode along in "exclude secrets"
