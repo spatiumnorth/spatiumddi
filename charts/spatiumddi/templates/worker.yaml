@@ -65,6 +65,20 @@ spec:
             - worker
             - --loglevel=info
             - --concurrency={{ .Values.worker.concurrency }}
+            # --without-mingle (#1669): mingle's startup handshake syncs revoked-task
+            # lists between workers, and SpatiumDDI never revokes a task. On a
+            # reconnect mid-failover it can hit a dead Sentinel, and celery treats
+            # that OperationalError as unrecoverable and exits the worker.
+            - --without-mingle
+            # --without-heartbeat --without-gossip (#1669): the heartbeat publishes
+            # every 2 s from the worker's event loop, and with no Redis master it
+            # sits in kombu's reconnect for as long as the outage lasts, so a
+            # SIGTERM is never acted on and the pod runs out its grace period.
+            # Nothing reads worker heartbeats or events (no flower, no event
+            # receiver), gossip only consumes those heartbeats, and the liveness
+            # probe's ``inspect ping`` is a remote-control call that needs neither.
+            - --without-heartbeat
+            - --without-gossip
             - -Q
             - {{ .Values.worker.queues | quote }}
           env:
@@ -99,7 +113,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
-            failureThreshold: 3
+            # 5 x 30 s (was 3): the ping is a broker round trip, so it fails
+            # after a Redis master is lost with its node until Sentinel has
+            # promoted a replica AND the worker has noticed its dead sockets
+            # (kernel keepalive, ~25 s; celery_app.py) and reconnected: about
+            # 30-60 s in a blackholed-master test (#1669). 3 misses (60-90 s)
+            # left little margin; 150 s still catches a wedged worker.
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}

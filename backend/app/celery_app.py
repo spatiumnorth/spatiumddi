@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from typing import Any
 
 import structlog
-from celery import Celery
+from celery import Celery, Task
+from celery.exceptions import Reject
 from celery.schedules import crontab, schedule
 from celery.signals import (
     beat_init,
@@ -16,6 +17,8 @@ from celery.signals import (
     task_prerun,
     worker_init,
 )
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from app.config import settings
 
@@ -63,8 +66,66 @@ def _install_pool_acquire_timeout() -> None:
 
 _install_pool_acquire_timeout()
 
+
+# ── A retry the broker refused is requeued, not dropped (#1669) ─────────
+#
+# ``Task.retry`` publishes the retry and, if that publish raises anything,
+# converts it into ``Reject(requeue=False)`` (celery 5.6.3
+# ``app/task.py`` ``retry``). With ``task_acks_late`` that deletes the
+# message: a retry attempted while the Redis master is unreachable is lost.
+# One reachable form is a kombu bug: ``Producer._publish`` holds its channel
+# in a local, a Redis error inside ``maybe_declare`` makes kombu's ``ensure``
+# ``collect()`` the connection (closing that channel), and the publish then
+# dies on the closed channel with ``AttributeError: 'NoneType' object has no
+# attribute 'client'`` from ``kombu/transport/redis.py``. Main hid it behind a
+# read that never timed out; with the #1669 socket timeouts the error
+# surfaces. Here a reject caused by a broker failure is turned into a
+# requeue: the message goes back to the queue (or, if Redis is still down,
+# stays in kombu's unacked set until it is restored), and the task runs again
+# — every task is idempotent (non-negotiable #9), so running it again early is
+# the documented contract, where losing it is not. Any other publish failure
+# (an unserialisable argument, say) keeps celery's drop, or it would loop.
+def _is_broker_failure(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    from kombu.exceptions import OperationalError
+    from kombu.transport.redis import get_redis_error_classes
+
+    if isinstance(exc, (OperationalError, *get_redis_error_classes().connection_errors)):
+        return True
+    if isinstance(exc, AttributeError):
+        tb = exc.__traceback__
+        last = None
+        while tb is not None:
+            last = tb
+            tb = tb.tb_next
+        return last is not None and last.tb_frame.f_code.co_filename.endswith(
+            "kombu/transport/redis.py"
+        )
+    return False
+
+
+class SpatiumTask(Task):
+    """App-wide task base: see the comment block above."""
+
+    def retry(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        try:
+            return super().retry(*args, **kwargs)
+        except Reject as rej:
+            if rej.requeue is False and _is_broker_failure(rej.reason):
+                structlog.get_logger(__name__).warning(
+                    "celery_retry_publish_failed_requeued",
+                    task=self.name,
+                    task_id=getattr(self.request, "id", None),
+                    error=repr(rej.reason),
+                )
+                raise Reject(rej.reason, requeue=True) from rej
+            raise
+
+
 celery_app = Celery(
     "spatiumddi",
+    task_cls=SpatiumTask,
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
     include=[
@@ -813,20 +874,146 @@ celery_app.conf.update(
 )
 
 
-# ── Redis Sentinel broker/backend (#272 Phase 3) ────────────────────────
+# ── Redis broker/backend transport (#272 Phase 3, #1669) ────────────────
 #
-# When the broker / result-backend URLs carry the ``sentinel://``
-# scheme (umbrella chart with ``redis.kind=sentinel``), Celery's
-# kombu transport needs the master name in transport options to know
-# which Sentinel-monitored master to resolve. The Sentinel auth
-# password (when the data nodes require auth) rides in
-# ``sentinel_kwargs``. Plain ``redis://`` URLs need none of this.
-if settings.celery_broker_url.startswith(("sentinel://", "redis+sentinel://")):
-    _sentinel_opts: dict = {"master_name": settings.redis_sentinel_master}
-    if settings.redis_sentinel_password:
-        _sentinel_opts["sentinel_kwargs"] = {"password": settings.redis_sentinel_password}
-    celery_app.conf.broker_transport_options = _sentinel_opts
-    celery_app.conf.result_backend_transport_options = dict(_sentinel_opts)
+# Sentinel: with ``sentinel://`` URLs (umbrella chart ``redis.kind=sentinel``)
+# kombu needs the master name in transport options, and the Sentinel auth
+# password (when set) rides in ``sentinel_kwargs``.
+#
+# Timeouts (#1669): kombu 5.6.2's Redis transport defaults ``socket_timeout``,
+# ``socket_connect_timeout`` and ``socket_keepalive`` to None, and celery's
+# sentinel result backend takes ``sentinel_kwargs`` from transport options
+# verbatim (an absent key means NO timeouts on the Sentinel queries too). A
+# peer that vanishes without closing its sockets (node power-off, partition)
+# then never produces an error: the worker's idle BRPOP socket just stays
+# silent, the worker is deaf after Sentinel promotes a replica, its liveness
+# ``inspect ping`` fails and the pod is killed. Worse, ``Channel.close()`` does
+# a blocking ``_brpop_read()`` on the dead socket while a BRPOP is
+# outstanding, so a warm shutdown blocked until SIGKILL.
+#
+# Two mechanisms, because they cover different reads:
+#  * ``socket_timeout`` bounds a synchronous request/response read (publish,
+#    ack, health-check PING, Sentinel queries, shutdown's ``_brpop_read``).
+#    It does NOT cover the worker's idle BRPOP wait: the event loop only
+#    reads once epoll says the socket is readable, so silence is never timed.
+#  * TCP keepalive (+ TCP_USER_TIMEOUT for unacked writes) makes the kernel
+#    reset a dead connection, which makes the socket readable-with-error and
+#    lets the worker's normal "Connection to broker lost" reconnect run.
+# ``socket_timeout`` MUST stay well above kombu's BRPOP block time
+# (``Transport.brpop_timeout`` = 1 s): the one place a BRPOP reply is read
+# without waiting for the poller first is ``Channel.close()`` draining an
+# outstanding BRPOP, which a live server answers within that 1 s; a smaller
+# timeout would turn a clean close into a connection error. (Both the
+# worker's event loop and the synchronous ``drain_events`` used by
+# ``celery inspect`` poll before reading.) Unlike
+# ``core/redis_client.py`` (whose pub/sub reads are meant to be slow, #925),
+# nothing here parks a read on purpose: celery's result pub/sub consumer calls
+# ``get_message(timeout=…)`` with an explicit timeout, and kombu's fanout
+# LISTEN is only read after the poller reports readable.
+REDIS_SOCKET_TIMEOUT_S = 10.0  # > BRPOP 1 s; < the 25 s keepalive detection; bounds shutdown I/O
+REDIS_SOCKET_CONNECT_TIMEOUT_S = 5.0  # > a LAN SYN round trip; < Sentinel down-after + promotion
+REDIS_KEEPALIVE_IDLE_S = 10  # first probe after 10 s idle
+REDIS_KEEPALIVE_INTERVAL_S = 5  # then every 5 s
+REDIS_KEEPALIVE_PROBES = 3  # dead after 10 + 3*5 = 25 s of silence
+REDIS_TCP_USER_TIMEOUT_MS = 25_000  # unacked data (keepalive does not run) gives up in 25 s
+REDIS_RESULT_STORE_RETRIES = 3  # result write: one fresh-connection retry is enough after failover
+
+
+def _redis_keepalive_options() -> dict[int, int]:
+    """Per-platform keepalive tuning. Only options the platform defines are
+    returned (Linux has all four; macOS lacks TCP_USER_TIMEOUT)."""
+    import socket
+
+    opts: dict[int, int] = {}
+    for name, value in (
+        ("TCP_KEEPIDLE", REDIS_KEEPALIVE_IDLE_S),
+        ("TCP_KEEPINTVL", REDIS_KEEPALIVE_INTERVAL_S),
+        ("TCP_KEEPCNT", REDIS_KEEPALIVE_PROBES),
+        ("TCP_USER_TIMEOUT", REDIS_TCP_USER_TIMEOUT_MS),
+    ):
+        const = getattr(socket, name, None)
+        if const is not None:
+            opts[const] = value
+    return opts
+
+
+def build_redis_transport_options(
+    broker_url: str, sentinel_master: str, sentinel_password: str | None
+) -> dict[str, Any]:
+    """Broker transport options for ``broker_url`` (empty for ``socket://``)."""
+    if broker_url.startswith(("unix://", "socket://")):
+        return {}
+    opts: dict[str, Any] = {
+        "socket_timeout": REDIS_SOCKET_TIMEOUT_S,
+        "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT_S,
+        "socket_keepalive": True,
+        "socket_keepalive_options": _redis_keepalive_options(),
+    }
+    if broker_url.startswith(("sentinel://", "redis+sentinel://")):
+        opts["master_name"] = sentinel_master
+        # A Sentinel query to a lost Sentinel must not hang either; redis-py
+        # only copies socket_* into sentinel connections when this is None.
+        #
+        # ``retry``: a redis-py client built without a pool (which is what
+        # ``Sentinel`` builds per Sentinel) defaults to 3 retries with
+        # exponential backoff, applied BOTH around the command and around the
+        # connect inside it. Against an unreachable Sentinel that nests to
+        # 10 s + 3 x (4 x 5 s connects + backoff), about 100 s for ONE master
+        # lookup — measured holding a warm shutdown past its 60 s grace on a
+        # single ``srem``. With no retry a lookup costs one socket or connect
+        # timeout, and the caller's own retry (kombu's reconnect loop, the
+        # publish retry policy) asks again, on a fresh connection.
+        sentinel_kwargs: dict[str, Any] = {
+            "socket_timeout": REDIS_SOCKET_TIMEOUT_S,
+            "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT_S,
+            "socket_keepalive": True,
+            "socket_keepalive_options": _redis_keepalive_options(),
+            "retry": Retry(NoBackoff(), 0),
+        }
+        if sentinel_password:
+            sentinel_kwargs["password"] = sentinel_password
+        opts["sentinel_kwargs"] = sentinel_kwargs
+    return opts
+
+
+if settings.celery_broker_url.startswith(
+    ("redis://", "rediss://", "sentinel://", "redis+sentinel://")
+):
+    _redis_opts = build_redis_transport_options(
+        settings.celery_broker_url,
+        settings.redis_sentinel_master,
+        settings.redis_sentinel_password,
+    )
+    celery_app.conf.broker_transport_options = _redis_opts
+    # The result backend reads sentinel_kwargs/master_name from these, but its
+    # own connection timeouts from the ``redis_socket_*`` settings (celery
+    # 5.6.3 backends/redis.py ``RedisBackend.__init__``), which forward
+    # ``socket_keepalive`` as a bare flag with no tuning (kernel defaults).
+    celery_app.conf.result_backend_transport_options = {
+        k: v for k, v in _redis_opts.items() if k in ("master_name", "sentinel_kwargs")
+    }
+    if settings.celery_result_backend.startswith(
+        ("redis://", "rediss://", "sentinel://", "redis+sentinel://")
+    ):
+        celery_app.conf.redis_socket_timeout = REDIS_SOCKET_TIMEOUT_S
+        celery_app.conf.redis_socket_connect_timeout = REDIS_SOCKET_CONNECT_TIMEOUT_S
+        celery_app.conf.redis_socket_keepalive = True
+        # A pool child's pooled backend socket can still point at a master
+        # that died after a failover, and ``_store_result`` first does an
+        # UNretried ``GET`` of the task's meta (backends/base.py
+        # ``_store_result`` -> ``_get_task_meta_for``), so that first state
+        # write per child failed the task. ``redis_retry_on_timeout`` does not
+        # help on Sentinel: redis-py 6.4 reconnects a retried command to the
+        # connection's cached host, the dead master. celery's own store retry
+        # does: each attempt checks a connection out of the pool afresh, and
+        # a dropped one reconnects through ``SentinelManagedConnection
+        # .connect()``, which asks Sentinel for the current master. Bounded,
+        # so a task finishing during an outage still fails in seconds rather
+        # than holding its pool child (and a warm shutdown) indefinitely.
+        # A result write is a SET of the same value, so a retry is idempotent.
+        celery_app.conf.result_backend_always_retry = True
+        celery_app.conf.result_backend_max_retries = REDIS_RESULT_STORE_RETRIES
+        celery_app.conf.result_backend_max_sleep_between_retries_ms = 1000
 
 
 # ── Diagnostics — Celery task_failure capture (issue #123) ──────────────
