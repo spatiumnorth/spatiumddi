@@ -62,6 +62,8 @@ STATE="$RELEASE_STATE/cluster-join.state"
 # supervisor's appliance_state.py.
 JOIN_CONFIRM="SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
 LEAVE_CONFIRM="SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
+# #1541 — removes this node's own etcd member before a leave wipes it.
+ETCD_EVICT="${SPATIUM_ETCD_EVICT:-/usr/local/bin/spatium-etcd-evict}"
 
 K3S_CONFIG="${SPATIUM_K3S_CONFIG:-/etc/rancher/k3s/config.yaml}"
 K3S_DROPIN_DIR="${SPATIUM_K3S_DROPIN_DIR:-/etc/rancher/k3s/config.yaml.d}"
@@ -691,6 +693,28 @@ do_leave() {
     fi
     log "LEAVE: resetting to a single-node seed"
     write_state leaving ""
+
+    # #1541 — leave etcd BEFORE wiping. A wipe that left the member behind
+    # gave the seed a voter nobody would ever answer for, and demoting both
+    # non-seed members of a three-node cluster (the only demote the odd-count
+    # rule allows there) cost the seed its quorum. The runner removes this
+    # node's own member while it still votes, stops k3s, and returns 0 only
+    # once a survivor no longer lists the member; 2 means this node joined
+    # nobody. Anything else keeps the node as it is: k3s back up, still a
+    # member, the leave reported failed.
+    "$ETCD_EVICT" --leave-self
+    local rc=$?
+    case "$rc" in
+        0) log "left etcd: a survivor confirmed this node's member is gone" ;;
+        2) log "no join drop-in: not a joined member, nothing to remove from etcd" ;;
+        *)
+            log "LEAVE refused — this node's etcd member removal was not confirmed (rc=$rc); not wiping"
+            systemctl start k3s || true
+            write_state failed "leave refused: this node's etcd member removal was not confirmed by the cluster, so the node was not reset (see etcd-evict.log)"
+            mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
+            exit 1
+            ;;
+    esac
 
     systemctl stop k3s || true
     clean_k3s_runtime

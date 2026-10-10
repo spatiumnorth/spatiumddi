@@ -2355,6 +2355,15 @@ async def supervisor_heartbeat(
     ):
         row.cluster_role = None
         row.desired_cluster_role = None
+        # #1541 — the node removed its own etcd member before it wiped, but
+        # its k8s Node is still on the seed, and only the seed can say etcd
+        # agrees. Hand the row to the seed's eviction (the path Replace
+        # uses): it deletes the stale Node, confirms etcd no longer lists the
+        # member (#1284), and the row settles ``left`` on that report.
+        row.evict_requested = True
+        row.cluster_join_state = CLUSTER_JOIN_STATE_EVICTING
+        row.cluster_join_state_at = datetime.now(UTC)
+        row.cluster_join_reason = None
     # #590 — and clear it on a failed leave, for the same reason a failed
     # join clears above: the leave runner also renames its trigger away, so
     # a desired-state left standing re-fires the destructive leave every
@@ -4471,9 +4480,10 @@ async def _refuse_promote_while_evicting(db: DB, row: Appliance) -> None:
     if row.evict_requested or row.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Appliance {row.hostname!r} is still being evicted (Fleet → Replace): the seed "
-            "removes etcd members under its hostname until the eviction settles. Promote it "
-            "once its row reads 'left' (or clear the cluster state if the eviction is stuck).",
+            f"Appliance {row.hostname!r} is still being evicted (Fleet → Replace, or the "
+            "seed's cleanup after a demote): the seed removes etcd members under its hostname "
+            "until the eviction settles. Promote it once its row reads 'left' (or clear the "
+            "cluster state if the eviction is stuck).",
         )
     if not row.hostname:
         return
@@ -4681,7 +4691,16 @@ async def demote_control_plane(
     """Batch-demote the given control-plane members back to application
     appliances. Refuses a batch that would leave the cluster at an even
     count, and refuses demoting the seed (use a dedicated seed-migration
-    flow for that — out of scope for Phase 7)."""
+    flow for that — out of scope for Phase 7).
+
+    #1541 — each target's leave runner removes its own etcd member while it
+    still votes, confirms with a survivor, and only then resets itself; a
+    removal it cannot confirm fails the leave without touching the node. Its
+    ``left`` report then hands the row to the seed's eviction, which deletes
+    the stale k8s Node and confirms etcd agrees before the row settles
+    ``left``. Before that, nobody removed a demoted node's member, and the
+    only demote three members allow (both non-seed ones) cost the seed its
+    quorum."""
     _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")

@@ -572,6 +572,14 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted node leaves etcd **before** it resets itself (#1541). Its leave
+runner removes its own etcd member while the node still votes, stops k3s,
+and asks the node it joined whether the member is gone; only then does it
+wipe and come back as a standalone appliance. If the cluster cannot confirm
+the removal, the leave fails and the node is left as it was, still a
+member. The row then reads `evicting` until the seed has deleted the node's
+stale k8s Node and confirmed etcd agrees, and settles `left` on that.
+
 Once a multi-node control plane exists, the **Control plane** table
 surfaces a dismissible amber banner prompting the operator to configure a
 VIP if none is set yet (a single-node-IP URL is a latent SPOF for every

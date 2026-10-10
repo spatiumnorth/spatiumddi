@@ -239,7 +239,12 @@ async def test_a_demote_in_flight_still_lands(
 
     await _report(client, row, token, CLUSTER_JOIN_STATE_LEFT)
 
+    # The report is applied (a demote in flight makes it count). Since #1541
+    # it hands the row to the seed's eviction rather than settling it: the
+    # row reads ``evicting`` until the seed confirms its etcd member and Node
+    # are gone (test_appliance_evict_etcd.py follows it to ``left``).
     await db_session.refresh(row)
-    assert row.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
+    assert row.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING
+    assert row.evict_requested is True
     assert row.cluster_role is None
     assert row.desired_cluster_role is None

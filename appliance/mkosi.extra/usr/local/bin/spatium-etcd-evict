@@ -6,7 +6,9 @@ evicts, on the seed (#1284).
 │ ⚠️  Removes etcd members. Only the members of a node the control      │
 │ plane is evicting are touched: the name k3s gave it                  │
 │ (<hostname>-<8 hex>, exactly), or no name yet and a peer URL on one  │
-│ of that node's addresses. Never this node's own member.              │
+│ of that node's addresses. Never this node's own member — except      │
+│ --leave-self (#1541), which removes exactly that one, and is run     │
+│ only by the leave runner on a demoted node.                          │
 └─────────────────────────────────────────────────────────────────────┘
 
 Flow (the host-runner pattern of spatium-cluster-join / -restore):
@@ -90,6 +92,16 @@ REMOVE_CMD = os.environ.get("SPATIUM_ETCD_REMOVE_CMD", "")
 # promoted again since then (its new member appears about 80 s after the
 # promote) would lose that member as the evicted one's.
 MAX_REQUEST_AGE_S = 60.0
+# --leave-self (#1541): the join drop-in names the survivor this node joined
+# (``server: <url>``); its /db/info is what confirms the removal.
+JOIN_DROPIN = Path(os.environ.get("SPATIUM_K3S_DROPIN_DIR", "/etc/rancher/k3s/config.yaml.d")) \
+    / "spatium-cluster.yaml"
+SURVIVOR_MEMBERS_CMD = os.environ.get("SPATIUM_ETCD_SURVIVOR_MEMBERS_CMD", "")
+STOP_K3S_CMD = os.environ.get("SPATIUM_STOP_K3S_CMD", "systemctl stop k3s")
+# How long --leave-self waits for a survivor to stop listing this node's
+# member. A control-plane VIP this node was announcing moves in seconds.
+LEAVE_CONFIRM_S = float(os.environ.get("SPATIUM_LEAVE_CONFIRM_S", "90"))
+LEAVE_POLL_S = float(os.environ.get("SPATIUM_LEAVE_POLL_S", "3"))
 
 
 def log(msg: str) -> None:
@@ -187,18 +199,22 @@ def own_names() -> set[str]:
 
 # ---- etcd --------------------------------------------------------------------------
 
-def list_members() -> list[dict]:
-    """The seed's etcd members through k3s's /db/info. Raises when the list is
-    unreadable, including k3s's canned fallback: when its own MemberList fails
-    it answers a list that names only itself and carries no member IDs."""
-    if MEMBERS_CMD:
-        body = subprocess.run(["sh", "-c", MEMBERS_CMD], capture_output=True, text=True,
+def list_members(url: str = "", cmd: str = "") -> list[dict]:
+    """The etcd members through k3s's /db/info: this node's k3s by default, or
+    the k3s at ``url`` (``--leave-self`` reads a survivor's). Raises when the
+    list is unreadable, including k3s's canned fallback: when its own
+    MemberList fails it answers a list that names only itself and carries no
+    member IDs."""
+    url = url or K3S_URL
+    cmd = cmd if url != K3S_URL else (cmd or MEMBERS_CMD)
+    if cmd:
+        body = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
                               timeout=30, check=False).stdout
     else:
         token = (K3S_SERVER_DIR / "token").read_text(encoding="utf-8").strip()
         password = token.split("::server:", 1)[1] if "::server:" in token else token
         ctx = ssl.create_default_context(cafile=str(K3S_SERVER_DIR / "tls" / "server-ca.crt"))
-        req = urllib.request.Request(f"{K3S_URL}/db/info")
+        req = urllib.request.Request(f"{url}/db/info")
         req.add_header("Authorization",
                        "Basic " + base64.b64encode(f"server:{password}".encode()).decode())
         with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
@@ -371,5 +387,98 @@ def answer(request_id: str, nodes: list[tuple[str, list[str]]]) -> int:
     return 0
 
 
+# ---- --leave-self (#1541) ---------------------------------------------------------
+#
+# A demoted member resets itself to a fresh single-node seed (spatium-cluster-join
+# leave). It used to wipe without leaving etcd, so the seed kept its seat as a
+# voter nobody would ever answer for. From three members the only demote allowed
+# takes both non-seed members, so the seed held three voters with two gone and
+# lost quorum: its apiserver, and the control plane on it, wedged.
+#
+# etcd removes a member only while the cluster has quorum, so the removal has to
+# come BEFORE the wipe, while this node still votes: on the last step, two
+# members of which one is already gone have no quorum to remove it with. So this
+# node removes its own member through its own etcd (the request is committed by
+# the leader like any other), stops k3s at once (a restart against a removed
+# member's data could try to re-join), and then asks a survivor whether the
+# member is gone. The banner above still holds for every other mode: only this
+# mode, called only by the leave runner, touches this node's own member.
+
+
+def survivor_url() -> str:
+    """The ``server:`` this node joined, from the join drop-in; '' when there is
+    none (a seed, or a node that never joined)."""
+    try:
+        text = JOIN_DROPIN.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r"(?m)^server:\s*(\S+)\s*$", text)
+    return m.group(1) if m else ""
+
+
+def own_members(members: list[dict]) -> list[dict]:
+    """This node's own member: the name in k3s's etcd config exactly, or the
+    name k3s gives this hostname's member (<hostname>-<8 hex>)."""
+    names = own_names()
+    res = [_member_name_re(n) for n in names]
+    return [m for m in members
+            if (name := str(m.get("name") or "")) and (name in names or any(r.match(name) for r in res))]
+
+
+def leave_self() -> int:
+    """0: this node's etcd member is gone and k3s is stopped. 2: this node
+    joined nobody, so there is no member to remove. 1: the removal did not
+    happen, or a survivor still lists the member; k3s may be stopped, and the
+    caller must restart it and must not wipe this node.
+
+    etcd answering the MemberRemove is the removal: a member change is
+    committed through raft, so an accepted one already has the quorum's
+    agreement. The survivor is asked as well, but only a survivor that
+    answers and still lists the member refuses the leave. One that cannot be
+    reached in the window does not: refusing there restarts k3s on a node
+    whose member is already gone, which deletes its etcd data and rejoins it
+    as a NEW member, leaving the seed alone for minutes and the control plane
+    on two voters (found by ddi-pg's walk of #1659)."""
+    server = survivor_url()
+    if not server:
+        log("leave-self: no server: in the join drop-in; not a joined member, nothing to remove")
+        return 2
+    try:
+        mine = own_members(list_members())
+    except Exception as exc:  # noqa: BLE001 — reported, and the wipe is refused
+        log(f"leave-self: this node's etcd member list is unreadable: {exc}")
+        return 1
+    for m in mine:
+        err = remove_member(int(m["ID"]))
+        if err:
+            log(f"leave-self: could not remove this node's etcd member {describe(m)}: {err}")
+            return 1
+        log(f"leave-self: removed this node's etcd member {describe(m)}")
+    subprocess.run(["sh", "-c", STOP_K3S_CMD], capture_output=True, timeout=120, check=False)
+    deadline = time.monotonic() + LEAVE_CONFIRM_S
+    why = "no answer yet"
+    answered = False
+    while True:
+        try:
+            still = own_members(list_members(url=server, cmd=SURVIVOR_MEMBERS_CMD))
+            answered = True
+            if not still:
+                log(f"leave-self: {server} no longer lists this node's etcd member")
+                return 0
+            why = "still listed: " + "; ".join(describe(m) for m in still)
+        except Exception as exc:  # noqa: BLE001 — a survivor mid-failover; retried
+            why = f"unreadable: {exc}"
+        if time.monotonic() >= deadline:
+            if not answered:
+                log(f"leave-self: etcd accepted the removal; {server} could not be reached "
+                    f"to confirm it within {LEAVE_CONFIRM_S:.0f} s ({why}); going on, "
+                    "since the member is already gone"[:400])
+                return 0
+            log(f"leave-self: {server} did not confirm the removal within "
+                f"{LEAVE_CONFIRM_S:.0f} s ({why})"[:400])
+            return 1
+        time.sleep(LEAVE_POLL_S)
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(leave_self() if sys.argv[1:] == ["--leave-self"] else run())

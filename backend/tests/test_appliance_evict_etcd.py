@@ -25,7 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     CLUSTER_JOIN_STATE_EVICTING,
+    CLUSTER_JOIN_STATE_LEAVING,
     CLUSTER_JOIN_STATE_LEFT,
+    CLUSTER_ROLE_MEMBER,
+    DESIRED_CLUSTER_ROLE_NONE,
     Appliance,
 )
 from app.models.settings import PlatformSettings
@@ -178,3 +181,47 @@ async def test_a_pending_reason_never_touches_a_row_that_is_not_evicting(
     await db_session.refresh(live)
     assert live.cluster_join_reason is None
     assert live.cluster_join_state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_a_demoted_member_settles_left_only_once_the_seed_confirms(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1541 — a demote used to settle on the leaving node's own ``left``, and
+    nobody removed its Node or etcd member from the seed. The node now leaves
+    etcd itself before it wipes; its ``left`` hands the row to the seed's
+    eviction, which deletes the stale Node and confirms etcd agrees, and only
+    that report settles it."""
+    seed, seed_token, _ = await _seed_and_ghost(db_session)
+    member, member_token = await _row(
+        db_session,
+        f"member-{uuid.uuid4().hex[:6]}",
+        appliance_variant="appliance",
+        node_ip="192.168.122.160",
+        node_ips=["192.168.122.160"],
+        cluster_role=CLUSTER_ROLE_MEMBER,
+        desired_cluster_role=DESIRED_CLUSTER_ROLE_NONE,
+        cluster_join_state=CLUSTER_JOIN_STATE_LEAVING,
+        cluster_join_state_at=datetime.now(UTC),
+    )
+    await db_session.commit()
+
+    await _beat(client, member, member_token, cluster_join_state=CLUSTER_JOIN_STATE_LEFT)
+    await db_session.refresh(member)
+    assert member.cluster_role is None
+    assert member.desired_cluster_role is None
+    assert member.evict_requested is True
+    assert member.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING
+
+    # The node keeps reporting ``left``; that alone must not settle the row.
+    await _beat(client, member, member_token, cluster_join_state=CLUSTER_JOIN_STATE_LEFT)
+    await db_session.refresh(member)
+    assert member.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING
+
+    out = await _beat(client, seed, seed_token)
+    assert member.hostname in out["evict_node_names"]
+
+    await _beat(client, seed, seed_token, evicted_node_names=[member.hostname])
+    await db_session.refresh(member)
+    assert member.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
+    assert member.evict_requested is False
