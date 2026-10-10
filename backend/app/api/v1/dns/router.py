@@ -8184,6 +8184,15 @@ async def import_zone_commit(
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing)
 
+    # #1683 — now that the import's changes reach the servers, it is refused
+    # where the record API refuses them: a reconciler-owned zone (the next sync
+    # would overwrite the change, after it was pushed to the wire), and a
+    # record type the group's drivers cannot serve (the provider would reject
+    # the op and keep retrying it, rather than the operator getting a 422).
+    _reject_if_synthesised_zone(zone, "import")
+    for rtype in sorted({c.record_type for c in diff.to_create}):
+        await _check_driver_gated_record_type(rtype, group_id, db)
+
     batch_id = uuid.uuid4()
     created = 0
     updated = 0

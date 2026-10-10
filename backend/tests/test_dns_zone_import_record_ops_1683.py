@@ -268,3 +268,61 @@ async def test_an_agentless_failure_is_surfaced_not_reported_as_success(
     assert [(o.state, o.next_attempt_at is not None) for o in ops] == [("pending", True)]
     assert body["provider_warning"] and "503 provider unavailable" in body["provider_warning"]
     assert (await _last_import_audit(db_session, zone)).result == "error"
+
+
+async def test_a_synthesised_zone_refuses_the_import(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The record API refuses writes to a reconciler-owned zone; now that the
+    import pushes its changes to the servers, it must refuse them too, before
+    anything is written or queued."""
+    from app.models.ipam import IPSpace  # noqa: PLC0415
+    from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
+
+    h = await _admin_headers(db_session)
+    grp, zone, (server,) = await _group(db_session)
+    space = IPSpace(name=f"ts-{uuid.uuid4().hex[:6]}")
+    db_session.add(space)
+    await db_session.flush()
+    tenant = TailscaleTenant(name=f"tn-{uuid.uuid4().hex[:6]}", ipam_space_id=space.id)
+    db_session.add(tenant)
+    await db_session.flush()
+    zone.tailscale_tenant_id = tenant.id
+    await db_session.commit()
+    serial_before = zone.last_serial
+
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/import/commit",
+        headers=h,
+        json={"zone_file": f"$ORIGIN {ZONE}\n$TTL 300\nimp IN A 192.0.2.9\n"},
+    )
+    assert r.status_code == 422, r.text
+    assert "Tailscale" in r.json()["detail"]
+
+    await db_session.refresh(zone)
+    assert zone.last_serial == serial_before
+    assert await _ops(db_session, server) == []
+    rows = await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
+    assert rows.scalars().all() == []
+
+
+async def test_a_record_type_the_group_cannot_serve_refuses_the_import(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As on the record API (#338): a DNAME on a Windows DNS group is a 422 up
+    front, not an op the provider rejects and keeps retrying."""
+    h = await _admin_headers(db_session)
+    grp, zone, (server,) = await _group(db_session, driver="windows_dns")
+    await db_session.commit()
+    driver = _AgentlessDriver()
+    monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: driver)
+
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/import/commit",
+        headers=h,
+        json={"zone_file": f"$ORIGIN {ZONE}\n$TTL 300\nold IN DNAME new.{ZONE}\n"},
+    )
+    assert r.status_code == 422, r.text
+    assert "DNAME" in r.json()["detail"]
+    assert driver.batches == []
+    assert await _ops(db_session, server) == []

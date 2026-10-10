@@ -182,7 +182,13 @@ the formatter handles the rest.
   record API does, removals first so a CNAME that replaces an A can
   land. When an agentless provider does not take every change, the
   response carries `provider_warning` and the import's audit entry
-  reads error (#1538).
+  reads error (#1538). Since a record change no longer reloads its
+  zone (#1373, above), that later write would not have rescued them
+  either. Because the import now reaches the servers, it is refused
+  where the record API is: a zone the Tailscale or NetBird
+  integration owns, and a record type a server in the group cannot
+  serve (SVCB, HTTPS and DNAME on a hosted-DNS or Windows group)
+  answer 422 before anything is written.
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
