@@ -58,6 +58,7 @@ from .kea_ctrl import (
     KeaCtrlError,
     config_check,
     config_reload,
+    lease4_del,
 )
 from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
@@ -787,6 +788,21 @@ class SyncLoop:
             self._record_success()
             return
 
+        # #1287 — lease ops act on the running daemon, not on the bundle, so
+        # they run (and are acked with their real result) whether or not the
+        # bundle below applies, is quarantined, or is refused.
+        pending_ops = bundle.get("pending_ops") or []
+        handled_ops = self._run_lease_ops(pending_ops)
+        if (
+            handled_ops
+            and etag == self._current_etag
+            and len(handled_ops) == len(pending_ops)
+        ):
+            # Only lease ops, on the bundle Kea already runs: nothing to
+            # re-render, and a reload would only drop in-flight exchanges.
+            self._record_success()
+            return
+
         # #882 — the quarantine names ONE bundle. If the control plane is no
         # longer serving it, the operator has saved something else and the
         # record is moot: drop it now rather than let ``retry_due`` keep
@@ -837,8 +853,49 @@ class SyncLoop:
         # stops re-delivering them on the next long-poll.
         for op in bundle.get("pending_ops") or []:
             op_id = op.get("op_id")
-            if op_id:
+            if op_id and op_id not in handled_ops:
                 self.heartbeat.pending_acks.append({"op_id": op_id, "result": "ok"})
+
+    def _run_lease_ops(self, ops: list[dict[str, Any]]) -> set[str]:
+        """Run ``lease4_del`` ops against Kea and queue their acks (#1287).
+
+        The control plane purges a lease's rows when a device is re-provisioned
+        to a static address; without deleting the lease in Kea too, the next
+        lease snapshot (e.g. after an agent restart) brings it, its IPAM mirror
+        and its DNS records back. A lease Kea no longer has is success: the op
+        is redelivered until the ack lands, and an HA partner may have dropped
+        it already. Returns the ids of the ops handled here.
+        """
+        handled: set[str] = set()
+        for op in ops:
+            if op.get("op_type") != "lease4_del":
+                continue
+            op_id = op.get("op_id")
+            if not op_id:
+                continue
+            ip = str((op.get("payload") or {}).get("ip_address") or "")
+            ack: dict[str, Any] = {"op_id": op_id, "result": "ok"}
+            try:
+                deleted = lease4_del(self.cfg.kea_control_socket, ip)
+                log.info("kea_lease4_del", ip=ip, deleted=deleted)
+            except (KeaCtrlError, OSError, ValueError) as e:
+                log.warning("kea_lease4_del_failed", ip=ip, error=str(e))
+                ack = {"op_id": op_id, "result": "error", "message": str(e)[:500]}
+            # Ack directly so the control plane stops re-serving the op on every
+            # long-poll; the heartbeat carries it if the POST does not land.
+            try:
+                with self._client() as c:
+                    resp = c.post(
+                        f"/api/v1/dhcp/agents/ops/{op_id}/ack",
+                        json=ack,
+                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    )
+                if resp.status_code >= 400:
+                    self.heartbeat.pending_acks.append(ack)
+            except httpx.HTTPError:
+                self.heartbeat.pending_acks.append(ack)
+            handled.add(op_id)
+        return handled
 
     def reapply_current_bundle(self, reason: str) -> bool | None:
         """Re-render the bundle Kea is running now, for a HOST change (#1247).
