@@ -529,7 +529,7 @@ async def test_step_uncordon_partial_failure_reports_state() -> None:
 @pytest.mark.asyncio
 async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every step returns ok → single_node_upgrade returns ok=True with
-    13 step results (etcd_snapshot is the no-op placeholder)."""
+    14 step results (etcd_snapshot is the no-op placeholder)."""
 
     # Mock every step to return an ok StepResult so we exercise the
     # chained-call shape without re-doing each step's tests.
@@ -546,6 +546,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
         per_node, "_step_verify_primary_moved", lambda *a, **k: _ok("verify_primary_moved")
     )
     monkeypatch.setattr(per_node, "_step_drain", lambda *a, **k: _ok("drain"))
+    monkeypatch.setattr(per_node, "_step_mirror_ready", lambda *a, **k: _ok("mirror_ready"))
     monkeypatch.setattr(
         per_node, "_step_trigger_slot_apply", lambda *a, **k: _ok("trigger_slot_apply")
     )
@@ -569,6 +570,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
     assert [s.name for s in result.steps] == [
         "preflight",
         "etcd_snapshot",
+        "mirror_ready",
         "trigger_slot_apply",
         "stage",
         "cnpg_maintenance_on",
@@ -587,7 +589,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
 async def test_single_node_upgrade_halts_on_cordon_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cordon returns ok=False → chain stops at step 6. No subsequent
+    """Cordon returns ok=False → chain stops at step 7. No subsequent
     steps run; result reports failed_at='cordon'."""
 
     async def _ok(name: per_node.StepName) -> per_node.StepResult:
@@ -607,6 +609,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
 
     monkeypatch.setattr(per_node, "_step_preflight", lambda *a, **k: _ok("preflight"))
     monkeypatch.setattr(per_node, "_step_etcd_snapshot", lambda *a, **k: _ok("etcd_snapshot"))
+    monkeypatch.setattr(per_node, "_step_mirror_ready", lambda *a, **k: _ok("mirror_ready"))
     monkeypatch.setattr(
         per_node, "_step_trigger_slot_apply", lambda *a, **k: _ok("trigger_slot_apply")
     )
@@ -632,6 +635,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     assert [s.name for s in result.steps] == [
         "preflight",
         "etcd_snapshot",
+        "mirror_ready",
         "trigger_slot_apply",
         "stage",
         "cnpg_maintenance_on",

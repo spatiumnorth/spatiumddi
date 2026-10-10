@@ -340,3 +340,238 @@ def test_the_chain_lists_every_step_once_in_its_order() -> None:
     assert len(set(per_node.CHAIN)) == len(per_node.CHAIN)
     assert per_node.CHAIN.index("stage") < per_node.CHAIN.index("cordon")
     assert per_node.CHAIN.index("drain") + 1 == per_node.CHAIN.index("reboot")
+
+
+# ── The mirror wait (#1463) ───────────────────────────────────────────────────
+#
+# The mirror's node comes back from its reboot with the mirror still Pending:
+# its replacement can only be scheduled on that node once it is uncordoned. The
+# next node's stamp would land in that gap and its fetch would answer 502, so a
+# node is told to fetch only once the mirror reports a Ready replica.
+
+MIRROR = "spatium-control-spatiumddi-slot-image-mirror"
+UPLOADED = SlotImageTarget(
+    url="https://10.0.0.1/api/v1/appliance/upgrade-images/abc/raw.xz?t=tok",
+    sha256="ab" * 32,
+    tls_insecure=True,
+)
+
+
+class _Row:
+    """The appliance columns the mirror wait reads."""
+
+    def __init__(self, **kw: Any) -> None:
+        self.id = uuid.uuid4()
+        self.hostname = "node-1"
+        self.installed_appliance_version: str | None = OLD
+        self.supervisor_version: str | None = None
+        self.desired_slot_image_url: str | None = "https://10.0.0.1/old.raw.xz?t=old"
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _deployments(*answers: Any) -> Any:
+    """``k8s.get_deployment`` answering in turn: an int is readyReplicas, a
+    status code alone is (code, None), an exception is raised."""
+    calls: list[str] = []
+    seq = list(answers)
+
+    def _get(name: str, namespace: str | None = None) -> Any:
+        calls.append(name)
+        answer = seq.pop(0) if len(seq) > 1 else seq[0]
+        if isinstance(answer, Exception):
+            raise answer
+        if isinstance(answer, tuple):
+            return answer
+        return 200, {"status": {"readyReplicas": answer} if answer else {}}
+
+    _get.calls = calls  # type: ignore[attr-defined]
+    return _get
+
+
+async def _mirror_step(
+    monkeypatch: pytest.MonkeyPatch,
+    get: Any,
+    *,
+    row: Any = None,
+    target: SlotImageTarget = UPLOADED,
+    timeout_s: float = 5.0,
+) -> per_node.StepResult:
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node.k8s, "get_deployment", get)
+    with patch.object(
+        per_node, "_resolve_appliance", AsyncMock(return_value=row if row else _Row())
+    ):
+        return await per_node._step_mirror_ready(
+            _db(), "node-1", TARGET, target, deployment=MIRROR, timeout_s=timeout_s
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_node_waits_for_the_mirror_before_it_is_told_to_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _recording_chain(monkeypatch, events)
+
+    await _chain()
+
+    assert events.index("mirror_ready") + 1 == events.index("trigger_slot_apply"), events
+    assert events.index("etcd_snapshot") < events.index("mirror_ready")
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_wait_holds_until_a_replica_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get = _deployments(0, 0, 1)
+
+    step = await _mirror_step(monkeypatch, get)
+
+    assert step.name == "mirror_ready"
+    assert step.ok is True, step.error
+    assert get.calls == [MIRROR, MIRROR, MIRROR]
+    assert step.detail["ready_replicas"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_mirror_that_never_comes_back_fails_the_node_before_its_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = await _mirror_step(monkeypatch, _deployments(0), timeout_s=0.05)
+
+    assert step.ok is False
+    assert MIRROR in (step.error or "")
+    assert "readyReplicas=0" in (step.error or "")
+    category = alerts.classify_per_node_failure(failed_at="mirror_ready", error=step.error)
+    assert category == alerts.CATEGORY_MIRROR_NOT_READY
+    assert "mirror" in alerts.operator_hint(category)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mirror_wait_leaves_the_node_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _recording_chain(monkeypatch, events, fail="mirror_ready")
+
+    result = await _chain()
+
+    assert result.failed_at == "mirror_ready"
+    for never in ("trigger_slot_apply", "stage", "cordon", "drain", "reboot"):
+        assert never not in events, events
+
+
+@pytest.mark.asyncio
+async def test_a_cluster_without_a_mirror_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = await _mirror_step(monkeypatch, _deployments((404, None)))
+
+    assert step.ok is True
+    assert step.detail.get("skipped") is True
+
+
+@pytest.mark.asyncio
+async def test_an_operator_url_never_asks_for_the_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get = _deployments(RuntimeError("must not be asked"))
+
+    step = await _mirror_step(
+        monkeypatch, get, target=SlotImageTarget(url="https://releases.example/x.raw.xz")
+    )
+
+    assert step.ok is True
+    assert step.detail.get("skipped") is True
+    assert get.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_already_on_the_target_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get = _deployments(0)
+
+    step = await _mirror_step(monkeypatch, get, row=_Row(installed_appliance_version=TARGET))
+
+    assert step.ok is True
+    assert step.detail.get("skipped") is True
+    assert get.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_already_holding_this_stamp_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-driven node: its stamp repeats the URL it already holds, so the
+    supervisor's fire-once marker fetches nothing. That is the mirror's own
+    node too, resumed after its drain with the mirror Pending on it; waiting
+    there would wait for itself."""
+    get = _deployments(0)
+
+    step = await _mirror_step(monkeypatch, get, row=_Row(desired_slot_image_url=UPLOADED.url))
+
+    assert step.ok is True
+    assert step.detail.get("skipped") is True
+    assert get.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_runner_takes_the_nonce_waits_for_a_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamp it compares is the one ``stamp_desired_slot_image`` would
+    write: with a re-fire nonce, the same image is a new fetch."""
+    target = SlotImageTarget(url=UPLOADED.url, sha256=UPLOADED.sha256, nonce="n1")
+    row = _Row(desired_slot_image_url=UPLOADED.url, installed_appliance_version="2026.10.02-1")
+    get = _deployments(1)
+
+    step = await _mirror_step(monkeypatch, get, row=row, target=target)
+
+    assert step.ok is True
+    assert step.detail.get("skipped") is not True
+    assert get.calls == [MIRROR]
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_wait_polls_through_a_kubeapi_blip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.appliance import k8s
+
+    get = _deployments(k8s.KubeapiUnavailableError("timed out"), (503, None), 1)
+
+    step = await _mirror_step(monkeypatch, get)
+
+    assert step.ok is True, step.error
+    assert len(get.calls) == 3
+
+
+def test_the_mirror_deployment_follows_the_chart_name() -> None:
+    assert per_node.slot_image_mirror_deployment("spatium-control") == MIRROR
+    assert per_node.slot_image_mirror_deployment("acme") == "acme-spatiumddi-slot-image-mirror"
+
+
+@pytest.mark.asyncio
+async def test_the_chain_asks_for_the_mirror_it_was_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    _recording_chain(monkeypatch, [])
+
+    async def _mirror(*_a: Any, deployment: str, **_k: Any) -> per_node.StepResult:
+        seen.append(deployment)
+        return per_node.StepResult(name="mirror_ready", started_at="t").finish(True)
+
+    monkeypatch.setattr(per_node, "_step_mirror_ready", _mirror)
+    await _chain()
+    await per_node.single_node_upgrade(
+        MagicMock(commit=AsyncMock()),
+        node_name="node-1",
+        target_version=TARGET,
+        slot_image=UPLOADED,
+        mirror_deployment="acme-spatiumddi-slot-image-mirror",
+    )
+
+    assert seen == [MIRROR, "acme-spatiumddi-slot-image-mirror"]

@@ -110,6 +110,7 @@ CATEGORY_SUPERVISOR_FAILED = "supervisor_reported_failed"
 CATEGORY_CONVERGENCE_TIMEOUT = "node_did_not_rejoin"
 CATEGORY_CHART_BUMP = "chart_bump_failed"
 CATEGORY_UNCORDON_FAIL = "uncordon_fail"
+CATEGORY_MIRROR_NOT_READY = "slot_image_mirror_not_ready"
 CATEGORY_OTHER = "other"
 
 
@@ -128,6 +129,8 @@ def classify_per_node_failure(
     """
     if failed_at == "preflight":
         return CATEGORY_PREFLIGHT
+    if failed_at == "mirror_ready":
+        return CATEGORY_MIRROR_NOT_READY
     if failed_at == "cordon":
         return CATEGORY_CORDON_FAIL
     if failed_at == "verify_primary_moved":
@@ -233,6 +236,14 @@ def operator_hint(category: str) -> str:
             "Every node committed the new slot but the post-loop chart bump "
             "failed (Deployment rollout / migrate Job). Forward-fix: helm "
             "rollback the chart, debug, re-apply the bump."
+        )
+    if category == CATEGORY_MIRROR_NOT_READY:
+        return (
+            "The slot-image mirror, which serves the uploaded image to every "
+            "node, had no Ready pod, so this node was not told to fetch and is "
+            "still in service. Its volume pins it to one node: check that node "
+            "is up and uncordoned and read the mirror pod's events, then plan "
+            "the upgrade again."
         )
     if category == CATEGORY_UNCORDON_FAIL:
         return (
