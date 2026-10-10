@@ -191,20 +191,26 @@ def operator_hint(category: str) -> str:
         return (
             "Drain timed out — a workload pod blocked eviction. Check "
             "PodDisruptionBudgets + per-pod status; once unblocked, abort + "
-            "plan a fresh run (drain doesn't auto-retry mid-run)."
+            "plan a fresh run (drain doesn't auto-retry mid-run). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_CORDON_FAIL:
         return (
             "kubectl cordon failed — likely an RBAC issue. Verify the api "
             "ServiceAccount has cluster-scoped patch on nodes "
-            "(api.upgradeOrchestratorRBAC.enabled=true in chart values)."
+            "(api.upgradeOrchestratorRBAC.enabled=true in chart values). "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_PRIMARY_NOT_MOVED:
         return (
             "CNPG primary didn't switch off the cordoned node within the "
             "switchover timeout. Check Cluster.status + replica replay lag; "
             "the cordon-triggered switchover only works with a caught-up "
-            "replica."
+            "replica. "
+            "The new slot is already staged and armed for this node's next "
+            "boot (#1463), so an unplanned reboot boots it."
         )
     if category == CATEGORY_AUTO_REVERTED:
         return (

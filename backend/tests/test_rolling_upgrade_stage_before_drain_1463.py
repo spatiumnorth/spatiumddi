@@ -683,3 +683,20 @@ async def test_the_mirror_wait_holds_no_transaction_while_it_waits(
 
     assert step.ok is True, step.error
     assert events == ["commit", "read", "commit", "poll"]
+
+
+@pytest.mark.parametrize("failed_at", ["cordon", "verify_primary_moved", "drain"])
+def test_a_failure_after_the_stage_tells_the_operator_the_slot_is_armed(failed_at: str) -> None:
+    """Those steps now run after the host staged the slot and armed it for
+    the next boot, so the node is left serving the old slot with the new one
+    armed: an unplanned reboot boots it outside the run. The hint says so."""
+    category = alerts.classify_per_node_failure(failed_at=failed_at, error="x")
+    assert "armed" in alerts.operator_hint(category)
+
+
+@pytest.mark.parametrize("failed_at", ["mirror_ready", "stage"])
+def test_a_failure_before_the_stage_does_not_claim_an_armed_slot(failed_at: str) -> None:
+    category = alerts.classify_per_node_failure(
+        failed_at=failed_at, error="supervisor reported upgrade failed"
+    )
+    assert "armed" not in alerts.operator_hint(category)
