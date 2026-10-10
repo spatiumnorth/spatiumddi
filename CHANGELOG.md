@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An ACME order whose CA cannot be reached now ends, and says why
+  (#1686).** A refused, timed-out or reset connection to the CA left
+  the order `processing` for the Celery task's retries, and nothing
+  settled it once the last retry failed. It stayed `processing` with
+  no error for good, the UI polled it forever, and the renewal sweep
+  skipped every certificate with the same domains as "already being
+  (re)issued", so the certificate could expire behind it. The task's
+  last attempt now ends the order `invalid` with `last_error` naming
+  the error and the host it could not reach. Each retry before that
+  leaves a `retrying: …` note, which the Certificates tab shows under
+  the processing order.
+
 - **Records put into a zone by its zone-file import are served
   (#1683).** Importing a zone file into an existing zone wrote the
   new, changed and removed records to the database and stopped

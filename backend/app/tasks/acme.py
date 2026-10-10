@@ -11,13 +11,16 @@
 The orchestrator is idempotent + re-runnable — it records normal
 protocol / DNS failures on the order row (``status='invalid'`` +
 ``last_error``) and only re-raises genuinely unexpected errors, so a
-Celery retry here re-converges from whatever state the order is in.
+Celery retry here re-converges from whatever state the order is in. A
+network error to the CA is retried here too; the last attempt tells the
+orchestrator so, and it then ends the order instead of re-raising (#1686).
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import structlog
@@ -54,14 +57,19 @@ _RENEW_LOCK_KEY = 0x53504D52454E  # "SPMREN"-ish
     retry_jitter=True,
     max_retries=3,
 )
-def run_acme_order(self: object, order_id: str) -> str:  # type: ignore[type-arg]
-    return asyncio.run(_run(order_id))
+def run_acme_order(self: Any, order_id: str) -> str:  # type: ignore[type-arg]
+    # Once ``max_retries`` retries have run, Celery re-raises the error
+    # instead of retrying, so this attempt is the last: tell the
+    # orchestrator, which then ends the order on a network error rather
+    # than leave it ``processing`` for a retry that never comes (#1686).
+    final_attempt = self.max_retries is not None and self.request.retries >= self.max_retries
+    return asyncio.run(_run(order_id, final_attempt=final_attempt))
 
 
-async def _run(order_id: str) -> str:
+async def _run(order_id: str, *, final_attempt: bool = False) -> str:
     async with task_session() as session:
         try:
-            status = await run_order(session, order_id)
+            status = await run_order(session, order_id, final_attempt=final_attempt)
             logger.info("acme_client_task_done", order_id=order_id, status=status)
             return status
         except Exception as exc:  # noqa: BLE001 — let Celery autoretry / capture
