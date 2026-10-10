@@ -2519,6 +2519,12 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `a3d9e5c17b42` — #1513, data-only: SVCB / HTTPS records in groups
+  running a Technitium driver whose target has two or more labels and no
+  trailing dot get the dot they were already served with, so the new
+  zone-file reading of a dot-less target does not re-point them.
+  Downgrade is a no-op: the dotted value means the same under either
+  reading.
 - `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
