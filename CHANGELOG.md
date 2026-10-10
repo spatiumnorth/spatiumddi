@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A member whose join fails for a transient reason keeps retrying for
+  the whole retry window (#1212).** After a transient join failure the
+  backend keeps the member's desired role for 15 minutes (#961), so that
+  its supervisor re-fires the join once the path to the seed is back. But
+  the supervisor re-fired on every heartbeat, three attempts at most and
+  none spaced, and an attempt against an unreachable seed fails in about
+  20 seconds. All three landed in the first two and a half minutes of an
+  outage. A member whose path to the seed's control-plane ports came back
+  after that stayed a standalone node with its row `failed`, and the
+  cluster kept an even control-plane count until an operator re-promoted
+  or replaced it. Re-fires against the same seed are now spaced from the
+  last attempt's time in the supervisor's own attempt ledger: one minute,
+  two, then every four. The first retry still comes a minute after the
+  first attempt, and the attempts now reach past the 15-minute window.
+  So the backend's window ends a transient failure's retries, and a
+  member whose path returns inside it joins with no operator action. The
+  ceiling stays as the backstop for a control plane that never processes
+  the failure: eight attempts over about 23 minutes, where it used to be
+  three in two and a half. A demote's leave is unchanged.
+
 - **On a multi-node control plane the slot-image mirror starts and stays
   up, so an uploaded upgrade image has somewhere to live (#1174).** Once the
   control plane has more than one node, the supervisor turns on the
