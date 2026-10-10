@@ -181,7 +181,12 @@ the formatter handles the rest.
   with a 500. Only `insecure_skip` with a password worked. DSA keys
   are no longer offered (OpenSSH dropped them too), and new tests load
   real known_hosts lines and private keys and complete a real SSH
-  handshake with the installed paramiko.
+  handshake with the installed paramiko. Two more found validating the
+  fix: a known_hosts line the driver cannot decode (`ssh-dss`, a FIDO
+  `sk-*` key, bad base64) no longer drops a valid pin for the same host
+  on a later line, and an OpenSSH-format DSA key, a PKCS#8 key, or an
+  encrypted key with no passphrase is now a Test-connection error that
+  says which, rather than a 500 or a misleading "not a valid RSA key".
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to

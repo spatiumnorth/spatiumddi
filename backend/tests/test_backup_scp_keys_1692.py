@@ -245,6 +245,72 @@ def test_text_that_is_no_private_key_is_a_destination_error() -> None:
         _load_private_key("-----BEGIN NOTHING-----\nAAAA\n-----END NOTHING-----\n", None)
 
 
+def _dsa_openssh_pem() -> str:
+    import warnings
+
+    from cryptography.hazmat.primitives.asymmetric import dsa
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # cryptography deprecates SSH DSA
+        return _pem(dsa.generate_private_key(key_size=1024))
+
+
+def test_an_openssh_format_dsa_key_is_a_destination_error_not_a_crash() -> None:
+    # RSAKey does not check the type inside an OpenSSH container, so the DSA
+    # numbers reach cryptography as RSA and it raises ValueError. That is not
+    # an SSHException, and it escaped Test connection as a 500.
+    with pytest.raises(BackupDestinationError, match="DSA is not supported"):
+        _load_private_key(_dsa_openssh_pem(), None)
+
+
+def test_a_pkcs8_key_is_refused_with_how_to_convert_it() -> None:
+    pem = (
+        _private_key("ed25519")
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    with pytest.raises(BackupDestinationError, match="PKCS#8.*ssh-keygen -p"):
+        _load_private_key(pem, None)
+
+
+@pytest.mark.parametrize(("kind", "fmt"), [("ed25519", "openssh"), ("ecdsa", "traditional")])
+def test_an_encrypted_key_with_no_passphrase_says_so(kind: str, fmt: str) -> None:
+    pem = _pem(_private_key(kind), fmt=fmt, passphrase="correct horse")
+    with pytest.raises(BackupDestinationError, match="passphrase-protected"):
+        _load_private_key(pem, None)
+
+
+def test_a_wrong_passphrase_is_a_destination_error() -> None:
+    pem = _pem(_private_key("ed25519"), passphrase="correct horse")
+    with pytest.raises(BackupDestinationError, match="could not parse private key"):
+        _load_private_key(pem, "battery staple")
+
+
+def test_a_pasted_key_with_surrounding_whitespace_is_loaded() -> None:
+    key = _private_key("ed25519")
+
+    loaded = _load_private_key("\n   \n" + _pem(key) + "\n\n", None)
+
+    assert f"{loaded.get_name()} {loaded.get_base64()}" == _public_line(key)
+
+
+async def test_test_connection_with_a_dsa_key_reports_a_failure_instead_of_raising() -> None:
+    config = _config(
+        _closed_port(),
+        private_key=_dsa_openssh_pem(),
+        host_key_check="insecure_skip",
+    )
+
+    outcome = await ScpDestination().test_connection(config=config)
+
+    assert outcome["ok"] is False
+    assert "DSA is not supported" in outcome["error"], outcome
+
+
 async def test_test_connection_with_a_private_key_reports_a_failure_instead_of_raising() -> None:
     # Nothing listens on the port: the key loads, the connect is refused, and
     # Test connection says so. It used to raise AttributeError (a 500).

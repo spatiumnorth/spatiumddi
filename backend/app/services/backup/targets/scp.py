@@ -477,11 +477,28 @@ def _load_private_key(pem: str, passphrase: str | None):
     unbounded ``paramiko>=3.4.0`` installs 4.0 or later, so naming it
     raised ``AttributeError`` before any key was tried. OpenSSH dropped
     DSA as well.
+
+    Every failure is a :class:`BackupDestinationError`, never a bare
+    exception: ``RSAKey`` does not check the type inside an OpenSSH
+    container, so an OpenSSH-format DSA key reaches ``cryptography`` as
+    RSA numbers and raises ``ValueError`` — which escaped Test
+    connection as a 500. The loop therefore treats ANY exception from a
+    class as "not this class".
     """
     import paramiko  # noqa: PLC0415
 
+    # A key pasted into a text field often carries a leading blank line
+    # or indentation; paramiko then fails to find the BEGIN line.
+    pem = pem.strip() + "\n"
+    if "-----BEGIN PRIVATE KEY-----" in pem or "-----BEGIN ENCRYPTED PRIVATE KEY-----" in pem:
+        raise BackupDestinationError(
+            "could not parse private key: PKCS#8 ('BEGIN PRIVATE KEY') is not "
+            "supported — convert it to OpenSSH format with "
+            "`ssh-keygen -p -f <keyfile>` and paste the result"
+        )
     text_io = io.StringIO(pem)
     last_exc: Exception | None = None
+    needs_passphrase = False
     for cls in (
         paramiko.Ed25519Key,
         paramiko.ECDSAKey,
@@ -490,11 +507,19 @@ def _load_private_key(pem: str, passphrase: str | None):
         text_io.seek(0)
         try:
             return cls.from_private_key(text_io, password=passphrase)
-        except paramiko.SSHException as exc:
+        except paramiko.PasswordRequiredException as exc:
+            needs_passphrase = True
             last_exc = exc
-            continue
+        except Exception as exc:  # noqa: BLE001 — any parse failure means "not this class"
+            last_exc = exc
+    if needs_passphrase and not passphrase:
+        raise BackupDestinationError(
+            "could not parse private key: it is passphrase-protected — set "
+            "'private_key_passphrase'"
+        )
     raise BackupDestinationError(
-        f"could not parse private key (tried Ed25519 / ECDSA / RSA): {last_exc}"
+        f"could not parse private key (tried Ed25519 / ECDSA / RSA; DSA is not "
+        f"supported): {last_exc}"
     )
 
 
