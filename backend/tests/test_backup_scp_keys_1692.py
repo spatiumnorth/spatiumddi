@@ -181,6 +181,36 @@ def test_every_line_of_ssh_keyscan_output_is_loaded() -> None:
     assert sorted(pinned.keys()) == sorted(line.split()[1] for line in lines)
 
 
+@pytest.mark.parametrize(
+    "unusable",
+    [
+        # DSA: no DSSKey in paramiko 4.0+. A real key blob prefix.
+        "ssh-dss AAAAB3NzaC1kc3MAAACBAP",
+        # FIDO security-key type the driver does not decode.
+        "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29t",
+        # Not base64 at all.
+        "ssh-ed25519 !!!not-base64",
+    ],
+)
+def test_an_unusable_line_does_not_drop_a_valid_pin_for_the_same_host(unusable: str) -> None:
+    # The unusable line used to be stored with a None key, and paramiko's
+    # HostKeys.add / lookup call get_name() on every entry for the host,
+    # so the valid line after it raised and was skipped too.
+    key = _private_key("ed25519")
+    keytype, b64 = _public_line(key).split()
+    client = paramiko.SSHClient()
+
+    _load_supplied_host_keys(
+        client, f"[sftp.example]:2222 {unusable}\n[sftp.example]:2222 {keytype} {b64}\n"
+    )
+
+    store = client.get_host_keys()
+    pinned = store.lookup("[sftp.example]:2222")
+    assert pinned is not None
+    assert list(pinned.keys()) == [keytype]
+    assert store.check("[sftp.example]:2222", paramiko.Ed25519Key(data=pinned[keytype].asbytes()))
+
+
 # ── private keys load ───────────────────────────────────────────────────
 
 

@@ -442,33 +442,28 @@ class ScpDestination(BackupDestination):
 def _load_supplied_host_keys(client, known: str) -> None:
     """Load operator-supplied known_hosts lines into the client's
     host-key store. Malformed lines are skipped, as before.
-    """
-    import paramiko  # noqa: PLC0415
 
+    A line whose key this driver cannot decode (``ssh-dss`` since
+    paramiko 4.0, a FIDO ``sk-*`` key, bad base64) is skipped BEFORE it
+    reaches the store. It used to be added with a ``None`` key, and
+    paramiko's ``HostKeys.add`` / ``lookup`` call ``e.key.get_name()``
+    on every entry for that host — so a valid pin on a later line for
+    the same host raised, was skipped too, and the server was refused
+    as "not found in known_hosts" with the right key pinned (#1692).
+    """
     for line in known.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             parts = line.split()
-            # paramiko's add_host_keys consumes a file path,
-            # so we feed lines manually via load_host_keys's
-            # internals.
             if len(parts) < 3:
                 continue
             hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
-            key_obj = paramiko.RSAKey if keytype == "ssh-rsa" else None
-            if not key_obj:
-                # Try the generic loader for non-RSA types.
-                # paramiko's HostKeys handles parsing better
-                # than a hand-rolled mapping.
-                host_keys = paramiko.HostKeys()
-                host_keys.add(hostnames, keytype, _decode_pubkey(keytype, key_b64))
-                client._host_keys.update(host_keys)  # noqa: SLF001
-            else:
-                decoded = _decode_pubkey(keytype, key_b64)
-                if decoded is not None:
-                    client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
+            decoded = _decode_pubkey(keytype, key_b64)
+            if decoded is None:
+                continue
+            client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
         except Exception:  # noqa: BLE001
             continue
 
