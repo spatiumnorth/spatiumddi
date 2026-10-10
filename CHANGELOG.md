@@ -115,7 +115,11 @@ the formatter handles the rest.
   the zone already on one server and then failed on another would
   delete that zone, records and all; on Cloudflare and Azure that
   removes a live zone. Such servers are named in the error as "Left as
-  found".
+  found". A successful create that found the zone already on a provider
+  adopts it, and now says so: the servers are listed in the create's
+  audit entry and in a new `adopted_existing_on` field on the response
+  (zone create, create from template, and the move's audit entry), because
+  deleting the zone in SpatiumDDI later removes it from those servers too.
 
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads

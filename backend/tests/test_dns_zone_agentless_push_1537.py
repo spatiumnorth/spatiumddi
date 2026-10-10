@@ -28,10 +28,15 @@ import uuid
 
 import pytest
 from fastapi import HTTPException
+from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns.router import _push_zone_to_agentless_servers
 from app.core.crypto import encrypt_dict
+from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
+from app.models.auth import User
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
 
@@ -396,3 +401,81 @@ async def test_changed_server_is_still_compensated_next_to_an_unchanged_one(
     assert ("found", "delete") not in fake.calls
     assert "Rolled back on: made" in excinfo.value.detail
     assert "Left as found on: found" in excinfo.value.detail
+
+
+# ── Adoption is recorded (#1537 follow-up) ──────────────────────────────────
+#
+# A create that finds the zone already on a provider adopts it. A later delete
+# in SpatiumDDI removes it from that provider too, so the push reports which
+# servers already held it, and the create handlers put that in the audit entry
+# and the response.
+
+
+async def test_push_reports_the_servers_that_already_held_the_zone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _NoopDriver(noop_on={"found"}, fail_on=set())
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    await _server(db_session, grp, "made")
+    await _server(db_session, grp, "found")
+
+    adopted = await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
+
+    assert adopted == ["found"]
+
+
+async def test_push_reports_nothing_when_every_server_was_changed(
+    db_session: AsyncSession, fake_driver: _FakeDriver
+) -> None:
+    grp = await _group(db_session)
+    await _server(db_session, grp, "a")
+    await _server(db_session, grp, "b")
+
+    assert await _push_zone_to_agentless_servers(db_session, _zone(grp), "create") == []
+
+
+async def test_zone_create_records_an_adopted_zone_in_the_response_and_the_audit(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _NoopDriver(noop_on={"found"}, fail_on=set())
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    await _server(db_session, grp, "found")
+    user = User(
+        username=f"adopt-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="Adopt Admin",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    user.groups = []
+    db_session.add(user)
+    await db_session.flush()
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    name = f"z{uuid.uuid4().hex[:6]}.example."
+
+    resp = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones",
+        json={
+            "name": name,
+            "zone_type": "primary",
+            "kind": "forward",
+            "primary_ns": "ns1.example.",
+            "admin_email": "admin.example.",
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["adopted_existing_on"] == ["found"]
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.resource_type == "dns_zone",
+                AuditLog.action == "create",
+                AuditLog.resource_display == resp.json()["name"],
+            )
+        )
+    ).scalar_one()
+    assert row.new_value == {"adopted_existing_on": ["found"]}
