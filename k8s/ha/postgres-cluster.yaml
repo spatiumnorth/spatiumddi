@@ -4,8 +4,11 @@
 #     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.0.yaml
 #
 # This creates a 3-node PostgreSQL cluster with:
-# - 1 primary (read/write)  → DNS: postgres-primary.spatiumddi.svc
-# - 2 replicas (read-only)  → DNS: postgres-replica.spatiumddi.svc
+# - 1 primary (read/write)  → DNS: postgres-rw.spatiumddi.svc
+# - 2 replicas (read-only)  → DNS: postgres-ro.spatiumddi.svc
+#   (CNPG names the Services after the Cluster, `postgres`:
+#   postgres-rw / postgres-ro / postgres-r. There are no
+#   postgres-primary / postgres-replica Services — #1547.)
 # - Continuous WAL archiving to a PVC
 # - Automatic failover via CloudNativePG
 apiVersion: postgresql.cnpg.io/v1

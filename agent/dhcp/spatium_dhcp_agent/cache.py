@@ -114,8 +114,8 @@ def save_config(state_dir: Path, bundle: dict[str, Any], etag: str) -> None:
 def commit_config(state_dir: Path, etag: str) -> None:
     """Promote ``current`` to ``previous`` — the last-known-GOOD bundle (#882).
 
-    Called only after Kea has answered ``config-test`` + ``config-reload``
-    successfully, so whatever lands here is known to load.
+    Called only after the ``-t`` preflight and ``config-reload`` both
+    succeeded, so whatever lands here is known to load.
 
     Copies rather than renames: ``current`` stays in place because it is
     what the agent re-applies on restart.

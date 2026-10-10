@@ -1,6 +1,6 @@
 """Per-node upgrade primitive (#296 Phase C).
 
-The 11-step sequence for taking one control-plane node from version
+The 12-step sequence for taking one control-plane node from version
 N-1 to N safely. Encapsulated as a single idempotent + resumable
 async function ``single_node_upgrade`` plus the individual step
 functions so an orchestrator (Phase D) can also drive them ala carte
@@ -23,12 +23,16 @@ Step shape (one row per step in the issue body):
                                         pod skip + mirror-pod skip);
                                         --force NOT supported
     7. trigger slot apply             — write desired_* on the appliance row
-    8. health gate                    — poll until installed_appliance_version
+    8. reboot                         — wait for the host to stage the new
+                                        slot, then request the reboot into
+                                        it (the host runner never reboots
+                                        on its own, #1445)
+    9. health gate                    — poll until installed_appliance_version
                                         == desired_appliance_version
-    9. convergence                    — node Ready + CNPG instance reported
+   10. convergence                    — node Ready + CNPG instance reported
                                         + DaemonSet pod Ready
-   10. uncordon + clear window        — uncordon_node + maintenance off
-   11. cluster verify                 — re-run a small slice of preflight
+   11. uncordon + clear window        — uncordon_node + maintenance off
+   12. cluster verify                 — re-run a small slice of preflight
 
 Resumability: each step is idempotent in itself (cordon-already-
 cordoned is a 200, evict-already-gone is 404 treated as success,
@@ -44,14 +48,18 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import appliance_channel, publish_wake
 from app.models.appliance import Appliance
+from app.models.audit import AuditLog
 from app.services.appliance import k8s
+from app.services.appliance.reboot import request_reboot
 from app.services.appliance.slot_image_target import (
     SlotImageArchitectureMismatch,
     SlotImageTarget,
@@ -70,6 +78,7 @@ StepName = Literal[
     "verify_primary_moved",
     "drain",
     "trigger_slot_apply",
+    "reboot",
     "health_gate",
     "convergence",
     "uncordon",
@@ -77,12 +86,18 @@ StepName = Literal[
     "release_node",
 ]
 
+# The actor recorded on audit rows the upgrade writes on its own, with no
+# operator behind them (#1449). ``user_display_name`` and ``auth_source``
+# are NOT NULL.
+SYSTEM_ACTOR = "system:upgrade-orchestrator"
+
 
 # Default-but-overridable timeouts. The orchestrator (Phase D) will
 # expose these on the upgrade-start request body so an operator with
 # a slow disk / large CNPG can stretch them.
 DEFAULT_DRAIN_TIMEOUT_S = 120.0
-DEFAULT_HEALTH_GATE_TIMEOUT_S = 1800.0  # 30 min — slot dd + reboot
+DEFAULT_STAGE_TIMEOUT_S = 3000.0  # 50 min — the host's 45 min apply ceiling + heartbeat lag
+DEFAULT_HEALTH_GATE_TIMEOUT_S = 1800.0  # 30 min — reboot + first heartbeat from the new slot
 DEFAULT_CONVERGENCE_TIMEOUT_S = 900.0  # 15 min — etcd rejoin + CNPG resync
 DEFAULT_SWITCHOVER_TIMEOUT_S = 180.0  # 3 min — CNPG cordon-triggered switch
 
@@ -121,7 +136,7 @@ class StepResult:
 
 @dataclass
 class SingleNodeResult:
-    """Aggregate outcome of one node's 11-step upgrade."""
+    """Aggregate outcome of one node's 12-step upgrade."""
 
     node_name: str
     target_version: str
@@ -142,9 +157,11 @@ def _now_iso() -> str:
 # ── Step 1: preflight ────────────────────────────────────────────────
 
 
-async def _step_preflight(target_version: str) -> StepResult:
+async def _step_preflight(target_version: str, lease_holder: str | None = None) -> StepResult:
     step = StepResult(name="preflight", started_at=_now_iso())
-    report = await preflight.run_all(target_version=target_version)
+    # The orchestrator holds the upgrade lease while it drives this chain;
+    # without its identity, the in-flight check fails on that very lease.
+    report = await preflight.run_all(target_version=target_version, own_holder=lease_holder)
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
         return step.finish(
@@ -280,37 +297,22 @@ async def _step_verify_primary_moved(
         status_block = body.get("status") or {}
         current_primary = status_block.get("currentPrimary")
         last_primary = current_primary
-        # CNPG primary pod names are ``<cluster>-<ordinal>``; the pod
-        # carries a ``spec.nodeName`` that tells us where it lives.
-        # We could resolve that pod here, but the simpler signal is
-        # comparing ``currentPrimary`` against the *previous* value —
-        # any change means switchover landed, and CNPG won't pick a
-        # pod on a cordoned node. We just need it to be NON-None +
-        # NON-empty + verified.
-        # Note: ``instances > 1`` was already enforced by the early-
-        # return on line 250-251, so the gate here is just on
-        # ``current_primary`` being non-empty.
+        # #1445 — the primary has moved only when its pod runs on another
+        # node. This used to return ok for any non-empty currentPrimary,
+        # the one on the cordoned node included, so the drain that follows
+        # evicted the primary itself instead of waiting for CNPG's
+        # switchover. A pod we cannot read proves nothing either way, so it
+        # is another poll, never a pass.
         if current_primary:
-            # Check the primary pod's nodeName != our cordoned node.
-            pods_status = status_block.get("instancesStatus") or {}
-            on_target = False
-            for pod_list in pods_status.values():
-                if not isinstance(pod_list, list):
-                    continue
-                for pod_name in pod_list:
-                    if pod_name == current_primary:
-                        # CNPG records which node the pod lives on via
-                        # the per-pod status (we'd need a second GET on
-                        # the pod itself for full certainty). Pragmatic
-                        # cheap check: if instances > 1 and the primary
-                        # changed since we started, the cordon-triggered
-                        # switchover did its job. We log the primary
-                        # name for forensics.
-                        on_target = False
-            if not on_target:
+            pod_status, pod = k8s.get_pod(current_primary, namespace=namespace)
+            primary_node = (
+                ((pod or {}).get("spec") or {}).get("nodeName") if pod_status == 200 else None
+            )
+            if primary_node and primary_node != node_name:
                 return step.finish(
                     True,
                     current_primary=current_primary,
+                    primary_node=primary_node,
                     instances=instances,
                 )
         await asyncio.sleep(_POLL_INTERVAL_S)
@@ -468,6 +470,7 @@ async def _step_trigger_slot_apply(
     # image fetch our own self-signed cert with verification on, and left
     # any stale sha256 from an earlier per-box schedule to fail the new
     # image as corrupt (#787).
+    previous_url = appliance.desired_slot_image_url
     try:
         stamp_desired_slot_image(appliance, slot_image, desired_version=target_version)
     except SlotImageArchitectureMismatch as exc:
@@ -479,14 +482,171 @@ async def _step_trigger_slot_apply(
         # the reason, not that the whole run dies at whichever node
         # happened to be scheduled first.
         return step.finish(False, error=str(exc))
+    # ``fresh_stamp`` is False when the row already carried this exact URL: a
+    # re-driven node, whose apply the supervisor's fire-once marker will not
+    # repeat. The reboot step then takes the staged state as it stands
+    # instead of waiting for a new apply that is never coming.
+    fresh = appliance.desired_slot_image_url != previous_url
+    if fresh:
+        _forget_previous_attempt(appliance)
     await db.flush()
-    # NB: db.commit is the orchestrator's responsibility — Phase D will
-    # commit at every step transition. For testing in Phase C the
-    # caller drives the commits.
+    # Flushed, not committed: ``single_node_upgrade`` commits straight after
+    # this step, before the reboot step waits on the supervisor (#1445).
+    return step.finish(True, appliance_id=str(appliance.id), fresh_stamp=fresh)
+
+
+def _forget_previous_attempt(appliance: Appliance) -> None:
+    """Drop our copy of the last upgrade's outcome when a new one is stamped.
+
+    The stamp does not touch the ``last_upgrade_*`` columns, so a node whose
+    previous apply failed still read ``failed`` the instant this run stamped
+    a new image, and the reboot step failed it in the same second while the
+    supervisor went on to run the apply with no drive watching (ddi-pg on
+    #1449). Same four columns the Fleet clear resets (#786).
+
+    Deliberately NOT the clear's host command (``clear_upgrade_requested``):
+    that command removes the slot-upgrade trigger and the fire-once marker,
+    and it stays raised until a later heartbeat, so it would delete or
+    re-fire the trigger this stamp is about to produce. Without it the next
+    heartbeat may re-publish the host's old ``failed``, with its old
+    timestamp, which is why ``_stale_failure`` also guards the reads.
+    """
+    appliance.last_upgrade_state = None
+    appliance.last_upgrade_state_at = None
+    appliance.last_upgrade_progress = None
+    appliance.last_upgrade_log_tail = None
+
+
+# ── Step 8: reboot into the staged slot ──────────────────────────────
+
+
+def _aware(at: datetime | None) -> datetime | None:
+    """``at`` as an aware datetime; a naive one is taken as UTC."""
+    if at is None or at.tzinfo is not None:
+        return at
+    return at.replace(tzinfo=UTC)
+
+
+def _slot_staged(appliance: Appliance, target_version: str, stamped_at: datetime | None) -> bool:
+    """Whether the host has staged ``target_version`` for THIS request.
+
+    The host runner ends a successful apply at state ``done`` with progress
+    ``reboot-pending``, and leaves both in place, so they alone also
+    describe the last upgrade this node ever staged. Rebooting on that would
+    restart the node in the middle of the apply this run just asked for. So:
+
+    * the inactive slot must carry ``target_version``, when the supervisor
+      reports slot versions (the sidecar is refreshed at the end of every
+      apply);
+    * when this invocation stamped a new image URL (``stamped_at`` set),
+      the ``done`` must have been written after the stamp. An apply takes
+      minutes, so a few seconds of clock skew between the worker and the
+      host cannot make a stale ``done`` look new.
+    """
+    if appliance.last_upgrade_state != "done":
+        return False
+    progress = appliance.last_upgrade_progress or {}
+    if progress.get("step") != "reboot-pending":
+        return False
+    slots = {v for v in (appliance.slot_a_version, appliance.slot_b_version) if v}
+    if slots and target_version not in slots:
+        return False
+    if stamped_at is not None:
+        done_at = _aware(appliance.last_upgrade_state_at)
+        if done_at is None or done_at < stamped_at:
+            return False
+    return True
+
+
+def _stale_failure(appliance: Appliance, stamped_at: datetime | None) -> bool:
+    """Whether a ``failed`` state belongs to an attempt before this run's stamp.
+
+    The counterpart of the stale-``done`` test in ``_slot_staged``: when this
+    invocation stamped a new image URL (``stamped_at`` set), a failure written
+    before the stamp (or with no timestamp at all) describes a previous
+    attempt, and the supervisor is still about to run this one. Without a
+    stamp this run (a re-driven node) every ``failed`` counts, as before.
+    """
+    if appliance.last_upgrade_state != "failed" or stamped_at is None:
+        return False
+    failed_at = _aware(appliance.last_upgrade_state_at)
+    return failed_at is None or failed_at < stamped_at
+
+
+async def _step_reboot(
+    db: AsyncSession,
+    node_name: str,
+    target_version: str,
+    *,
+    stamped_at: datetime | None,
+    timeout_s: float = DEFAULT_STAGE_TIMEOUT_S,
+) -> StepResult:
+    """Wait for the host to stage the new slot, then request the reboot.
+
+    The host runner writes the inactive slot, arms the next boot and stops
+    there ("upgrade staged — reboot to boot the new slot"); it never reboots
+    on its own. Without this step the health gate below could only time out
+    (found by ddi-pg on #1449). The request goes through the same flag as
+    the Fleet reboot action, delivered by the supervisor's heartbeat.
+    """
+    step = StepResult(
+        name="reboot",
+        started_at=_now_iso(),
+        detail={"node": node_name, "target_version": target_version},
+    )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        # End the read transaction each poll: the heartbeat writes these
+        # columns from another session, and a fresh checkout is what lets
+        # ``pool_pre_ping`` replace a connection lost to a database
+        # switchover while this waits.
+        await db.commit()
+        appliance = await _resolve_appliance(db, node_name)
+        if appliance is None:
+            return step.finish(False, error=f"appliance row vanished mid-upgrade: {node_name}")
+        await db.refresh(appliance)
+        if appliance.installed_appliance_version == target_version:
+            # A resumed run whose node already rebooted into the new slot.
+            return step.finish(True, already_running_target=True)
+        if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
+            return step.finish(False, error="supervisor reported upgrade failed")
+        if appliance.reboot_requested:
+            # A request is already outstanding (a resumed run, or an
+            # operator's). Stamping another could reboot the node twice.
+            return step.finish(True, reboot_already_requested=True)
+        if _slot_staged(appliance, target_version, stamped_at):
+            break
+        if time.monotonic() >= deadline:
+            return step.finish(
+                False,
+                error=f"slot was not staged within {timeout_s:.0f}s",
+                last_upgrade_state=appliance.last_upgrade_state,
+            )
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+    request_reboot(appliance)
+    db.add(
+        AuditLog(
+            user_id=None,
+            user_display_name=SYSTEM_ACTOR,
+            auth_source="system",
+            action="appliance.reboot_scheduled",
+            resource_type="appliance",
+            resource_id=str(appliance.id),
+            resource_display=appliance.hostname,
+            result="success",
+            new_value={"reason": "rolling upgrade", "target_version": target_version},
+        )
+    )
+    # Committed before the wake: the supervisor's heartbeat reads the flag
+    # from another session.
+    await db.commit()
+    await publish_wake(appliance_channel(appliance.id))
+    logger.info("upgrade_node_reboot_requested", node=node_name, target_version=target_version)
     return step.finish(True, appliance_id=str(appliance.id))
 
 
-# ── Step 8: health gate ───────────────────────────────────────────────
+# ── Step 9: health gate ───────────────────────────────────────────────
 
 
 async def _step_health_gate(
@@ -494,6 +654,7 @@ async def _step_health_gate(
     node_name: str,
     target_version: str,
     *,
+    stamped_at: datetime | None = None,
     timeout_s: float = DEFAULT_HEALTH_GATE_TIMEOUT_S,
 ) -> StepResult:
     """Wait for the appliance's heartbeat to report
@@ -501,7 +662,10 @@ async def _step_health_gate(
     ``last_upgrade_state == 'done'``.
 
     Failure paths we surface:
-      * ``last_upgrade_state == 'failed'`` — the apply itself failed.
+      * ``last_upgrade_state == 'failed'`` — the apply itself failed. A
+        failure older than this run's stamp (``stamped_at``) is a previous
+        attempt's and is waited past, not reported: the reboot step's early
+        exits hand over without having seen a fresh state (#1449).
       * Health-gate auto-revert (#138 Phase 8c): the host reboots back
         into the OLD slot, so installed_version never matches +
         ``last_upgrade_state`` may be 'done' on the OLD slot. We
@@ -521,13 +685,17 @@ async def _step_health_gate(
     # moved but landed on the wrong slot).
     last_installed: str | None = None
     while time.monotonic() < deadline:
+        # One transaction per poll, as in ``_step_reboot``: this wait spans
+        # the node's reboot, and a dropped connection must be replaced at
+        # the next checkout rather than crash the step.
+        await db.commit()
         appliance = await _resolve_appliance(db, node_name)
         if appliance is None:
             return step.finish(False, error=f"appliance row vanished mid-upgrade: {node_name}")
         # Refresh so we see the supervisor's heartbeat updates.
         await db.refresh(appliance)
         last_installed = appliance.installed_appliance_version
-        if appliance.last_upgrade_state == "failed":
+        if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
             return step.finish(
                 False,
                 error="supervisor reported upgrade failed",
@@ -549,7 +717,7 @@ async def _step_health_gate(
     )
 
 
-# ── Step 9: convergence ──────────────────────────────────────────────
+# ── Step 10: convergence ─────────────────────────────────────────────
 
 
 async def _step_convergence(
@@ -580,7 +748,15 @@ async def _step_convergence(
     step = StepResult(name="convergence", started_at=_now_iso(), detail={"node": node_name})
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        node_status, node = k8s.get_node(node_name)
+        try:
+            node_status, node = k8s.get_node(node_name)
+        except k8s.KubeapiUnavailableError:
+            # A node rejoining after its reboot is exactly when the API
+            # times out; one timeout ending the step failed a run whose
+            # node came back seconds later (#1449). Keep polling until the
+            # window ends.
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            continue
         if node_status != 200 or node is None:
             await asyncio.sleep(_POLL_INTERVAL_S)
             continue
@@ -634,7 +810,7 @@ async def _step_convergence(
     )
 
 
-# ── Step 10: uncordon + clear maintenance window ─────────────────────
+# ── Step 11: uncordon + clear maintenance window ─────────────────────
 
 
 async def _step_uncordon(
@@ -724,7 +900,7 @@ async def _step_release_node(
     return step.finish(True, uncordon_ok=True, maintenance_window_cleared=True)
 
 
-# ── Step 11: cluster verify ──────────────────────────────────────────
+# ── Step 12: cluster verify ──────────────────────────────────────────
 
 
 async def _step_cluster_verify(target_version: str) -> StepResult:
@@ -760,8 +936,9 @@ async def single_node_upgrade(
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     start_step: StepName | None = None,
+    lease_holder: str | None = None,
 ) -> SingleNodeResult:
-    """Drive one node through the 11-step rolling-upgrade primitive.
+    """Drive one node through the 12-step rolling-upgrade primitive.
 
     Idempotent — each step short-circuits cleanly if its precondition
     is already met. Resumable via ``start_step``: pass the step name to
@@ -781,6 +958,9 @@ async def single_node_upgrade(
         cnpg_namespace: namespace of the Cluster CR; defaults to the
             SA-mounted namespace.
         start_step: skip-ahead-to. Useful for resume + tests.
+        lease_holder: identity holding the upgrade lease for this run, so
+            the per-node preflight does not count that lease as another
+            upgrade in flight.
     """
     steps_in_order: list[StepName] = [
         "preflight",
@@ -790,6 +970,7 @@ async def single_node_upgrade(
         "verify_primary_moved",
         "drain",
         "trigger_slot_apply",
+        "reboot",
         "health_gate",
         "convergence",
         "uncordon",
@@ -832,12 +1013,19 @@ async def single_node_upgrade(
         cordoned and the CNPG maintenance window stays on until an
         operator releases it by hand."""
         if cordon_done and not released:
-            comp = await _step_release_node(
-                node_name,
-                cnpg_cluster_name,
-                cnpg_namespace,
-                clear_window=window_set,
-            )
+            try:
+                comp = await _step_release_node(
+                    node_name,
+                    cnpg_cluster_name,
+                    cnpg_namespace,
+                    clear_window=window_set,
+                )
+            except Exception as exc:  # noqa: BLE001 — never mask the real failure
+                # The compensation is best-effort: an exception here must
+                # not escape and replace the step failure being reported.
+                comp = StepResult(name="release_node", started_at=_now_iso()).finish(
+                    False, error=f"compensating release crashed: {exc}"
+                )
             results.append(comp)
             if not comp.ok:
                 logger.error(
@@ -861,7 +1049,7 @@ async def single_node_upgrade(
         results.append(r)
         return r.ok
 
-    if not await _run("preflight", _step_preflight(target_version)):
+    if not await _run("preflight", _step_preflight(target_version, lease_holder)):
         return _failed(node_name, target_version, "preflight", results)
     if not await _run("etcd_snapshot", _step_etcd_snapshot()):
         return _failed(node_name, target_version, "etcd_snapshot", results)
@@ -888,7 +1076,36 @@ async def single_node_upgrade(
         _step_trigger_slot_apply(db, node_name, target_version, slot_image),
     ):
         return await _fail("trigger_slot_apply")
-    if not await _run("health_gate", _step_health_gate(db, node_name, target_version)):
+    # #1445 — the supervisor reads the desired slot image from its heartbeat,
+    # in another session, so it sees the stamp only once it is committed. The
+    # orchestrator commits before and after this whole chain, never between
+    # steps, so without this the health gate waited out its timeout for a
+    # node that had never been told to upgrade.
+    stamped_at: datetime | None = None
+    if start_index <= steps_in_order.index("trigger_slot_apply"):
+        try:
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001 — fail the step, release the node
+            # The node is cordoned and drained by now; letting this raise
+            # out of the chain would skip the #1542 release and strand it.
+            # An uncommitted stamp means the supervisor was never told to
+            # upgrade, so this is the stamp step failing.
+            logger.exception("single_node_upgrade_stamp_commit_failed", node=node_name)
+            await db.rollback()
+            results.append(
+                StepResult(name="trigger_slot_apply", started_at=_now_iso()).finish(
+                    False, error=f"committing the slot stamp failed: {exc}"
+                )
+            )
+            return await _fail("trigger_slot_apply")
+        if results and results[-1].detail.get("fresh_stamp"):
+            stamped_at = datetime.now(UTC)
+    if not await _run("reboot", _step_reboot(db, node_name, target_version, stamped_at=stamped_at)):
+        return await _fail("reboot")
+    if not await _run(
+        "health_gate",
+        _step_health_gate(db, node_name, target_version, stamped_at=stamped_at),
+    ):
         return await _fail("health_gate")
     if not await _run(
         "convergence",

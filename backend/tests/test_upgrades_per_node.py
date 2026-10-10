@@ -418,6 +418,7 @@ async def test_step_health_gate_succeeds_on_version_match(
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=5.0)
@@ -438,6 +439,7 @@ async def test_step_health_gate_fails_on_supervisor_failed(
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=5.0)
@@ -455,6 +457,7 @@ async def test_step_health_gate_times_out(monkeypatch: pytest.MonkeyPatch) -> No
 
     db = MagicMock()
     db.refresh = AsyncMock()
+    db.commit = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Appliance())):
         monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
         step = await per_node._step_health_gate(db, "node-1", "2026.06.01-1", timeout_s=0.05)
@@ -638,7 +641,7 @@ async def test_step_uncordon_partial_failure_reports_state() -> None:
 @pytest.mark.asyncio
 async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every step returns ok → single_node_upgrade returns ok=True with
-    11 step results (etcd_snapshot is the no-op placeholder)."""
+    12 step results (etcd_snapshot is the no-op placeholder)."""
 
     # Mock every step to return an ok StepResult so we exercise the
     # chained-call shape without re-doing each step's tests.
@@ -658,13 +661,14 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         per_node, "_step_trigger_slot_apply", lambda *a, **k: _ok("trigger_slot_apply")
     )
+    monkeypatch.setattr(per_node, "_step_reboot", lambda *a, **k: _ok("reboot"))
     monkeypatch.setattr(per_node, "_step_health_gate", lambda *a, **k: _ok("health_gate"))
     monkeypatch.setattr(per_node, "_step_convergence", lambda *a, **k: _ok("convergence"))
     monkeypatch.setattr(per_node, "_step_uncordon", lambda *a, **k: _ok("uncordon"))
     monkeypatch.setattr(per_node, "_step_cluster_verify", lambda *a, **k: _ok("cluster_verify"))
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -681,6 +685,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
         "verify_primary_moved",
         "drain",
         "trigger_slot_apply",
+        "reboot",
         "health_gate",
         "convergence",
         "uncordon",
@@ -719,7 +724,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
     monkeypatch.setattr(per_node, "_step_drain", _track_drain)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
@@ -835,6 +840,254 @@ async def test_single_node_upgrade_records_failed_release(
     assert "compensating uncordon failed" in release.error
 
 
+def _patch_chain_ok(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
+    """Every chain step returns ok unless ``overrides`` names a replacement."""
+
+    def _ok(name: per_node.StepName) -> Any:
+        async def _step(*_a: Any, **_k: Any) -> per_node.StepResult:
+            return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(True)
+
+        return _step
+
+    for step in (
+        "preflight",
+        "etcd_snapshot",
+        "cnpg_maintenance_on",
+        "cordon",
+        "verify_primary_moved",
+        "drain",
+        "trigger_slot_apply",
+        "reboot",
+        "health_gate",
+        "convergence",
+        "uncordon",
+        "cluster_verify",
+    ):
+        monkeypatch.setattr(per_node, f"_step_{step}", overrides.get(step) or _ok(step))
+
+
+def _failing(name: per_node.StepName, error: str) -> Any:
+    async def _step(*_a: Any, **_k: Any) -> per_node.StepResult:
+        return per_node.StepResult(name=name, started_at="t", finished_at="t").finish(
+            False, error=error
+        )
+
+    return _step
+
+
+def _must_not_run(name: str) -> Any:
+    # The chain builds each step's coroutine before ``_run`` decides to skip
+    # it, so the stub must fail on AWAIT, not on call.
+    async def _step(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError(f"{name} must not run")
+
+    return _step
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_releases_node_on_reboot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1542 x #1445: the reboot step (added after #1542 was written) is
+    post-cordon, so its failure releases the node too."""
+    _patch_chain_ok(
+        monkeypatch,
+        reboot=_failing("reboot", "slot was not staged within 3000s"),
+        health_gate=_must_not_run("health_gate"),
+        convergence=_must_not_run("convergence"),
+    )
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            cnpg_namespace="spatium",
+        )
+    assert result.ok is False
+    assert result.failed_at == "reboot"
+    assert result.error == "slot was not staged within 3000s"
+    assert [s.name for s in result.steps][-2:] == ["reboot", "release_node"]
+    assert result.steps[-1].ok is True
+    un.assert_called_once_with("node-1")
+    mw.assert_called_once_with("pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium")
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_reboot_failure_without_cnpg_only_uncordons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1545 x #1542: no CNPG cluster in the run (none configured, none
+    detected) means no window was set, so the release must not PATCH a
+    nameless Cluster."""
+    _patch_chain_ok(monkeypatch, reboot=_failing("reboot", "supervisor reported upgrade failed"))
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(per_node.k8s, "patch_cnpg_maintenance_window") as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+        )
+    assert result.failed_at == "reboot"
+    release = result.steps[-1]
+    assert release.name == "release_node" and release.ok is True
+    assert release.detail["maintenance_window_clear_skipped"] is True
+    un.assert_called_once_with("node-1")
+    mw.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_resumed_past_cordon_still_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run resumed at a step after the cordon did not cordon the node in
+    THIS invocation, but the node is cordoned all the same (the earlier
+    invocation did it) — so a failure must still release it, and clear
+    the window the earlier invocation set."""
+    _patch_chain_ok(
+        monkeypatch,
+        preflight=_must_not_run("preflight"),
+        cnpg_maintenance_on=_must_not_run("cnpg_maintenance_on"),
+        cordon=_must_not_run("cordon"),
+        drain=_must_not_run("drain"),
+        trigger_slot_apply=_must_not_run("trigger_slot_apply"),
+        health_gate=_failing("health_gate", "health gate timed out after 1800s"),
+    )
+    db = MagicMock(commit=AsyncMock())
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(
+            per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)
+        ) as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            db,
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            cnpg_namespace="spatium",
+            start_step="reboot",
+        )
+    assert result.failed_at == "health_gate"
+    assert result.error == "health gate timed out after 1800s"
+    assert [s.name for s in result.steps] == ["reboot", "health_gate", "release_node"]
+    assert result.steps[-1].ok is True
+    un.assert_called_once_with("node-1")
+    mw.assert_called_once_with("pg-cluster", in_progress=False, reuse_pvc=True, namespace="spatium")
+    # Resumed past the stamp: no #1445 commit from the chain itself.
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_resumed_past_uncordon_does_not_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the chain's own uncordon has run, a later failure leaves the
+    node alone — it is already back in service."""
+    _patch_chain_ok(monkeypatch, cluster_verify=_failing("cluster_verify", "pods not ready"))
+    with patch.object(per_node.k8s, "uncordon_node") as un:
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            start_step="cluster_verify",
+        )
+    assert result.failed_at == "cluster_verify"
+    assert [s.name for s in result.steps] == ["cluster_verify"]
+    un.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_releases_node_when_stamp_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #1445 commit sits between steps, outside the per-step crash
+    wrapper. It failing used to raise out of the chain with the node
+    cordoned and drained; it now fails the stamp step and releases."""
+    _patch_chain_ok(monkeypatch, reboot=_must_not_run("reboot"))
+    db = MagicMock(commit=AsyncMock(side_effect=RuntimeError("connection lost")))
+    db.rollback = AsyncMock()
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=(True, None)) as un,
+        patch.object(per_node.k8s, "patch_cnpg_maintenance_window", return_value=(True, None)),
+    ):
+        result = await per_node.single_node_upgrade(
+            db,
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
+    assert result.failed_at == "trigger_slot_apply"
+    assert "connection lost" in result.error
+    assert result.steps[-1].name == "release_node"
+    db.rollback.assert_awaited_once()
+    un.assert_called_once_with("node-1")
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_release_crash_does_not_mask_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compensation that raises is recorded as a failed release_node;
+    the chain still returns the original failure instead of raising."""
+    _patch_chain_ok(monkeypatch, drain=_failing("drain", "drain timed out"))
+    with patch.object(per_node.k8s, "uncordon_node", side_effect=RuntimeError("boom")):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
+    assert result.failed_at == "drain"
+    assert result.error == "drain timed out"
+    release = result.steps[-1]
+    assert release.name == "release_node" and release.ok is False
+    assert "boom" in release.error
+
+
+@pytest.mark.asyncio
+async def test_single_node_upgrade_passes_cnpg_cluster_to_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: the chain hands convergence the run's (possibly auto-detected)
+    CNPG cluster so it can wait for the node's Postgres instance."""
+    seen: dict[str, Any] = {}
+
+    async def _convergence(node: str, **kw: Any) -> per_node.StepResult:
+        seen.update(kw, node=node)
+        return per_node.StepResult(name="convergence", started_at="t").finish(True)
+
+    _patch_chain_ok(monkeypatch, convergence=_convergence)
+    result = await per_node.single_node_upgrade(
+        MagicMock(commit=AsyncMock()),
+        node_name="node-1",
+        target_version="2026.06.01-1",
+        slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+        cnpg_cluster_name="pg-cluster",
+        cnpg_namespace="spatium",
+    )
+    assert result.ok is True
+    assert seen == {
+        "node": "node-1",
+        "cnpg_cluster_name": "pg-cluster",
+        "cnpg_namespace": "spatium",
+    }
+
+
 @pytest.mark.asyncio
 async def test_single_node_upgrade_step_crash_caught(
     monkeypatch: pytest.MonkeyPatch,
@@ -844,13 +1097,13 @@ async def test_single_node_upgrade_step_crash_caught(
     Otherwise an orchestrator-pod crash mid-step would leave the
     SystemUpgradeRun row stuck in ``running`` forever."""
 
-    async def _crash(_target_version: str) -> per_node.StepResult:
+    async def _crash(_target_version: str, *_a: object) -> per_node.StepResult:
         raise RuntimeError("kubeapi unreachable")
 
     monkeypatch.setattr(per_node, "_step_preflight", _crash)
 
     result = await per_node.single_node_upgrade(
-        MagicMock(),
+        MagicMock(commit=AsyncMock()),
         node_name="node-1",
         target_version="2026.06.01-1",
         slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),

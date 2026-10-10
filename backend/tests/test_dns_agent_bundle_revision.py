@@ -44,6 +44,31 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "c69af6546ce6118fe11c4abfeb4abc230e7d4c8b33c679444fa6e06cfba33748",
         "views": "1e70781c25f21f3563a0800205adfaef09b615eb0990e0f4ab8569f9d02bb7a0",
     },
+    # #1171: every zone copy carries refresh / retry / expire / minimum, at
+    # the ZONE_DEFAULT_* values for these fixtures' zones.
+    2: {
+        "plain": "f3b09e44127b9a25c77f06180586ee1c935853403f98f72988efa8b35d19a73e",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1373: the serial left the plain group's structural etag (views keep it).
+    3: {
+        "plain": "2ff144dc196f8f186e9a3ba3dcfc6b9f988839d9bf2e2ad6f5ee0596e32138d9",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1373: the zones are listed by name, so the plain group's reverse zone
+    # now comes before its forward one (the views group has one zone).
+    4: {
+        "plain": "90082e1b1aebf1f15faecfdecaa1056b5316cdd884a9479dbad94a84aae1d6ab",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1171's later change under #1373's: a group serves each zone's own SOA
+    # timers only once its last BIND9 agent renders them, so these fixtures'
+    # zones (no agent has said so) carry the old defaults again. 2 is #1171's
+    # stamp of that change alone; 3 and 4 were stamped over its earlier head.
+    5: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
 }
 
 

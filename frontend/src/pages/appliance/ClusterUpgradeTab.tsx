@@ -403,8 +403,9 @@ function PlanFormPanel() {
             className="rounded-md border bg-background px-2 py-1 font-mono text-sm"
           />
           <span className="text-xs text-muted-foreground">
-            Empty disables CNPG-related steps (single-instance / non-CNPG
-            deploys). On the appliance shape this is{" "}
+            Leave empty to detect it from the database connection. A deploy
+            without CNPG detects nothing and skips the CNPG steps. On the
+            appliance shape this is{" "}
             <code className="font-mono">
               {"<release>"}-spatiumddi-postgresql
             </code>

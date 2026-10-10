@@ -42,6 +42,7 @@ class FindServicesArgs(BaseModel):
 
 @register_tool(
     name="find_services",
+    permission="superadmin",
     description=(
         "List the SpatiumDDI services this deployment can control, and report "
         "which lifecycle backend is live (kubernetes / compose / none), whether "
@@ -103,6 +104,7 @@ async def find_services(db: AsyncSession, user: User, args: FindServicesArgs) ->
 
 @register_tool(
     name="propose_restart_service",
+    permission="superadmin",
     description=(
         "Prepare a proposal to restart one SpatiumDDI service — a compose "
         "container or a Kubernetes workload rollout. The operator must click "

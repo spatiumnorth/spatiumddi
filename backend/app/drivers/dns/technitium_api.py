@@ -259,7 +259,14 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         try:
             resp = await client.get(f"/api/{path}", params=params or {})
         except httpx.HTTPError as exc:
-            raise CloudDNSError(f"Technitium {what} request failed: {exc}") from exc
+            # A refused connection raises a ConnectError whose str() is empty,
+            # which left "request failed:" with no cause at all (#1613 QA).
+            # The class name always says something; the text, when present,
+            # says more.
+            cause = type(exc).__name__
+            if str(exc):
+                cause = f"{cause}: {exc}"
+            raise CloudDNSError(f"Technitium {what} request failed: {cause}") from exc
         return self._unwrap(resp, what)
 
     # ── Zone reads ──────────────────────────────────────────────────────
@@ -490,7 +497,15 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
 
     # ── Zone writes ─────────────────────────────────────────────────────
 
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> None:
         api_url, token, verify = self._creds(creds)
         bare = normalize_fqdn(str(getattr(zone, "name", ""))).rstrip(".")
         if not bare:

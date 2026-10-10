@@ -125,6 +125,7 @@ class FindPendingAppliancesArgs(BaseModel):
 
 @register_tool(
     name="find_pending_appliances",
+    permission="superadmin",
     description=(
         "List Application appliances sitting in pending_approval state "
         "(superadmin only). Each row carries the supervisor's hostname, "
@@ -191,6 +192,7 @@ class FindApplianceFleetArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_fleet",
+    permission="superadmin",
     description=(
         "Roll up the SpatiumDDI appliance fleet (superadmin only). "
         "Returns every appliance row — pending + approved + rejected — "
@@ -295,6 +297,7 @@ class FindApplianceStorageArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_storage",
+    permission="superadmin",
     description=(
         "Report software-RAID (md) and multipath storage redundancy "
         "across the appliance fleet (superadmin only, #999). Each row "
@@ -404,6 +407,7 @@ class FindApplianceRemovableArgs(BaseModel):
 
 @register_tool(
     name="find_appliance_removable",
+    permission="superadmin",
     description=(
         "Report removable (USB) backup disks across the appliance fleet "
         "(superadmin only, #989). Each configured mount carries a state: "
@@ -512,6 +516,7 @@ class ProposeStorageActionArgs(BaseModel):
 
 @register_tool(
     name="propose_storage_action",
+    permission="superadmin",
     description=(
         "Propose an md / multipath management action on an appliance "
         "(superadmin only, #999 Part B) — fail or remove an array "
@@ -588,6 +593,7 @@ class FindControlPlaneVipArgs(BaseModel):
 
 @register_tool(
     name="find_control_plane_vip",
+    permission="superadmin",
     description=(
         "Read the cluster-wide MetalLB VIP config (superadmin only, "
         "#272). Returns whether MetalLB is enabled, the L2 address pool, "
@@ -650,6 +656,7 @@ class FindK8sPodsArgs(BaseModel):
 
 @register_tool(
     name="find_k8s_pods",
+    permission="superadmin",
     description=(
         "List Kubernetes pods on the appliance control plane (superadmin "
         "only, #272). Returns per-pod namespace / name / phase / node / "
@@ -716,6 +723,7 @@ class FindClusterHealthArgs(BaseModel):
 
 @register_tool(
     name="find_cluster_health",
+    permission="superadmin",
     description=(
         "Roll up the appliance control-plane cluster health (superadmin "
         "only, #272). Returns the settled control-plane member count, an "
@@ -787,6 +795,7 @@ class FindClusterMetricsArgs(BaseModel):
 
 @register_tool(
     name="find_cluster_metrics",
+    permission="superadmin",
     description=(
         "Live resource metrics for the appliance k3s cluster (superadmin "
         "only, #402). Unlike ``find_cluster_health`` (control-plane "
@@ -910,6 +919,7 @@ class FindEtcdSnapshotsArgs(BaseModel):
 
 @register_tool(
     name="find_etcd_snapshots",
+    permission="superadmin",
     description=(
         "List recoverable etcd snapshots reported by the appliance "
         "control-plane seed (superadmin only). Returns "
@@ -990,6 +1000,7 @@ class FindUpgradeImagesArgs(BaseModel):
 
 @register_tool(
     name="find_upgrade_images",
+    permission="superadmin",
     description=(
         "List appliance upgrade images stored on the control plane "
         "(superadmin only, #199). These are the ``.raw.xz`` artifacts an "
@@ -1052,6 +1063,7 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
 
 @register_tool(
     name="find_available_upgrade_images",
+    permission="superadmin",
     description=(
         "List GitHub releases that carry an importable appliance upgrade "
         "image (superadmin only, #199). Returns each release tag + name + "
@@ -1107,6 +1119,7 @@ class ProposeApproveApplianceArgs(BaseModel):
 
 @register_tool(
     name="propose_approve_appliance",
+    permission="superadmin",
     description=(
         "Propose approving a pending Application appliance "
         "(superadmin only). Approval is irreversible cryptographically "
@@ -1164,20 +1177,25 @@ class ProposeAssignRoleArgs(BaseModel):
         default=None,
         description=(
             "Optional DNSServerGroup UUID. Required if roles include "
-            "a DNS role and there's no existing assignment."
+            "a DNS role and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
     dhcp_group_id: str | None = Field(
         default=None,
         description=(
             "Optional DHCPServerGroup UUID. Required if roles include "
-            "dhcp and there's no existing assignment."
+            "dhcp and there's no existing assignment. Pass null "
+            "explicitly to unassign the current group; omit to leave "
+            "it unchanged."
         ),
     )
 
 
 @register_tool(
     name="propose_assign_role",
+    permission="superadmin",
     description=(
         "Propose role + group assignment for an approved appliance "
         "(superadmin only). The model proposes the assignment + the "
@@ -1211,7 +1229,10 @@ async def propose_assign_role(
         db,
         user=user,
         operation="assign_appliance_role",
-        args=args.model_dump(),
+        # exclude_unset (#1562): an explicit null group id means
+        # "unassign", an omitted one means "leave it" — a full dump
+        # would turn every omitted group into an unassign on apply.
+        args=args.model_dump(exclude_unset=True),
         preview_text=preview.preview_text,
     )
     return _proposal_result(proposal, preview_text=preview.preview_text)

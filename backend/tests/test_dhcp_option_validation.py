@@ -104,13 +104,14 @@ def test_dhcpv6_has_its_own_vocabulary() -> None:
         validate_options({"code:43": "01"}, address_family="ipv6")
 
 
-def test_a_client_class_is_checked_as_the_dhcp4_it_always_renders_into() -> None:
-    validate_options({"routers": ["10.0.0.1"]}, address_family="any")
-    validate_options({"dns-servers": ["10.0.0.53"]}, address_family="any")
-    # Dhcp4 always carries the class, so an IPv6 ``dns-servers`` would reach
-    # it as ``domain-name-servers`` and fail the whole config.
+def test_a_client_class_is_checked_against_its_own_family() -> None:
+    """Since #1229 a class names the daemons it renders into; a ``dual`` one
+    takes an option either family accepts, and the bundle routes it
+    (``test_dhcp_client_class_family.py``)."""
+    validate_options({"routers": ["10.0.0.1"]}, address_family="ipv4")
     with pytest.raises(ValueError, match="not an IPv4 address"):
-        validate_options({"dns-servers": ["2001:db8::53"]}, address_family="any")
+        validate_options({"dns-servers": ["2001:db8::53"]}, address_family="ipv4")
+    validate_options({"dns-servers": ["2001:db8::53"]}, address_family="dual")
 
 
 def test_an_aliased_stored_key_still_counts_as_unchanged() -> None:

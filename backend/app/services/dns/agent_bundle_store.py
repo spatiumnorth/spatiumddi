@@ -61,7 +61,15 @@ _MAX_ERROR = 2000
 # replaces a newer render during a rolling upgrade (which the ``app_version``
 # equality check before #1185 did every 30 s), and a release that leaves the
 # renderer alone re-renders nothing.
-RENDERER_REVISION = 1
+#
+# 2 (#1171): every zone copy carries its SOA timers.
+# 3 (#1373): a zone's serial left the structural fingerprint of a group
+#   without views.
+# 4 (#1373): a group's zones are listed by name, not in the order Postgres
+#   happened to read them.
+# 5 (#1171, #1373): 4 with #1171's later change, which serves a zone's own SOA
+#   timers only once the group's last BIND9 agent renders them.
+RENDERER_REVISION = 5
 
 
 def _serves(revision: int | None) -> bool:

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 
+from app.api.token_path_scope import enforce_path_token_scope
 from app.api.v1.acme import router as acme_router
 from app.api.v1.address_sets import router as address_sets_router
 from app.api.v1.admin.agent_keys import router as agent_keys_router
@@ -297,7 +298,13 @@ api_v1_router.include_router(
     # the long-poll and never enqueues record ops, and since #1068 that
     # separation is also what keeps the fleet reachable when core.dns is
     # off (the gate answers 404, which re-bootstraps agents).
-    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
+    # GHSA-46mq-mpwf-xxwv: a zone-scoped token is held to its zones on
+    # every route keyed on {zone_id}, before any handler runs.
+    dependencies=[
+        Depends(require_module("core.dns")),
+        Depends(wake_publishing),
+        Depends(enforce_path_token_scope),
+    ],
 )
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(
@@ -318,7 +325,11 @@ api_v1_router.include_router(
     prefix="/dns",
     tags=["dns-pools"],
     # #358 — GSLB pool reconcile calls enqueue_record_op; publish on commit.
-    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
+    dependencies=[
+        Depends(require_module("core.dns")),
+        Depends(wake_publishing),
+        Depends(enforce_path_token_scope),
+    ],
 )
 api_v1_router.include_router(
     dns_tools_router,
@@ -356,7 +367,9 @@ api_v1_router.include_router(
     prefix="/ipam",
     tags=["ipam"],
     # #358 — IPAM→DNS auto-sync calls enqueue_record_op; publish on commit.
-    dependencies=[Depends(wake_publishing)],
+    # GHSA-46mq-mpwf-xxwv: a subnet-scoped token is held to its subnets on
+    # every route keyed on {subnet_id} / {address_id}.
+    dependencies=[Depends(wake_publishing), Depends(enforce_path_token_scope)],
 )
 api_v1_router.include_router(
     kubernetes_router,

@@ -112,6 +112,7 @@ from app.services.appliance.ca import (
     verify_session_token,
 )
 from app.services.appliance.firewall import firewall_bundle
+from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.network_mtu import (
     evaluate_node as evaluate_node_mtu,
@@ -121,6 +122,7 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
     archive_path,
@@ -151,6 +153,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
 
@@ -1280,6 +1283,9 @@ class SupervisorHeartbeatRequest(BaseModel):
     slot_a_version: str | None = None
     slot_b_version: str | None = None
     is_trial_boot: bool | None = None
+    # #1446 — this boot's kernel boot id. A reboot request is retired when a
+    # heartbeat arrives from a different boot. None from an older supervisor.
+    boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -1817,6 +1823,9 @@ async def _ingest_lldp_neighbours(
 # trigger it does not own is unlinkable out of the sticky release-state
 # directory — so the flag can't pin the heartbeat long-poll off forever.
 _CLEAR_UPGRADE_GIVE_UP_SECONDS = 600.0
+# #1446 — how long a reboot request is delivered without a heartbeat from a
+# new boot before it is given up (and logged).
+_REBOOT_GIVE_UP_SECONDS = 900.0
 
 
 # (heartbeat_interval + 10 s) so the hold returns before the client gives up.
@@ -1850,11 +1859,10 @@ async def supervisor_heartbeat(
       ``installed_appliance_version`` matches it AND the upgrade
       state is ``done`` or ``ready`` — the upgrade has landed and
       the operator's target is no longer load-bearing.
-    * Auto-clears ``reboot_requested`` 15 s after the stamp on the
-      assumption that the supervisor's heartbeat proves it survived
-      the reboot. Same auto-heal shape as the legacy
-      ``dns_server.reboot_requested`` / ``dhcp_server.reboot_requested``
-      flags in Phase 8f-8.
+    * Retires ``reboot_requested`` once a heartbeat arrives from a
+      different boot than the one the request applied to (#1446), with a
+      give-up backstop. It used to clear 15 s after the stamp, which could
+      happen before the request was ever delivered.
     """
     if not await _module_enabled(db):
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
@@ -2406,18 +2414,58 @@ async def supervisor_heartbeat(
     if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
         row.desired_default_slot = None
 
-    # Auto-clear reboot_requested 15 s after the stamp — by that
-    # point the heartbeat is itself proof the reboot landed (or that
-    # the reboot trigger has been written + the host runner is about
-    # to fire). Reduces the chance of a stale flag stalling the
-    # operator's next reboot request.
-    if (
-        row.reboot_requested
-        and row.reboot_requested_at is not None
-        and (datetime.now(UTC) - row.reboot_requested_at).total_seconds() >= 15
-    ):
-        row.reboot_requested = False
-        row.reboot_requested_at = None
+    # #1446 — retire reboot_requested on PROOF it landed, not on a clock.
+    # It used to clear 15 s after the stamp. A node with an upgrade staged
+    # keeps ``desired_appliance_version`` set, which suppresses the
+    # long-poll, so its heartbeats arrive a full interval apart: the first
+    # one after the stamp cleared the flag and then carried ``false`` in
+    # its own response, so the supervisor never saw the request (found on a
+    # 3-node rolling upgrade). The #786 stopwatch, again.
+    #
+    # The first heartbeat after the stamp records which boot the request
+    # applies to; it is delivered until a heartbeat comes from another boot.
+    # ``deliver_reboot`` is read AFTER the retire, unlike the clear-upgrade
+    # command below: delivering it again from the new boot would reboot the
+    # node a second time.
+    deliver_reboot = False
+    if row.reboot_requested:
+        if body.boot_id:
+            if row.reboot_requested_boot_id is None:
+                row.reboot_requested_boot_id = body.boot_id
+                deliver_reboot = True
+            elif body.boot_id != row.reboot_requested_boot_id:
+                row.reboot_requested = False
+                row.reboot_requested_at = None
+                row.reboot_requested_boot_id = None
+            else:
+                deliver_reboot = True
+        else:
+            # A supervisor too old to report its boot: deliver the request
+            # once and retire it. Never clearing it before it was sent is the
+            # fix; repeating it to a supervisor that cannot say whether it
+            # rebooted could reboot the node twice.
+            deliver_reboot = True
+            row.reboot_requested = False
+            row.reboot_requested_at = None
+        if (
+            row.reboot_requested
+            and row.reboot_requested_at is not None
+            and (datetime.now(UTC) - row.reboot_requested_at).total_seconds()
+            >= _REBOOT_GIVE_UP_SECONDS
+        ):
+            # Backstop: a node that never reboots must not keep the flag, and
+            # with it a suppressed long-poll, forever. Said out loud rather
+            # than cleared silently, which was this issue.
+            logger.warning(
+                "appliance_reboot_unacknowledged",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                boot_id=body.boot_id,
+            )
+            row.reboot_requested = False
+            row.reboot_requested_at = None
+            row.reboot_requested_boot_id = None
+            deliver_reboot = False
 
     # Retire clear_upgrade_requested on ACKNOWLEDGEMENT, not on a clock
     # (#786). The host's compliance is already observable: the clear's
@@ -2486,7 +2534,9 @@ async def supervisor_heartbeat(
     if body.wait_seconds > 0:
         has_pending_command = (
             row.desired_appliance_version is not None
-            or row.reboot_requested
+            # ``deliver_reboot``, not the row: an old supervisor's request is
+            # retired in the same heartbeat that delivers it (#1446).
+            or deliver_reboot
             # ``deliver_clear_upgrade``, not the row: the auto-expiry above
             # may have just cleared the flag while the response below still
             # carries the command. Reading the row here would make this look
@@ -2766,7 +2816,7 @@ async def supervisor_heartbeat(
         desired_slot_image_tls_insecure=row.desired_slot_image_tls_insecure,
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
-        reboot_requested=row.reboot_requested,
+        reboot_requested=deliver_reboot,
         clear_upgrade_requested=deliver_clear_upgrade,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
@@ -4004,6 +4054,8 @@ class ApplianceRolesUpdate(BaseModel):
             "mutually exclusive — one engine per appliance."
         ),
     )
+    # ``dns_group_id`` / ``dhcp_group_id``: omitted leaves the current
+    # group alone; an explicit ``null`` unassigns it (#1562).
     dns_group_id: uuid.UUID | None = None
     dhcp_group_id: uuid.UUID | None = None
     tags: dict[str, str] | None = None
@@ -4089,27 +4141,91 @@ async def update_appliance_roles(
                 )
         row.assigned_roles = list(body.roles)
 
-    if body.dns_group_id is not None:
-        # Best-effort existence check — wrong group_id → 422.
-        from app.models.dns import DNSServerGroup
+    # #1562 — presence in the payload decides, not non-None: an
+    # explicit ``null`` (the Fleet "(unassigned)" option) clears the
+    # assignment, an omitted field leaves it alone. The downstream
+    # role_assignment builder already handles a group-less role (no
+    # AGENT_GROUP shipped), so clearing is a supported state.
+    if "dns_group_id" in body.model_fields_set:
+        if body.dns_group_id is None:
+            row.assigned_dns_group_id = None
+        else:
+            # Best-effort existence check — wrong group_id → 422.
+            from app.models.dns import DNSServerGroup
 
-        dns_group = await db.get(DNSServerGroup, body.dns_group_id)
-        if dns_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DNS server group {body.dns_group_id} not found.",
-            )
-        row.assigned_dns_group_id = dns_group.id
-    if body.dhcp_group_id is not None:
-        from app.models.dhcp import DHCPServerGroup
+            dns_group = await db.get(DNSServerGroup, body.dns_group_id)
+            if dns_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {body.dns_group_id} not found.",
+                )
+            # #1468 — the supervisor drops a name it won't put in the role env.
+            problem = group_name_problem("dns", dns_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — the pointer alone moved the appliance's env and firewall
+            # to the new group while its registered server kept serving the old
+            # one (re-registration never moves a row, by design). Move the
+            # appliance's own DNS server(s) with it, through #934's move, in this
+            # transaction; a move it refuses (a name clash, a mixed-driver group)
+            # refuses the whole PUT, so the pointer and the server can't disagree.
+            from app.models.dns import DNSServer
+            from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
-        dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
-        if dhcp_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DHCP server group {body.dhcp_group_id} not found.",
+            for server in (
+                (await db.execute(select(DNSServer).where(DNSServer.appliance_id == row.id)))
+                .scalars()
+                .all()
+            ):
+                try:
+                    await move_server_to_group(db, server, dns_group)
+                except ServerMoveError as exc:
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
+                    ) from exc
+            row.assigned_dns_group_id = dns_group.id
+    if "dhcp_group_id" in body.model_fields_set:
+        if body.dhcp_group_id is None:
+            row.assigned_dhcp_group_id = None
+        else:
+            from app.models.dhcp import DHCPServer, DHCPServerGroup
+
+            dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
+            if dhcp_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DHCP server group {body.dhcp_group_id} not found.",
+                )
+            problem = group_name_problem("dhcp", dhcp_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — likewise the appliance's DHCP server(s), with the checks
+            # the DHCP server PUT applies to a group change.
+            from app.api.v1.dhcp.servers import (
+                _assert_driver_mix_allowed,
+                _assert_no_v6_scopes_for_windows,
             )
-        row.assigned_dhcp_group_id = dhcp_group.id
+            from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+
+            for dserver in (
+                (await db.execute(select(DHCPServer).where(DHCPServer.appliance_id == row.id)))
+                .scalars()
+                .all()
+            ):
+                if dserver.server_group_id == dhcp_group.id:
+                    continue
+                await _assert_driver_mix_allowed(
+                    db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
+                )
+                await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
+                old_gid = dserver.server_group_id
+                dserver.server_group_id = dhcp_group.id
+                collect_wake(dhcp_server_channel(dserver.id))
+                for gid in (old_gid, dhcp_group.id):
+                    if gid is not None:
+                        collect_wake(dhcp_group_channel(gid))
+            row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
         # Coerce every value to string — JSONB will accept anything
@@ -4432,6 +4548,8 @@ async def promote_control_plane(
     odd total member count (etcd quorum hygiene).
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane promote")
 
     members = await _effective_cp_members(db)
     primary = await _resolve_primary(db, members)
@@ -4565,6 +4683,8 @@ async def demote_control_plane(
     count, and refuses demoting the seed (use a dedicated seed-migration
     flow for that — out of scope for Phase 7)."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
 
     members = await _effective_cp_members(db)
     current_count = len(members)
@@ -4677,6 +4797,8 @@ async def replace_control_plane_member(
     stays ``evicting``, with the seed's reason.
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane replace")
 
     from app.api.v1.appliance.pairing import _generate_code, _hash_code  # noqa: PLC0415
     from app.models.appliance import PairingCode  # noqa: PLC0415
@@ -5056,6 +5178,8 @@ async def restore_etcd_snapshot(
     last-reported inventory + ``confirm_hostname`` must match the seed's
     hostname exactly. Refuses a second restore while one is in flight."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="an etcd snapshot restore")
     seed = await _find_seed_row(db)
     if seed is None:
         raise HTTPException(
@@ -5623,6 +5747,8 @@ async def schedule_appliance_upgrade(
     ``desired_slot_image_url``. The control plane composes the
     authenticated internal URL the supervisor pulls from."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance slot upgrade")
     if (body.desired_slot_image_url is None) == (body.slot_image_id is None):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5896,6 +6022,8 @@ async def schedule_appliance_set_next_boot(
     either reboots manually (``/reboot`` endpoint) or waits for the
     next planned reboot window."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance next-boot slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -5963,6 +6091,8 @@ async def schedule_appliance_set_default_slot(
       slot for good (not just one boot). Calls this against the
       previous slot."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance default-slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -6011,8 +6141,9 @@ async def schedule_appliance_reboot(
 ) -> ApplianceRow:
     """Stamps ``reboot_requested=True``. The supervisor's next
     heartbeat returns this; the supervisor writes the host-side
-    ``reboot-pending`` trigger; the host runner ``systemctl reboot``s
-    after a 5s grace.
+    ``reboot-pending-fleet`` trigger; the host runner ``systemctl reboot``s
+    after a 5s grace. The request stays set until a heartbeat arrives from
+    the new boot (#1446).
 
     Strict appliance-only — docker / k8s deployments return 409 since
     there's no host to reboot from the supervisor."""
@@ -6034,8 +6165,7 @@ async def schedule_appliance_reboot(
                 "appliance OS."
             ),
         )
-    row.reboot_requested = True
-    row.reboot_requested_at = datetime.now(UTC)
+    request_reboot(row)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -7351,11 +7481,8 @@ async def reveal_appliance_kubeconfig(
     downloaded file directly; operators on a different network may
     need to edit the server line to a reachable address.
     """
+    from app.api.stepup import require_operator_stepup  # noqa: PLC0415
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.services.reauth import (  # noqa: PLC0415
-        ReauthOutcome,
-        reverify_operator,
-    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -7382,20 +7509,18 @@ async def reveal_appliance_kubeconfig(
         )
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        await asyncio.sleep(0.1)
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="appliance_kubeconfig_reveal_denied",
+        resource_type="appliance",
+        resource_id=str(appliance_id),
+        resource_display=str(appliance_id),
+    )
 
     row = await db.get(Appliance, appliance_id)
     if row is None:
