@@ -90,18 +90,32 @@ the formatter handles the rest.
   already done keep their change, so the retry used to fail on the first
   server ("already exists" on create, "not found" on delete). Each
   driver now accepts only the provider's own signal: Cloudflare error
-  1061 on create (after confirming the token can see the zone) and an
-  absent zone or HTTP 404 on delete; Azure DNS creates with
-  `If-None-Match: *` (412 means it exists, and an existing zone's tags
-  are no longer overwritten) and treats 404 on delete as done; Google
-  Cloud DNS accepts a 409 on create only when a managed zone with that
-  DNS name exists, and matches the delete 404 by exception class rather
-  than message text; Technitium accepts `No such zone was found` on
-  delete. Windows DNS probed with `SilentlyContinue`, so an
-  access-denied probe read as "zone absent" and a delete reported
-  success; only Win32 9601 now means absent. Authentication, throttling
-  and server errors still fail in every driver, and Route 53 still
-  refuses to adopt a same-named zone it did not create.
+  1061 on create and an absent zone or HTTP 404 on delete; Azure DNS
+  creates with `If-None-Match: *` (412 means it exists, and an existing
+  zone's tags are no longer overwritten) and treats 404 on delete as
+  done; Google Cloud DNS accepts a 409 on create only when a managed zone
+  with that DNS name exists, and matches the delete 404 by exception
+  class rather than message text; Technitium accepts
+  `No such zone was found` on delete. Cloudflare returns 1061 also when
+  a *different* account holds the domain, so the create confirms the
+  zone with a lookup scoped to the configured `account_id`; the delete
+  lookup is scoped the same way, where it used to take whichever
+  same-named zone the token's accounts listed first. Windows DNS probed
+  with `SilentlyContinue`, so an access-denied probe read as "zone
+  absent" and a delete reported success; only Win32 9601 now means
+  absent. Authentication, throttling and server errors still fail in
+  every driver, and Route 53 still refuses to adopt a same-named zone it
+  did not create. DigitalOcean, Linode and Vultr do not yet converge
+  (Hetzner does on delete only).
+
+- **A failed multi-server zone push no longer rolls back a zone it did
+  not create (#1537).** The rollback after a partial failure (delete
+  what was created, re-create what was deleted) now skips any server
+  that was already in the requested state. Before, a create that found
+  the zone already on one server and then failed on another would
+  delete that zone, records and all; on Cloudflare and Azure that
+  removes a live zone. Such servers are named in the error as "Left as
+  found".
 
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads

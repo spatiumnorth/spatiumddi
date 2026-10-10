@@ -414,7 +414,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         client = self._client(creds)
         name = normalize_fqdn(getattr(zone, "name", "") or "")
         if name == ".":
@@ -438,13 +438,22 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 # be a different domain that took the same zone name.
                 if not _cause_is(exc, "Conflict"):
                     raise
-                await self._resolve_zone(client, name)
+                try:
+                    await self._resolve_zone(client, name)
+                except CloudDNSError as lookup_exc:
+                    if lookup_exc.__cause__ is not None:
+                        raise  # the lookup itself failed (auth, quota, …)
+                    # No zone with this dns_name: the slug is taken by some
+                    # other domain. Report the provider's own 409, not a
+                    # confusing "not found".
+                    raise exc from exc.__cause__
                 logger.info(
                     "google_dns.apply_zone.create_already_exists",
                     server=str(getattr(server, "id", "")),
                     zone=name,
                 )
-            return
+                return False
+            return True
 
         if op == "delete":
             try:
@@ -459,7 +468,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                         server=str(getattr(server, "id", "")),
                         zone=name,
                     )
-                    return
+                    return False
                 raise
             # #1528 — Cloud DNS refuses to delete a populated zone
             # (containerNotEmpty); empty OUR records first. Records the
@@ -474,9 +483,9 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 # itself; matching message text could swallow an unrelated
                 # failure that happens to mention a 404.
                 if _cause_is(exc, "NotFound"):
-                    return
+                    return False
                 raise
-            return
+            return True
 
         raise CloudDNSError(f"google_dns._apply_zone: unsupported op {op!r}")
 

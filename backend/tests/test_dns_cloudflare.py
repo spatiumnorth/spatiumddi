@@ -1230,3 +1230,72 @@ async def test_apply_zone_delete_other_errors_still_raise(
     driver = _patch_client(monkeypatch, fake)
     with pytest.raises(CloudDNSError):
         await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+async def test_apply_zone_reports_whether_it_changed_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``False`` = already in the requested state, so the caller's
+    partial-failure compensation leaves that server alone (#1537)."""
+    zone = type("Z", (), {"name": "example.org."})()
+    fake = _FakeClient({"post": [_FakeResponse(200, _env({"id": "zid"}))]})
+    assert await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "create")
+
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+        }
+    )
+    assert (
+        await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "create")
+        is False
+    )
+
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_FakeResponse(200, _env({"id": "zid"}))],
+        }
+    )
+    assert await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    assert (
+        await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "delete")
+        is False
+    )
+
+
+async def test_apply_zone_1061_from_another_account_raises_the_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloudflare answers 1061 when a DIFFERENT account holds the domain
+    active too. The confirming lookup is scoped to the configured account,
+    and a miss re-raises Cloudflare's own error rather than "not found"."""
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "example.org already exists")],
+            "get": [_FakeResponse(200, _env([]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    creds = {"api_token": "tok", "account_id": "acct-a"}
+    with pytest.raises(CloudDNSError, match="already exists"):
+        await driver._apply_zone(_Server(), creds, zone, "create")
+    assert fake.calls[1]["params"] == {"name": "example.org", "account.id": "acct-a"}
+
+
+async def test_apply_zone_delete_lookup_is_scoped_to_the_configured_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token spanning several accounts must not delete the same-named
+    zone in whichever account the API happens to list first."""
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    creds = {"api_token": "tok", "account_id": "acct-a"}
+    assert await driver._apply_zone(_Server(), creds, zone, "delete") is False
+    assert fake.calls[0]["params"] == {"name": "example.org", "account.id": "acct-a"}
+    assert [c["method"] for c in fake.calls] == ["get"]

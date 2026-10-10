@@ -594,7 +594,7 @@ class AzureDNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         client = self._client(creds)
         rg = self._resource_group(creds)
         zone_label = _zone_label(getattr(zone, "name", ""))
@@ -621,9 +621,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
                         server=str(getattr(server, "id", "")),
                         zone=zone_label,
                     )
-                    return
+                    return False
                 raise self._wrap_errors(exc) from exc
-            return
+            return True
 
         # delete — zone delete is a long-running operation; block on the
         # poller. Some SDK versions expose a synchronous ``delete`` instead.
@@ -645,8 +645,9 @@ class AzureDNSDriver(CloudDNSDriverBase):
                     server=str(getattr(server, "id", "")),
                     zone=zone_label,
                 )
-                return
+                return False
             raise self._wrap_errors(exc) from exc
+        return True
 
     # ── Capabilities ─────────────────────────────────────────────────────
     def capabilities(self) -> dict[str, Any]:

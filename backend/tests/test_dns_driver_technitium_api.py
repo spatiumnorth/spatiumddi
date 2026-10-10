@@ -917,3 +917,39 @@ async def test_zone_ops_other_failures_still_raise(
     drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
     with pytest.raises(CloudDNSError):
         await drv.apply_zone_change(_tserver(), _TZone(), op)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "body", "changed"),
+    [
+        ("create", {"status": "ok", "response": {"domain": "new.example.com"}}, True),
+        (
+            "create",
+            {"status": "error", "errorMessage": "Zone already exists: new.example.com"},
+            False,
+        ),
+        ("delete", {"status": "ok", "response": {}}, True),
+        (
+            "delete",
+            {"status": "error", "errorMessage": "No such zone was found: new.example.com"},
+            False,
+        ),
+        # Technitium's own lookup → delete race says it this way instead.
+        (
+            "delete",
+            {
+                "status": "error",
+                "errorMessage": "Failed to delete the zone 'new.example.com': no such zone exists.",
+            },
+            False,
+        ),
+    ],
+)
+async def test_zone_ops_report_whether_they_changed_anything(
+    monkeypatch: pytest.MonkeyPatch, op: str, body: dict[str, Any], changed: bool
+) -> None:
+    """``False`` = already in the requested state; the caller's partial
+    failure compensation must leave that server alone (#1537)."""
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
+    assert await drv.apply_zone_change(_tserver(), _TZone(), op) is changed

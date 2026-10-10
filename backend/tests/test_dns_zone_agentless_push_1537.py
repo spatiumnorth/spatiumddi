@@ -16,9 +16,10 @@ while the record path deliberately skips disabled agentless servers.
 Fixed here: disabled servers are excluded from the fan-out, and on a
 partial failure the servers that succeeded receive the inverse op as
 compensation (create → delete, delete → create) before the 502 is
-raised, with the outcome named in the error detail. What remains
-tracked in #1537: making each driver itself treat "already exists" on
-create and "not found" on delete as success.
+raised, with the outcome named in the error detail. The drivers then
+learned to treat "already exists" on create and "not found" on delete
+as success, and to say so (``apply_zone_change`` returns False), so the
+compensation skips a server that was already in the requested state.
 """
 
 from __future__ import annotations
@@ -327,3 +328,71 @@ async def test_conflict_mixed_with_another_failure_is_still_a_502(
     assert "hosted zone named example.com exists" in detail
     assert "third unreachable" in detail
     assert "Rolled back on: first" in detail
+
+
+# ── A server already in the requested state is not "rolled back" ──────────
+
+
+class _NoopDriver(_FakeDriver):
+    """Reports "no change" (``False``) for servers named in ``noop_on``.
+
+    Models a driver that found the zone already there on create, or
+    already gone on delete — the converged answers #1537 made success.
+    """
+
+    def __init__(self, noop_on: set[str], fail_on: set[str]) -> None:
+        super().__init__(fail_on)
+        self.noop_on = noop_on
+
+    async def apply_zone_change(  # type: ignore[override]
+        self, server: DNSServer, zone: DNSZone, op: str
+    ) -> bool:
+        await super().apply_zone_change(server, zone, op)
+        return server.name not in self.noop_on
+
+
+@pytest.mark.parametrize("op", ["create", "delete"])
+async def test_server_already_in_state_is_left_as_found_on_partial_failure(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """A create that FOUND the zone must not be compensated with a delete.
+
+    "first" already held the zone before this request (an operator-seeded
+    zone, or one a previous attempt left behind). When "second" fails, a
+    compensating delete on "first" would tear down a zone this request
+    never created — on Cloudflare / Azure that deletes every record in it.
+    The mirror case: a delete that found the zone already gone is not
+    "rolled back" by re-creating it.
+    """
+    fake = _NoopDriver(noop_on={"first"}, fail_on={"second"})
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    await _server(db_session, grp, "first")
+    await _server(db_session, grp, "second")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, _zone(grp), op)
+
+    assert excinfo.value.status_code == 502
+    # Each server tried once, and no inverse op anywhere.
+    assert sorted(fake.calls) == [("first", op), ("second", op)]
+    assert "Rolled back on" not in excinfo.value.detail
+    assert "Left as found on: first" in excinfo.value.detail
+
+
+async def test_changed_server_is_still_compensated_next_to_an_unchanged_one(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _NoopDriver(noop_on={"found"}, fail_on={"broken"})
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda name: fake)
+    grp = await _group(db_session)
+    for name in ("made", "found", "broken"):
+        await _server(db_session, grp, name)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _push_zone_to_agentless_servers(db_session, _zone(grp), "create")
+
+    assert ("made", "delete") in fake.calls
+    assert ("found", "delete") not in fake.calls
+    assert "Rolled back on: made" in excinfo.value.detail
+    assert "Left as found on: found" in excinfo.value.detail

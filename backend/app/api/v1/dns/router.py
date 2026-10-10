@@ -6892,7 +6892,14 @@ async def _push_zone_to_agentless_servers(
     if op == "delete":
         managed_records = await _managed_zone_records(db, zone)
 
-    async def _apply(server: DNSServer, driver: Any, this_op: str) -> None:
+    async def _apply(server: DNSServer, driver: Any, this_op: str) -> bool:
+        """Apply ``this_op``; True when the server was changed.
+
+        False means the driver found the server already in the requested
+        state (#1537): the zone already existed on create, or was already
+        gone on delete. A driver that does not report it (returns None)
+        counts as changed — the pre-#1537 assumption.
+        """
         if isinstance(driver, CloudDNSDriverBase):
             # The compensating delete of a rolled-back create needs the
             # same scoping as a real delete, or a cloud driver would empty
@@ -6900,13 +6907,20 @@ async def _push_zone_to_agentless_servers(
             records = managed_records
             if this_op == "delete" and records is None:
                 records = await _managed_zone_records(db, zone)
-            await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+            result = await driver.apply_zone_change(server, zone, this_op, managed_records=records)
         else:
-            await driver.apply_zone_change(server, zone, this_op)
+            result = await driver.apply_zone_change(server, zone, this_op)
+        return result is not False
 
     errors: list[str] = []
     failed_drivers: set[str] = set()
     succeeded: list[DNSServer] = []
+    # Servers that were already in the requested state: the op succeeded
+    # there without changing anything, so there is nothing to roll back.
+    # Compensating them would delete a zone this request did not create
+    # (records and all — a pre-existing zone the create merely found), or
+    # re-create one that was already gone before the delete (#1537).
+    unchanged: list[DNSServer] = []
     # A CloudDNSConflictError is recorded like any other failure rather
     # than raised from inside the loop: raising here would skip the
     # compensation below, leaving servers that already took the change
@@ -6918,8 +6932,7 @@ async def _push_zone_to_agentless_servers(
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
-            await _apply(server, driver, op)
-            succeeded.append(server)
+            changed = await _apply(server, driver, op)
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
             if isinstance(exc, CloudDNSConflictError):
                 # The provider already holds a zone/record this op would
@@ -6936,6 +6949,8 @@ async def _push_zone_to_agentless_servers(
                 op=op,
                 error=_exc_text(exc),
             )
+            continue
+        (succeeded if changed else unchanged).append(server)
 
     if not errors:
         return
@@ -6995,6 +7010,12 @@ async def _push_zone_to_agentless_servers(
     )
     if compensated:
         detail += f" Rolled back on: {', '.join(compensated)}."
+    if unchanged:
+        state = "already held" if op == "create" else "already lacked"
+        detail += (
+            f" Left as found on: {', '.join(s.name for s in unchanged)} "
+            f"(those servers {state} the zone before this request)."
+        )
     if records_unrestored:
         detail += (
             f" Zone re-created on {'; '.join(records_unrestored)}, but its records "

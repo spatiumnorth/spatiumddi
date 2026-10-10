@@ -37,7 +37,7 @@ class _GoogleAuthError(Exception):
 
 
 @pytest.fixture(autouse=True)
-def _stub_google_modules() -> Any:
+def _stub_google_modules(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Make the driver's lazy ``from google... import exceptions`` resolve.
 
     The driver imports ``google.api_core.exceptions`` +
@@ -56,8 +56,20 @@ def _stub_google_modules() -> Any:
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
             created.append(mod_name)
-    sys.modules["google.api_core.exceptions"].GoogleAPICallError = _GoogleAPICallError  # type: ignore[attr-defined]
-    sys.modules["google.auth.exceptions"].GoogleAuthError = _GoogleAuthError  # type: ignore[attr-defined]
+    # ``monkeypatch`` rather than a bare assignment: where the real SDK IS
+    # installed (the api image ships it), a bare assignment replaced the
+    # real module's base class for the rest of the session, so any later
+    # test raising a genuine ``google.api_core`` error escaped the driver's
+    # ``except`` clause.
+    monkeypatch.setattr(
+        sys.modules["google.api_core.exceptions"],
+        "GoogleAPICallError",
+        _GoogleAPICallError,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sys.modules["google.auth.exceptions"], "GoogleAuthError", _GoogleAuthError, raising=False
+    )
     yield
     for mod_name in created:
         sys.modules.pop(mod_name, None)

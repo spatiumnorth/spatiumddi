@@ -463,7 +463,7 @@ class WindowsDNSDriver(DNSDriver):
                 final.append(entry)
         return final
 
-    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
+    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> bool:
         """Create / delete a zone on the Windows DC over WinRM.
 
         Only meaningful when the server has stored credentials — without
@@ -482,14 +482,21 @@ class WindowsDNSDriver(DNSDriver):
             )
         creds = _load_credentials(server)
         script = _ps_apply_zone(zone, op)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        # #1537 — the script says when the server was already in the
+        # requested state. Report that as "no change" so the caller's
+        # partial-failure compensation never deletes a zone this request
+        # found already there (or re-creates one it found already gone).
+        changed = not any(marker in (out or "") for marker in _ZONE_NOOP_MARKERS)
         logger.info(
             "windows_dns.apply_zone_change",
             server=str(getattr(server, "id", "")),
             zone=getattr(zone, "name", ""),
             op=op,
             kind=getattr(zone, "kind", None),
+            changed=changed,
         )
+        return changed
 
     async def reload_config(self, server: Any) -> None:
         # Windows handles its own config lifecycle; nothing to do remotely.
@@ -879,6 +886,12 @@ def _parse_zones(raw: str) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+# Output lines ``_ps_apply_zone`` writes when the server was already in
+# the requested state (#1537). ``apply_zone_change`` keys "no change" off
+# these, so the script and the parser must agree — pinned by a test.
+_ZONE_NOOP_MARKERS = ("already exists on server", "was not present on server")
 
 
 def _ps_apply_zone(zone: Any, op: str) -> str:
