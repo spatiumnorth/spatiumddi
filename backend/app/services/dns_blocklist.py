@@ -12,9 +12,11 @@ this module.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -57,6 +59,20 @@ class EffectiveBlocklist:
     lists: list[uuid.UUID] = field(default_factory=list)
 
 
+def _entry_rows(list_id: uuid.UUID) -> Any:
+    """One list's entries as column rows, in ``domain`` order (see below)."""
+    return (
+        select(
+            DNSBlockListEntry.domain,
+            DNSBlockListEntry.entry_type,
+            DNSBlockListEntry.target,
+            DNSBlockListEntry.is_wildcard,
+        )
+        .where(DNSBlockListEntry.list_id == list_id)
+        .order_by(DNSBlockListEntry.domain)
+    )
+
+
 async def _collect_lists(
     db: AsyncSession, lists: list[DNSBlockList]
 ) -> tuple[list[EffectiveEntry], set[str], list[uuid.UUID]]:
@@ -79,16 +95,7 @@ async def _collect_lists(
             continue
         list_ids.append(bl.id)
 
-        entry_result = await db.execute(
-            select(
-                DNSBlockListEntry.domain,
-                DNSBlockListEntry.entry_type,
-                DNSBlockListEntry.target,
-                DNSBlockListEntry.is_wildcard,
-            )
-            .where(DNSBlockListEntry.list_id == bl.id)
-            .order_by(DNSBlockListEntry.domain)
-        )
+        entry_result = await db.execute(_entry_rows(bl.id))
         block_mode, sinkhole_ip, list_id, list_name = bl.block_mode, bl.sinkhole_ip, bl.id, bl.name
         entries.extend(
             EffectiveEntry(
@@ -126,13 +133,12 @@ def _stable_list_order(lists: list[DNSBlockList]) -> list[DNSBlockList]:
     return sorted(lists, key=lambda bl: bl.name)
 
 
-async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
-    """Compute the effective blocklist for a DNS view.
-
-    Combines:
-      - Blocklists assigned directly to the view
-      - Blocklists assigned to the view's parent server group
-    """
+async def effective_lists_for_view(
+    db: AsyncSession, view_id: uuid.UUID
+) -> list[DNSBlockList] | None:
+    """The lists a view's RPZ zone draws on, in the order that decides a
+    duplicate owner name: the view's own, then its group's. ``None`` when
+    the view does not exist."""
     view = (
         await db.execute(
             select(DNSView)
@@ -145,7 +151,7 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
     ).scalar_one_or_none()
 
     if view is None:
-        return EffectiveBlocklist(scope="view", scope_id=view_id)
+        return None
 
     # View-scoped lists precede the group's, so a view's own list wins a
     # duplicate owner name; each tier is in a stable order of its own.
@@ -153,8 +159,39 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
     if view.group is not None:
         for bl in _stable_list_order(list(view.group.blocklists)):
             combined.setdefault(bl.id, bl)
+    return list(combined.values())
 
-    entries, exceptions, list_ids = await _collect_lists(db, list(combined.values()))
+
+async def effective_lists_for_group(
+    db: AsyncSession, group_id: uuid.UUID
+) -> list[DNSBlockList] | None:
+    """The lists a server group's RPZ zone draws on, in a stable order.
+    ``None`` when the group does not exist."""
+    group = (
+        await db.execute(
+            select(DNSServerGroup)
+            .where(DNSServerGroup.id == group_id)
+            .options(selectinload(DNSServerGroup.blocklists))
+        )
+    ).scalar_one_or_none()
+
+    if group is None:
+        return None
+    return _stable_list_order(list(group.blocklists))
+
+
+async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
+    """Compute the effective blocklist for a DNS view.
+
+    Combines:
+      - Blocklists assigned directly to the view
+      - Blocklists assigned to the view's parent server group
+    """
+    lists = await effective_lists_for_view(db, view_id)
+    if lists is None:
+        return EffectiveBlocklist(scope="view", scope_id=view_id)
+
+    entries, exceptions, list_ids = await _collect_lists(db, lists)
     return EffectiveBlocklist(
         scope="view",
         scope_id=view_id,
@@ -166,20 +203,11 @@ async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> Effe
 
 async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS server group (all views)."""
-    group = (
-        await db.execute(
-            select(DNSServerGroup)
-            .where(DNSServerGroup.id == group_id)
-            .options(selectinload(DNSServerGroup.blocklists))
-        )
-    ).scalar_one_or_none()
-
-    if group is None:
+    lists = await effective_lists_for_group(db, group_id)
+    if lists is None:
         return EffectiveBlocklist(scope="group", scope_id=group_id)
 
-    entries, exceptions, list_ids = await _collect_lists(
-        db, _stable_list_order(list(group.blocklists))
-    )
+    entries, exceptions, list_ids = await _collect_lists(db, lists)
     return EffectiveBlocklist(
         scope="group",
         scope_id=group_id,
@@ -187,6 +215,61 @@ async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> Ef
         exceptions=exceptions,
         lists=list_ids,
     )
+
+
+# ── Streaming the entries (#1662) ─────────────────────────────────────────────
+#
+# The DNS agent bundle carries every entry of every list a zone draws on. The
+# catalog's largest feed is ~582k domains, and ``_collect_lists`` holds all of
+# them at once, as rows and then as one ``EffectiveEntry`` each: the render of
+# such a bundle took the whole 1 GiB worker. The render reads them through
+# these instead, one batch at a time, in exactly ``_collect_lists``'s order.
+
+#: (domain, action, block_mode, target, is_wildcard) — what the bundle ships.
+RenderEntry = tuple[str, str, str, str | None, bool]
+
+
+def _enabled(lists: list[DNSBlockList]) -> list[DNSBlockList]:
+    return [bl for bl in lists if bl.enabled]
+
+
+async def has_entries(db: AsyncSession, lists: list[DNSBlockList]) -> bool:
+    """Does any enabled list of ``lists`` carry an entry?"""
+    ids = [bl.id for bl in _enabled(lists)]
+    if not ids:
+        return False
+    return bool(await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids)))))
+
+
+async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
+    """The exceptions of the enabled lists of ``lists``, as ``_collect_lists``
+    collects them."""
+    out: set[str] = set()
+    for bl in _enabled(lists):
+        rows = await db.execute(
+            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
+        )
+        out.update(domain.lower() for domain in rows.scalars())
+    return out
+
+
+async def stream_entries(
+    db: AsyncSession, lists: list[DNSBlockList], batch: int
+) -> AsyncGenerator[list[RenderEntry], None]:
+    """Every entry ``_collect_lists`` collects for ``lists``, in the same order,
+    at most ``batch`` at a time: one server-side cursor per list, so neither
+    the driver nor this process ever holds more than a batch of a list."""
+    for bl in _enabled(lists):
+        block_mode = bl.block_mode
+        result = await db.stream(_entry_rows(bl.id).execution_options(yield_per=batch))
+        try:
+            async for rows in result.partitions():
+                yield [
+                    (domain.lower(), entry_type, block_mode, target, is_wildcard)
+                    for domain, entry_type, target, is_wildcard in rows
+                ]
+        finally:
+            await result.close()
 
 
 # ── Feed parsing (manual / hosts / domains / adblock) ────────────────────────

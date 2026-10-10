@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS agent bundle render streams a blocklist instead of holding
+  it whole (#1662).** The render of a server whose group carries a
+  blocklist built every entry as a row, an `EffectiveEntry` and a dict,
+  then serialised the whole payload three times (the structural ETag,
+  the ETag, the body) and kept the body. With the catalog's Hagezi
+  Gambling feed (~582k domains, a 60.8 MB body) the Celery child grew
+  ~400 MB, the render took the whole 1 GiB worker of an appliance at
+  the sizing floor, and once the kernel OOM-killed the worker with
+  every DHCP, DNS, IPAM and default task beside it. The render now
+  reads each list through a server-side cursor, 5,000 entries at a
+  time, and writes them straight into the two running ETag hashes and
+  the gzip stream, so it holds one batch whatever the list's length.
+  The stored body, its ETag and its structural ETag are byte-identical
+  (a test pins them to the values before the change), so no agent
+  re-renders and no renderer revision bump is owed. In the backend
+  tests the render's peak grew ~826 bytes per entry before and ~3
+  after (133 MB to 8 MB at 160k entries).
+
 - **An SCP / SFTP backup target can check a pinned host key and sign
   in with a private key again (#1692).** paramiko 4.0 removed DSA
   (`paramiko.DSSKey`), the backend's `paramiko>=3.4.0` has no upper
