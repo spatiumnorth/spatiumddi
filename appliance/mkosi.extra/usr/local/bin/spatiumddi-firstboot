@@ -1762,8 +1762,11 @@ place_deferred_tls_manifest() {
 # (its RBAC has no create, by design) and adopts whatever it finds there. So
 # once the Secret exists, a ``.skip`` beside the manifest tells k3s to leave
 # it alone. k3s keeps the Addon and the Secret as they are, uid and
-# resourceVersion included. Deleting the manifest instead would make k3s
-# delete the Secret with it.
+# resourceVersion included: its deploy controller drops a skipped file from
+# the scan without calling its delete path, which only ``--disable`` reaches
+# (pkg/deploy/controller.go, listFilesIn). The manifest itself stays, because
+# it is what recreates the Secret on a new datastore (a cluster leave) and
+# what the repair below creates it from.
 #
 # Every boot re-asserts the marker. A seed upgraded from a build without it
 # gets it before k3s first starts on the new slot (spatium-tls-manifest-skip,

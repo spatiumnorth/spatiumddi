@@ -12,8 +12,10 @@ write-back then rolled every frontend pod (#1282).
 The manifest's one job is to create the Secret. The api never creates it (its
 RBAC has no create, by design) and adopts whatever it finds there, so once
 the Secret exists a ``.skip`` beside the manifest tells k3s to leave it alone.
-k3s keeps the Addon and the Secret as they are; deleting the manifest instead
-would make k3s delete the Secret with it. Three places carry the marker, and
+k3s keeps the Addon and the Secret as they are: a skipped file is dropped from
+the deploy controller's scan, and only ``--disable`` reaches its delete path.
+The manifest stays, since a cluster leave needs it to create the Secret on the
+new datastore. Three places carry the marker, and
 these tests drive each of them as a shell run:
 
   * firstboot writes it on every boot once the Secret exists, and creates the

@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A k3s start on the seed no longer puts the first-boot Web UI
+  certificate back (#1215).** firstboot hands the self-signed
+  certificate it mints on the seed's first boot to k3s as an
+  auto-deploy manifest, and k3s re-applies every such manifest each
+  time it starts. So every k3s start on the seed, a restart, a crash
+  or any reboot including a rolling upgrade's, wrote that certificate
+  back into `spatium-appliance-tls` over the one the api had deployed:
+  an uploaded, CSR-signed or ACME certificate. A frontend pod that
+  started afterwards served the first-boot certificate, which names
+  only the seed, and since #1282 the api's write-back rolled every
+  frontend pod a few minutes after each seed reboot. Once the Secret
+  exists, the seed now puts k3s's `.skip` marker beside the manifest,
+  which k3s honours by leaving both the Addon and the Secret untouched.
+  firstboot writes it on every boot; a new k3s.service `ExecStartPre`
+  writes it before k3s starts on a seed upgraded from a build without
+  it, and only when every sign says the Secret is already in the
+  datastore; and a cluster leave drops it, because the datastore it
+  starts k3s on is new. A marker found with no Secret behind it makes
+  firstboot create the Secret from the manifest.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
