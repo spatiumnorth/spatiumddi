@@ -87,21 +87,41 @@ the formatter handles the rest.
 - **Losing the node that held the Redis master no longer restarts
   every Celery worker (#1669).** kombu leaves `socket_timeout`,
   `socket_connect_timeout` and `socket_keepalive` unset, and the
-  sentinel result backend took no timeouts on its Sentinel queries
-  either, so a connection to a vanished peer never errored: the
-  worker stayed deaf after Sentinel promoted a replica, its
-  `inspect ping` liveness probe failed three times, and the warm
-  shutdown then blocked in `Channel.close()` reading the dead socket
-  until SIGKILL. The broker and result backend now set a 10 s socket
-  timeout, 5 s connect timeout and TCP keepalive (the kernel resets a
-  connection to a vanished peer within about 25 s), including on
-  Sentinel queries and plain `redis://` URLs, so the worker reconnects
-  to the promoted master and a warm shutdown finishes instead of
-  waiting for SIGKILL. The worker liveness probe tolerates 5 misses
-  instead of 3, and the worker starts with `--without-mingle`: mingle's
-  startup handshake only syncs revoked-task lists, which SpatiumDDI
-  never uses, and a reconnect that met a dead Sentinel there exited the
-  worker as an unrecoverable error.
+  Sentinel queries had no timeouts either, so a connection to a
+  vanished peer never errored: the worker stayed deaf after Sentinel
+  promoted a replica, its `inspect ping` liveness probe failed three
+  times, and the pod was killed. The broker and result backend now set
+  a 10 s socket timeout, 5 s connect timeout and TCP keepalive (the
+  kernel resets a connection to a vanished peer within about 25 s),
+  including on Sentinel queries and plain `redis://` URLs, so the
+  worker reconnects to the promoted master on its own. The liveness
+  probe tolerates 5 misses instead of 3.
+  - **A warm shutdown with no Redis master finishes.** It used to run
+    out its 60 s grace and end in SIGKILL, on main as well. The worker
+    heartbeat publishes every 2 s from the event loop and, with no
+    master, sat in kombu's reconnect for as long as the outage lasted,
+    so SIGTERM was never acted on. Nothing reads worker heartbeats or
+    events, so the worker now starts with `--without-heartbeat` and
+    `--without-gossip` (gossip only consumes heartbeats), as well as
+    `--without-mingle`: mingle syncs revoked-task lists, SpatiumDDI
+    never revokes a task, and a reconnect that met a dead Sentinel
+    inside it exited the worker. Sentinel lookups also no longer take
+    redis-py's default 3 retries, which nest around the connect too and
+    made one lookup against an unreachable Sentinel take about 100 s.
+    In a test rig, shutdowns with no master now take 3–23 s.
+  - **The first result write in each pool child after a failover no
+    longer fails its task.** Its pooled socket still pointed at the old
+    master, and celery's first read of the task's state is not retried.
+    Result writes now retry up to 3 times, each on a connection that
+    asks Sentinel for the current master.
+  - **A `Task.retry` during a broker outage is requeued instead of
+    deleted.** celery turns any failure to publish the retry into
+    `Reject(requeue=False)`, which `task_acks_late` turns into a deleted
+    message; this happened on main too whenever Sentinel had no master.
+    A reject caused by a broker error is now a requeue, so the task runs
+    again once Redis is back.
+  - Not fixed here: Sentinel goes into TILT on a node loss and fails over
+    only after 78–102 s (#1718), and a worker reconnects only after that.
 
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads

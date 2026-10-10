@@ -109,3 +109,87 @@ def test_sentinel_kwargs_reach_the_sentinel_clients():
     assert kw["socket_connect_timeout"] == REDIS_SOCKET_CONNECT_TIMEOUT_S
     assert kw["socket_keepalive"] is True
     assert kw["password"] == "pw"
+
+
+def test_sentinel_lookups_are_not_retried_inside_redis_py():
+    # redis-py's default for a pool-less client (3 retries, nested around the
+    # command AND its connect) made one lookup against an unreachable Sentinel
+    # take ~100 s, holding a warm shutdown past its grace period.
+    from redis.sentinel import Sentinel
+
+    o = build_redis_transport_options("sentinel://s:26379", "m", None)
+    assert o["sentinel_kwargs"]["retry"].get_retries() == 0
+    s = Sentinel([("s", 26379)], sentinel_kwargs=o["sentinel_kwargs"])
+    assert s.sentinels[0].connection_pool.connection_kwargs["retry"].get_retries() == 0
+    # the broker's own (master) connections are untouched by it
+    assert "retry" not in o
+
+
+def test_result_writes_retry_a_bounded_number_of_times():
+    assert celery_app.conf.result_backend_always_retry is True
+    assert 1 <= celery_app.conf.result_backend_max_retries <= 5
+
+
+def _raise_from(filename: str) -> AttributeError:
+    code = compile("def f():\n    None.client\n", filename, "exec")
+    ns: dict = {}
+    exec(code, ns)
+    try:
+        ns["f"]()
+    except AttributeError as exc:
+        return exc
+    raise AssertionError("unreachable")
+
+
+def test_broker_failure_classification():
+    from kombu.exceptions import EncodeError, OperationalError
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    from app.celery_app import _is_broker_failure
+
+    assert _is_broker_failure(OperationalError("No master found"))
+    assert _is_broker_failure(RedisConnectionError("x"))
+    assert _is_broker_failure(RedisTimeoutError("x"))
+    # kombu's closed-channel publish bug, seen on the ddi-pg walk
+    assert _is_broker_failure(_raise_from("/x/site-packages/kombu/transport/redis.py"))
+    # anything else must keep celery's drop, or a bad message loops forever
+    assert not _is_broker_failure(_raise_from("/app/app/tasks/foo.py"))
+    assert not _is_broker_failure(EncodeError("unserialisable"))
+    assert not _is_broker_failure(None)
+
+
+def test_every_task_uses_the_requeueing_base():
+    from app.celery_app import SpatiumTask
+
+    celery_app.loader.import_default_modules()
+    names = [n for n in celery_app.tasks if n.startswith("app.")]
+    assert names
+    assert all(isinstance(celery_app.tasks[n], SpatiumTask) for n in names)
+
+
+def test_retry_rejected_by_the_broker_is_requeued(monkeypatch):
+    import pytest
+    from celery import Task
+    from celery.exceptions import Reject
+    from kombu.exceptions import EncodeError, OperationalError
+
+    from app.celery_app import SpatiumTask
+
+    task = celery_app.tasks["app.tasks.event_outbox.process_event_outbox"]
+
+    def broker_down(self, *a, **kw):
+        raise Reject(OperationalError("No master found"), requeue=False)
+
+    monkeypatch.setattr(Task, "retry", broker_down)
+    with pytest.raises(Reject) as info:
+        SpatiumTask.retry(task)
+    assert info.value.requeue is True
+
+    def bad_payload(self, *a, **kw):
+        raise Reject(EncodeError("nope"), requeue=False)
+
+    monkeypatch.setattr(Task, "retry", bad_payload)
+    with pytest.raises(Reject) as info:
+        SpatiumTask.retry(task)
+    assert info.value.requeue is False
