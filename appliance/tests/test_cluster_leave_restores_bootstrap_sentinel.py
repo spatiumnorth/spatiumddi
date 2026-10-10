@@ -40,7 +40,9 @@ def _leave(
     nft_dir = tmp_path / "nftables.d"
     nft_dir.mkdir()
     if sentinel == "retired":
-        (nft_dir / f"{SENTINEL}.retired").write_text('tcp dport 6443 accept comment "k3s-bootstrap"\n')
+        (nft_dir / f"{SENTINEL}.retired").write_text(
+            'tcp dport 6443 accept comment "k3s-bootstrap"\n'
+        )
     elif sentinel == "present":
         (nft_dir / SENTINEL).write_text('tcp dport 6443 accept comment "k3s-bootstrap"\n')
     calls = tmp_path / "calls"
