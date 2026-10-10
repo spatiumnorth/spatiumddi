@@ -85,6 +85,7 @@ pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
 place_deferred_control_manifest() {{ :; }}
+skip_tls_manifest_reapply() {{ :; }}
 commit_slot_if_healthy() {{ echo committed > "{tmp_path}/committed"; }}
 is_trial_boot() {{ return {0 if trial else 1}; }}
 {real.replace(HELPER, str(helper))}

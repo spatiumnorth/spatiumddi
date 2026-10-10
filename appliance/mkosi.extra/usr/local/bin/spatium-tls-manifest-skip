@@ -1,0 +1,52 @@
+#!/bin/sh
+# spatium-tls-manifest-skip — runs before every k3s start (k3s.service
+# ExecStartPre), #1215.
+#
+# k3s re-applies every manifest in its manifests dir each time it starts, and
+# spatium-appliance-tls.yaml holds the self-signed certificate firstboot minted
+# on the seed's first boot. So each k3s start put that certificate back over
+# whatever the api had deployed into the spatium-appliance-tls Secret.
+# firstboot now writes the manifest's ``.skip`` marker once the Secret exists
+# (skip_tls_manifest_reapply), but only once k3s is up. On the first boot of a
+# slot upgraded from a build without it, k3s would revert the certificate once
+# more before firstboot got there. This runs before k3s starts, and writes the
+# marker for it.
+#
+# It writes the marker only where the Secret must already exist, and does
+# nothing everywhere else:
+#   * no placed manifest: a joined member (the seed owns the Secret, #590), or
+#     a first boot before firstboot placed it (it is staged first, #994);
+#   * the marker already there: every start on a seed that has it;
+#   * no first boot finished before this boot: the manifest may have been
+#     placed moments ago and not applied yet (a k3s restart during a first
+#     boot). firstboot's own run handles that boot;
+#   * no datastore: k3s's first start, or the new one a cluster leave starts
+#     (spatium-cluster-join), which has to create the Secret from the manifest.
+# A marker on a datastore that does not hold the Secret would leave the Web UI
+# with no certificate. So every doubt leaves the manifest to k3s, which costs
+# at worst the behaviour before #1215 for one more start.
+#
+# Never fails k3s's start (the unit runs it as ExecStartPre=-).
+set -u
+
+MANIFEST="${SPATIUM_K3S_MANIFESTS_DIR:-/var/lib/rancher/k3s/server/manifests}/spatium-appliance-tls.yaml"
+DATASTORE="${SPATIUM_K3S_DB_DIR:-/var/lib/rancher/k3s/server/db}"
+STAMP="${SPATIUM_FIRSTBOOT_STAMP:-/var/lib/spatiumddi/firstboot.done}"
+PROC_STAT="${SPATIUM_PROC_STAT:-/proc/stat}"
+
+[ -f "$MANIFEST" ] || exit 0
+[ -e "$MANIFEST.skip" ] && exit 0
+[ -f "$STAMP" ] || exit 0
+[ -d "$DATASTORE" ] || exit 0
+
+# firstboot rewrites its stamp on every boot that reaches a ready k3s, so a
+# stamp older than this boot means an earlier boot finished, and placed the
+# manifest (it does so right after the stamp).
+booted=$(awk '$1 == "btime" { print $2 }' "$PROC_STAT" 2>/dev/null)
+stamped=$(date -r "$STAMP" +%s 2>/dev/null)
+case "$booted" in '' | *[!0-9]*) exit 0 ;; esac
+case "$stamped" in '' | *[!0-9]*) exit 0 ;; esac
+[ "$stamped" -lt "$booted" ] || exit 0
+
+touch "$MANIFEST.skip" || exit 0
+echo "spatium-tls-manifest-skip: k3s no longer re-applies $MANIFEST over the api's certificate (#1215)."

@@ -1749,6 +1749,61 @@ place_deferred_tls_manifest() {
     echo "Placed self-signed TLS Secret manifest at $TLS_CERT_MANIFEST"
 }
 
+# #1215 — k3s re-applies every manifest in its manifests dir each time it
+# starts, and this one holds the certificate minted on the first boot. So every
+# k3s start on the seed put that certificate back over the one the api had
+# deployed into spatium-appliance-tls (an uploaded, CSR-signed or ACME one).
+# On a single node the api does not restart with k3s (KillMode=process keeps
+# the pods), so the revert stayed until the api next restarted and wrote the
+# active certificate back; and since #1282 that write-back rolls every
+# frontend pod.
+#
+# The manifest's one job is to create the Secret: the api never creates it
+# (its RBAC has no create, by design) and adopts whatever it finds there. So
+# once the Secret exists, a ``.skip`` beside the manifest tells k3s to leave
+# it alone. k3s keeps the Addon and the Secret as they are, uid and
+# resourceVersion included. Deleting the manifest instead would make k3s
+# delete the Secret with it.
+#
+# Every boot re-asserts the marker. A seed upgraded from a build without it
+# gets it before k3s first starts on the new slot (spatium-tls-manifest-skip,
+# a k3s.service ExecStartPre), and a cluster leave drops it (its datastore is
+# new). A marker with no Secret behind it would leave the Web UI with no
+# certificate, since k3s never applies a skipped manifest; that case creates
+# the Secret from the manifest here, as k3s's next start used to.
+skip_tls_manifest_reapply() {
+    [ -f "$TLS_CERT_MANIFEST" ] || return 0
+    node_is_cluster_member && return 0
+    local skip="${TLS_CERT_MANIFEST}.skip" out have=0
+    for _ in $(seq 1 24); do   # up to 2 min
+        if out=$(/usr/local/bin/k3s kubectl -n spatium get secret spatium-appliance-tls -o name 2>&1); then
+            have=1
+            break
+        fi
+        # Only an explicit NotFound says the Secret is missing; an apiserver
+        # that did not answer says nothing either way.
+        case "$out" in
+            *NotFound*)
+                if [ -e "$skip" ] && /usr/local/bin/k3s kubectl create -f "$TLS_CERT_MANIFEST" >/dev/null 2>&1; then
+                    echo "WARN: spatium-appliance-tls was missing behind $skip — created it from the manifest" >&2
+                    echo "      (the first-boot certificate; the api deploys the active one again when it next starts)." >&2
+                    have=1
+                    break
+                fi
+                ;;
+        esac
+        sleep 5
+    done
+    if [ "$have" != 1 ]; then
+        echo "WARN: spatium-appliance-tls not found after 2 min — leaving $TLS_CERT_MANIFEST to k3s;" >&2
+        echo "      the next boot looks again." >&2
+        return 0
+    fi
+    [ -e "$skip" ] && return 0
+    touch "$skip"
+    echo "spatium-appliance-tls exists — k3s no longer re-applies $TLS_CERT_MANIFEST over the api's certificate (#1215)."
+}
+
 # #1123 — put spatium-control-plane back BEFORE the control chart is released.
 #
 # release_control_manifest's degraded path covers the CONTROL chart only. The
@@ -1953,6 +2008,9 @@ if [ "$ready" = 1 ]; then
     place_deferred_tls_manifest
     reassert_control_plane_class || true
     place_deferred_control_manifest
+    # #1215 — after the webhook wait above, by when k3s applied the TLS
+    # manifest placed earlier long ago, and before the commit, which can exit.
+    skip_tls_manifest_reapply
     slot_images_allow_commit || exit 1
     commit_slot_if_healthy
     # #779 — immediate first verdict on Web UI firewall reachability, so a
