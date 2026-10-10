@@ -260,19 +260,18 @@ _DB_URL = "postgresql+asyncpg://spatium:pw@db.internal:5433/spatiumddi"
 
 @pytest.mark.asyncio
 async def test_restore_helpers_spawn_pg_tools_with_the_allowlisted_env(
-    captured_envs: list[dict[str, str]], tmp_path: Path
+    captured_envs: list[dict[str, str]],
 ):
     from app.services.backup import restore as restore_mod
 
     pg_env = {"PGHOST": "db.internal", "PGPASSWORD": "pw"}
     await restore_mod._terminate_other_db_connections(pg_env)
-    await restore_mod._truncate_tables(["dns_zone"], _DB_URL)
-    await restore_mod._run_pg_restore_data_only(tmp_path / "dump", _DB_URL, ["dns_zone"])
     await restore_mod._collect_post_restore_warnings(_DB_URL)
 
-    # terminate (x2: standalone + inside pg_restore), truncate,
-    # pg_restore, DNSSEC scan.
-    assert len(captured_envs) == 5
+    # terminate, DNSSEC scan. The selective restore's pg_restore and psql
+    # now run as one streamed replay (#1693), which this stub cannot drive;
+    # test_selective_restore_app_role_1693.py pins their env on real ones.
+    assert len(captured_envs) == 2
     for env in captured_envs:
         assert "SPATIUM_TEST_SECRET_SENTINEL" not in env
         assert env["PGHOST"] == "db.internal"
