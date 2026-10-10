@@ -84,6 +84,17 @@ def _zone_slug(dns_name: str) -> str:
     return slug[:63].rstrip("-")
 
 
+def _cause_is(exc: BaseException, name: str) -> bool:
+    """True when ``exc`` was raised from a ``google.api_core`` error class ``name``.
+
+    ``_wrap_call`` re-raises SDK errors as ``CloudDNSError(...) from exc``;
+    the original is the ``__cause__``. Matched on the class name through the
+    MRO so the SDK stays a lazy import.
+    """
+    cause = exc.__cause__
+    return cause is not None and any(c.__name__ == name for c in type(cause).__mro__)
+
+
 class GoogleCloudDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Google Cloud DNS managed zones."""
 
@@ -418,7 +429,21 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 slug,
                 dns_name=name,
             )
-            await asyncio.to_thread(self._wrap_call, "create_zone", managed.create)
+            try:
+                await asyncio.to_thread(self._wrap_call, "create_zone", managed.create)
+            except CloudDNSError as exc:
+                # #1537 — HTTP 409 (``Conflict``, "already exists") is the
+                # converged signal, but only if a managed zone with THIS
+                # dns_name is really there: a 409 on the slug alone could
+                # be a different domain that took the same zone name.
+                if not _cause_is(exc, "Conflict"):
+                    raise
+                await self._resolve_zone(client, name)
+                logger.info(
+                    "google_dns.apply_zone.create_already_exists",
+                    server=str(getattr(server, "id", "")),
+                    zone=name,
+                )
             return
 
         if op == "delete":
@@ -445,7 +470,10 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             try:
                 await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
             except CloudDNSError as exc:
-                if "not found" in str(exc).lower() or "404" in str(exc):
+                # #1537 — only a 404 (``NotFound``) from the delete call
+                # itself; matching message text could swallow an unrelated
+                # failure that happens to mention a 404.
+                if _cause_is(exc, "NotFound"):
                     return
                 raise
             return

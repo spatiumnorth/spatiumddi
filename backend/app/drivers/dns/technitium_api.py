@@ -538,7 +538,23 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 )
                 return
             if op == "delete":
-                await self._call(client, "zones/delete", f"delete zone {bare!r}", {"zone": bare})
+                try:
+                    await self._call(
+                        client, "zones/delete", f"delete zone {bare!r}", {"zone": bare}
+                    )
+                except CloudDNSError as exc:
+                    # #1537 — Technitium answers "No such zone was found: x"
+                    # for a zone that is already gone. Matched on the error
+                    # envelope text only; invalid-token / 2fa / transport
+                    # errors have different messages and still raise.
+                    if "no such zone was found" in str(exc).lower():
+                        logger.info(
+                            "technitium_api.zone_delete_noop_absent",
+                            server=str(getattr(server, "id", "")),
+                            zone=bare,
+                        )
+                        return
+                    raise
                 return
             # Unreachable while ``CloudDNSDriverBase.apply_zone_change``
             # validates op first — kept so this method is safe to call

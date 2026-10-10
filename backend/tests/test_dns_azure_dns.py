@@ -606,7 +606,7 @@ async def test_apply_zone_create(
     await driver._apply_zone(server, dict(_CREDS), zone, "create")
 
     client.zones.create_or_update.assert_called_once_with(
-        "rg", "new.example.com", {"location": "global"}
+        "rg", "new.example.com", {"location": "global"}, if_none_match="*"
     )
 
 
@@ -699,3 +699,63 @@ async def test_apply_record_create_mx_bare_target_does_not_raise(
 
     _, _, _, _, params = client.record_sets.create_or_update.call_args.args
     assert params["mx_records"] == [{"preference": 15, "exchange": "mail.example.com"}]
+
+
+# ── #1537 — zone create / delete converge on retry ───────────────────────────
+
+
+class _HttpErr(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+async def test_apply_zone_create_existing_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    """412 on the create-only PUT = the zone already exists in the group."""
+    client = Mock()
+    client.zones.create_or_update.side_effect = _HttpErr(412)
+    _patch_client(monkeypatch, driver, client)
+    await driver._apply_zone(server, dict(_CREDS), SimpleNamespace(name="a.example.com."), "create")
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+async def test_apply_zone_create_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    driver: AzureDNSDriver,
+    server: SimpleNamespace,
+    status: int,
+) -> None:
+    client = Mock()
+    client.zones.create_or_update.side_effect = _HttpErr(status)
+    _patch_client(monkeypatch, driver, client)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(
+            server, dict(_CREDS), SimpleNamespace(name="a.example.com."), "create"
+        )
+
+
+async def test_apply_zone_delete_missing_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch, driver: AzureDNSDriver, server: SimpleNamespace
+) -> None:
+    client = Mock()
+    client.zones.begin_delete.side_effect = _HttpErr(404)
+    _patch_client(monkeypatch, driver, client)
+    await driver._apply_zone(server, dict(_CREDS), SimpleNamespace(name="a.example.com."), "delete")
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 429, 500])
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    driver: AzureDNSDriver,
+    server: SimpleNamespace,
+    status: int,
+) -> None:
+    client = Mock()
+    client.zones.begin_delete.side_effect = _HttpErr(status)
+    _patch_client(monkeypatch, driver, client)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(
+            server, dict(_CREDS), SimpleNamespace(name="a.example.com."), "delete"
+        )

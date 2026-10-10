@@ -1132,3 +1132,101 @@ async def test_set_write_srv_converged_is_a_noop(
     await driver._apply_record(_Server(), _CREDS, change)
 
     assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+# ── #1537 — zone create / delete converge on retry ──────────────────────
+def _err(status: int, code: int, message: str = "boom") -> _FakeResponse:
+    return _FakeResponse(
+        status,
+        {"success": False, "errors": [{"code": code, "message": message}], "result": None},
+    )
+
+
+async def test_apply_zone_create_already_exists_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "create")
+    assert [c["method"] for c in fake.calls] == ["post", "get"]
+
+
+async def test_apply_zone_create_exists_but_not_visible_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1061 with no zone visible to the token is not proof it is ours."""
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "create")
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), [(403, 9109), (429, 971), (500, 1061 + 1), (400, 1097)]
+)
+async def test_apply_zone_create_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch, status: int, code: int
+) -> None:
+    fake = _FakeClient({"post": [_err(status, code)]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "create")
+
+
+async def test_apply_zone_delete_absent_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+    assert [c["method"] for c in fake.calls] == ["get"]
+
+
+async def test_apply_zone_delete_404_after_lookup_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_err(404, 1001, "Invalid zone")],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    # Lookup itself failing (auth / throttle) must not read as "absent".
+    fake = _FakeClient({"get": [_err(status, 9109)]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_err(status, 9109)],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")

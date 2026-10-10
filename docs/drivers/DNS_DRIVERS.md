@@ -364,8 +364,8 @@ Activated when `DNSServer.credentials_encrypted` is set. Does **not** replace Pa
 | Operation | Mechanism | Notes |
 |---|---|---|
 | List zones | `Get-DnsServerZone \| Where { -not $_.IsAutoCreated }` | Feeds the group-level "Sync with Servers" step 1. |
-| Create zone | `Add-DnsServerPrimaryZone -Name <n> -ReplicationScope Domain -DynamicUpdate Secure` | Guarded with `Get-DnsServerZone -ErrorAction SilentlyContinue` — idempotent. |
-| Delete zone | `Remove-DnsServerZone -Name <n> -Force` | Same idempotent guard — no-op when zone already absent. |
+| Create zone | `Add-DnsServerPrimaryZone -Name <n> -ReplicationScope Domain -DynamicUpdate Secure` | Guarded by a strict `Get-DnsServerZone -ErrorAction Stop` probe: only Win32 9601 (zone does not exist) reads as absent, so access-denied and other probe failures fail the op instead of passing as converged (#1537). An existing zone, or a lost create race (Win32 9609), is success. |
+| Delete zone | `Remove-DnsServerZone -Name <n> -Force` | Same probe — no-op when the zone is already absent (9601, including a zone that vanishes between probe and remove). |
 | Pull records | `Get-DnsServerResourceRecord -ZoneName <n>` | Sidesteps AXFR ACLs on AD-integrated zones. Returns JSON that the driver normalises into `RecordData`. |
 | Test connection | `(Get-DnsServerSetting -All).BuildNumber` | Cheap probe used by the `POST /dns/test-windows-credentials` endpoint and the UI's Test button. |
 | Record writes | **Still RFC 2136** | PowerShell-per-record would be too slow for hot writes. |
@@ -410,6 +410,8 @@ await db.commit()
 ```
 
 If the push fails, the 502 response prevents the DB commit — the Windows DNS state and SpatiumDDI state stay consistent. Record ops follow the same pattern via the agent-side op queue for agented drivers and direct calls for agentless.
+
+**Zone create / delete converge on retry (#1537).** Because a multi-server push can fail partway (the DB rolls back, servers already done are not), every agentless driver treats the end state as success: a zone create that finds the zone already there, and a zone delete that finds it already gone, return normally. Only the provider's own "exists" / "not found" signal counts, never auth, throttling or 5xx errors: Windows Win32 9609 / 9601; Cloudflare error code 1061 on create (confirmed by a name lookup the token can see) and an empty name lookup or HTTP 404 on delete; Route 53 a hosted zone carrying this zone row's deterministic `CallerReference` on create (a same-named zone SpatiumDDI did not create is refused with a 409, never adopted) and `NoSuchHostedZone` on delete; Azure a create-only PUT (`If-None-Match: *`, 412 = exists) and 404 on delete; Google Cloud DNS HTTP 409 on create (only when a managed zone with the same `dns_name` is visible) and 404 on delete; Technitium API `already exists` on create and `No such zone was found` on delete. Technitium cannot tell a same-name zone of another type from ours on create, so a pre-existing non-primary zone of that name is reported as done.
 
 ### 3.6 Shared AXFR helper
 

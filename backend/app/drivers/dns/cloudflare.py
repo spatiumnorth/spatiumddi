@@ -30,6 +30,7 @@ import ipaddress
 from typing import Any
 
 import httpx
+import structlog
 
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
@@ -40,6 +41,25 @@ from app.drivers.dns._cloud_base import (
     split_structured_rdata,
 )
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
+
+logger = structlog.get_logger(__name__)
+
+# Cloudflare API error 1061, "Zone already exists" (zone create, #1537).
+_ZONE_ALREADY_EXISTS = 1061
+
+
+class _CloudflareAPIError(CloudDNSError):
+    """A Cloudflare API failure that keeps its HTTP status and error codes.
+
+    Lets the zone create / delete paths tell the one converged answer apart
+    from auth, throttling and server errors without matching message text.
+    """
+
+    def __init__(self, message: str, *, status: int, codes: list[Any]) -> None:
+        super().__init__(message)
+        self.status = status
+        self.codes = codes
+
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the
@@ -183,7 +203,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         errors = body.get("errors") or []
         messages = [str(e.get("message", e)) for e in errors if e]
         detail = "; ".join(m for m in messages if m) or f"HTTP {status}"
-        raise CloudDNSError(f"Cloudflare API error: {detail}")
+        raise _CloudflareAPIError(
+            f"Cloudflare API error: {detail}",
+            status=status,
+            codes=[e.get("code") for e in errors if isinstance(e, dict)],
+        )
 
     def _token(self, creds: dict[str, Any]) -> str:
         token = (creds or {}).get("api_token")
@@ -613,13 +637,53 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 if account_id:
                     payload["account"] = {"id": str(account_id)}
                 resp = await client.post("/zones", json=payload)
-                self._unwrap(resp)
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # #1537 — error 1061 "Zone already exists" is the only
+                    # converged signal. Confirm the token can see a zone of
+                    # that name (a lookup scoped to the token's account)
+                    # before calling it done; a zone held by ANOTHER
+                    # account is a different error code and stays a failure.
+                    if _ZONE_ALREADY_EXISTS not in exc.codes:
+                        raise
+                    await self._resolve_zone_id(client, zone_fqdn)
+                    logger.info(
+                        "cloudflare.apply_zone.create_already_exists",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
                 return
 
             if op == "delete":
-                zone_id = await self._resolve_zone_id(client, zone_fqdn)
+                try:
+                    zone_id = await self._resolve_zone_id(client, zone_fqdn)
+                except CloudDNSError as exc:
+                    # #1537 — an already-absent zone is the desired end state.
+                    # Only the "zone not found" lookup miss; auth, rate-limit
+                    # and 5xx errors from the lookup propagate.
+                    if isinstance(exc, _CloudflareAPIError):
+                        raise
+                    if "not found on this account" in str(exc):
+                        logger.info(
+                            "cloudflare.apply_zone.delete_noop_absent",
+                            server=str(getattr(server, "id", "")),
+                            zone=bare,
+                        )
+                        return
+                    raise
                 resp = await client.delete(f"/zones/{zone_id}")
-                self._unwrap(resp)
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # Gone between the lookup and the delete (HTTP 404 only).
+                    if exc.status != 404:
+                        raise
+                    logger.info(
+                        "cloudflare.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
                 return
 
             raise CloudDNSError(f"Cloudflare: unsupported zone op {op!r}")

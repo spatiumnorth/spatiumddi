@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import structlog
+
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
@@ -67,6 +69,15 @@ _RECORD_TYPE_TO_AZURE_ATTR = {
     "PTR": "ptr_records",
     "CAA": "caa_records",
 }
+
+
+logger = structlog.get_logger(__name__)
+
+
+def _http_status(exc: Exception) -> int | None:
+    """HTTP status carried by an Azure SDK ``HttpResponseError``, else None."""
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
 
 
 def _zone_label(zone_name: str) -> str:
@@ -590,12 +601,27 @@ class AzureDNSDriver(CloudDNSDriverBase):
 
         if op == "create":
 
+            # #1537 — ``If-None-Match: *`` makes the PUT create-only: an
+            # existing zone of this name in this resource group answers
+            # 412 Precondition Failed, which is the converged state (a zone
+            # name is unique per resource group, so it IS the same zone).
+            # Without it the PUT silently overwrote the existing zone's
+            # tags / properties.
             def _create() -> None:
-                client.zones.create_or_update(rg, zone_label, {"location": "global"})
+                client.zones.create_or_update(
+                    rg, zone_label, {"location": "global"}, if_none_match="*"
+                )
 
             try:
                 await asyncio.to_thread(_create)
             except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+                if _http_status(exc) == 412:
+                    logger.info(
+                        "azure_dns.apply_zone.create_already_exists",
+                        server=str(getattr(server, "id", "")),
+                        zone=zone_label,
+                    )
+                    return
                 raise self._wrap_errors(exc) from exc
             return
 
@@ -610,6 +636,16 @@ class AzureDNSDriver(CloudDNSDriverBase):
         try:
             await asyncio.to_thread(_delete)
         except Exception as exc:  # noqa: BLE001 — wrapped into CloudDNSError
+            # #1537 — ResourceNotFound (HTTP 404) on delete means the zone
+            # is already gone. Auth failures (401/403), throttling (429)
+            # and 5xx are not this and still raise.
+            if _http_status(exc) == 404:
+                logger.info(
+                    "azure_dns.apply_zone.delete_noop_absent",
+                    server=str(getattr(server, "id", "")),
+                    zone=zone_label,
+                )
+                return
             raise self._wrap_errors(exc) from exc
 
     # ── Capabilities ─────────────────────────────────────────────────────

@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Agentless DNS drivers treat an existing zone on create and a
+  missing zone on delete as done (#1537).** A zone push to several
+  agentless servers can fail partway; the DB rolls back but the servers
+  already done keep their change, so the retry used to fail on the first
+  server ("already exists" on create, "not found" on delete). Each
+  driver now accepts only the provider's own signal: Cloudflare error
+  1061 on create (after confirming the token can see the zone) and an
+  absent zone or HTTP 404 on delete; Azure DNS creates with
+  `If-None-Match: *` (412 means it exists, and an existing zone's tags
+  are no longer overwritten) and treats 404 on delete as done; Google
+  Cloud DNS accepts a 409 on create only when a managed zone with that
+  DNS name exists, and matches the delete 404 by exception class rather
+  than message text; Technitium accepts `No such zone was found` on
+  delete. Windows DNS probed with `SilentlyContinue`, so an
+  access-denied probe read as "zone absent" and a delete reported
+  success; only Win32 9601 now means absent. Authentication, throttling
+  and server errors still fail in every driver, and Route 53 still
+  refuses to adopt a same-named zone it did not create.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
