@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **On a multi-node control plane the slot-image mirror starts and stays
+  up, so an uploaded upgrade image has somewhere to live (#1174).** Once the
+  control plane has more than one node, the supervisor turns on the
+  slot-image mirror: the one place an uploaded or imported upgrade image is
+  kept, and where every node fetches it during a rolling upgrade. The mirror
+  runs the api's image and imports the whole application before it serves a
+  byte (about 280 MiB once started), but it kept resources written for a
+  small idle process, 256Mi of memory and 500m of CPU. It was OOMKilled
+  during that import and crash-looped, so an air-gapped rolling upgrade had
+  no image source. The mirror is now sized as the api: it takes
+  `api.resources` (on an appliance, the memory limit the supervisor sizes
+  from the node's RAM), with any `slotImageMirror.resources` key laid over
+  it, and the Charts job refuses a render whose mirror memory or CPU limit
+  is below the api's. Its liveness and readiness probes are the api's too
+  (`api.probes`, with `slotImageMirror.probes` laid over them): its own
+  probes killed a start that had not bound its port about 40 seconds in,
+  and gave each check the kubelet's default 1 second, so a slow cold start
+  on a busy node was killed before it served (the pod in #1174 logged 12
+  liveness kills before its OOMKills).
+
 - **An ACME order whose CA cannot be reached now ends, and says why
   (#1686).** A refused, timed-out or reset connection to the CA left
   the order `processing` for the Celery task's retries, and nothing
