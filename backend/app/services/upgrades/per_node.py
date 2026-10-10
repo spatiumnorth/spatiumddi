@@ -515,6 +515,10 @@ async def _step_mirror_ready(
         return step.finish(
             True, skipped=True, reason="the node already holds this stamp; nothing new to fetch"
         )
+    # End the read before the wait: nothing below needs the database, and a
+    # connection held idle for minutes is one the database can close under the
+    # stamp that follows.
+    await db.commit()
 
     started = time.monotonic()
     deadline = started + timeout_s
@@ -1122,6 +1126,11 @@ async def single_node_upgrade(
     # service, before anything below takes the node out of it.
     if not await _run("stage", _step_stage(db, node_name, target_version, stamped_at=stamped_at)):
         return _failed(node_name, target_version, "stage", results)
+    # End the stage's read before the node leaves service. Cordoning the node
+    # that runs the CNPG primary switches it over, and the switchover closes
+    # every connection the old primary held; the reboot after the drain has
+    # to start on a fresh connection, not commit on one of those.
+    await db.commit()
     if cnpg_cluster_name:
         if not await _run(
             "cnpg_maintenance_on",

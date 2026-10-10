@@ -16,13 +16,16 @@ whatever runs on it still serve, and drains only before the reboot.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select, text
 
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.services.appliance.slot_image_target import SlotImageTarget
 from app.services.upgrades import alerts, per_node
@@ -575,3 +578,108 @@ async def test_the_chain_asks_for_the_mirror_it_was_given(
     )
 
     assert seen == [MIRROR, "acme-spatiumddi-slot-image-mirror"]
+
+
+# ── No connection held while the node leaves service (#1463) ──────────────────
+#
+# Found by ddi-pg's three-node walk of this change. Cordoning the node that ran
+# the CNPG primary switched the primary over, and the old primary's demotion
+# closed every connection it held. The chain had carried the stage step's last
+# read across the cordon on one of them, so the reboot after the drain
+# committed on a closed connection and crashed: "cannot call
+# Transaction.commit(): the underlying connection is closed".
+
+
+async def _switchover(db: Any) -> None:
+    """Close every other connection to the test database, as a CNPG primary's
+    demotion closes every connection it held."""
+    async with db.bind.connect() as conn:
+        await conn.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+            )
+        )
+    # Let asyncpg read the closed connections' end before the next step.
+    await asyncio.sleep(0.2)
+
+
+@pytest.mark.asyncio
+async def test_a_switchover_at_the_cordon_does_not_crash_the_reboot(
+    db_session: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_session.add(
+        Appliance(
+            id=uuid.uuid4(),
+            hostname="node-1",
+            public_key_der=b"fake-key",
+            public_key_fingerprint="ab" * 32,
+            state=APPLIANCE_STATE_APPROVED,
+            deployment_kind="appliance",
+            installed_appliance_version=OLD,
+            last_upgrade_state="done",
+            last_upgrade_state_at=datetime.now(UTC),
+            last_upgrade_progress={"step": "reboot-pending"},
+            slot_a_version=OLD,
+            slot_b_version=TARGET,
+        )
+    )
+    await db_session.commit()
+    stage, reboot = per_node._step_stage, per_node._step_reboot
+    _recording_chain(monkeypatch, [])
+    monkeypatch.setattr(per_node, "_step_stage", stage)
+    monkeypatch.setattr(per_node, "_step_reboot", reboot)
+
+    async def _cordon(*_a: Any, **_k: Any) -> per_node.StepResult:
+        await _switchover(db_session)
+        return per_node.StepResult(name="cordon", started_at="t").finish(True)
+
+    monkeypatch.setattr(per_node, "_step_cordon", _cordon)
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node, "publish_wake", AsyncMock())
+
+    result = await _chain(db_session)
+
+    assert result.ok is True, result.error
+    requested = await db_session.scalar(
+        select(Appliance.reboot_requested).where(Appliance.hostname == "node-1")
+    )
+    assert requested is True
+
+
+@pytest.mark.asyncio
+async def test_the_stage_read_ends_before_the_node_leaves_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _recording_chain(monkeypatch, events)
+    db = MagicMock()
+    db.commit = AsyncMock(side_effect=lambda: events.append("commit"))
+
+    await _chain(db)
+
+    i = events.index("stage")
+    assert events[i + 1 : i + 3] == ["commit", "cnpg_maintenance_on"], events
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_wait_holds_no_transaction_while_it_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait can last minutes; a connection held idle across it is one the
+    database can close under the stamp that follows."""
+    events: list[str] = []
+    db = _db(lambda _row: events.append("read"))
+    db.commit = AsyncMock(side_effect=lambda: events.append("commit"))
+
+    def _get(name: str, namespace: str | None = None) -> Any:
+        events.append("poll")
+        return 200, {"status": {"readyReplicas": 1}}
+
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node.k8s, "get_deployment", _get)
+    with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=_Row())):
+        step = await per_node._step_mirror_ready(db, "node-1", TARGET, UPLOADED, deployment=MIRROR)
+
+    assert step.ok is True, step.error
+    assert events == ["commit", "read", "commit", "poll"]
