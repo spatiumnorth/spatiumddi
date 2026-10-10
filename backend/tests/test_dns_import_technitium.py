@@ -125,7 +125,7 @@ def test_rdata_to_value_svcb_params_dict_to_presentation() -> None:
     value, _ = _rdata_to_value(
         "HTTPS", {"svcPriority": 1, "svcTargetName": ".", "svcParams": {"alpn": "h2,h3"}}
     )
-    assert value == '1 . alpn="h2,h3"'
+    assert value == "1 . alpn=h2,h3"
 
 
 def test_build_imported_zone_hoists_soa_and_skips_dnssec() -> None:
@@ -230,9 +230,9 @@ def test_svcb_params_sorted_by_key_and_valueless_keys_kept() -> None:
     from app.services.technitium.rdata import svcb_params
 
     _, _, params = svcb_params('1 . port=443 alpn="h2"')
-    assert params == "alpn|h2,port|443"
+    assert params == "alpn|h2|port|443"
     _, _, params = svcb_params('1 . no-default-alpn alpn="h2"')
-    assert params == "alpn|h2,no-default-alpn|"
+    assert params == "alpn|h2|no-default-alpn|true"
 
 
 def test_record_params_uri_and_aaaa_canonicalisation() -> None:
@@ -258,3 +258,153 @@ def test_pull_normalize_value_uri_and_aaaa() -> None:
         "1 1 https://example.test/path/"
     )
     assert _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.") == "2001:db8::1"
+
+
+# ── #1513 / #1698: SVCB/HTTPS compare canonically ──────────────────────
+
+
+def _key_of(value: str, rtype: str = "SVCB", zone: str = "example.net."):
+    from app.drivers.dns.base import RecordData
+    from app.services.dns.pull_from_server import _key
+
+    return _key(RecordData(name="svc", record_type=rtype, value=value), zone)
+
+
+def test_svcb_quoting_is_one_record() -> None:
+    """The exact QA case: stored ``alpn=h2`` vs read back ``alpn="h2"``."""
+    assert _key_of("1 . alpn=h2") == _key_of('1 . alpn="h2"')
+
+
+def test_svcb_in_zone_target_relative_or_absolute_is_one_record() -> None:
+    a = _key_of("1 svc.example.net. alpn=h2")
+    assert a == _key_of("1 svc alpn=h2")
+    assert a == _key_of("1 SVC.Example.Net. alpn=h2")
+
+
+def test_svcb_param_order_valueless_and_mandatory() -> None:
+    a = _key_of('1 . port=443 no-default-alpn mandatory="port,alpn" alpn=h2', "HTTPS")
+    b = _key_of("1 . mandatory=alpn,port alpn=h2 no-default-alpn port=443", "HTTPS")
+    assert a == b
+
+
+def test_svcb_different_records_stay_different() -> None:
+    base = _key_of("1 . alpn=h2")
+    assert base != _key_of("1 . alpn=h3")
+    assert base != _key_of("2 . alpn=h2")
+    assert base != _key_of("1 . alpn=h2 port=443")
+    assert base != _key_of("1 other.example.net. alpn=h2")
+    assert _key_of("1 . alpn=h2,h3") != _key_of("1 . alpn=h3,h2")
+
+
+def test_rdata_to_value_round_trips_to_the_same_key() -> None:
+    """What the agentless driver reads back keys the same as what was
+    stored — quoting, relative target and valueless param included."""
+    stored = "1 svc.example.net. alpn=h2 no-default-alpn port=8443"
+    value, _ = _rdata_to_value(
+        "SVCB",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "svc.example.net",
+            "svcParams": {"port": "8443", "no-default-alpn": None, "alpn": "h2"},
+        },
+    )
+    assert value == "1 svc.example.net. alpn=h2 no-default-alpn port=8443"
+    assert _key_of(value) == _key_of(stored)
+
+
+def test_record_params_svcb_two_params_is_pipe_separated() -> None:
+    from app.services.technitium.rdata import record_params
+
+    out = record_params("SVCB", "1 svc port=8443 alpn=h2", origin="example.net")
+    assert out == {
+        "svcPriority": 1,
+        "svcTargetName": "svc.example.net",
+        "svcParams": "alpn|h2|port|8443",
+    }
+    # Absolute target's trailing dot is no longer eaten before parsing.
+    out = record_params("SVCB", "1 cdn.other.net.", origin="example.net")
+    assert out["svcTargetName"] == "cdn.other.net"
+    # The API requires svcParams; ``false`` is its spelling of "none".
+    assert out["svcParams"] == "false"
+
+
+def test_rdata_to_value_target_is_absolute_never_qualified() -> None:
+    """Technitium has no relative names: ``svc`` on the daemon is served as
+    ``svc.``, so it reads back as ``svc.`` — not ``svc.<zone>.``."""
+    value, _ = _rdata_to_value(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}}
+    )
+    assert value == "1 svc. alpn=h2"
+    assert _key_of(value) != _key_of("1 svc alpn=h2")
+    value, _ = _rdata_to_value("SVCB", {"svcPriority": 0, "svcTargetName": "", "svcParams": {}})
+    assert value == "0 ."
+
+
+def test_svcb_trailing_dot_is_absolute_whatever_the_label_count() -> None:
+    from app.services.technitium.rdata import svcb_canonical
+
+    assert svcb_canonical("1 localhost. alpn=h2", "example.net.") == "1 localhost. alpn=h2"
+    assert svcb_canonical("1 localhost alpn=h2", "example.net.") == (
+        "1 localhost.example.net. alpn=h2"
+    )
+    assert svcb_canonical("1 . alpn=h2", "example.net.") == "1 . alpn=h2"
+    assert svcb_canonical("1 @ alpn=h2", "example.net.") == "1 example.net. alpn=h2"
+
+
+def test_rdata_to_value_ech_and_unnamed_keys_decode_colon_hex() -> None:
+    """``ech`` and an unnamed key come back as ``DnsSvcUnknownParamValue``
+    colon-hex, the unnamed key by number; both render as presentation."""
+    value, _ = _rdata_to_value(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {"65000": "61:20:62", "ech": "00:01:02", "alpn": "h2"},
+        },
+    )
+    assert value == "1 . alpn=h2 ech=AAEC key65000=a\\032b"
+    assert _key_of(value, "HTTPS") == _key_of('1 . key65000="a b" ech="AAEC" alpn=h2', "HTTPS")
+
+
+def test_record_params_ech_and_unnamed_keys_go_as_hex() -> None:
+    from app.services.technitium.rdata import record_params
+
+    out = record_params("HTTPS", '1 . alpn=h2 ech="AAEC" key65000="a b"', origin="z")
+    assert out["svcParams"] == "alpn|h2|ech|000102|65000|612062"
+
+
+def test_axfr_svcb_target_is_derelativized() -> None:
+    """dnspython relativizes an in-zone target to ``svc``; the AXFR reader
+    must hand drift an absolute one, or it reads as a different record."""
+    import dns.rdata
+    import dns.rdataclass
+    import dns.rdatatype
+    from dns.name import from_text
+
+    origin = from_text("example.net.")
+    rd = dns.rdata.from_text(
+        dns.rdataclass.IN, dns.rdatatype.SVCB, '1 svc alpn="h2"', origin=origin, relativize=True
+    )
+    assert rd.to_text() == '1 svc alpn="h2"'
+    assert rd.to_text(origin=origin, relativize=False) == '1 svc.example.net. alpn="h2"'
+    assert _key_of(rd.to_text(origin=origin, relativize=False)) == _key_of(
+        "1 svc.example.net. alpn=h2"
+    )
+
+
+def test_migration_dot_terminates_only_multi_label_targets() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    path = next(Path(__file__).parents[1].glob("alembic/versions/a3d9e5c17b42_*.py"))
+    spec = importlib.util.spec_from_file_location("_m1513", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    f = mod._dot_terminate
+    assert f('1 cdn.example.net alpn="h2"') == '1 cdn.example.net. alpn="h2"'
+    assert f("1 cdn.example.net.") == "1 cdn.example.net."
+    assert f("1 svc alpn=h2") == "1 svc alpn=h2"
+    assert f("1 . alpn=h2") == "1 . alpn=h2"
+    assert f("1 @ alpn=h2") == "1 @ alpn=h2"
+    assert f("0 cdn.example.net") == "0 cdn.example.net."

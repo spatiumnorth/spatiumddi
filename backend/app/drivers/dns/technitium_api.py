@@ -450,7 +450,14 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         base = {"domain": domain, "zone": zone_bare, "type": rtype}
 
         def _params(r: RecordData) -> dict[str, Any]:
-            return record_params(rtype, r.value, priority=r.priority, weight=r.weight, port=r.port)
+            return record_params(
+                rtype,
+                r.value,
+                priority=r.priority,
+                weight=r.weight,
+                port=r.port,
+                origin=zone_bare,
+            )
 
         async with self._client(api_url, token, verify) as client:
             if change.op == "delete":

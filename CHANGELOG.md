@@ -84,6 +84,38 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium SVCB / HTTPS records are sent the way the daemon parses
+  them, and stop churning and reading as drift (#1513, #1698).**
+  - **Two or more SvcParams were refused (#1698).** Technitium splits
+    `svcParams` on `|` and reads key, value, key, value
+    (`alpn|h2|port|8443`); the agent and the agentless driver joined pairs
+    with commas, which parses for one param only. A record with no params
+    sent nothing, and the API requires the field (`false` means none), so
+    an AliasMode record was refused too, and so was its delete. `ech` and
+    unnamed `keyNNNNN` params now go as hex and by key number, which is
+    what the daemon parses.
+  - **A stored record churned.** `1 . alpn=h2` read back as
+    `1 . alpn="h2"` and params came back in another order, so the
+    structural reconcile deleted and re-added the record on every pass.
+    Both sides now compare one RFC 9460 form: params in key-number order,
+    values unquoted, `mandatory` sorted, hint addresses canonical.
+  - **Drift and Sync with Servers listed it twice**, once as missing and
+    once as extra: the zone transfer gave an in-zone target relative
+    (`svc`). It is now absolute, and both sides compare the same form.
+  - **A target is read the way a zone file reads it**: a trailing dot is
+    absolute whatever the label count (`localhost.` and `.` are never
+    rewritten), and no trailing dot is relative to the zone. Technitium
+    has no relative names, so a stored `1 svc alpn=h2` used to be served
+    as `svc.`; it is now served as `svc.<zone>.`, and the agent replaces
+    the old record once. A migration writes the trailing dot on the
+    dot-less multi-label targets of Technitium groups (`cdn.example.net`),
+    which were always served as absolute, so nothing they serve changes.
+    BIND9 and PowerDNS groups are not touched.
+  - Records the Technitium importer and the agentless pull read are now
+    stored with absolute targets and unquoted params.
+  - Not verified against a live daemon: the `no-default-alpn`, `ech` and
+    `keyNNNNN` forms, taken from Technitium 15.4.0's source.
+
 - **Records put into a zone by its zone-file import are served
   (#1683).** Importing a zone file into an existing zone wrote the
   new, changed and removed records to the database and stopped
@@ -2526,6 +2558,12 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `a3d9e5c17b42` — #1513, data-only: SVCB / HTTPS records in groups
+  running a Technitium driver whose target has two or more labels and no
+  trailing dot get the dot they were already served with, so the new
+  zone-file reading of a dot-less target does not re-point them.
+  Downgrade is a no-op: the dotted value means the same under either
+  reading.
 - `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
