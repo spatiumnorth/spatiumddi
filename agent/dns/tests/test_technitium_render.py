@@ -17,6 +17,7 @@ Two layers here:
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -150,8 +151,273 @@ def test_record_params_srv() -> None:
     }
 
 
+def _b64s(*strings: bytes) -> str:
+    """``characterStringsBase64`` for these character-strings."""
+    return ",".join(base64.b64encode(s).decode("ascii") for s in strings)
+
+
 def test_record_params_txt() -> None:
-    assert _record_params("TXT", "v=spf1 -all", {}) == {"text": "v=spf1 -all"}
+    assert _record_params("TXT", "v=spf1 -all", {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+
+
+# ── TXT served as entered (issue #1694) ─────────────────────────────────
+#
+# Technitium's ``text`` param is the text itself: the quotes of an
+# already-quoted value became part of the served string, and the
+# name-valued types' trailing-dot strip cut the last character off a
+# value ending in a full stop. The driver now sends the character-strings
+# the value stands for (the shared ``_txt`` parse BIND9 and PowerDNS use)
+# through ``characterStringsBase64``, octet for octet, and reads them back
+# the same way.
+
+
+def test_record_params_txt_already_quoted_value_sends_its_strings() -> None:
+    assert _record_params("TXT", '"v=spf1 -all"', {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+    # Each quoted string stays a string of its own (DNS-SD keeps one
+    # key=value per string), and \DDD is one octet, UTF-8 or not.
+    assert _record_params("TXT", '"a" "b"', {}) == {"characterStringsBase64": _b64s(b"a", b"b")}
+    assert _record_params("TXT", '"caf\\195\\169"', {}) == {
+        "characterStringsBase64": _b64s(b"caf\xc3\xa9")
+    }
+    assert _record_params("TXT", '"a\\255b"', {}) == {"characterStringsBase64": _b64s(b"a\xffb")}
+    assert _record_params("TXT", '"say \\"hi\\""', {}) == {
+        "characterStringsBase64": _b64s(b'say "hi"')
+    }
+
+
+def test_record_params_txt_keeps_a_trailing_full_stop() -> None:
+    """#1694: the trailing-dot strip is for name-valued targets. It cut
+    the last character off a TXT value that ends in a full stop."""
+    assert _record_params("TXT", "this value ends with a full stop.", {}) == {
+        "characterStringsBase64": _b64s(b"this value ends with a full stop.")
+    }
+    # The name-valued types still lose theirs.
+    assert _record_params("CNAME", "target.example.com.", {}) == {"cname": "target.example.com"}
+
+
+def test_record_params_txt_long_value_splits_on_a_character_boundary() -> None:
+    value = chr(0xE9) * 200  # 400 octets
+    sent = _record_params("TXT", value, {})["characterStringsBase64"].split(",")
+    strings = [base64.b64decode(s) for s in sent]
+    # 255 would cut a 2-octet character in half; BIND9 and PowerDNS cut at 254.
+    assert [len(s) for s in strings] == [254, 146]
+    assert b"".join(strings) == value.encode("utf-8")
+
+
+def test_record_params_txt_leaves_out_an_empty_string() -> None:
+    """Technitium (15.4) cannot hold an empty character-string: it drops
+    one from the list it is sent. The driver leaves them out itself, so
+    the strings it compares are the strings the server holds and a value
+    with an empty string in it does not churn."""
+    assert _record_params("TXT", '"" "a"', {}) == {
+        "characterStringsBase64": _b64s(b"a")
+    }
+    assert _record_params("TXT", '"a" "" "b"', {}) == {
+        "characterStringsBase64": _b64s(b"a", b"b")
+    }
+
+
+def test_record_params_txt_never_asks_for_a_record_with_no_string() -> None:
+    """A TXT record with no string at all is served as a malformed packet
+    (Technitium 15.4 stores one when every string it is sent is empty). A
+    value that is nothing but empty strings is sent as its text, as it was
+    before #1694, and an empty value is refused by the server, as before."""
+    assert _record_params("TXT", '""', {}) == {"characterStringsBase64": _b64s(b'""')}
+    assert _record_params("TXT", '"" ""', {}) == {
+        "characterStringsBase64": _b64s(b'"" ""')
+    }
+    assert _record_params("TXT", "", {}) == {"text": ""}
+    for value in ('""', '"" ""', '"" "a"', '"a" ""', "", "a"):
+        sent = _record_params("TXT", value, {}).get("characterStringsBase64")
+        assert sent is None or all(sent.split(",")), value
+
+
+def _txt_rdata(*strings: bytes) -> dict[str, Any]:
+    """A TXT ``rData`` as Technitium 15.4's records/get returns it."""
+    return {
+        "text": b"".join(strings).decode("utf-8", "replace"),
+        "splitText": any(len(s) != 255 for s in strings[:-1]),
+        "characterStrings": [s.decode("utf-8", "replace") for s in strings],
+        "characterStringsBase64": [base64.b64encode(s).decode("ascii") for s in strings],
+    }
+
+
+def test_normalize_rdata_txt_compares_the_character_strings() -> None:
+    for value, strings in (
+        ('"a" "b"', (b"a", b"b")),
+        ("v=spf1 -all", (b"v=spf1 -all",)),
+        ('"a\\255b"', (b"a\xffb",)),
+        # What Technitium holds for a value with an empty string in it.
+        ('"" "a"', (b"a",)),
+        ('""', (b'""',)),
+    ):
+        assert _normalize_rdata("TXT", _txt_rdata(*strings)) == _record_params("TXT", value, {})
+
+
+def test_get_zone_records_reads_txt_as_its_character_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d,
+        lambda *_: {
+            "status": "ok",
+            "response": {
+                "records": [
+                    {"name": "two.z.test", "type": "TXT", "ttl": 300,
+                     "rData": _txt_rdata(b"a", b"b")},
+                ]
+            },
+        },
+    )
+    assert d._get_zone_records("t", "z.test") == [
+        {"domain": "two.z.test", "type": "TXT", "ttl": 300,
+         "characterStringsBase64": _b64s(b"a", b"b")}
+    ]
+
+
+def _txt_desired(name: str, value: str) -> dict[str, Any]:
+    return {"domain": f"{name}.example.com", "type": "TXT", "ttl": 300,
+            **_record_params("TXT", value, {})}
+
+
+def test_reconcile_is_a_noop_for_txt_served_as_entered(tmp_path: Path) -> None:
+    """A steady zone must not churn: what the add sent is what the read
+    gives back, string for string."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    long_octets = (chr(0xE9) * 200).encode("utf-8")
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+            {"name": "note.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"ends with a full stop.")},
+            {"name": "long.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(long_octets[:254], long_octets[254:])},
+        ],
+        desired=[
+            _txt_desired("spf", '"v=spf1 -all"'),
+            _txt_desired("two", '"a" "b"'),
+            _txt_desired("note", "ends with a full stop."),
+            _txt_desired("long", chr(0xE9) * 200),
+        ],
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def _record_calls(calls: list[tuple[str, str, str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    return [(c[2], c[3]["characterStringsBase64"]) for c in calls
+            if c[2] in ("zones/records/delete", "zones/records/add")]
+
+
+def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -> None:
+    """A value the driver served one character short before #1694 is
+    replaced once, and the next pass changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("note", "a full stop.")]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop")}],
+        desired=desired,
+    )
+    assert _record_calls(calls) == [
+        ("zones/records/delete", _b64s(b"a full stop")),
+        ("zones/records/add", _b64s(b"a full stop.")),
+    ]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop.")}],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) -> None:
+    """What the driver served before #1694 for an already-quoted value (one
+    string with the quotes in it) is deleted by its own strings and
+    replaced, and the next pass over the replaced record changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("spf", '"v=spf1 -all"'), _txt_desired("two", '"a" "b"')]
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"v=spf1 -all"')},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"a" "b"')},
+        ],
+        desired=desired,
+    )
+    assert sorted(_record_calls(calls)) == sorted([
+        ("zones/records/delete", _b64s(b'"v=spf1 -all"')),
+        ("zones/records/delete", _b64s(b'"a" "b"')),
+        ("zones/records/add", _b64s(b"v=spf1 -all")),
+        ("zones/records/add", _b64s(b"a", b"b")),
+    ])
+    assert all("text" not in c[3] for c in calls if c[2].startswith("zones/records/"))
+
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+        ],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_apply_record_op_sends_each_txt_member_as_its_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "create",
+            "record": {
+                "name": "@",
+                "type": "TXT",
+                "value": '"v=spf1 -all"',
+                "ttl": 300,
+                "rrset": {
+                    "ttl": 300,
+                    "members": [
+                        {"value": '"v=spf1 -all"'},
+                        {"value": "site-verification=abc."},
+                    ],
+                },
+            },
+        }
+    )
+    sent = [(c[3]["overwrite"], c[3]["characterStringsBase64"]) for c in calls]
+    assert sent == [
+        ("true", _b64s(b"v=spf1 -all")),
+        ("false", _b64s(b"site-verification=abc.")),
+    ]
+    assert all("text" not in c[3] for c in calls)
+
+    calls.clear()
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {"name": "@", "type": "TXT", "value": '"v=spf1 -all"'},
+        }
+    )
+    assert [(c[2], c[3]["characterStringsBase64"]) for c in calls] == [
+        ("zones/records/delete", _b64s(b"v=spf1 -all"))
+    ]
 
 
 def test_record_params_caa() -> None:

@@ -75,6 +75,7 @@ import structlog
 
 from ..secure_io import write_private
 from ._process import find_running_daemon, is_zombie
+from ._txt import txt_strings
 from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
@@ -589,8 +590,8 @@ def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
 # converged.
 #
 # Types whose rData already matches the add params — A, AAAA, CNAME,
-# DNAME, PTR, NS, MX, SRV, TXT, CAA — are deliberately absent here and
-# pass through untouched.
+# DNAME, PTR, NS, MX, SRV, CAA — are deliberately absent here and pass
+# through untouched.
 
 _TLSA_USAGE = {"PKIX-TA": "0", "PKIX-EE": "1", "DANE-TA": "2", "DANE-EE": "3"}
 _TLSA_SELECTOR = {"Cert": "0", "SPKI": "1"}
@@ -676,6 +677,15 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         # target as stored, which is always absolute.
         out["svcParams"] = _svcb_wire(_svcb_daemon_params(out.get("svcParams")))
         out["svcTargetName"] = _svcb_daemon_target(out.get("svcTargetName"))
+    elif rtype == "TXT":
+        # Only characterStringsBase64 is the record exactly (#1694): the
+        # GET's ``text`` joins the strings, so "ab" and "a" "b" read the
+        # same; ``characterStrings`` decodes them as UTF-8; ``splitText``
+        # is derived from the string lengths.
+        strings = out.pop("characterStringsBase64", None) or []
+        for derived in ("text", "splitText", "characterStrings"):
+            out.pop(derived, None)
+        out["characterStringsBase64"] = ",".join(str(s) for s in strings)
     return out
 
 
@@ -1000,6 +1010,40 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _txt_params(value: str) -> dict[str, Any]:
+    """A TXT value as the character-strings it stands for (#1694).
+
+    Technitium's ``text`` param is the text itself, so the quotes of an
+    already-quoted value (``"v=spf1 -all"``, as providers print SPF,
+    DMARC and DKIM values) were served as part of the string, two quoted
+    strings could not stay two, and a ``\\DDD`` octet that is not UTF-8
+    could not be sent at all. ``characterStringsBase64`` takes the strings
+    themselves, octet for octet, comma-separated. They come from the parse
+    the BIND9 and PowerDNS drivers render (``_txt.txt_strings``), so the
+    three engines serve the same strings, and the record GET hands the same
+    list back for ``_normalize_rdata`` to compare and delete by.
+
+    Technitium cannot hold an empty character-string: it drops one from the
+    list, and a record left with no string at all is served as a malformed
+    packet. So empty strings are left out here as well, and what is compared
+    is what the server holds. A value that is nothing but empty strings
+    (``""``) goes as its text, as it did before #1694, and an empty value is
+    refused by the server, as before.
+    """
+    strings = [s for s in txt_strings(value) if s]
+    if not strings:
+        if not value:
+            return {"text": ""}
+        # As the ``text`` param took it: one string, cut every 255 octets.
+        raw = value.encode("utf-8")
+        strings = [raw[i : i + 255] for i in range(0, len(raw), 255)]
+    return {
+        "characterStringsBase64": ",".join(
+            base64.b64encode(s).decode("ascii") for s in strings
+        )
+    }
+
+
 def _record_params(
     rtype: str, value: str, rec: dict[str, Any], origin: str | None = None
 ) -> dict[str, Any]:
@@ -1013,6 +1057,9 @@ def _record_params(
         # ``svcParams`` is always sent: the API requires it (``false`` = none).
         priority, target, params = _svcb_params(value, origin)
         return {"svcPriority": priority, "svcTargetName": target, "svcParams": params}
+    if rtype == "TXT":
+        # Text, not a name: it keeps a trailing full stop (#1694).
+        return _txt_params(value)
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
@@ -1043,8 +1090,6 @@ def _record_params(
             "weight": rec.get("weight") if rec.get("weight") is not None else 0,
             "port": rec.get("port") if rec.get("port") is not None else 0,
         }
-    if rtype == "TXT":
-        return {"text": value}
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)
@@ -2757,19 +2802,14 @@ class TechnitiumDriver(DriverBase):
                 continue
             flat = {"domain": rec.get("name"), "type": rtype, "ttl": rec.get("ttl")}
             flat.update(rec.get("rData") or {})
-            # Technitium's TXT rData carries extra derived fields
-            # (splitText/characterStrings/characterStringsBase64) that
-            # never round-trip through our add params — drop them so the
-            # fingerprint comparison in ``_reconcile_zones`` doesn't treat
-            # every existing TXT record as "different from desired" on
-            # every single reconcile pass.
-            for extra_key in (
-                "splitText",
-                "characterStrings",
-                "characterStringsBase64",
-                "autoIpv4Hint",
-                "autoIpv6Hint",
-            ):
+            # Technitium's SVCB/HTTPS rData carries derived fields
+            # (autoIpv4Hint/autoIpv6Hint) that never round-trip through our
+            # add params — drop them so the fingerprint comparison in
+            # ``_reconcile_zones`` doesn't treat every such record as
+            # "different from desired" on every single reconcile pass.
+            # TXT's derived fields are folded by ``_normalize_rdata``
+            # (#1694).
+            for extra_key in ("autoIpv4Hint", "autoIpv6Hint"):
                 flat.pop(extra_key, None)
             out.append(_normalize_rdata(rtype, flat))
         return out
