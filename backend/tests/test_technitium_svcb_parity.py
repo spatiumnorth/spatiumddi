@@ -4,7 +4,8 @@ The agent image cannot import ``app``, so ``agent/dns/spatium_dns_agent/
 drivers/technitium.py`` carries its own copy of the block in
 ``app/services/technitium/rdata.py``. If the two drift, the agent and the
 agentless driver send — and drift compares — different forms of the same
-record, which is the #1513 churn again. Pin them (comments aside) equal.
+record, which is the #1513 churn again. Pin them equal, comments and blank
+lines aside.
 """
 
 from __future__ import annotations
@@ -23,7 +24,9 @@ def _block(path: Path) -> list[str]:
     text = path.read_text()
     assert _START in text and _END in text, f"{path} lost its shared-block markers"
     body = text[text.index(_START) : text.index(_END)]
-    return [ln for ln in body.splitlines() if not ln.lstrip().startswith("#")]
+    # Comments and blank lines aside: black spaces the end of the block by
+    # what follows it, which differs between the two files.
+    return [ln for ln in body.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
 
 
 @pytest.mark.skipif(not _AGENT.exists(), reason="agent package not in this checkout")
