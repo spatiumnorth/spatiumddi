@@ -84,6 +84,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Records put into a zone by its zone-file import are served
+  (#1683).** Importing a zone file into an existing zone wrote the
+  new, changed and removed records to the database and stopped
+  there: it queued no record op and left the zone's serial alone. An
+  agent applies a record change from a record op (records stay out of
+  the bundle's structural fingerprint in a group without views), and
+  an agentless provider only through its driver, so the imported
+  records were not served until something else re-rendered the zone,
+  in the report the next record write in it. The import now queues
+  its changes as one batch of record ops on one serial bump, as the
+  record API does, removals first so a CNAME that replaces an A can
+  land. When an agentless provider does not take every change, the
+  response carries `provider_warning` and the import's audit entry
+  reads error (#1538). Since a record change no longer reloads its
+  zone (#1373, above), that later write would not have rescued them
+  either. Because the import now reaches the servers, it is refused
+  where the record API is: a zone the Tailscale or NetBird
+  integration owns, and a record type a server in the group cannot
+  serve (SVCB, HTTPS and DNAME on a hosted-DNS or Windows group)
+  answer 422 before anything is written.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
