@@ -289,12 +289,28 @@ _pod_networks() {
 # A fresh node has no peers, so no route into the pod network may go through
 # a gateway. Only gateway routes are removed: cni0's own route has none. Runs
 # while k3s is stopped, so flannel cannot put them back.
+#
+# Flannel installs its routes without a protocol (RTPROT_BOOT, which `ip route`
+# does not print), so a route that names one belongs to something else: an
+# operator's static route (`proto static`), DHCP option 121 (`proto dhcp`), a
+# router advertisement (`proto ra`). Those are kept even inside the pod
+# network. They can only be there when the LAN overlaps it, which the
+# installer refuses on the node's own CIDRs, but an Additional node pins none
+# and inherits the seed's: without subnet.env the fallback above is k3s's
+# default, which may not be the network the cluster used. Removing a LAN route
+# would cut the node off the network it is being reset onto.
 clear_stale_pod_routes() {
     local net fam dst rest gw
     for net in $(_pod_networks); do
         case "$net" in *:*) fam=-6 ;; *) fam=-4 ;; esac
         ip "$fam" route show root "$net" 2>/dev/null | while read -r dst rest; do
             case " $rest " in *" via "*) ;; *) continue ;; esac
+            case " $rest " in
+                *" proto static "* | *" proto dhcp "* | *" proto ra "* | *" proto kernel "* | *" proto redirect "*)
+                    log "kept the pod-network route $dst ($rest): it is not flannel's"
+                    continue
+                    ;;
+            esac
             gw="${rest#*via }"
             gw="${gw%% *}"
             if ip "$fam" route del "$dst" via "$gw" 2>/dev/null; then

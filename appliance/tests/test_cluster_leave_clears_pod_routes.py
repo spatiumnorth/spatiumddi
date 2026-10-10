@@ -33,6 +33,8 @@ V4_ROUTES = (
     "10.52.0.0/24 via 192.0.2.10 dev ens18 \n"
     "10.52.1.0/24 dev cni0 proto kernel scope link src 10.52.1.1 \n"
     "10.52.2.0/24 via 192.0.2.12 dev ens18 \n"
+    "10.52.7.0/24 via 192.0.2.1 dev ens18 proto static metric 100 \n"
+    "10.52.8.0/24 via 192.0.2.1 dev ens18 proto dhcp metric 100 \n"
 )
 V6_ROUTES = (
     "fd52:0:0:1::/64 dev cni0 proto kernel metric 256 pref medium\n"
@@ -109,6 +111,21 @@ def test_every_route_through_an_old_peer_is_removed_and_cni0_is_kept(tmp_path: P
         "ip -4 route del 10.52.0.0/24 via 192.0.2.10",
         "ip -4 route del 10.52.2.0/24 via 192.0.2.12",
     ], calls
+
+
+def test_a_route_another_owner_installed_is_kept(tmp_path: Path) -> None:
+    """Flannel's routes carry no protocol. A gateway route inside the pod
+    network that names one (an operator's `proto static`, a DHCP option 121
+    `proto dhcp`) is the LAN's, and removing it would cut the node off the
+    network it is being reset onto."""
+    rc, calls, _ = _leave(
+        tmp_path, subnet_env="FLANNEL_NETWORK=10.52.0.0/16\nFLANNEL_SUBNET=10.52.1.1/24\n"
+    )
+    assert rc == 0, calls
+    assert not any("10.52.7.0/24" in c or "10.52.8.0/24" in c for c in calls if " del " in c)
+    log = (tmp_path / "log" / "cluster-join.log").read_text()
+    assert "kept the pod-network route 10.52.7.0/24" in log
+    assert "kept the pod-network route 10.52.8.0/24" in log
 
 
 def test_routes_go_while_k3s_is_stopped_and_before_the_wipe_takes_subnet_env(
