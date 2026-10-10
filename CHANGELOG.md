@@ -109,6 +109,21 @@ the formatter handles the rest.
   that kept it (five down to three) still carries them until they are
   removed by hand.
 
+- **A demoted control-plane member comes back as a working appliance
+  (#1682).** The leave reset a member to a fresh single-node cluster but
+  kept two things from the old one. Flannel's routes to the old peers'
+  pod subnets stayed in the kernel, and the fresh cluster takes the
+  seed's subnet for itself, so every reply to the node's own pods went
+  to the seed. And the 6443 bootstrap firewall rule a multi-node member
+  retires stayed retired, so the input chain dropped the node's pods on
+  their way to its own API. Either one kept the bootstrap chart from
+  installing, so no supervisor started, the `left` report never came,
+  and the row read `leaving` for good. The leave now removes every
+  gateway route into the pod network while k3s is stopped (cni0's own
+  route has none, and a route another owner installed, `proto static`
+  or `proto dhcp`, is kept), and puts the bootstrap rule back before k3s
+  starts, validating the merged firewall first.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
