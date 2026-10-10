@@ -614,6 +614,9 @@ FROM pg_catalog.pg_constraint k
 JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE k.contype = 'f'
+  -- A partition's copy of its parent's key goes with the parent's, and
+  -- dropping one directly is an ERROR. The product has no partitions.
+  AND k.conparentid = 0
   AND n.nspname = 'public'
   AND c.relname = ANY ({tables});
 DO $setaside$
@@ -625,6 +628,46 @@ BEGIN
     END LOOP;
 END
 $setaside$;
+"""
+
+# ``tables`` is the closure ``sections.cascade_closure`` computes from the
+# models' foreign keys, and the TRUNCATE's CASCADE follows the DATABASE's. A
+# foreign key a migration created and no model declares would let the CASCADE
+# empty a table this restore does not reload, and that table's rows would be
+# gone with nothing reporting it: the #781 loss, back through a gap nothing
+# checks. So before anything is emptied, the closure is worked out again from
+# the catalog, and a table it reaches outside ``tables`` refuses the restore,
+# naming the table, with nothing changed.
+_REFUSE_A_WIDER_CASCADE_SQL = """\
+DO $closure$
+DECLARE
+    beyond text;
+BEGIN
+    WITH RECURSIVE reached(oid) AS (
+        SELECT c.oid
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = ANY ({tables})
+        UNION
+        SELECT k.conrelid
+        FROM pg_catalog.pg_constraint k
+        JOIN reached r ON r.oid = k.confrelid
+        WHERE k.contype = 'f' AND k.conparentid = 0
+    )
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', '
+                      ORDER BY n.nspname, c.relname)
+    INTO beyond
+    FROM reached r
+    JOIN pg_catalog.pg_class c ON c.oid = r.oid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT (n.nspname = 'public' AND c.relname = ANY ({tables}));
+    IF beyond IS NOT NULL THEN
+        RAISE EXCEPTION 'selective restore: TRUNCATE ... CASCADE would also empty %, '
+            'which this restore does not reload (a foreign key the models do not '
+            'declare); nothing was changed', beyond;
+    END IF;
+END
+$closure$;
 """
 
 _PUT_BACK_FOREIGN_KEYS_SQL = """\
@@ -707,17 +750,20 @@ def _selective_prelude(tables: list[str]) -> str:
     keys aside also locks the tables they point into, which the lock block
     has already taken.
 
-    Last, the foreign keys of ``tables`` are set aside
-    (:data:`_SET_ASIDE_FOREIGN_KEYS_SQL`) after the TRUNCATE, whose CASCADE
-    follows them.
+    Before the TRUNCATE, a CASCADE that would reach past ``tables`` is
+    refused (:data:`_REFUSE_A_WIDER_CASCADE_SQL`). Last, the foreign keys of
+    ``tables`` are set aside (:data:`_SET_ASIDE_FOREIGN_KEYS_SQL`) after the
+    TRUNCATE, whose CASCADE follows them.
     """
     quoted = ", ".join(f'"public"."{t}"' for t in tables)
+    array = _sql_text_array(tables)
     return (
         # One NOTICE per cascaded table would otherwise bury the error, if any.
         "SET client_min_messages = warning;\n"
         + _LOCK_PUBLIC_TABLES_SQL
+        + _REFUSE_A_WIDER_CASCADE_SQL.format(tables=array)
         + f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE;\n"
-        + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=_sql_text_array(tables))
+        + _SET_ASIDE_FOREIGN_KEYS_SQL.format(tables=array)
     )
 
 

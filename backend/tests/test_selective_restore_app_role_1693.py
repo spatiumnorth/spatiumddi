@@ -438,6 +438,38 @@ async def test_rows_that_point_at_something_gone_are_refused_and_change_nothing(
     assert await _foreign_keys(url) == keys_before
 
 
+async def test_a_cascade_reaching_a_table_the_restore_does_not_reload_is_refused(
+    appliance_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closure comes from the models' foreign keys and the CASCADE
+    follows the database's. A table no model declares, holding a foreign key
+    into ``ip_space``, would be emptied by a restore of ``ipam`` and never
+    reloaded. The restore is refused, naming it, and its row survives."""
+    url, archive, _archived = appliance_db
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        await conn.execute(
+            "CREATE TABLE r1693_unmodelled (id int PRIMARY KEY, "
+            "space_id uuid NOT NULL REFERENCES ip_space (id))"
+        )
+        await conn.execute("INSERT INTO r1693_unmodelled SELECT 1, id FROM ip_space LIMIT 1")
+    finally:
+        await conn.close()
+    before = await _state(url)
+    keys_before = await _foreign_keys(url)
+
+    with pytest.raises(restore.BackupRestoreError, match=r"public\.r1693_unmodelled"):
+        await _restore(url, archive, monkeypatch)
+
+    assert await _state(url) == before
+    assert await _foreign_keys(url) == keys_before
+    conn = await asyncpg.connect(_dsn(url))
+    try:
+        assert await conn.fetchval("SELECT count(*) FROM r1693_unmodelled") == 1
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize("section", ["dns", "dhcp", "auth"])
 async def test_other_sections_restore_as_the_app_role_too(
     appliance_db, monkeypatch: pytest.MonkeyPatch, section: str
