@@ -84,6 +84,39 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An ACME order whose CA cannot be reached now ends, and says why
+  (#1686).** A refused, timed-out or reset connection to the CA left
+  the order `processing` for the Celery task's retries, and nothing
+  settled it once the last retry failed. It stayed `processing` with
+  no error for good, the UI polled it forever, and the renewal sweep
+  skipped every certificate with the same domains as "already being
+  (re)issued", so the certificate could expire behind it. The task's
+  last attempt now ends the order `invalid` with `last_error` naming
+  the error and the host it could not reach. Each retry before that
+  leaves a `retrying: …` note, which the Certificates tab shows under
+  the processing order.
+
+- **Records put into a zone by its zone-file import are served
+  (#1683).** Importing a zone file into an existing zone wrote the
+  new, changed and removed records to the database and stopped
+  there: it queued no record op and left the zone's serial alone. An
+  agent applies a record change from a record op (records stay out of
+  the bundle's structural fingerprint in a group without views), and
+  an agentless provider only through its driver, so the imported
+  records were not served until something else re-rendered the zone,
+  in the report the next record write in it. The import now queues
+  its changes as one batch of record ops on one serial bump, as the
+  record API does, removals first so a CNAME that replaces an A can
+  land. When an agentless provider does not take every change, the
+  response carries `provider_warning` and the import's audit entry
+  reads error (#1538). Since a record change no longer reloads its
+  zone (#1373, above), that later write would not have rescued them
+  either. Because the import now reaches the servers, it is refused
+  where the record API is: a zone the Tailscale or NetBird
+  integration owns, and a record type a server in the group cannot
+  serve (SVCB, HTTPS and DNAME on a hosted-DNS or Windows group)
+  answer 422 before anything is written.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
@@ -168,18 +201,6 @@ the formatter handles the rest.
   takeover, and Abort's release is no longer renewed away (the aborted
   drive's next renewal sees it lost the lease and stops). A halted run's
   drive releases its lease on exit, so Resume can take it at once.
-
-- **An ACME order whose CA cannot be reached now ends, and says why
-  (#1686).** A refused, timed-out or reset connection to the CA left
-  the order `processing` for the Celery task's retries, and nothing
-  settled it once the last retry failed. It stayed `processing` with
-  no error for good, the UI polled it forever, and the renewal sweep
-  skipped every certificate with the same domains as "already being
-  (re)issued", so the certificate could expire behind it. The task's
-  last attempt now ends the order `invalid` with `last_error` naming
-  the error and the host it could not reach. Each retry before that
-  leaves a `retrying: …` note, which the Certificates tab shows under
-  the processing order.
 
 - **The rolling upgrade can run on a multi-node cluster (#1445).**
   Reported by @stefanriegel from a 3-node upgrade, 2026.09.04-1 to
@@ -427,7 +448,25 @@ the formatter handles the rest.
   own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
   keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
   a string over 255 octets is split further. Control characters are
-  stripped. The Technitium TXT path is unchanged (#1694).
+  stripped. The Technitium agent serves the same strings since #1694
+  (next entry).
+
+- **The Technitium agent serves a TXT value as entered (#1694).**
+  The agent sent each TXT value to Technitium as one text string. A
+  value stored already quoted, the way providers print SPF, DMARC
+  and DKIM records (`"v=spf1 -all"`), was served with its quote
+  characters as part of the text, so receivers found no SPF record;
+  two quoted strings were served as one; and a trailing full stop
+  was cut off, as if the value were a host name. The agent now sends
+  Technitium the character-strings the BIND9 and PowerDNS agents
+  serve (the same `drivers/_txt.py` parse, through Technitium's
+  `characterStringsBase64`), keeps a trailing full stop, and compares
+  what the server holds string by string, so a steady zone does not
+  churn. Technitium cannot hold an empty string: the agent leaves one
+  out, and a value that is nothing but empty strings (`""`) is served
+  as its text, as before. A record an older agent served the old way
+  is replaced once, on the agent's first full reconcile after the
+  upgrade.
 
 - **Rolling-upgrade preflight warns on a SemVer jump that skips a major
   version (#1182).** Between two CalVer releases the version check warns when
