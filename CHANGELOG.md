@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Fleet group change now finds the appliance's own servers
+  (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
+  group by selecting `appliance_id`, which nothing writes: agents
+  register with `host` set to the node's hostname, so on a real
+  appliance only the pointer moved and the server kept serving the old
+  group. The roles PUT now also matches agent-based rows by hostname
+  (case-insensitive, never a row another appliance owns, and not when
+  two approved appliances share the hostname). After an engine switch
+  only the current engine's DNS row moves; the old engine's stale row
+  stays in its group. The 409 on a name clash is unchanged, and a
+  re-registering agent still does not undo the move.
 - **Agentless DNS drivers treat an existing zone on create and a
   missing zone on delete as done (#1537).** A zone push to several
   agentless servers can fail partway; the DB rolls back but the servers

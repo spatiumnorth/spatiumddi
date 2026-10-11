@@ -4037,6 +4037,89 @@ _VALID_ROLES = {
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
+# #1715 — engine role -> the dns_server.driver its agent registers with.
+_DNS_ROLE_DRIVER = {
+    "dns-bind9": "bind9",
+    "dns-powerdns": "powerdns",
+    "dns-technitium": "technitium",
+}
+
+
+async def _hostname_is_unambiguous(db: DB, appliance: Appliance) -> bool:
+    """True when no OTHER other approved appliance shares this one's hostname
+    (case-insensitively). A hostname match is only a safe way to claim a
+    server row when it can't be someone else's."""
+    n = (
+        await db.execute(
+            select(sa_func.count())
+            .select_from(Appliance)
+            .where(
+                sa_func.lower(Appliance.hostname) == appliance.hostname.lower(),
+                Appliance.id != appliance.id,
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+            )
+        )
+    ).scalar_one()
+    return n == 0
+
+
+async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The dns_server row(s) of the appliance's CURRENT DNS engine (#1715).
+
+    Agents register with ``host`` = the node's hostname and never set
+    ``appliance_id``, so the FK alone finds nothing on a real appliance;
+    hostname is matched too (as ``_find_appliance_dependents`` does), but
+    only on agent-based rows not already owned by another appliance, and
+    only when the hostname is unambiguous. An engine switch leaves the old
+    engine's row behind in its old group; moving it would clash on name or
+    driver in the target, so only rows of the current engine are returned.
+    """
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    drivers = {
+        _DNS_ROLE_DRIVER[r] for r in (appliance.assigned_roles or []) if r in _DNS_ROLE_DRIVER
+    }
+    if not drivers:
+        return []
+    conds = [DNSServer.appliance_id == appliance.id]
+    if await _hostname_is_unambiguous(db, appliance):
+        conds.append(
+            (sa_func.lower(DNSServer.host) == appliance.hostname.lower())
+            & DNSServer.appliance_id.is_(None)
+            & DNSServer.agent_id.is_not(None)
+        )
+    return list(
+        (
+            await db.execute(
+                select(DNSServer).where(or_(*conds), DNSServer.driver.in_(sorted(drivers)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _appliance_own_dhcp_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The appliance's agent-based (kea) dhcp_server rows (#1715); same
+    matching rules as ``_appliance_own_dns_servers``."""
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+
+    if "dhcp" not in (appliance.assigned_roles or []):
+        return []
+    conds = [DHCPServer.appliance_id == appliance.id]
+    if await _hostname_is_unambiguous(db, appliance):
+        conds.append(
+            (sa_func.lower(DHCPServer.host) == appliance.hostname.lower())
+            & DHCPServer.appliance_id.is_(None)
+            & DHCPServer.agent_id.is_not(None)
+        )
+    return list(
+        (await db.execute(select(DHCPServer).where(or_(*conds), DHCPServer.driver == "kea")))
+        .scalars()
+        .all()
+    )
+
+
 class ApplianceRolesUpdate(BaseModel):
     """Operator-driven role + group + tag assignment payload.
 
@@ -4169,14 +4252,9 @@ async def update_appliance_roles(
             # appliance's own DNS server(s) with it, through #934's move, in this
             # transaction; a move it refuses (a name clash, a mixed-driver group)
             # refuses the whole PUT, so the pointer and the server can't disagree.
-            from app.models.dns import DNSServer
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
-            for server in (
-                (await db.execute(select(DNSServer).where(DNSServer.appliance_id == row.id)))
-                .scalars()
-                .all()
-            ):
+            for server in await _appliance_own_dns_servers(db, row):
                 try:
                     await move_server_to_group(db, server, dns_group)
                 except ServerMoveError as exc:
@@ -4189,7 +4267,7 @@ async def update_appliance_roles(
         if body.dhcp_group_id is None:
             row.assigned_dhcp_group_id = None
         else:
-            from app.models.dhcp import DHCPServer, DHCPServerGroup
+            from app.models.dhcp import DHCPServerGroup
 
             dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
             if dhcp_group is None:
@@ -4208,11 +4286,7 @@ async def update_appliance_roles(
             )
             from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
 
-            for dserver in (
-                (await db.execute(select(DHCPServer).where(DHCPServer.appliance_id == row.id)))
-                .scalars()
-                .all()
-            ):
+            for dserver in await _appliance_own_dhcp_servers(db, row):
                 if dserver.server_group_id == dhcp_group.id:
                     continue
                 await _assert_driver_mix_allowed(
