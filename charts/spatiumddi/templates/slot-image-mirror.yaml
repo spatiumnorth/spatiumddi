@@ -27,11 +27,14 @@
 # instead of building a new container. The mirror pod runs the
 # unmodified api codebase + flags ``SLOT_IMAGE_MIRROR_MODE=true``;
 # the api's internal byte-op endpoints check that flag + the
-# ``X-Mirror-Auth`` shared-secret header before serving. ~150 MiB
-# RAM cost on the mirror node in exchange for zero new images to
-# build, push, or maintain across releases. We can swap to a tiny
-# dedicated image in a later cut if the footprint matters more than
-# the maintenance saving.
+# ``X-Mirror-Auth`` shared-secret header before serving. The cost is
+# the api's own footprint on the mirror node (about 280 MiB resident
+# once started, on the 2026-10-02 image; it was ~150 MiB when this
+# was written, and it grows with the application) in exchange for
+# zero new images to build, push, or maintain across releases. We
+# can swap to a tiny dedicated image in a later cut if the footprint
+# matters more than the maintenance saving. Until then the mirror is
+# sized as the api (#1174, ``resources`` below).
 #
 # Authentication — operator traffic NEVER hits the mirror directly.
 # The frontend nginx + api Service own operator routing for the
@@ -176,22 +179,45 @@ spec:
                 secretKeyRef:
                   name: {{ $mirrorName }}-auth
                   key: secret
+          # #1174 — the api's probe budgets (``api.probes``, #1051), with any
+          # key of ``slotImageMirror.probes`` laid over them. The mirror is
+          # the api's process: one uvicorn worker that imports the whole
+          # application and runs its startup before it binds the port, and
+          # whose event loop answers late when busy. Its own budgets (a
+          # liveness that killed it ~40 s after a start that had not bound
+          # yet, and the kubelet's 1 s timeout on both probes) killed a cold
+          # boot on a busy node: #1174's pod logged 12 liveness kills before
+          # its OOMKills.
+          {{- $probes := mergeOverwrite (deepCopy (.Values.api.probes | default dict)) (deepCopy (.Values.slotImageMirror.probes | default dict)) }}
+          {{- with $probes.liveness }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            failureThreshold: 3
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          {{- with $probes.readiness }}
           readinessProbe:
             httpGet:
               path: /health/ready
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 3
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          # #1174 — sized as the api, because it runs the api: the same
+          # image, the whole application imported before the first byte
+          # is served. ``api.resources`` (on an appliance, the limit the
+          # supervisor sizes from the node's RAM), with any key of
+          # ``slotImageMirror.resources`` laid over it. The 256Mi / 500m
+          # this used to carry OOMKilled the mirror during that import.
+          {{- $resources := mergeOverwrite (deepCopy (.Values.api.resources | default dict)) (deepCopy (.Values.slotImageMirror.resources | default dict)) }}
           resources:
-            {{- toYaml .Values.slotImageMirror.resources | nindent 12 }}
+            {{- toYaml $resources | nindent 12 }}
           volumeMounts:
             - name: slot-images
               mountPath: /var/lib/spatiumddi/slot-images
