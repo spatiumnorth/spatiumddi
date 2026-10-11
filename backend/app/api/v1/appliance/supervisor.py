@@ -4694,8 +4694,10 @@ async def demote_control_plane(
     flow for that — out of scope for Phase 7).
 
     #1541 — each target's leave runner removes its own etcd member while it
-    still votes, confirms with a survivor, and only then resets itself; a
-    removal it cannot confirm fails the leave without touching the node. Its
+    still votes and only then resets itself. It waits for a survivor to
+    confirm the removal, but since etcd's acceptance IS the removal, a
+    survivor it cannot reach does not fail the leave; a removal etcd refuses
+    does, without touching the node. Its
     ``left`` report then hands the row to the seed's eviction, which deletes
     the stale k8s Node and confirms etcd agrees before the row settles
     ``left``. Before that, nobody removed a demoted node's member, and the
