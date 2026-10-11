@@ -591,9 +591,10 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
     ) -> None:
         """Raise unless the existing zone ``bare`` is an empty Primary zone.
 
-        "Empty" means no record besides the SOA and apex NS that Technitium
-        puts in every new Primary zone. Raises :class:`CloudDNSConflictError`
-        (mapped to 409 by the zone push), whose message names the reason.
+        "Empty" means no record besides the apex SOA and NS that Technitium
+        puts in every new Primary zone (a sub-apex NS is a delegation).
+        Raises :class:`CloudDNSConflictError` (mapped to 409 by the zone
+        push), whose message names the reason.
         """
         existing = next(
             (z for z in await self._walk_zones(creds) if self._zone_name(z).rstrip(".") == bare),
@@ -621,10 +622,19 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 {"domain": bare, "zone": bare, "listZone": "true"},
             )
         )
+
+        # Only the APEX SOA / NS are Technitium's own: an NS below the apex
+        # is a delegation the operator made, and deleting the zone later
+        # would delete it too.
+        def _technitium_default(r: dict[str, Any]) -> bool:
+            rtype = str(r.get("type") or "").upper()
+            at_apex = str(r.get("name") or bare).rstrip(".").lower() in (bare.lower(), "@", "")
+            return rtype in ("SOA", "NS") and at_apex
+
         foreign = [
             str(r.get("type") or "").upper()
             for r in body.get("records") or []
-            if isinstance(r, dict) and str(r.get("type") or "").upper() not in ("SOA", "NS")
+            if isinstance(r, dict) and not _technitium_default(r)
         ]
         if foreign:
             raise CloudDNSConflictError(

@@ -4971,6 +4971,9 @@ export interface ZoneMovePreview {
    *  doesn't define (#1316). Non-empty means the commit refuses, for the
    *  same reason as ``acl_names_lost``. */
   key_names_lost: string[];
+  /** #1784 — why the experimental technitium_api target refuses this zone.
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  technitium_api_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */

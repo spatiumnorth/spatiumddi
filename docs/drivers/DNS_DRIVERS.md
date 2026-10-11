@@ -988,16 +988,19 @@ Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry 
 Supported:
 
 - **One server per group.** A second `technitium_api` server is refused on server create, on a driver change via update, and on a move into the group (`ensure_group_single_driver`). A second server never received zones the first was given (#1771).
-- **Zones SpatiumDDI creates, Primary only.** A non-Primary zone create is refused. If the zone already exists on the server, create adopts it only when it is an **empty Primary** (no records beyond SOA and apex NS); a Secondary / Stub / Forwarder of the same name, or a Primary holding records, is a 409 naming what was found, because a later delete from SpatiumDDI would remove the operator's zone (#1775).
+- **Zones SpatiumDDI creates, Primary only.** A non-Primary zone create is refused. If the zone already exists on the server, create adopts it only when it is an **empty Primary** (no records beyond the apex SOA and NS; a delegation NS below the apex counts as a record); a Secondary / Stub / Forwarder of the same name, or a Primary holding records, is a 409 naming what was found, because a later delete from SpatiumDDI would remove the operator's zone (#1775).
 - **Records** on those zones, over the REST API as in §4C.2.
 
 Refused (422), because the driver never writes them (#1769, #1771, #1774, #1775 track the 1.1 fixes):
 
 - **DNS pools** on the group: pool create and pool member add (a pool collapses to one member).
-- **Zone settings** SOA `ttl` / `refresh` / `retry` / `expire` / `minimum` / `primary_ns` / `admin_email` and `allow_query` / `allow_transfer` / `also_notify` / `notify_enabled`, and changing `zone_type` away from Primary. On update only a *changed* value is refused, so a zone that already holds one can be re-saved.
-- **Group options** (`PUT …/options`) and `catalog_zones_enabled`; changing a value from the stored one is refused, an unchanged re-save is not.
+- **Zone settings** SOA `ttl` / `refresh` / `retry` / `expire` / `minimum` / `primary_ns` / `admin_email` and `allow_query` / `allow_transfer` / `also_notify` / `notify_enabled`, and changing `zone_type` away from Primary. On update only a *changed* value is refused, so a zone that already holds one can be re-saved, or put back to the default.
+- **Group options** (`PUT …/options`): changing a value from the stored one is refused; an unchanged re-save, or a change back to the column default, is not. **Catalog zones**: turning `catalog_zones_enabled` on is refused, turning it off is not.
 - **Blocklist assignment** to the group (new assignments only).
-- **Moving a zone into** such a group when it is non-Primary, has pools, or carries a setting above.
+- **Moving a zone into** such a group when it is non-Primary, has pools, or carries a setting above. The move preview reports it as `technitium_api_refusal` and the move dialog blocks on it, so preview and commit agree.
+- The Operator Copilot's `create_dns_zone` is held to the same zone rules in its preview and its apply.
+
+The UI hides what it would refuse on such a group: the zone dialog offers Primary only and drops Primary NS / admin email / default TTL, the group's Options tab is hidden, and the zone's Pools view lists existing pools without a *New Pool* button.
 
 **Groups that already violate the scope** (two servers, existing pools) keep serving: nothing is removed or disabled. The group response carries `scope_warnings`, rendered as a banner on the group page, and only *new* changes are refused. Other drivers are untouched.
 

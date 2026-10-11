@@ -93,9 +93,14 @@ the formatter handles the rest.
   the API refuses (422, naming "technitium_api is experimental in
   1.0") a second server per group (create, driver change, move), DNS
   pools, non-Primary zones, zone and group settings the driver never
-  writes (only a changed value; re-saving a stored one still works),
-  catalog zones and blocklist assignment; zone create adopts an
-  existing zone only if it is an empty Primary. A group that already
+  writes (only a changed value; re-saving a stored one or putting it
+  back to the default still works), turning catalog zones on, and
+  blocklist assignment; the Copilot's zone create is held to the same
+  rules, and the zone-move preview shows the refusal the commit
+  raises. Zone create adopts an existing zone only if it is an empty
+  Primary (a delegation below the apex counts as content). The UI
+  hides the zone SOA / TTL fields, non-Primary types, the group
+  Options tab and *New Pool* on such a group. A group that already
   breaks the scope keeps serving and shows a warning
   (`scope_warnings`). Capability flag `experimental`, an
   Experimental label in the UI, and `DNS_DRIVERS.md` §4C.7a list what

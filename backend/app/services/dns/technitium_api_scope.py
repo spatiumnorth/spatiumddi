@@ -76,6 +76,10 @@ def _empty(value: Any) -> bool:
     return value is None or value == "" or value == []
 
 
+def _same(value: Any, other: Any) -> bool:
+    return value == other or (_empty(value) and _empty(other))
+
+
 async def group_is_technitium_api(db: AsyncSession, group_id: uuid.UUID) -> bool:
     n = (
         await db.execute(
@@ -114,15 +118,18 @@ def refuse_unapplied_zone_changes(changes: dict[str, Any], current: Any | None) 
 
     ``current`` is the stored zone on update: only a CHANGED value is
     refused, so a zone that already holds one (set before the gate, or on
-    another driver and moved in) can still be re-saved unchanged.  On
-    create it is ``None`` and the baseline is the default.
+    another driver and moved in) can still be re-saved unchanged, or put
+    back to the default.  On create it is ``None`` and the baseline is the
+    default.
     """
     for field, default in ZONE_UNAPPLIED_DEFAULTS.items():
         if field not in changes:
             continue
         value = changes[field]
         baseline = getattr(current, field) if current is not None else default
-        if value == baseline or (_empty(value) and _empty(baseline)):
+        if _same(value, baseline) or _same(value, default):
+            # Unchanged, or put back to the default: clearing a value the
+            # driver never applied is the way out, not a new setting.
             continue
         raise refusal(
             f"zone field {field!r} is never written to the Technitium server, "
@@ -163,17 +170,22 @@ def refuse_unapplied_option_changes(
     """422 a group option being changed: this driver writes none of them.
 
     Compared against the stored row (or the column default when there is no
-    row yet) so an unchanged re-save of a form passes.
+    row yet) so an unchanged re-save of a form passes, and a change back to
+    the column default passes so a value stored before the gate can be
+    cleared.
     """
     for field, value in changes.items():
         if field in _OPTION_IGNORED or field not in DNSServerOptions.__table__.c:
             continue
+        default = _column_default(field)
         baseline = (
             getattr(current, field, None)
             if current is not None and current.id is not None
-            else _column_default(field)
+            else default
         )
-        if value == baseline or (_empty(value) and _empty(baseline)):
+        if _same(value, baseline) or _same(value, default):
+            # Unchanged, or put back to the default (the way out of a value
+            # stored before the gate).
             continue
         raise refusal(
             f"group option {field!r} is never applied to the Technitium "

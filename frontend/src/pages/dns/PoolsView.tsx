@@ -45,6 +45,8 @@ export function PoolsView({
 }) {
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
+  // #1784 — the API refuses new pools / members on this driver.
+  const technitiumApi = (group.server_drivers ?? []).includes("technitium_api");
   const [editPool, setEditPool] = useState<DNSPool | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSPool | null>(null);
 
@@ -80,14 +82,24 @@ export function PoolsView({
             <em>ttl</em> seconds.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-3 w-3" /> New Pool
-        </button>
+        {!technitiumApi && (
+          <button
+            type="button"
+            onClick={() => setShowCreate(true)}
+            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-3 w-3" /> New Pool
+          </button>
+        )}
       </div>
+      {technitiumApi && (
+        <p className="border-b bg-amber-500/10 px-5 py-2 text-xs text-amber-800 dark:text-amber-300">
+          DNS pools are not supported by the experimental{" "}
+          <code>technitium_api</code> driver: a pool&rsquo;s members collapse to
+          one record on the Technitium server. Existing pools are listed here,
+          but new pools and members are refused.
+        </p>
+      )}
 
       <div className="flex-1 overflow-auto">
         {isFetching && pools.length === 0 && (
@@ -96,7 +108,13 @@ export function PoolsView({
         {pools.length === 0 && !isFetching && (
           <div className="flex h-40 flex-col items-center justify-center">
             <p className="text-sm italic text-muted-foreground">
-              No pools yet. Click <em>New Pool</em> to create one.
+              {technitiumApi ? (
+                "No pools."
+              ) : (
+                <>
+                  No pools yet. Click <em>New Pool</em> to create one.
+                </>
+              )}
             </p>
           </div>
         )}

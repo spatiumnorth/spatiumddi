@@ -498,3 +498,203 @@ async def test_existing_empty_primary_zone_is_adopted(monkeypatch: pytest.Monkey
         ],
     )
     assert await d.apply_zone_change(_S(), _Z(), "create") is False
+
+
+# ── validation pass: preview/commit agreement, ways out, Copilot ─────────
+
+
+@pytest.mark.asyncio
+async def test_zone_move_preview_reports_the_refusal_the_commit_raises(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Preview and commit agree: the preview names the refusal (and the UI
+    blocks on it) instead of the operator finding out at commit."""
+    t = await _token(db_session)
+    src = await _group(db_session, "bind9")
+    dst = await _group(db_session, "technitium_api")
+    z = await _zone(db_session, src, zone_type="secondary")
+    await db_session.commit()
+    base = f"/api/v1/dns/groups/{src.id}/zones/{z.id}/move"
+    pv = await client.post(f"{base}/preview", headers=_h(t), json={"target_group_id": str(dst.id)})
+    assert pv.status_code == 200, pv.text
+    refusal = pv.json()["technitium_api_refusal"]
+    assert refusal and EXPERIMENTAL in refusal and "secondary" in refusal
+    cm = await client.post(
+        f"{base}/commit",
+        headers=_h(t),
+        json={"target_group_id": str(dst.id), "confirmation_zone_name": z.name},
+    )
+    assert cm.status_code == 422, cm.text
+    assert cm.json()["detail"] == refusal
+
+
+@pytest.mark.asyncio
+async def test_zone_move_preview_clean_for_a_fitting_zone_and_other_targets(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    t = await _token(db_session)
+    src = await _group(db_session, "bind9")
+    dst = await _group(db_session, "technitium_api")
+    other = await _group(db_session, "bind9")
+    z = DNSZone(group_id=src.id, name=f"m{uuid.uuid4().hex[:6]}.example.com.", kind="forward")
+    db_session.add(z)
+    await db_session.commit()
+    base = f"/api/v1/dns/groups/{src.id}/zones/{z.id}/move/preview"
+    for target in (dst, other):
+        pv = await client.post(base, headers=_h(t), json={"target_group_id": str(target.id)})
+        assert pv.status_code == 200, pv.text
+        assert pv.json()["technitium_api_refusal"] is None
+
+
+@pytest.mark.asyncio
+async def test_catalog_zones_can_be_turned_off_on_technitium_api(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Turning an unapplied setting OFF is the way out, not a new setting."""
+    t = await _token(db_session)
+    g = await _group(db_session, "technitium_api")
+    g.catalog_zones_enabled = True
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{g.id}"
+    assert (
+        await client.put(url, headers=_h(t), json={"catalog_zones_enabled": True})
+    ).status_code == 200
+    r = await client.put(url, headers=_h(t), json={"catalog_zones_enabled": False})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_stored_option_can_be_cleared_back_to_default(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    t = await _token(db_session)
+    g = await _group(db_session, "technitium_api")
+    await db_session.commit()
+    opts = (
+        await client.get(f"/api/v1/dns/groups/{g.id}/options", headers=_h(t))
+    ).json()  # what the UI loads
+    row = await db_session.get(DNSServerOptions, uuid.UUID(opts["id"]))
+    assert row is not None
+    row.forwarders = ["9.9.9.9"]
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{g.id}/options"
+    # Unchanged re-save, then cleared: both fine. A different value: refused.
+    assert (
+        await client.put(url, headers=_h(t), json={"forwarders": ["9.9.9.9"]})
+    ).status_code == 200
+    _assert_refused(await client.put(url, headers=_h(t), json={"forwarders": ["1.1.1.1"]}))
+    r = await client.put(url, headers=_h(t), json={"forwarders": []})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_zone_field_can_be_put_back_to_default_and_ui_resave_passes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    t = await _token(db_session)
+    g = await _group(db_session, "technitium_api")
+    z = await _zone(db_session, g, ttl=300)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{g.id}/zones/{z.id}"
+    # What ZoneModal sends on Save with nothing edited.
+    ui = {
+        "name": z.name.rstrip("."),
+        "zone_type": "primary",
+        "kind": "forward",
+        "view_id": None,
+        "primary_ns": "ns1.example.com.",
+        "admin_email": "admin.example.com.",
+        "ttl": 300,
+        "dnssec_enabled": False,
+        "color": None,
+        "domain_id": None,
+        "customer_id": None,
+    }
+    r = await client.put(url, headers=_h(t), json=ui)
+    assert r.status_code == 200, r.text
+    r = await client.put(url, headers=_h(t), json={**ui, "ttl": 3600, "primary_ns": ""})
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_copilot_create_zone_is_held_to_the_rest_scope(db_session: AsyncSession) -> None:
+    """The Copilot fronts the REST API and must not be a way around its 422s."""
+    from app.services.ai.operations import CreateDNSZoneArgs, get_operation
+
+    user = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="T",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    g = await _group(db_session, "technitium_api")
+    b = await _group(db_session, "bind9")
+    await db_session.flush()
+    op = get_operation("create_dns_zone")
+    assert op is not None
+    for bad in ({"zone_type": "secondary"}, {"ttl": 300}, {"primary_ns": "ns1.example.com."}):
+        args = CreateDNSZoneArgs(name="c.example.com", group_id=str(g.id), **bad)
+        pv = await op.preview(db_session, user, args)
+        assert pv.ok is False and EXPERIMENTAL in pv.detail
+        with pytest.raises(ValueError, match="experimental in 1.0"):
+            await op.apply(db_session, user, args)
+    # A plain Primary is fine, and other drivers are untouched.
+    assert (
+        await op.preview(
+            db_session, user, CreateDNSZoneArgs(name="ok.example.com", group_id=str(g.id))
+        )
+    ).ok
+    assert (
+        await op.preview(
+            db_session,
+            user,
+            CreateDNSZoneArgs(name="b.example.com", group_id=str(b.id), ttl=300),
+        )
+    ).ok
+
+
+@pytest.mark.asyncio
+async def test_real_create_response_is_never_read_as_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Technitium's real create answer (``WebServiceZonesApi.CreateZoneAsync``
+    always writes ``domain``) is a create: no adoption probe follows."""
+    d = _drv(monkeypatch, [_ok({"domain": "a.example.com"})])
+    assert await d.apply_zone_change(_S(), _Z(), "create") is True
+
+
+@pytest.mark.asyncio
+async def test_other_create_error_is_never_read_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.drivers.dns._cloud_base import CloudDNSError
+
+    d = _drv(monkeypatch, [{"status": "error", "errorMessage": "Access was denied."}])
+    with pytest.raises(CloudDNSError) as ei:
+        await d.apply_zone_change(_S(), _Z(), "create")
+    assert not isinstance(ei.value, CloudDNSConflictError)
+
+
+@pytest.mark.asyncio
+async def test_sub_apex_ns_delegation_is_not_adopted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the apex NS is Technitium's own; a delegation is operator data."""
+    d = _drv(
+        monkeypatch,
+        [
+            _EXISTS,
+            _ok({"zones": [{"name": "a.example.com", "type": "Primary"}], "totalPages": 1}),
+            _ok(
+                {
+                    "records": [
+                        {"type": "SOA", "name": "a.example.com"},
+                        {"type": "NS", "name": "a.example.com"},
+                        {"type": "NS", "name": "child.a.example.com"},
+                    ]
+                }
+            ),
+        ],
+    )
+    with pytest.raises(CloudDNSConflictError):
+        await d.apply_zone_change(_S(), _Z(), "create")

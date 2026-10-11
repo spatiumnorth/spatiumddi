@@ -1776,9 +1776,12 @@ async def update_group(
             "is_public_facing",
         },
     )
+    # #1784 — only turning catalog zones ON is refused: turning an
+    # unapplied setting OFF is the way out of it, and a re-save of the
+    # stored value must keep working.
     if (
-        "catalog_zones_enabled" in changes
-        and changes["catalog_zones_enabled"] != group.catalog_zones_enabled
+        changes.get("catalog_zones_enabled") is True
+        and not group.catalog_zones_enabled
         and await technitium_api_scope.group_is_technitium_api(db, group.id)
     ):
         raise technitium_api_scope.refusal(
@@ -6399,6 +6402,9 @@ class ZoneMovePreviewResponse(BaseModel):
     acl_names_remapped: list[str]
     acl_names_lost: list[str]
     key_names_lost: list[str]
+    #: #1784 — the experimental technitium_api target refuses this zone;
+    #: non-null means the commit refuses, not waivable by acknowledgement.
+    technitium_api_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6435,6 +6441,7 @@ class ZoneMovePreviewResponse(BaseModel):
             acl_names_remapped=plan.acl_names_remapped,
             acl_names_lost=plan.acl_names_lost,
             key_names_lost=plan.key_names_lost,
+            technitium_api_refusal=plan.technitium_api_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
