@@ -123,13 +123,8 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
-from app.services.appliance.ownership import (
-    DNS_ROLE_DRIVER,
-    current_dns_drivers,
-    hostname_is_unambiguous,
-    norm_host,
-    own_server_condition,
-)
+from app.services.appliance.ownership import current_dns_drivers as _current_dns_drivers
+from app.services.appliance.ownership import own_server_condition as _own_server_condition
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
@@ -4045,14 +4040,10 @@ _VALID_ROLES = {
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
-# #1715 / #1749 — the ownership matching lives in a service so the DNS server
-# move (server -> appliance) uses the very same rules as Fleet (appliance ->
-# server).
-_DNS_ROLE_DRIVER = DNS_ROLE_DRIVER
-_norm_host = norm_host
-_hostname_is_unambiguous = hostname_is_unambiguous
-_own_server_condition = own_server_condition
-_current_dns_drivers = current_dns_drivers
+# #1715 / #1749 — the ownership matching (``_own_server_condition``,
+# ``_current_dns_drivers``) lives in ``app.services.appliance.ownership`` so
+# the DNS / DHCP server moves (server -> appliance) use the very same rules as
+# Fleet (appliance -> server).
 
 
 async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:

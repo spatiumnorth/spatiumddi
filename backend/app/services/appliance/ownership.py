@@ -10,8 +10,9 @@ directions of the lookup therefore share one rule:
     appliance. Two approved appliances sharing a hostname disable the match
     — a hostname is only a safe claim when it can't be someone else's.
 
-Fleet goes appliance -> servers (``own_server_condition``); the DNS server
-move goes server -> appliance (``owning_appliance_for_dns_server``).
+Fleet goes appliance -> servers (``own_server_condition``); the DNS and
+DHCP server moves go server -> appliance (``owning_appliance_for_dns_server``
+/ ``owning_appliance_for_dhcp_server``).
 """
 
 from __future__ import annotations
@@ -76,17 +77,11 @@ def current_dns_drivers(appliance: Appliance) -> set[str]:
     return {DNS_ROLE_DRIVER[r] for r in (appliance.assigned_roles or []) if r in DNS_ROLE_DRIVER}
 
 
-async def owning_appliance_for_dns_server(db: AsyncSession, server: Any) -> Appliance | None:
-    """The appliance that owns ``server`` (a DNSServer), or None.
-
-    The FK wins. Otherwise the hostname match, which is only trusted for an
-    agent-based row of the appliance's CURRENT DNS engine: an engine switch
-    leaves the old engine's row behind, and that row is not what the
-    appliance's ``assigned_dns_group_id`` / AGENT_GROUP drive, so moving it
-    must not repoint the appliance.
-    """
-    if server.appliance_id is not None:
-        return await db.get(Appliance, server.appliance_id)
+async def _unique_approved_by_hostname(db: AsyncSession, server: Any) -> Appliance | None:
+    """The one approved appliance whose normalised hostname equals an
+    agent-based, appliance_id-less ``server``'s normalised host — the
+    reverse of ``own_server_condition``'s hostname branch. None when the
+    row is not agent-based, or zero or several approved appliances match."""
     if server.agent_id is None or not server.host:
         return None
     host = norm_host(server.host)
@@ -104,9 +99,37 @@ async def owning_appliance_for_dns_server(db: AsyncSession, server: Any) -> Appl
         .scalars()
         .all()
     )
-    if len(matches) != 1:
+    return matches[0] if len(matches) == 1 else None
+
+
+async def owning_appliance_for_dns_server(db: AsyncSession, server: Any) -> Appliance | None:
+    """The appliance that owns ``server`` (a DNSServer), or None.
+
+    The FK wins. Otherwise the hostname match, which is only trusted for an
+    agent-based row of the appliance's CURRENT DNS engine: an engine switch
+    leaves the old engine's row behind, and that row is not what the
+    appliance's ``assigned_dns_group_id`` / AGENT_GROUP drive, so moving it
+    must not repoint the appliance.
+    """
+    if server.appliance_id is not None:
+        return await db.get(Appliance, server.appliance_id)
+    appliance = await _unique_approved_by_hostname(db, server)
+    if appliance is None or server.driver not in current_dns_drivers(appliance):
         return None
-    appliance = matches[0]
-    if server.driver not in current_dns_drivers(appliance):
+    return appliance
+
+
+async def owning_appliance_for_dhcp_server(db: AsyncSession, server: Any) -> Appliance | None:
+    """The appliance that owns ``server`` (a DHCPServer), or None.
+
+    Same rule as the DNS lookup. DHCP has one engine (Kea), so "current
+    engine" reduces to the appliance holding the ``dhcp`` role: a row it
+    no longer runs an agent for is not what ``assigned_dhcp_group_id``
+    drives.
+    """
+    if server.appliance_id is not None:
+        return await db.get(Appliance, server.appliance_id)
+    appliance = await _unique_approved_by_hostname(db, server)
+    if appliance is None or "dhcp" not in (appliance.assigned_roles or []):
         return None
     return appliance
