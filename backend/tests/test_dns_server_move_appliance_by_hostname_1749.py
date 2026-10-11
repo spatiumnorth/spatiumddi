@@ -213,7 +213,9 @@ async def test_move_reaches_the_role_assignment_render(
     db_session.add(cert)
     await db_session.flush()
     db_session.add(
-        DNSServerOptions(group_id=dst.id, dot_enabled=True, dot_port=8853, tls_certificate_id=cert.id)
+        DNSServerOptions(
+            group_id=dst.id, dot_enabled=True, dot_port=8853, tls_certificate_id=cert.id
+        )
     )
     appliance = await _appliance(db_session, src)
     await db_session.commit()

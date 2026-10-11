@@ -93,7 +93,13 @@ the formatter handles the rest.
   (#1715): by FK, else by hostname, never when two approved appliances
   share it, and for a hostname match only on a row of the appliance's
   current DNS engine. It is repointed only if it still named the
-  group being left, and its supervisor is woken.
+  group being left, and its supervisor is woken. The DHCP server PUT
+  had the same gap and worse (it never repointed, not even by FK), so
+  the supervisor kept rendering the old group's `AGENT_GROUP`, network
+  mode and Kea HA listener; it now repoints `assigned_dhcp_group_id`
+  under the same rule, for an appliance holding the `dhcp` role.
+  Clearing a DHCP server's group never clears the appliance's, since a
+  NULL group idles its DHCP role.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
