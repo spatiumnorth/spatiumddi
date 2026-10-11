@@ -731,6 +731,8 @@ Technitium has no static local secret file the entrypoint pre-seeds (unlike Powe
 3. On first-ever config apply, the driver calls `GET /api/user/createToken?user=admin&pass=<bootstrap-pw>&tokenName=spatiumddi-agent` **exactly once** and persists the resulting bearer token. Confirmed empirically: `createToken` is **not idempotent on tokenName** — calling it again mints a brand-new token and leaves the old one orphaned on the server — so the local token file's mere presence is the "already provisioned" signal, not an API-side check.
 4. All subsequent calls carry `Authorization: Bearer <token>`. **Auth failure surfaces as HTTP 200** with `{"status": "invalid-token", ...}` in the body — confirmed empirically — so every caller must inspect the JSON `status` field, never the HTTP status code alone.
 
+5. **When the bootstrap password stops working** (state volume lost while `/etc/dns` survives, admin password changed, TOTP enabled on `admin`) a re-mint is impossible. The driver recognises Technitium's `Invalid username or password` error and the `2fa-required` status (APIDOCS.md, "API Response Format"), raises `TechnitiumCredentialsError` with a specific `bad-credentials` / `2fa-required` reason — it becomes the #882 apply-status `error` — and records `technitium-credentials-rejected.json` in the state dir. While that marker is fresh and the password file unchanged, the agent does not call `createToken` again; it retries at most once per 15 minutes, because Technitium blocks the loopback client for 5 minutes after 5 failed logins. Recover by restoring the password / disabling TOTP; changing the password file or deleting the marker retries immediately.
+
 The token never reaches the control plane — same agent-local trust boundary as PowerDNS's API key and BIND9's TSIG/rndc key.
 
 ### 4B.3 Capabilities
@@ -930,7 +932,7 @@ Fernet-encrypted into `DNSServer.credentials_encrypted`, the same column every o
 
 `verify_tls` defaults to true and only an explicit `false` turns it off, so a credential blob written before the field existed stays strict.
 
-Auth is `Authorization: Bearer`, required for everything since Technitium 15.0. The operator mints the token at Administration → Sessions → Create Token. Technitium's own docs recommend a dedicated limited user for token use, and SpatiumDDI only needs **Zones: Modify** and **DnsClient: View** — not Administrator. The token inherits that user's permissions, including Technitium's per-zone ACLs.
+Auth is `Authorization: Bearer`, required for everything since Technitium 15.0. The operator mints the token at Administration → Sessions → Create Token. Technitium's own docs recommend a dedicated limited user for token use, so use a user in the built-in **DNS Administrators** group — not Administrator. (Zones: Modify + DnsClient: View is *not* enough: `zones/delete` checks the section's Delete flag, and zone-level checks consult only each zone's own ACL, which for a pre-existing zone names only its creator, Administrators and DNS Administrators — the probe then reports 0 zones.) Technitium **15.0 or later** is required; a 14.x server answers `invalid-token` to the Bearer header and the probe says so. The token inherits that user's permissions, including Technitium's per-zone ACLs.
 
 SECURITY: the URL is operator-supplied and the *server* dials it, so create/update runs it through `app.core.ssrf.assert_safe_target`. Advisory, not blocking, per that module's contract — a co-located Technitium on the appliance's own loopback is a legitimate target.
 

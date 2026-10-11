@@ -385,7 +385,7 @@ const SELF_HOSTED_CRED_FIELDS: Record<string, CloudCredField[]> = {
       label: "API token",
       placeholder: "permanent API token",
       secret: true,
-      help: "Administration → Sessions → Create Token. Create it against a limited user (Zones: Modify + DnsClient: View), not the admin account — the token inherits that user's permissions.",
+      help: "Administration → Sessions → Create Token. Requires Technitium 15.0 or later. Create it against a dedicated user that is a member of the DNS Administrators group (not the admin account) — the token inherits that user's permissions, and Zones: Modify alone cannot delete zones or see zones that already existed.",
     },
     {
       key: "verify_tls",

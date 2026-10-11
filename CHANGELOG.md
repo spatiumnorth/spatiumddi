@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium token and auth lifecycle (#1772).** The agentless
+  `technitium_api` setup text said Zones: Modify + DnsClient: View, which
+  cannot delete zones and sees no pre-existing zone; the form, API
+  docstring and docs now say to use a user in DNS Administrators, and the
+  connection test warns when it sees 0 zones. A pre-15.0 server (no Bearer
+  auth) is now reported as such by the test instead of "recreate the
+  token". The Technitium agent now names `bad-credentials` and
+  `2fa-required` when it cannot re-mint its API token and stops presenting
+  the password (one attempt per 15 minutes), so retries no longer trip
+  Technitium's 5-attempt login lockout.
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
