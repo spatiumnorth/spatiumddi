@@ -90,12 +90,22 @@ the formatter handles the rest.
   Sentinel queries had no timeouts either, so a connection to a
   vanished peer never errored: the worker stayed deaf after Sentinel
   promoted a replica, its `inspect ping` liveness probe failed three
-  times, and the pod was killed. The broker and result backend now set
-  a 10 s socket timeout, 5 s connect timeout and TCP keepalive (the
-  kernel resets a connection to a vanished peer within about 25 s),
-  including on Sentinel queries and plain `redis://` URLs, so the
-  worker reconnects to the promoted master on its own. The liveness
+  times, and the pod was killed. The broker now sets a 10 s socket
+  timeout, 5 s connect timeout and TCP keepalive (the kernel resets a
+  connection to a vanished peer within about 25 s), on plain
+  `redis://` URLs too; Sentinel queries and the result backend get
+  shorter timeouts of their own (below). The worker now reconnects to
+  the promoted master on its own. The liveness
   probe tolerates 5 misses instead of 3.
+  - **The worker reconnects within about 2 s of Sentinel's switch.**
+    Celery's reconnect loop waited kombu's default 2, 4, 6 ... up to
+    30 s between attempts, so a worker could reconnect 10 s or more after
+    a master was available again. The wait is now 1 s and then 2 s each
+    time (through celery's `worker_consumer` setting). Each attempt is
+    one bounded Sentinel lookup, so while no master exists a worker asks
+    Sentinel at most once every 2 s. Celery's 100 reconnect attempts now
+    run out after roughly 4–8 minutes of continuous outage instead of
+    about 45, after which the worker exits and is restarted.
   - **A warm shutdown with no Redis master finishes.** It used to run
     out its 60 s grace and end in SIGKILL, on main as well. The worker
     heartbeat publishes every 2 s from the event loop and, with no
@@ -107,13 +117,20 @@ the formatter handles the rest.
     never revokes a task, and a reconnect that met a dead Sentinel
     inside it exited the worker. Sentinel lookups also no longer take
     redis-py's default 3 retries, which nest around the connect too and
-    made one lookup against an unreachable Sentinel take about 100 s.
-    In a test rig, shutdowns with no master now take 3–23 s.
+    made one lookup against an unreachable Sentinel take about 100 s,
+    and Sentinel queries now time out after 3 s (2 s to connect)
+    instead of the data connections' 10 s and 5 s. In a test rig,
+    shutdowns with no master take 3–23 s. With a task that finishes
+    and fails its result write during the shutdown, they take 31–43 s,
+    17 s of which, in the longer case, is the task still running.
   - **The first result write in each pool child after a failover no
     longer fails its task.** Its pooled socket still pointed at the old
     master, and celery's first read of the task's state is not retried.
-    Result writes now retry up to 3 times, each on a connection that
-    asks Sentinel for the current master.
+    Result writes now retry up to 2 times, each on a connection that
+    asks Sentinel for the current master, and the result backend's socket
+    and connect timeouts are 5 s and 2 s. A write that cannot succeed
+    because there is no master fails after at most about 16 s (it took
+    about 40 s on a test cluster).
   - **A `Task.retry` during a broker outage is requeued instead of
     deleted.** celery turns any failure to publish the retry into
     `Reject(requeue=False)`, which `task_acks_late` turns into a deleted

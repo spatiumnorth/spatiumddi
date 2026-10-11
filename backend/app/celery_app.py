@@ -17,6 +17,7 @@ from celery.signals import (
     task_prerun,
     worker_init,
 )
+from celery.worker.consumer import Consumer
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
@@ -916,7 +917,18 @@ REDIS_KEEPALIVE_IDLE_S = 10  # first probe after 10 s idle
 REDIS_KEEPALIVE_INTERVAL_S = 5  # then every 5 s
 REDIS_KEEPALIVE_PROBES = 3  # dead after 10 + 3*5 = 25 s of silence
 REDIS_TCP_USER_TIMEOUT_MS = 25_000  # unacked data (keepalive does not run) gives up in 25 s
-REDIS_RESULT_STORE_RETRIES = 3  # result write: one fresh-connection retry is enough after failover
+# Sentinel queries: one small reply from memory; these bound each master lookup.
+REDIS_SENTINEL_SOCKET_TIMEOUT_S = 3.0
+REDIS_SENTINEL_CONNECT_TIMEOUT_S = 2.0  # in-cluster connects take milliseconds
+# Result backend: small GET/SET replies, so shorter than the broker's.
+REDIS_RESULT_SOCKET_TIMEOUT_S = 5.0
+REDIS_RESULT_CONNECT_TIMEOUT_S = 2.0
+# After a failover one fresh-connection retry is enough; 2 also covers a lookup
+# that lands on a dead Sentinel endpoint.
+REDIS_RESULT_STORE_RETRIES = 2
+# The worker's broker reconnect waits 1 s, then 2 s every time (kombu's own
+# default grows 2, 4, 6 ... up to 30 s).
+CONSUMER_RECONNECT_INTERVAL_MAX_S = 2.0
 
 
 def _redis_keepalive_options() -> dict[int, int]:
@@ -962,10 +974,15 @@ def build_redis_transport_options(
         # lookup — measured holding a warm shutdown past its 60 s grace on a
         # single ``srem``. With no retry a lookup costs one socket or connect
         # timeout, and the caller's own retry (kombu's reconnect loop, the
-        # publish retry policy) asks again, on a fresh connection.
+        # publish retry policy) asks again, on a fresh connection. The
+        # timeouts are shorter than the data connections' because a Sentinel
+        # answers ``SENTINEL MASTERS`` from memory: a lookup is then at most
+        # 3 s (a dead pooled socket) or 2 s (a dead Service endpoint), which
+        # is what bounds the result-write retries and the consumer's
+        # reconnect attempts while no master is available.
         sentinel_kwargs: dict[str, Any] = {
-            "socket_timeout": REDIS_SOCKET_TIMEOUT_S,
-            "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT_S,
+            "socket_timeout": REDIS_SENTINEL_SOCKET_TIMEOUT_S,
+            "socket_connect_timeout": REDIS_SENTINEL_CONNECT_TIMEOUT_S,
             "socket_keepalive": True,
             "socket_keepalive_options": _redis_keepalive_options(),
             "retry": Retry(NoBackoff(), 0),
@@ -974,6 +991,42 @@ def build_redis_transport_options(
             sentinel_kwargs["password"] = sentinel_password
         opts["sentinel_kwargs"] = sentinel_kwargs
     return opts
+
+
+class SpatiumConsumer(Consumer):
+    """Worker consumer whose broker reconnect retries every <= 2 s (#1669).
+
+    celery 5.6.3's ``Consumer.ensure_connected`` calls kombu's
+    ``ensure_connection`` with no intervals, so kombu's defaults apply
+    (start 2 s, step 2 s, max 30 s): after a Redis master is lost the wait
+    between attempts grows 2, 4, 6 ... s, and on the ddi-pg walk of #1717
+    the attempt before Sentinel's switch missed it by 1.5 s and the next came
+    10.5 s later. Celery has no setting for these intervals and kombu reads
+    ``broker_transport_options`` intervals only on its ``default_channel``
+    path, so the consumer class (the supported ``worker_consumer`` setting)
+    binds them on the connection it is about to retry. A capped interval does
+    not hammer Sentinel: each attempt is one master lookup, bounded by the
+    Sentinel timeouts above (<= 3 s), so a worker sends at most one Sentinel
+    query per 2 s while no master exists. Side effect: celery's
+    ``broker_connection_max_retries`` (100) is now spent in roughly 3.5-8
+    minutes of continuous broker outage instead of ~45, after which the
+    worker exits and its restart policy brings it back; the k8s liveness
+    probe (5 x 30 s) restarts it sooner than either.
+    """
+
+    def ensure_connected(self, conn: Any) -> Any:
+        conn.ensure_connection = functools.partial(
+            conn.ensure_connection,
+            interval_start=1,
+            interval_step=1,
+            interval_max=CONSUMER_RECONNECT_INTERVAL_MAX_S - 1,
+        )
+        return super().ensure_connected(conn)
+
+
+# kombu's retry_over_time sleeps through fxrange(start, interval_max + start,
+# step), so interval_max=1 with start=1 yields 1, 2, 2, 2 ... seconds.
+celery_app.conf.worker_consumer = f"{__name__}:SpatiumConsumer"
 
 
 if settings.celery_broker_url.startswith(
@@ -995,8 +1048,14 @@ if settings.celery_broker_url.startswith(
     if settings.celery_result_backend.startswith(
         ("redis://", "rediss://", "sentinel://", "redis+sentinel://")
     ):
-        celery_app.conf.redis_socket_timeout = REDIS_SOCKET_TIMEOUT_S
-        celery_app.conf.redis_socket_connect_timeout = REDIS_SOCKET_CONNECT_TIMEOUT_S
+        # Shorter than the broker's: a result write is a GET plus a pipelined
+        # SET/PUBLISH of a small value, and nothing here parks a read (the
+        # result consumer's pub/sub reads pass their own timeout). The
+        # timeouts are what a write costs when the master is gone, and on a
+        # warm shutdown a task that fails its write is written TWICE: by the
+        # pool child, then by the parent's ``Request.on_failure``.
+        celery_app.conf.redis_socket_timeout = REDIS_RESULT_SOCKET_TIMEOUT_S
+        celery_app.conf.redis_socket_connect_timeout = REDIS_RESULT_CONNECT_TIMEOUT_S
         celery_app.conf.redis_socket_keepalive = True
         # A pool child's pooled backend socket can still point at a master
         # that died after a failover, and ``_store_result`` first does an
@@ -1008,12 +1067,16 @@ if settings.celery_broker_url.startswith(
         # does: each attempt checks a connection out of the pool afresh, and
         # a dropped one reconnects through ``SentinelManagedConnection
         # .connect()``, which asks Sentinel for the current master. Bounded,
-        # so a task finishing during an outage still fails in seconds rather
-        # than holding its pool child (and a warm shutdown) indefinitely.
+        # so a task finishing during an outage still fails rather than
+        # holding its pool child (and a warm shutdown) indefinitely. Worst
+        # case with no master: the stale socket's 5 s read, then per retry a
+        # lookup (<= 3 s) plus a connect to the master Sentinel still names
+        # (<= 2 s) plus <= 0.5 s backoff: 5 + 2 x 5.5 = 16 s (it was ~40 s
+        # with 3 retries and 10 s timeouts, ddi-pg walk of #1717).
         # A result write is a SET of the same value, so a retry is idempotent.
         celery_app.conf.result_backend_always_retry = True
         celery_app.conf.result_backend_max_retries = REDIS_RESULT_STORE_RETRIES
-        celery_app.conf.result_backend_max_sleep_between_retries_ms = 1000
+        celery_app.conf.result_backend_max_sleep_between_retries_ms = 500
 
 
 # ── Diagnostics — Celery task_failure capture (issue #123) ──────────────

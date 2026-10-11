@@ -10,14 +10,19 @@ from __future__ import annotations
 import socket
 
 from app.celery_app import (
+    REDIS_RESULT_CONNECT_TIMEOUT_S,
+    REDIS_RESULT_SOCKET_TIMEOUT_S,
+    REDIS_RESULT_STORE_RETRIES,
+    REDIS_SENTINEL_CONNECT_TIMEOUT_S,
+    REDIS_SENTINEL_SOCKET_TIMEOUT_S,
     REDIS_SOCKET_CONNECT_TIMEOUT_S,
     REDIS_SOCKET_TIMEOUT_S,
     build_redis_transport_options,
     celery_app,
 )
 
-# kombu 5.6.2 Transport.brpop_timeout: the synchronous path blocks this long
-# on the socket for every idle BRPOP.
+# kombu 5.6.2 Transport.brpop_timeout: Channel.close() reads an outstanding
+# BRPOP reply without polling, and a live server answers within this.
 _KOMBU_BRPOP_TIMEOUT_S = 1
 
 
@@ -29,17 +34,20 @@ def test_socket_timeout_exceeds_brpop_block():
 def test_sentinel_options_cover_broker_and_sentinel_queries():
     o = build_redis_transport_options("sentinel://s:26379", "mymaster", "pw")
     assert o["master_name"] == "mymaster"
-    for d in (o, o["sentinel_kwargs"]):
-        assert d["socket_timeout"] == REDIS_SOCKET_TIMEOUT_S
-        assert d["socket_connect_timeout"] == REDIS_SOCKET_CONNECT_TIMEOUT_S
+    assert o["socket_timeout"] == REDIS_SOCKET_TIMEOUT_S
+    assert o["socket_connect_timeout"] == REDIS_SOCKET_CONNECT_TIMEOUT_S
+    sk = o["sentinel_kwargs"]
+    assert sk["socket_timeout"] == REDIS_SENTINEL_SOCKET_TIMEOUT_S
+    assert sk["socket_connect_timeout"] == REDIS_SENTINEL_CONNECT_TIMEOUT_S
+    for d in (o, sk):
         assert d["socket_keepalive"] is True
-    assert o["sentinel_kwargs"]["password"] == "pw"
+    assert sk["password"] == "pw"
 
 
 def test_sentinel_without_password_still_gets_timeouts():
     o = build_redis_transport_options("sentinel://s:26379", "m", None)
     assert "password" not in o["sentinel_kwargs"]
-    assert o["sentinel_kwargs"]["socket_timeout"] == REDIS_SOCKET_TIMEOUT_S
+    assert o["sentinel_kwargs"]["socket_timeout"] == REDIS_SENTINEL_SOCKET_TIMEOUT_S
 
 
 def test_plain_redis_gets_timeouts_but_no_master():
@@ -64,7 +72,7 @@ def test_app_conf_carries_options_in_this_deployment():
     # The default test URL is redis://, so the broker carries timeouts and the
     # result backend inherits the redis_socket_* settings celery reads.
     assert celery_app.conf.broker_transport_options["socket_timeout"] == REDIS_SOCKET_TIMEOUT_S
-    assert celery_app.conf.redis_socket_timeout == REDIS_SOCKET_TIMEOUT_S
+    assert celery_app.conf.redis_socket_timeout == REDIS_RESULT_SOCKET_TIMEOUT_S
     assert celery_app.conf.redis_socket_keepalive is True
 
 
@@ -105,8 +113,8 @@ def test_sentinel_kwargs_reach_the_sentinel_clients():
     o = build_redis_transport_options("sentinel://s:26379", "m", "pw")
     s = Sentinel([("s", 26379)], sentinel_kwargs=o["sentinel_kwargs"])
     kw = s.sentinels[0].connection_pool.connection_kwargs
-    assert kw["socket_timeout"] == REDIS_SOCKET_TIMEOUT_S
-    assert kw["socket_connect_timeout"] == REDIS_SOCKET_CONNECT_TIMEOUT_S
+    assert kw["socket_timeout"] == REDIS_SENTINEL_SOCKET_TIMEOUT_S
+    assert kw["socket_connect_timeout"] == REDIS_SENTINEL_CONNECT_TIMEOUT_S
     assert kw["socket_keepalive"] is True
     assert kw["password"] == "pw"
 
@@ -127,7 +135,57 @@ def test_sentinel_lookups_are_not_retried_inside_redis_py():
 
 def test_result_writes_retry_a_bounded_number_of_times():
     assert celery_app.conf.result_backend_always_retry is True
-    assert 1 <= celery_app.conf.result_backend_max_retries <= 5
+    assert celery_app.conf.result_backend_max_retries == REDIS_RESULT_STORE_RETRIES
+    assert celery_app.conf.redis_socket_timeout == REDIS_RESULT_SOCKET_TIMEOUT_S
+    assert celery_app.conf.redis_socket_connect_timeout == REDIS_RESULT_CONNECT_TIMEOUT_S
+
+
+def test_worst_case_result_write_fits_a_warm_shutdown():
+    # With no master, a failing write costs the stale socket's read, then per
+    # retry one Sentinel lookup + one connect + the max backoff. On a warm
+    # shutdown it happens twice (pool child, then the parent's on_failure),
+    # beside Channel.close()'s two broker reads; all inside the 60 s grace.
+    backoff_s = celery_app.conf.result_backend_max_sleep_between_retries_ms / 1000
+    write = REDIS_RESULT_SOCKET_TIMEOUT_S + REDIS_RESULT_STORE_RETRIES * (
+        REDIS_SENTINEL_SOCKET_TIMEOUT_S + REDIS_RESULT_CONNECT_TIMEOUT_S + backoff_s
+    )
+    assert write <= 20
+    assert 2 * write + 2 * REDIS_SOCKET_TIMEOUT_S < 60
+
+
+def test_worker_uses_the_capped_reconnect_consumer(monkeypatch):
+    from celery.utils.imports import symbol_by_name
+    from celery.worker.consumer import Consumer
+    from kombu.utils.functional import fxrange
+
+    from app.celery_app import CONSUMER_RECONNECT_INTERVAL_MAX_S, SpatiumConsumer
+
+    assert symbol_by_name(celery_app.conf.worker_consumer) is SpatiumConsumer
+
+    seen: dict = {}
+
+    class FakeConn:
+        def ensure_connection(self, *args, **kwargs):
+            seen["args"], seen["kwargs"] = args, kwargs
+            return self
+
+    monkeypatch.setattr(Consumer, "ensure_connected", lambda self, conn: conn)
+    consumer = object.__new__(SpatiumConsumer)
+    conn = consumer.ensure_connected(FakeConn())
+    # celery calls it as ensure_connection(errback, max_retries, callback=...)
+    conn.ensure_connection("errback", 100, callback="cb")
+    kw = seen["kwargs"]
+    assert seen["args"] == ("errback", 100) and kw["callback"] == "cb"
+    # kombu's retry_over_time sleeps through exactly this range
+    waits = fxrange(
+        kw["interval_start"],
+        kw["interval_max"] + kw["interval_start"],
+        kw["interval_step"],
+        repeatlast=True,
+    )
+    first = [next(waits) for _ in range(6)]
+    assert max(first) == CONSUMER_RECONNECT_INTERVAL_MAX_S
+    assert first[0] <= first[1] and first[-1] == CONSUMER_RECONNECT_INTERVAL_MAX_S
 
 
 def _raise_from(filename: str) -> AttributeError:
