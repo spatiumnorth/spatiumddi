@@ -90,10 +90,13 @@ the formatter handles the rest.
   docstring and docs now say to use a user in DNS Administrators, and the
   connection test warns when it sees 0 zones. A pre-15.0 server (no Bearer
   auth) is now reported as such by the test instead of "recreate the
-  token". The Technitium agent now names `bad-credentials` and
-  `2fa-required` when it cannot re-mint its API token and stops presenting
-  the password (one attempt per 15 minutes), so retries no longer trip
-  Technitium's 5-attempt login lockout.
+  token". The Technitium agent now names `bad-credentials`,
+  `2fa-required` and `locked-out` when it cannot re-mint its API token, and
+  stops presenting the password: one attempt per 15 minutes, instead of
+  one per apply retry and per record op, which kept the agent's address
+  under Technitium's 5-failure login block. Such an apply reports
+  `reverted` with that reason, not `revert_failed`, because no call reached
+  the daemon.
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

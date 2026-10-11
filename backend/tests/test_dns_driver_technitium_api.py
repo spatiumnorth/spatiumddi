@@ -784,6 +784,39 @@ async def test_probe_names_a_pre_15_server_instead_of_blaming_the_token(
 
 
 @pytest.mark.asyncio
+async def test_probe_blames_the_token_when_the_server_is_15_or_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On 15.x a bad token is bad in the form field too, so the fallback must
+    not turn a real token problem into an "upgrade" message."""
+    drv, _fake = _driver(
+        monkeypatch,
+        [_FakeResponse({"status": "invalid-token"}), _FakeResponse({"status": "invalid-token"})],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "Create Token" in result.message
+    assert "predates" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_call_a_restricted_token_an_old_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token whose user lacks a permission answers ``error``, not
+    ``invalid-token`` — no fallback call, no version claim."""
+    drv, fake = _driver(
+        monkeypatch,
+        [_FakeResponse({"status": "error", "errorMessage": "Access was denied."})],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "Access was denied" in result.message
+    assert "predates" not in result.message
+    assert [c["path"] for c in fake.calls] == ["/api/dnsClient/healthCheck"]
+
+
+@pytest.mark.asyncio
 async def test_probe_zero_zones_warns_about_permissions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

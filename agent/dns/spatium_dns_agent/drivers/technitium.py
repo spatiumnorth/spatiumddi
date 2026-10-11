@@ -58,8 +58,8 @@ live-pull + blocklist wiring (#744).
 from __future__ import annotations
 
 import base64
-import hashlib
 import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -88,12 +88,15 @@ _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
 _TOKEN_NAME = "spatiumddi-agent"
 # #1772: set after Technitium REFUSES the bootstrap credentials, so the agent
-# stops presenting them. Technitium blocks a loopback client for 5 minutes
-# after 5 failed logins (``AuthManager.cs`` MAX_LOGIN_ATTEMPTS), and the
-# apply loop's retry ladder would otherwise burn those attempts and lock out
-# the password the operator has just fixed.
+# stops presenting them. ``AuthManager.cs`` counts failed logins per client
+# address (the agent's is loopback) with NO time window: the count only resets
+# on a successful login or when a block expires, and every 5th failure blocks
+# that address for 5 minutes (MAX_LOGIN_ATTEMPTS / BLOCK_NETWORK_INTERVAL).
+# Without this marker the apply loop and every record op re-presented the
+# dead password, keeping the agent's address blocked almost continuously.
 _CREDS_REJECTED_FILE = "technitium-credentials-rejected.json"
-# One attempt per window is far below the 5-in-5-minutes lockout.
+# One attempt per window: at most one 5-minute loopback block per ~75 minutes
+# while the credentials stay wrong, and never a standing one.
 _CREDS_RETRY_SECONDS = 15 * 60
 # Zones this agent created from a bundle — the only ones it may delete when
 # the bundle drops them (see ``_retire_dropped_zones``).
@@ -1168,6 +1171,11 @@ class TechnitiumCredentialsError(RuntimeError):
     names the cause and the way out rather than "no API token available".
     """
 
+    #: Raised before any authenticated call succeeds — every call in an apply
+    #: carries the same token — so the daemon has taken nothing from this
+    #: apply and there is nothing to revert (see ``ConfigApplyError``).
+    daemon_untouched = True
+
     def __init__(self, reason: str, detail: str = ""):
         self.reason = reason
         super().__init__(_creds_message(reason, detail))
@@ -1179,17 +1187,26 @@ def _creds_message(reason: str, detail: str = "") -> str:
             "Technitium requires a two-factor code for the 'admin' account "
             "(2fa-required), so the agent cannot mint a new API token"
         )
+    elif reason == "locked-out":
+        what = (
+            "Technitium has blocked logins from the agent's address after "
+            "repeated failures (locked-out), so the agent cannot mint a new "
+            "API token; the block lifts after 5 minutes"
+        )
     else:
         what = (
             "Technitium rejected the agent's stored admin password "
             "(bad-credentials), so the agent cannot mint a new API token"
         )
     fix = (
-        "Recovery: disable TOTP on 'admin' (or restore the password the agent "
-        "stored in technitium-admin-password), or delete the agent state "
-        "volume's technitium-credentials-rejected.json after fixing it. The "
-        "agent retries at most once every 15 minutes to stay clear of "
-        "Technitium's 5-attempt login lockout"
+        "Recovery: disable TOTP on 'admin', or make the two passwords agree — "
+        "write Technitium's current 'admin' password into "
+        "technitium-admin-password in the agent state directory (the file is "
+        "regenerated if the state volume was lost), or set 'admin' in "
+        "Technitium to the password in that file. Changing that file, or "
+        "deleting technitium-credentials-rejected.json beside it, retries at "
+        "once; otherwise the agent retries at most every 15 minutes to stay "
+        "clear of Technitium's 5-attempt login lockout"
     )
     return f"{what}. {fix}." + (f" Technitium said: {detail}" if detail else "")
 
@@ -2949,13 +2966,18 @@ class TechnitiumDriver(DriverBase):
             # AuthManager.cs: a wrong password answers "Invalid username or
             # password for user: …" and TOTP-enabled users get 2fa-required.
             # Both are verdicts about the credentials, not transient faults.
+            # A blocked address answers "Max limit of 5 attempts exceeded"
+            # before the password is even checked (not counted, but the
+            # agent would otherwise retry it on every op).
             reason = None
             if body.get("status") == "2fa-required":
                 reason = "2fa-required"
             elif "invalid username or password" in detail.lower():
                 reason = "bad-credentials"
+            elif detail.lower().startswith("max limit of"):
+                reason = "locked-out"
             if reason is not None:
-                self._record_creds_rejected(password, reason)
+                self._record_creds_rejected(password, reason, detail)
                 raise TechnitiumCredentialsError(reason, detail)
             return None
         token = body["token"]
@@ -2970,12 +2992,16 @@ class TechnitiumDriver(DriverBase):
     def _password_fingerprint(password: str) -> str:
         return hashlib.sha256(password.encode()).hexdigest()
 
-    def _record_creds_rejected(self, password: str, reason: str) -> None:
+    def _record_creds_rejected(self, password: str, reason: str, detail: str) -> None:
+        # ``detail`` is kept so the suppressed attempts report the same error
+        # text as the real one: a steady apply-status error, not one that
+        # changes shape after the first failure.
         write_private(
             self._creds_rejected_path(),
             json.dumps(
                 {
                     "reason": reason,
+                    "detail": detail,
                     "at": time.time(),
                     "pw": self._password_fingerprint(password),
                 }
@@ -2992,13 +3018,14 @@ class TechnitiumDriver(DriverBase):
         try:
             rec = json.loads(path.read_text())
             reason = str(rec["reason"])
+            detail = str(rec.get("detail") or "")
             at = float(rec["at"])
             same_pw = rec.get("pw") == self._password_fingerprint(password)
         except (OSError, ValueError, KeyError, TypeError):
             return
         if same_pw and time.time() - at < _CREDS_RETRY_SECONDS:
             log.warning("technitium_create_token_suppressed", reason=reason)
-            raise TechnitiumCredentialsError(reason)
+            raise TechnitiumCredentialsError(reason, detail)
         path.unlink(missing_ok=True)
 
     @staticmethod
