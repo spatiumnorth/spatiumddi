@@ -11,7 +11,6 @@ import socket
 
 from app.celery_app import (
     DNS_LOOKUP_STALL_S,
-    WORKER_TERMINATION_GRACE_S,
     REDIS_RESULT_CONNECT_TIMEOUT_S,
     REDIS_RESULT_SOCKET_TIMEOUT_S,
     REDIS_RESULT_STORE_RETRIES,
@@ -19,9 +18,11 @@ from app.celery_app import (
     REDIS_SENTINEL_SOCKET_TIMEOUT_S,
     REDIS_SOCKET_CONNECT_TIMEOUT_S,
     REDIS_SOCKET_TIMEOUT_S,
+    WORKER_TERMINATION_GRACE_S,
     build_redis_transport_options,
     celery_app,
 )
+from app.services.upgrades.per_node import DEFAULT_DRAIN_TIMEOUT_S
 
 # kombu 5.6.2 Transport.brpop_timeout: Channel.close() reads an outstanding
 # BRPOP reply without polling, and a live server answers within this.
@@ -147,22 +148,30 @@ def test_worst_case_result_write_fits_a_warm_shutdown():
     # retry one Sentinel lookup + one connect + the max backoff. On a warm
     # shutdown it happens twice (pool child, then the parent's on_failure),
     # beside Channel.close()'s two broker reads; all inside the pod's grace.
-    # A Sentinel lookup can also stall in getaddrinfo (#1754), which no
-    # socket timeout bounds; the worker pod's resolver options cap it.
+    # Each retry can also stall once in getaddrinfo (#1754): the reconnect to
+    # the lost node's Sentinel. No socket timeout bounds it; the worker pod's
+    # resolver options (timeout:2 attempts:2, x2 search candidates) cap it.
     backoff_s = celery_app.conf.result_backend_max_sleep_between_retries_ms / 1000
-    write = REDIS_RESULT_SOCKET_TIMEOUT_S + REDIS_RESULT_STORE_RETRIES * (
-        REDIS_SENTINEL_SOCKET_TIMEOUT_S
-        + REDIS_RESULT_CONNECT_TIMEOUT_S
-        + backoff_s
-        + DNS_LOOKUP_STALL_S
-    )
-    assert write <= 35
-    shutdown = 2 * write + 2 * REDIS_SOCKET_TIMEOUT_S
+
+    def shutdown_s(lookup_stall_s: float) -> float:
+        write = REDIS_RESULT_SOCKET_TIMEOUT_S + REDIS_RESULT_STORE_RETRIES * (
+            REDIS_SENTINEL_SOCKET_TIMEOUT_S
+            + REDIS_RESULT_CONNECT_TIMEOUT_S
+            + backoff_s
+            + lookup_stall_s
+        )
+        return 2 * write + 2 * REDIS_SOCKET_TIMEOUT_S
+
+    assert DNS_LOOKUP_STALL_S == 8
     # margin for the rest of a warm shutdown (pool join, signal handling)
-    assert shutdown + 5 < WORKER_TERMINATION_GRACE_S
-    # and the unbounded-resolver case (the ~20 s lookups of #1754) would not
-    # have fit the old 60 s grace: the options are what make the number honest
-    assert DNS_LOOKUP_STALL_S <= 8
+    assert shutdown_s(DNS_LOOKUP_STALL_S) + 5 < WORKER_TERMINATION_GRACE_S
+    # With glibc's default options (timeout:5 attempts:2, the ~20 s lookups the
+    # #1717 walk measured) the same estimate does not fit: the pod's resolver
+    # options, not the grace alone, are what make the number hold.
+    assert shutdown_s(5 * 2 * 2) > WORKER_TERMINATION_GRACE_S
+    # The upgrade orchestrator's drain waits for a terminating worker pod to
+    # be gone, so the grace must leave it room.
+    assert WORKER_TERMINATION_GRACE_S + 20 <= DEFAULT_DRAIN_TIMEOUT_S
 
 
 def test_worker_uses_the_capped_reconnect_consumer(monkeypatch):

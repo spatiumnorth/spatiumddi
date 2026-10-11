@@ -93,7 +93,11 @@ the formatter handles the rest.
   (glibc; `ndots` untouched), about 8 s per stalled lookup, and
   `terminationGracePeriodSeconds` is 90 (chart value
   `worker.terminationGracePeriodSeconds`, and `k8s/base/worker.yaml`).
-  The api and beat are unchanged.
+  The api and beat are unchanged. The one cost: a worker now waits 4 s for
+  CoreDNS, where it waited 10 s, so a cold external lookup that the
+  upstream resolver takes 4 to 6 s to answer fails once instead of
+  succeeding slowly (CoreDNS itself gives up at about 6 s either way, and
+  caches the late answer for the task's next attempt).
 
 - **Losing the node that held the Redis master no longer restarts
   every Celery worker (#1669).** kombu leaves `socket_timeout`,

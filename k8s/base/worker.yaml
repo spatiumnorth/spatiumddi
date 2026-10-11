@@ -44,6 +44,7 @@ spec:
       terminationGracePeriodSeconds: 90
       # #1754 — bound getaddrinfo (socket timeouts do not): a stalled cluster
       # DNS endpoint costs ~8 s per lookup instead of ~20 s. ndots untouched.
+      # Trade-off and arithmetic: DNS_LOOKUP_STALL_S in backend/app/celery_app.py.
       dnsConfig:
         options:
           - name: timeout

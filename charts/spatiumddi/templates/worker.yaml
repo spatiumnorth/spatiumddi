@@ -41,7 +41,8 @@ spec:
       # Service each lookup stalled ~20 s (glibc default timeout:5 attempts:2,
       # x2 search-list candidates). timeout:2 attempts:2 makes that ~8 s.
       # ndots is deliberately NOT set here: leaving it out keeps Kubernetes'
-      # default of 5.
+      # default of 5. The cost (a cold external lookup over 4 s fails once)
+      # and the arithmetic are in app/celery_app.py next to DNS_LOOKUP_STALL_S.
       dnsConfig:
         options:
           - name: timeout
