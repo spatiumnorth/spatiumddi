@@ -38,7 +38,18 @@ spec:
                   matchLabels:
                     app: spatiumddi-worker
                 topologyKey: kubernetes.io/hostname
-      terminationGracePeriodSeconds: 60
+      # #1754 — 90 s: a warm shutdown mid-result-write inside a Redis
+      # no-master window was measured at 54.5 s and 59.2 s. Keep above
+      # WORKER_TERMINATION_GRACE_S in backend/app/celery_app.py.
+      terminationGracePeriodSeconds: 90
+      # #1754 — bound getaddrinfo (socket timeouts do not): a stalled cluster
+      # DNS endpoint costs ~8 s per lookup instead of ~20 s. ndots untouched.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "2"
       containers:
         - name: worker
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest

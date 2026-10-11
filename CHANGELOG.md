@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Celery worker's warm shutdown has room for a stalled cluster-DNS
+  lookup (#1754).** With a Redis master lost, a shutdown mid-result-write
+  exited at 54.5 s and 59.2 s of a 60 s grace: socket timeouts do not
+  bound `getaddrinfo`, and while the dead node's CoreDNS pod was still
+  behind the cluster DNS Service each lookup stalled about 20 s. The worker
+  pod now carries `dnsConfig` options `timeout:2` and `attempts:2`
+  (glibc; `ndots` untouched), about 8 s per stalled lookup, and
+  `terminationGracePeriodSeconds` is 90 (chart value
+  `worker.terminationGracePeriodSeconds`, and `k8s/base/worker.yaml`).
+  The api and beat are unchanged.
+
 - **Losing the node that held the Redis master no longer restarts
   every Celery worker (#1669).** kombu leaves `socket_timeout`,
   `socket_connect_timeout` and `socket_keepalive` unset, and the

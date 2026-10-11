@@ -10,6 +10,8 @@ from __future__ import annotations
 import socket
 
 from app.celery_app import (
+    DNS_LOOKUP_STALL_S,
+    WORKER_TERMINATION_GRACE_S,
     REDIS_RESULT_CONNECT_TIMEOUT_S,
     REDIS_RESULT_SOCKET_TIMEOUT_S,
     REDIS_RESULT_STORE_RETRIES,
@@ -144,13 +146,23 @@ def test_worst_case_result_write_fits_a_warm_shutdown():
     # With no master, a failing write costs the stale socket's read, then per
     # retry one Sentinel lookup + one connect + the max backoff. On a warm
     # shutdown it happens twice (pool child, then the parent's on_failure),
-    # beside Channel.close()'s two broker reads; all inside the 60 s grace.
+    # beside Channel.close()'s two broker reads; all inside the pod's grace.
+    # A Sentinel lookup can also stall in getaddrinfo (#1754), which no
+    # socket timeout bounds; the worker pod's resolver options cap it.
     backoff_s = celery_app.conf.result_backend_max_sleep_between_retries_ms / 1000
     write = REDIS_RESULT_SOCKET_TIMEOUT_S + REDIS_RESULT_STORE_RETRIES * (
-        REDIS_SENTINEL_SOCKET_TIMEOUT_S + REDIS_RESULT_CONNECT_TIMEOUT_S + backoff_s
+        REDIS_SENTINEL_SOCKET_TIMEOUT_S
+        + REDIS_RESULT_CONNECT_TIMEOUT_S
+        + backoff_s
+        + DNS_LOOKUP_STALL_S
     )
-    assert write <= 20
-    assert 2 * write + 2 * REDIS_SOCKET_TIMEOUT_S < 60
+    assert write <= 35
+    shutdown = 2 * write + 2 * REDIS_SOCKET_TIMEOUT_S
+    # margin for the rest of a warm shutdown (pool join, signal handling)
+    assert shutdown + 5 < WORKER_TERMINATION_GRACE_S
+    # and the unbounded-resolver case (the ~20 s lookups of #1754) would not
+    # have fit the old 60 s grace: the options are what make the number honest
+    assert DNS_LOOKUP_STALL_S <= 8
 
 
 def test_worker_uses_the_capped_reconnect_consumer(monkeypatch):
