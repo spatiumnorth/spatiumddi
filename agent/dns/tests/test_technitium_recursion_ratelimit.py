@@ -75,15 +75,19 @@ def test_recursion_on_with_acl_sends_specified_acl(tmp_path: Path) -> None:
     ]
 
 
-def test_recursion_any_sends_allow_and_unset_acl_keeps_private_only(
+def test_default_any_keeps_private_networks_and_never_opens_recursion(
     tmp_path: Path,
 ) -> None:
-    assert _field(_apply(tmp_path, {"allow_recursion": ["any"]}), "recursion") == [
-        "Allow"
-    ]
-    assert _field(_apply(tmp_path, {"allow_recursion": []}), "recursion") == [
-        "AllowOnlyForPrivateNetworks"
-    ]
+    # ["any"] is the stored default and indistinguishable from an explicit
+    # choice; it must not become open recursion on upgrade (#1761 review,
+    # #1786). Same for an empty list and for no options row at all.
+    for acl in (["any"], ["ANY"], [], None):
+        opts: dict[str, Any] = {"recursion_enabled": True}
+        if acl is not None:
+            opts["allow_recursion"] = acl
+        sets = _apply(tmp_path, opts)
+        assert _field(sets, "recursion") == ["AllowOnlyForPrivateNetworks"], acl
+        assert _field(sets, "recursionNetworkACL") == [], acl
 
 
 def test_an_acl_with_no_usable_entry_fails_closed(tmp_path: Path) -> None:

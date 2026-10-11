@@ -187,8 +187,8 @@ _FORWARDER_PROTOCOLS = {
 # ── Recursion + rate limiting (issue #1761) ─────────────────────────────
 #
 # ``settings/set`` silently ignores an unrecognised ``recursion`` value
-# (it is parsed with a try-parse), so every value sent is validated
-# against this set first.
+# (it is parsed with a try-parse), so every value is checked against this
+# set in ``_apply_recursion`` before it is sent.
 _RECURSION_MODES = frozenset(
     {"Deny", "Allow", "AllowOnlyForPrivateNetworks", "UseSpecifiedNetworkACL"}
 )
@@ -2351,6 +2351,12 @@ class TechnitiumDriver(DriverBase):
         editing the list converges instead of sticking.
         """
         mode, acl = self._recursion_params(options)
+        if mode not in _RECURSION_MODES:
+            # settings/set try-parses the enum and ignores a bad value with
+            # status "ok", so an unknown mode would read as applied.
+            log.error("technitium_recursion_mode_invalid", mode=mode)
+            self._note_apply_failure(f"recursion: invalid mode {mode!r}")
+            return
         params: dict[str, Any] = {"recursion": mode}
         if mode == "UseSpecifiedNetworkACL":
             params["recursionNetworkACL"] = ",".join(acl)
@@ -2366,10 +2372,14 @@ class TechnitiumDriver(DriverBase):
         """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
 
         * ``recursion_enabled`` false → ``Deny``.
-        * ``allow_recursion`` absent or empty → ``AllowOnlyForPrivateNetworks``
-          (the BIND9 agent's own behaviour: no ``allow-recursion`` line, so
-          BIND's localnets/localhost default).
-        * exactly ``["any"]`` → ``Allow``.
+        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
+          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
+          default and nothing distinguishes it from an explicit choice, while
+          the BIND9 agent never renders ``allow-recursion`` (#1786) and so
+          runs BIND's localnets/localhost default. Mapping it to ``Allow``
+          would open recursion to the internet on upgrade; the engine's
+          private-network default is the closest match and is what
+          Technitium already did. ``Allow`` is therefore never sent.
         * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
           CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
           a warning; if none survive the result is ``Deny`` — fail closed.
@@ -2377,10 +2387,8 @@ class TechnitiumDriver(DriverBase):
         if not options.get("recursion_enabled", True):
             return "Deny", []
         raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
-        if not raw:
+        if not raw or [e.lower() for e in raw] == ["any"]:
             return "AllowOnlyForPrivateNetworks", []
-        if [e.lower() for e in raw] == ["any"]:
-            return "Allow", []
         acl: list[str] = []
         for entry in raw:
             deny = entry.startswith("!")

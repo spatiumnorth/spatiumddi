@@ -90,17 +90,22 @@ the formatter handles the rest.
   recursion for every private network even on an authoritative-only
   group, and 600 queries/min per client with rate limiting shown as off,
   which dropped a busy downstream resolver's answers. Recursion off
-  (or `is_recursive=false`) now sends `Deny`; an `allow_recursion` list
-  sends `UseSpecifiedNetworkACL` with the list as CIDRs (`any` sends
-  `Allow`, an empty list keeps private-networks-only, a list with no
-  usable entry fails closed to `Deny`). RRL off sends empty QPM limits;
-  RRL on derives a per-client limit from `rrl_responses_per_second`, the
-  window from `rrl_window`, the truncation share from `rrl_slip`, and
-  `rrl_exempt_clients` as the bypass list. Upgrade note: a Technitium
-  group whose `allow_recursion` is the stored default `["any"]` now
-  recurses for any client, as the UI shows, instead of private networks
-  only; review it. The bundle gains `allow_recursion` for Technitium
-  only.
+  (or `is_recursive=false`) now sends `Deny`. An explicit
+  `allow_recursion` list sends `UseSpecifiedNetworkACL` with the list as
+  CIDRs, failing closed to `Deny` when no entry is usable. The stored
+  default `["any"]`, like an empty list, keeps Technitium's
+  private-networks-only recursion: SpatiumDDI does not open recursion on
+  Technitium through the default, because the BIND9 agent never renders
+  `allow_recursion` either (#1786) and `["any"]` cannot be told apart
+  from an untouched group. So recursion-enabled groups see no change on
+  upgrade. RRL off sends empty QPM limits; RRL on derives a per-client
+  limit from `rrl_responses_per_second`, the window from `rrl_window`,
+  the truncation share from `rrl_slip`, and `rrl_exempt_clients` as the
+  bypass list. **Behaviour change on upgrade:** `rrl_enabled` defaults
+  to off, so every Technitium group with RRL off loses the daemon's
+  built-in 600 qpm per-client limit (and the /24 and IPv6 prefix limits
+  beside it). That is the fix; turn RRL on to rate-limit. The bundle
+  gains `allow_recursion` for Technitium only.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
