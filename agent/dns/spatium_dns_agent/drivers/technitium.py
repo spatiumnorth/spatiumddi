@@ -556,6 +556,13 @@ def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
 # ── end of the block shared with the agent ──────────────────────────────
 
 
+#: The bundle key a control plane from #1513 on sets to say a dot-less
+#: SVCB / HTTPS target is relative to the zone (``agent_config`` sets it).
+#: Without it, a dot-less target is absolute, as the older renderer meant.
+SVCB_TARGET_RULE_KEY = "svcb_target_rule"
+SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
+
 def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
     """Parse a BIND-zone-file-style SVCB/HTTPS rdata string into
     ``(priority, target, svcParams)`` for the Technitium API.
@@ -1160,9 +1167,24 @@ class TechnitiumDriver(DriverBase):
     # standalone behaviour.
     _apply_failures: list[str] | None = None
 
+    # How a dot-less SVCB / HTTPS target in the bundle is read (#1513). A
+    # control plane from before #1513 rendered a dot-less target meaning
+    # ABSOLUTE (it was sent to the daemon as-is, and Technitium has no
+    # relative names); one from #1513 on means relative to the zone, as in a
+    # zone file, and says so with ``svcb_target_rule: "zone-file"`` in the
+    # bundle. Set by ``render`` from the bundle being applied, so replaying a
+    # cached bundle from the older control plane keeps its own meaning, and
+    # read by ``apply_record_op`` for ops shipped beside that bundle.
+    _svcb_zone_file_targets: bool = False
+
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
             self._apply_failures.append(what)
+
+    def _svcb_origin(self, zone: str) -> str | None:
+        """The origin a dot-less SVCB target is relative to, or ``None`` when
+        the applied bundle predates #1513 and a dot-less target is absolute."""
+        return zone if self._svcb_zone_file_targets else None
 
 
     # ── Render / validate / swap ────────────────────────────────────────────
@@ -1180,6 +1202,8 @@ class TechnitiumDriver(DriverBase):
         if new_dir.exists():
             shutil.rmtree(new_dir)
         new_dir.mkdir(parents=True)
+
+        self._svcb_zone_file_targets = bundle.get(SVCB_TARGET_RULE_KEY) == SVCB_TARGET_RULE_ZONE_FILE
 
         raw_zones = bundle.get("zones")
         if not isinstance(raw_zones, list):
@@ -1263,7 +1287,9 @@ class TechnitiumDriver(DriverBase):
                                 if _rec_ttl is not None
                                 else (_zone_ttl if _zone_ttl is not None else 3600)
                             ),
-                            **_record_params(rtype, rec.get("value") or "", rec, zname),
+                            **_record_params(
+                                rtype, rec.get("value") or "", rec, self._svcb_origin(zname)
+                            ),
                         }
                     )
 
@@ -1804,7 +1830,7 @@ class TechnitiumDriver(DriverBase):
             "domain": name,
             "zone": zone,
             "type": rtype,
-            **_record_params(rtype, rec.get("value") or "", rec, zone),
+            **_record_params(rtype, rec.get("value") or "", rec, self._svcb_origin(zone)),
         }
 
         # #773 — the control plane ships the complete desired RRset. Technitium's
@@ -1849,7 +1875,12 @@ class TechnitiumDriver(DriverBase):
                             "type": rtype,
                             "ttl": rrset_ttl,
                             "overwrite": "true" if index == 0 else "false",
-                            **_record_params(rtype, member.get("value") or "", member, zone),
+                            **_record_params(
+                                rtype,
+                                member.get("value") or "",
+                                member,
+                                self._svcb_origin(zone),
+                            ),
                         },
                         zone,
                         name,

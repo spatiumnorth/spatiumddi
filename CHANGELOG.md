@@ -111,6 +111,19 @@ the formatter handles the rest.
     dot-less multi-label targets of Technitium groups (`cdn.example.net`),
     which were always served as absolute, so nothing they serve changes.
     BIND9 and PowerDNS groups are not touched.
+  - **The upgrade itself does not re-point those records.** A Technitium
+    server's bundle now says which rule its targets follow
+    (`svcb_target_rule`), and the agent applies that rule to the bundle it
+    is applying. The agent replays its cached bundle on start, and a cached
+    bundle from before the upgrade has no such field, so its dot-less
+    targets stay absolute, as that build meant them. The migration also
+    marks the affected servers' stored bundles out of date and rewrites the
+    same targets in their queued record ops. Because the field is part of
+    the bundle's structural fingerprint, every Technitium agent
+    re-reconciles its zones once under the new rule when the new bundle
+    arrives. Before this, the new agent served
+    `cdn.example.net.<zone>.` from its cache until the next structural
+    change in the group.
   - Records the Technitium importer and the agentless pull read are now
     stored with absolute targets and unquoted params.
   - Not verified against a live daemon: the `no-default-alpn`, `ech` and

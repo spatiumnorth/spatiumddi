@@ -25,6 +25,7 @@ import pytest
 
 from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
+    SVCB_TARGET_RULE_ZONE_FILE,
     TechnitiumDriver,
     _blocking_payload,
     _normalize_rdata,
@@ -2880,3 +2881,76 @@ def test_svcb_ech_and_unnamed_keys_go_as_hex_and_read_back_equal() -> None:
 def test_svcb_mandatory_naming_an_unnamed_key_goes_by_number() -> None:
     _, _, params = _svcb_params("1 . mandatory=key65000,alpn alpn=h2 key65000=x")
     assert params == "mandatory|alpn,65000|alpn|h2|65000|78"
+
+
+# ── #1513 case 7: a cached pre-#1513 bundle keeps its own target meaning ──
+
+
+def _render_svcb(tmp_path: Path, value: str, rule: str | None) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle: dict[str, Any] = {
+        "zones": [
+            {
+                "name": "up.test.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [{"name": "c7s", "type": "SVCB", "value": value, "ttl": 300}],
+            }
+        ]
+    }
+    if rule is not None:
+        bundle["svcb_target_rule"] = rule
+    d.render(bundle)
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "SVCB"]
+    return str(rec["svcTargetName"])
+
+
+def test_replaying_a_pre_1513_bundle_keeps_a_dotless_target_absolute(tmp_path: Path) -> None:
+    """The #1731 walk's case 7: the agent replays its cached bundle at start,
+    and a bundle from the renderer before #1513 holds ``1 cdn.example.net``
+    meaning ``cdn.example.net.`` — what that renderer sent to the daemon. It
+    carries no ``svcb_target_rule``, so it must not be read as zone-relative."""
+    assert _render_svcb(tmp_path, '1 cdn.example.net alpn="h2"', None) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", None) == "svc"
+
+
+def test_a_zone_file_rule_bundle_reads_a_dotless_target_as_relative(tmp_path: Path) -> None:
+    rule = SVCB_TARGET_RULE_ZONE_FILE
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", rule) == "svc.up.test"
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", rule) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 localhost. alpn=h2", rule) == "localhost"
+    # Under either rule a trailing dot is absolute.
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", None) == "cdn.example.net"
+
+
+def test_record_ops_follow_the_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(rule: str | None) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        bundle: dict[str, Any] = {"zones": []}
+        if rule is not None:
+            bundle["svcb_target_rule"] = rule
+        d.render(bundle)
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "c7s", "type": "SVCB", "value": "1 svc alpn=h2", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["svcTargetName"])
+
+    assert _op_target(None) == "svc"
+    assert _op_target(SVCB_TARGET_RULE_ZONE_FILE) == "svc.up.test"
+
+
+def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE})
+    assert d._svcb_zone_file_targets
+    d.render({"zones": []})
+    assert not d._svcb_zone_file_targets
