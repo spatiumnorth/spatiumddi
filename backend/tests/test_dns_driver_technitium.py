@@ -344,7 +344,7 @@ def test_capabilities_scope() -> None:
     # shape, not a drop-in equivalent.
     assert caps["alias_records"] is False
     assert caps["lua_records"] is False
-    assert caps["catalog_zones"] is True
+    assert caps["catalog_zones"] is False
     assert "SVCB" in caps["record_types"]
     assert "HTTPS" in caps["record_types"]
     assert "DNAME" in caps["record_types"]
@@ -434,7 +434,7 @@ def test_validate_rejects_unknown_zone_type() -> None:
 def test_capabilities_report_zone_types_and_catalog() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
-    assert caps["catalog_zones"] is True
+    assert caps["catalog_zones"] is False
 
 
 def test_capabilities_report_dnssec_online_signing() -> None:

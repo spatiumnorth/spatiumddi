@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium no longer claims catalog-zone support (#1782).** Both
+  roles are broken: producer member zones inherit the catalog zone's
+  transfer Deny / notify None (undoing the #734 grant, so drift, Sync
+  with Servers and NOTIFY stop), and the consumer's `SecondaryCatalog`
+  has no TSIG and stays empty. The `technitium` driver now reports
+  `catalog_zones: False`; turning catalog zones on for a group with a
+  `technitium` / `technitium_api` server, or adding such a server to a
+  catalog-enabled group, is a 422 naming #1766 (the 1.1.0 fix). A group
+  that already has it on keeps rendering as before and shows a
+  `catalog_unsupported_warning` on the API and in the group editor.
+  `DNS_DRIVERS.md` and `DNS.md` no longer say both roles work.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
