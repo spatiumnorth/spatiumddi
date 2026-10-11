@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Renaming a DNS record now retracts the old name (#1773).** The
+  record PUT queued a single `update` carrying only the new name, which
+  replaces the RRset at the new name and never touches the old one. On
+  agent engines the old name stayed served until the next structural
+  render (and since #1373 a record change no longer triggers one); on
+  agentless drivers (technitium_api, Windows, cloud) it stayed served
+  for good and drift showed it as extra. #492 had fixed only the IPAM
+  path. A rename is now a `delete` of the old name followed by a
+  `create` of the new one, queued in order in one transaction (#1489);
+  agentless drivers get both in one `apply_record_changes` call. A
+  value-only edit is still a single `update`.
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
