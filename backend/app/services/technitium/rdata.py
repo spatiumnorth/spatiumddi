@@ -50,7 +50,7 @@ import ipaddress
 import shlex
 from typing import Any
 
-from app.drivers.dns._txt import quote_strings, quote_txt, txt_strings
+from app.drivers.dns._txt import txt_strings, txt_value
 
 # Record types both directions model. Technitium-proprietary types
 # (ANAME / APP / FWD) are deliberately absent: they are not drop-in
@@ -544,8 +544,10 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
     if rtype == "TXT":
         # characterStringsBase64 is the record exactly (#1760, as the agent
         # driver reads it, #1694): ``text`` joins the strings and drops a
-        # string boundary. Rendered as presentation form so the stored
-        # value round-trips through ``record_params``.
+        # string boundary. ``txt_value`` gives the plain text where that
+        # says the same strings, and presentation form where it would not
+        # (an explicit split, or literal quote characters in the content),
+        # so the stored value round-trips through ``record_params``.
         encoded = rdata.get("characterStringsBase64")
         if isinstance(encoded, list) and encoded:
             try:
@@ -553,9 +555,12 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
             except (ValueError, binascii.Error):
                 strings = None
             if strings is not None:
-                return quote_strings(strings), extra
-        text = str(rdata.get("text") or "")
-        return (quote_txt(text) if text else ""), extra
+                return txt_value(strings), extra
+        # An older server: ``text`` is the content joined, which Technitium
+        # cut every 255 octets (``DnsTXTRecordData(string)``). Content, not
+        # presentation form, so a leading quote is a character.
+        raw = str(rdata.get("text") or "").encode("utf-8")
+        return txt_value([raw[i : i + 255] for i in range(0, len(raw), 255)]), extra
     if rtype == "MX":
         extra["priority"] = int_or(rdata.get("preference"), 10)
         return str(rdata.get("exchange") or ""), extra

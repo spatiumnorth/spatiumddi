@@ -84,6 +84,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
     # #1513 — the SVCB block is duplicated in the agent's Technitium driver.
     "test_technitium_svcb_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
+    # #1760 — the TXT helper is duplicated, whole, in the agent.
+    "test_txt_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_txt.py"),
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
     # its own nginx location block in BOTH shipped templates or it falls
