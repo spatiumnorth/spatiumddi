@@ -71,7 +71,9 @@ _MAX_ERROR = 2000
 #   happened to read them.
 # 5 (#1171, #1373): 4 with #1171's later change, which serves a zone's own SOA
 #   timers only once the group's last BIND9 agent renders them.
-RENDERER_REVISION = 5
+# 6 (#1513): a Technitium server's bundle carries ``svcb_target_rule``, and
+#   its SVCB / HTTPS targets the trailing dot migration a3d9e5c17b42 wrote.
+RENDERER_REVISION = 6
 
 
 def _serves(revision: int | None) -> bool:

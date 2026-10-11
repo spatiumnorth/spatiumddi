@@ -631,6 +631,11 @@ async def _drive_loop(
     slot_image = SlotImageTarget.from_plan_fields(run.plan)
     cnpg_name: str = run.plan.get("cnpg_cluster_name") or ""
     cnpg_namespace: str | None = run.plan.get("cnpg_namespace")
+    # #1463 — every node waits for this release's slot-image mirror before
+    # it is told to fetch an uploaded image.
+    mirror_deployment = per_node.slot_image_mirror_deployment(
+        run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
+    )
 
     while True:
         if stop_event.is_set():
@@ -831,6 +836,7 @@ async def _drive_loop(
             cnpg_cluster_name=cnpg_name,
             cnpg_namespace=cnpg_namespace,
             lease_holder=run.lease_holder,
+            mirror_deployment=mirror_deployment,
         )
 
         per_node_progress[next_node] = {
