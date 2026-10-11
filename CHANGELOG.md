@@ -92,9 +92,20 @@ the formatter handles the rest.
   group. The roles PUT now also matches agent-based rows by hostname
   (case-insensitive, never a row another appliance owns, and not when
   two approved appliances share the hostname). After an engine switch
-  only the current engine's DNS row moves; the old engine's stale row
-  stays in its group. The 409 on a name clash is unchanged, and a
-  re-registering agent still does not undo the move.
+  only the current engine's DNS row moves. Moving back to the group the
+  old engine served used to clash with the appliance's own dead row of
+  that engine (same name, other driver); that row is now retired as part
+  of the save, audited like a server delete, and only when it is this
+  appliance's, of an engine it no longer runs, and silent for more than
+  two minutes. While the old agent is still reporting, the save answers
+  409 naming the row. A clash with any other row still refuses the move,
+  and a re-registering agent still does not undo it. The route now
+  publishes the wakes the move collects (before, there was no collector,
+  so the moved agent and both groups converged only on the safety tick),
+  writes an audit row per moved server, and locks the appliance row so
+  two saves cannot interleave. Under a DNS VIP the agent pod has no
+  hostNetwork, so it registered under its pod name; it now registers
+  under the node name.
 - **Agentless DNS drivers treat an existing zone on create and a
   missing zone on delete as done (#1537).** A zone push to several
   agentless servers can fail partway; the DB rolls back but the servers
