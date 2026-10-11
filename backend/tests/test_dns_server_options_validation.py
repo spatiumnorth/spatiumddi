@@ -242,3 +242,97 @@ async def test_a_value_stored_before_the_gate_does_not_block_an_unrelated_save(
     r = await client.put(url, json={"query_log_file": "/srv/other.log"}, headers=headers)
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["field"] == "query_log_file"
+
+
+# ── Technitium cannot apply some options (#1763) ──────────────────────
+
+
+async def _technitium_group(db: AsyncSession) -> DNSServerGroup:
+    from app.models.dns import DNSServer
+
+    group = await _group(db)
+    db.add(DNSServer(group_id=group.id, name="t1", driver="technitium", host="t1", port=53))
+    await db.flush()
+    return group
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"forward_policy": "only"},
+        {"forward_tls_verify": False},
+        {"minimal_responses": True},
+        {"tcp_clients": 100},
+        {"clients_per_query": 10},
+        {"max_clients_per_query": 10},
+        {"allow_query": ["localnets"]},
+        {"allow_query": ["key xfer-key"]},
+    ],
+)
+async def test_a_technitium_group_refuses_options_the_daemon_ignores(
+    client: AsyncClient, db_session: AsyncSession, body: dict
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    db_session.add(
+        DNSTSIGKey(
+            group_id=group.id, name="xfer-key", algorithm="hmac-sha256", secret_encrypted=b"x"
+        )
+    )
+    await db_session.commit()
+    r = await client.put(f"/api/v1/dns/groups/{group.id}/options", json=body, headers=headers)
+    assert r.status_code == 422, r.text
+    assert "Technitium" in str(r.json()["detail"])
+
+
+@pytest.mark.asyncio
+async def test_a_technitium_group_still_takes_what_the_daemon_applies(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+    body = {
+        "dnssec_validation": "no",
+        "allow_query": ["!10.1.0.0/16", "10.0.0.0/8", "2001:db8::/32"],
+        # Defaults re-posted by the form on every save stay allowed.
+        "forward_policy": "first",
+        "forward_tls_verify": True,
+        "minimal_responses": False,
+    }
+    r = await client.put(url, json=body, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["dnssec_validation"] == "no"
+
+
+@pytest.mark.asyncio
+async def test_a_non_technitium_group_keeps_every_option(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options",
+        json={"forward_policy": "only", "minimal_responses": True, "tcp_clients": 50},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_stored_unsupported_value_does_not_block_resaving_it(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, forward_policy="only", tcp_clients=7))
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options",
+        json={"forward_policy": "only", "tcp_clients": 7, "rrl_window": 20},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text

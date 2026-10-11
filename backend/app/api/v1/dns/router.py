@@ -146,6 +146,7 @@ from app.services.dns.server_move import (
     ensure_group_single_driver,
     move_server_to_group,
 )
+from app.services.dns.technitium_options import refusals as technitium_option_refusals
 from app.services.dns.tld_registry import (
     SOURCE_URL,
     TldFetchError,
@@ -3632,6 +3633,18 @@ async def update_options(
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
+    # Options the agent-managed Technitium driver cannot apply (#1763): refuse
+    # rather than store a value the daemon will silently ignore. Same subset
+    # semantics as the transport gates: any Technitium server in the group.
+    if "technitium" in await _group_driver_names(db, group_id):
+        if refused := technitium_option_refusals(changes, opts):
+            raise HTTPException(
+                422,
+                "This group has a Technitium server, which cannot apply: "
+                + "; ".join(refused)
+                + ". Move the Technitium server to its own group, or leave these at "
+                "their defaults.",
+            )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
         setattr(opts, k, v)

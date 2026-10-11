@@ -6632,6 +6632,17 @@ function OptionsTab({ groupId }: { groupId: string }) {
     retry: false,
   });
 
+  // Options the agent-managed Technitium driver cannot apply (#1763): the
+  // API refuses a non-default value for a group holding such a server, so the
+  // controls are disabled with the reason rather than offered and ignored.
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dns-servers", groupId],
+    queryFn: () => dnsApi.listServers(groupId),
+  });
+  const techUnsupported = groupServers.some((s) => s.driver === "technitium");
+  const techReason =
+    "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
+
   const [forwardersEnabled, setForwardersEnabled] = useState(false);
   const [forwarders, setForwarders] = useState("");
   const [forwardPolicy, setForwardPolicy] = useState("first");
@@ -7089,6 +7100,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
               <select
                 className={selCls}
                 value={forwardPolicy}
+                disabled={techUnsupported}
+                title={techUnsupported ? techReason : undefined}
                 onChange={(e) => {
                   setForwardPolicy(e.target.value);
                   setDirty(true);
@@ -7102,6 +7115,13 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
+            {techUnsupported && (
+              <p className="text-xs text-muted-foreground">
+                Technitium never falls back to recursion once forwarders are
+                set, so it always behaves as "only"; the policy cannot be
+                changed for this group.
+              </p>
+            )}
           </>
         )}
       </div>
@@ -7263,10 +7283,18 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </>
         )}
         <div className="border-t pt-3 space-y-3">
+          {techUnsupported && (
+            <p className="text-xs text-muted-foreground">
+              Technitium has no minimal-responses, tcp-clients or
+              clients-per-query settings, so these are disabled for this group.
+            </p>
+          )}
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
               type="checkbox"
               checked={minimalResponses}
+              disabled={techUnsupported}
+              title={techUnsupported ? techReason : undefined}
               onChange={(e) => {
                 setMinimalResponses(e.target.checked);
                 setDirty(true);
@@ -7282,6 +7310,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={tcpClients}
+                disabled={techUnsupported}
+                title={techUnsupported ? techReason : undefined}
                 onChange={(e) => {
                   setTcpClients(e.target.value);
                   setDirty(true);
@@ -7295,6 +7325,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={clientsPerQuery}
+                disabled={techUnsupported}
+                title={techUnsupported ? techReason : undefined}
                 onChange={(e) => {
                   setClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7308,6 +7340,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={maxClientsPerQuery}
+                disabled={techUnsupported}
+                title={techUnsupported ? techReason : undefined}
                 onChange={(e) => {
                   setMaxClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7529,6 +7563,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <input
                   type="checkbox"
                   checked={forwardTlsVerify}
+                  disabled={techUnsupported}
+                  title={techUnsupported ? techReason : undefined}
                   onChange={(e) => {
                     setForwardTlsVerify(e.target.checked);
                     setDirty(true);
@@ -7686,6 +7722,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
 
       <div className={card}>
         <h4 className={cardTitle}>Query &amp; Transfer ACLs</h4>
+        {techUnsupported && (
+          <p className="text-xs text-muted-foreground">
+            Technitium applies allow-query to each zone it serves as a network
+            ACL: addresses and CIDRs (optionally prefixed with !), or any /
+            none. localhost, localnets, key and ACL names are refused for this
+            group.
+          </p>
+        )}
         <Field label="allow-query (comma-separated CIDRs / ACL names)">
           <input
             className={inputCls}

@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Group options the Options tab offers for every driver are no longer
+  silently ignored on Technitium (#1763).** The bundle carried
+  `dnssec_validation`, `allow_query` and the rest, and the Technitium
+  agent read none of them, so `dnssec_validation = no` behind a
+  DNSSEC-stripping upstream kept validating and SERVFAILed signed names,
+  and a group's `allow_query` left every authoritative zone answering
+  anyone. The agent now sends `dnssecValidation` and maps `allow_query`
+  onto each served zone's `queryAccess` / `queryAccessNetworkACL`
+  (addresses, CIDRs, `!` negation, `any`, `none`). The options Technitium
+  has no setting for (`forward_policy`, `forward_tls_verify`,
+  `minimal_responses`, `tcp_clients`, `clients_per_query`,
+  `max_clients_per_query`, and an `allow_query` using `localnets`, `key`
+  or ACL names) now answer 422 when changed to a non-default value on a
+  group with a Technitium server, and the Options tab disables them with
+  the reason. Re-saving a stored value stays allowed. BIND9 and PowerDNS
+  bundles are unchanged.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
