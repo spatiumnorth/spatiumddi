@@ -463,7 +463,7 @@ class WindowsDNSDriver(DNSDriver):
                 final.append(entry)
         return final
 
-    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
+    async def apply_zone_change(self, server: Any, zone: Any, op: str) -> bool:
         """Create / delete a zone on the Windows DC over WinRM.
 
         Only meaningful when the server has stored credentials — without
@@ -482,14 +482,21 @@ class WindowsDNSDriver(DNSDriver):
             )
         creds = _load_credentials(server)
         script = _ps_apply_zone(zone, op)
-        await asyncio.to_thread(_run_ps, server, creds, script)
+        out = await asyncio.to_thread(_run_ps, server, creds, script)
+        # #1537 — the script says when the server was already in the
+        # requested state. Report that as "no change" so the caller's
+        # partial-failure compensation never deletes a zone this request
+        # found already there (or re-creates one it found already gone).
+        changed = not any(marker in (out or "") for marker in _ZONE_NOOP_MARKERS)
         logger.info(
             "windows_dns.apply_zone_change",
             server=str(getattr(server, "id", "")),
             zone=getattr(zone, "name", ""),
             op=op,
             kind=getattr(zone, "kind", None),
+            changed=changed,
         )
+        return changed
 
     async def reload_config(self, server: Any) -> None:
         # Windows handles its own config lifecycle; nothing to do remotely.
@@ -881,6 +888,12 @@ def _parse_zones(raw: str) -> list[dict[str, Any]]:
     return out
 
 
+# Output lines ``_ps_apply_zone`` writes when the server was already in
+# the requested state (#1537). ``apply_zone_change`` keys "no change" off
+# these, so the script and the parser must agree — pinned by a test.
+_ZONE_NOOP_MARKERS = ("already exists on server", "was not present on server")
+
+
 def _ps_apply_zone(zone: Any, op: str) -> str:
     """PowerShell script for ``apply_zone_change(op=create|delete)``.
 
@@ -896,27 +909,62 @@ def _ps_apply_zone(zone: Any, op: str) -> str:
     if not name:
         raise ValueError("windows_dns._ps_apply_zone: zone name is required")
 
+    # #1537 — probe for the zone with ``-ErrorAction Stop`` and treat ONLY
+    # DNS_ERROR_ZONE_DOES_NOT_EXIST (Win32 9601) as "absent". The old
+    # ``SilentlyContinue`` probe also swallowed access-denied (Win32 5), a
+    # dead DNS service and a bad WinRM session, so a delete "succeeded" on a
+    # server the account could not even read. Anything else rethrows and
+    # fails the script, which ``_run_ps`` surfaces.
+    probe = f"""$zone = $null
+try {{
+    $zone = Get-DnsServerZone -Name '{name}' -ErrorAction Stop
+}} catch {{
+    if ($_.FullyQualifiedErrorId -notmatch 'WIN32 9601') {{
+        throw
+    }}
+}}"""
     if op == "create":
         # Existing zone → no-op with a reassuring log line rather than a
         # hard error. The common case is: operator seeded the zone in
         # DNS Manager, imported it via sync, then edited it in SpatiumDDI
-        # — we don't want to "re-create" it.
+        # — we don't want to "re-create" it. A concurrent create that
+        # loses the race reports DNS_ERROR_ZONE_ALREADY_EXISTS (Win32
+        # 9609), which is the same converged state.
         return f"""
-if (Get-DnsServerZone -Name '{name}' -ErrorAction SilentlyContinue) {{
+{probe}
+if ($zone) {{
     Write-Output "zone '{name}' already exists on server"
 }} else {{
-    Add-DnsServerPrimaryZone -Name '{name}' -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
-    Write-Output "zone '{name}' created"
+    try {{
+        Add-DnsServerPrimaryZone -Name '{name}' -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+        Write-Output "zone '{name}' created"
+    }} catch {{
+        if ($_.FullyQualifiedErrorId -match 'WIN32 9609') {{
+            Write-Output "zone '{name}' already exists on server"
+        }} else {{
+            throw
+        }}
+    }}
 }}
 """.strip()
     if op == "delete":
-        # ``-Force`` skips the prompt. SilentlyContinue on the probe so
-        # we turn "already gone" into a clean success — idempotent
-        # delete matches the DHCP-side semantics.
+        # ``-Force`` skips the prompt. A zone that is gone (probe, or
+        # Win32 9601 from the remove itself when it vanishes between the
+        # two) is a clean success — idempotent delete matches the
+        # DHCP-side semantics.
         return f"""
-if (Get-DnsServerZone -Name '{name}' -ErrorAction SilentlyContinue) {{
-    Remove-DnsServerZone -Name '{name}' -Force -ErrorAction Stop
-    Write-Output "zone '{name}' deleted"
+{probe}
+if ($zone) {{
+    try {{
+        Remove-DnsServerZone -Name '{name}' -Force -ErrorAction Stop
+        Write-Output "zone '{name}' deleted"
+    }} catch {{
+        if ($_.FullyQualifiedErrorId -match 'WIN32 9601') {{
+            Write-Output "zone '{name}' was not present on server"
+        }} else {{
+            throw
+        }}
+    }}
 }} else {{
     Write-Output "zone '{name}' was not present on server"
 }}
