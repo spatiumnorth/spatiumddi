@@ -43,7 +43,7 @@ import re
 import secrets
 import uuid
 from collections.abc import Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -1675,6 +1675,16 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ones it deleted back via ``evicted_node_names`` so the backend
     # clears the flag. Empty in the steady state.
     evict_node_names: list[str] = Field(default_factory=list)
+    # #1541 — ``evict_node_names`` split by why. ``replace_node_names`` are
+    # dead-node Replaces: the seed arms #1059's CNPG size hold on them and
+    # keeps the control plane's size until the replacement is promoted.
+    # ``demote_evict_node_names`` are a graceful demote's cleanup (the node
+    # already left etcd; the seed deletes its stale Node and confirms): no
+    # replacement is coming, so the seed scales the control plane down to the
+    # committed count instead. A supervisor that predates the split reads
+    # only ``evict_node_names`` and holds on both, as before.
+    replace_node_names: list[str] = Field(default_factory=list)
+    demote_evict_node_names: list[str] = Field(default_factory=list)
     # #1284 — the node IPs of each name above. k3s names an etcd member
     # ``<node name>-<8 hex>`` only once it has started; a learner that never
     # did is matched by its peer URL's host.
@@ -2236,6 +2246,7 @@ async def supervisor_heartbeat(
         )
         for ev in evicted:
             ev.evict_requested = False
+            ev.evict_after_demote = False
             ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
             ev.cluster_join_reason = None
             logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
@@ -2360,7 +2371,15 @@ async def supervisor_heartbeat(
         # agrees. Hand the row to the seed's eviction (the path Replace
         # uses): it deletes the stale Node, confirms etcd no longer lists the
         # member (#1284), and the row settles ``left`` on that report.
+        #
+        # ``evict_after_demote`` tells the seed this eviction is a demote's
+        # cleanup, not a dead-node Replace: a Replace arms #1059's CNPG size
+        # hold until the replacement is promoted, and a demote has no
+        # replacement coming — armed on it, the hold kept a cluster demoted to
+        # one node at three Postgres instances and three api / frontend /
+        # worker / redis replicas for good (#1541 walk, finding 1).
         row.evict_requested = True
+        row.evict_after_demote = True
         row.cluster_join_state = CLUSTER_JOIN_STATE_EVICTING
         row.cluster_join_state_at = datetime.now(UTC)
         row.cluster_join_reason = None
@@ -2789,16 +2808,26 @@ async def supervisor_heartbeat(
     # each node's IPs, so the seed can match an etcd member that has no name.
     evict_rows = (
         await db.execute(
-            select(Appliance.hostname, Appliance.node_ips, Appliance.node_ip).where(
+            select(
+                Appliance.hostname,
+                Appliance.node_ips,
+                Appliance.node_ip,
+                Appliance.evict_after_demote,
+            ).where(
                 Appliance.evict_requested.is_(True),
                 Appliance.hostname.isnot(None),
             )
         )
     ).all()
-    evict_names = [h for (h, _ips, _ip) in evict_rows]
+    evict_names = [h for (h, _ips, _ip, _demote) in evict_rows]
     evict_addresses = {
-        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip) in evict_rows
+        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip, _demote) in evict_rows
     }
+    # #1541 — which of those are a dead-node Replace (the seed holds the
+    # control plane's size for the replacement, #1059) and which are a
+    # demote's cleanup (no replacement coming: the seed scales down).
+    replace_names = [h for (h, _ips, _ip, demote) in evict_rows if not demote]
+    demote_names = [h for (h, _ips, _ip, demote) in evict_rows if demote]
     # #1284 — and the nodes asked to join, so the seed never takes a node
     # promoted again after its eviction for a late arrival of the evicted one.
     join_names: list[str] = []
@@ -2854,6 +2883,8 @@ async def supervisor_heartbeat(
         desired_metallb_bgp_peers=metallb_bgp_peers,
         desired_metallb_bgp_advertisements=metallb_bgp_advertisements,
         evict_node_names=evict_names,
+        replace_node_names=replace_names,
+        demote_evict_node_names=demote_names,
         evict_node_addresses=evict_addresses,
         join_node_names=join_names,
         desired_timezone=desired_timezone,
@@ -4677,6 +4708,161 @@ async def promote_control_plane(
     return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
 
 
+@dataclass(frozen=True)
+class _VoterHealth:
+    """One etcd voter as ``demote_control_plane`` judges it (#1541)."""
+
+    name: str
+    live: bool
+    why: str = ""  # what is wrong with it, when not live
+
+
+def _demote_quorum_refusal(voters: Sequence[_VoterHealth], leaving: set[str]) -> str | None:
+    """PURE (#1541, walk finding 2): why demoting ``leaving`` could cost the
+    survivors their quorum, or ``None`` when it cannot.
+
+    Each live leaver removes its own etcd member, one at a time and in any
+    order; a dead one cannot run its leave and stays a voter until it comes
+    back. After ``k`` live removals the cluster has ``n - k`` voters of which
+    ``L - k`` are live (every removed member was live), and it keeps quorum
+    while ``2 * (L - k) > n - k``, i.e. while ``k < 2L - n``. That is
+    monotone in ``k``, so the binding step is the last one, ``k = TL`` (the
+    live leavers): ``2 * (L - TL) > n - TL``. Every intermediate step,
+    including the commit of each removal, is then safe.
+
+    The arithmetic is not the whole rule. A dead or unhealthy voter that is
+    NOT being demoted refuses the demote outright, even where the count alone
+    would pass (five voters, one dead, two demoted leaves 2 of 3 live): the
+    end state could not lose another node, and an operator asking for a
+    demote while a member is down should fix or Replace that member first.
+    An unhealthy voter that IS being demoted is accepted when the arithmetic
+    holds — removing a member that is already gone only helps — though its
+    row waits in ``leaving`` until the node comes back to run the leave
+    (Replace is the path for a node that never will)."""
+    unhealthy_others = [v for v in voters if not v.live and v.name not in leaving]
+    if unhealthy_others:
+        names = ", ".join(f"{v.name!r} ({v.why})" for v in unhealthy_others)
+        return (
+            f"control-plane member(s) {names} are not healthy. A demote removes etcd "
+            "voters while the cluster runs; with a member down, the survivors could lose "
+            "quorum (a leaving node's own etcd can still count a dead peer as active). "
+            "Bring it back, or Replace it, before demoting."
+        )
+    n = len(voters)
+    live = sum(1 for v in voters if v.live)
+    live_leaving = sum(1 for v in voters if v.live and v.name in leaving)
+    if 2 * (live - live_leaving) <= n - live_leaving:
+        dead = ", ".join(f"{v.name!r} ({v.why})" for v in voters if not v.live)
+        return (
+            f"after the demote's {live_leaving} live member(s) leave, {live - live_leaving} of "
+            f"the remaining {n - live_leaving} etcd voters would be live, which is not a "
+            f"majority. Not healthy: {dead}."
+        )
+    return None
+
+
+def _node_ready_map() -> dict[str, bool] | None:
+    """Every k8s Node's ``Ready`` condition by name, or ``None`` when this
+    control plane does not run on k3s (no ServiceAccount: compose, tests).
+    Raises :class:`k8s.KubeapiUnavailableError` when it does but the Node
+    list cannot be read — the caller must not guess."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if k8s.get_config() is None:
+        return None
+    status_code, items = k8s.list_nodes()
+    if status_code != 200:
+        raise k8s.KubeapiUnavailableError(f"node list returned {status_code}")
+    out: dict[str, bool] = {}
+    for n in items:
+        name = str((n.get("metadata") or {}).get("name") or "")
+        if name:
+            out[name] = k8s.is_node_ready(n)
+    return out
+
+
+async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> None:
+    """409 when demoting ``targets`` could leave the survivors without an etcd
+    quorum (#1541, walk finding 2), naming the unhealthy member.
+
+    The leaver's own etcd guards a removal with its view of which peers are
+    active, and a follower's view can be minutes stale: on the walk member-1
+    removed itself while member-2 had been powered off for two minutes, its
+    etcd still counted the idle link to member-2 as active, and the seed was
+    left one live voter of two — no api for four minutes. So the control
+    plane decides first, from evidence it trusts: a voter is live when its
+    supervisor heartbeated within ``ONLINE_STALE_SECONDS`` AND its k8s Node
+    reads Ready (a powered-off node fails both, a wedged one at least the
+    Node). Every leave already in flight counts as leaving too."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+    from app.services.appliance.agent_cmd import (  # noqa: PLC0415
+        ONLINE_STALE_SECONDS,
+        appliance_ready,
+    )
+
+    voter_rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    try:
+        nodes = await asyncio.to_thread(_node_ready_map)
+    except k8s.KubeapiUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Cannot read the k8s Nodes to check the control plane's health before a demote "
+            f"({exc}); refusing rather than guessing. Retry once kubeapi answers.",
+        ) from exc
+
+    now = datetime.now(UTC)
+    target_ids = {t.id for t in targets}
+    voters: list[_VoterHealth] = []
+    leaving: set[str] = set()
+    for r in voter_rows:
+        name = r.hostname or str(r.id)
+        problems: list[str] = []
+        if not appliance_ready(state=r.state, last_seen_at=r.last_seen_at, now=now):
+            if r.last_seen_at is None:
+                problems.append("never heartbeated")
+            else:
+                seen = (
+                    r.last_seen_at if r.last_seen_at.tzinfo else r.last_seen_at.replace(tzinfo=UTC)
+                )
+                problems.append(
+                    f"last heartbeat {int((now - seen).total_seconds())}s ago, "
+                    f"over {int(ONLINE_STALE_SECONDS)}s"
+                )
+        if nodes is not None:
+            ready = nodes.get(r.hostname or "")
+            if ready is None:
+                problems.append("no k8s Node")
+            elif not ready:
+                problems.append("Node NotReady")
+        voters.append(_VoterHealth(name=name, live=not problems, why="; ".join(problems)))
+        in_flight_leave = (
+            r.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
+        if r.id in target_ids or in_flight_leave:
+            leaving.add(name)
+
+    refusal = _demote_quorum_refusal(voters, leaving)
+    if refusal is not None:
+        logger.warning(
+            "control_plane_demote_refused_quorum",
+            targets=[t.hostname for t in targets],
+            reason=refusal,
+        )
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Refusing the demote: {refusal}")
+
+
 @router.post(
     "/fleet/control-plane/demote",
     response_model=ApplianceList,
@@ -4702,7 +4888,14 @@ async def demote_control_plane(
     the stale k8s Node and confirms etcd agrees before the row settles
     ``left``. Before that, nobody removed a demoted node's member, and the
     only demote three members allow (both non-seed ones) cost the seed its
-    quorum."""
+    quorum.
+
+    It also refuses (409) a demote while any control-plane member is
+    unhealthy — a stale heartbeat or a NotReady Node — unless that member is
+    itself being demoted and the survivors keep a live majority throughout
+    (:func:`_demote_quorum_refusal` has the arithmetic). The leaver's own
+    etcd guards its removal with a follower's view of the peers, which can
+    still count a powered-off peer as active."""
     _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
@@ -4739,6 +4932,11 @@ async def demote_control_plane(
             f"{remaining} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — demote "
             f"{'one fewer' if len(targets) > 1 else 'one more'} so the remainder is odd.",
         )
+
+    # #1541 (walk finding 2) — never start removing voters while a member is
+    # down: the leaver's own etcd may not know, and its removal then costs the
+    # survivors their quorum.
+    await _refuse_demote_without_quorum(db, targets)
 
     for row in targets:
         row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
@@ -4871,6 +5069,10 @@ async def replace_control_plane_member(
     row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
     row.cluster_join_reason = None
     row.evict_requested = True
+    # A Replace: the seed holds the control plane's size until the
+    # replacement is promoted (#1059). Explicit, in case the row last
+    # carried a demote's cleanup flag.
+    row.evict_after_demote = False
 
     # Mint a single-use 60-min pairing code for the replacement box.
     code = _generate_code()
@@ -5030,6 +5232,7 @@ async def clear_control_plane_state(
     row.desired_k3s_server_url = None
     row.desired_k3s_join_token_encrypted = None
     row.evict_requested = False
+    row.evict_after_demote = False
 
     db.add(
         AuditLog(

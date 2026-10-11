@@ -98,6 +98,9 @@ async def test_the_seed_gets_each_evicting_nodes_addresses(
 
     assert ghost.hostname in out["evict_node_names"]
     assert out["evict_node_addresses"][ghost.hostname] == ["192.168.122.86", "fd00::86"]
+    # #1541 — a Replace's eviction arms #1059's hold on the seed.
+    assert ghost.hostname in out["replace_node_names"]
+    assert ghost.hostname not in out["demote_evict_node_names"]
 
 
 @pytest.mark.asyncio
@@ -211,6 +214,7 @@ async def test_a_demoted_member_settles_left_only_once_the_seed_confirms(
     assert member.cluster_role is None
     assert member.desired_cluster_role is None
     assert member.evict_requested is True
+    assert member.evict_after_demote is True
     assert member.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING
 
     # The node keeps reporting ``left``; that alone must not settle the row.
@@ -220,8 +224,15 @@ async def test_a_demoted_member_settles_left_only_once_the_seed_confirms(
 
     out = await _beat(client, seed, seed_token)
     assert member.hostname in out["evict_node_names"]
+    # #1541 (walk finding 1) — it is a demote's cleanup, not a Replace: the
+    # seed must not arm #1059's size hold on it, or the cluster stays at its
+    # old size for good. The committed count already excludes it.
+    assert member.hostname in out["demote_evict_node_names"]
+    assert member.hostname not in out["replace_node_names"]
+    assert out["control_plane_size"] == 1
 
     await _beat(client, seed, seed_token, evicted_node_names=[member.hostname])
     await db_session.refresh(member)
     assert member.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
     assert member.evict_requested is False
+    assert member.evict_after_demote is False

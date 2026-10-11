@@ -209,9 +209,14 @@ async def test_promote_non_superadmin_403(db_session: AsyncSession, client: Asyn
 
 async def test_demote_to_one_ok(db_session: AsyncSession, client: AsyncClient) -> None:
     token = await _admin(db_session)
-    await _seed(db_session)
-    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER)
-    m2 = await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER)
+    seed = await _seed(db_session)
+    # #1541 — a demote is refused while a member is unhealthy, so every voter
+    # here has heartbeated (this control plane runs without k3s in the suite,
+    # so the heartbeat is the whole health check).
+    now = datetime.now(UTC)
+    seed.last_seen_at = now
+    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, last_seen_at=now)
+    m2 = await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER, last_seen_at=now)
     await db_session.commit()
 
     # 3 members - 2 = 1 → odd → ok.
@@ -267,7 +272,15 @@ async def test_replace_member_evicts_and_mints_code(
 ) -> None:
     token = await _admin(db_session)
     await _seed(db_session)
-    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    # A stale demote-cleanup flag from an earlier life must not survive a
+    # Replace: the seed holds the size for a Replace only (#1541).
+    m1 = await _appliance(
+        db_session,
+        "m1",
+        cluster_role=CLUSTER_ROLE_MEMBER,
+        node_ip="10.0.0.2",
+        evict_after_demote=True,
+    )
     await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.3")
     await db_session.commit()
 
@@ -283,6 +296,7 @@ async def test_replace_member_evicts_and_mints_code(
     await db_session.refresh(m1)
     assert m1.cluster_role is None
     assert m1.evict_requested is True
+    assert m1.evict_after_demote is False
     assert m1.cluster_join_state == "evicting"
 
 

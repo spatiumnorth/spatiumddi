@@ -345,10 +345,15 @@ class _ReplaceHold:
     Node, so from the eviction tick until the replacement is promoted the
     count the heartbeat carries is one short of what the cluster is
     committed to — and a replace is never a scale-down by intent (the
-    product refuses an even count). Only ``/replace`` sets
-    ``evict_requested``; a demote is a ``leaving`` row, never an eviction —
-    so an eviction tick is a replace tick by construction. The hold is
-    armed on it and kept until the count is back at the size CNPG has
+    product refuses an even count). #1541 — a demoted node's ``left`` is an
+    eviction too now (the seed deletes its stale Node and confirms etcd), so
+    an eviction tick is no longer a replace tick by construction: the backend
+    names the Replaces in ``replace_node_names`` (:func:`_replace_names`),
+    and only those arm the hold. A demote's cleanup must not — nothing is
+    coming to fill the slot, and armed on it neither release below could
+    fire, which held a cluster demoted to one node at three of everything
+    (see :class:`_DemoteShrink` for what a demote gets instead). The hold is
+    armed on a replace tick and kept until the count is back at the size CNPG has
     (``settle``: the replacement settled) or the operator shrinks the
     control plane below the count the eviction tick carried (a deliberate
     demote: the slot is abandoned). Module state, like ``_evicted_pending``:
@@ -395,6 +400,62 @@ class _ReplaceHold:
 
 
 _replace_hold = _ReplaceHold()
+
+
+def _replace_names(body_out: dict[str, Any]) -> list[str]:
+    """#1541 — the evictions that are dead-node Replaces, i.e. the ones that
+    arm :class:`_ReplaceHold`. A backend that predates the split sends no
+    ``replace_node_names`` (the key is absent, not empty): then every
+    eviction counts, as it did before, because that backend never evicted a
+    demoted node."""
+    if "replace_node_names" in body_out and body_out["replace_node_names"] is not None:
+        return [str(n) for n in body_out["replace_node_names"] if n]
+    return [str(n) for n in (body_out.get("evict_node_names") or []) if n]
+
+
+class _DemoteShrink:
+    """#1541 — lets a demote's scale-down past CloudNativePG's readiness
+    deferral (``patch_cnpg_instances(shrink_past_unready=True)``).
+
+    A demote drops the committed count only when the leaving node reports
+    ``left`` — after it has stopped k3s and reset — so by the time the seed
+    is asked for the smaller size, the departed nodes' instances are unready
+    and stay that way: ``readyInstances`` is below ``instances`` for good and
+    the plain deferral would keep the old size forever, exactly like the
+    replace hold did (the walk's finding 1). Armed on any tick whose
+    heartbeat names a demote's eviction (``demote_evict_node_names``), and
+    kept, past the eviction settling, until the Cluster's spec is at (or
+    below) the committed count, or the count rises again (a promote: the
+    shrink is no longer wanted). Module state, like :class:`_ReplaceHold`: a
+    supervisor restart between the eviction settling and the scale-down
+    landing forgets it — the plain deferral then holds the old size until an
+    operator acts, which is the pre-#1541 behaviour, never a wrong one."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.cp_size = 0
+
+    def allow(self, demote_names: Iterable[str], cp_size: int) -> bool:
+        if any(n for n in demote_names):
+            self.armed, self.cp_size = True, cp_size
+            return True
+        if not self.armed:
+            return False
+        if cp_size > self.cp_size:
+            self.clear()
+            return False
+        self.cp_size = cp_size
+        return True
+
+    def settle(self, cp_size: int, spec_after: int | None) -> None:
+        if self.armed and spec_after is not None and spec_after <= cp_size:
+            self.clear()
+
+    def clear(self) -> None:
+        self.armed, self.cp_size = False, 0
+
+
+_demote_shrink = _DemoteShrink()
 
 
 def _release_size(cp_size: int, hold: str, cnpg_instances: int) -> int:
@@ -1119,11 +1180,19 @@ def heartbeat_once(
         # eviction tick arms _replace_hold, which keeps the size until the
         # committed count is back (or the operator shrinks on purpose), and
         # patch_cnpg_instances itself defers any scale-down the Cluster
-        # reports it cannot take. Scale-up is untouched; a real demote lands
-        # on the first tick the cluster is whole.
-        hold = _replace_hold.reason(body_out.get("evict_node_names") or [], cp_size)
-        pg_scale = k8s_api.patch_cnpg_instances(cp_size, scale_down=not hold, hold_reason=hold)
+        # reports it cannot take. Scale-up is untouched.
+        #
+        # #1541 — only a Replace arms the hold (_replace_names); a demote's
+        # cleanup eviction instead lets the scale-down past the readiness
+        # deferral (_DemoteShrink), because the departed nodes' instances
+        # never report ready again.
+        hold = _replace_hold.reason(_replace_names(body_out), cp_size)
+        shrink = _demote_shrink.allow(body_out.get("demote_evict_node_names") or [], cp_size)
+        pg_scale = k8s_api.patch_cnpg_instances(
+            cp_size, scale_down=not hold, hold_reason=hold, shrink_past_unready=shrink
+        )
         _replace_hold.settle(cp_size, pg_scale.current)
+        _demote_shrink.settle(cp_size, pg_scale.spec_after(cp_size))
         if pg_scale.scaled:
             log.info("supervisor.heartbeat.cnpg_instances_scaled", size=cp_size)
         elif pg_scale.deferred:

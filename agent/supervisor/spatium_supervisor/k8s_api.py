@@ -2010,6 +2010,7 @@ def patch_cnpg_instances(
     namespace: str = "spatium",
     scale_down: bool = True,
     hold_reason: str = "",
+    shrink_past_unready: bool = False,
 ) -> CnpgScale:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and
     its instance-spreading policy.
@@ -2058,8 +2059,21 @@ def patch_cnpg_instances(
     ``Status.Instances`` counts PVC groups, a pending join included), so it
     would refuse the write anyway and act on it later, when the cluster is
     whole and nobody means it any more. The
-    caller retries every tick, so a real demote still lands once the cluster
-    is whole. Scale-UP and the affinity patch are never deferred.
+    caller retries every tick; a demote, whose departed instances never make
+    the cluster whole again, lifts this deferral (#1541, below). Scale-UP and
+    the affinity patch are never deferred.
+
+    #1541 — ``shrink_past_unready`` lifts the readiness deferral for a
+    demote whose nodes are gone (``heartbeat._DemoteShrink``). There the
+    unready instances are the departed nodes' and never come back, so the
+    Cluster is never whole again and the deferral above would hold the old
+    size for good. It is lifted only when the new size is at least the
+    number of ready instances: a spec no smaller than what is healthy can
+    never make CloudNativePG remove a healthy instance. CNPG's own gate
+    still keeps it from acting until the stranded instances' claims are
+    reclaimed (#1058; it does not remove instances while one is not
+    reporting), and then the smaller spec is what stops it re-creating them
+    on the nodes that are left.
 
     Note the affinity patch can strand an instance whose PVC is already
     bound to a node that now hosts another instance — it goes Pending until
@@ -2113,7 +2127,7 @@ def patch_cnpg_instances(
             deferred = hold_reason or "scale-down held by the caller"
         elif ready is None or reported is None:
             deferred = "the Cluster reports no readiness yet"
-        elif ready < reported:
+        elif ready < reported and not (shrink_past_unready and instances >= ready):
             deferred = f"readyInstances {ready} < instances {reported}"
     result = CnpgScale(current=current if isinstance(current, int) else None,
                        ready=ready, reported=reported, deferred=deferred)
