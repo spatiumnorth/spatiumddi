@@ -97,3 +97,63 @@ async def test_record_type_cannot_change_on_update(
     await client.put(_record_delete_url(zone, rec), json={"record_type": "AAAA"}, headers=headers)
     await db_session.refresh(rec)
     assert rec.record_type == "A"
+
+
+async def _add(db: AsyncSession, zone: Any, name: str, value: str) -> Any:
+    from app.models.dns import DNSRecord
+
+    rec = DNSRecord(
+        zone_id=zone.id,
+        fqdn=f"{name}.{zone.name}",
+        name=name,
+        record_type="A",
+        value=value,
+        ttl=300,
+    )
+    db.add(rec)
+    await db.flush()
+    return rec
+
+
+@pytest.mark.asyncio
+async def test_rename_out_of_a_shared_rrset_keeps_the_siblings_and_merges_at_the_target(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The delete must ship the old name's REMAINING members (a whole-RRset
+    replace on BIND9 / PowerDNS / Technitium), never an empty set that would
+    drop the round-robin siblings; the create must carry the target name's
+    existing members plus the renamed one."""
+    _server, zone = await _make_zone(db_session, driver="bind9")
+    rec = await _add(db_session, zone, "web", "203.0.113.1")
+    await _add(db_session, zone, "web", "203.0.113.2")
+    await _add(db_session, zone, "api", "203.0.113.9")
+    headers = await _make_admin(db_session)
+    await db_session.commit()
+
+    r = await client.put(_record_delete_url(zone, rec), json={"name": "api"}, headers=headers)
+    assert r.status_code == 200, r.text
+    rows = (await db_session.execute(select(DNSRecordOp).order_by(DNSRecordOp.seq))).scalars().all()
+    assert [(o.op, o.record["name"]) for o in rows] == [("delete", "web"), ("create", "api")]
+    assert [m["value"] for m in rows[0].record["rrset"]["members"]] == ["203.0.113.2"]
+    assert sorted(m["value"] for m in rows[1].record["rrset"]["members"]) == [
+        "203.0.113.1",
+        "203.0.113.9",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_case_only_rename_is_a_single_update(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """DNS names are case-insensitive: Web01 and web01 are one owner, so a
+    case-only edit must not retract the name it is about to write."""
+    _server, zone = await _make_zone(db_session, driver="bind9")
+    rec = await _add_record(db_session, zone, "web01")
+    headers = await _make_admin(db_session)
+    await db_session.commit()
+
+    r = await client.put(_record_delete_url(zone, rec), json={"name": "Web01"}, headers=headers)
+    assert r.status_code == 200, r.text
+    rows = (await db_session.execute(select(DNSRecordOp))).scalars().all()
+    assert [o.op for o in rows] == ["update"]
+    assert [m["value"] for m in rows[0].record["rrset"]["members"]] == ["203.0.113.40"]
