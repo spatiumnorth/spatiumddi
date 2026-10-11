@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Fleet group change now finds the appliance's own servers
+  (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
+  group by selecting `appliance_id`, which nothing writes: agents
+  register with `host` set to the node's hostname, so on a real
+  appliance only the pointer moved and the server kept serving the old
+  group. The roles PUT now also matches agent-based rows by hostname
+  (case-insensitive, never a row another appliance owns, and not when
+  two approved appliances share the hostname). After an engine switch
+  only the current engine's DNS row moves. Moving back to the group the
+  old engine served used to clash with the appliance's own dead row of
+  that engine (same name, other driver); that row is now retired as part
+  of the save, audited like a server delete, and only when it is this
+  appliance's, of an engine it no longer runs, and silent for more than
+  two minutes. While the old agent is still reporting, the save answers
+  409 naming the row. A clash with any other row still refuses the move,
+  and a re-registering agent still does not undo it. The route now
+  publishes the wakes the move collects (before, there was no collector,
+  so the moved agent and both groups converged only on the safety tick),
+  writes an audit row per moved server, and locks the appliance row so
+  two saves cannot interleave. Under a DNS VIP the agent pod has no
+  hostNetwork, so it registered under its pod name; it now registers
+  under the node name.
+
 - **Technitium SVCB / HTTPS records are sent the way the daemon parses
   them, and stop churning and reading as drift (#1513, #1698).**
   - **Two or more SvcParams were refused (#1698).** Technitium splits
