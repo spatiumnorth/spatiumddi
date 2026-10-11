@@ -4387,22 +4387,22 @@ async def update_appliance_roles(
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
             own_dns = await _appliance_own_dns_servers(db, row)
-            if not own_dns and "dns" in " ".join(row.assigned_roles or []):
-                # #1762 — no server row yet: it will register into this group
-                # as a new signer, so apply the same refusal a move gets.
-                from app.services.dns.dnssec_signers import (
-                    add_server_refusal_message,
-                    enabled_server_count,
-                    signed_zone_count,
-                )
+            if (
+                not own_dns
+                and _current_dns_drivers(row)
+                and dns_group.id != row.assigned_dns_group_id
+            ):
+                # #1762 — no server row yet: the agent will register into this
+                # group as a new signer, so apply the same refusal a move gets.
+                # Only on a pointer change, so re-saving an unchanged
+                # assignment is never refused.
+                from app.services.dns.dnssec_signers import second_signer_refusal
 
-                if await enabled_server_count(db, dns_group.id) >= 1:
-                    n_signed = await signed_zone_count(db, dns_group.id)
-                    if n_signed:
-                        raise HTTPException(
-                            status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            add_server_refusal_message(dns_group.name, n_signed),
-                        )
+                refusal = await second_signer_refusal(
+                    db, dns_group, driver=next(iter(_current_dns_drivers(row)))
+                )
+                if refusal is not None:
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
             if any(srv.group_id != dns_group.id for srv in own_dns):
                 # #1715 — the appliance's own dead row of a previous engine
                 # would block the move on name and driver; retire it first.

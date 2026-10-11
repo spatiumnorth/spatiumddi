@@ -64,6 +64,7 @@ from app.services.agents.ingest_receipt import (
 )
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.dns import agent_bundle_store as bundle_store
+from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
@@ -74,7 +75,6 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
-from app.services.dns.dnssec_signers import enabled_server_count
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
@@ -266,6 +266,52 @@ async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
         logger.exception("dns_group_soa_timers_failed", group_id=str(group_id))
 
 
+async def _warn_if_second_signer(db: DB, group: DNSServerGroup, server: DNSServer) -> None:
+    """#1762 — an agent that auto-registers (``AGENT_GROUP``) into a group
+    that already has a signer and holds signed zones becomes a second
+    independent signer. Registration is not refused: that would leave the
+    agent re-bootstrapping forever with no row an operator can act on. There
+    is also no safe "register but don't sign" mode — a server serving the
+    zone unsigned under the parent's DS is just as bogus as one signing with
+    its own keys. So the row is created and the hazard is made loud: a
+    warning log, an audit row, the zone's ``dnssec_multi_signer`` flag (UI
+    badge + DNSSEC card) and the default-on ``dnssec_multi_signer`` alert.
+    """
+    if server.driver not in dnssec_signers.SIGNING_DRIVERS:
+        return
+    n = await dnssec_signers.signing_server_count(db, group.id)
+    if n < 2:
+        return
+    signed = await dnssec_signers.signed_zone_count(db, group.id)
+    if not signed:
+        return
+    message = dnssec_signers.register_warning_message(group.name, server.name, signed, n)
+    logger.warning(
+        "dns_agent_registered_into_signed_group",
+        group_id=str(group.id),
+        server_id=str(server.id),
+        signed_zones=signed,
+        signing_servers=n,
+    )
+    db.add(
+        AuditLog(
+            user_display_name="system:dns-agent",
+            auth_source="system",
+            action="dns.agent.register.dnssec_multi_signer",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            new_value={
+                "group_id": str(group.id),
+                "signed_zones": signed,
+                "signing_servers": n,
+                "warning": message,
+            },
+            result="success",
+        )
+    )
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
@@ -372,6 +418,7 @@ async def agent_register(
         pending_approval = require_approval
         db.add(server)
         await db.flush()
+        await _warn_if_second_signer(db, group, server)
     else:
         # Anti-hijack: fingerprint change → force approval IFF the
         # operator has opted into the approval gate. Otherwise the
@@ -1201,13 +1248,14 @@ async def agent_dnssec_state(
     if not body.zones:
         return {"updated": 0}
 
-    # #1762 — on a group with several enabled servers each signs with its own
+    # #1762 — on a group with several agent servers each signs with its own
     # keys, so their DS/key reports disagree and the last writer used to win,
-    # flapping the DS the UI shows. Only the group's primary is authoritative
-    # (the DS an operator publishes comes from one server); ignore the rest.
-    # Multi-signer groups are refused for new signing, so this only governs
-    # zones signed before that rule.
-    if not reporter.is_primary and await enabled_server_count(db, reporter.group_id) > 1:
+    # flapping the DS the UI shows. Keep one server's report: the primary's,
+    # or the oldest signer's when no signer is primary (see
+    # ``dnssec_signers.is_ds_reporter``). Multi-signer groups are refused for
+    # new signing, so this only governs zones signed before that rule and
+    # agents that auto-registered into a signed group.
+    if not await dnssec_signers.is_ds_reporter(db, reporter):
         return {"updated": 0}
 
     # DNSZone.name is stored *with* the trailing dot in the DB

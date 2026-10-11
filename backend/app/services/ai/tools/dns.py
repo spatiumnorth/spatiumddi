@@ -962,11 +962,18 @@ async def find_zone_dnssec_info(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    from app.services.dns.dnssec_signers import signing_server_count  # noqa: PLC0415
+
     keys = (await db.execute(select(DNSKey).where(DNSKey.zone_id == zone.id))).scalars().all()
+    signers = await signing_server_count(db, zone.group_id)
     return {
         "zone_id": str(zone.id),
         "name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
+        # #1762 — signed on a group whose servers each sign with their own
+        # keys: the DS shown is one server's, and the others' do not match it.
+        "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
+        "signing_servers": signers,
         "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
         "dnssec_ds_records": zone.dnssec_ds_records,
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),

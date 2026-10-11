@@ -293,7 +293,27 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    are no-ops on the BIND9 agent (the config render drives signing).
 
 Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on
-`{powerdns, bind9}` and `dnssec_rollover` on `{bind9}`.
+`{powerdns, bind9, technitium}` and `dnssec_rollover` on `{bind9}`.
+
+**One signer per group ([#1762](https://github.com/spatiumnorth/spatiumddi/issues/1762)).**
+Keys are node-local on every agent engine — BIND9's `K*` files in the agent
+state dir, PowerDNS's LMDB cryptokeys, Technitium's own key store — and the
+control plane holds none of them, so two agent servers in one group serve a
+signed zone with two DNSKEY sets against one published DS. BIND9 is the
+sharpest case: signing is config-driven, so *every* server that receives the
+bundle renders `inline-signing yes;` for a `dnssec_enabled` zone — there is no
+sign op to withhold, and `is_enabled` does not stop a server receiving the
+bundle. `services/dns/dnssec_signers.py` therefore counts every agent server
+of a signing driver (enabled or not; agentless drivers excluded) and the
+`dnssec_sign` gate refuses when there is more than one; a server joining a
+group that holds signed zones is refused on every operator path (create,
+move, Fleet, Copilot). Existing multi-signer zones keep rendering signed on
+every server — unsigning them automatically would be its own outage — and are
+surfaced instead (`dnssec_multi_signer` on the zone, the UI badge + DNSSEC
+card, and the `dnssec_multi_signer` alert). The `/dnssec-state` report is
+matched within the reporting server's group, and on a multi-signer group only
+one server's report (the primary's, else the oldest signer's) is stored. See
+[`DNS.md`](../features/DNS.md) ("One signing server per group").
 
 ### 2.6 Rate limiting (RRL) + amplification (issue #146)
 
@@ -567,7 +587,7 @@ PowerDNS does the full DNSSEC dance internally:
 2. `POST /cryptokeys` with `keytype: zsk` (same algorithm). PowerDNS now signs all rrsets in the zone with the ZSK on every query.
 3. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain. The agent deliberately does **not** set the `PRESIGNED` zone metadata: that flag is for externally-signed zones loaded as already-signed, whereas pdns derives online-signing intent from the presence of active/published cryptokeys (and pdns rejects setting `PRESIGNED` with "Unsupported metadata kind" — re-verified on 5.0.5 in #638).
 
-After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
+After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent. The cryptokeys are per container, so signing is refused on a group with more than one PowerDNS server (§2.5, #1762).
 
 **Backup integration.** DNSSEC keys live in the agent's LMDB store, **not** in the control-plane backup. Restoring a DNSSEC-signed zone to a fresh agent regenerates keys and produces NEW DS records, which must be re-published to the parent registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory. See [issue #127 Phase 4d](https://github.com/spatiumnorth/spatiumddi/issues/127).
 

@@ -440,6 +440,16 @@ RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 # shows, so the alarm and the panel cannot disagree.
 RULE_TYPE_DHCP_SCOPE_UNCOORDINATED = "dhcp_scope_uncoordinated"
 
+# Issue #1762 — a DNSSEC-signed zone on a group with more than one agent DNS
+# server (BIND9 / PowerDNS / Technitium; disabled servers count — they still
+# serve the bundle). Each server signs with keys it generated, so the zone is
+# served with several DNSKEY sets against the one DS published at the parent,
+# and validating resolvers SERVFAIL on whichever server it does not match.
+# New signing and operator server-adds are refused; this rule covers what the
+# control plane cannot refuse: zones signed before the rule, and an agent that
+# auto-registered (``AGENT_GROUP``) into a signed group. Subject = dns_zone.
+RULE_TYPE_DNSSEC_MULTI_SIGNER = "dnssec_multi_signer"
+
 # Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
 # Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
 # sweep + SNMP poll already write + the ip_mac_history observation log; no new
@@ -637,6 +647,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AGENT_BUNDLE_RENDER_FAILED,
         RULE_TYPE_DNS_RECORD_OP_FAILED,
         RULE_TYPE_DHCP_SCOPE_UNCOORDINATED,
+        RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
@@ -3765,6 +3776,36 @@ async def _matching_dns_record_op_failed_subjects(
     return matches
 
 
+async def _matching_dnssec_multi_signer_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``dnssec_multi_signer`` — every signed zone whose group has more than one
+    agent DNS server (#1762). Critical: it is an outage for validating
+    resolvers, not an early warning. Auto-resolves when the zone is unsigned
+    or the group is back to one server."""
+    from app.services.dns.dnssec_signers import multi_signer_zones  # noqa: PLC0415
+
+    matches: list[tuple[str, str, str, str | None]] = []
+    for zone, n in await multi_signer_zones(db):
+        matches.append(
+            (
+                str(zone.id),
+                zone.name.rstrip("."),
+                (
+                    f"DNSSEC-signed zone {zone.name.rstrip('.')!r} is served by {n} DNS "
+                    f"servers in one group, and each signs it with its own keys. The DS "
+                    f"published at the parent matches at most one of them, so validating "
+                    f"resolvers that reach another server get SERVFAIL. Keep one server in "
+                    f"the group (delete or move the others; disabling a server does not "
+                    f"stop it serving the zone), or unsign the zone."
+                ),
+                "critical",
+            )
+        )
+    return matches
+
+
 async def _matching_dhcp_scope_uncoordinated_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -5148,6 +5189,50 @@ async def seed_agent_spool_trimmed_alert_rule() -> None:
         await session.commit()
 
 
+_DNSSEC_MULTI_SIGNER_RULE_NAME = "DNSSEC zone signed by several servers"
+
+
+async def seed_dnssec_multi_signer_alert_rule() -> None:
+    """Seed the #1762 rule, ENABLED by default.
+
+    Silent on every install whose signed zones each sit on a single-server
+    group, which every operator path now enforces. It speaks only for a state
+    the control plane could not refuse (a zone signed before the rule, or an
+    agent that auto-registered into a signed group), and that state is a
+    validation outage nothing else reports: every server answers and every
+    health check is green. Keyed on ``name``; an operator who disables or
+    renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DNSSEC_MULTI_SIGNER_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DNSSEC_MULTI_SIGNER_RULE_NAME,
+                description=(
+                    "Fires for every DNSSEC-signed zone whose server group has more "
+                    "than one DNS server. Each server signs with its own keys, so the "
+                    "DS published at the parent matches at most one of them and "
+                    "validating resolvers get SERVFAIL from the others. Auto-resolves "
+                    "when the zone is unsigned or the group is back to one server."
+                ),
+                rule_type=RULE_TYPE_DNSSEC_MULTI_SIGNER,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DHCP_SCOPE_UNCOORDINATED_RULE_NAME = "DHCP scope served uncoordinated"
 
 
@@ -6468,6 +6553,7 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
+    RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -6710,6 +6796,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # tables. Without the prefix a dns_server and a dhcp_server
                 # sharing a UUID would collide into one event.
                 subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_DNSSEC_MULTI_SIGNER:
+                multi = await _matching_dnssec_multi_signer_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in multi]
+                subject_type = "dns_zone"
             elif rule.rule_type == RULE_TYPE_AGENT_SPOOL_TRIMMED:
                 trimmed_hits = await _matching_agent_spool_trimmed_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in trimmed_hits]

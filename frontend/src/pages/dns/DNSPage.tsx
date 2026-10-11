@@ -2307,6 +2307,8 @@ function DnssecCard({
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
   const keys = info.data?.keys ?? [];
+  const multiSigner = info.data?.dnssec_multi_signer ?? false;
+  const signingServers = info.data?.signing_servers ?? 0;
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
@@ -2322,6 +2324,22 @@ function DnssecCard({
 
   return (
     <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+      {multiSigner && (
+        <div
+          role="alert"
+          className="rounded border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive"
+        >
+          <span className="font-medium">
+            Signed by {signingServers} servers.
+          </span>{" "}
+          Every server in this group signs the zone with its own keys, so the DS
+          below matches at most one of them and validating resolvers get
+          SERVFAIL from the others. Keep a single DNS server in the group
+          (delete or move the others — disabling a server does not stop it
+          serving the zone), or unsign the zone. Re-signing is refused until
+          then.
+        </div>
+      )}
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-medium">DNSSEC</div>
@@ -3889,6 +3907,14 @@ function ZoneDetailView({
             {zone.dnssec_enabled && (
               <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-emerald-500/15 text-emerald-600">
                 DNSSEC
+              </span>
+            )}
+            {zone.dnssec_multi_signer && (
+              <span
+                className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-destructive/15 text-destructive"
+                title="This zone is DNSSEC-signed on a group with more than one DNS server. Each server signs it with its own keys, so the DS published at the parent matches at most one of them and validating resolvers get SERVFAIL from the others. Keep one server in the group (disabling a server does not stop it serving the zone), or unsign the zone."
+              >
+                DNSSEC: multiple signers
               </span>
             )}
             {zone.dynamic_update_enabled && (

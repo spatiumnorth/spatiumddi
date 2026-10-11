@@ -1297,8 +1297,9 @@ class ZoneResponse(BaseModel):
     linked_subnet_id: uuid.UUID | None
     domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
-    # #1762 — True when the zone is signed on a group with >1 enabled server
-    # (each signs with its own keys). Derived in ``_zones_out``; never stored.
+    # #1762 — True when the zone is signed on a group with >1 agent DNS server
+    # (each signs with its own keys; disabled ones too — they still serve the
+    # bundle). Derived in ``_zones_out``; never stored.
     dnssec_multi_signer: bool = False
     auto_tls_probe: bool = False
     dnssec_policy_id: uuid.UUID | None = None
@@ -2004,8 +2005,7 @@ async def create_server(
         )
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-    if body.is_enabled:
-        await _refuse_second_signer(db, group)
+    await _refuse_second_signer(db, group, driver=body.driver)
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
@@ -2085,18 +2085,16 @@ async def create_server(
 
 
 async def _refuse_second_signer(
-    db: DB, group: DNSServerGroup, *, exclude: uuid.UUID | None = None
+    db: DB, group: DNSServerGroup, *, driver: str, exclude: uuid.UUID | None = None
 ) -> None:
-    """#1762 — 422 when an enabled server joining ``group`` would be a second
-    independent DNSSEC signer for zones that are already signed there."""
-    if await dnssec_signers.enabled_server_count(db, group.id, exclude_server_id=exclude) < 1:
-        return
-    signed = await dnssec_signers.signed_zone_count(db, group.id)
-    if signed:
-        raise HTTPException(
-            status_code=422,
-            detail=dnssec_signers.add_server_refusal_message(group.name, signed),
-        )
+    """#1762 — 422 when a server joining ``group`` would be a second
+    independent DNSSEC signer for zones that are already signed there. A
+    disabled server counts: it still receives and serves the bundle."""
+    refusal = await dnssec_signers.second_signer_refusal(
+        db, group, driver=driver, exclude_server_id=exclude
+    )
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
 
 
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
@@ -2108,16 +2106,6 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
-    # #1762 — re-enabling a server in a group that already has an enabled
-    # one makes it a second independent signer.
-    if (
-        body.is_enabled
-        and not server.is_enabled
-        and (body.group_id is None or body.group_id == server.group_id)
-    ):
-        await _refuse_second_signer(
-            db, await _require_group(server.group_id, db), exclude=server.id
-        )
     # #1540 — a driver change on update is the other path that used to
     # manufacture a mixed group. Enforce single-driver against the OTHER
     # members of the group the server stays in. When the same request
@@ -6066,6 +6054,10 @@ class ZoneDNSSECInfo(BaseModel):
     dnssec_ds_records: list[str] = []
     dnssec_synced_at: datetime | None = None
     keys: list[DNSSECKeyState] = []
+    # #1762 — the zone is signed and its group has more than one DNS server,
+    # each signing with its own keys; ``signing_servers`` is that count.
+    dnssec_multi_signer: bool = False
+    signing_servers: int = 0
 
 
 class ZoneTemplateParameter(BaseModel):
@@ -6151,8 +6143,11 @@ async def get_zone_dnssec_info(
         .scalars()
         .all()
     )
+    signers = await dnssec_signers.signing_server_count(db, zone.group_id)
     return ZoneDNSSECInfo.model_validate(
         {
+            "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
+            "signing_servers": signers,
             "zone_id": str(zone.id),
             "zone_name": zone.name,
             "dnssec_enabled": zone.dnssec_enabled,
@@ -8670,16 +8665,12 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
         return
     incompatible = drivers - allowed
     if not incompatible and op == "dnssec_sign":
-        # #1762 — every engine signs per server with its own keys.
-        n_signers = await dnssec_signers.enabled_server_count(db, group_id)
-        if n_signers > 1:
-            group = await db.get(DNSServerGroup, group_id)
-            raise HTTPException(
-                status_code=422,
-                detail=dnssec_signers.sign_refusal_message(
-                    repr(group.name) if group else group_id, n_signers
-                ),
-            )
+        # #1762 — every engine signs per server with its own keys. Counts
+        # disabled servers too (they still serve the bundle) and locks the
+        # group so a concurrent server add cannot slip in.
+        refusal = await dnssec_signers.sign_refusal(db, group_id)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
     if incompatible:
         raise HTTPException(
             status_code=422,

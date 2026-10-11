@@ -53,6 +53,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns.dnssec_signers import lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
 from app.services.dns.record_ops import (
@@ -171,6 +172,9 @@ class ZoneMovePlan:
     #: onto one is refused rather than warned: the row keeps saying
     #: ``dnssec_enabled`` while the zone is served unsigned forever.
     dnssec_unsupported_drivers: list[str] = field(default_factory=list)
+    #: Signing agent servers in the target, when the zone is signed (#1762).
+    #: More than one is refused: each would sign with its own keys.
+    dnssec_target_signers: int = 0
     #: Named ACLs cited in the zone's own address-match lists
     #: (``allow_query`` / ``allow_transfer`` / ``also_notify``). ``DNSAcl``
     #: is group-scoped, so a name that exists in the source and not the
@@ -417,6 +421,7 @@ async def assemble_move_plan(
     if plan.dnssec_signed:
         allowed = DNSSEC_SIGN_DRIVERS
         plan.dnssec_unsupported_drivers = sorted(set(plan.target_drivers) - allowed)
+        plan.dnssec_target_signers = await signing_server_count(db, target_group.id)
 
     # ── Named ACLs cited by the zone's own address-match lists ────────
     _scan_acl_references(plan, zone, source_acls, target_acls)
@@ -541,6 +546,12 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             "publish the new one, and the zone will fail validation in the interval."
         )
         plan.required_acknowledgements.append(ACK_DNSSEC_ROLLOVER)
+        if plan.dnssec_target_signers > 1:
+            plan.warnings.append(
+                f"The target group has {plan.dnssec_target_signers} DNS servers, each of which "
+                f"would sign this zone with its own keys. The move is refused until the zone "
+                f"is unsigned or the target has a single DNS server (#1762)."
+            )
 
     if plan.acl_keys_lost:
         plan.warnings.append(
@@ -639,6 +650,9 @@ async def commit_move(
             status_code=423,
         )
 
+    if zone.dnssec_enabled:
+        # #1762 — serialise with a concurrent server add to the target.
+        await lock_group(db, target_group.id)
     plan = await assemble_move_plan(db, zone, target_group)
 
     # Hard refusals that no acknowledgement can waive, because none of them
@@ -649,6 +663,14 @@ async def commit_move(
             f"{plan.dnssec_unsupported_drivers}, which cannot sign. The zone would keep "
             f"reporting as signed while being served unsigned. Unsign it first, or pick a "
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
+            status_code=422,
+        )
+    if plan.dnssec_signed and plan.dnssec_target_signers > 1:
+        raise ZoneMoveError(
+            f"This zone is DNSSEC-signed and '{target_group.name}' has "
+            f"{plan.dnssec_target_signers} DNS servers; each would sign it with its own "
+            f"keys, so resolvers would see DNSKEYs the published DS does not match "
+            f"(#1762). Unsign it first, or pick a group with a single DNS server.",
             status_code=422,
         )
     if plan.acl_names_lost:
