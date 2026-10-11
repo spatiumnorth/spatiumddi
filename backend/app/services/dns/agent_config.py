@@ -134,6 +134,14 @@ logger = structlog.get_logger(__name__)
 # agent as RFC 2136 ops, not as a re-render (#1373). See ``zones_structural``.
 _RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
 
+# #1513 — the key, and its one value, by which a Technitium bundle says a
+# dot-less SVCB / HTTPS target is zone-relative. The agent's
+# ``drivers/technitium.py`` reads the same two literals; without the key it
+# reads a dot-less target as absolute, which is what the renderer before
+# #1513 meant.
+SVCB_TARGET_RULE_KEY = "svcb_target_rule"
+SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
 
 #: How an ETag's payload is serialised before it is hashed. The streamed
 #: render (#1662) hashes each batch of blocklist entries with these too.
@@ -1305,6 +1313,17 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # be structural (issue #50).
         "tls_cert": tls_cert_block,
     }
+    if server.driver == "technitium":
+        # #1513 — say how a dot-less SVCB / HTTPS target in this bundle is
+        # meant: relative to the zone, as in a zone file. Before #1513 the
+        # Technitium agent sent it to the daemon as-is (absolute), and an
+        # agent replaying a cached bundle from that renderer must keep that
+        # meaning, so the agent reads the rule from the bundle rather than
+        # assuming its own. Structural on purpose: its arrival moves the
+        # structural etag once, so every Technitium agent re-reconciles its
+        # zones under the rule even when nothing else changed.
+        bundle_body[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
+        structural[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
     return _Assembled(
         body=bundle_body,
         structural=structural,
