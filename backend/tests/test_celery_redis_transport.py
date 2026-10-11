@@ -253,6 +253,7 @@ def test_retry_rejected_by_the_broker_is_requeued(monkeypatch):
     from celery.exceptions import Reject
     from kombu.exceptions import EncodeError, OperationalError
 
+    import app.tasks.event_outbox  # noqa: F401 — registers the task; don't rely on test order
     from app.celery_app import SpatiumTask
 
     task = celery_app.tasks["app.tasks.event_outbox.process_event_outbox"]
