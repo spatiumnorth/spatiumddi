@@ -670,7 +670,7 @@ async def test_zone_create_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
         name = "new.example.com."
         zone_type = "primary"
 
-    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({"domain": "new.example.com"}), _ok({})])
     server = _Server({"api_url": "https://x.test", "api_token": "t"})
     await drv.apply_zone_change(server, _Zone(), "create")
     await drv.apply_zone_change(server, _Zone(), "delete")
@@ -865,6 +865,12 @@ def test_record_type_gate_matches_what_the_driver_advertises() -> None:
 # ── #1537 — zone create / delete converge on retry ─────────────────────
 
 
+_EMPTY_PRIMARY = [
+    _ok({"zones": [{"name": "new.example.com", "type": "Primary"}], "totalPages": 1}),
+    _ok({"records": [{"type": "SOA", "name": "new.example.com"}, {"type": "NS"}]}),
+]
+
+
 class _TZone:
     name = "new.example.com."
     zone_type = "primary"
@@ -876,12 +882,14 @@ def _tserver() -> Any:
 
 @pytest.mark.asyncio
 async def test_zone_create_already_exists_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An EMPTY Primary zone already there is adopted (#1784 narrows this)."""
     drv, fake = _driver(
         monkeypatch,
         [
             _FakeResponse(
                 {"status": "error", "errorMessage": "Zone already exists: new.example.com"}
-            )
+            ),
+            *_EMPTY_PRIMARY,
         ],
     )
     await drv.apply_zone_change(_tserver(), _TZone(), "create")
@@ -951,5 +959,6 @@ async def test_zone_ops_report_whether_they_changed_anything(
 ) -> None:
     """``False`` = already in the requested state; the caller's partial
     failure compensation must leave that server alone (#1537)."""
-    drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
+    extra = _EMPTY_PRIMARY if (op == "create" and not changed) else []
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body), *extra])
     assert await drv.apply_zone_change(_tserver(), _TZone(), op) is changed

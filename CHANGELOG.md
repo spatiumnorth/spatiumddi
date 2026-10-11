@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The agentless `technitium_api` driver is marked experimental
+  for 1.0 and its supported scope is enforced.** It writes into a
+  Technitium server SpatiumDDI does not own and has no reconcile loop,
+  so pools, SOA / ACL / option settings and a second server were
+  accepted and silently not applied, and a same-name Secondary or
+  populated zone was adopted and later deleted with its records. Now
+  the API refuses (422, naming "technitium_api is experimental in
+  1.0") a second server per group (create, driver change, move), DNS
+  pools, non-Primary zones, zone and group settings the driver never
+  writes (only a changed value; re-saving a stored one still works),
+  catalog zones and blocklist assignment; zone create adopts an
+  existing zone only if it is an empty Primary. A group that already
+  breaks the scope keeps serving and shows a warning
+  (`scope_warnings`). Capability flag `experimental`, an
+  Experimental label in the UI, and `DNS_DRIVERS.md` §4C.7a list what
+  is supported. Full support is tracked for 1.1.0 (#1769, #1771,
+  #1774, #1775). (#1784)
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

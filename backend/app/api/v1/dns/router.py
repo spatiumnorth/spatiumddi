@@ -95,6 +95,7 @@ from app.services.appliance.group_names import (
     group_name_problem,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns import technitium_api_scope
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -358,13 +359,22 @@ class ServerGroupResponse(BaseModel):
     # Exposed so a client can tell which groups a given server may move into
     # without fetching every group's server list to find out.
     server_drivers: list[str] = []
+    # #1784 — set when the group holds an experimental ``technitium_api``
+    # server, and says where an already-existing group falls outside the
+    # supported scope (second server, pools). Empty for every other group.
+    scope_warnings: list[str] = []
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_model(cls, g: DNSServerGroup, drivers: list[str] | None = None) -> ServerGroupResponse:
+    def from_model(
+        cls,
+        g: DNSServerGroup,
+        drivers: list[str] | None = None,
+        warnings: list[str] | None = None,
+    ) -> ServerGroupResponse:
         return cls(
             id=g.id,
             name=g.name,
@@ -376,6 +386,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             server_drivers=sorted(drivers or []),
+            scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
@@ -1694,7 +1705,8 @@ async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
     result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
-    return [ServerGroupResponse.from_model(g, drivers.get(g.id)) for g in groups]
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
+    return [ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id)) for g in groups]
 
 
 @router.post("/groups", response_model=ServerGroupResponse, status_code=status.HTTP_201_CREATED)
@@ -1737,7 +1749,8 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
@@ -1763,6 +1776,14 @@ async def update_group(
             "is_public_facing",
         },
     )
+    if (
+        "catalog_zones_enabled" in changes
+        and changes["catalog_zones_enabled"] != group.catalog_zones_enabled
+        and await technitium_api_scope.group_is_technitium_api(db, group.id)
+    ):
+        raise technitium_api_scope.refusal(
+            "catalog zones are not written to the Technitium server."
+        )
     # #1468 — an appliance's supervisor gets this group by NAME and drops a
     # name it won't put in its role env, so don't rename an assigned group
     # into one. Only on an actual change: re-saving a legacy name is fine.
@@ -1795,7 +1816,8 @@ async def update_group(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
@@ -1831,7 +1853,8 @@ async def rotate_group_key(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -3606,6 +3629,7 @@ async def update_options(
 ) -> DNSServerOptions:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
+    stored_opts = opts
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
@@ -3631,6 +3655,8 @@ async def update_options(
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
@@ -4572,11 +4598,27 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _enforce_technitium_api_zone_scope(
+    db: DB, group_id: uuid.UUID, changes: dict[str, Any], current: DNSZone | None
+) -> None:
+    """422 zone settings the experimental ``technitium_api`` driver can't apply (#1784).
+
+    No-op for every other driver. ``current`` is the stored zone on update,
+    so only a CHANGED value is refused and an unchanged re-save passes.
+    """
+    if not await technitium_api_scope.group_is_technitium_api(db, group_id):
+        return
+    if current is None or ("zone_type" in changes and changes["zone_type"] != current.zone_type):
+        technitium_api_scope.refuse_non_primary(changes.get("zone_type", "primary"))
+    technitium_api_scope.refuse_unapplied_zone_changes(changes, current)
+
+
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
 ) -> ZoneResponse:
     await _require_group(group_id, db)
+    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -5295,6 +5337,7 @@ async def update_zone(
     # nor empty the masters on an existing secondary.
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(

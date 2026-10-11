@@ -406,7 +406,7 @@ const CRED_FIELDS_BY_DRIVER: Record<string, CloudCredField[]> = {
 
 const CRED_DRIVER_LABELS: Record<string, string> = {
   ...CLOUD_DNS_LABELS,
-  technitium_api: "Technitium (remote API)",
+  technitium_api: "Technitium (remote API, experimental)",
 };
 
 function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
@@ -1606,7 +1606,7 @@ function ServerModal({
               <option value="powerdns">PowerDNS (agent-managed)</option>
               <option value="technitium">Technitium (agent-managed)</option>
               <option value="technitium_api">
-                Technitium (agentless, remote API)
+                Technitium (agentless, remote API) — Experimental
               </option>
               <option value="windows_dns">
                 Windows DNS (agentless, RFC 2136 + optional WinRM)
@@ -1659,7 +1659,9 @@ function ServerModal({
         )}
         {driver === "technitium_api" && (
           <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
-            <strong>Technitium (remote API):</strong> agentless. For a
+            <strong>Technitium (remote API) — Experimental in 1.0:</strong> one
+            server per group, zones SpatiumDDI creates, no DNS pools and no
+            group or zone options (the API refuses them). Agentless. For a
             Technitium server <em>you already run</em> — nothing is deployed,
             and record CRUD runs from the SpatiumDDI control plane against its
             HTTP API. Enter the API URL and a permanent token below; they're
@@ -5271,6 +5273,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
                     {s.driver}
                   </span>
+                  {s.driver === "technitium_api" && <ExperimentalBadge />}
                   {s.maintenance_mode && (
                     <span
                       className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
@@ -10391,6 +10394,17 @@ type GroupTab =
   | "tsig"
   | "options";
 
+function ExperimentalBadge() {
+  return (
+    <span
+      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+      title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+    >
+      Experimental
+    </span>
+  );
+}
+
 function GroupDetailView({
   group,
   onSelectZone,
@@ -10526,6 +10540,16 @@ function GroupDetailView({
           <p className="text-xs text-muted-foreground mt-0.5">
             {group.description}
           </p>
+        )}
+        {(group.scope_warnings ?? []).length > 0 && (
+          <div
+            className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+            role="note"
+          >
+            {(group.scope_warnings ?? []).map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
         )}
       </div>
 

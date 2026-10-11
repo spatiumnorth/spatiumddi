@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
@@ -53,6 +54,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns import technitium_api_scope
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
 from app.services.dns.record_ops import (
@@ -651,6 +653,22 @@ async def commit_move(
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
             status_code=422,
         )
+    if technitium_api_scope.DRIVER in plan.target_drivers:
+        # #1784 — the experimental agentless driver supports Primary zones
+        # without pools or settings it cannot apply. Refused, not warned: the
+        # zone would read as configured on a server that ignores the config.
+        try:
+            technitium_api_scope.refuse_non_primary(zone.zone_type)
+            technitium_api_scope.refuse_unapplied_zone_changes(
+                {f: getattr(zone, f) for f in technitium_api_scope.ZONE_UNAPPLIED_DEFAULTS},
+                None,
+            )
+            if await _count(db, DNSPool, DNSPool.zone_id == zone.id):
+                raise technitium_api_scope.refusal(
+                    "DNS pools are not supported; this zone has pools."
+                )
+        except HTTPException as exc:
+            raise ZoneMoveError(str(exc.detail), status_code=422) from exc
     if plan.acl_names_lost:
         raise ZoneMoveError(
             f"The zone names ACL(s) the target group does not define "
