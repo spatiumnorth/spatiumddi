@@ -527,57 +527,97 @@ async def test_step_convergence_times_out_on_unready_ds_pod(
 
 
 @pytest.mark.asyncio
-async def test_step_convergence_waits_for_cnpg_instances(
+async def test_step_convergence_does_not_wait_for_cnpg(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1544: Node Ready + DS Ready is not enough — convergence must
-    also wait until the CNPG Cluster reports every instance ready,
-    or the chain uncordons and drains the next node with Postgres
-    short an instance."""
+    """#1544 / ddi-pg case 3: convergence runs while the node is still
+    cordoned, when its own evicted Postgres instance cannot schedule. It
+    must not read the CNPG count at all — that wait lives after the
+    uncordon, in cluster_verify."""
     ready_node = {
         "metadata": {"name": "node-1"},
         "status": {"conditions": [{"type": "Ready", "status": "True"}]},
     }
-    cluster = {
-        "spec": {"instances": 3},
-        "status": {"readyInstances": 3, "currentPrimary": "pg-cluster-1"},
-    }
     monkeypatch.setattr(per_node.k8s, "get_node", lambda _name: (200, ready_node))
     monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _name: [])
-    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, cluster))
-    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
-    step = await per_node._step_convergence(
-        "node-1", timeout_s=5.0, cnpg_cluster_name="pg-cluster", cnpg_namespace="spatium"
+    monkeypatch.setattr(
+        per_node.k8s,
+        "get_cnpg_cluster",
+        lambda *a, **k: pytest.fail("convergence must not read the CNPG count"),
     )
+    step = await per_node._step_convergence("node-1", timeout_s=5.0)
+    assert step.ok is True
+
+
+def _cnpg(ready: int, spec: int = 3) -> dict[str, Any]:
+    return {
+        "spec": {"instances": spec},
+        "status": {"readyInstances": ready, "currentPrimary": "pg-cluster-1"},
+    }
+
+
+def _ok_check(name: str) -> preflight.PreflightResult:
+    return preflight.PreflightResult(name, "ok", "fine", {})
+
+
+@pytest.mark.asyncio
+async def test_step_cluster_verify_waits_for_cnpg_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: after the uncordon, cluster_verify polls until the CNPG
+    Cluster reports every instance ready, then runs repl + quorum."""
+    reads = iter([_cnpg(2), _cnpg(2), _cnpg(3)])
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, next(reads)))
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    with (
+        patch.object(preflight, "check_replication_lag", AsyncMock(return_value=_ok_check("repl"))),
+        patch.object(preflight, "check_quorum", return_value=_ok_check("quorum")),
+    ):
+        step = await per_node._step_cluster_verify(
+            "2026.06.01-1", cnpg_cluster_name="pg-cluster", cnpg_namespace="spatium"
+        )
     assert step.ok is True
     assert step.detail["cnpg_ready_instances"] == 3
     assert step.detail["cnpg_spec_instances"] == 3
 
 
 @pytest.mark.asyncio
-async def test_step_convergence_times_out_when_cnpg_instance_missing(
+async def test_step_cluster_verify_times_out_when_cnpg_instance_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1544: the upgraded node's CNPG instance never came back
-    (readyInstances stays below spec) → convergence times out
-    instead of passing on Node/DS readiness alone."""
-    ready_node = {
-        "metadata": {"name": "node-1"},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
-    }
-    cluster = {
-        "spec": {"instances": 3},
-        "status": {"readyInstances": 2, "currentPrimary": "pg-cluster-1"},
-    }
-    monkeypatch.setattr(per_node.k8s, "get_node", lambda _name: (200, ready_node))
-    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _name: [])
-    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, cluster))
+    """#1544: the instance never comes back after the uncordon → the step
+    fails, with the count in the error, instead of passing on repl/quorum."""
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, _cnpg(2)))
     monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
-    step = await per_node._step_convergence(
-        "node-1", timeout_s=0.05, cnpg_cluster_name="pg-cluster", cnpg_namespace="spatium"
+    step = await per_node._step_cluster_verify(
+        "2026.06.01-1", cnpg_cluster_name="pg-cluster", cnpg_timeout_s=0.05
     )
     assert step.ok is False
-    assert "timed out" in step.error
+    assert "2/3" in step.error and "after uncordon" in step.error
+
+
+@pytest.mark.asyncio
+async def test_step_preflight_waits_for_cnpg_before_the_node_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: preflight runs before this node's maintenance window and
+    cordon; a cluster short an instance fails it, so this node's drain
+    cannot start at 2/3."""
+    report = preflight.PreflightReport(
+        target_version="2026.06.01-1",
+        current_version="2026.05.22-2",
+        overall="ok",
+        can_start=True,
+        results=[_ok_check("x")],
+    )
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, _cnpg(2)))
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    with patch.object(preflight, "run_all", AsyncMock(return_value=report)):
+        step = await per_node._step_preflight(
+            "2026.06.01-1", cnpg_cluster_name="pg-cluster", cnpg_timeout_s=0.05
+        )
+    assert step.ok is False
+    assert "CNPG instances not all ready" in step.error
 
 
 # ── Step 10: uncordon + clear window ─────────────────────────────────
@@ -1160,18 +1200,27 @@ async def test_single_node_upgrade_release_crash_does_not_mask_failure(
 
 
 @pytest.mark.asyncio
-async def test_single_node_upgrade_passes_cnpg_cluster_to_convergence(
+async def test_single_node_upgrade_passes_cnpg_cluster_to_the_count_waits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#1544: the chain hands convergence the run's (possibly auto-detected)
-    CNPG cluster so it can wait for the node's Postgres instance."""
-    seen: dict[str, Any] = {}
+    """#1544: the chain hands the run's (possibly auto-detected) CNPG
+    cluster to preflight and cluster_verify, where the count is waited
+    for, and not to convergence."""
+    seen: dict[str, dict[str, Any]] = {}
 
-    async def _convergence(node: str, **kw: Any) -> per_node.StepResult:
-        seen.update(kw, node=node)
-        return per_node.StepResult(name="convergence", started_at="t").finish(True)
+    def _capture(name: per_node.StepName) -> Any:
+        async def _step(*_a: Any, **kw: Any) -> per_node.StepResult:
+            seen[name] = kw
+            return per_node.StepResult(name=name, started_at="t").finish(True)
 
-    _patch_chain_ok(monkeypatch, convergence=_convergence)
+        return _step
+
+    _patch_chain_ok(
+        monkeypatch,
+        preflight=_capture("preflight"),
+        convergence=_capture("convergence"),
+        cluster_verify=_capture("cluster_verify"),
+    )
     result = await per_node.single_node_upgrade(
         MagicMock(commit=AsyncMock()),
         node_name="node-1",
@@ -1181,11 +1230,184 @@ async def test_single_node_upgrade_passes_cnpg_cluster_to_convergence(
         cnpg_namespace="spatium",
     )
     assert result.ok is True
-    assert seen == {
-        "node": "node-1",
-        "cnpg_cluster_name": "pg-cluster",
-        "cnpg_namespace": "spatium",
+    cnpg = {"cnpg_cluster_name": "pg-cluster", "cnpg_namespace": "spatium"}
+    assert seen["preflight"] == cnpg
+    assert seen["cluster_verify"] == cnpg
+    assert seen["convergence"] == {}
+
+
+class _CnpgPinnedToCordonedNode:
+    """A fake cluster where the node's own Postgres instance (local-path
+    volume, pinned to the node) is evicted by its drain and can only
+    reschedule once the node is uncordoned — ddi-pg's case 3 on #1610."""
+
+    def __init__(self) -> None:
+        self.cordoned = False
+        self.drained = False
+        self.events: list[str] = []
+
+    def cluster(self, *_a: Any, **_k: Any) -> tuple[int, dict[str, Any]]:
+        ready = 2 if (self.cordoned and self.drained) else 3
+        return 200, _cnpg(ready)
+
+    def cordon(self, _node: str) -> tuple[bool, None]:
+        self.cordoned = True
+        self.events.append("cordon")
+        return True, None
+
+    def uncordon(self, _node: str) -> tuple[bool, None]:
+        self.cordoned = False
+        self.drained = False
+        self.events.append("uncordon")
+        return True, None
+
+
+@pytest.mark.asyncio
+async def test_chain_waits_for_cnpg_after_uncordon_not_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ddi-pg case 3 on #1610: CNPG reads 2/3 from the drain until the
+    uncordon. The real convergence, uncordon and cluster_verify steps run;
+    the node must succeed, with the count waited for after the uncordon.
+
+    Negative control: on f941e21c, where convergence waited for the count
+    before the uncordon, this chain fails at ``convergence`` (timed out).
+    """
+    fake = _CnpgPinnedToCordonedNode()
+    ready_node = {
+        "metadata": {"name": "node-1"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
     }
+
+    async def _drain(*_a: Any, **_k: Any) -> per_node.StepResult:
+        fake.drained = True
+        fake.events.append("drain")
+        return per_node.StepResult(name="drain", started_at="t").finish(True)
+
+    real_convergence = per_node._step_convergence
+    real_cluster_verify = per_node._step_cluster_verify
+
+    async def _convergence(node: str, **kw: Any) -> per_node.StepResult:
+        return await real_convergence(node, **{**kw, "timeout_s": 0.3})
+
+    async def _cluster_verify(target: str, **kw: Any) -> per_node.StepResult:
+        fake.events.append("cluster_verify")
+        return await real_cluster_verify(target, **kw)
+
+    _patch_chain_ok(
+        monkeypatch,
+        cordon=lambda node, **_k: _as_step("cordon", fake.cordon(node)),
+        drain=_drain,
+        convergence=_convergence,
+        uncordon=per_node._step_uncordon,
+        cluster_verify=_cluster_verify,
+    )
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node.k8s, "get_node", lambda _name: (200, ready_node))
+    monkeypatch.setattr(per_node.k8s, "list_pods_on_node", lambda _name: [])
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", fake.cluster)
+    monkeypatch.setattr(per_node.k8s, "uncordon_node", fake.uncordon)
+    monkeypatch.setattr(per_node.k8s, "patch_cnpg_maintenance_window", lambda *a, **k: (True, None))
+    with (
+        patch.object(preflight, "check_replication_lag", AsyncMock(return_value=_ok_check("repl"))),
+        patch.object(preflight, "check_quorum", return_value=_ok_check("quorum")),
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+            cnpg_namespace="spatium",
+        )
+    assert result.ok is True, (result.failed_at, result.error)
+    assert fake.events == ["cordon", "drain", "uncordon", "cluster_verify"]
+    verify = result.steps[-1]
+    assert verify.name == "cluster_verify"
+    assert verify.detail["cnpg_ready_instances"] == 3
+    assert "release_node" not in [s.name for s in result.steps]
+
+
+async def _as_step(name: per_node.StepName, outcome: tuple[bool, Any]) -> per_node.StepResult:
+    return per_node.StepResult(name=name, started_at="t").finish(outcome[0])
+
+
+@pytest.mark.asyncio
+async def test_chain_does_not_drain_while_cnpg_is_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1544: the next node's chain starts with CNPG at 2/3 (the previous
+    node's instance has not come back). Preflight waits, times out, and
+    fails — before this node's window, cordon or drain."""
+    report = preflight.PreflightReport(
+        target_version="2026.06.01-1",
+        current_version="2026.05.22-2",
+        overall="ok",
+        can_start=True,
+        results=[_ok_check("x")],
+    )
+    real_preflight = per_node._step_preflight
+
+    async def _preflight(*a: Any, **kw: Any) -> per_node.StepResult:
+        return await real_preflight(*a, **{**kw, "cnpg_timeout_s": 0.05})
+
+    _patch_chain_ok(
+        monkeypatch,
+        preflight=_preflight,
+        cnpg_maintenance_on=_must_not_run("cnpg_maintenance_on"),
+        cordon=_must_not_run("cordon"),
+        drain=_must_not_run("drain"),
+    )
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, _cnpg(2)))
+    with (
+        patch.object(preflight, "run_all", AsyncMock(return_value=report)),
+        patch.object(per_node.k8s, "uncordon_node") as un,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-2",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
+    assert result.failed_at == "preflight"
+    assert "CNPG instances not all ready" in result.error
+    assert [s.name for s in result.steps] == ["preflight"]
+    un.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chain_cnpg_timeout_after_uncordon_fails_without_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The count never recovers after the uncordon: cluster_verify fails
+    the node and the run stops before the next drain. The node is already
+    uncordoned with its window cleared, so no release_node runs."""
+    real_cluster_verify = per_node._step_cluster_verify
+
+    async def _cluster_verify(target: str, **kw: Any) -> per_node.StepResult:
+        return await real_cluster_verify(target, **{**kw, "cnpg_timeout_s": 0.05})
+
+    _patch_chain_ok(monkeypatch, cluster_verify=_cluster_verify)
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(per_node.k8s, "get_cnpg_cluster", lambda *a, **k: (200, _cnpg(2)))
+    with (
+        patch.object(per_node.k8s, "uncordon_node") as un,
+        patch.object(per_node.k8s, "patch_cnpg_maintenance_window") as mw,
+    ):
+        result = await per_node.single_node_upgrade(
+            MagicMock(commit=AsyncMock()),
+            node_name="node-1",
+            target_version="2026.06.01-1",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
+            cnpg_cluster_name="pg-cluster",
+        )
+    assert result.failed_at == "cluster_verify"
+    assert "after uncordon" in result.error
+    assert result.steps[-1].name == "cluster_verify"
+    un.assert_not_called()
+    mw.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1197,7 +1419,7 @@ async def test_single_node_upgrade_step_crash_caught(
     Otherwise an orchestrator-pod crash mid-step would leave the
     SystemUpgradeRun row stuck in ``running`` forever."""
 
-    async def _crash(_target_version: str, *_a: object) -> per_node.StepResult:
+    async def _crash(_target_version: str, *_a: object, **_k: object) -> per_node.StepResult:
         raise RuntimeError("kubeapi unreachable")
 
     monkeypatch.setattr(per_node, "_step_preflight", _crash)

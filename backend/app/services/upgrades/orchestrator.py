@@ -751,7 +751,11 @@ async def _drive_loop(
             # can render a checklist; a ``fail`` aggregates to
             # ``state='failed'`` so a flaky cluster shape (CNPG
             # instance count, DS pods NotReady cluster-wide) doesn't
-            # silently report success.
+            # silently report success. The per-node chain already waited
+            # for the CNPG count after each node's uncordon, the last
+            # node's included (#1544, ``cluster_verify``); this single
+            # read re-confirms it after the chart bump rolled the
+            # control-plane Deployments.
             verify_results = await safety.verify_post_upgrade(
                 cnpg_cluster_name=cnpg_name,
                 cnpg_namespace=cnpg_namespace,

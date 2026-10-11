@@ -1756,11 +1756,18 @@ the formatter handles the rest.
   before the upgrade is left cordoned. When the run has no CNPG
   cluster (none configured and none detected), the maintenance-window
   clear at uncordon time is skipped instead of failing every node's
-  uncordon. The drain step
-  refuses to evict pods with no controller owner, honouring the
-  no-force rule (a bare pod would never be re-created). And the
-  chain verifies the upgraded node's Postgres instance actually
-  came back before moving to the next node.
+  uncordon. The drain step refuses to evict pods with no controller
+  owner, honouring the no-force rule (a bare pod would never be
+  re-created). And no node is drained while the CNPG cluster is short
+  an instance: after each node's uncordon, the chain waits (up to
+  15 minutes) for `readyInstances` to reach `spec.instances` before it
+  reports the node done, the last node included, and each node's
+  preflight waits for the same count before its cordon. The wait comes
+  after the uncordon on purpose: the node's own drain evicts its
+  Postgres instance, whose local-path volume pins it to that node, so
+  the count cannot recover while the node is cordoned. An earlier
+  version of this fix waited before the uncordon and timed out on the
+  first node holding an instance, which ended the run.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

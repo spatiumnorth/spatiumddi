@@ -277,7 +277,7 @@ async def test_the_node_chain_forwards_the_lease_holder_to_preflight(
 ) -> None:
     seen: list[Any] = []
 
-    async def _preflight(target_version: str, lease_holder: str | None = None) -> Any:
+    async def _preflight(target_version: str, lease_holder: str | None = None, **_k: Any) -> Any:
         seen.append(lease_holder)
         return per_node.StepResult(name="preflight", started_at="t").finish(True)
 
