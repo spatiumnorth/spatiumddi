@@ -37,7 +37,7 @@ class _GoogleAuthError(Exception):
 
 
 @pytest.fixture(autouse=True)
-def _stub_google_modules() -> Any:
+def _stub_google_modules(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Make the driver's lazy ``from google... import exceptions`` resolve.
 
     The driver imports ``google.api_core.exceptions`` +
@@ -56,8 +56,20 @@ def _stub_google_modules() -> Any:
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
             created.append(mod_name)
-    sys.modules["google.api_core.exceptions"].GoogleAPICallError = _GoogleAPICallError  # type: ignore[attr-defined]
-    sys.modules["google.auth.exceptions"].GoogleAuthError = _GoogleAuthError  # type: ignore[attr-defined]
+    # ``monkeypatch`` rather than a bare assignment: where the real SDK IS
+    # installed (the api image ships it), a bare assignment replaced the
+    # real module's base class for the rest of the session, so any later
+    # test raising a genuine ``google.api_core`` error escaped the driver's
+    # ``except`` clause.
+    monkeypatch.setattr(
+        sys.modules["google.api_core.exceptions"],
+        "GoogleAPICallError",
+        _GoogleAPICallError,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sys.modules["google.auth.exceptions"], "GoogleAuthError", _GoogleAuthError, raising=False
+    )
     yield
     for mod_name in created:
         sys.modules.pop(mod_name, None)
@@ -842,3 +854,94 @@ async def test_list_zone_records_splits_srv(monkeypatch: pytest.MonkeyPatch) -> 
             port=5060,
         )
     ]
+
+
+# ── #1537 — zone create / delete converge on retry ───────────────────────
+
+
+def _gcp_error(cls_name: str) -> Exception:
+    # The suite stubs ``google.api_core.exceptions``; subclass the stub base
+    # under the real class name — the driver matches on the name via the MRO.
+    return type(cls_name, (_GoogleAPICallError,), {})("boom")
+
+
+def _zone_raising(kind: str, op: str) -> Any:
+    class _Z(_StubZone):
+        pass
+
+    def _raise(self: Any) -> None:
+        raise _gcp_error(kind)
+
+    setattr(_Z, op, _raise)
+    return _Z
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create_conflict_with_matching_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = GoogleCloudDNSDriver()
+    existing = _StubZone("new-example", "new.example.")
+    zone_cls = _zone_raising("Conflict", "create")
+    client = SimpleNamespace(
+        list_zones=lambda: iter([existing]),
+        zone=lambda slug, dns_name=None: zone_cls(slug, dns_name or ""),
+    )
+    _patch_client(monkeypatch, driver, client)
+    await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="new.example."), "create")
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_create_conflict_without_matching_zone_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slug collision with a different domain is not "already exists"."""
+    driver = GoogleCloudDNSDriver()
+    zone_cls = _zone_raising("Conflict", "create")
+    client = SimpleNamespace(
+        list_zones=lambda: iter([_StubZone("new-example", "other.example.")]),
+        zone=lambda slug, dns_name=None: zone_cls(slug, dns_name or ""),
+    )
+    _patch_client(monkeypatch, driver, client)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="new.example."), "create")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Forbidden", "TooManyRequests", "InternalServerError"])
+async def test_apply_zone_create_other_errors_raise(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone_cls = _zone_raising(kind, "create")
+    client = SimpleNamespace(
+        list_zones=lambda: iter(()),
+        zone=lambda slug, dns_name=None: zone_cls(slug, dns_name or ""),
+    )
+    _patch_client(monkeypatch, driver, client)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="new.example."), "create")
+
+
+@pytest.mark.asyncio
+async def test_apply_zone_delete_notfound_at_delete_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone_cls = _zone_raising("NotFound", "delete")
+    client = _client_with_zones(zone_cls("gone-example", "gone.example."))
+    _patch_client(monkeypatch, driver, client)
+    await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="gone.example."), "delete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Forbidden", "TooManyRequests", "InternalServerError"])
+async def test_apply_zone_delete_other_errors_raise(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    driver = GoogleCloudDNSDriver()
+    zone_cls = _zone_raising(kind, "delete")
+    client = _client_with_zones(zone_cls("gone-example", "gone.example."))
+    _patch_client(monkeypatch, driver, client)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_server(), CREDS, SimpleNamespace(name="gone.example."), "delete")

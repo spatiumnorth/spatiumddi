@@ -246,6 +246,7 @@ async def test_the_chain_passes_the_stamp_time_to_the_health_gate(
     for name in (
         "preflight",
         "etcd_snapshot",
+        "stage",
         "cordon",
         "drain",
         "reboot",

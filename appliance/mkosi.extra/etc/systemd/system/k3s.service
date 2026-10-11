@@ -81,6 +81,13 @@ ExecStartPre=/bin/touch /var/lib/rancher/k3s/agent/images/.cache.json
 # appliance resumes no pulls. ``-``: a failure here never keeps k3s down;
 # firstboot's image check is the backstop.
 ExecStartPre=-/usr/local/bin/spatium-k3s-images clear-ingests
+# #1215 — k3s re-applies every manifest each time it starts, which put the
+# first-boot certificate back over the api's in spatium-appliance-tls.
+# firstboot skips that manifest once the Secret exists, but only once k3s is
+# up; this skips it before k3s starts on a seed that finished its first boot
+# on an earlier boot (a slot upgraded from a build without the marker).
+# ``-``: never keeps k3s down; the worst case is one more revert.
+ExecStartPre=-/usr/local/bin/spatium-tls-manifest-skip
 # ``server`` boots an all-in-one node (control plane + agent). Single
 # node — no joining a cluster. All other flags live in /etc/rancher/
 # k3s/config.yaml so they're operator-editable without touching the

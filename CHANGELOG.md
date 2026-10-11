@@ -140,6 +140,124 @@ the formatter handles the rest.
   - Not fixed here: Sentinel goes into TILT on a node loss and fails over
     only after 78–102 s (#1718), and a worker reconnects only after that.
 
+- **A rolling upgrade from an uploaded image no longer drains the
+  slot-image mirror before a node fetches from it (#1463).** On a
+  multi-node appliance an uploaded image reaches every node through the
+  slot-image mirror, one pod whose local volume pins it to one node. The
+  per-node chain cordoned and drained each node before telling it to
+  fetch, so the mirror's own node evicted its image source first: the
+  replacement could not schedule on the cordoned node, every download
+  answered 502, and the run failed there with the node cordoned and its
+  CNPG maintenance window open. The chain now stamps the node and waits
+  for the host to stage the new slot while the node is still in service,
+  and cordons, drains and reboots it only after that; a fetch that fails
+  leaves the node uncordoned and serving. Before a node is stamped the
+  run also waits, up to 10 minutes, for the mirror to have a Ready pod
+  again, since it comes back only once its own node is uncordoned after
+  the reboot; a mirror that never returns fails that node before it is
+  touched, under its own alert category. A cordon, switchover or drain
+  failure now happens with the new slot already staged and armed for the
+  node's next boot, and its alert hint says so. An upgrade from an
+  operator-supplied URL, or on a cluster with no mirror, is unchanged.
+  Also: the database connection is released before the node leaves
+  service, so the CNPG switchover the cordon triggers can no longer
+  leave the reboot step committing on a closed connection.
+
+- **Agentless DNS drivers treat an existing zone on create and a
+  missing zone on delete as done (#1537).** A zone push to several
+  agentless servers can fail partway; the DB rolls back but the servers
+  already done keep their change, so the retry used to fail on the first
+  server ("already exists" on create, "not found" on delete). Each
+  driver now accepts only the provider's own signal: Cloudflare error
+  1061 on create and an absent zone or HTTP 404 on delete; Azure DNS
+  creates with `If-None-Match: *` (412 means it exists, and an existing
+  zone's tags are no longer overwritten) and treats 404 on delete as
+  done; Google Cloud DNS accepts a 409 on create only when a managed zone
+  with that DNS name exists, and matches the delete 404 by exception
+  class rather than message text; Technitium accepts
+  `No such zone was found` on delete. Cloudflare returns 1061 also when
+  a *different* account holds the domain, so the create confirms the
+  zone with a lookup scoped to the configured `account_id`; the delete
+  lookup is scoped the same way, where it used to take whichever
+  same-named zone the token's accounts listed first. Windows DNS probed
+  with `SilentlyContinue`, so an access-denied probe read as "zone
+  absent" and a delete reported success; only Win32 9601 now means
+  absent. Authentication, throttling and server errors still fail in
+  every driver, and Route 53 still refuses to adopt a same-named zone it
+  did not create. DigitalOcean, Linode and Vultr do not yet converge
+  (Hetzner does on delete only).
+
+- **A failed multi-server zone push no longer rolls back a zone it did
+  not create (#1537).** The rollback after a partial failure (delete
+  what was created, re-create what was deleted) now skips any server
+  that was already in the requested state. Before, a create that found
+  the zone already on one server and then failed on another would
+  delete that zone, records and all; on Cloudflare and Azure that
+  removes a live zone. Such servers are named in the error as "Left as
+  found". A successful create that found the zone already on a provider
+  adopts it, and now says so: the servers are listed in the create's
+  audit entry and in a new `adopted_existing_on` field on the response
+  (zone create, create from template, and the move's audit entry), because
+  deleting the zone in SpatiumDDI later removes it from those servers too.
+
+- **A k3s start on the seed no longer puts the first-boot Web UI
+  certificate back (#1215).** firstboot hands the self-signed
+  certificate it mints on the seed's first boot to k3s as an
+  auto-deploy manifest, and k3s re-applies every such manifest each
+  time it starts. So every k3s start on the seed, a restart, a crash
+  or any reboot including a rolling upgrade's, wrote that certificate
+  back into `spatium-appliance-tls` over the one the api had deployed:
+  an uploaded, CSR-signed or ACME certificate. A frontend pod that
+  started afterwards served the first-boot certificate, which names
+  only the seed, and since #1282 the api's write-back rolled every
+  frontend pod a few minutes after each seed reboot. Once the Secret
+  exists, the seed now puts k3s's `.skip` marker beside the manifest,
+  which k3s honours by leaving both the Addon and the Secret untouched.
+  firstboot writes it on every boot; a new k3s.service `ExecStartPre`
+  writes it before k3s starts on a seed upgraded from a build without
+  it, and only when every sign says the Secret is already in the
+  datastore; and a cluster leave drops it, because the datastore it
+  starts k3s on is new. A marker found with no Secret behind it makes
+  firstboot create the Secret from the manifest.
+
+- **A selective restore works on an appliance, and one that fails
+  leaves the database as it was (#1693).** A restore with `sections`
+  emptied the selected sections' FK-cascade closure in one transaction,
+  which committed, and loaded the archive's rows in a second with
+  `pg_restore --data-only --disable-triggers`. That flag emits
+  `ALTER TABLE … DISABLE TRIGGER ALL`, which PostgreSQL refuses to a
+  non-superuser on any table with a foreign key, and an appliance
+  connects as the app role, which is not one. So every selective
+  restore on an appliance answered 400 after emptying the closure
+  (71 tables for `ipam`), `alembic_version` among them: the api stayed
+  not ready and the UI that could undo it answered 502. CI never saw
+  it, because its Postgres connects as a superuser. The emptying and
+  the load now run in one transaction, through the same streamed psql
+  replay the full restore uses, so a failure of any kind rolls the
+  emptying back. The closure's foreign keys are dropped for the load
+  and added back from their own definitions before it commits, which
+  needs only ownership and checks every row loaded. Two behaviour
+  changes: an archive whose rows point at something deleted since the
+  backup, outside the restored sections, is now refused with the
+  constraint named (a superuser used to load them pointing at nothing),
+  and a selective restore holds every table's lock for the length of
+  its load, as the full restore does (#1648). A restore whose
+  `TRUNCATE … CASCADE` would reach a table outside the closure (a
+  foreign key a migration created and no model declares) is refused
+  too, instead of emptying a table it never reloads.
+
+- **A selective restore no longer restarts the sequences of the tables
+  it reloads (#1720).** `TRUNCATE … RESTART IDENTITY` sent every
+  sequence the closure owns back to its start, and
+  `pg_restore --data-only --table` reloads rows, not sequences. After a
+  restore of `audit`, every audited write, logins included, answered
+  409 on a duplicate `audit_log.seq` until as many had failed as the
+  restored log had rows; after a restore of `dns`, every DHCP log post
+  failed the same way on `dhcp_log_entry`. Each sequence a reloaded
+  table owns is now set past the largest value its column holds, in
+  the restore's one transaction. As after a full restore, values that
+  rows written after the backup had held can be handed out again.
+
 - **The DNS agent bundle render streams a blocklist instead of holding
   it whole (#1662).** The render of a server whose group carries a
   blocklist built every entry as a row, an `EffectiveEntry` and a dict,

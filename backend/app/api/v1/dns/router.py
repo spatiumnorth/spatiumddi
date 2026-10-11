@@ -1331,6 +1331,11 @@ class ZoneResponse(BaseModel):
     # where NULL means UNKNOWN and never ``ok``.
     name_scope: str | None = None
     name_scope_detail: ZoneNameScopeDetail | None = None
+    # #1537 — on a create, the agentless servers that ALREADY held a zone of
+    # this name, which SpatiumDDI adopted rather than created. Set only by
+    # the create handlers; empty everywhere else. A later delete removes the
+    # zone from those servers too, so the operator should know it was found.
+    adopted_existing_on: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -4605,7 +4610,7 @@ async def create_zone(
     # want an orphan DB row claiming a zone the authoritative server has
     # never heard of. BIND9 zones still get applied via the agent's next
     # ConfigBundle poll — that's a separate path and untouched here.
-    await _push_zone_to_agentless_servers(db, zone, "create")
+    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
 
     # ... and the sign op itself (#811). BIND9 signs inline from the config
     # bundle and ignores this; PowerDNS + Technitium sign only in response
@@ -4625,13 +4630,16 @@ async def create_zone(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=zone.name,
+            new_value={"adopted_existing_on": adopted_on} if adopted_on else None,
             result="success",
         )
     )
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(zone)
-    return await _zone_out(db, zone)
+    out = await _zone_out(db, zone)
+    out.adopted_existing_on = list(adopted_on or [])
+    return out
 
 
 @router.get(
@@ -6482,7 +6490,7 @@ async def move_zone_commit(
     # fail leaves the zone existing in both places (visible, fixable) where
     # delete-then-fail would have removed it from the old server with the
     # database still saying it lives there.
-    await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
+    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
     await _push_zone_to_agentless_servers(db, zone, "delete", group_id=source_group_id)
 
     db.add(
@@ -6506,6 +6514,7 @@ async def move_zone_commit(
                 "pools_repointed": plan.pools_repointed,
                 "dnssec_signed": plan.dnssec_signed,
                 "acknowledgements": sorted(body.acknowledgements),
+                "adopted_existing_on": adopted_on,
             },
             result="success",
         )
@@ -6650,7 +6659,7 @@ async def create_zone_from_template(
         kind=body.kind,
     )
     db.add(zone)
-    await _push_zone_to_agentless_servers(db, zone, "create")
+    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
     await db.flush()
 
     record_payloads = materialize(template, body.zone_name, body.params)
@@ -6710,13 +6719,16 @@ async def create_zone_from_template(
             new_value={
                 "from_template": template.id,
                 "records_created": len(created_records),
+                "adopted_existing_on": adopted_on,
             },
             result="success",
         )
     )
     await db.commit()
     await db.refresh(zone)
-    return await _zone_out(db, zone)
+    out = await _zone_out(db, zone)
+    out.adopted_existing_on = list(adopted_on or [])
+    return out
 
 
 # ── Zone delegation wizard ──────────────────────────────────────────────────
@@ -6839,8 +6851,14 @@ async def apply_delegation(
 
 async def _push_zone_to_agentless_servers(
     db: DB, zone: DNSZone, op: str, group_id: uuid.UUID | None = None
-) -> None:
+) -> list[str]:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    Returns the names of the servers that were already in the requested
+    state (#1537): on a create, the servers that already held a zone of
+    this name, which SpatiumDDI has now adopted. The create handlers record
+    that in the audit entry and the response, because a later delete removes
+    the zone from those servers too.
 
     "Agentless" means ``windows_dns`` (WinRM Path B), the cloud DNS drivers
     (issue #37) and ``technitium_api`` (issue #810) — every driver in
@@ -6889,7 +6907,7 @@ async def _push_zone_to_agentless_servers(
     )
     targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
     if not targets:
-        return
+        return []
 
     # On delete, cloud providers that must empty a zone before deleting
     # it scope that emptying to the records SpatiumDDI manages — the
@@ -6904,7 +6922,14 @@ async def _push_zone_to_agentless_servers(
     if op == "delete":
         managed_records = await _managed_zone_records(db, zone)
 
-    async def _apply(server: DNSServer, driver: Any, this_op: str) -> None:
+    async def _apply(server: DNSServer, driver: Any, this_op: str) -> bool:
+        """Apply ``this_op``; True when the server was changed.
+
+        False means the driver found the server already in the requested
+        state (#1537): the zone already existed on create, or was already
+        gone on delete. A driver that does not report it (returns None)
+        counts as changed — the pre-#1537 assumption.
+        """
         if isinstance(driver, CloudDNSDriverBase):
             # The compensating delete of a rolled-back create needs the
             # same scoping as a real delete, or a cloud driver would empty
@@ -6912,13 +6937,20 @@ async def _push_zone_to_agentless_servers(
             records = managed_records
             if this_op == "delete" and records is None:
                 records = await _managed_zone_records(db, zone)
-            await driver.apply_zone_change(server, zone, this_op, managed_records=records)
+            result = await driver.apply_zone_change(server, zone, this_op, managed_records=records)
         else:
-            await driver.apply_zone_change(server, zone, this_op)
+            result = await driver.apply_zone_change(server, zone, this_op)
+        return result is not False
 
     errors: list[str] = []
     failed_drivers: set[str] = set()
     succeeded: list[DNSServer] = []
+    # Servers that were already in the requested state: the op succeeded
+    # there without changing anything, so there is nothing to roll back.
+    # Compensating them would delete a zone this request did not create
+    # (records and all — a pre-existing zone the create merely found), or
+    # re-create one that was already gone before the delete (#1537).
+    unchanged: list[DNSServer] = []
     # A CloudDNSConflictError is recorded like any other failure rather
     # than raised from inside the loop: raising here would skip the
     # compensation below, leaving servers that already took the change
@@ -6930,8 +6962,7 @@ async def _push_zone_to_agentless_servers(
         if not hasattr(driver, "apply_zone_change"):
             continue
         try:
-            await _apply(server, driver, op)
-            succeeded.append(server)
+            changed = await _apply(server, driver, op)
         except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
             if isinstance(exc, CloudDNSConflictError):
                 # The provider already holds a zone/record this op would
@@ -6948,9 +6979,17 @@ async def _push_zone_to_agentless_servers(
                 op=op,
                 error=_exc_text(exc),
             )
+            continue
+        (succeeded if changed else unchanged).append(server)
 
     if not errors:
-        return
+        if unchanged and op == "create":
+            logger.info(
+                "dns.zone.adopted_existing",
+                zone=zone.name,
+                servers=[s.name for s in unchanged],
+            )
+        return [s.name for s in unchanged]
 
     from app.services.dns.pull_from_server import (  # noqa: PLC0415
         restore_zone_records_to_server,
@@ -7007,6 +7046,12 @@ async def _push_zone_to_agentless_servers(
     )
     if compensated:
         detail += f" Rolled back on: {', '.join(compensated)}."
+    if unchanged:
+        state = "already held" if op == "create" else "already lacked"
+        detail += (
+            f" Left as found on: {', '.join(s.name for s in unchanged)} "
+            f"(those servers {state} the zone before this request)."
+        )
     if records_unrestored:
         detail += (
             f" Zone re-created on {'; '.join(records_unrestored)}, but its records "
