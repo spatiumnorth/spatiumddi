@@ -95,6 +95,7 @@ from app.services.appliance.group_names import (
     group_name_problem,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns import dnssec_signers
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -1296,6 +1297,9 @@ class ZoneResponse(BaseModel):
     linked_subnet_id: uuid.UUID | None
     domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
+    # #1762 — True when the zone is signed on a group with >1 enabled server
+    # (each signs with its own keys). Derived in ``_zones_out``; never stored.
+    dnssec_multi_signer: bool = False
     auto_tls_probe: bool = False
     dnssec_policy_id: uuid.UUID | None = None
     dynamic_update_enabled: bool = False
@@ -1356,11 +1360,15 @@ async def _zones_out(db: DB, zones: Sequence[DNSZone]) -> list[ZoneResponse]:
     if not zones:
         return []
     registry = await effective_registry(db)
+    multi = await dnssec_signers.multi_signer_group_ids(
+        db, {z.group_id for z in zones if z.dnssec_enabled}
+    )
     out: list[ZoneResponse] = []
     for z in zones:
         scope = classify_zone_name(z.name, tlds=registry.tlds)
         row = ZoneResponse.model_validate(z)
         row.name_scope = scope.scope
+        row.dnssec_multi_signer = bool(z.dnssec_enabled) and z.group_id in multi
         row.name_scope_detail = ZoneNameScopeDetail(
             scope=scope.scope,
             reason=scope.reason,
@@ -1996,6 +2004,8 @@ async def create_server(
         )
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    if body.is_enabled:
+        await _refuse_second_signer(db, group)
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
@@ -2074,6 +2084,21 @@ async def create_server(
     return ServerResponse.from_model(server)
 
 
+async def _refuse_second_signer(
+    db: DB, group: DNSServerGroup, *, exclude: uuid.UUID | None = None
+) -> None:
+    """#1762 — 422 when an enabled server joining ``group`` would be a second
+    independent DNSSEC signer for zones that are already signed there."""
+    if await dnssec_signers.enabled_server_count(db, group.id, exclude_server_id=exclude) < 1:
+        return
+    signed = await dnssec_signers.signed_zone_count(db, group.id)
+    if signed:
+        raise HTTPException(
+            status_code=422,
+            detail=dnssec_signers.add_server_refusal_message(group.name, signed),
+        )
+
+
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
     group_id: uuid.UUID,
@@ -2083,6 +2108,16 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
+    # #1762 — re-enabling a server in a group that already has an enabled
+    # one makes it a second independent signer.
+    if (
+        body.is_enabled
+        and not server.is_enabled
+        and (body.group_id is None or body.group_id == server.group_id)
+    ):
+        await _refuse_second_signer(
+            db, await _require_group(server.group_id, db), exclude=server.id
+        )
     # #1540 — a driver change on update is the other path that used to
     # manufacture a mixed group. Enforce single-driver against the OTHER
     # members of the group the server stays in. When the same request
@@ -8634,6 +8669,17 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
     if not drivers:
         return
     incompatible = drivers - allowed
+    if not incompatible and op == "dnssec_sign":
+        # #1762 — every engine signs per server with its own keys.
+        n_signers = await dnssec_signers.enabled_server_count(db, group_id)
+        if n_signers > 1:
+            group = await db.get(DNSServerGroup, group_id)
+            raise HTTPException(
+                status_code=422,
+                detail=dnssec_signers.sign_refusal_message(
+                    repr(group.name) if group else group_id, n_signers
+                ),
+            )
     if incompatible:
         raise HTTPException(
             status_code=422,

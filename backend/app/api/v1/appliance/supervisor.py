@@ -4387,6 +4387,22 @@ async def update_appliance_roles(
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
             own_dns = await _appliance_own_dns_servers(db, row)
+            if not own_dns and "dns" in " ".join(row.assigned_roles or []):
+                # #1762 — no server row yet: it will register into this group
+                # as a new signer, so apply the same refusal a move gets.
+                from app.services.dns.dnssec_signers import (
+                    add_server_refusal_message,
+                    enabled_server_count,
+                    signed_zone_count,
+                )
+
+                if await enabled_server_count(db, dns_group.id) >= 1:
+                    n_signed = await signed_zone_count(db, dns_group.id)
+                    if n_signed:
+                        raise HTTPException(
+                            status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            add_server_refusal_message(dns_group.name, n_signed),
+                        )
             if any(srv.group_id != dns_group.id for srv in own_dns):
                 # #1715 — the appliance's own dead row of a previous engine
                 # would block the move on name and driver; retire it first.

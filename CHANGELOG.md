@@ -84,6 +84,7 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each server signs with its own keys, so a signed zone on a group with two enabled servers served mismatched DNSKEYs against the published DS. Signing (sign endpoint, `dnssec_enabled` on create/update, the Copilot tool) now 422s when the group has more than one enabled server on every engine, and adding, re-enabling or moving an enabled server into a group with signed zones (including a Fleet group change) is refused. Already-signed multi-server zones are left alone and flagged `dnssec_multi_signer` in the zone response. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group (same-named zones in different groups no longer collide) and ignores non-primary reporters on multi-server groups, ending last-writer-wins DS flapping.
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

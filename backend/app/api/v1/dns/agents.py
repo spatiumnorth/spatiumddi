@@ -74,6 +74,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
+from app.services.dns.dnssec_signers import enabled_server_count
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
@@ -1193,11 +1194,20 @@ async def agent_dnssec_state(
     Unknown zone names are silently skipped (deleted between sign
     and report) — same fail-soft semantic as ``/zone-state``.
     """
-    _, _ = auth
+    reporter, _ = auth
     now = datetime.now(UTC)
     updated = 0
 
     if not body.zones:
+        return {"updated": 0}
+
+    # #1762 — on a group with several enabled servers each signs with its own
+    # keys, so their DS/key reports disagree and the last writer used to win,
+    # flapping the DS the UI shows. Only the group's primary is authoritative
+    # (the DS an operator publishes comes from one server); ignore the rest.
+    # Multi-signer groups are refused for new signing, so this only governs
+    # zones signed before that rule.
+    if not reporter.is_primary and await enabled_server_count(db, reporter.group_id) > 1:
         return {"updated": 0}
 
     # DNSZone.name is stored *with* the trailing dot in the DB
@@ -1213,7 +1223,9 @@ async def agent_dnssec_state(
         name_set.add(n.rstrip("."))
         if not n.endswith("."):
             name_set.add(n + ".")
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(name_set)))
+    res = await db.execute(
+        select(DNSZone).where(DNSZone.name.in_(name_set), DNSZone.group_id == reporter.group_id)
+    )
     zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
 
     for entry in body.zones:
