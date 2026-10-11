@@ -109,7 +109,11 @@ the formatter handles the rest.
   serve** for records the Technitium importer created: their dot-less
   targets are made absolute, so `www CNAME web.example.net` is served as
   `web.example.net.` as it was on Technitium, instead of the wrong
-  `web.example.net.<zone>.`. Check imported zones you have since moved.
+  `web.example.net.<zone>.`. The migration queues the record update
+  that takes the corrected answer to the BIND9 or PowerDNS servers,
+  since a changed row alone never reaches them. A record whose value
+  you have edited since the import is left as you typed it. Check
+  imported zones you have since moved.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
@@ -2937,8 +2941,13 @@ the formatter handles the rest.
   does not re-point them. Rows the Technitium importer stamped
   (`import_source = 'technitium'`) are made absolute in every group,
   single labels included, which **changes what BIND9 and PowerDNS
-  groups serve** for them. Bumps `bundle_dirty_seq` on affected
-  servers and rewrites queued record ops. Downgrade is a no-op.
+  groups serve** for them, except rows whose value was edited after the
+  import (an `update` audit row naming `value`). Bumps
+  `bundle_dirty_seq` on affected servers, rewrites queued record ops
+  (matched to their row by `record_id`), and for the BIND9 / PowerDNS
+  rows queues a whole-RRset update op per agent server and bumps the
+  zone serial. Agentless groups other than `technitium_api` get the row
+  change and no push. Downgrade is a no-op.
 
 ## 2026.10.02-1 — 2026-10-02
 

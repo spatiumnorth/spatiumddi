@@ -74,6 +74,9 @@ def test_the_target_rewrite_rules() -> None:
     assert f("NAPTR", '100 10 "" "" "!^.*$!x!" .', single_label=True) == (
         '100 10 "" "" "!^.*$!x!" .'
     )
+    # a NAPTR missing its replacement: the regexp is not a name
+    no_repl = '100 10 "U" "E2U+sip" "!^.*$!sip:info@example.net!"'
+    assert f("NAPTR", no_repl, single_label=True) == no_repl
 
 
 async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> None:
@@ -135,16 +138,58 @@ async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> Non
         "b_other_import": rec("b", "CNAME", "web.sub", import_source="bind9"),
         # an imported single label in a Technitium group was absolute as well
         "t_imp_single": rec("t", "CNAME", "localhost", import_source="technitium"),
+        # imported, then the VALUE edited by an operator: theirs now. In a
+        # BIND9 group it keeps the meaning they typed; in a Technitium group
+        # it takes the multi-label rule like any other row.
+        "b_imp_edited": rec("b", "CNAME", "web.sub", name="edited", import_source="technitium"),
+        "t_imp_edited": rec("t", "CNAME", "web", name="edited", import_source="technitium"),
+        # imported, then only the TTL edited: still the importer's value
+        "b_imp_ttl": rec("b", "PTR", "host.example.net", name="ttl", import_source="technitium"),
+        # imported into a BIND9 group, but in the trash: rewritten, not pushed
+        "b_imp_trashed": rec("b", "NS", "ns9.example.net", name="gone", import_source="technitium"),
     }
     await session.flush()
     ids = {k: r.id for k, r in rows.items()}
+    await conn.execute(
+        sa.text("UPDATE dns_record SET deleted_at = now() WHERE id = :i"),
+        {"i": ids["b_imp_trashed"]},
+    )
+    for key, fields in (
+        ("b_imp_edited", ["value"]),
+        ("t_imp_edited", ["ttl", "value"]),
+        ("b_imp_ttl", ["ttl"]),
+    ):
+        await conn.execute(
+            sa.text(
+                "INSERT INTO audit_log (id, user_display_name, auth_source, action, "
+                "resource_type, resource_id, resource_display, changed_fields, result, row_hash) "
+                "VALUES (:id, 'op', 'local', 'update', 'dns_record', :rid, 'x', "
+                "CAST(:f AS jsonb), 'success', repeat('0', 64))"
+            ),
+            {"id": uuid.uuid4(), "rid": str(ids[key]), "f": json.dumps(fields)},
+        )
+    zserial = zones["b"].last_serial
     bseq = servers["b"].bundle_dirty_seq
     tseq = servers["t"].bundle_dirty_seq
 
     # queued ops: a Technitium-group one, and a BIND9 one for an imported row
-    async def queue(server: str, zone: str, name: str, rtype: str, value: str) -> uuid.UUID:
+    async def queue(
+        server: str,
+        zone: str,
+        name: str,
+        rtype: str,
+        value: str,
+        record_id: uuid.UUID | None = None,
+        members: list[str] | None = None,
+    ) -> uuid.UUID:
         oid = uuid.uuid4()
-        member = {"value": value, "priority": None}
+        payload: dict = {"name": name, "type": rtype, "value": value}
+        if record_id is not None:
+            payload["record_id"] = str(record_id)
+        payload["rrset"] = {
+            "ttl": None,
+            "members": [{"value": v, "priority": None} for v in (members or [value])],
+        }
         await conn.execute(
             sa.text(
                 "INSERT INTO dns_record_op (id, server_id, zone_name, op, record, state, attempts) "
@@ -154,14 +199,7 @@ async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> Non
                 "id": oid,
                 "s": servers[server].id,
                 "z": zones[zone].name.rstrip("."),
-                "r": json.dumps(
-                    {
-                        "name": name,
-                        "type": rtype,
-                        "value": value,
-                        "rrset": {"ttl": None, "members": [member]},
-                    }
-                ),
+                "r": json.dumps(payload),
             },
         )
         return oid
@@ -169,6 +207,14 @@ async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> Non
     t_op = await queue("t", "t", "x", "CNAME", "web.example.net")
     b_imp_op = await queue("b", "b", "x", "CNAME", "web.example.net")
     b_hand_op = await queue("b", "b", "x", "CNAME", "web.sub")
+    # an OLDER op for an imported row, holding a value the row no longer
+    # has: matched by record_id, so its own value is fixed, not replaced
+    b_old_op = await queue("b", "b", "x", "CNAME", "old.example.net", record_id=ids["b_imp_multi"])
+    # an op for the edited row, which shares no content with the imported one
+    b_edited_op = await queue("b", "b", "edited", "CNAME", "web.sub", record_id=ids["b_imp_edited"])
+    before = {
+        r[0] for r in (await conn.execute(sa.text("SELECT id FROM dns_record_op"))).fetchall()
+    }
 
     await conn.run_sync(_up)
 
@@ -197,6 +243,10 @@ async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> Non
         "b_imp_mx": "mail.example.net.",
         "b_other_import": "web.sub",
         "t_imp_single": "localhost.",
+        "b_imp_edited": "web.sub",
+        "t_imp_edited": "web",
+        "b_imp_ttl": "host.example.net.",
+        "b_imp_trashed": "ns9.example.net.",
     }
 
     async def op_record(oid: uuid.UUID) -> dict:
@@ -209,6 +259,40 @@ async def test_technitium_groups_and_imported_rows(conn: AsyncConnection) -> Non
         assert r["value"] == want
         assert r["rrset"]["members"][0]["value"] == want
     assert (await op_record(b_hand_op))["value"] == "web.sub"
+    assert (await op_record(b_old_op))["value"] == "old.example.net."
+    assert (await op_record(b_edited_op))["value"] == "web.sub"
+
+    # The BIND9 group's re-pointed RRsets are pushed: records are not
+    # structural there, so without an op the daemon keeps the old answer.
+    new_ops = (
+        await conn.execute(
+            sa.text(
+                "SELECT server_id, zone_name, op, record, target_serial, state "
+                "FROM dns_record_op WHERE NOT (id = ANY(:b))"
+            ),
+            {"b": list(before)},
+        )
+    ).fetchall()
+    assert {o.server_id for o in new_ops} == {servers["b"].id}
+    assert all(o.op == "update" and o.state == "pending" for o in new_ops)
+    by_rrset = {(o.record["name"], o.record["type"]): o for o in new_ops}
+    # one op per re-pointed live RRset; the trashed row is not pushed, the
+    # edited and hand-made rows' RRsets are not re-pointed on their own
+    assert set(by_rrset) == {("x", "CNAME"), ("x", "MX"), ("ttl", "PTR")}
+    cname = by_rrset[("x", "CNAME")].record
+    # every live member of the RRset, the twin "web.sub" rows once
+    assert sorted(m["value"] for m in cname["rrset"]["members"]) == [
+        "localhost.",
+        "web.example.net.",
+        "web.sub",
+    ]
+    mx = by_rrset[("x", "MX")].record
+    assert mx["rrset"]["members"] == [{"value": "mail.example.net.", "priority": 5}]
+    assert mx["record_id"] == str(ids["b_imp_mx"]) and mx["value"] == "mail.example.net."
+    await session.refresh(zones["b"])
+    assert zones["b"].last_serial > zserial
+    assert {o.target_serial for o in new_ops} == {zones["b"].last_serial}
+    assert all(o.zone_name == zones["b"].name for o in new_ops)
 
     # the stored bundles of both groups' agents are stale; the agentless
     # group's server has none to mark
