@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
+from app.drivers.dns._txt import quote_txt
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
 from app.services.dns.record_ops import resolve_primary_server
@@ -175,6 +176,11 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     * Everything else: stripped + lowercased (fine for A/AAAA/IP literals
       where case doesn't matter either).
     """
+    if rtype == "TXT":
+        # #1760: a stored value may be bare (``v=spf1 -all``) or quoted, and
+        # the wire gives the quoted form. One canonical presentation form,
+        # case kept: TXT content is case-sensitive (DKIM keys, tokens).
+        return quote_txt((value or "").strip())
     v = (value or "").strip().lower()
     if rtype in ("A", "AAAA"):
         # Canonical form (#1513): an expanded/upper-case address as

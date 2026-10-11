@@ -161,6 +161,13 @@ def txt_strings(value: str) -> list[bytes]:
     return [chunk for string in strings for chunk in _chunk_octets(string)]
 
 
+def quote_strings(strings: list[bytes]) -> str:
+    """Render character-strings (octets) as RFC 1035 presentation form:
+    the inverse of ``txt_strings`` for a value already split into strings
+    (a server's read-back, #1760)."""
+    return " ".join(f'"{_escape_octets(c)}"' for c in strings)
+
+
 def quote_txt(value: str) -> str:
     """Render a stored TXT value as RFC 1035 presentation form.
 

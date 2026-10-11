@@ -50,6 +50,8 @@ import ipaddress
 import shlex
 from typing import Any
 
+from app.drivers.dns._txt import quote_strings, quote_txt, txt_strings
+
 # Record types both directions model. Technitium-proprietary types
 # (ANAME / APP / FWD) are deliberately absent: they are not drop-in
 # equivalents of PowerDNS's ALIAS/LUA and need their own design pass.
@@ -540,7 +542,20 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
     if rtype == "PTR":
         return str(rdata.get("ptrName") or ""), extra
     if rtype == "TXT":
-        return str(rdata.get("text") or ""), extra
+        # characterStringsBase64 is the record exactly (#1760, as the agent
+        # driver reads it, #1694): ``text`` joins the strings and drops a
+        # string boundary. Rendered as presentation form so the stored
+        # value round-trips through ``record_params``.
+        encoded = rdata.get("characterStringsBase64")
+        if isinstance(encoded, list) and encoded:
+            try:
+                strings = [base64.b64decode(str(e), validate=True) for e in encoded]
+            except (ValueError, binascii.Error):
+                strings = None
+            if strings is not None:
+                return quote_strings(strings), extra
+        text = str(rdata.get("text") or "")
+        return (quote_txt(text) if text else ""), extra
     if rtype == "MX":
         extra["priority"] = int_or(rdata.get("preference"), 10)
         return str(rdata.get("exchange") or ""), extra
@@ -613,6 +628,24 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
 # ── Write direction: stored value → Technitium add/delete params ───────
 
 
+def _txt_params(value: str) -> dict[str, Any]:
+    """TXT as ``characterStringsBase64`` (octet-exact, comma-separated).
+
+    Technitium cannot hold an empty character-string, so empties are left
+    out, as the agent driver does; a value of only empty strings goes as
+    ``text``.
+    """
+    strings = [s for s in txt_strings(value) if s]
+    if not strings:
+        if not value:
+            return {"text": ""}
+        raw = value.encode("utf-8")
+        strings = [raw[i : i + 255] for i in range(0, len(raw), 255)]
+    return {
+        "characterStringsBase64": ",".join(base64.b64encode(s).decode("ascii") for s in strings)
+    }
+
+
 def record_params(
     rtype: str,
     value: str,
@@ -641,6 +674,10 @@ def record_params(
         # ``false`` meaning none (AliasMode / a param-less record).
         prio, target, params = svcb_params(value, origin)
         return {"svcPriority": prio, "svcTargetName": target, "svcParams": params}
+    if rtype == "TXT":
+        # Text, not a name: it keeps a trailing full stop and its quotes are
+        # presentation syntax, not content (#1760). Before the rstrip below.
+        return _txt_params(value)
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
         return {"ipAddress": canonical_ip(value)}
@@ -661,8 +698,6 @@ def record_params(
             "weight": 0 if weight is None else weight,
             "port": 0 if port is None else port,
         }
-    if rtype == "TXT":
-        return {"text": value}
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)
