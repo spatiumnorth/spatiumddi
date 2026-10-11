@@ -121,6 +121,64 @@ the formatter handles the rest.
   (zone create, create from template, and the move's audit entry), because
   deleting the zone in SpatiumDDI later removes it from those servers too.
 
+- **A k3s start on the seed no longer puts the first-boot Web UI
+  certificate back (#1215).** firstboot hands the self-signed
+  certificate it mints on the seed's first boot to k3s as an
+  auto-deploy manifest, and k3s re-applies every such manifest each
+  time it starts. So every k3s start on the seed, a restart, a crash
+  or any reboot including a rolling upgrade's, wrote that certificate
+  back into `spatium-appliance-tls` over the one the api had deployed:
+  an uploaded, CSR-signed or ACME certificate. A frontend pod that
+  started afterwards served the first-boot certificate, which names
+  only the seed, and since #1282 the api's write-back rolled every
+  frontend pod a few minutes after each seed reboot. Once the Secret
+  exists, the seed now puts k3s's `.skip` marker beside the manifest,
+  which k3s honours by leaving both the Addon and the Secret untouched.
+  firstboot writes it on every boot; a new k3s.service `ExecStartPre`
+  writes it before k3s starts on a seed upgraded from a build without
+  it, and only when every sign says the Secret is already in the
+  datastore; and a cluster leave drops it, because the datastore it
+  starts k3s on is new. A marker found with no Secret behind it makes
+  firstboot create the Secret from the manifest.
+
+- **A selective restore works on an appliance, and one that fails
+  leaves the database as it was (#1693).** A restore with `sections`
+  emptied the selected sections' FK-cascade closure in one transaction,
+  which committed, and loaded the archive's rows in a second with
+  `pg_restore --data-only --disable-triggers`. That flag emits
+  `ALTER TABLE … DISABLE TRIGGER ALL`, which PostgreSQL refuses to a
+  non-superuser on any table with a foreign key, and an appliance
+  connects as the app role, which is not one. So every selective
+  restore on an appliance answered 400 after emptying the closure
+  (71 tables for `ipam`), `alembic_version` among them: the api stayed
+  not ready and the UI that could undo it answered 502. CI never saw
+  it, because its Postgres connects as a superuser. The emptying and
+  the load now run in one transaction, through the same streamed psql
+  replay the full restore uses, so a failure of any kind rolls the
+  emptying back. The closure's foreign keys are dropped for the load
+  and added back from their own definitions before it commits, which
+  needs only ownership and checks every row loaded. Two behaviour
+  changes: an archive whose rows point at something deleted since the
+  backup, outside the restored sections, is now refused with the
+  constraint named (a superuser used to load them pointing at nothing),
+  and a selective restore holds every table's lock for the length of
+  its load, as the full restore does (#1648). A restore whose
+  `TRUNCATE … CASCADE` would reach a table outside the closure (a
+  foreign key a migration created and no model declares) is refused
+  too, instead of emptying a table it never reloads.
+
+- **A selective restore no longer restarts the sequences of the tables
+  it reloads (#1720).** `TRUNCATE … RESTART IDENTITY` sent every
+  sequence the closure owns back to its start, and
+  `pg_restore --data-only --table` reloads rows, not sequences. After a
+  restore of `audit`, every audited write, logins included, answered
+  409 on a duplicate `audit_log.seq` until as many had failed as the
+  restored log had rows; after a restore of `dns`, every DHCP log post
+  failed the same way on `dhcp_log_entry`. Each sequence a reloaded
+  table owns is now set past the largest value its column holds, in
+  the restore's one transaction. As after a full restore, values that
+  rows written after the backup had held can be handed out again.
+
 - **The DNS agent bundle render streams a blocklist instead of holding
   it whole (#1662).** The render of a server whose group carries a
   blocklist built every entry as a row, an `EffectiveEntry` and a dict,
