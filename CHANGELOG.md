@@ -109,6 +109,28 @@ the formatter handles the rest.
   that kept it (five down to three) still carries them until they are
   removed by hand.
 
+  Two follow-ups from the three-node drills. **A demote now scales the
+  control plane down.** The seed treated the demote's eviction as a
+  Replace and armed #1059's size hold on it, and neither of the hold's
+  releases can fire after a demote, so a cluster demoted to one node
+  kept three Postgres instances and three api / frontend / worker /
+  redis replicas, with their pods Pending on the lone seed. The row now
+  carries `evict_after_demote`; the seed holds the size only for a
+  Replace, and for a demote lets the scale-down past CloudNativePG's
+  readiness deferral, which would otherwise have held it too (the
+  departed nodes' instances never report ready again). It never asks for
+  fewer instances than are ready, so it cannot make CloudNativePG remove
+  a healthy one. **A demote is refused (409) while a control-plane member
+  is unhealthy** — a heartbeat older than 90 s, or a k8s Node that is
+  NotReady or absent — naming the member, unless that member is itself
+  being demoted and a majority of the voters stays live at every step of
+  the leave. A leave's removal goes to the leaver's own etcd, a follower
+  whose view of its peers can be minutes stale: with one member powered
+  off and both demoted, it accepted its own removal and left the seed one
+  live voter of two. The check narrows that window, it does not close
+  it: a member that dies within the 40–50 s before its Node turns NotReady,
+  or during the leave itself, is not seen.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
@@ -2512,6 +2534,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e3a81c5d07f2` — #1541: `appliance.evict_after_demote`, a boolean,
+  NOT NULL, default false. No backfill: every eviction an older build
+  stamped was a Replace, which is what false means. Downgrade drops the
+  column.
 - `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not
