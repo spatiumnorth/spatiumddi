@@ -1,8 +1,8 @@
 """SCP / SFTP backup destination (issue #117 Phase 1d).
 
 Writes archives to a remote host via SSH. Authentication is
-either password or private-key (ED25519 / ECDSA / RSA / DSS —
-whatever paramiko supports). Both creds are Fernet-wrapped at
+either password or private-key (ED25519 / ECDSA / RSA; not DSA,
+which paramiko 4.0 removed — #1692). Both creds are Fernet-wrapped at
 rest via :mod:`secrets_config` because they're declared
 ``secret=True`` in the config-fields spec.
 
@@ -139,7 +139,7 @@ class ScpDestination(BackupDestination):
             required=False,
             secret=True,
             description=(
-                "ED25519 / ECDSA / RSA / DSS. Paste the entire "
+                "ED25519 / ECDSA / RSA. Paste the entire "
                 "PEM-encoded key including BEGIN / END lines."
             ),
         ),
@@ -442,33 +442,28 @@ class ScpDestination(BackupDestination):
 def _load_supplied_host_keys(client, known: str) -> None:
     """Load operator-supplied known_hosts lines into the client's
     host-key store. Malformed lines are skipped, as before.
-    """
-    import paramiko  # noqa: PLC0415
 
+    A line whose key this driver cannot decode (``ssh-dss`` since
+    paramiko 4.0, a FIDO ``sk-*`` key, bad base64) is skipped BEFORE it
+    reaches the store. It used to be added with a ``None`` key, and
+    paramiko's ``HostKeys.add`` / ``lookup`` call ``e.key.get_name()``
+    on every entry for that host — so a valid pin on a later line for
+    the same host raised, was skipped too, and the server was refused
+    as "not found in known_hosts" with the right key pinned (#1692).
+    """
     for line in known.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             parts = line.split()
-            # paramiko's add_host_keys consumes a file path,
-            # so we feed lines manually via load_host_keys's
-            # internals.
             if len(parts) < 3:
                 continue
             hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
-            key_obj = paramiko.RSAKey if keytype == "ssh-rsa" else None
-            if not key_obj:
-                # Try the generic loader for non-RSA types.
-                # paramiko's HostKeys handles parsing better
-                # than a hand-rolled mapping.
-                host_keys = paramiko.HostKeys()
-                host_keys.add(hostnames, keytype, _decode_pubkey(keytype, key_b64))
-                client._host_keys.update(host_keys)  # noqa: SLF001
-            else:
-                decoded = _decode_pubkey(keytype, key_b64)
-                if decoded is not None:
-                    client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
+            decoded = _decode_pubkey(keytype, key_b64)
+            if decoded is None:
+                continue
+            client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
         except Exception:  # noqa: BLE001
             continue
 
@@ -477,31 +472,62 @@ def _load_private_key(pem: str, passphrase: str | None):
     """Load a PEM-encoded SSH private key. paramiko's
     ``RSAKey.from_private_key`` / ``Ed25519Key.from_private_key`` /
     etc. each only handle one algo, so we try them in turn.
+
+    No DSA (#1692): paramiko 4.0 removed ``DSSKey``, and the backend's
+    unbounded ``paramiko>=3.4.0`` installs 4.0 or later, so naming it
+    raised ``AttributeError`` before any key was tried. OpenSSH dropped
+    DSA as well.
+
+    Every failure is a :class:`BackupDestinationError`, never a bare
+    exception: ``RSAKey`` does not check the type inside an OpenSSH
+    container, so an OpenSSH-format DSA key reaches ``cryptography`` as
+    RSA numbers and raises ``ValueError`` — which escaped Test
+    connection as a 500. The loop therefore treats ANY exception from a
+    class as "not this class".
     """
     import paramiko  # noqa: PLC0415
 
+    # A key pasted into a text field often carries a leading blank line
+    # or indentation; paramiko then fails to find the BEGIN line.
+    pem = pem.strip() + "\n"
+    if "-----BEGIN PRIVATE KEY-----" in pem or "-----BEGIN ENCRYPTED PRIVATE KEY-----" in pem:
+        raise BackupDestinationError(
+            "could not parse private key: PKCS#8 ('BEGIN PRIVATE KEY') is not "
+            "supported — convert it to OpenSSH format with "
+            "`ssh-keygen -p -f <keyfile>` and paste the result"
+        )
     text_io = io.StringIO(pem)
     last_exc: Exception | None = None
+    needs_passphrase = False
     for cls in (
         paramiko.Ed25519Key,
         paramiko.ECDSAKey,
         paramiko.RSAKey,
-        paramiko.DSSKey,
     ):
         text_io.seek(0)
         try:
             return cls.from_private_key(text_io, password=passphrase)
-        except paramiko.SSHException as exc:
+        except paramiko.PasswordRequiredException as exc:
+            needs_passphrase = True
             last_exc = exc
-            continue
+        except Exception as exc:  # noqa: BLE001 — any parse failure means "not this class"
+            last_exc = exc
+    if needs_passphrase and not passphrase:
+        raise BackupDestinationError(
+            "could not parse private key: it is passphrase-protected — set "
+            "'private_key_passphrase'"
+        )
     raise BackupDestinationError(
-        f"could not parse private key (tried Ed25519 / ECDSA / RSA / DSS): {last_exc}"
+        f"could not parse private key (tried Ed25519 / ECDSA / RSA; DSA is not "
+        f"supported): {last_exc}"
     )
 
 
 def _decode_pubkey(keytype: str, b64: str):
     """Best-effort decoder for known_hosts pubkey lines.
-    Returns a paramiko PKey subclass or None on parse failure.
+    Returns a paramiko PKey subclass or None on parse failure, or for a
+    key type this driver does not take (``ssh-dss``: no ``DSSKey`` in
+    paramiko 4.0 and later, #1692).
     """
     import base64  # noqa: PLC0415
 
@@ -513,7 +539,6 @@ def _decode_pubkey(keytype: str, b64: str):
         return None
     cls_map = {
         "ssh-rsa": paramiko.RSAKey,
-        "ssh-dss": paramiko.DSSKey,
         "ssh-ed25519": paramiko.Ed25519Key,
         "ecdsa-sha2-nistp256": paramiko.ECDSAKey,
         "ecdsa-sha2-nistp384": paramiko.ECDSAKey,
