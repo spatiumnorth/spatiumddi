@@ -84,6 +84,33 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Technitium record target is read the way a zone file reads it, and
+  imported targets keep their dot (#1759).** Both Technitium drivers
+  (the agent and the agentless `technitium_api`) stripped the trailing
+  dot from a CNAME, DNAME, NS, PTR, MX exchange, SRV target or NAPTR
+  replacement and sent what was left as an absolute name, while
+  everywhere else in SpatiumDDI, BIND9 included, a name without a
+  trailing dot is relative to the zone. So `www CNAME web` was served as
+  `web.`, a delegation `sub NS ns1` pointed at `ns1.`, and `MX 10 @`
+  was refused. One rule now applies to every one of those types on both
+  drivers: `@` is the zone, a trailing dot is absolute, anything else is
+  `value.zone`, and `.` is sent as `"."`, so a Null MX (`0 .`) and a
+  "no service" SRV are accepted instead of refused as an empty
+  parameter. The other direction is fixed too: the Technitium importer
+  and the Sync-with-Servers pull now store every target with its
+  trailing dot, because Technitium reports absolute names, and a
+  dot-less value stored from them was served as `target.<zone>.` as soon
+  as the zone moved to BIND9. Sync and drift compare DNAME and NAPTR
+  canonically, and read their AXFR targets absolute, so they stop
+  reporting a difference that is not one. A Technitium server's bundle
+  carries `name_target_rule` (renderer revision 7); a bundle without it,
+  such as one the agent has cached, keeps the old absolute reading.
+  **Migration `d6b2f81a3c57` changes what BIND9 and PowerDNS groups
+  serve** for records the Technitium importer created: their dot-less
+  targets are made absolute, so `www CNAME web.example.net` is served as
+  `web.example.net.` as it was on Technitium, instead of the wrong
+  `web.example.net.<zone>.`. Check imported zones you have since moved.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
@@ -2903,6 +2930,15 @@ the formatter handles the rest.
   zone-file reading of a dot-less target does not re-point them.
   Downgrade is a no-op: the dotted value means the same under either
   reading.
+- `d6b2f81a3c57` — #1759, data-only: CNAME / DNAME / NS / PTR / MX /
+  SRV / NAPTR records in groups running a Technitium driver whose target
+  has two or more labels and no trailing dot get the dot they were
+  already served with, so the zone-file reading of a dot-less target
+  does not re-point them. Rows the Technitium importer stamped
+  (`import_source = 'technitium'`) are made absolute in every group,
+  single labels included, which **changes what BIND9 and PowerDNS
+  groups serve** for them. Bumps `bundle_dirty_seq` on affected
+  servers and rewrites queued record ops. Downgrade is a no-op.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -267,6 +267,12 @@ async def axfr_zone_records(
                     value = _absolutize(rdata.target)
                 elif rtype == "PTR":
                     value = _absolutize(rdata.target)
+                elif rtype == "DNAME":
+                    value = _absolutize(rdata.target)
+                elif rtype == "NAPTR":
+                    # The replacement is a name like any other (#1759); the
+                    # derelativized text keeps an in-zone one unambiguous.
+                    value = rdata.to_text(origin=zone_origin, relativize=False)
                 elif rtype == "MX":
                     priority = rdata.preference
                     value = _absolutize(rdata.exchange)
