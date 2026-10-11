@@ -709,6 +709,14 @@ do_leave() {
         mv -f "$MANIFESTS_ASIDE"/*.yaml* "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi
+    # #1215 — the TLS Secret manifest comes back with the ``.skip`` firstboot
+    # put beside it once the Secret existed, but the datastore k3s starts on
+    # below is new and holds no Secret. k3s never applies a skipped manifest,
+    # so the Web UI would come up with no certificate. Drop the marker: k3s
+    # creates the Secret from the manifest, and firstboot skips it again on
+    # the next boot. (The failed-join rollback keeps it: it restores the
+    # node's own datastore, Secret included.)
+    rm -f "$K3S_MANIFESTS/spatium-appliance-tls.yaml.skip"
 
     log "restarting k3s as a fresh single-node seed"
     clean_k3s_runtime
