@@ -79,6 +79,7 @@ from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES,
     SUPPORTED_RECORD_TYPES,
     int_or,
+    is_idempotent_noop,
     qualified_name,
     rdata_to_value,
     record_params,
@@ -184,11 +185,12 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         one member the server already has does not make the remaining members
         optional.
 
-        Same two substrings the agent driver matches, deliberately — the two
-        implementations must agree about what counts as converged.
+        Exact upstream messages (see ``rdata.is_idempotent_noop``), not a
+        substring: Technitium's CNAME/DNAME conflict refusal also contains
+        "already exists" and must surface as a failure (#1770). The agent
+        driver matches the same set; the two must agree.
         """
-        msg = (message or "").lower()
-        return "already exists" in msg or "no such record" in msg
+        return is_idempotent_noop(message)
 
     @classmethod
     def _unwrap(cls, response: Any, what: str) -> Any:

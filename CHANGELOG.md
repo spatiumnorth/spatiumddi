@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium's "CNAME record already exists" refusal is no longer
+  counted as success (#1770).** Both Technitium drivers treated any
+  error containing "already exists" as an idempotent no-op, so adding a
+  CNAME or DNAME beside other data at a name, which Technitium refuses
+  with `Cannot add record: CNAME record already exists for the same
+  name.`, was marked applied while the server kept serving the old data.
+  The drivers now match Technitium's exact no-op messages (record
+  already exists, no such record to delete, zone already exists), so
+  the conflict surfaces as a failed op with Technitium's message.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

@@ -730,3 +730,36 @@ __all__ = [
     "svcb_target",
     "svcb_wire",
 ]
+
+
+# ── "Already in that state" answers (#1770) ────────────────────────────
+#
+# Exact messages, not a substring: the bare ``"already exists"`` also matched
+# the CNAME/DNAME conflict refusal "Cannot add record: CNAME record already
+# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a failure
+# (the record does not exist; old data keeps being served). Upstream,
+# TechnitiumSoftware/DnsServer v15.4.0:
+#   WebServiceZonesApi.cs:4229          "Cannot add record: record already exists."
+#   WebServiceZonesApi.cs:3932/4022/4183 "Record already exists. Use overwrite
+#                                         option if you wish to overwrite existing record."
+#   WebServiceZonesApi.cs:4336-4544     "Cannot delete record: no such record exists."
+#   AuthZoneManager.cs:745              "Zone already exists: <zone>"
+# The agent driver keeps a copy (``_is_record_noop`` / ``_is_zone_exists``).
+
+_NOOP_MESSAGES = frozenset(
+    {
+        "cannot add record: record already exists",
+        "record already exists. use overwrite option if you wish to overwrite existing record",
+        "cannot delete record: no such record exists",
+    }
+)
+
+
+def _norm_error(message: Any) -> str:
+    return str(message or "").strip().lower().rstrip(".").strip()
+
+
+def is_idempotent_noop(message: Any) -> bool:
+    """True when Technitium reports the op's target state already holds."""
+    msg = _norm_error(message)
+    return msg in _NOOP_MESSAGES or msg.startswith("zone already exists:")

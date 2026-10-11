@@ -518,7 +518,13 @@ async def test_delete_stays_value_scoped_even_with_an_rrset(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "message", ["Record already exists", "No such record was found", "ALREADY EXISTS"]
+    "message",
+    [
+        "Cannot add record: record already exists.",
+        "CANNOT ADD RECORD: RECORD ALREADY EXISTS.",
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+        "Cannot delete record: no such record exists.",
+    ],
 )
 async def test_replayed_op_is_an_idempotent_noop(
     monkeypatch: pytest.MonkeyPatch, message: str
@@ -545,6 +551,31 @@ async def test_replayed_op_is_an_idempotent_noop(
     )
     # Both members were attempted — the first not-a-failure didn't stop it.
     assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        "Cannot add record: DNAME record already exists for the same name.",
+        "Cannot add record: CNAME record already exists for the same name",
+        "Record already exists",
+        "No such record was found",
+    ],
+)
+async def test_conflict_refusal_is_a_failure_not_a_noop(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    """#1770: the CNAME/DNAME conflict refusal contains "already exists" but
+    means the record was NOT written; counting it as converged marks the op
+    applied while the server keeps serving the old data."""
+    drv, _ = _driver(monkeypatch, [_FakeResponse({"status": "error", "errorMessage": message})])
+    with pytest.raises(Exception, match="(?i)already exists|no such record"):
+        await drv.apply_record_change(
+            _Server({"api_url": "https://x.test", "api_token": "t"}),
+            _change("create", rrset=_rrset("10.0.0.1")),
+        )
 
 
 @pytest.mark.asyncio
