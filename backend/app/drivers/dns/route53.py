@@ -455,7 +455,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         client = self._client(creds)
         name = normalize_fqdn(getattr(zone, "name", "") or "")
         if name == ".":
@@ -482,7 +482,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                         zone=name,
                         zone_id=match["id"],
                     )
-                    return
+                    return False
             if matches:
                 # Never adopt a hosted zone SpatiumDDI did not create:
                 # adopting it would put a foreign zone under management,
@@ -507,7 +507,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 raise CloudDNSError(
                     f"route53 create_hosted_zone failed for {name!r}: {exc}"
                 ) from exc
-            return
+            return True
 
         if op == "delete":
             try:
@@ -522,7 +522,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                         server=str(getattr(server, "id", "")),
                         zone=name,
                     )
-                    return
+                    return False
                 raise
             # #1528 — Route 53 refuses to delete a populated zone
             # (HostedZoneNotEmpty); empty OUR records first. Records the
@@ -534,7 +534,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 await asyncio.to_thread(client.delete_hosted_zone, Id=zone_id)
             except Exception as exc:  # noqa: BLE001 — wrap any botocore/SDK error
                 if _is_no_such_hosted_zone(exc):
-                    return
+                    return False
                 if _is_hosted_zone_not_empty(exc):
                     raise CloudDNSError(
                         f"route53 delete_hosted_zone failed for {name!r}: the zone "
@@ -545,7 +545,7 @@ class Route53DNSDriver(CloudDNSDriverBase):
                 raise CloudDNSError(
                     f"route53 delete_hosted_zone failed for {name!r}: {exc}"
                 ) from exc
-            return
+            return True
 
         raise CloudDNSError(f"route53._apply_zone: unsupported op {op!r}")
 

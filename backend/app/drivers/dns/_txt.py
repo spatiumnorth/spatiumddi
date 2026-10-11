@@ -1,4 +1,4 @@
-"""TXT record presentation-form quoting (issues #1514, #1609).
+"""TXT record presentation-form quoting (issues #1514, #1609, #1694).
 
 One helper shared by this package's DNS drivers so the copies cannot
 drift. The control plane (``backend/app/drivers/dns/_txt.py``) and the
@@ -141,8 +141,11 @@ def _escape_octets(data: bytes) -> str:
     return "".join(out)
 
 
-def quote_txt(value: str) -> str:
-    """Render a stored TXT value as RFC 1035 presentation form.
+def txt_strings(value: str) -> list[bytes]:
+    """The character-strings a stored TXT value stands for, as octets,
+    each at most 255 of them: what ``quote_txt`` renders, before it
+    escapes them. For a server that takes the strings themselves rather
+    than presentation form (Technitium, #1694).
 
     Control characters are stripped from the stored value first. See
     the module docstring for how unquoted vs already-quoted values are
@@ -155,5 +158,14 @@ def quote_txt(value: str) -> str:
         strings = _parse_quoted_txt(stripped)
     if strings is None:
         strings = [s.encode("utf-8")]
-    chunks = [chunk for string in strings for chunk in _chunk_octets(string)]
-    return " ".join(f'"{_escape_octets(c)}"' for c in chunks)
+    return [chunk for string in strings for chunk in _chunk_octets(string)]
+
+
+def quote_txt(value: str) -> str:
+    """Render a stored TXT value as RFC 1035 presentation form.
+
+    Control characters are stripped from the stored value first. See
+    the module docstring for how unquoted vs already-quoted values are
+    treated.
+    """
+    return " ".join(f'"{_escape_octets(c)}"' for c in txt_strings(value))

@@ -84,6 +84,17 @@ def _zone_slug(dns_name: str) -> str:
     return slug[:63].rstrip("-")
 
 
+def _cause_is(exc: BaseException, name: str) -> bool:
+    """True when ``exc`` was raised from a ``google.api_core`` error class ``name``.
+
+    ``_wrap_call`` re-raises SDK errors as ``CloudDNSError(...) from exc``;
+    the original is the ``__cause__``. Matched on the class name through the
+    MRO so the SDK stays a lazy import.
+    """
+    cause = exc.__cause__
+    return cause is not None and any(c.__name__ == name for c in type(cause).__mro__)
+
+
 class GoogleCloudDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Google Cloud DNS managed zones."""
 
@@ -403,7 +414,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         client = self._client(creds)
         name = normalize_fqdn(getattr(zone, "name", "") or "")
         if name == ".":
@@ -418,8 +429,31 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 slug,
                 dns_name=name,
             )
-            await asyncio.to_thread(self._wrap_call, "create_zone", managed.create)
-            return
+            try:
+                await asyncio.to_thread(self._wrap_call, "create_zone", managed.create)
+            except CloudDNSError as exc:
+                # #1537 — HTTP 409 (``Conflict``, "already exists") is the
+                # converged signal, but only if a managed zone with THIS
+                # dns_name is really there: a 409 on the slug alone could
+                # be a different domain that took the same zone name.
+                if not _cause_is(exc, "Conflict"):
+                    raise
+                try:
+                    await self._resolve_zone(client, name)
+                except CloudDNSError as lookup_exc:
+                    if lookup_exc.__cause__ is not None:
+                        raise  # the lookup itself failed (auth, quota, …)
+                    # No zone with this dns_name: the slug is taken by some
+                    # other domain. Report the provider's own 409, not a
+                    # confusing "not found".
+                    raise exc from exc.__cause__
+                logger.info(
+                    "google_dns.apply_zone.create_already_exists",
+                    server=str(getattr(server, "id", "")),
+                    zone=name,
+                )
+                return False
+            return True
 
         if op == "delete":
             try:
@@ -434,7 +468,7 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                         server=str(getattr(server, "id", "")),
                         zone=name,
                     )
-                    return
+                    return False
                 raise
             # #1528 — Cloud DNS refuses to delete a populated zone
             # (containerNotEmpty); empty OUR records first. Records the
@@ -445,10 +479,13 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
             try:
                 await asyncio.to_thread(self._wrap_call, "delete_zone", managed.delete)
             except CloudDNSError as exc:
-                if "not found" in str(exc).lower() or "404" in str(exc):
-                    return
+                # #1537 — only a 404 (``NotFound``) from the delete call
+                # itself; matching message text could swallow an unrelated
+                # failure that happens to mention a 404.
+                if _cause_is(exc, "NotFound"):
+                    return False
                 raise
-            return
+            return True
 
         raise CloudDNSError(f"google_dns._apply_zone: unsupported op {op!r}")
 

@@ -49,6 +49,11 @@
 #                      family policy, annotations) reach the Service, and
 #                      negative controls for encrypted-transport ports a
 #                      flavor cannot serve (#1553).
+#   slot-image-mirror — every render: the mirror runs the api's image and
+#                      imports the whole application, so its memory and CPU
+#                      limits must each be at least the api's (#1174). Below
+#                      the api it is OOMKilled before it serves a byte, and
+#                      helm, kubeconform and the posture gates all pass it.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -139,6 +144,8 @@ render() { # name chart [helm --set args...]
     # source address is never used.
     python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
         || failures=$((failures + 1))
+    python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -206,6 +213,14 @@ render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
+# #1174 — the shape the slot-image mirror actually runs in: an appliance
+# whose control plane has more than one node, where the supervisor turns the
+# mirror on and sizes the api from the node's RAM (``control_plane_resources``
+# writes ``api.resources.limits.memory``: 2949Mi on an 8 GiB node). The mirror
+# runs the api's image, so that sizing has to reach it as well.
+render umbrella-appliance-mirror "$UMBRELLA" \
+    --set slotImageMirror.enabled=true \
+    --set api.resources.limits.memory=2949Mi
 POSTURE_ARGS="--require-priority"
 render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 # ...and again on the HA topology. The CNPG ``Cluster`` and the Sentinel

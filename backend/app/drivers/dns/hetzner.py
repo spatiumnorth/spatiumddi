@@ -536,7 +536,7 @@ class HetznerDNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         async with self._client(token) as client:
@@ -548,14 +548,14 @@ class HetznerDNSDriver(CloudDNSDriverBase):
                     json={"name": zone_fqdn.rstrip("."), "mode": "primary"},
                 )
                 await self._wait_action(client, self._unwrap(resp))
-                return
+                return True
 
             if op == "delete":
                 resp = await self._send(client, "delete", f"/zones/{self._zone_ref(zone_fqdn)}")
                 if self._status(resp) == 404:
-                    return
+                    return False
                 await self._wait_action(client, self._unwrap(resp))
-                return
+                return True
 
             raise CloudDNSError(f"Hetzner: unsupported zone op {op!r}")
 
