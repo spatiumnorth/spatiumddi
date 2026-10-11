@@ -260,8 +260,6 @@ async def _technitium_group(db: AsyncSession) -> DNSServerGroup:
 @pytest.mark.parametrize(
     "body",
     [
-        {"forward_policy": "only"},
-        {"forward_tls_verify": False},
         {"minimal_responses": True},
         {"tcp_clients": 100},
         {"clients_per_query": 10},
@@ -298,13 +296,15 @@ async def test_a_technitium_group_still_takes_what_the_daemon_applies(
         "dnssec_validation": "no",
         "allow_query": ["!10.1.0.0/16", "10.0.0.0/8", "2001:db8::/32"],
         # Defaults re-posted by the form on every save stay allowed.
-        "forward_policy": "first",
-        "forward_tls_verify": True,
         "minimal_responses": False,
+        # Forwarding semantics on Technitium are #1764's, not refused here.
+        "forward_policy": "only",
+        "forward_tls_verify": False,
     }
     r = await client.put(url, json=body, headers=headers)
     assert r.status_code == 200, r.text
     assert r.json()["dnssec_validation"] == "no"
+    assert r.json()["technitium_warnings"] == []
 
 
 @pytest.mark.asyncio
@@ -328,11 +328,43 @@ async def test_a_stored_unsupported_value_does_not_block_resaving_it(
 ):
     headers = await _superadmin(db_session)
     group = await _technitium_group(db_session)
-    db_session.add(DNSServerOptions(group_id=group.id, forward_policy="only", tcp_clients=7))
+    db_session.add(DNSServerOptions(group_id=group.id, minimal_responses=True, tcp_clients=7))
     await db_session.commit()
     r = await client.put(
         f"/api/v1/dns/groups/{group.id}/options",
-        json={"forward_policy": "only", "tcp_clients": 7, "rrl_window": 20},
+        json={"minimal_responses": True, "tcp_clients": 7, "rrl_window": 20},
         headers=headers,
     )
     assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_technitium_server_joining_a_group_with_stored_values_is_warned(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """A value stored before a Technitium server joined never passes the PUT
+    gate (agent registration, a move or a Fleet assignment add the server),
+    so the options response names it instead."""
+    from app.models.dns import DNSServer
+
+    headers = await _superadmin(db_session)
+    group = await _group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, tcp_clients=50, allow_query=["localnets"]))
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+
+    r = await client.get(url, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["technitium_warnings"] == []  # no Technitium server yet
+
+    db_session.add(DNSServer(group_id=group.id, name="t1", driver="technitium", host="t1", port=53))
+    await db_session.commit()
+    r = await client.get(url, headers=headers)
+    warnings = r.json()["technitium_warnings"]
+    assert any(w.startswith("tcp_clients") for w in warnings), warnings
+    assert any("localnets" in w for w in warnings), warnings
+
+    # Clearing both clears the warning, and the clear itself is not refused.
+    r = await client.put(url, json={"tcp_clients": None, "allow_query": ["any"]}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["technitium_warnings"] == []

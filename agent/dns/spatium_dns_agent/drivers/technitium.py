@@ -838,10 +838,12 @@ def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
     return sorted(set(out))
 
 
-# Zone types whose queries the group's ``allow_query`` governs: the ones this
-# server answers authoritatively. A forwarder zone is a resolution rule, and a
-# catalog zone is not a served namespace.
-_QUERY_ACCESS_ZONE_TYPES = frozenset({"Primary", "Secondary", "Stub"})
+# Zone types whose queries the group's ``allow_query`` governs. BIND applies
+# an options-level ``allow-query`` to every query the server receives, a
+# conditional-forward zone's included, so a Forwarder zone carries it too
+# (Technitium's "Set Zone Options" accepts ``queryAccess`` on every zone type
+# but ``SecondaryCatalog``). A catalog zone is not a served namespace.
+_QUERY_ACCESS_ZONE_TYPES = frozenset({"Primary", "Secondary", "Stub", "Forwarder"})
 
 
 def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
@@ -1244,6 +1246,12 @@ class TechnitiumDriver(DriverBase):
     # read by ``apply_record_op`` for ops shipped beside that bundle.
     _svcb_zone_file_targets: bool = False
 
+    # Zones whose group ``allow_query`` this apply could not express (#1763),
+    # collected by ``_apply_zone_options`` and reported ONCE by
+    # ``swap_and_reload``: the cause is one group option, and a refusal per
+    # zone would bury every other refusal in the truncated apply error.
+    _unapplied_query_access: list[str] | None = None
+
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
             self._apply_failures.append(what)
@@ -1473,6 +1481,7 @@ class TechnitiumDriver(DriverBase):
         # them through ``refused_zones()`` so the apply reads as a partial
         # one rather than as success (#1280's model).
         self._apply_failures = []
+        self._unapplied_query_access = []
         try:
             server_path = current / "server.json"
             server_state: dict[str, Any] = {}
@@ -1521,9 +1530,17 @@ class TechnitiumDriver(DriverBase):
             )
             self._reconcile_zones(token, payload)
             self._apply_catalog(token, server_state.get("catalog"), payload)
+            if self._unapplied_query_access:
+                skipped = self._unapplied_query_access
+                self._note_apply_failure(
+                    "allow_query: the group's list has an element Technitium cannot "
+                    "express (localhost, localnets, a key or an ACL name), so query "
+                    f"access was left as the daemon has it on {len(skipped)} zone(s)"
+                )
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None
+            self._unapplied_query_access = None
         # Partial apply, not a failure (#1280): every step the daemon took is
         # live, and re-applying this bundle or the last-known-good cannot make
         # it accept what it just refused — the QA walk of #1608 showed a
@@ -2867,7 +2884,8 @@ class TechnitiumDriver(DriverBase):
             # ``_query_access``); the API refuses to store such a value for a
             # Technitium group, so this is a row saved before that gate.
             log.error("technitium_zone_option_unapplied", zone=zone, reason=unapplied)
-            self._note_apply_failure(f"{zone}: zone options: {unapplied}")
+            if self._unapplied_query_access is not None:
+                self._unapplied_query_access.append(zone)
         if not options:
             return
         transfer = options.get("zoneTransfer")

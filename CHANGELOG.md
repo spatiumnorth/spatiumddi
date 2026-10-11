@@ -92,13 +92,16 @@ the formatter handles the rest.
   and a group's `allow_query` left every authoritative zone answering
   anyone. The agent now sends `dnssecValidation` and maps `allow_query`
   onto each served zone's `queryAccess` / `queryAccessNetworkACL`
-  (addresses, CIDRs, `!` negation, `any`, `none`). The options Technitium
-  has no setting for (`forward_policy`, `forward_tls_verify`,
-  `minimal_responses`, `tcp_clients`, `clients_per_query`,
+  (addresses, CIDRs, `!` negation, `any`, `none`), forwarder zones
+  included. The options Technitium has no setting for
+  (`minimal_responses`, `tcp_clients`, `clients_per_query`,
   `max_clients_per_query`, and an `allow_query` using `localnets`, `key`
   or ACL names) now answer 422 when changed to a non-default value on a
   group with a Technitium server, and the Options tab disables them with
-  the reason. Re-saving a stored value stays allowed. BIND9 and PowerDNS
+  the reason. Re-saving a stored value stays allowed, and a value stored
+  before this, or before a Technitium server joined the group, is listed
+  in the options response's `technitium_warnings` and shown on the tab.
+  Forwarding options are left to #1764. BIND9 and PowerDNS
   bundles are unchanged.
 
 - **A Fleet group change now finds the appliance's own servers

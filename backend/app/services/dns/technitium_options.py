@@ -21,17 +21,11 @@ import ipaddress
 from typing import Any
 
 #: field -> (default, why Technitium cannot honour another value)
+#:
+#: The forwarding options (``forward_policy``, ``forward_tls_verify``) are
+#: deliberately absent: what Technitium does with forwarders, and which of
+#: those values is the honest default for it, is #1764's to settle.
 UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
-    "forward_policy": (
-        "first",
-        "Technitium never falls back to recursion once forwarders are set, so "
-        "it always behaves as 'only'",
-    ),
-    "forward_tls_verify": (
-        True,
-        "Technitium always validates an encrypted upstream's certificate "
-        "against its hostname and has no setting to turn that off",
-    ),
     "minimal_responses": (False, "Technitium has no minimal-responses setting"),
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
@@ -78,4 +72,27 @@ def refusals(changes: dict[str, Any], stored: Any) -> list[str]:
         problem = allow_query_problem(changes["allow_query"])
         if problem:
             out.append(problem)
+    return out
+
+
+def stored_warnings(stored: Any) -> list[str]:
+    """What a group's STORED options say that a Technitium server in it will
+    not do (#1763).
+
+    The PUT gate only sees a change. A row saved before it, or a Technitium
+    server joining a group that already holds such a value (agent
+    registration, a server move or a Fleet role assignment, none of which
+    can usefully refuse), never passes through it, so the options response
+    carries these instead and the Options tab shows them.
+    """
+    if stored is None:
+        return []
+    out = [
+        f"{field}: {why}"
+        for field, (default, why) in UNSUPPORTED_OPTIONS.items()
+        if getattr(stored, field, default) != default
+    ]
+    problem = allow_query_problem(getattr(stored, "allow_query", None))
+    if problem:
+        out.append(problem + "; query access is left as each zone has it")
     return out

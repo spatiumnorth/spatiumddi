@@ -5461,6 +5461,8 @@ export interface DNSServerOptions {
   forward_tls_verify: boolean;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
+  // Stored values a Technitium server in this group will not apply (#1763).
+  technitium_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the

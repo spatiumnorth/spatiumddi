@@ -988,7 +988,6 @@ def test_zone_options_only_for_primary() -> None:
         payload = _zone_options_payload(ztype, _zone_bundle())
         # Never a transfer setting; a served type may carry query access (#1763).
         assert not {k for k in payload if k.startswith("zoneTransfer")}
-    assert _zone_options_payload("Forwarder", _zone_bundle()) == {}
 
 
 def test_tsig_key_names_track_the_bundle() -> None:
@@ -3021,7 +3020,8 @@ def test_allow_query_becomes_a_per_zone_network_acl(tmp_path: Path) -> None:
         },
     )
     sent = _query_access_calls(calls)
-    assert set(sent) == {"a.test", "b.test"}  # a forwarder zone is not a served namespace
+    # BIND's options-level allow-query covers a conditional-forward zone too.
+    assert set(sent) == {"a.test", "b.test", "c.test"}
     for params in sent.values():
         assert params["queryAccess"] == "UseSpecifiedNetworkACL"
         assert params["queryAccessNetworkACL"] == "!10.1.0.0/16,10.0.0.0/8,2001:db8::/32"
@@ -3060,8 +3060,31 @@ def test_untranslatable_allow_query_is_reported_and_never_guessed(tmp_path: Path
     d.daemon_running = lambda: True  # type: ignore[method-assign]
     d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
     calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
-    d.render({"zones": [_zone("a.test")], "options": {"allow_query": ["localnets"]}})
+    d.render(
+        {
+            "zones": [_zone("a.test"), _zone("b.test"), _zone("c.test", "secondary")],
+            "options": {"allow_query": ["localnets"]},
+        }
+    )
     d.validate()
     d.swap_and_reload()
     assert _query_access_calls(calls) == {}
-    assert any("allow_query" in r for r in d._refused_zones)
+    # One refusal for the one group option, naming how many zones it left
+    # alone, not one per zone burying every other refusal.
+    refused = [r for r in d._refused_zones if "allow_query" in r]
+    assert len(refused) == 1, d._refused_zones
+    assert "3 zone(s)" in refused[0]
+
+
+def test_a_clean_apply_after_an_untranslatable_one_reports_nothing(tmp_path: Path) -> None:
+    """The once-per-apply collector is reset, so fixing the option clears it."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    for allow_query in (["localnets"], ["10.0.0.0/8"]):
+        d.render({"zones": [_zone("a.test")], "options": {"allow_query": allow_query}})
+        d.validate()
+        d.swap_and_reload()
+    assert not [r for r in d._refused_zones if "allow_query" in r]

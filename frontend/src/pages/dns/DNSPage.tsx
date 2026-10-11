@@ -6634,12 +6634,20 @@ function OptionsTab({ groupId }: { groupId: string }) {
 
   // Options the agent-managed Technitium driver cannot apply (#1763): the
   // API refuses a non-default value for a group holding such a server, so the
-  // controls are disabled with the reason rather than offered and ignored.
+  // controls are disabled with the reason rather than offered and ignored. A
+  // control holding a stored non-default value stays enabled so it can be
+  // cleared back to the default.
   const { data: groupServers = [] } = useQuery({
     queryKey: ["dns-servers", groupId],
     queryFn: () => dnsApi.listServers(groupId),
   });
   const techUnsupported = groupServers.some((s) => s.driver === "technitium");
+  const techLocked = {
+    minimal: techUnsupported && !opts?.minimal_responses,
+    tcpClients: techUnsupported && opts?.tcp_clients == null,
+    clientsPerQuery: techUnsupported && opts?.clients_per_query == null,
+    maxClientsPerQuery: techUnsupported && opts?.max_clients_per_query == null,
+  };
   const techReason =
     "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
 
@@ -6969,6 +6977,23 @@ function OptionsTab({ groupId }: { groupId: string }) {
         </p>
       )}
 
+      {/* Stored values a Technitium server here will not apply (#1763):
+          saved before the gate, or before the server joined the group. */}
+      {(opts?.technitium_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">
+            This group has a Technitium server, which does not apply:
+          </p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.technitium_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className={card}>
         <div className="flex items-center justify-between">
           <h4 className={cardTitle}>
@@ -7100,8 +7125,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
               <select
                 className={selCls}
                 value={forwardPolicy}
-                disabled={techUnsupported}
-                title={techUnsupported ? techReason : undefined}
                 onChange={(e) => {
                   setForwardPolicy(e.target.value);
                   setDirty(true);
@@ -7115,13 +7138,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
-            {techUnsupported && (
-              <p className="text-xs text-muted-foreground">
-                Technitium never falls back to recursion once forwarders are
-                set, so it always behaves as "only"; the policy cannot be
-                changed for this group.
-              </p>
-            )}
           </>
         )}
       </div>
@@ -7293,8 +7309,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
             <input
               type="checkbox"
               checked={minimalResponses}
-              disabled={techUnsupported}
-              title={techUnsupported ? techReason : undefined}
+              disabled={techLocked.minimal}
+              title={techLocked.minimal ? techReason : undefined}
               onChange={(e) => {
                 setMinimalResponses(e.target.checked);
                 setDirty(true);
@@ -7310,8 +7326,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={tcpClients}
-                disabled={techUnsupported}
-                title={techUnsupported ? techReason : undefined}
+                disabled={techLocked.tcpClients}
+                title={techLocked.tcpClients ? techReason : undefined}
                 onChange={(e) => {
                   setTcpClients(e.target.value);
                   setDirty(true);
@@ -7325,8 +7341,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={clientsPerQuery}
-                disabled={techUnsupported}
-                title={techUnsupported ? techReason : undefined}
+                disabled={techLocked.clientsPerQuery}
+                title={techLocked.clientsPerQuery ? techReason : undefined}
                 onChange={(e) => {
                   setClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7340,8 +7356,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={maxClientsPerQuery}
-                disabled={techUnsupported}
-                title={techUnsupported ? techReason : undefined}
+                disabled={techLocked.maxClientsPerQuery}
+                title={techLocked.maxClientsPerQuery ? techReason : undefined}
                 onChange={(e) => {
                   setMaxClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7563,8 +7579,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <input
                   type="checkbox"
                   checked={forwardTlsVerify}
-                  disabled={techUnsupported}
-                  title={techUnsupported ? techReason : undefined}
                   onChange={(e) => {
                     setForwardTlsVerify(e.target.checked);
                     setDirty(true);
