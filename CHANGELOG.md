@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Moving an appliance's own DNS server repoints the appliance
+  (#1749).** The DNS server PUT (the #934 move) repointed
+  `assigned_dns_group_id` only when the row had `appliance_id`, which
+  agents never set, so the supervisor kept rendering `AGENT_GROUP` and
+  the DoT/DoH/DoQ firewall ports for the group the agent had left. The
+  owning appliance is now found the way Fleet finds its servers
+  (#1715): by FK, else by hostname, never when two approved appliances
+  share it, and for a hostname match only on a row of the appliance's
+  current DNS engine. It is repointed only if it still named the
+  group being left, and its supervisor is woken.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

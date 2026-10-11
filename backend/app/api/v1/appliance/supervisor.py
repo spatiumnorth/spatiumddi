@@ -123,6 +123,13 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import (
+    DNS_ROLE_DRIVER,
+    current_dns_drivers,
+    hostname_is_unambiguous,
+    norm_host,
+    own_server_condition,
+)
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
@@ -4038,65 +4045,14 @@ _VALID_ROLES = {
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
-# #1715 — engine role -> the dns_server.driver its agent registers with.
-_DNS_ROLE_DRIVER = {
-    "dns-bind9": "bind9",
-    "dns-powerdns": "powerdns",
-    "dns-technitium": "technitium",
-}
-
-
-def _norm_host(value: str) -> str:
-    """A hostname as compared for ownership (#1715): case-folded, trailing
-    root dot dropped. Both sides come from the node's kernel nodename (the
-    supervisor's ``APPLIANCE_HOSTNAME`` is firstboot's ``hostname``; a
-    hostNetwork agent's ``os.uname().nodename`` / the downward-API node
-    name), so they agree in practice; this only absorbs the spellings a
-    hand edit or a k8s node name (always lowercase) can introduce."""
-    return value.strip().rstrip(".").lower()
-
-
-async def _hostname_is_unambiguous(db: DB, appliance: Appliance) -> bool:
-    """True when no OTHER approved appliance shares this one's hostname
-    (case-insensitively). A hostname match is only a safe way to claim a
-    server row when it can't be someone else's."""
-    others = (
-        await db.execute(
-            select(Appliance.hostname).where(
-                Appliance.id != appliance.id,
-                Appliance.state == APPLIANCE_STATE_APPROVED,
-            )
-        )
-    ).scalars()
-    mine = _norm_host(appliance.hostname or "")
-    return bool(mine) and all(_norm_host(h or "") != mine for h in others)
-
-
-async def _own_server_condition(db: DB, appliance: Appliance, model: Any) -> Any:
-    """SQL condition selecting ``model`` (DNSServer / DHCPServer) rows that
-    belong to ``appliance`` (#1715).
-
-    Agents register with ``host`` = the node's hostname and never set
-    ``appliance_id``, so the FK alone finds nothing on a real appliance.
-    Hostname is matched too (as ``_find_appliance_dependents`` does), but
-    only on agent-based rows not already owned by another appliance, and
-    only when the hostname is unambiguous across approved appliances.
-    """
-    conds = [model.appliance_id == appliance.id]
-    if await _hostname_is_unambiguous(db, appliance):
-        conds.append(
-            (
-                sa_func.lower(sa_func.rtrim(sa_func.trim(model.host), "."))
-                == _norm_host(appliance.hostname)
-            )
-            & model.appliance_id.is_(None)
-            & model.agent_id.is_not(None)
-        )
-    return or_(*conds)
-
-
-def _current_dns_drivers(appliance: Appliance) -> set[str]:
-    return {_DNS_ROLE_DRIVER[r] for r in (appliance.assigned_roles or []) if r in _DNS_ROLE_DRIVER}
+# #1715 / #1749 — the ownership matching lives in a service so the DNS server
+# move (server -> appliance) uses the very same rules as Fleet (appliance ->
+# server).
+_DNS_ROLE_DRIVER = DNS_ROLE_DRIVER
+_norm_host = norm_host
+_hostname_is_unambiguous = hostname_is_unambiguous
+_own_server_condition = own_server_condition
+_current_dns_drivers = current_dns_drivers
 
 
 async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
