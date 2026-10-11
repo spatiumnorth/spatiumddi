@@ -93,6 +93,10 @@ the formatter handles the rest.
   The drivers now match Technitium's exact no-op messages (record
   already exists, no such record to delete, zone already exists), so
   the conflict surfaces as a failed op with Technitium's message.
+  `Record already exists. Use overwrite option …` is a failure too: it
+  is raised when a CNAME or DNAME with any value holds the name, so it
+  does not mean ours is there. A Technitium release that rewords one of
+  these messages now fails the op rather than reading it as applied.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the

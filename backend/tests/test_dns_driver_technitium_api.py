@@ -522,7 +522,6 @@ async def test_delete_stays_value_scoped_even_with_an_rrset(
     [
         "Cannot add record: record already exists.",
         "CANNOT ADD RECORD: RECORD ALREADY EXISTS.",
-        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
         "Cannot delete record: no such record exists.",
     ],
 )
@@ -560,6 +559,9 @@ async def test_replayed_op_is_an_idempotent_noop(
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
         "Cannot add record: CNAME record already exists for the same name",
+        # Raised for a CNAME/DNAME add with overwrite=false whatever the
+        # existing record's value, so it does not prove ours is there.
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
         "Record already exists",
         "No such record was found",
     ],

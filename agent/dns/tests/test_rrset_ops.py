@@ -1115,6 +1115,7 @@ def test_powerdns_without_rrset_still_does_the_get_merge_patch(
     [
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
         "Record already exists.",
     ],
 )

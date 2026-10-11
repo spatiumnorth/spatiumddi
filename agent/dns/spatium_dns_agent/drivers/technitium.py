@@ -233,15 +233,23 @@ _TSIG_ALGORITHMS = frozenset(
 # the record does not exist and the server keeps serving the old data.
 # Upstream (TechnitiumSoftware/DnsServer v15.4.0):
 #   WebServiceZonesApi.cs:4229  "Cannot add record: record already exists."
-#   WebServiceZonesApi.cs:3932/4022/4183  "Record already exists. Use
-#       overwrite option if you wish to overwrite existing record."
-#   WebServiceZonesApi.cs:4336-4544  "Cannot delete record: no such record exists."
-#   AuthZoneManager.cs:745  "Zone already exists: <zone>"
-# Compared whole (case-folded, trailing period dropped), never as a substring.
+#   WebServiceZonesApi.cs:4336-4596  "Cannot delete record: no such record exists."
+#   WebServiceZonesApi.cs:1661-1877  "Zone already exists: <zone>"
+# Unchanged through v15.6.1. Compared whole (case-folded, trailing period
+# dropped), never as a substring.
+#
+# Deliberately NOT a no-op: "Record already exists. Use overwrite option if
+# you wish to overwrite existing record." (WebServiceZonesApi.cs:3932/4022/
+# 4183). It is raised for a CNAME / DNAME / APP add with overwrite=false when
+# ANY record of that type is at the name, whatever its value. This driver only
+# sends overwrite=false for a record the server lacks (reconcile adds, RRset
+# members after the first), so the answer means a different one holds the
+# name. Same set as ``app/services/technitium/rdata.py``; pinned by the
+# backend's test_technitium_svcb_parity.py.
+_RECORD_ABSENT_MESSAGE = "cannot delete record: no such record exists"
 _RECORD_NOOP_MESSAGES = frozenset(
     {
         "cannot add record: record already exists",
-        "record already exists. use overwrite option if you wish to overwrite existing record",
         "cannot delete record: no such record exists",
     }
 )
@@ -2532,7 +2540,7 @@ class TechnitiumDriver(DriverBase):
                     # not a deletion. Counting it (or the failure case) would
                     # report churn that never happened, which is the same
                     # phantom the apex-NS filter above exists to prevent.
-                    if _norm_error(body.get("errorMessage")) != "cannot delete record: no such record exists":
+                    if _norm_error(body.get("errorMessage")) != _RECORD_ABSENT_MESSAGE:
                         log.warning(
                             "technitium_reconcile_delete_failed",
                             zone=zone,

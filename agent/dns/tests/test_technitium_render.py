@@ -2958,7 +2958,12 @@ def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "message",
-    ["Cannot add record: CNAME record already exists for the same name."],
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        # A different CNAME at the name: reconcile only adds what the server
+        # lacks, so this answer cannot mean ours is already there.
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+    ],
 )
 def test_reconcile_add_conflict_is_an_apply_failure(tmp_path: Path, message: str) -> None:
     """#1770: the conflict refusal must be recorded as an apply failure."""
