@@ -90,11 +90,16 @@ the formatter handles the rest.
   with Servers and NOTIFY stop), and the consumer's `SecondaryCatalog`
   has no TSIG and stays empty. The `technitium` driver now reports
   `catalog_zones: False`; turning catalog zones on for a group with a
-  `technitium` / `technitium_api` server, or adding such a server to a
-  catalog-enabled group, is a 422 naming #1766 (the 1.1.0 fix). A group
-  that already has it on keeps rendering as before and shows a
-  `catalog_unsupported_warning` on the API and in the group editor.
-  `DNS_DRIVERS.md` and `DNS.md` no longer say both roles work.
+  `technitium` / `technitium_api` server, or putting such a server into a
+  catalog-enabled group (server create, driver change, server move, or a
+  Fleet / Copilot role assignment pointing a `dns-technitium` appliance
+  at one), is a 422 naming #1766 (the 1.1.0 fix). An agent
+  auto-registering straight into a catalog group is logged, not refused,
+  since a refused registration loops. A group that already has it on
+  keeps rendering as before and shows a `catalog_unsupported_warning` on
+  the API and in the group editor.
+  `DNS_DRIVERS.md`, `DNS.md`, `GETTING_STARTED.md`, `TOPOLOGIES.md` and the
+  README no longer say both roles work.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the

@@ -4316,6 +4316,11 @@ async def update_appliance_roles(
         )
     moved_servers: list[dict[str, Any]] = []
     retired_servers: list[str] = []
+    # #1782 — captured before the edits below so the Technitium-into-a-
+    # catalog-group refusal fires only on a change, never on a re-save of a
+    # pre-existing assignment.
+    prev_dns_roles = set(row.assigned_roles or [])
+    prev_dns_group_id = row.assigned_dns_group_id
 
     if body.roles is not None:
         # Reject unknown role tokens explicitly so a typo on the API
@@ -4417,6 +4422,26 @@ async def update_appliance_roles(
                     )
                 )
             row.assigned_dns_group_id = dns_group.id
+    # #1782 — Technitium cannot do catalog zones (#1766). The own-server move
+    # above refuses it for a server that already exists, but an appliance
+    # whose agent has not registered yet has none: the pointer alone would
+    # send a fresh Technitium agent into a catalog group, and registration
+    # cannot refuse it (a refused agent loops). So refuse it here, on change.
+    if row.assigned_dns_group_id is not None and "dns-technitium" in (row.assigned_roles or []):
+        changed = (
+            "dns-technitium" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id
+        )
+        if changed:
+            from app.models.dns import DNSServerGroup
+            from app.services.dns.server_move import catalog_unsupported_message
+
+            target = await db.get(DNSServerGroup, row.assigned_dns_group_id)
+            if target is not None and target.catalog_zones_enabled:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {target.name!r} has catalog zones enabled. "
+                    + catalog_unsupported_message({"technitium"}),
+                )
     if "dhcp_group_id" in body.model_fields_set:
         if body.dhcp_group_id is None:
             row.assigned_dhcp_group_id = None

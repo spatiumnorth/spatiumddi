@@ -88,3 +88,80 @@ async def test_adding_technitium_server_to_catalog_group_is_422(
     )
     assert r.status_code == 422
     assert "#1766" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_moving_technitium_server_into_catalog_group_is_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _superadmin(db_session, "root1782e")
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst", catalog_zones_enabled=True)
+    srv = await _server(db_session, src, "t1", driver="technitium")
+    r = await client.put(
+        f"/api/v1/dns/groups/{src.id}/servers/{srv.id}",
+        json={"group_id": str(dst.id)},
+        headers=_auth(token),
+    )
+    assert r.status_code == 422
+    assert "#1766" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_assigning_technitium_appliance_to_catalog_group_is_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An appliance whose agent has not registered yet has no server row for
+    the #934 move to refuse, so the role assignment itself must."""
+    from tests.test_dns_server_group_move import _fleet_appliance, _roles_url
+
+    token = await _superadmin(db_session, "root1782f")
+    plain = await _group(db_session, "plain")
+    cat = await _group(db_session, "catgrp", catalog_zones_enabled=True)
+    appliance = await _fleet_appliance(db_session, plain)
+    appliance.assigned_roles = ["dns-technitium"]
+    await db_session.flush()
+    r = await client.put(
+        _roles_url(appliance.id), json={"dns_group_id": str(cat.id)}, headers=_auth(token)
+    )
+    assert r.status_code == 422, r.text
+    assert "#1766" in r.json()["detail"]
+
+    # A pre-existing assignment (legacy) is not refused on a re-save.
+    legacy = await _fleet_appliance(db_session, cat)
+    legacy.assigned_roles = ["dns-technitium"]
+    await db_session.flush()
+    r = await client.put(
+        _roles_url(legacy.id), json={"dns_group_id": str(cat.id)}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_copilot_assigning_technitium_appliance_to_catalog_group_is_refused(
+    db_session: AsyncSession,
+) -> None:
+    from sqlalchemy import select
+
+    from app.models.auth import User
+    from app.services.ai.operations import (
+        AssignApplianceRoleArgs,
+        _apply_assign_appliance_role,
+        _preview_assign_appliance_role,
+    )
+    from tests.test_dns_server_group_move import _fleet_appliance
+
+    await _superadmin(db_session, "root1782g")
+    user = (await db_session.execute(select(User).where(User.username == "root1782g"))).scalar_one()
+    plain = await _group(db_session, "plain-g")
+    cat = await _group(db_session, "cat-g", catalog_zones_enabled=True)
+    appliance = await _fleet_appliance(db_session, plain)
+    args = AssignApplianceRoleArgs(
+        appliance_id=str(appliance.id), roles=["dns-technitium"], dns_group_id=str(cat.id)
+    )
+    preview = await _preview_assign_appliance_role(db_session, user, args)
+    assert not preview.ok
+    assert "#1766" in preview.detail
+    with pytest.raises(ValueError, match="#1766"):
+        await _apply_assign_appliance_role(db_session, user, args)
+    assert appliance.assigned_dns_group_id == plain.id

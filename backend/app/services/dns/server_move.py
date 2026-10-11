@@ -113,12 +113,12 @@ CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium", "technitium_api"})
 
 
 def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
-    bad = sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS)
+    bad = ", ".join(sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS))
     return (
-        f"Catalog zones are not supported on the {bad} driver: member zones "
-        "inherit the catalog zone's transfer-deny / notify-none settings and the "
-        "consumer cannot transfer the catalog, so zone sync breaks. Support is "
-        "tracked in #1766 (1.1.0)."
+        f"Catalog zones are not supported on Technitium (driver {bad}): its member "
+        "zones inherit the catalog zone's zone-transfer Deny and notify None, which "
+        "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
+        "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
     )
 
 
