@@ -2302,6 +2302,10 @@ async def supervisor_heartbeat(
         row.desired_cluster_role = None
         row.desired_k3s_server_url = None
         row.desired_k3s_join_token_encrypted = None
+        # #1750 — a re-joined node normally registers a fresh Node, but one
+        # that re-used a Node an earlier demote cordoned must not stay
+        # unschedulable as a member. Marker-gated: an operator's cordon stays.
+        await _set_node_schedulable(row.hostname, cordon=False)
     # #590 — clear the promote desired-state on a reported ``failed`` too.
     # The host runner rolls the node back to its prior single-node seed and
     # renames its trigger out of the way, so leaving desired_cluster_role
@@ -2393,6 +2397,8 @@ async def supervisor_heartbeat(
         and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
     ):
         row.desired_cluster_role = None
+        # #1750 — the node did not leave: don't strand it cordoned.
+        await _set_node_schedulable(row.hostname, cordon=False)
         logger.warning(
             "control_plane_leave_failed",
             appliance_id=str(row.id),
@@ -5141,6 +5147,102 @@ async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> Non
         raise HTTPException(status.HTTP_409_CONFLICT, f"Refusing the demote: {refusal}")
 
 
+#: #1750 — set on a Node when a demote cordons it, and only then. An uncordon
+#: acts only on a Node carrying it, so a node the operator had already
+#: cordoned before the demote (the rule #1610 applies to upgrades) is never
+#: uncordoned by a failed leave. It lives on the Node rather than the row
+#: because the Node is what it describes: a re-joined node registers a new
+#: Node object without it, and an evicted one takes it with it.
+DEMOTE_CORDON_ANNOTATION = "spatium.io/demote-cordoned"
+
+
+def _node_schedulable_sync(name: str, *, cordon: bool) -> tuple[str, str | None]:
+    """Cordon / uncordon one Node for a demote. ``(outcome, error)``.
+
+    Outcomes: ``cordoned`` / ``uncordoned`` (done), ``pre_cordoned`` (the
+    operator's cordon, left alone and not marked), ``not_ours`` (uncordon
+    skipped: no demote cordon on it), ``gone`` (no such Node — harmless,
+    the eviction already deleted it), ``no_kubeapi`` (compose / tests), and
+    ``failed`` with ``error`` set. Raises nothing it can help."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if k8s.get_config() is None:
+        return "no_kubeapi", None
+    try:
+        status_code, node = k8s.get_node(name)
+    except k8s.KubeapiUnavailableError as exc:
+        status_code, node, read_err = 0, None, str(exc)
+    else:
+        read_err = None
+    if status_code == 404:
+        return "gone", None
+    spec = (node or {}).get("spec") or {}
+    annotations = ((node or {}).get("metadata") or {}).get("annotations") or {}
+    ours = DEMOTE_CORDON_ANNOTATION in annotations
+
+    if cordon:
+        if status_code == 200 and spec.get("unschedulable") and not ours:
+            return "pre_cordoned", None
+        # Unknown pre-state (the read failed) cordons and marks, so a failed
+        # leave still releases it — #1610's "could not tell" rule.
+        code, err = k8s.patch_node(
+            name,
+            {
+                "metadata": {"annotations": {DEMOTE_CORDON_ANNOTATION: "true"}},
+                "spec": {"unschedulable": True},
+            },
+        )
+        if err is None:
+            return "cordoned", None
+        return ("gone", None) if code == 404 else ("failed", err)
+
+    if status_code != 200:
+        # Cannot tell whose cordon it is: leave it. Clear-cluster-state or a
+        # retried demote's failure path gets another go.
+        return "failed", read_err or f"node read returned {status_code}"
+    if not ours:
+        return "not_ours", None
+    code, err = k8s.patch_node(
+        name,
+        {
+            "metadata": {"annotations": {DEMOTE_CORDON_ANNOTATION: None}},
+            "spec": {"unschedulable": False},
+        },
+    )
+    if err is None:
+        return "uncordoned", None
+    return ("gone", None) if code == 404 else ("failed", err)
+
+
+async def _set_node_schedulable(hostname: str | None, *, cordon: bool) -> None:
+    """Best-effort cordon / uncordon of a demoted member's k8s Node (#1750).
+
+    A demoted member keeps scheduling new pods until its k3s stops, so
+    the helm-controller's replaced install Job can land on it and strand.
+    Never fails the caller: no ServiceAccount (compose) or an unreachable
+    kubeapi just logs, because a missed cordon is the old behaviour, not
+    a reason to refuse a demote.
+
+    Keyed on the row's hostname, the same name the seed's eviction deletes
+    the Node by and the quorum gate looks it up by (k3s names its Node
+    after the host; nothing passes ``--node-name``). Uncordon touches only
+    a Node this marked (:data:`DEMOTE_CORDON_ANNOTATION`)."""
+    if not hostname:
+        return
+    try:
+        outcome, err = await asyncio.to_thread(_node_schedulable_sync, hostname, cordon=cordon)
+    except Exception as exc:  # noqa: BLE001 - best-effort, must not fail the caller
+        outcome, err = "failed", str(exc)
+    if outcome == "failed":
+        logger.warning(
+            "control_plane_cordon_failed" if cordon else "control_plane_uncordon_failed",
+            hostname=hostname,
+            error=err,
+        )
+    elif outcome in ("cordoned", "uncordoned", "pre_cordoned"):
+        logger.info(f"control_plane_node_{outcome}", hostname=hostname)
+
+
 @router.post(
     "/fleet/control-plane/demote",
     response_model=ApplianceList,
@@ -5215,6 +5317,14 @@ async def demote_control_plane(
     # down: the leaver's own etcd may not know, and its removal then costs the
     # survivors their quorum.
     await _refuse_demote_without_quorum(db, targets)
+
+    # #1750 — stop the scheduler placing new pods (a replaced helm install
+    # Job, say) on a node about to stop k3s. Cordon only, no drain: the
+    # node's own k3s teardown and the seed's Node eviction reschedule what
+    # runs there, a drain adds a PDB-bounded wait to a request, and the
+    # point is only that nothing NEW lands. Undone if the leave fails.
+    for row in targets:
+        await _set_node_schedulable(row.hostname, cordon=True)
 
     for row in targets:
         row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
@@ -5502,6 +5612,12 @@ async def clear_control_plane_state(
                 f"Wait {remaining}s for it to converge, or re-send with force=true if you "
                 "know the node is never coming back.",
             )
+
+    if before["desired_cluster_role"] == DESIRED_CLUSTER_ROLE_NONE and (
+        row.cluster_role == CLUSTER_ROLE_MEMBER
+    ):
+        # #1750 — an abandoned demote leaves a member that demote cordoned.
+        await _set_node_schedulable(row.hostname, cordon=False)
 
     row.cluster_join_state = None
     row.cluster_join_state_at = None

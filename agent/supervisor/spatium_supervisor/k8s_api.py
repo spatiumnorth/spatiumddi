@@ -1904,6 +1904,39 @@ def node_role_labels(exclude: str = "", timeout: float = 5.0) -> tuple[set[str] 
     return role_labels_of(doc, exclude), None
 
 
+def node_names_of(nodes_doc: Any) -> list[str]:
+    """PURE — #1750: the name of every node in a ``/api/v1/nodes`` list."""
+    items = nodes_doc.get("items") if isinstance(nodes_doc, dict) else None
+    names: list[str] = []
+    for node in items or []:
+        name = ((node or {}).get("metadata") or {}).get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def cluster_node_names(timeout: float = 5.0) -> tuple[list[str] | None, str | None]:
+    """``(names, error)``: :func:`node_names_of` over ``GET /api/v1/nodes``.
+
+    ``None`` means unknown, never "this node is alone": the role apply decides
+    from it whether the chart it would write is another node's too (#1750), and
+    an unknown read taken as "alone" would let a leaving member write its
+    non-member values over the cluster's shared chart."""
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, str(exc)
+    if status != 200:
+        return None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, "unparseable node list"
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        return None, "unparseable node list"
+    return node_names_of(doc), None
+
+
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
 _FAST_EVICT_TOLERATIONS = [
@@ -2353,6 +2386,7 @@ __all__ = [
     "apply_metallb_overrides",
     "apply_control_plane_overrides",
     "apply_helmchart",
+    "cluster_node_names",
     "check_kubeapi_ready",
     "delete_helmchart",
     "delete_node",

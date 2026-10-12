@@ -16,6 +16,7 @@ every step of the leave.
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -25,8 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.appliance import supervisor
 from app.api.v1.appliance.supervisor import _demote_quorum_refusal, _VoterHealth
 from app.models.appliance import (
+    CLUSTER_JOIN_STATE_JOINING,
     CLUSTER_JOIN_STATE_LEAVING,
     CLUSTER_ROLE_MEMBER,
+    DESIRED_CLUSTER_ROLE_MEMBER,
     DESIRED_CLUSTER_ROLE_NONE,
 )
 from app.services.appliance import k8s
@@ -245,6 +248,392 @@ async def test_a_leave_already_in_flight_counts_as_leaving(
     # and 3 - 2 = 1 is odd, so it is the quorum check that refuses.
     assert resp.status_code == 409, resp.text
     assert "1 of the remaining 2" in resp.text
+
+
+# ── #1750 — the leaving node is cordoned ─────────────────────────────
+#
+# A fake kubeapi holding real Node documents, so each test asserts on the
+# Node the cluster would end up with (cordoned? marked?) rather than on which
+# helper was called. Every other kubeapi request raises, so nothing in the
+# heartbeat reaches a network.
+
+ANN = supervisor.DEMOTE_CORDON_ANNOTATION
+
+
+class _FakeNodes:
+    def __init__(self, names: tuple[str, ...], cordoned: tuple[str, ...] = ()) -> None:
+        self.nodes: dict[str, dict] = {
+            n: {"metadata": {"name": n}, "spec": {"unschedulable": n in cordoned}} for n in names
+        }
+        self.calls: list[tuple[str, str]] = []
+        self.on_patch = None
+
+    def get_node(self, name: str):
+        self.calls.append(("get", name))
+        node = self.nodes.get(name)
+        return (200, copy.deepcopy(node)) if node is not None else (404, None)
+
+    def patch_node(self, name: str, patch: dict):
+        if self.on_patch is not None:
+            self.on_patch(name)
+        node = self.nodes.get(name)
+        if node is None:
+            self.calls.append(("patch-404", name))
+            return 404, "kubeapi status 404"
+        ann = node.setdefault("metadata", {}).setdefault("annotations", {})
+        for k, v in ((patch.get("metadata") or {}).get("annotations") or {}).items():
+            if v is None:
+                ann.pop(k, None)
+            else:
+                ann[k] = v
+        if "unschedulable" in (patch.get("spec") or {}):
+            node.setdefault("spec", {})["unschedulable"] = patch["spec"]["unschedulable"]
+            self.calls.append(("cordon" if patch["spec"]["unschedulable"] else "uncordon", name))
+        return 200, None
+
+    def cordoned(self, name: str) -> bool:
+        return bool(self.nodes[name]["spec"].get("unschedulable"))
+
+    def marked(self, name: str) -> bool:
+        return ANN in ((self.nodes[name].get("metadata") or {}).get("annotations") or {})
+
+
+def _fake_kubeapi(monkeypatch, *names: str, cordoned: tuple[str, ...] = ()) -> _FakeNodes:
+    fake = _FakeNodes(names, cordoned)
+
+    def _no_network(*_a, **_kw):
+        raise k8s.KubeapiUnavailableError("test: no kubeapi")
+
+    monkeypatch.setattr(k8s, "get_config", object)
+    monkeypatch.setattr(k8s, "_request", _no_network)
+    monkeypatch.setattr(k8s, "get_node", fake.get_node)
+    monkeypatch.setattr(k8s, "patch_node", fake.patch_node)
+    monkeypatch.setattr(supervisor, "_node_ready_map", lambda: {n: True for n in ("seed", *names)})
+    return fake
+
+
+def _clear_url(row) -> str:
+    return f"/api/v1/appliance/fleet/control-plane/{row.id}/clear-cluster-state"
+
+
+@pytest.mark.asyncio
+async def test_a_demote_cordons_each_target_before_stamping(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2")
+    # The handler shares this session, so these are the rows it stamps.
+    rows = {"m1": m1, "m2": m2}
+    seen_at_cordon: dict[str, str | None] = {}
+    fake.on_patch = lambda name: seen_at_cordon.setdefault(name, rows[name].desired_cluster_role)
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert fake.cordoned("m1") and fake.cordoned("m2")
+    assert fake.marked("m1") and fake.marked("m2")
+    # Cordoned while neither row was stamped yet: nothing reached the
+    # supervisor (and so the leave runner) ahead of the cordon.
+    assert seen_at_cordon == {"m1": None, "m2": None}
+    await db_session.refresh(m1)
+    assert m1.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+
+
+@pytest.mark.asyncio
+async def test_a_refused_demote_cordons_nothing(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session, m2_seen_ago=timedelta(minutes=2))
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2")
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert not fake.cordoned("m1") and not fake.cordoned("m2")
+    assert [c for c in fake.calls if c[0] != "get"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_cordon_failure_does_not_fail_the_demote(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    _fake_kubeapi(monkeypatch, "m1", "m2")
+    monkeypatch.setattr(k8s, "patch_node", lambda *_a: (0, "ServiceAccount not mounted"))
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(m1)
+    assert m1.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+
+
+async def _leaving_member(db_session: AsyncSession, hostname: str):
+    from tests.test_appliance_evict_etcd import _row
+
+    return await _row(
+        db_session,
+        hostname,
+        appliance_variant="appliance",
+        cluster_role=CLUSTER_ROLE_MEMBER,
+        desired_cluster_role=DESIRED_CLUSTER_ROLE_NONE,
+        cluster_join_state=CLUSTER_JOIN_STATE_LEAVING,
+        cluster_join_state_at=datetime.now(UTC),
+    )
+
+
+async def _sessions(db_session: AsyncSession, *rows) -> dict[str, str]:
+    """Give demote-test rows a supervisor heartbeat session."""
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.services.appliance.ca import generate_session_token  # noqa: PLC0415
+
+    settings_row = await db_session.get(PlatformSettings, 1)
+    if settings_row is None:
+        settings_row = PlatformSettings(id=1)
+        db_session.add(settings_row)
+    settings_row.supervisor_registration_enabled = True
+    tokens = {}
+    for row in rows:
+        tok, tok_hash = generate_session_token()
+        row.session_token_hash = tok_hash
+        row.cert_serial = row.cert_serial or "c0ffee00"
+        tokens[row.hostname] = tok
+    await db_session.commit()
+    return tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # rc != 0 from --leave-self: etcd refused the removal, k3s restarted.
+        (
+            "leave refused: this node's etcd member removal was not confirmed by the "
+            "cluster, so the node was not reset (see etcd-evict.log)"
+        ),
+        # wiped, but the standalone k3s never came Ready.
+        "leave failed; k3s not Ready",
+    ],
+)
+async def test_a_failed_leave_uncordons_the_node(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch, reason: str
+) -> None:
+    from tests.test_appliance_evict_etcd import _beat
+
+    member, member_token = await _leaving_member(db_session, "m-failed")
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m-failed")
+    fake.nodes["m-failed"]["spec"]["unschedulable"] = True
+    fake.nodes["m-failed"]["metadata"]["annotations"] = {ANN: "true"}
+
+    await _beat(
+        client, member, member_token, cluster_join_state="failed", cluster_join_reason=reason
+    )
+
+    assert not fake.cordoned("m-failed") and not fake.marked("m-failed")
+    await db_session.refresh(member)
+    assert member.cluster_role == CLUSTER_ROLE_MEMBER
+    assert member.desired_cluster_role is None
+
+    # The supervisor re-reports ``failed`` until it sees no desired role; the
+    # branch does not fire again (desired is gone), so one uncordon only.
+    await _beat(
+        client, member, member_token, cluster_join_state="failed", cluster_join_reason=reason
+    )
+    assert [c for c in fake.calls if c[0] == "uncordon"] == [("uncordon", "m-failed")]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_leave_keeps_an_operators_own_cordon(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """The node was cordoned before the demote (maintenance, say). The demote
+    leaves it alone and unmarked, so the failed leave leaves it cordoned."""
+    from tests.test_appliance_evict_etcd import _beat
+
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2", cordoned=("m1",))
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+    assert resp.status_code == 200, resp.text
+    assert fake.cordoned("m1") and not fake.marked("m1")
+    assert fake.cordoned("m2") and fake.marked("m2")
+
+    # Both leaves fail.
+    tokens = await _sessions(db_session, m1, m2)
+    for row in (m1, m2):
+        await _beat(client, row, tokens[row.hostname], cluster_join_state="failed")
+
+    assert fake.cordoned("m1"), "an operator's cordon must survive a failed leave"
+    assert not fake.cordoned("m2") and not fake.marked("m2")
+
+
+@pytest.mark.asyncio
+async def test_uncordoning_a_node_that_is_gone_is_harmless(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    from tests.test_appliance_evict_etcd import _beat
+
+    member, member_token = await _leaving_member(db_session, "m-gone")
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch)  # no Node at all
+    warned: list[str] = []
+    monkeypatch.setattr(supervisor.logger, "warning", lambda ev, **_kw: warned.append(ev))
+
+    await _beat(client, member, member_token, cluster_join_state="failed")
+
+    assert ("get", "m-gone") in fake.calls
+    assert not [c for c in fake.calls if c[0] != "get"]
+    assert "control_plane_uncordon_failed" not in warned
+
+
+@pytest.mark.asyncio
+async def test_a_completed_leave_is_never_uncordoned(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """``left`` hands the row to the seed's eviction, which deletes the Node.
+    Nothing on that path — nor a later ``failed`` the wiped node reports from
+    a stale sidecar — may touch the Node."""
+    from tests.test_appliance_evict_etcd import _beat
+
+    member, member_token = await _leaving_member(db_session, "m-left")
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m-left")
+    fake.nodes["m-left"]["spec"]["unschedulable"] = True
+    fake.nodes["m-left"]["metadata"]["annotations"] = {ANN: "true"}
+
+    await _beat(client, member, member_token, cluster_join_state="left")
+    await _beat(client, member, member_token, cluster_join_state="failed")
+
+    assert fake.cordoned("m-left")
+    assert [c for c in fake.calls if c[0] in ("cordon", "uncordon")] == []
+
+
+@pytest.mark.asyncio
+async def test_clear_cluster_state_on_an_abandoned_demote_uncordons(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    member, _ = await _leaving_member(db_session, "m-stuck")
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m-stuck")
+    fake.nodes["m-stuck"]["spec"]["unschedulable"] = True
+    fake.nodes["m-stuck"]["metadata"]["annotations"] = {ANN: "true"}
+
+    resp = await client.post(_clear_url(member), json={"force": True}, headers=_hdr(token))
+
+    assert resp.status_code == 200, resp.text
+    assert not fake.cordoned("m-stuck") and not fake.marked("m-stuck")
+
+
+@pytest.mark.asyncio
+async def test_clear_cluster_state_keeps_an_operators_cordon(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    member, _ = await _leaving_member(db_session, "m-stuck2")
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m-stuck2", cordoned=("m-stuck2",))
+
+    resp = await client.post(_clear_url(member), json={"force": True}, headers=_hdr(token))
+
+    assert resp.status_code == 200, resp.text
+    assert fake.cordoned("m-stuck2")
+
+
+@pytest.mark.asyncio
+async def test_a_retried_demote_cordons_again(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """A failed leave released the node; demoting it again cordons it again —
+    and a cordon the failed leave could not release (kubeapi blip) still reads
+    as the demote's own, not the operator's, so the retry's failure releases it."""
+    from tests.test_appliance_evict_etcd import _beat
+
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2")
+    body = {"appliance_ids": [str(m1.id), str(m2.id)]}
+
+    assert (await client.post(DEMOTE, json=body, headers=_hdr(token))).status_code == 200
+    # m2's leave fails and its uncordon is lost; m1's fails and is released.
+    tokens = await _sessions(db_session, m1, m2)
+    real_patch = fake.patch_node
+    monkeypatch.setattr(
+        k8s,
+        "patch_node",
+        lambda name, patch: (0, "blip") if name == "m2" else real_patch(name, patch),
+    )
+    for row in (m1, m2):
+        await _beat(client, row, tokens[row.hostname], cluster_join_state="failed")
+    monkeypatch.setattr(k8s, "patch_node", real_patch)
+    assert not fake.cordoned("m1") and fake.cordoned("m2") and fake.marked("m2")
+
+    # Retry. Rows report ``ready`` again (k3s back up as a member).
+    for row in (m1, m2):
+        await _beat(client, row, tokens[row.hostname], cluster_join_state="ready")
+    resp = await client.post(DEMOTE, json=body, headers=_hdr(token))
+    assert resp.status_code == 200, resp.text
+    assert fake.cordoned("m1") and fake.marked("m1")
+    assert fake.cordoned("m2") and fake.marked("m2")
+
+    for row in (m1, m2):
+        await _beat(client, row, tokens[row.hostname], cluster_join_state="failed")
+    assert not fake.cordoned("m1") and not fake.cordoned("m2")
+
+
+@pytest.mark.asyncio
+async def test_a_re_promote_does_not_inherit_the_demotes_cordon(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """A re-joined node normally registers a fresh Node. If it re-uses one an
+    earlier demote cordoned, the join's ``ready`` settle releases it — and
+    only the demote's cordon, never an operator's."""
+    from tests.test_appliance_evict_etcd import _beat, _row
+
+    ours, ours_token = await _row(
+        db_session,
+        "m-back",
+        appliance_variant="appliance",
+        desired_cluster_role=DESIRED_CLUSTER_ROLE_MEMBER,
+        cluster_join_state=CLUSTER_JOIN_STATE_JOINING,
+    )
+    theirs, theirs_token = await _row(
+        db_session,
+        "m-maint",
+        appliance_variant="appliance",
+        desired_cluster_role=DESIRED_CLUSTER_ROLE_MEMBER,
+        cluster_join_state=CLUSTER_JOIN_STATE_JOINING,
+    )
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m-back", "m-maint", cordoned=("m-maint",))
+    fake.nodes["m-back"]["spec"]["unschedulable"] = True
+    fake.nodes["m-back"]["metadata"]["annotations"] = {ANN: "true"}
+
+    await _beat(client, ours, ours_token, cluster_join_state="ready")
+    await _beat(client, theirs, theirs_token, cluster_join_state="ready")
+
+    await db_session.refresh(ours)
+    assert ours.cluster_role == CLUSTER_ROLE_MEMBER
+    assert not fake.cordoned("m-back") and not fake.marked("m-back")
+    assert fake.cordoned("m-maint")
 
 
 # ── who the refusal names (#1659 walk, C3) ───────────────────────────

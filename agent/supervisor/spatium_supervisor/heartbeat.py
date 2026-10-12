@@ -59,6 +59,7 @@ from .role_orchestrator import (
 # (compose vs k3s on ``detect_runtime()``) is gone with the rest of
 # docker; this is the only path now.
 from .service_lifecycle import (
+    LifecycleResult,
     apply_role_assignment,
     reconcile_node_labels,
     role_release_fingerprint,
@@ -1679,7 +1680,7 @@ def heartbeat_once(
             # re-attempt on the next heartbeat (the failure may have
             # been transient: image pull glitch, transient port
             # conflict, etc).
-            if lifecycle.state in ("ready", "idle"):
+            if _apply_settled(lifecycle):
                 _write_last_apply_hash(cfg.state_dir, env_hash)
 
     # Identity unused in C2's payload but kept on the signature so
@@ -1692,6 +1693,17 @@ def heartbeat_once(
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"
 _LAST_APPLY_HASH_FILE = "role-compose.env.hash"
+
+
+def _apply_settled(lifecycle: LifecycleResult) -> bool:
+    """Whether the heartbeat stamps the apply key after ``lifecycle``.
+
+    Only on success: a failed apply re-attempts on the next heartbeat. #1750 —
+    nor on a deferred one: a node sharing a cluster it is not a member of wrote
+    nothing, and stamping the key would skip the apply once it may write again
+    (a demoted node's fresh standalone cluster after ``left`` renders the same
+    key its ``leaving`` did, so it would never get its own role chart)."""
+    return lifecycle.state in ("ready", "idle") and not lifecycle.deferred
 
 
 def _role_apply_key(rendered_env: str, env_path: Path) -> str:

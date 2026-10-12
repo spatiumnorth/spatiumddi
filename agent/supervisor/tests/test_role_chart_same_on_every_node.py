@@ -97,6 +97,11 @@ def _applied_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
     monkeypatch.setattr(k8s_api, "_helmchart_values", lambda name, *, namespace: {})
     monkeypatch.setattr(k8s_api, "node_role_labels", lambda exclude="", timeout=5.0: (set(), None))
     monkeypatch.setattr(k8s_api, "apply_helmchart", capture)
+    # Each render is of a node alone in its k3s, so a non-member's render is
+    # written too (#1750 refuses only a non-member sharing a cluster).
+    monkeypatch.setattr(
+        k8s_api, "cluster_node_names", lambda timeout=5.0: (["this-node"], None), raising=False
+    )
     result = service_lifecycle.apply_role_assignment(target.profiles, env_file)
     assert result.state == "ready"
     assert len(written) == 1
