@@ -175,6 +175,10 @@ _DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
 # writes a .pfx into its own state dir.
 _TLS_CERT_FILE = "technitium-tls.pfx"
 
+# Zones created this pass and still held at ``queryAccess=Deny`` (#1758),
+# so a pass that dies before the release is finished by the next one.
+_HELD_ZONES_FILE = "technitium-zones-held.json"
+
 # Catalog-zone state (issue #1519). The catalog zone is not in the
 # bundle's zone list, so when catalog is turned off the bundle carries
 # no name for the zone that has to go — the previously applied
@@ -3541,82 +3545,162 @@ class TechnitiumDriver(DriverBase):
             zone = zone_payload["zone"]
             held_back = self._reconcile_one_zone(token, zone_payload, zone in held)
             if held_back:
-                # Re-enabling failed: remembered so the next pass retries.
+                # Release refused or skipped: remembered so the next pass
+                # releases it (#1758).
                 held.add(zone)
             else:
                 held.discard(zone)
             self._save_held_zones(held)
 
     def _reconcile_one_zone(self, token: str, zone_payload: dict[str, Any], held: bool) -> bool:
-        """Reconcile one zone; returns True if it is still held disabled.
+        """Reconcile one zone; returns True if it is still held (#1758).
 
         A Primary this pass just created answers under Technitium's DEFAULT
-        SOA (``hostadmin@<zone>``, 900 s minimum) until its own SOA and
-        records land, 8-11 s on a real group move (#1758), and a resolver
-        can cache an NXDOMAIN from it for that 900 s. ``zones/create`` takes
-        no SOA, so the zone is disabled straight after the create and
-        enabled only once the apex has been reconciled. A disabled zone is
-        not consulted for queries at all (``AuthZoneManager.Query*`` skip a
-        zone whose ``IsActive`` is false, 15.4.0), so nothing is answered
-        from the placeholder. A zone that already exists is never touched
-        here, so a second pass issues no disable/enable. ``held`` is a zone
-        a previous pass disabled and did not get to enable (agent killed
-        mid-pass, enable failed).
+        SOA (``hostadmin@<zone>``, TTL and minimum 900 s, ``PrimaryZone``
+        ctor, 15.4.0) until its own SOA and records land: 8-11 s on a real
+        group move, and a resolver can cache an NXDOMAIN from that window
+        for the 900 s. ``zones/create`` takes no SOA and no options, so the
+        zone is HELD straight after the create: its ``queryAccess`` is set
+        to ``Deny``, and its real options (query access included) are sent
+        only once records and apex are reconciled. A Forwarder converted
+        into a Primary (#1457) gets the same SOA from
+        ``_replace_placeholder_soa`` and is held the same way.
+
+        Why ``queryAccess=Deny`` and not ``zones/disable``: a DISABLED zone
+        is not authoritative at all (``AuthZoneManager.QueryAsync`` returns
+        null for ``!apexZone.IsActive``), and ``DnsServer.ProcessRequestAsync``
+        then RECURSES whenever the query has RD set and recursion is allowed,
+        which is the normal case for an internal zone on a resolving group.
+        ``corp.lan`` would then get the root's NXDOMAIN (negative TTL 86400)
+        and a split-horizon ``example.com`` its PUBLIC answers, both cached
+        downstream far longer than the 900 s this fixes. A zone that is
+        active but denies the client answers REFUSED from ``QueryAsync``
+        (``IsQueryAllowedAsync``) before any recursion or locally-served
+        special zone is consulted, and nobody caches a REFUSED (RFC 2308
+        caches NXDOMAIN / NODATA only), so a client moves to the next server.
+
+        A new zone has no catalog membership yet (``_apply_catalog`` runs
+        after every zone), so its own ``queryAccess`` is the one in force.
+        A zone that already exists is never held, so a second pass issues
+        nothing extra. ``held`` is a zone a previous pass held and did not
+        release (agent killed mid-pass, release refused).
         """
         zone = zone_payload["zone"]
-        created = self._ensure_zone_exists(token, zone_payload)
+        new_primary = self._ensure_zone_exists(token, zone_payload)
         is_primary = zone_payload.get("type", "Primary") == "Primary"
-        if created and is_primary:
-            held = self._set_zone_enabled(token, zone, False) or held
-            if held:
-                self._save_held_zone_now(zone)
-        try:
-            self._reconcile_zone_body(token, zone, zone_payload)
-        finally:
-            if held:
-                held = not self._set_zone_enabled(token, zone, True)
-        return held
-
-    def _set_zone_enabled(self, token: str, zone: str, enabled: bool) -> bool:
-        """``zones/enable`` / ``zones/disable``. True when the call succeeded."""
-        verb = "enable" if enabled else "disable"
-        try:
-            body = self._call(token, "POST", f"zones/{verb}", {"zone": zone}).json()
-        except (httpx.HTTPError, ValueError) as exc:  # report; never raise past the pass
-            log.warning(f"technitium_zone_{verb}_failed", zone=zone, error=str(exc))
+        options = zone_payload.get("options") or {}
+        if new_primary and is_primary and self._hold_zone(token, zone):
+            held = True
+            self._save_held_zone_now(zone)
+        if not held:
+            self._reconcile_zone_body(token, zone, zone_payload, options)
             return False
+        try:
+            # The zone's options, query access among them, are what release
+            # the hold, so they are applied last rather than first.
+            self._reconcile_zone_body(token, zone, zone_payload, None)
+        finally:
+            released = self._release_zone(token, zone, options)
+        return not released
+
+    def _hold_zone(self, token: str, zone: str) -> bool:
+        """Refuse every query to ``zone`` (loopback aside). True on success."""
+        return self._set_query_access(token, zone, {"queryAccess": "Deny"}, "hold")
+
+    def _release_zone(self, token: str, zone: str, options: dict[str, Any]) -> bool:
+        """Apply a held zone's options, which carry its query access.
+
+        No query access in the bundle (an ``allow_query`` Technitium cannot
+        express, which a normal pass leaves as the daemon has it) means
+        ``Allow``: what the zone had before the hold (``ApexZone`` ctor,
+        15.4.0), not a translation of the operator's list. If the options
+        call is refused or not sent (a bad ``zoneTransfer`` is never sent),
+        the query access still goes out on its own: a zone left at ``Deny``
+        is not served at all.
+        """
+        params = dict(options)
+        if "queryAccess" not in params:
+            params.update(queryAccess="Allow", queryAccessNetworkACL=[])
+        try:
+            if self._apply_zone_options(token, zone, params):
+                return True
+        except (httpx.HTTPError, ValueError) as exc:  # fall back below
+            log.warning("technitium_zone_options_failed", zone=zone, error=str(exc))
+        acl = params.get("queryAccessNetworkACL") or []
+        return self._set_query_access(
+            token,
+            zone,
+            {
+                "queryAccess": params["queryAccess"],
+                "queryAccessNetworkACL": ",".join(str(a) for a in acl)
+                if isinstance(acl, list)
+                else str(acl),
+            },
+            "release",
+        )
+
+    def _set_query_access(
+        self, token: str, zone: str, params: dict[str, Any], what: str
+    ) -> bool:
+        try:
+            body = self._call(
+                token, "POST", "zones/options/set", {"zone": zone, **params}
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:  # report; never raise past the pass
+            body = {"status": "error", "errorMessage": str(exc)}
         if body.get("status") == "ok":
             return True
-        log.warning(f"technitium_zone_{verb}_failed", zone=zone, error=body.get("errorMessage"))
-        if enabled:
-            self._note_apply_failure(f"{zone}: zone enable: {body.get('errorMessage')}")
+        log.warning(f"technitium_zone_{what}_failed", zone=zone, error=body.get("errorMessage"))
+        if what == "release":
+            # Still refusing every query: the zone is not served, which the
+            # operator must see. The next pass retries from the marker.
+            self._note_apply_failure(
+                f"{zone}: zone still refusing queries (release failed): "
+                f"{body.get('errorMessage')}"
+            )
         return False
 
     @property
     def _held_zones_path(self) -> Path:
-        return Path(self.state_dir) / "zones-held-disabled.json"
+        return Path(self.state_dir) / _HELD_ZONES_FILE
 
     def _load_held_zones(self) -> set[str]:
         try:
-            return {str(z) for z in json.loads(self._held_zones_path.read_text())}
-        except (OSError, ValueError, TypeError):
+            data = json.loads(self._held_zones_path.read_text())
+        except FileNotFoundError:
             return set()
+        except (OSError, ValueError) as exc:
+            log.warning("technitium_held_zones_unreadable", error=str(exc))
+            return set()
+        if not isinstance(data, list):
+            log.warning("technitium_held_zones_unreadable", error="not a list")
+            return set()
+        return {z for z in data if isinstance(z, str) and z}
 
     def _save_held_zones(self, held: set[str]) -> None:
         path = self._held_zones_path
         try:
             if held:
-                path.write_text(json.dumps(sorted(held)))
-            elif path.exists():
-                path.unlink()
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(sorted(held)))
+                os.replace(tmp, path)
+            else:
+                path.unlink(missing_ok=True)
         except OSError as exc:
             log.warning("technitium_held_zones_write_failed", error=str(exc))
 
     def _save_held_zone_now(self, zone: str) -> None:
         self._save_held_zones(self._load_held_zones() | {zone})
 
-    def _reconcile_zone_body(self, token: str, zone: str, zone_payload: dict[str, Any]) -> None:
-        self._apply_zone_options(token, zone, zone_payload.get("options") or {})
+    def _reconcile_zone_body(
+        self,
+        token: str,
+        zone: str,
+        zone_payload: dict[str, Any],
+        options: dict[str, Any] | None,
+    ) -> None:
+        if options is not None:
+            self._apply_zone_options(token, zone, options)
 
         # Records belong to us only on a Primary. A Secondary/Stub is
         # filled by the transfer and a Forwarder holds none, so diffing
@@ -3923,7 +4007,10 @@ class TechnitiumDriver(DriverBase):
     def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> bool:
         """Create the zone if absent, with the params its type requires.
 
-        Returns True only when this call created the zone (#1758).
+        Returns True when this call created the zone, or converted an
+        existing one into a Primary (#1457): either way the zone starts
+        answering authoritatively from a SOA that is not its own, so the
+        caller holds it until the apex is reconciled (#1758).
 
         Unlike a Primary, a Secondary/Stub create is **not** guaranteed to
         succeed and is **not** safely retryable-forever: Technitium resolves
@@ -3978,11 +4065,11 @@ class TechnitiumDriver(DriverBase):
                 # the old upstream. Convert first, so the upstream below is
                 # applied to the type the zone now has (a zone converted to
                 # Forwarder gets every upstream in the bundle, #1764).
-                self._reconcile_zone_type(token, zone, ztype)
+                converted = self._reconcile_zone_type(token, zone, ztype)
                 self._reapply_zone_upstream(
                     token, zone, ztype, params, forwarder_specs, dnssec
                 )
-                return False
+                return converted
             log.error(
                 "technitium_zone_create_failed",
                 zone=zone,
@@ -3998,7 +4085,7 @@ class TechnitiumDriver(DriverBase):
             self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)
         return True
 
-    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
+    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> bool:
         """Bring an existing zone's type in line with the bundle (#1457).
 
         ``zones/create`` never changes the type of a zone that already
@@ -4013,6 +4100,8 @@ class TechnitiumDriver(DriverBase):
 
         An unreadable live type is skipped, not guessed: converting on a
         wrong guess is worse than leaving the zone as it is.
+
+        Returns True when the zone was converted (to any type).
         """
         body = self._call(token, "GET", "zones/options/get", {"zone": zone}).json()
         live = (body.get("response") or {}).get("type") if body.get("status") == "ok" else None
@@ -4022,15 +4111,15 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 error=body.get("errorMessage"),
             )
-            return
+            return False
         if live == ztype:
-            return
+            return False
         resp = self._call(token, "POST", "zones/convert", {"zone": zone, "type": ztype}).json()
         if resp.get("status") == "ok":
             log.info("technitium_zone_type_converted", zone=zone, from_type=live, to_type=ztype)
             if live == "Forwarder" and ztype == "Primary":
                 self._replace_placeholder_soa(token, zone)
-            return
+            return True
         log.error(
             "technitium_zone_type_mismatch",
             zone=zone,
@@ -4039,6 +4128,7 @@ class TechnitiumDriver(DriverBase):
             error=resp.get("errorMessage"),
         )
         self._note_apply_failure(f"{zone}: zone type: {resp.get('errorMessage')}")
+        return False
 
     def _reapply_zone_upstream(
         self,
@@ -4262,7 +4352,7 @@ class TechnitiumDriver(DriverBase):
 
     def _apply_zone_options(
         self, token: str, zone: str, options: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """Push per-zone options, validating enums before we send them.
 
         ``zones/options/set`` answers ``{"status": "ok"}`` for a value it
@@ -4272,6 +4362,8 @@ class TechnitiumDriver(DriverBase):
         whatever it was, which for a zone we meant to lock down is a
         security regression that no log line would report. Refuse to send
         anything not in the known set.
+
+        True when there was nothing to send or the daemon took it.
         """
         options = dict(options)
         for item in options.pop("_unapplied", None) or []:
@@ -4283,7 +4375,7 @@ class TechnitiumDriver(DriverBase):
             if self._unapplied_acl is not None:
                 self._unapplied_acl.setdefault(item["kind"], []).append(zone)
         if not options:
-            return
+            return True
         transfer = options.get("zoneTransfer")
         if transfer is not None and transfer not in _ZONE_TRANSFER_VALUES:
             log.error(
@@ -4293,7 +4385,7 @@ class TechnitiumDriver(DriverBase):
                 supported=sorted(_ZONE_TRANSFER_VALUES),
             )
             self._note_apply_failure(f"{zone}: zone options: bad zoneTransfer {transfer}")
-            return
+            return False
 
         params: dict[str, Any] = {"zone": zone}
         for key, value in options.items():
@@ -4311,6 +4403,8 @@ class TechnitiumDriver(DriverBase):
             self._note_apply_failure(
                 f"{zone}: zone options: {body.get('errorMessage')}"
             )
+            return False
+        return True
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
         resp = self._call(
