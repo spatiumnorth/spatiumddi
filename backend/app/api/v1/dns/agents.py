@@ -278,7 +278,7 @@ async def _warn_if_second_signer(db: DB, group: DNSServerGroup, server: DNSServe
     warning log, an audit row, the zone's ``dnssec_multi_signer`` flag (UI
     badge + DNSSEC card) and the default-on ``dnssec_multi_signer`` alert.
     """
-    if server.driver not in dnssec_signers.SIGNING_DRIVERS:
+    if server.driver not in dnssec_signers.PER_SERVER_SIGNING_DRIVERS:
         return
     n = await dnssec_signers.signing_server_count(db, group.id)
     if n < 2:

@@ -55,7 +55,7 @@ from app.models.dns import (
     DNSZoneUpdateAcl,
 )
 from app.services.dns import technitium_api_scope
-from app.services.dns.dnssec_signers import lock_group, signing_server_count
+from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
 from app.services.dns.record_ops import (
@@ -78,12 +78,13 @@ ACK_VIEW_WIDENING = "view_widening"
 ACK_DNSSEC_ROLLOVER = "dnssec_rollover"
 ACK_LOST_UPDATE_GRANTS = "lost_update_grants"
 
-#: Drivers whose agents can actually sign a zone. Mirrors the router's
-#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate, which every other
+#: Drivers whose agents can actually sign a zone: the same set as the router's
+#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate (both read
+#: ``dnssec_signers.SIGNING_DRIVERS``), which every other
 #: path into a signed zone goes through — a move that skipped it would
 #: leave the row saying ``dnssec_enabled`` while the zone is served
 #: unsigned, indefinitely and with nothing to notice it.
-DNSSEC_SIGN_DRIVERS = frozenset({"bind9", "powerdns"})
+DNSSEC_SIGN_DRIVERS = SIGNING_DRIVERS
 
 
 class ZoneMoveError(Exception):
