@@ -452,6 +452,12 @@ so a hard node loss reschedules them promptly. Under `hard` a
 when `replicas == eligible nodes`, required anti-affinity makes a surge
 pod unschedulable, so the default surge-first rollout would deadlock
 forever. Retiring one old pod first frees a node for its replacement.
+Under `hard` this holds at one replica too (#1541): a demote from three
+nodes to one renders a single replica with no anti-affinity, but the old
+pod it replaces still carries the 3-node required term, which keeps a
+surged pod off the only node. So a one-node appliance takes a brief api /
+worker outage on each rollout, as its frontend already does with
+`Recreate`.
 
 > **The raw HA prototypes in `k8s/ha/`** (`postgres-cluster.yaml`,
 > `redis-sentinel.yaml`, `postgres-docker-compose.yaml`) are non-Helm

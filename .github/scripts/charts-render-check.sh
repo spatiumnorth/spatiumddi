@@ -54,6 +54,12 @@
 #                      limits must each be at least the api's (#1174). Below
 #                      the api it is OOMKilled before it serves a byte, and
 #                      helm, kubeconform and the posture gates all pass it.
+#   rollout-strategy — every render: a Deployment with required pod
+#                      anti-affinity must retire an old pod first, or its
+#                      rollout wedges once replicas == nodes (#590); plus a
+#                      dedicated pass asserting the appliance's api / worker /
+#                      frontend retire first at one replica too, where the
+#                      blocking term rides on the OUTGOING pods (#1541).
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -146,6 +152,10 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
         || failures=$((failures + 1))
+    # #590 / #1541 — required anti-affinity with a surge-first rollout
+    # wedges once replicas == nodes.
+    python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -221,6 +231,26 @@ render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
 render umbrella-appliance-mirror "$UMBRELLA" \
     --set slotImageMirror.enabled=true \
     --set api.resources.limits.memory=2949Mi
+# #1541 — the appliance control plane's own values (``hard`` anti-affinity,
+# which the supervisor writes on every install) at one replica and at three.
+# One replica renders no anti-affinity of its own, but the pods a 3 → 1
+# demote replaces still carry the 3-node required term, which keeps a
+# surged pod off the only node for good — so api and worker must retire
+# first at one replica as well as at three.
+APPLIANCE_CP_HARD=(
+    --set api.podAntiAffinity=hard
+    --set worker.podAntiAffinity=hard
+    --set frontend.podAntiAffinity=hard
+    --set frontend.hostNetwork=true
+)
+for n in 1 3; do
+    render "umbrella-appliance-cp-$n" "$UMBRELLA" "${APPLIANCE_CP_HARD[@]}" \
+        --set api.replicas=$n --set worker.replicas=$n --set frontend.replicas=$n
+    echo "── rollout strategy at $n replica(s) (umbrella, #1541)"
+    python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" \
+        --retire-first api --retire-first worker --retire-first frontend \
+        "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
+done
 POSTURE_ARGS="--require-priority"
 render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 # ...and again on the HA topology. The CNPG ``Cluster`` and the Sentinel
