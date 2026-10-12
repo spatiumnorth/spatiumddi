@@ -164,7 +164,7 @@ def _syncable_types(driver: Any, fallback: frozenset[str] | set[str]) -> frozens
 # naive string compare would treat those as distinct and import a duplicate.
 # ``_normalize_value`` folds both forms into a single canonical shape before
 # we key on them.
-_NAME_VALUED_TYPES = frozenset({"CNAME", "NS", "PTR", "MX", "SRV"})
+_NAME_VALUED_TYPES = frozenset({"CNAME", "DNAME", "NS", "PTR", "MX", "SRV"})
 
 
 def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
@@ -195,12 +195,26 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
         # as stored, not ``v``: ``ech`` base64 is case-sensitive, and the
         # canonical form already folds what is case-insensitive.
         return svcb_canonical((value or "").strip(), zone_name)
+    if rtype == "NAPTR":
+        # #1759: the replacement is the last token and a name like any
+        # other, so ``web`` / ``web.`` / ``web.<zone>.`` are one record. The
+        # other fields compare as the lower-cased text they are.
+        head, sep, replacement = v.rpartition(" ")
+        if not sep:
+            return v
+        return f"{head} {_normalize_name(replacement, zone_name)}"
     if rtype == "URI":
         # #1513: fold away the bare-authority trailing slash a server
         # may append when storing the record; a path's slash stays.
         return strip_bare_authority_slash(v)
     if rtype not in _NAME_VALUED_TYPES:
         return v
+    return _normalize_name(v, zone_name)
+
+
+def _normalize_name(v: str, zone_name: str) -> str:
+    """A lower-cased name target in its one comparison form: absolute, with
+    its trailing dot. ``@`` and the empty string are the zone."""
     # "@" means the zone apex.
     if v == "@" or v == "":
         return zone_name.lower()
