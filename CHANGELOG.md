@@ -84,6 +84,35 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Agentless Technitium servers now serve TXT records as written
+  (#1760).** The #1694 fix reached only the agent-managed driver. The
+  agentless `technitium_api` driver still sent a TXT value as
+  Technitium's `text` parameter after stripping a trailing dot, so a
+  quoted SPF, DMARC or DKIM value (`"v=spf1 -all"`, the form the UI
+  suggests) was served with its quote characters and receivers found
+  no policy, a DKIM key split into two strings was merged into one,
+  and `Hello.` lost its full stop. Reading back joined the strings
+  too, so drift reported these records in sync. The driver now sends
+  and reads `characterStringsBase64`, the strings themselves. The
+  same pass fixed TXT on the AXFR pull path (BIND9, agent-managed
+  Technitium, Windows without WinRM): the reader joined a record's
+  strings, so a DKIM key stored as two quoted strings was permanent
+  drift and Sync with Servers imported a merged duplicate. Drift and
+  Sync now compare TXT by its strings, case kept, so a DKIM edit that
+  only changes case is no longer invisible. Sync's push now sends the
+  whole record set at a name, as an ordinary edit does, so repairing
+  one TXT no longer removes the in-sync TXT beside it on a
+  Technitium or Windows server.
+
+  **After upgrading, repair existing TXT records on `technitium_api`
+  servers.** Records written before this release are still served in
+  the broken form. Either run Sync with Servers on each affected
+  zone, or open each TXT record and save it unchanged. Sync no longer
+  imports the broken form as a new record: it recognises it as the
+  stored record served wrong and pushes the stored value, which
+  replaces the whole TXT set at that name. Until a zone is repaired,
+  its drift report lists each affected TXT as both missing and extra.
+
 - **The agentless `technitium_api` driver is marked experimental
   for 1.0 and its supported scope is enforced.** It writes into a
   Technitium server SpatiumDDI does not own and has no reconcile loop,
