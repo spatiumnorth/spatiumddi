@@ -32,6 +32,23 @@ class OIDCServiceError(Exception):
     """Raised on discovery / token / verification failures."""
 
 
+#: How far before a step-up flow started an ``auth_time`` may fall, for clock
+#: skew between this server and the IdP. A compliant IdP re-authenticates
+#: AFTER the flow starts, so this only has to cover skew.
+AUTH_TIME_LEEWAY_SECONDS = 30
+
+
+def _require_fresh_auth_time(raw: Any, fresh_since: int, *, now: float | None = None) -> None:
+    # bool is an int subclass; ``true`` is not a time.
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise OIDCServiceError("ID token has no usable auth_time, so it proves no fresh sign-in")
+    current = time.time() if now is None else now
+    if raw < fresh_since - AUTH_TIME_LEEWAY_SECONDS:
+        raise OIDCServiceError("ID token auth_time predates this re-authentication")
+    if raw > current + AUTH_TIME_LEEWAY_SECONDS:
+        raise OIDCServiceError("ID token auth_time is in the future")
+
+
 @dataclass
 class OIDCConfig:
     discovery_url: str
@@ -131,7 +148,13 @@ async def build_authorize_url(
     state: str,
     nonce: str,
     redirect_uri: str,
+    *,
+    reauth: bool = False,
 ) -> str:
+    """The IdP's authorize URL. ``reauth`` is the MFA-enrolment step-up
+    (#1354): ``prompt=login`` + ``max_age=0`` ask the IdP to authenticate the
+    user again rather than reuse its session, and make ``auth_time`` a claim
+    the ID token must carry (OIDC core 3.1.2.1)."""
     doc = await _fetch_discovery(cfg, provider_id)
     endpoint = doc.get("authorization_endpoint")
     if not endpoint:
@@ -144,6 +167,9 @@ async def build_authorize_url(
         "state": state,
         "nonce": nonce,
     }
+    if reauth:
+        params["prompt"] = "login"
+        params["max_age"] = "0"
     sep = "&" if "?" in endpoint else "?"
     return f"{endpoint}{sep}{urlencode(params)}"
 
@@ -154,9 +180,18 @@ async def exchange_code(
     code: str,
     redirect_uri: str,
     expected_nonce: str,
+    *,
+    fresh_since: int | None = None,
 ) -> ExternalAuthResult:
     """Exchange an authorization code for tokens, validate the ID token, and
-    return a normalised ``ExternalAuthResult``."""
+    return a normalised ``ExternalAuthResult``.
+
+    ``fresh_since`` (epoch seconds) makes this the verification half of a
+    step-up (#1354): the ID token must carry an ``auth_time`` no earlier than
+    that instant (less :data:`AUTH_TIME_LEEWAY_SECONDS`) and not in the
+    future. A token with no ``auth_time``, or a non-numeric one, is refused: an
+    IdP that ignored ``prompt=login`` and replayed its old session proves
+    nothing, and so does one that does not say when the user signed in."""
     doc = await _fetch_discovery(cfg, provider_id)
     token_endpoint = doc.get("token_endpoint")
     issuer = doc.get("issuer")
@@ -204,6 +239,9 @@ async def exchange_code(
 
     if claims.get("nonce") != expected_nonce:
         raise OIDCServiceError("nonce mismatch")
+
+    if fresh_since is not None:
+        _require_fresh_auth_time(claims.get("auth_time"), fresh_since)
 
     # Merge in userinfo claims where missing (access_token is required).
     merged: dict[str, Any] = dict(claims)

@@ -2412,8 +2412,17 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
-  /** What starting an enrolment asks for (#1241). */
-  enrol_requires: "password" | "recent_sign_in";
+  /** What starting an enrolment asks for (#1241, #1354): the local
+   *  password; the password at the account's own LDAP / RADIUS / TACACS+
+   *  provider; a forced re-login at its OIDC / SAML IdP; or, only when the
+   *  provider is gone or off, a recent sign-in. */
+  enrol_requires:
+    | "password"
+    | "provider_password"
+    | "provider_reauth"
+    | "recent_sign_in";
+  /** The provider named by `provider_password` / `provider_reauth`. */
+  enrol_provider_name: string | null;
   /** For `recent_sign_in`: false means sign out and back in first. */
   enrol_sign_in_recent: boolean;
   /** How recent that sign-in must be, in minutes. */
@@ -9747,6 +9756,13 @@ export const authApi = {
   mfaEnrollBegin: (password?: string) =>
     api
       .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
+      .then((r) => r.data),
+  /** #1354 — start the forced IdP re-login an OIDC / SAML account needs
+   *  before `mfaEnrollBegin`. Navigate the browser to `authorize_url`; it
+   *  returns to /account?mfa_reauth=ok|failed. */
+  mfaEnrollReauth: () =>
+    api
+      .post<{ authorize_url: string }>("/auth/mfa/enroll/reauth")
       .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
