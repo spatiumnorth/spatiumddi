@@ -3043,6 +3043,27 @@ def test_allow_query_none_denies(tmp_path: Path) -> None:
     assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
 
 
+def test_allow_query_none_inside_a_list_denies_everyone(tmp_path: Path) -> None:
+    # BIND compiles ``none`` as ``!any`` (aclconf.c: "none == !any"), so a
+    # ``none`` ahead of an address admits nobody. Dropping it as a no-op
+    # would open the zone to 10/8.
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["none", "10.0.0.0/8"]}},
+    )
+    assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
+
+
+def test_allow_query_address_before_none_keeps_only_that_address(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["10.0.0.0/8", "none", "any"]}},
+    )
+    got = _query_access_calls(calls)["a.test"]
+    assert got["queryAccess"] == "UseSpecifiedNetworkACL"
+    assert got["queryAccessNetworkACL"] == "10.0.0.0/8,!0.0.0.0/0,!::/0"
+
+
 def test_allow_query_any_inside_a_list_keeps_the_exception(tmp_path: Path) -> None:
     calls = _apply_with_calls(
         tmp_path,

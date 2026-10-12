@@ -863,10 +863,12 @@ def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
     named ACL). The caller then leaves the zone alone and says so: guessing
     would either widen the access or lock the zone out.
 
-    Empty / absent means ``any``, as the BIND9 agent reads it. ``none`` and
-    ``any`` are only special on their own; inside a list ``any`` becomes both
-    default routes (so ``["!10.1.0.0/16", "any"]`` keeps its exception) and
-    ``none`` (which matches nothing) drops out.
+    Empty / absent means ``any``, as the BIND9 agent reads it. Inside a list
+    ``any`` becomes both default routes (so ``["!10.1.0.0/16", "any"]`` keeps
+    its exception). ``none`` is NOT a no-op: BIND compiles it as ``!any``, a
+    deny-everyone match (``aclconf.c``: "none == !any"), so
+    ``["none", "10.0.0.0/8"]`` admits nobody. Both are catch-alls, so
+    everything after the first one is unreachable and dropped.
     """
     elements = [str(e).strip() for e in (allow_query or []) if str(e).strip()]
     if not elements:
@@ -882,17 +884,20 @@ def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
         body = element[1:].strip() if negated else element
         prefix = "!" if negated else ""
         name = body.lower()
-        if name == "any":
-            acl += [f"{prefix}0.0.0.0/0", f"{prefix}::/0"]
-        elif name == "none":
-            continue
+        if name in ("any", "none"):
+            # ``none`` is ``!any``; ``!none`` is ``any``. Either way it
+            # matches every client, so nothing after it can be reached.
+            deny = negated != (name == "none")
+            mark = "!" if deny else ""
+            acl += [f"{mark}0.0.0.0/0", f"{mark}::/0"]
+            break
         else:
             try:
                 net = ipaddress.ip_network(body, strict=False)
             except ValueError:
                 return None
             acl.append(f"{prefix}{net}")
-    if not acl:
+    if not acl or all(a.startswith("!") for a in acl):
         return "Deny", []
     return "UseSpecifiedNetworkACL", acl
 
