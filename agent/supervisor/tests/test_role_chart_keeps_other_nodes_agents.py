@@ -65,6 +65,8 @@ class Cluster:
         self.reads: list[str] = []
         self.chart_readable = True
         self.labels_readable = True
+        self.nodes_readable = True
+        self.deleted = False
 
     def helmchart_values(self, name: str, *, namespace: str = "kube-system") -> dict | None:
         assert (name, namespace) == ("spatiumddi-appliance", "kube-system")
@@ -86,6 +88,19 @@ class Cluster:
             ]
         }
         return k8s_api.role_labels_of(doc, exclude), None
+
+    def cluster_node_names(self, timeout: float = 5.0):
+        """The nodes of the cluster (#1750): every node with a labels entry."""
+        self.reads.append("nodes")
+        if not self.nodes_readable:
+            return None, "kubeapi status 503"
+        return list(self.labels), None
+
+    def delete_helmchart(self, name: str, *, chart_namespace: str) -> tuple[bool, None]:
+        assert (name, chart_namespace) == ("spatiumddi-appliance", "kube-system")
+        self.deleted = True
+        self.values_content = None
+        return True, None
 
     def apply_helmchart(
         self, name: str, *, values: dict, chart_content_b64: str, **_: object
@@ -145,6 +160,10 @@ def _as(
     monkeypatch.setattr(k8s_api, "node_role_labels", cluster.node_role_labels, raising=False)
     monkeypatch.setattr(k8s_api, "apply_helmchart", cluster.apply_helmchart)
     monkeypatch.setattr(k8s_api, "patch_node_labels", cluster.patch_node_labels)
+    monkeypatch.setattr(k8s_api, "cluster_node_names", cluster.cluster_node_names, raising=False)
+    monkeypatch.setattr(k8s_api, "delete_helmchart", cluster.delete_helmchart)
+    # This node is a node of the cluster (#1750).
+    cluster.labels.setdefault(name, {})
 
 
 def _seed(monkeypatch: pytest.MonkeyPatch, cluster: Cluster, release: str = RELEASE) -> None:
@@ -310,12 +329,13 @@ def test_an_appliance_off_the_cluster_reads_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A paired appliance never promoted runs its own k3s and its own chart:
-    nothing it writes is another node's, so it reads nothing and renders its
-    own roles alone."""
+    nothing it writes is another node's, so it reads no labels and no chart
+    and renders its own roles alone. It reads only the node list, which says
+    it is alone in its k3s (#1750)."""
     cluster = Cluster()
     _member(monkeypatch, cluster, join_state=None)
     assert _apply(tmp_path, NO_ROLES).state == "ready"
-    assert cluster.reads == []
+    assert cluster.reads == ["nodes"]
     assert not any(cluster.agent_blocks().values())
 
 

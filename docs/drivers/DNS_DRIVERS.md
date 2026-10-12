@@ -777,7 +777,7 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 **TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
 
-**Catalog zones (RFC 9432)** work in both roles. As **producer** the agent creates the `Catalog` zone and stamps `catalog=<name>` onto each primary it owns. As **consumer** it creates a `SecondaryCatalog` zone pointed at the producer — note that zone is *not* in the bundle's zone list (the control plane ships it as a catalog block, not a zone row), so `_apply_catalog` has to create it or a consumer silently does nothing at all. Turning catalog zones off clears membership by writing `catalog=""`, which is how Technitium unsets the field; without that, disabling the feature would leave every member permanently enrolled.
+**Catalog zones (RFC 9432) are NOT supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782); the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766), 1.1.0). Both roles are broken: as **producer**, turning the catalog on makes every member zone inherit the catalog zone's transfer `Deny` and notify `None`, which silently undoes the #734 transfer grant, so drift, Sync with Servers and NOTIFY all stop; as **consumer**, the `SecondaryCatalog` zone is created without TSIG, cannot transfer the producer's denied catalog, and stays empty. The driver reports `catalog_zones: False`; enabling `catalog_zones_enabled` on a group with a `technitium` / `technitium_api` server is a 422, as is putting such a server into a catalog-enabled group: on server create, on a driver change, on a server move, and on a Fleet or Copilot role assignment that points a `dns-technitium` appliance at one. An agent that auto-registers straight into a catalog group (its `AGENT_GROUP` names one) is *not* refused, because a refused registration re-bootstraps in a loop; it logs `dns_agent_catalog_unsupported_driver` and the group carries the warning below. A group that already had it on keeps rendering as before, and `GET /dns/groups` carries a `catalog_unsupported_warning` (also shown in the group editor). The agent code (`_apply_catalog`: producer `Catalog` zone + `catalog=<name>` stamping, consumer `SecondaryCatalog`, `catalog=""` to unenrol) is retained for #1766.
 
 ### 4B.3b DNSSEC (issue #740)
 
@@ -830,6 +830,11 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 - **Enabling a listener and setting the cert path are independent.** `enableDnsOverTls=true` lands even when the `dnsTlsCertificatePath` in the *same call* is rejected, which would leave a listener enabled with no certificate. So the cert path goes first, in its own call, and the listeners are only enabled once it succeeds.
 - **`forwarderProtocol` is silently ignored unless `forwarders` is set in the same call.** Setting the protocol alone returns `{"status":"ok"}` and leaves it at `Udp`. The two are always sent together.
 - **Encrypted forwarding needs a domain name, not an IP.** `1.1.1.1` is rejected with `Address must be a domain name` — there would be nothing to validate the upstream certificate against. The neutral model carries a list of forwarder IPs plus a single `forward_tls_hostname`, so over `tls`/`https`/`quic` the hostname wins and the IPs are dropped with a log line naming what went. Technitium then normalises a bare hostname into the transport's canonical form (`cloudflare-dns.com` → `cloudflare-dns.com:853` for DoT, `https://cloudflare-dns.com/dns-query` for DoH).
+
+**Recursion and rate limiting ([#1761](https://github.com/spatiumnorth/spatiumddi/issues/1761)).** Both have daemon defaults that stay in force unless sent (recursion `AllowOnlyForPrivateNetworks`; 600 queries/min per IPv4 /32 and 6000 per /24, IPv6 600/1200/6000, averaged over 5 minutes), so every structural apply sends them:
+
+- `recursion`: `Deny` when `recursion_enabled` is false (the bundle already ANDs in the group's `is_recursive`). Otherwise `allow_recursion` decides. Absent, empty, or exactly `["any"]` all send `AllowOnlyForPrivateNetworks`, the engine's private-network default. **SpatiumDDI does not expose open recursion on Technitium through the default.** `["any"]` is the model's stored default and nothing distinguishes an untouched group from one where an operator chose it; the BIND9 agent never renders `allow-recursion` ([#1786](https://github.com/spatiumnorth/spatiumddi/issues/1786)), so BIND groups run BIND's own `localnets; localhost;` default whatever the field says. Mapping `["any"]` to `Allow` would therefore open recursion to the internet on upgrade, on one engine only. Until `allow_recursion` is rendered the same way for every engine, `["any"]` means "the engine's private-network default", and `Allow` is never sent. Any other list is an explicit ACL and sends `UseSpecifiedNetworkACL` with `recursionNetworkACL` as comma-separated CIDRs (`!` denies; `localhost` / `localnets` expand to loopback / RFC 1918 + link-local + ULA, an approximation of BIND's attached-networks `localnets`; an `any` *inside* a longer list expands to `0.0.0.0/0, ::/0`, so open recursion takes an explicit list). Named ACLs and unparseable entries are dropped with a warning; if no allow entry survives the result is `Deny`. The mode is checked against the four enum values before sending, because `settings/set` ignores an unknown one silently.
+- Rate limits: RRL off (or `rrl_log_only`, which Technitium cannot express) sends empty `qpmPrefixLimitsIPv4` / `IPv6`, which disables the limit, and clears `qpmLimitBypassList`. `rrl_enabled` defaults to false, so on upgrade every existing Technitium group loses the daemon's built-in 600 qpm limit; that is the fix, not a side effect. RRL on sends one per-client limit, `32|N|N` and `128|N|N` with N = `rrl_responses_per_second` x 60, `qpmLimitSampleMinutes` from `rrl_window` (seconds rounded up to minutes), `qpmLimitUdpTruncationPercentage` from `rrl_slip` (100 / slip, 0 = drop), and `rrl_exempt_clients` as the bypass list. This approximates BIND's RRL (identical responses per second); Technitium counts queries per minute. Neither call restarts the daemon: in 15.4.0 `recursion` and the `qpm*` keys are plain property sets (an unchanged `recursion` is a no-op, the qpm setters re-arm the sampling timer), followed by the same config-file save every `settings/set` does.
 
 `forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
 
@@ -996,6 +1001,29 @@ Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry 
 
 `CloudDNSDriverBase.probe` has existed since #37 with **no caller**: nothing in the API, tasks or services invoked it, so the answer to "did that token work?" was "wait for the next sync to fail". #810 adds `POST /api/v1/dns/groups/{gid}/servers/{sid}/test-connection`, which probes a saved server with its stored credentials and returns `{ok, message}`. It covers every driver in `CREDENTIALED_DNS_DRIVERS`, so the eight cloud drivers get it too. Post-save only — the credentials come from the row, unlike `/test-windows-credentials`, which also accepts plaintext for a pre-save dry run.
 
+### 4C.7a Experimental in 1.0 — the supported scope, enforced ([#1784](https://github.com/spatiumnorth/spatiumddi/issues/1784))
+
+`technitium_api` writes into a server SpatiumDDI does not own and has no reconcile loop, so for 1.0 it is labelled **experimental** (`capabilities()["experimental"] is True`; an *Experimental* label on the driver picker, the server row and detail, and the group page) and its supported scope is enforced with 422s instead of being left to fail silently. Every refusal names `technitium_api is experimental in 1.0` and the reason.
+
+Supported:
+
+- **One server per group.** A second `technitium_api` server is refused on server create, on a driver change via update, and on a move into the group (`ensure_group_single_driver`). A second server never received zones the first was given (#1771).
+- **Zones SpatiumDDI creates, Primary only.** A non-Primary zone create is refused. If the zone already exists on the server, create adopts it only when it is an **empty Primary** (no records beyond the apex SOA and NS; a delegation NS below the apex counts as a record); a Secondary / Stub / Forwarder of the same name, or a Primary holding records, is a 409 naming what was found, because a later delete from SpatiumDDI would remove the operator's zone (#1775).
+- **Records** on those zones, over the REST API as in §4C.2.
+
+Refused (422), because the driver never writes them (#1769, #1771, #1774, #1775 track the 1.1 fixes):
+
+- **DNS pools** on the group: pool create and pool member add (a pool collapses to one member).
+- **Zone settings** SOA `ttl` / `refresh` / `retry` / `expire` / `minimum` / `primary_ns` / `admin_email` and `allow_query` / `allow_transfer` / `also_notify` / `notify_enabled`, and changing `zone_type` away from Primary. On update only a *changed* value is refused, so a zone that already holds one can be re-saved, or put back to the default.
+- **Group options** (`PUT …/options`): changing a value from the stored one is refused; an unchanged re-save, or a change back to the column default, is not. **Catalog zones**: turning `catalog_zones_enabled` on is refused, turning it off is not.
+- **Blocklist assignment** to the group (new assignments only).
+- **Moving a zone into** such a group when it is non-Primary, has pools, or carries a setting above. The move preview reports it as `technitium_api_refusal` and the move dialog blocks on it, so preview and commit agree.
+- The Operator Copilot's `create_dns_zone` is held to the same zone rules in its preview and its apply.
+
+The UI hides what it would refuse on such a group: the zone dialog offers Primary only and drops Primary NS / admin email / default TTL, the group's Options tab is hidden, and the zone's Pools view lists existing pools without a *New Pool* button.
+
+**Groups that already violate the scope** (two servers, existing pools) keep serving: nothing is removed or disabled. The group response carries `scope_warnings`, rendered as a banner on the group page, and only *new* changes are refused. Other drivers are untouched.
+
 ### 4C.8 Not in scope for this driver
 
 DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
@@ -1063,8 +1091,8 @@ Mixed installs work via multiple groups:
 | One-toggle online DNSSEC | **PowerDNS** or **Technitium** |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
-| Catalog zones as **producer** | BIND9, PowerDNS or Technitium — same wire bytes |
-| Catalog zones as **consumer** | **BIND9** or **Technitium** (not wired up on the PowerDNS agent) |
+| Catalog zones as **producer** | BIND9 or PowerDNS (Technitium refused, #1782) |
+| Catalog zones as **consumer** | **BIND9** (not wired up on the PowerDNS agent; Technitium refused, #1782) |
 | Native DoT / DoH with no sidecar | **BIND9** or **Technitium** |
 | DNS-over-QUIC, or encrypted *upstream* forwarding over DoH / DoQ | **Technitium** (BIND 9.20 has no client-side HTTP or QUIC transport; pdns doesn't forward at all) |
 | Query logs on the Logs page | **BIND9** or **PowerDNS** (Technitium pending, §4B.5) |
@@ -1076,7 +1104,7 @@ BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS
 
 **Picking between the two Technitium drivers** comes down to one question — do you want SpatiumDDI to *run* the daemon?
 
-- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists, catalog zones.
+- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists (not catalog zones — #1782).
 - No, it's already running → `technitium_api` (§4C). Zones and records only; the rest stays managed in Technitium's own console.
 
 A group is single-driver, so servers of the two kinds live in separate groups.
