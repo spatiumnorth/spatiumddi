@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade whose own cleanup fails now raises a distinct
+  alert (#1542).** When an upgrade fails after cordoning a node, the
+  orchestrator uncordons it and clears the CNPG maintenance window; if
+  that release itself fails the node stays held and an operator must
+  act, but the alert was the same as any other failed step. The
+  existing `cluster-upgrade-failed` event now carries category
+  `release_failed`, names what is still held (`cordon`,
+  `maintenance_window`) in its message and `stuck` detail, and the
+  per-node progress records `release_failed` with the error. The run
+  still stops. No new rule or migration: the rule is already critical,
+  the highest severity.
+
 - **A rolling upgrade waits for the control-plane Deployments before it
   moves to the next node (#1544).** The other half of the gate that
   already waits for CNPG: after each node's uncordon, the per-node

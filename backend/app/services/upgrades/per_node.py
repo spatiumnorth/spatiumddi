@@ -1267,8 +1267,14 @@ async def _step_release_node(
     else:
         ok, err = k8s.uncordon_node(node_name)
         if not ok:
+            # The window clear is not attempted after a failed uncordon, so
+            # a window this run set is still on as well (#1542).
+            stuck = ["cordon"] + (["maintenance_window"] if clear_window and cluster_name else [])
             return step.finish(
-                False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
+                False,
+                error=f"compensating uncordon failed: {err}",
+                uncordon_ok=False,
+                stuck=stuck,
             )
         done["uncordon_ok"] = True
     if not (clear_window and cluster_name):
@@ -1284,6 +1290,7 @@ async def _step_release_node(
         return step.finish(
             False,
             error=f"{prefix}compensating maintenance-window clear failed: {err}",
+            stuck=["maintenance_window"],
             **done,
         )
     return step.finish(True, maintenance_window_cleared=True, **done)
@@ -1468,8 +1475,15 @@ async def single_node_upgrade(
             except Exception as exc:  # noqa: BLE001 — never mask the real failure
                 # The compensation is best-effort: an exception here must
                 # not escape and replace the step failure being reported.
+                # What the crash left held is unknown, so name everything
+                # this run took (#1542).
+                crash_stuck = (["cordon"] if skip is None else []) + (
+                    ["maintenance_window"] if window_set else []
+                )
                 comp = StepResult(name="release_node", started_at=_now_iso()).finish(
-                    False, error=f"compensating release crashed: {exc}"
+                    False,
+                    error=f"compensating release crashed: {exc}",
+                    stuck=crash_stuck,
                 )
             results.append(comp)
             if not comp.ok:

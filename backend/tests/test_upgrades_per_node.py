@@ -1000,6 +1000,8 @@ async def test_single_node_upgrade_records_failed_release(
     assert release.name == "release_node"
     assert release.ok is False
     assert "compensating uncordon failed" in release.error
+    # #1542: the step names what is still held, for the distinct alert.
+    assert release.detail["stuck"] == ["cordon", "maintenance_window"]
 
 
 def _patch_chain_ok(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
