@@ -150,6 +150,9 @@ from app.services.dns.server_move import (
     ensure_group_single_driver,
     move_server_to_group,
 )
+from app.services.dns.technitium_options import (
+    allow_transfer_problem as technitium_transfer_problem,
+)
 from app.services.dns.technitium_options import refusals as technitium_option_refusals
 from app.services.dns.technitium_options import stored_warnings as technitium_stored_warnings
 from app.services.dns.tld_registry import (
@@ -3516,8 +3519,42 @@ async def _options_response(
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
     if "technitium" in await _group_driver_names(db, group_id):
-        out.technitium_warnings = technitium_stored_warnings(opts)
+        acls = await _group_acl_definitions(db, group_id)
+        out.technitium_warnings = technitium_stored_warnings(opts, acls)
+        # Zone-level overrides saved before the gate (#1765).
+        zones = (
+            await db.execute(
+                select(DNSZone.name, DNSZone.allow_transfer).where(
+                    DNSZone.group_id == group_id, DNSZone.allow_transfer.is_not(None)
+                )
+            )
+        ).all()
+        for name, allow_transfer in zones:
+            if problem := technitium_transfer_problem(allow_transfer, acls):
+                out.technitium_warnings.append(
+                    f"zone {name}: {problem}; zone transfer is left as the daemon has it"
+                )
     return out
+
+
+async def _group_acl_definitions(db: DB, group_id: uuid.UUID) -> dict[str, list[tuple[str, bool]]]:
+    """The group's named ACLs as ``name -> [(value, negate)]``, for the
+    Technitium address-match translation (#1765)."""
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        a.name: [(e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)]
+        for a in rows
+    }
 
 
 @router.get("/groups/{group_id}/options", response_model=ServerOptionsResponse)
@@ -3602,6 +3639,21 @@ async def _validated_zone_named_conf_fields(
         and (zone is None or v != getattr(zone, k, None))
     }
     cleaned = await _validated_option_changes(group_id, fields, zone, db) if fields else {}
+    if (
+        "allow_transfer" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (
+            problem := technitium_transfer_problem(
+                cleaned["allow_transfer"], await _group_acl_definitions(db, group_id)
+            )
+        )
+    ):
+        raise HTTPException(
+            422,
+            "This group has a Technitium server, which cannot apply this zone's "
+            f"{problem}. Move the Technitium server to its own group, or use addresses, "
+            "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
+        )
     zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
     if zone_type != "forward":
         return cleaned
@@ -3713,7 +3765,9 @@ async def update_options(
     # rather than store a value the daemon will silently ignore. Same subset
     # semantics as the transport gates: any Technitium server in the group.
     if "technitium" in await _group_driver_names(db, group_id):
-        if refused := technitium_option_refusals(changes, opts):
+        if refused := technitium_option_refusals(
+            changes, opts, await _group_acl_definitions(db, group_id)
+        ):
             raise HTTPException(
                 422,
                 "This group has a Technitium server, which cannot apply: "

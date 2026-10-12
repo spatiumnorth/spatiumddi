@@ -1111,7 +1111,15 @@ def test_tsig_key_names_strip_root_dot() -> None:
     """Technitium stores names un-dotted, so a dotted name would compare
     as different forever."""
     assert _tsig_key_names(
-        {"tsig_keys": [{"name": "a."}, {"name": "b"}, {"name": ""}]}
+        {
+            "tsig_keys": [
+                {"name": "a.", "secret": "s"},
+                {"name": "b", "secret": "s"},
+                {"name": "", "secret": "s"},
+                # Not installable (``_sync_tsig_keys`` skips it), so not pinned.
+                {"name": "c"},
+            ]
+        }
     ) == ["a", "b"]
 
 
@@ -3439,7 +3447,10 @@ def test_allow_query_none_inside_a_list_denies_everyone(tmp_path: Path) -> None:
         tmp_path,
         {"zones": [_zone("a.test")], "options": {"allow_query": ["none", "10.0.0.0/8"]}},
     )
-    assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
+    got = _query_access_calls(calls)["a.test"]
+    acl = [a for a in str(got.get("queryAccessNetworkACL") or "").split(",") if a]
+    # Nobody admitted: either Deny outright, or an ACL holding only denies.
+    assert got["queryAccess"] == "Deny" or all(a.startswith("!") for a in acl)
 
 
 def test_allow_query_address_before_none_keeps_only_that_address(tmp_path: Path) -> None:
@@ -3810,6 +3821,317 @@ def test_render_pairs_zone_forwarders_with_the_group_tls_name(tmp_path: Path) ->
     create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
     assert create[3]["forwarder"] == "tls://dns.quad9.net (9.9.9.9)"
     assert create[3]["protocol"] == "Tls"
+
+
+# ── Zone transfer ACL grammar, secondary TSIG, TSIG algorithms (#1765) ──
+
+
+def _xfer(allow_transfer: Any, **over: Any) -> dict[str, Any]:
+    keys = over.pop("tsig_keys", [{"name": "k1", "secret": "s", "algorithm": "hmac-sha256"}])
+    return _zone_options_payload(
+        "Primary",
+        _zone_bundle(tsig_keys=keys, options={"allow_transfer": allow_transfer}, **over),
+    )
+
+
+def test_a_negation_beside_any_keeps_the_exclusion() -> None:
+    """``["!10.1.0.0/16", "any"]`` used to become ``Allow``: everyone,
+    the excluded range included."""
+    out = _xfer(["!10.1.0.0/16", "any"])
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]
+
+
+def test_a_key_element_becomes_the_key_set_not_an_acl() -> None:
+    out = _xfer(['key "xfer"'], tsig_keys=[
+        {"name": "xfer", "secret": "s", "algorithm": "hmac-sha256"},
+        {"name": "other", "secret": "s", "algorithm": "hmac-sha256"},
+    ])
+    assert out["zoneTransfer"] == "Allow"
+    assert "zoneTransferNetworkACL" not in out
+    assert out["zoneTransferTsigKeyNames"] == ["xfer"]
+    assert "_unapplied" not in out
+
+
+def test_exclusions_before_a_key_stay_in_the_acl_with_the_key() -> None:
+    out = _xfer(["!10.1.0.0/16", "key k1"])
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]
+    assert out["zoneTransferTsigKeyNames"] == ["k1"]
+
+
+def test_localhost_is_loopback_and_a_named_acl_is_expanded() -> None:
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(
+            options={"allow_transfer": ["localhost", "office", "!192.0.2.0/24", "any"]},
+            acls=[
+                {
+                    "name": "office",
+                    "entries": [
+                        {"value": "10.0.0.0/8", "negate": False},
+                        {"value": "10.9.0.0/16", "negate": True},
+                    ],
+                }
+            ],
+        ),
+    )
+    assert out["zoneTransferNetworkACL"] == [
+        "127.0.0.1/32",
+        "::1/128",
+        "10.0.0.0/8",
+        "!10.9.0.0/16",
+        "!192.0.2.0/24",
+        "0.0.0.0/0",
+        "::/0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "elements",
+    [
+        ["localnets"],
+        ["undefined-acl"],
+        ["10.0.0.0/8", "key k1"],  # OR in BIND, AND here
+        ["key k1", "!10.1.0.0/16"],  # the key lets it through first in BIND
+        ["!key k1"],
+        ["!localhost", "any"],  # the server's own addresses are not just loopback
+    ],
+)
+def test_untranslatable_transfer_lists_are_left_alone_and_reported(elements: list[str]) -> None:
+    out = _xfer(elements)
+    assert not {k for k in out if k.startswith("zoneTransfer")}
+    assert [u["kind"] for u in out["_unapplied"]] == ["allow_transfer"]
+
+
+def test_a_negated_acl_with_a_negation_inside_is_refused() -> None:
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(
+            options={"allow_transfer": ["!office", "any"]},
+            acls=[{"name": "office", "entries": [{"value": "10.0.0.0/8", "negate": True}]}],
+        ),
+    )
+    assert out["_unapplied"][0]["kind"] == "allow_transfer"
+
+
+def test_a_key_the_daemon_does_not_hold_denies_instead_of_opening() -> None:
+    out = _xfer(["key gone"])
+    assert out["zoneTransfer"] == "Deny"
+    assert out["zoneTransferTsigKeyNames"] == []
+    assert [u["kind"] for u in out["_unapplied"]] == ["allow_transfer_key"]
+
+
+def test_untranslatable_transfer_is_an_apply_failure_and_sends_no_transfer_options(
+    tmp_path: Path,
+) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(
+        {
+            "zones": [_zone("a.test"), {**_zone("b.test"), "allow_transfer": ["localnets"]}],
+            "options": {"allow_transfer": ["10.0.0.0/8"]},
+            "tsig_keys": [],
+        }
+    )
+    d.validate()
+    d.swap_and_reload()
+    sent = {
+        c[3]["zone"]: c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "queryAccess" in c[3]
+    }
+    assert sent["a.test"]["zoneTransferNetworkACL"] == "10.0.0.0/8"
+    assert "zoneTransfer" not in sent["b.test"]
+    assert [r for r in d._refused_zones if "allow_transfer" in r and "1 zone(s)" in r]
+
+
+def test_query_access_expands_named_acls_too() -> None:
+    from spatium_dns_agent.drivers.technitium import _query_access
+
+    acls = {"office": [("10.0.0.0/8", False)]}
+    assert _query_access(["office"], acls) == ("UseSpecifiedNetworkACL", ["10.0.0.0/8"])
+    assert _query_access(["office"]) is None  # undefined here
+    assert _query_access(["key k1"], acls) is None  # a key means nothing to a query ACL
+
+
+@pytest.mark.parametrize(
+    ("elements", "expected"),
+    [
+        # BIND compiles ``none`` as ``!any``: it denies everyone, so nothing
+        # after it can grant.
+        (["none", "10.0.0.0/8"], ("UseSpecifiedNetworkACL", ["!0.0.0.0/0", "!::/0"])),
+        (
+            ["10.0.0.0/8", "none", "192.0.2.0/24"],
+            ("UseSpecifiedNetworkACL", ["10.0.0.0/8", "!0.0.0.0/0", "!::/0"]),
+        ),
+        # ``!none`` is ``any``.
+        (["!none"], ("Allow", [])),
+        (
+            ["!10.1.0.0/16", "!none"],
+            ("UseSpecifiedNetworkACL", ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]),
+        ),
+    ],
+)
+def test_none_is_a_deny_all_match_as_in_bind(elements: list[str], expected: Any) -> None:
+    from spatium_dns_agent.drivers.technitium import _query_access
+
+    assert _query_access(elements) == expected
+
+
+def test_none_before_a_key_denies_and_after_it_is_harmless() -> None:
+    from spatium_dns_agent.drivers.technitium import _transfer_access
+
+    # Nothing after ``none`` is reachable, the key included: deny everyone.
+    mode, acl, _, _ = _transfer_access(["none", "key k1"], ["k1"])
+    assert (mode, acl) == ("UseSpecifiedNetworkACL", ["!0.0.0.0/0", "!::/0"])
+    assert _transfer_access(["key k1", "none"], ["k1"]) == ("Allow", [], ["k1"], [])
+
+
+def test_an_ipv4_mapped_prefix_is_refused() -> None:
+    from spatium_dns_agent.drivers.technitium import _transfer_access
+
+    # Technitium matches a mapped client as IPv4, so this exclusion would never fire.
+    assert _transfer_access(["!::ffff:10.1.0.0/112", "any"], []) is None
+
+
+# Secondary TSIG
+
+
+def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(
+        d, responder or (lambda *_: {"status": "ok", "response": {"records": []}})
+    )
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    return d, calls
+
+
+_MASTER_KEY = {"name": "spatium-primary-grp", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}
+
+
+def test_a_secondary_is_created_with_its_masters_transfer_key(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "spatium-primary-grp"}
+    stub = {**_zone("t.test", "stub"), "masters_tsig_key": "spatium-primary-grp"}
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec, stub], "options": {}, "tsig_keys": [_MASTER_KEY]},
+    )
+    created = {c[3]["zone"]: c[3] for c in calls if c[2] == "zones/create"}
+    assert created["s.test"]["tsigKeyName"] == "spatium-primary-grp"
+    # A Stub transfers nothing, and Technitium takes no key for one.
+    assert "tsigKeyName" not in created["t.test"]
+    # The key is installed before the zone refers to it.
+    keys_call = next(c for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3])
+    assert "spatium-primary-grp|c2VjcmV0|hmac-sha256" in keys_call[3]["tsigKeys"]
+    assert calls.index(keys_call) < calls.index(
+        next(c for c in calls if c[2] == "zones/create")
+    )
+
+
+def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "spatium-primary-grp"}
+
+    def respond(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "Zone already exists: s.test"}
+        return {"status": "ok", "response": {"records": []}}
+
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
+        respond,
+    )
+    reapply = [
+        c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "primaryNameServerAddresses" in c[3]
+    ]
+    assert reapply[0]["primaryZoneTransferTsigKeyName"] == "spatium-primary-grp"
+
+
+def test_a_secondary_without_a_managed_master_sends_no_key(tmp_path: Path) -> None:
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [_zone("s.test", "secondary")], "options": {}, "tsig_keys": []},
+    )
+    create = next(c[3] for c in calls if c[2] == "zones/create")
+    assert "tsigKeyName" not in create
+
+
+def test_a_transfer_key_the_daemon_cannot_install_is_not_sent(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "weird"}
+    bad = {"name": "weird", "secret": "s", "algorithm": "hmac-sha3"}
+    d, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec], "options": {}, "tsig_keys": [bad]},
+    )
+    assert "tsigKeyName" not in next(c[3] for c in calls if c[2] == "zones/create")
+    assert any("weird" in r and "hmac-sha3" in r for r in d._refused_zones)
+    # ...and the unsigned secondary is reported, not left to expire quietly.
+    assert any("s.test" in r and "refused" in r for r in d._refused_zones)
+
+
+def test_a_secondary_whose_master_shares_no_key_is_an_apply_failure(tmp_path: Path) -> None:
+    """The control plane names no key when the master's group shares none with
+    this one (it never ships another group's secret, #1765); the agent says the
+    transfer will be refused rather than reporting success."""
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_unresolved": True}
+    d, calls = _secondary_calls(tmp_path, {"zones": [sec], "options": {}, "tsig_keys": []})
+    assert "tsigKeyName" not in next(c[3] for c in calls if c[2] == "zones/create")
+    assert any("s.test" in r and "no key it grants" in r for r in d._refused_zones)
+
+
+def test_the_catalog_consumer_signs_with_its_producers_key(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {
+            "mode": "consumer",
+            "zone_name": "cat.test.",
+            "producer_addr": "192.0.2.9",
+            "producer_tsig_key": "k1",
+        },
+        [],
+    )
+    assert calls[0][3]["tsigKeyName"] == "k1"
+
+
+# TSIG algorithms
+
+
+@pytest.mark.parametrize("algorithm", ["hmac-sha224", "hmac-sha384-192", "hmac-sha512-256"])
+def test_every_algorithm_technitium_accepts_is_installed(tmp_path: Path, algorithm: str) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._sync_tsig_keys("t", [{"name": "k", "secret": "s", "algorithm": algorithm}])
+    assert calls[0][3]["tsigKeys"] == f"k|s|{algorithm}"
+
+
+def test_a_skipped_key_is_an_apply_failure_and_is_not_pinned(tmp_path: Path) -> None:
+    keys = [
+        {"name": "bad", "secret": "s", "algorithm": "hmac-sha3"},
+        {"name": "good", "secret": "s", "algorithm": "hmac-sha256"},
+    ]
+    d, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_transfer": ["any"]}, "tsig_keys": keys},
+    )
+    pinned = next(
+        c[3]["zoneTransferTsigKeyNames"] for c in calls if c[2] == "zones/options/set"
+        and "zoneTransferTsigKeyNames" in c[3]
+    )
+    assert pinned == "good"
+    assert any("bad" in r and "hmac-sha3" in r for r in d._refused_zones)
 
 
 # ── #1759: one target rule for every name-valued type ───────────────────
