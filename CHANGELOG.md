@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Moving an appliance's own DNS server repoints the appliance
+  (#1749).** The DNS server PUT (the #934 move) repointed
+  `assigned_dns_group_id` only when the row had `appliance_id`, which
+  agents never set, so the supervisor kept rendering `AGENT_GROUP` and
+  the DoT/DoH/DoQ firewall ports for the group the agent had left. The
+  owning appliance is now found the way Fleet finds its servers
+  (#1715): by FK, else by hostname, never when two approved appliances
+  share it, and for a hostname match only on a row of the appliance's
+  current DNS engine. It is repointed only if it still named the
+  group being left, and its supervisor is woken. The DHCP server PUT
+  had the same gap and worse (it never repointed, not even by FK), so
+  the supervisor kept rendering the old group's `AGENT_GROUP`, network
+  mode and Kea HA listener; it now repoints `assigned_dhcp_group_id`
+  under the same rule, for an appliance holding the `dhcp` role.
+  Clearing a DHCP server's group never clears the appliance's, since a
+  NULL group idles its DHCP role.
+
 - **Technitium now follows the group's recursion and rate-limit
   settings (#1761).** The agent never sent `recursion` or
   `qpmPrefixLimits*`, so the daemon's own defaults stayed in force:
