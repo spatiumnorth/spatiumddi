@@ -572,6 +572,33 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted node leaves etcd **before** it resets itself (#1541). Its leave
+runner removes its own etcd member while the node still votes, stops k3s,
+and asks the node it joined whether the member is gone; only then does it
+wipe and come back as a standalone appliance. If etcd refuses the removal,
+or the node it joined answers and still lists the member, the leave fails
+and the node is left as it was, still a member; a survivor that cannot be
+reached does not fail it, since etcd accepting the removal is the removal.
+The row then reads `evicting` until the seed has deleted the node's stale
+k8s Node and confirmed etcd agrees, and settles `left` on that. The seed
+then scales Postgres and the control-plane replicas down to the new member
+count (a dead-node Replace, by contrast, holds the old size until the
+replacement is promoted), and re-creates the slot-image mirror's volume on
+a live node if the removed node held it. On a one-node control plane the
+api and worker roll out by retiring the old pod first, so each rollout there
+costs a brief api outage.
+
+A demote is refused (409) while any control-plane member is unhealthy — no
+heartbeat for 90 s, or a k8s Node that is NotReady or missing — and the
+error names every unhealthy member. The seed is judged by its k8s Node
+alone, since its own heartbeat can stall for a couple of minutes when
+another member dies. The one exception is demoting the unhealthy member itself,
+allowed when a majority of the voters stays live throughout; its row waits
+in `leaving` until the node comes back to run its leave (use Replace for a
+node that never will). The check exists because the leaving node removes its
+member through its own etcd, whose view of the other members can be stale:
+with a member powered off, that removal can cost the survivors their quorum.
+
 Once a multi-node control plane exists, the **Control plane** table
 surfaces a dismissible amber banner prompting the operator to configure a
 VIP if none is set yet (a single-node-IP URL is a latent SPOF for every
