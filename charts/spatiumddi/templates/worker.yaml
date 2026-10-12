@@ -31,7 +31,24 @@ spec:
         seccompProfile:
           type: {{ . }}
       {{- end }}
-      terminationGracePeriodSeconds: 60
+      # #1754 — 90 s, not 60: a warm shutdown mid-result-write inside a Redis
+      # no-master window was measured at 54.5 s and 59.2 s. The estimate
+      # (WORKER_TERMINATION_GRACE_S in app/celery_app.py, pinned by
+      # tests/test_celery_redis_transport.py) must stay under this value.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default 90 }}
+      # #1754 — bound the resolver. Socket timeouts do not cover getaddrinfo,
+      # and while a dead node's CoreDNS pod is still behind the cluster DNS
+      # Service each lookup stalled ~20 s (glibc default timeout:5 attempts:2,
+      # x2 search-list candidates). timeout:2 attempts:2 makes that ~8 s.
+      # ndots is deliberately NOT set here: leaving it out keeps Kubernetes'
+      # default of 5. The cost (a cold external lookup over 4 s fails once)
+      # and the arithmetic are in app/celery_app.py next to DNS_LOOKUP_STALL_S.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "2"
       {{- if .Values.worker.serviceAccount.enabled }}
       # #983 Phase 2 — alert evaluation runs HERE, not in the api, so the
       # node_pressure rule needs the worker to be able to read the kubelet

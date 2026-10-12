@@ -104,6 +104,71 @@ the formatter handles the rest.
   Forwarding options are left to #1764. BIND9 and PowerDNS
   bundles are unchanged.
 
+- **Changing a zone's type now reaches Technitium (#1457).** The agent
+  creates zones with `zones/create` and treats "already exists" as
+  success, re-applying only the upstream, so the type of an existing
+  zone was never compared. A zone switched from forward to primary in
+  SpatiumDDI stayed a Forwarder on every Technitium server: names that
+  were not a local record were still forwarded to the old upstream and
+  answered with that server's stale data, while SpatiumDDI showed the
+  zone as primary and the agents reported every record op as applied.
+  The agent now reads the live type (`zones/options/get`) when the zone
+  already exists and converts it in place with `zones/convert`, before
+  the upstream is re-applied. Verified against Technitium 15.4.0:
+  Forwarder to Primary keeps the zone's records, and Primary to
+  Forwarder works too. Technitium refuses a conversion to Secondary or
+  Stub ("not supported"); that is logged at error as
+  `technitium_zone_type_mismatch` and reported as a partial apply
+  (#1516) rather than worked around with a delete, since the agent
+  never deletes zones on its own. A refused forwarder change is
+  reported the same way.
+  A forward zone's upstream is now written as the zone's FWD record
+  instead of through `zones/options/set`, which has no `forwarder`
+  parameter (it answers `ok` and stores nothing). So a zone converted to
+  forward gets its forwarder, and changing an existing forward zone's
+  forwarder reaches the server too (#1647). A zone converted from
+  forward to primary drops the Forwarder's placeholder SOA (responsible
+  person `invalid`, TTL 0) for the one a new primary gets.
+
+- **A Celery worker's warm shutdown has room for a stalled cluster-DNS
+  lookup (#1754).** With a Redis master lost, a shutdown mid-result-write
+  exited at 54.5 s and 59.2 s of a 60 s grace: socket timeouts do not
+  bound `getaddrinfo`, and while the dead node's CoreDNS pod was still
+  behind the cluster DNS Service each lookup stalled about 20 s. The worker
+  pod now carries `dnsConfig` options `timeout:2` and `attempts:2`
+  (glibc; `ndots` untouched), about 8 s per stalled lookup, and
+  `terminationGracePeriodSeconds` is 90 (chart value
+  `worker.terminationGracePeriodSeconds`, and `k8s/base/worker.yaml`).
+  The api and beat are unchanged. The one cost: a worker now waits 4 s for
+  CoreDNS, where it waited 10 s, so a cold external lookup that the
+  upstream resolver takes 4 to 6 s to answer fails once instead of
+  succeeding slowly (CoreDNS itself gives up at about 6 s either way, and
+  caches the late answer for the task's next attempt).
+
+- **Rolling upgrades no longer strand nodes or skip their safety
+  checks (#1542, #1545, #1546, #1544).** A failure at any step after
+  the cordon (the reboot step included, and in a run resumed past the
+  cordon) now runs a compensating release — uncordon the node and
+  clear the CNPG maintenance window this run set — instead of leaving
+  the node cordoned with the window on. A failure at the cordon itself,
+  after the window was set, clears the window without uncordoning a
+  node the run never cordoned; and a node that was already cordoned
+  before the upgrade is left cordoned. When the run has no CNPG
+  cluster (none configured and none detected), the maintenance-window
+  clear at uncordon time is skipped instead of failing every node's
+  uncordon. The drain step refuses to evict pods with no controller
+  owner, honouring the no-force rule (a bare pod would never be
+  re-created). And no node is drained while the CNPG cluster is short
+  an instance: after each node's uncordon, the chain waits (up to
+  15 minutes) for `readyInstances` to reach `spec.instances` before it
+  reports the node done, the last node included, and each node's
+  preflight waits for the same count before its cordon. The wait comes
+  after the uncordon on purpose: the node's own drain evicts its
+  Postgres instance, whose local-path volume pins it to that node, so
+  the count cannot recover while the node is cordoned. An earlier
+  version of this fix waited before the uncordon and timed out on the
+  first node holding an instance, which ended the run.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
