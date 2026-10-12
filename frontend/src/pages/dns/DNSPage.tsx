@@ -7282,7 +7282,7 @@ function OptionsTab({ groupId }: { groupId: string }) {
               setAllowRecursion(e.target.value);
               setDirty(true);
             }}
-            placeholder="any"
+            placeholder="any = BIND default (localnets, localhost); 0.0.0.0/0, ::/0 opens it"
           />
         </Field>
       </div>

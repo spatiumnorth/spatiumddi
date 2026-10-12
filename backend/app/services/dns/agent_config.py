@@ -1089,9 +1089,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
-    if server.driver == "technitium":
-        # #1761: only Technitium reads this (the BIND9 agent renders a bare
-        # ``recursion yes|no``), so no other driver's etag moves with it.
+    if server.driver in ("technitium", "bind9"):
+        # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
+        # renders ``allow-recursion`` from it, treating ["any"] as unset), so
+        # PowerDNS's etag does not move with it.
         options_block["allow_recursion"] = (
             list(getattr(opts, "allow_recursion", None) or []) if opts else []
         )

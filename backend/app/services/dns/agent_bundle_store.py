@@ -76,7 +76,9 @@ _MAX_ERROR = 2000
 # 7 (#1759): a Technitium server's bundle also carries ``name_target_rule``, and
 #   its CNAME / DNAME / NS / PTR / MX / SRV / NAPTR targets the trailing dot
 #   migration d6b2f81a3c57 wrote.
-RENDERER_REVISION = 7
+# 8 (#1786): a BIND9 server's bundle carries ``allow_recursion`` (the agent now
+#   renders ``allow-recursion``).
+RENDERER_REVISION = 8
 
 
 def _serves(revision: int | None) -> bool:

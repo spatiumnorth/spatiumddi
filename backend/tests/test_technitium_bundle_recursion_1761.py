@@ -2,9 +2,8 @@
 
 The Technitium agent maps ``recursion_enabled`` / ``allow_recursion`` onto
 ``settings/set recursion``. ``allow_recursion`` was never in the agent
-bundle, so the ACL an operator typed could not reach the daemon. It is
-Technitium-only: the BIND9 agent renders a bare ``recursion yes|no`` and no
-other driver's etag moves with it.
+bundle, so the ACL an operator typed could not reach the daemon. BIND9 reads
+it too since #1786; PowerDNS's etag does not move with it.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSServer, DNSServerGroup, DNSServerOptions
@@ -53,7 +53,27 @@ async def test_group_not_recursive_still_folds_into_recursion_enabled(
 
 
 @pytest.mark.asyncio
-async def test_other_drivers_do_not_gain_the_key(db_session: AsyncSession) -> None:
-    server = await _server(db_session, "bind9", allow_recursion=["10.0.0.0/8"])
+async def test_powerdns_does_not_gain_the_key(db_session: AsyncSession) -> None:
+    server = await _server(db_session, "powerdns", allow_recursion=["10.0.0.0/8"])
     body = (await render_bundle_body(db_session, server)).body
     assert "allow_recursion" not in body["options"]
+
+
+@pytest.mark.asyncio
+async def test_bind9_bundle_carries_allow_recursion_and_etag_shifts(
+    db_session: AsyncSession,
+) -> None:
+    """#1786: the BIND9 agent renders ``allow-recursion`` from this key."""
+    server = await _server(db_session, "bind9", allow_recursion=["10.0.0.0/8"])
+    first = await render_bundle_body(db_session, server)
+    assert first.body["options"]["allow_recursion"] == ["10.0.0.0/8"]
+
+    opts = (
+        await db_session.execute(
+            select(DNSServerOptions).where(DNSServerOptions.group_id == server.group_id)
+        )
+    ).scalar_one()
+    opts.allow_recursion = ["10.0.0.0/8", "192.168.0.0/16"]
+    await db_session.commit()
+    second = await render_bundle_body(db_session, server)
+    assert second.etag != first.etag

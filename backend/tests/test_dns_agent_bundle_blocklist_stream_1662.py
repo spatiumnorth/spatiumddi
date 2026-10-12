@@ -194,23 +194,25 @@ async def _fixture(db: AsyncSession, *, views: bool) -> DNSServer:
 
 # The stored body, ETag and structural ETag of ``_fixture`` as rendered at
 # 1c00a7e4, before #1662: the streamed render must store exactly these bytes.
+# Re-pinned for #1786, which adds ``options.allow_recursion`` to a BIND9
+# bundle (RENDERER_REVISION 8): the only change to the bytes.
 # The gzip bytes are deliberately not pinned: deflate's output is a property of
 # the zlib build, not of the render (the desk's pin, taken in another image,
 # does not reproduce in the dev image for the identical body). The test pins
 # them against ``compress_body`` of the same body in the same process.
 PINNED_AT_1C00A7E4: dict[str, dict[str, str]] = {
     "plain": {
-        "body_sha256": "9952e4fb7e794de8b4ca2dcc90705e2f39bd1d62f3763fa6dc57d23ef0461aa9",
-        "etag": "sha256:9dd79c6171e997b7fdec4f3261040382a5c682b7ec5b90070011ee96d910ecc7",
+        "body_sha256": "55c507248af553d70dee3cd33dd5568e4f49de92779cb9fe4a71cfa6eb615ccc",
+        "etag": "sha256:4776aa9e5bfe5067aeaf121d4bde31bb7f4f2536a69f8c1c0714655068a60852",
         "structural_etag": (
-            "sha256:55a10815a2a830be6a828c208eff9cf32d2534e88396844bff17634c063c8bbb"
+            "sha256:0d55af6a39dac9600745946742a61bbaa19ae11e3cdd4b9da3b5b0fa853da8e5"
         ),
     },
     "views": {
-        "body_sha256": "0256b9c182d2a640e7af1f72234a1f984b8e2b98853766292af6bba3549d8cba",
-        "etag": "sha256:6e92f0bd447c1815678c116cd75fb89e87863f1402767cf68524d132967e7b72",
+        "body_sha256": "1c118ebe7e84e4f36a3f61515570e7f76acbb1ab99758b08b7b4ee5d989e1c76",
+        "etag": "sha256:5f28e37868b38013d691bd17afa8160a99aa25cb8985bdd874aeff2de5ee9c94",
         "structural_etag": (
-            "sha256:cf01f25bba58631ad36b3a3bb4b1bd9b0366b60d27855dd6f338cb54d9e83283"
+            "sha256:2b7ef50767d00ee784b02ae6f371e3f84b95db6889e1f1776c6aea7b0b7b807b"
         ),
     },
 }
@@ -431,14 +433,14 @@ async def _tricky_fixture(db: AsyncSession, *, view_only: bool) -> DNSServer:
 # #1662): body sha256, ETag, structural ETag.
 PINNED_TRICKY_AT_MAIN: dict[bool, tuple[str, str, str]] = {
     False: (
-        "e499cbdc3dcea65bdfeb0f58d351c1e67e787d54457b3bc895b63a52affa05c9",
-        "sha256:9223e53256e66b1f5e217e5bd7f055fa51ac7a89db29e8a82a3d29a932dbc523",
-        "sha256:1cf8f2ab37df2532dfdfe806eedb848b8a7c88eac8c62c7c8e88ef37850a3baa",
+        "d16890acb874a355de0266326fb820ae7a0dc795733ccf2ec61a0b3adc5383e4",
+        "sha256:9213fd4bbbc684e1a3a3a582ff00b16944d3cc07d85a980b16bdb8e6e2d49acd",
+        "sha256:65015507eb01af612290b79bc18f821bd89fff4dc77612212d3d73524f7fba35",
     ),
     True: (
-        "c1879c092a53ef7b8e89ab1b74f65d8ac6f2008c3bb736d50b2296c9ca90d418",
-        "sha256:44034c8654141178a919357eb733bf0ac55a475be19ce3ad0fb123a5aab9a537",
-        "sha256:6371c4e3f9e776c453542c48cc46661df8b0289bec2ca70788c2464a0371e58e",
+        "91aaff4dbf25189d3c85658a93e12f27926a7260dbbf2d015af3ef3f6caeb571",
+        "sha256:aa20f2dd903d99b5e84a5416fe4a05b4512ca48f6fdc93ecb579af56c6995e4a",
+        "sha256:296c9b340e16e481f038a01fb9396067f9fc5c443bc3018e81a2ce24adbcf42f",
     ),
 }
 

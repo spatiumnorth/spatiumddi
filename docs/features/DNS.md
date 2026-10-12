@@ -354,7 +354,7 @@ DNSServerOptions.allow_recursion: list[str]     -- CIDR list; who may use this s
                                                 --   "any" or "none" are also valid literals
 ```
 
-- **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}` or per-view
+- **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}` (#1786). The stored default `["any"]`, an empty list, and recursion off all render **no** `allow-recursion` line, so BIND runs its own `localnets; localhost;`. `["any"]` is the column default and cannot be told apart from an untouched group, so rendering it would turn every existing recursive group into an open resolver on upgrade. To open recursion deliberately, list `0.0.0.0/0` and `::/0`. Entries outside the address-match-list grammar are dropped by the agent (named-checkconf would refuse the whole bundle); named ACLs must exist in the group (§8.2).
 - Authoritative-only servers must have `recursion_enabled: false` + `allow_recursion: ["none"]`
 
 ### 3.3 DNSSEC Resolution

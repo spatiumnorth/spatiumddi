@@ -49,7 +49,7 @@ NAMED_CONF_SKELETON = """\
     listen-on {{ any; }};
     listen-on-v6 {{ any; }};
 {encrypted_listeners}    recursion {recursion};
-    allow-query {{ {allow_query}; }};
+{allow_recursion}    allow-query {{ {allow_query}; }};
     {allow_transfer}
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
@@ -1202,6 +1202,38 @@ def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
     return res.returncode, res.stdout or "", res.stderr or ""
 
 
+# One address-match-list element: ``[!]`` then an address / prefix / built-in /
+# ACL name, or ``key <name>``. The API gate (#876/#1244) is authoritative; this
+# only stops a value stored before that gate existed from reaching named.conf,
+# where one bad element makes named-checkconf refuse the whole bundle.
+_AML_ELEMENT_RE = re.compile(r"^!?\s*(?:key\s+)?[A-Za-z0-9_.:/-]+$")
+
+
+def _render_allow_recursion(opts: dict[str, Any]) -> str:
+    """The ``allow-recursion`` line for ``options {}`` (#1786), or ``""``.
+
+    Omitted (BIND's own ``localnets; localhost;``) when recursion is off, when
+    the list is empty, or when it is exactly the stored default ``["any"]``:
+    nothing distinguishes that default from an untouched group, and rendering
+    it would turn every existing recursive group into an open resolver on
+    upgrade. Widening therefore needs an explicit value, e.g. ``0.0.0.0/0``.
+    """
+    if not opts.get("recursion_enabled", True):
+        return ""
+    raw = [str(e).strip() for e in (opts.get("allow_recursion") or []) if str(e).strip()]
+    if not raw or [e.lower() for e in raw] == ["any"]:
+        return ""
+    kept: list[str] = []
+    for entry in raw:
+        if _AML_ELEMENT_RE.match(entry):
+            kept.append(entry)
+        else:
+            log.warning("bind9_allow_recursion_entry_dropped", entry=entry)
+    if not kept:
+        return ""
+    return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
+
+
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
 
@@ -1325,6 +1357,7 @@ class Bind9Driver(DriverBase):
         logging_block = _render_logging_block(opts)
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
+            allow_recursion=_render_allow_recursion(opts),
             allow_query=allow_query,
             allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,

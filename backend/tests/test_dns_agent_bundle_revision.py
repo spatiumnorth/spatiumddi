@@ -83,6 +83,11 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
         "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
     },
+    # #1786: a BIND9 server's options carry ``allow_recursion``.
+    8: {
+        "plain": "73febbb71ff5182cc8dd4bbf69d4674477523efebaed0275d8ce8a4480a842a2",
+        "views": "97179b2434c34036a9deb2acb80d1e0ed792efadd58def074533f99f10885b2e",
+    },
 }
 
 
