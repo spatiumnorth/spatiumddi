@@ -1498,7 +1498,7 @@ def _patch_cp(monkeypatch: pytest.MonkeyPatch, reads: list[list[dict[str, Any]]]
             pass  # keep serving the final read
         return 200, last[0]
 
-    monkeypatch.setattr(per_node.k8s, "get_config", lambda: object())
+    monkeypatch.setattr(per_node.k8s, "get_config", object)
     monkeypatch.setattr(per_node.k8s, "list_deployments", _list)
     monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
     return seen
@@ -1613,7 +1613,7 @@ async def test_cluster_verify_fails_fast_on_refused_list(
         calls.append(selector)
         return code, []
 
-    monkeypatch.setattr(per_node.k8s, "get_config", lambda: object())
+    monkeypatch.setattr(per_node.k8s, "get_config", object)
     monkeypatch.setattr(per_node.k8s, "list_deployments", _list)
     monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
     step = await per_node._step_cluster_verify(
