@@ -707,11 +707,14 @@ def test_reconcile_converges_ttl_only_change(tmp_path: Path) -> None:
              "ipAddress": "10.0.0.1"}
         ],
     )
+    # In place (#1768): a delete would also take the A's PTR with it.
     paths = [c[2] for c in calls]
-    assert "zones/records/delete" in paths
-    added = [c[3] for c in calls if c[2] == "zones/records/add"]
-    assert len(added) == 1
-    assert added[0]["ttl"] == 300
+    assert "zones/records/delete" not in paths
+    assert "zones/records/add" not in paths
+    updated = [c[3] for c in calls if c[2] == "zones/records/update"]
+    assert len(updated) == 1
+    assert updated[0]["ttl"] == 300
+    assert updated[0]["ipAddress"] == "10.0.0.1"
 
 
 def test_reconcile_is_a_noop_when_already_in_sync(tmp_path: Path) -> None:

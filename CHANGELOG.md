@@ -479,6 +479,21 @@ the formatter handles the rest.
   version of this fix waited before the uncordon and timed out on the
   first node holding an instance, which ended the run.
 
+- **The Technitium agent's structural reconcile no longer rewrites
+  records on every pass or silently deletes PTRs (#1768).** It
+  fingerprinted the daemon's raw record data and fixed any difference by
+  deleting and re-adding, so records Technitium stores differently from
+  how they are sent were rewritten each time: a set with mixed TTLs
+  (Technitium keeps one per set), IDN targets (the derived `*Idn` keys),
+  CAA tags with capitals, and URIs it normalises. Each A/AAAA delete also
+  made Technitium delete the matching PTR in a reverse zone SpatiumDDI
+  manages on the same server. Now both sides are normalised to what the
+  daemon reads back, the set's minimum TTL is stamped (Technitium only),
+  a TTL-only change or a record disabled in the console is fixed with
+  `zones/records/update` in place, reverse zones are reconciled after
+  forward zones so a deleted PTR is re-added, and an apex NS TTL change
+  reaches the daemon. A second pass over an unchanged bundle sends no
+  writes. BIND9 and PowerDNS are untouched.
 - **Technitium's "CNAME record already exists" refusal is no longer
   counted as success (#1770).** Both Technitium drivers treated any
   error containing "already exists" as an idempotent no-op, so adding a
