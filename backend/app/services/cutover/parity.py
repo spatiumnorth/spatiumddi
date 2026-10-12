@@ -171,10 +171,14 @@ def _bucket_records(
     is split: the first two elements form the bucket, the rest — the
     normalised value plus, for MX / SRV, the structured priority / weight /
     port (#1525) — is the identity used for multiset matching inside it.
+
+    Targets are read zone-file style (#1794): the DB side is what a managed
+    zone-file server will serve, and Windows reports every name target
+    absolute with its trailing dot, so only the DB side is ambiguous.
     """
     buckets: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
     for row in rows:
-        name, rtype, *rest = _key(row, zone_name)
+        name, rtype, *rest = _key(row, zone_name, relative_targets=True)
         buckets.setdefault((name, rtype), []).append((tuple(rest), row))
     return buckets
 

@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Drift and Sync with Servers read a dot-less name target the way
+  the driver does (#1794).** A target such as `a.b` is `a.b.<zone>.`
+  on BIND9, Technitium and Windows without WinRM credentials, where only
+  a trailing dot makes a name absolute, but the shared record key read it
+  as the absolute `a.b.`. A relative multi-label CNAME, DNAME, NS, PTR,
+  MX, SRV, NAPTR replacement or SVCB / HTTPS target therefore drifted
+  against the absolute name an AXFR returns, and Sync imported it again as
+  a duplicate. The cloud drivers and Windows over WinRM take the name as
+  given, so there `a.b` stays absolute. The Windows cutover parity check
+  reads the managed side the zone-file way.
+
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
 - **DNSSEC signing is no longer offered on Technitium (#1783).** The sign
