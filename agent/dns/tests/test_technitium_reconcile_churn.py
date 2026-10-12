@@ -17,17 +17,6 @@ from spatium_dns_agent.drivers.technitium import TechnitiumDriver
 
 from .test_technitium_render import _install_fake_request, _seed_token
 
-_VALUE_KEYS = {
-    "A": ("ipAddress",),
-    "AAAA": ("ipAddress",),
-    "CNAME": ("cname",),
-    "PTR": ("ptrName",),
-    "MX": ("preference", "exchange"),
-    "CAA": ("flags", "tag", "value"),
-    "URI": ("uriPriority", "uriWeight", "uri"),
-}
-
-
 def _reverse_name(ip: str) -> str:
     return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
 
