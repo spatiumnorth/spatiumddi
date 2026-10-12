@@ -142,6 +142,15 @@ _RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
 SVCB_TARGET_RULE_KEY = "svcb_target_rule"
 SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
 
+# #1759 — the same statement for every OTHER name-valued target (CNAME,
+# DNAME, NS, PTR, MX exchange, SRV target, NAPTR replacement). A separate key,
+# not a rename of the SVCB one: a bundle a #1513 control plane stored carries
+# ``svcb_target_rule`` and not this, and the agent must keep reading that
+# bundle's CNAME targets as absolute, as they were rendered. Without the key
+# a dot-less target is absolute.
+NAME_TARGET_RULE_KEY = "name_target_rule"
+NAME_TARGET_RULE_ZONE_FILE = "zone-file"
+
 
 #: How an ETag's payload is serialised before it is hashed. The streamed
 #: render (#1662) hashes each batch of blocklist entries with these too.
@@ -1330,6 +1339,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # zones under the rule even when nothing else changed.
         bundle_body[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
         structural[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
+        # #1759 — and the same for every other name-valued target, so a
+        # dot-less CNAME / NS / MX / SRV / PTR / DNAME / NAPTR target is
+        # relative to the zone too. Structural for the same reason.
+        bundle_body[NAME_TARGET_RULE_KEY] = NAME_TARGET_RULE_ZONE_FILE
+        structural[NAME_TARGET_RULE_KEY] = NAME_TARGET_RULE_ZONE_FILE
     return _Assembled(
         body=bundle_body,
         structural=structural,

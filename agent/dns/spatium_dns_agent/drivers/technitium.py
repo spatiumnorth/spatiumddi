@@ -530,14 +530,19 @@ def _svcb_render(params: list[tuple[str, str | None]]) -> str:
     return " ".join(k if v is None else f"{k}={_q(v)}" for k, v in params)
 
 
-def _svcb_target(name: str, origin: str | None) -> str:
-    """A presentation-format target -> Technitium's form: absolute, lower
-    case, no trailing dot, ``.`` for the root.
+def _zone_file_target(name: str, origin: str | None) -> str:
+    """A presentation-format name-valued target -> Technitium's form:
+    absolute, lower case, no trailing dot, ``.`` for the root.
 
-    A trailing dot means absolute and is honoured whatever the label count
-    (``localhost.`` stays ``localhost``). Without one the name is relative
-    to ``origin`` (``svc`` in ``example.net`` is ``svc.example.net``), as in
-    a zone file; with no origin it is left as written.
+    ONE rule for every name a record points at: SVCB / HTTPS targets, CNAME,
+    DNAME, NS, PTR, MX exchange, SRV target and the NAPTR replacement (#1759).
+    ``@`` is the zone, a trailing dot means absolute and is honoured whatever
+    the label count (``localhost.`` stays ``localhost``), and anything else
+    is relative to ``origin`` (``svc`` in ``example.net`` is
+    ``svc.example.net``), as in a zone file; with no origin it is left as
+    written. ``.`` is the root (Null MX ``0 .``, SRV "no service"), sent as
+    ``"."``: Technitium trims the dots itself, and an EMPTY parameter is
+    read as missing (``Extensions.GetQueryOrFormAlt``).
     """
     name = name.strip()
     if name in ("", "."):
@@ -550,9 +555,20 @@ def _svcb_target(name: str, origin: str | None) -> str:
     return f"{name}.{zone}".lower() if zone else name.lower()
 
 
+def _dotted_target(name: Any) -> str:
+    """A target as Technitium reports it (absolute, no trailing dot, ``"."``
+    for the root) -> the presentation form stored: its trailing dot, so BIND9
+    reads it as absolute too. An absent value stays empty."""
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    bare = raw.rstrip(".")
+    return f"{bare}." if bare else "."
+
+
 def _svcb_daemon_target(name: Any) -> str:
     """Technitium's read-back target, which is always absolute, in the same
-    form ``_svcb_target`` produces. ``""`` is the root."""
+    form ``_zone_file_target`` produces. ``""`` is the root."""
     bare = str(name or "").strip().rstrip(".").lower()
     return bare or "."
 
@@ -566,7 +582,7 @@ def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[st
     for tok in tokens[2:]:
         key, eq, raw = tok.partition("=")
         items.append((key, _svcb_unquote(raw) if eq else None))
-    return (priority, _svcb_target(tokens[1], origin), _svcb_param_list(items, False))
+    return (priority, _zone_file_target(tokens[1], origin), _svcb_param_list(items, False))
 
 
 def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
@@ -584,6 +600,15 @@ def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
 #: Without it, a dot-less target is absolute, as the older renderer meant.
 SVCB_TARGET_RULE_KEY = "svcb_target_rule"
 SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
+#: The bundle key a control plane from #1759 on sets to say a dot-less CNAME /
+#: DNAME / NS / PTR / MX / SRV / NAPTR target is relative to the zone, the
+#: way the SVCB marker above says it of SVCB. Separate from that key because
+#: a bundle cached by a #1513 control plane carries the SVCB marker and not
+#: this one, and its CNAME targets must keep the absolute reading they were
+#: rendered with. Same value, same fallback: no key, absolute.
+NAME_TARGET_RULE_KEY = "name_target_rule"
+NAME_TARGET_RULE_ZONE_FILE = "zone-file"
 
 
 def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
@@ -691,7 +716,7 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         _move("flags", "naptrFlags")
         _move("services", "naptrServices")
         _move("regexp", "naptrRegexp")
-        _move("replacement", "naptrReplacement")
+        _move("replacement", "naptrReplacement", lambda v: str(v).lower())
     elif rtype == "URI":
         _move("priority", "uriPriority")
         _move("weight", "uriWeight")
@@ -1075,7 +1100,11 @@ def _txt_params(value: str) -> dict[str, Any]:
 
 
 def _record_params(
-    rtype: str, value: str, rec: dict[str, Any], origin: str | None = None
+    rtype: str,
+    value: str,
+    rec: dict[str, Any],
+    origin: str | None = None,
+    name_origin: str | None = None,
 ) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
@@ -1090,7 +1119,19 @@ def _record_params(
     if rtype == "TXT":
         # Text, not a name: it keeps a trailing full stop (#1694).
         return _txt_params(value)
+    raw = value
     value = value.rstrip(".")
+
+    def _target(name: str) -> str:
+        # The one target rule for every name-valued type (#1759): ``@`` is
+        # the zone, a trailing dot is absolute, anything else is relative to
+        # the zone, ``.`` is the root and goes out as ``"."`` (Technitium
+        # reads an empty parameter as missing). ``name_origin`` is None for
+        # a bundle that predates the rule: a dot-less target is absolute.
+        if name_origin is None:
+            return name.rstrip(".").lower() or "."
+        return _zone_file_target(name, name_origin)
+
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
         # canonical read-back regardless of how the operator typed it.
@@ -1098,24 +1139,24 @@ def _record_params(
     # Name-valued targets are folded to lower case on BOTH sides of the
     # fingerprint (#1513); DNS names are case-insensitive.
     if rtype == "CNAME":
-        return {"cname": value.lower()}
+        return {"cname": _target(raw)}
     if rtype == "DNAME":
-        return {"dname": value.lower()}
+        return {"dname": _target(raw)}
     if rtype == "NS":
-        return {"nameServer": value.lower()}
+        return {"nameServer": _target(raw)}
     if rtype == "PTR":
-        return {"ptrName": value.lower()}
+        return {"ptrName": _target(raw)}
     if rtype == "MX":
         # Absence, not falsiness — preference 0 is the highest priority
         # (Microsoft 365 publishes it), and ``or 10`` silently promoted
         # it to a backup. Issue #1518.
         return {
-            "exchange": value.lower(),
+            "exchange": _target(raw),
             "preference": rec.get("priority") if rec.get("priority") is not None else 10,
         }
     if rtype == "SRV":
         return {
-            "target": value.lower(),
+            "target": _target(raw),
             "priority": rec.get("priority") if rec.get("priority") is not None else 0,
             "weight": rec.get("weight") if rec.get("weight") is not None else 0,
             "port": rec.get("port") if rec.get("port") is not None else 0,
@@ -1147,14 +1188,16 @@ def _record_params(
             "sshfpFingerprint": tokens[2].lower() if len(tokens) > 2 else "",
         }
     if rtype == "NAPTR":
-        tokens = shlex.split(value)
+        # The replacement is the last token and its trailing dot says it is
+        # absolute, so split ``raw``, not the rstripped value (#1759).
+        tokens = shlex.split(raw if name_origin is not None else value)
         return {
             "naptrOrder": tokens[0] if len(tokens) > 0 else "0",
             "naptrPreference": tokens[1] if len(tokens) > 1 else "0",
             "naptrFlags": tokens[2] if len(tokens) > 2 else "",
             "naptrServices": tokens[3] if len(tokens) > 3 else "",
             "naptrRegexp": tokens[4] if len(tokens) > 4 else "",
-            "naptrReplacement": tokens[5] if len(tokens) > 5 else ".",
+            "naptrReplacement": _target(tokens[5] if len(tokens) > 5 else "."),
         }
     if rtype == "URI":
         tokens = shlex.split(value)
@@ -1200,6 +1243,11 @@ class TechnitiumDriver(DriverBase):
     # read by ``apply_record_op`` for ops shipped beside that bundle.
     _svcb_zone_file_targets: bool = False
 
+    # The same, for every other name-valued target (#1759), read from
+    # ``name_target_rule``. Independent of the SVCB flag: a bundle cached by
+    # a #1513 control plane has the SVCB marker and not this one.
+    _name_zone_file_targets: bool = False
+
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
             self._apply_failures.append(what)
@@ -1208,6 +1256,12 @@ class TechnitiumDriver(DriverBase):
         """The origin a dot-less SVCB target is relative to, or ``None`` when
         the applied bundle predates #1513 and a dot-less target is absolute."""
         return zone if self._svcb_zone_file_targets else None
+
+    def _name_origin(self, zone: str) -> str | None:
+        """The origin a dot-less CNAME / DNAME / NS / PTR / MX / SRV / NAPTR
+        target is relative to, or ``None`` when the applied bundle predates
+        #1759 and a dot-less target is absolute."""
+        return zone if self._name_zone_file_targets else None
 
 
     # ── Render / validate / swap ────────────────────────────────────────────
@@ -1227,6 +1281,7 @@ class TechnitiumDriver(DriverBase):
         new_dir.mkdir(parents=True)
 
         self._svcb_zone_file_targets = bundle.get(SVCB_TARGET_RULE_KEY) == SVCB_TARGET_RULE_ZONE_FILE
+        self._name_zone_file_targets = bundle.get(NAME_TARGET_RULE_KEY) == NAME_TARGET_RULE_ZONE_FILE
 
         raw_zones = bundle.get("zones")
         if not isinstance(raw_zones, list):
@@ -1311,7 +1366,11 @@ class TechnitiumDriver(DriverBase):
                                 else (_zone_ttl if _zone_ttl is not None else 3600)
                             ),
                             **_record_params(
-                                rtype, rec.get("value") or "", rec, self._svcb_origin(zname)
+                                rtype,
+                                rec.get("value") or "",
+                                rec,
+                                self._svcb_origin(zname),
+                                self._name_origin(zname),
                             ),
                         }
                     )
@@ -1857,7 +1916,13 @@ class TechnitiumDriver(DriverBase):
             "domain": name,
             "zone": zone,
             "type": rtype,
-            **_record_params(rtype, rec.get("value") or "", rec, self._svcb_origin(zone)),
+            **_record_params(
+                rtype,
+                rec.get("value") or "",
+                rec,
+                self._svcb_origin(zone),
+                self._name_origin(zone),
+            ),
         }
 
         # #773 — the control plane ships the complete desired RRset. Technitium's
@@ -1907,6 +1972,7 @@ class TechnitiumDriver(DriverBase):
                                 member.get("value") or "",
                                 member,
                                 self._svcb_origin(zone),
+                                self._name_origin(zone),
                             ),
                         },
                         zone,

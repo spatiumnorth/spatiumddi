@@ -25,6 +25,7 @@ import pytest
 
 from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
+    NAME_TARGET_RULE_ZONE_FILE,
     SVCB_TARGET_RULE_ZONE_FILE,
     TechnitiumDriver,
     _blocking_payload,
@@ -3211,3 +3212,119 @@ def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
     assert d._svcb_zone_file_targets
     d.render({"zones": []})
     assert not d._svcb_zone_file_targets
+
+
+# ── #1759: one target rule for every name-valued type ───────────────────
+
+_NAME_PARAM = {
+    "CNAME": "cname",
+    "DNAME": "dname",
+    "NS": "nameServer",
+    "PTR": "ptrName",
+    "MX": "exchange",
+    "SRV": "target",
+}
+_NAME_CASES = [
+    ("web", "web.up.test"),
+    ("web.sub", "web.sub.up.test"),
+    ("web.example.net.", "web.example.net"),
+    ("localhost.", "localhost"),
+    ("@", "up.test"),
+    (".", "."),
+]
+
+
+@pytest.mark.parametrize("rtype", sorted(_NAME_PARAM))
+@pytest.mark.parametrize(("value", "sent"), _NAME_CASES)
+def test_name_targets_follow_the_zone_file_rule(rtype: str, value: str, sent: str) -> None:
+    got = _record_params(rtype, value, {"priority": 10, "weight": 1, "port": 1}, None, "up.test")
+    assert got[_NAME_PARAM[rtype]] == sent
+
+
+@pytest.mark.parametrize(
+    ("value", "sent"),
+    [
+        ('100 10 "S" "SIP+D2U" "" _sip._udp', "_sip._udp.up.test"),
+        ('100 10 "S" "SIP+D2U" "" _sip._udp.example.net.', "_sip._udp.example.net"),
+        ('100 10 "S" "SIP+D2U" "" @', "up.test"),
+        ('100 10 "" "" "!^.*$!x!" .', "."),
+    ],
+)
+def test_naptr_replacement_follows_the_rule(value: str, sent: str) -> None:
+    got = _record_params("NAPTR", value, {}, None, "up.test")
+    assert got["naptrReplacement"] == sent
+
+
+def test_a_bundle_without_the_marker_keeps_the_absolute_reading() -> None:
+    # No ``name_target_rule``: a dot-less target is absolute, as the renderer
+    # that wrote the bundle meant.
+    assert _record_params("CNAME", "web", {}, None, None) == {"cname": "web"}
+    assert _record_params("MX", "mail.example.net", {}, None, None)["exchange"] == "mail.example.net"
+
+
+def test_read_back_root_compares_equal_to_a_root_target() -> None:
+    sent = _record_params("MX", ".", {"priority": 0}, None, "up.test")
+    back = _normalize_rdata("MX", {"exchange": ".", "preference": 0})
+    assert sent["exchange"] == back["exchange"] == "."
+    naptr = _normalize_rdata("NAPTR", {"order": 1, "preference": 1, "replacement": "Web.Example.Net"})
+    assert naptr["naptrReplacement"] == "web.example.net"
+
+
+def _render_cname(tmp_path: Path, value: str, bundle_extra: dict[str, Any]) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        {
+            "zones": [
+                {
+                    "name": "up.test.",
+                    "type": "primary",
+                    "ttl": 3600,
+                    "records": [{"name": "www", "type": "CNAME", "value": value, "ttl": 300}],
+                }
+            ],
+            **bundle_extra,
+        }
+    )
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "CNAME"]
+    return str(rec["cname"])
+
+
+def test_replaying_a_pre_1759_bundle_keeps_a_dotless_cname_absolute(tmp_path: Path) -> None:
+    # A bundle cached by a #1513 control plane has the SVCB marker and not the
+    # new one: its CNAME targets keep the reading they were rendered with.
+    assert _render_cname(tmp_path, "web", {}) == "web"
+    assert _render_cname(tmp_path, "web", {"svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE}) == "web"
+    assert (
+        _render_cname(tmp_path, "web", {"name_target_rule": NAME_TARGET_RULE_ZONE_FILE})
+        == "web.up.test"
+    )
+
+
+def test_record_ops_follow_the_name_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(extra: dict[str, Any]) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        d.render({"zones": [], **extra})
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "www", "type": "CNAME", "value": "web", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["cname"])
+
+    assert _op_target({}) == "web"
+    assert _op_target({"name_target_rule": NAME_TARGET_RULE_ZONE_FILE}) == "web.up.test"
+
+
+def test_render_reads_the_name_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "name_target_rule": NAME_TARGET_RULE_ZONE_FILE})
+    assert d._name_zone_file_targets
+    d.render({"zones": []})
+    assert not d._name_zone_file_targets

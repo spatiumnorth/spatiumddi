@@ -38,10 +38,10 @@ def test_classify_zone_detects_reverse() -> None:
     [
         ("A", {"ipAddress": "10.0.0.1"}, "10.0.0.1"),
         ("AAAA", {"ipAddress": "2001:db8::1"}, "2001:db8::1"),
-        ("CNAME", {"cname": "www.example.net"}, "www.example.net"),
-        ("DNAME", {"dname": "other.example.net"}, "other.example.net"),
-        ("NS", {"nameServer": "ns1.example.net"}, "ns1.example.net"),
-        ("PTR", {"ptrName": "host.example.net"}, "host.example.net"),
+        ("CNAME", {"cname": "www.example.net"}, "www.example.net."),
+        ("DNAME", {"dname": "other.example.net"}, "other.example.net."),
+        ("NS", {"nameServer": "ns1.example.net"}, "ns1.example.net."),
+        ("PTR", {"ptrName": "host.example.net"}, "host.example.net."),
         # #1760: no characterStringsBase64 (an older server) falls back to
         # the joined ``text``, as content; a simple record reads back plain,
         # an explicit split or a literal quote as presentation form.
@@ -88,12 +88,12 @@ def test_rdata_to_value_hoists_structured_fields() -> None:
     """MX/SRV carry priority (and weight/port) as columns, not in the
     value string."""
     value, extra = _rdata_to_value("MX", {"exchange": "mail.example.net", "preference": 20})
-    assert (value, extra) == ("mail.example.net", {"priority": 20})
+    assert (value, extra) == ("mail.example.net.", {"priority": 20})
 
     value, extra = _rdata_to_value(
         "SRV", {"target": "sip.example.net", "priority": 10, "weight": 20, "port": 5060}
     )
-    assert value == "sip.example.net"
+    assert value == "sip.example.net."
     assert extra == {"priority": 10, "weight": 20, "port": 5060}
 
 
