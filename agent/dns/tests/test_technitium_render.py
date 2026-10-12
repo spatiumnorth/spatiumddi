@@ -54,6 +54,11 @@ class _FakeResponse:
         return self._body
 
 
+# A created Primary is held disabled until its apex is reconciled (#1758), so
+# these generic fakes (which answer "ok" to a create) also see disable/enable.
+_CREATE_NOISE = ("zones/create", "zones/disable", "zones/enable")
+
+
 def _install_fake_request(
     driver: TechnitiumDriver,
     responder: Any,
@@ -309,7 +314,7 @@ def test_reconcile_is_a_noop_for_txt_served_as_entered(tmp_path: Path) -> None:
             _txt_desired("long", chr(0xE9) * 200),
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
 
 
 def _record_calls(calls: list[tuple[str, str, str, dict[str, Any]]]) -> list[tuple[str, str]]:
@@ -338,7 +343,7 @@ def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -
                    "rData": _txt_rdata(b"a full stop.")}],
         desired=desired,
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
 
 
 def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) -> None:
@@ -375,7 +380,7 @@ def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) ->
         ],
         desired=desired,
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
 
 
 def test_apply_record_op_sends_each_txt_member_as_its_strings(tmp_path: Path) -> None:
@@ -732,7 +737,7 @@ def test_reconcile_is_a_noop_when_already_in_sync(tmp_path: Path) -> None:
              "ipAddress": "10.0.0.1"}
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
 
 
 def test_reconcile_tolerates_numeric_vs_string_rdata(tmp_path: Path) -> None:
@@ -751,7 +756,7 @@ def test_reconcile_tolerates_numeric_vs_string_rdata(tmp_path: Path) -> None:
              "exchange": "mail.example.com", "preference": "10"}
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
 
 
 def test_reconcile_never_deletes_daemon_managed_apex(tmp_path: Path) -> None:
@@ -3042,7 +3047,7 @@ _WANTED_APEX = {
 def test_reconcile_apex_rewrites_daemon_soa_and_ns(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX)
-    writes = [(c[2], c[3]) for c in calls if c[2] != "zones/create" and c[2] != "zones/records/get"]
+    writes = [(c[2], c[3]) for c in calls if c[2] not in _CREATE_NOISE and c[2] != "zones/records/get"]
 
     soa = [p for path, p in writes if path == "zones/records/update"]
     assert len(soa) == 1
@@ -3074,7 +3079,7 @@ def test_reconcile_apex_is_a_noop_when_converged(tmp_path: Path) -> None:
                    "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300}},
     ]
     calls = _apex_reconcile(d, converged, _WANTED_APEX)
-    assert [c[2] for c in calls if c[2] != "zones/create"] == [
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == [
         "zones/records/get",  # the zone's records
         "zones/records/get",  # its apex
     ]
@@ -3092,7 +3097,7 @@ def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
     nothing): the daemon's own SOA and NS are not even read."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in calls if c[2] not in _CREATE_NOISE] == ["zones/records/get"]
     assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
 
 

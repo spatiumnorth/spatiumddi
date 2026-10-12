@@ -3535,157 +3535,232 @@ class TechnitiumDriver(DriverBase):
         # stay a PTR short until the next structural change. After them, its
         # fresh read sees the hole and re-adds the PTR the bundle owns (#1768).
         payload = sorted(payload, key=lambda z: _is_reverse_zone(z.get("zone")))
+        held = self._load_held_zones()
+        held &= {z["zone"] for z in payload}
         for zone_payload in payload:
             zone = zone_payload["zone"]
-            self._ensure_zone_exists(token, zone_payload)
-            self._apply_zone_options(token, zone, zone_payload.get("options") or {})
+            held_back = self._reconcile_one_zone(token, zone_payload, zone in held)
+            if held_back:
+                # Re-enabling failed: remembered so the next pass retries.
+                held.add(zone)
+            else:
+                held.discard(zone)
+            self._save_held_zones(held)
 
-            # Records belong to us only on a Primary. A Secondary/Stub is
-            # filled by the transfer and a Forwarder holds none, so diffing
-            # them would delete whatever the daemon just pulled down.
-            if zone_payload.get("type", "Primary") not in _RECORD_MANAGED_ZONE_TYPES:
-                continue
+    def _reconcile_one_zone(self, token: str, zone_payload: dict[str, Any], held: bool) -> bool:
+        """Reconcile one zone; returns True if it is still held disabled.
 
-            existing = self._get_zone_records(token, zone)
-            desired = zone_payload.get("records") or []
+        A Primary this pass just created answers under Technitium's DEFAULT
+        SOA (``hostadmin@<zone>``, 900 s minimum) until its own SOA and
+        records land, 8-11 s on a real group move (#1758), and a resolver
+        can cache an NXDOMAIN from it for that 900 s. ``zones/create`` takes
+        no SOA, so the zone is disabled straight after the create and
+        enabled only once the apex has been reconciled. A disabled zone is
+        not consulted for queries at all (``AuthZoneManager.Query*`` skip a
+        zone whose ``IsActive`` is false, 15.4.0), so nothing is answered
+        from the placeholder. A zone that already exists is never touched
+        here, so a second pass issues no disable/enable. ``held`` is a zone
+        a previous pass disabled and did not get to enable (agent killed
+        mid-pass, enable failed).
+        """
+        zone = zone_payload["zone"]
+        created = self._ensure_zone_exists(token, zone_payload)
+        is_primary = zone_payload.get("type", "Primary") == "Primary"
+        if created and is_primary:
+            held = self._set_zone_enabled(token, zone, False) or held
+            if held:
+                self._save_held_zone_now(zone)
+        try:
+            self._reconcile_zone_body(token, zone, zone_payload)
+        finally:
+            if held:
+                held = not self._set_zone_enabled(token, zone, True)
+        return held
 
-            def _identity(rec: dict[str, Any]) -> tuple[Any, ...]:
-                # Which record this is: owner, type and rdata. The TTL and
-                # the disabled flag are STATE of a record, not identity, so
-                # a change in either is an update in place (below) and never
-                # a delete and add (#1768). Values are str()-normalised —
-                # Technitium returns some rdata fields as numbers/enums where
-                # our add-params are strings, and a bare type mismatch would
-                # make every such record look "changed" on every pass.
-                extra = tuple(
-                    sorted(
-                        (k, str(v)) for k, v in rec.items() if k not in _RECORD_STATE_KEYS
-                    )
+    def _set_zone_enabled(self, token: str, zone: str, enabled: bool) -> bool:
+        """``zones/enable`` / ``zones/disable``. True when the call succeeded."""
+        verb = "enable" if enabled else "disable"
+        try:
+            body = self._call(token, "POST", f"zones/{verb}", {"zone": zone}).json()
+        except (httpx.HTTPError, ValueError) as exc:  # report; never raise past the pass
+            log.warning(f"technitium_zone_{verb}_failed", zone=zone, error=str(exc))
+            return False
+        if body.get("status") == "ok":
+            return True
+        log.warning(f"technitium_zone_{verb}_failed", zone=zone, error=body.get("errorMessage"))
+        if enabled:
+            self._note_apply_failure(f"{zone}: zone enable: {body.get('errorMessage')}")
+        return False
+
+    @property
+    def _held_zones_path(self) -> Path:
+        return Path(self.state_dir) / "zones-held-disabled.json"
+
+    def _load_held_zones(self) -> set[str]:
+        try:
+            return {str(z) for z in json.loads(self._held_zones_path.read_text())}
+        except (OSError, ValueError, TypeError):
+            return set()
+
+    def _save_held_zones(self, held: set[str]) -> None:
+        path = self._held_zones_path
+        try:
+            if held:
+                path.write_text(json.dumps(sorted(held)))
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            log.warning("technitium_held_zones_write_failed", error=str(exc))
+
+    def _save_held_zone_now(self, zone: str) -> None:
+        self._save_held_zones(self._load_held_zones() | {zone})
+
+    def _reconcile_zone_body(self, token: str, zone: str, zone_payload: dict[str, Any]) -> None:
+        self._apply_zone_options(token, zone, zone_payload.get("options") or {})
+
+        # Records belong to us only on a Primary. A Secondary/Stub is
+        # filled by the transfer and a Forwarder holds none, so diffing
+        # them would delete whatever the daemon just pulled down.
+        if zone_payload.get("type", "Primary") not in _RECORD_MANAGED_ZONE_TYPES:
+            return
+
+        existing = self._get_zone_records(token, zone)
+        desired = zone_payload.get("records") or []
+
+        def _identity(rec: dict[str, Any]) -> tuple[Any, ...]:
+            # Which record this is: owner, type and rdata. The TTL and
+            # the disabled flag are STATE of a record, not identity, so
+            # a change in either is an update in place (below) and never
+            # a delete and add (#1768). Values are str()-normalised —
+            # Technitium returns some rdata fields as numbers/enums where
+            # our add-params are strings, and a bare type mismatch would
+            # make every such record look "changed" on every pass.
+            extra = tuple(
+                sorted((k, str(v)) for k, v in rec.items() if k not in _RECORD_STATE_KEYS)
+            )
+            return (rec.get("domain"), rec.get("type"), extra)
+
+        def _state(rec: dict[str, Any]) -> tuple[Any, ...]:
+            # Compared as int so a JSON "300" from the daemon doesn't
+            # read as different from a rendered 300. A record disabled
+            # in the console is not served, so it is not converged.
+            ttl = rec.get("ttl")
+            return (int(ttl) if ttl is not None else None, bool(rec.get("disabled")))
+
+        existing_by_id = {_identity(r): r for r in existing}
+        desired_by_id = {_identity(r): r for r in desired}
+
+        to_delete = [r for i, r in existing_by_id.items() if i not in desired_by_id]
+        to_add = [r for i, r in desired_by_id.items() if i not in existing_by_id]
+        # Same record, different TTL or disabled: one ``update``. Neither
+        # touches the owner's PTR the way a delete does, and an RRset
+        # keeps serving throughout. ``records/update`` takes the current
+        # value params and, with no ``new*`` param, keeps the value; it
+        # re-enables (``disable`` defaults false) and sets ``ttl``
+        # (APIDOCS "Update Record"; ``AuthZone.UpdateRecord`` is a
+        # zone-level delete + add, without the web API's PTR cleanup).
+        to_update = [
+            (existing_by_id[i], r)
+            for i, r in desired_by_id.items()
+            if i in existing_by_id and _state(existing_by_id[i]) != _state(r)
+        ]
+
+        updated = 0
+        for old, want in to_update:
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/update",
+                {
+                    "domain": old["domain"],
+                    "zone": zone,
+                    "type": old["type"],
+                    **{k: v for k, v in old.items() if k not in _RECORD_STATE_KEYS},
+                    "ttl": want["ttl"],
+                    "disable": "false",
+                },
+            ).json()
+            if body.get("status") == "error":
+                log.warning(
+                    "technitium_reconcile_update_failed",
+                    zone=zone,
+                    record=old,
+                    error=body.get("errorMessage"),
                 )
-                return (rec.get("domain"), rec.get("type"), extra)
+                self._note_apply_failure(
+                    f"{zone}: record update {old.get('domain')} {old.get('type')}: "
+                    f"{body.get('errorMessage')}"
+                )
+            else:
+                updated += 1
 
-            def _state(rec: dict[str, Any]) -> tuple[Any, ...]:
-                # Compared as int so a JSON "300" from the daemon doesn't
-                # read as different from a rendered 300. A record disabled
-                # in the console is not served, so it is not converged.
-                ttl = rec.get("ttl")
-                return (int(ttl) if ttl is not None else None, bool(rec.get("disabled")))
-
-            existing_by_id = {_identity(r): r for r in existing}
-            desired_by_id = {_identity(r): r for r in desired}
-
-            to_delete = [r for i, r in existing_by_id.items() if i not in desired_by_id]
-            to_add = [r for i, r in desired_by_id.items() if i not in existing_by_id]
-            # Same record, different TTL or disabled: one ``update``. Neither
-            # touches the owner's PTR the way a delete does, and an RRset
-            # keeps serving throughout. ``records/update`` takes the current
-            # value params and, with no ``new*`` param, keeps the value; it
-            # re-enables (``disable`` defaults false) and sets ``ttl``
-            # (APIDOCS "Update Record"; ``AuthZone.UpdateRecord`` is a
-            # zone-level delete + add, without the web API's PTR cleanup).
-            to_update = [
-                (existing_by_id[i], r)
-                for i, r in desired_by_id.items()
-                if i in existing_by_id and _state(existing_by_id[i]) != _state(r)
-            ]
-
-            updated = 0
-            for old, want in to_update:
-                body = self._call(
-                    token,
-                    "POST",
-                    "zones/records/update",
-                    {
-                        "domain": old["domain"],
-                        "zone": zone,
-                        "type": old["type"],
-                        **{k: v for k, v in old.items() if k not in _RECORD_STATE_KEYS},
-                        "ttl": want["ttl"],
-                        "disable": "false",
-                    },
-                ).json()
-                if body.get("status") == "error":
+        deleted = 0
+        for rec in to_delete:
+            resp = self._call(
+                token,
+                "POST",
+                "zones/records/delete",
+                {
+                    "domain": rec["domain"],
+                    "zone": zone,
+                    "type": rec["type"],
+                    **{k: v for k, v in rec.items() if k not in _RECORD_STATE_KEYS},
+                },
+            )
+            body = resp.json()
+            if body.get("status") == "error":
+                # "no such record" means it was already gone — a no-op,
+                # not a deletion. Counting it (or the failure case) would
+                # report churn that never happened, which is the same
+                # phantom the apex-NS filter above exists to prevent.
+                if _norm_error(body.get("errorMessage")) != _RECORD_ABSENT_MESSAGE:
                     log.warning(
-                        "technitium_reconcile_update_failed",
+                        "technitium_reconcile_delete_failed",
                         zone=zone,
-                        record=old,
+                        record=rec,
                         error=body.get("errorMessage"),
                     )
                     self._note_apply_failure(
-                        f"{zone}: record update {old.get('domain')} {old.get('type')}: "
+                        f"{zone}: record delete {rec.get('domain')} {rec.get('type')}: "
                         f"{body.get('errorMessage')}"
                     )
-                else:
-                    updated += 1
+            else:
+                deleted += 1
 
-            deleted = 0
-            for rec in to_delete:
-                resp = self._call(
-                    token,
-                    "POST",
-                    "zones/records/delete",
-                    {
-                        "domain": rec["domain"],
-                        "zone": zone,
-                        "type": rec["type"],
-                        **{k: v for k, v in rec.items() if k not in _RECORD_STATE_KEYS},
-                    },
-                )
-                body = resp.json()
-                if body.get("status") == "error":
-                    # "no such record" means it was already gone — a no-op,
-                    # not a deletion. Counting it (or the failure case) would
-                    # report churn that never happened, which is the same
-                    # phantom the apex-NS filter above exists to prevent.
-                    if _norm_error(body.get("errorMessage")) != _RECORD_ABSENT_MESSAGE:
-                        log.warning(
-                            "technitium_reconcile_delete_failed",
-                            zone=zone,
-                            record=rec,
-                            error=body.get("errorMessage"),
-                        )
-                        self._note_apply_failure(
-                            f"{zone}: record delete {rec.get('domain')} {rec.get('type')}: "
-                            f"{body.get('errorMessage')}"
-                        )
-                else:
-                    deleted += 1
-
-            added = 0
-            for rec in to_add:
-                resp = self._call(
-                    token,
-                    "POST",
-                    "zones/records/add",
-                    {**rec, "zone": zone, "overwrite": "false"},
-                )
-                body = resp.json()
-                if body.get("status") == "error":
-                    # "already exists" is a no-op, not an add — same
-                    # reasoning as the delete branch above.
-                    if not _is_record_noop(body.get("errorMessage")):
-                        log.error(
-                            "technitium_reconcile_add_failed",
-                            zone=zone,
-                            record=rec,
-                            error=body.get("errorMessage"),
-                        )
-                        self._note_apply_failure(
-                            f"{zone}: record add {rec.get('domain')} {rec.get('type')}: "
-                            f"{body.get('errorMessage')}"
-                        )
-                    continue
-                added += 1
-            if added or deleted or updated:
-                log.info(
-                    "technitium_zone_reconciled",
-                    zone=zone,
-                    added=added,
-                    deleted=deleted,
-                    updated=updated,
-                )
-            self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
-
+        added = 0
+        for rec in to_add:
+            resp = self._call(
+                token,
+                "POST",
+                "zones/records/add",
+                {**rec, "zone": zone, "overwrite": "false"},
+            )
+            body = resp.json()
+            if body.get("status") == "error":
+                # "already exists" is a no-op, not an add — same
+                # reasoning as the delete branch above.
+                if not _is_record_noop(body.get("errorMessage")):
+                    log.error(
+                        "technitium_reconcile_add_failed",
+                        zone=zone,
+                        record=rec,
+                        error=body.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"{zone}: record add {rec.get('domain')} {rec.get('type')}: "
+                        f"{body.get('errorMessage')}"
+                    )
+                continue
+            added += 1
+        if added or deleted or updated:
+            log.info(
+                "technitium_zone_reconciled",
+                zone=zone,
+                added=added,
+                deleted=deleted,
+                updated=updated,
+            )
+        self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
     def _reconcile_zone_apex(self, token: str, zone: str, apex: dict[str, Any] | None) -> None:
         """Bring a primary zone's SOA and apex NS set in line with ``apex``.
 
@@ -3845,8 +3920,10 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> None:
+    def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> bool:
         """Create the zone if absent, with the params its type requires.
+
+        Returns True only when this call created the zone (#1758).
 
         Unlike a Primary, a Secondary/Stub create is **not** guaranteed to
         succeed and is **not** safely retryable-forever: Technitium resolves
@@ -3905,7 +3982,7 @@ class TechnitiumDriver(DriverBase):
                 self._reapply_zone_upstream(
                     token, zone, ztype, params, forwarder_specs, dnssec
                 )
-                return
+                return False
             log.error(
                 "technitium_zone_create_failed",
                 zone=zone,
@@ -3915,10 +3992,11 @@ class TechnitiumDriver(DriverBase):
             self._note_apply_failure(
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
-            return
+            return False
         if ztype == "Forwarder":
             # The create carried the first upstream only.
             self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)
+        return True
 
     def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
         """Bring an existing zone's type in line with the bundle (#1457).
