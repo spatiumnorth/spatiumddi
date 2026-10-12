@@ -534,6 +534,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_spool_trimmed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_spool_trimmed_alert_rule_seed_skipped", reason=str(exc))
+    # DNSSEC multi-signer alert rule — singleton, ENABLED by default
+    # (issue #1762). Silent unless a signed zone sits on a group with more than
+    # one DNS server, each signing with its own keys. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dnssec_multi_signer_alert_rule,
+        )
+
+        await seed_dnssec_multi_signer_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dnssec_multi_signer_alert_rule_seed_skipped", reason=str(exc))
     # Uncoordinated DHCP scope alert rule — singleton, ENABLED by default
     # (issue #1110). Silent unless two servers already serve one scope
     # without coordinating. Idempotent.

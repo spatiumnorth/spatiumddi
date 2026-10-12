@@ -53,6 +53,7 @@ from app.models.dns import (
 )
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
 
@@ -276,6 +277,13 @@ async def move_server_to_group(
         hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
     await ensure_group_catalog_compatible(db, target_group, server.driver)
+
+    # #1762 — a server joining a group that already has one and holds signed
+    # zones would sign them with its own keys. Enabled or not: a disabled
+    # agent still receives and serves the bundle.
+    refusal = await second_signer_refusal(db, target_group, driver=server.driver)
+    if refusal is not None:
+        raise ServerMoveError(refusal, status_code=422)
 
     # ── Purge state that belongs to the old group ─────────────────────
     zone_state_purged = (
