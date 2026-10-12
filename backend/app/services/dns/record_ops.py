@@ -467,6 +467,14 @@ async def _apply_agentless(
 PTR_CLEANUP_DRIVERS: frozenset[str] = frozenset({"technitium", "technitium_api"})
 
 
+def _is_address_delete(op: Any, record: Any) -> bool:
+    return (
+        op == "delete"
+        and isinstance(record, dict)
+        and (record.get("type") or "").upper() in ("A", "AAAA")
+    )
+
+
 def _qualified_owner(zone: DNSZone, name: str) -> str:
     zone_name = zone.name.rstrip(".").lower()
     name = (name or "@").rstrip(".").lower()
@@ -524,8 +532,7 @@ async def reassert_ptrs_after_a_deletes(
     owners: dict[str, str] = {}  # reverse pointer (lower, no dot) -> owner fqdn
     for o in ops:
         rec = o.get("record") or {}
-        rtype = (rec.get("type") or "").upper()
-        if o.get("op") != "delete" or rtype not in ("A", "AAAA"):
+        if not _is_address_delete(o.get("op"), rec):
             continue
         try:
             ip = ipaddress.ip_address(str(rec.get("value") or "").strip())
@@ -1065,7 +1072,10 @@ async def retract_address_records(
             continue  # a zone in the trash is not served: nothing on the wire
         by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
     wake: set[uuid.UUID] = set()
-    for zone, recs in by_zone.values():
+    # #1800 — reverse zones first, so a Technitium A/AAAA delete finds its PTR's
+    # delete already queued and the re-assert queues no create that delete
+    # would only undo.
+    for zone, recs in sorted(by_zone.values(), key=lambda zr: zr[0].kind != "reverse"):
         target_serial = bump_zone_serial(zone)
         await enqueue_record_ops_batch(
             db,
@@ -1330,6 +1340,7 @@ async def apply_acks(
     }
     now = datetime.now(UTC)
     failures: dict[uuid.UUID, tuple[DNSRecordOp, str]] = {}
+    retried_deletes: list[DNSRecordOp] = []
     for op_id, ack in parsed:
         op = ops.get(op_id)
         if op is None:
@@ -1346,11 +1357,52 @@ async def apply_acks(
                 op.next_attempt_at = None
                 op.updated_at = now
                 failures.pop(op_id, None)
+                if op.attempts > 1 and _is_address_delete(op.op, op.record):
+                    retried_deletes.append(op)
         elif op.state == "in_flight" and current and op_id not in failures:
             failures[op_id] = (op, str(ack.get("message") or "the agent reported an error"))
     if failures:
         await fail_attempts(db, list(failures.values()), now=now)
     await db.flush()
+    if retried_deletes:
+        await _reassert_after_retried_deletes(db, server_id, retried_deletes)
+
+
+async def _reassert_after_retried_deletes(
+    db: AsyncSession, server_id: uuid.UUID, ops: list[DNSRecordOp]
+) -> None:
+    """#1800 — re-assert PTRs a RETRIED A/AAAA delete took with it.
+
+    The PTR ``create`` queued after the delete ships in the same page, and the
+    agent keeps going past a failed op. So when the delete failed and the
+    create applied, the delete's retry lands AFTER the create and Technitium
+    removes the PTR again. The ack of that retry is the first moment we know
+    it happened; queue the create once more. The same database guards apply
+    (row live, target matches, no newer delete queued), so a PTR deleted in
+    the meantime stays deleted."""
+    server = await db.get(DNSServer, server_id)
+    if server is None or server.driver not in PTR_CLEANUP_DRIVERS:
+        return
+    by_zone: dict[str, list[dict[str, Any]]] = {}
+    for op in ops:
+        by_zone.setdefault(op.zone_name.rstrip(".").lower(), []).append(
+            {"op": "delete", "record": op.record}
+        )
+    for zone_name, zone_ops in by_zone.items():
+        zone = (
+            (
+                await db.execute(
+                    select(DNSZone).where(
+                        DNSZone.group_id == server.group_id,
+                        func.lower(func.rtrim(DNSZone.name, ".")) == zone_name,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if zone is not None:
+            await reassert_ptrs_after_a_deletes(db, zone, server, zone_ops)
 
 
 async def ack_op(

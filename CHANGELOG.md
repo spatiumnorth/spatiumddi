@@ -91,7 +91,9 @@ the formatter handles the rest.
   pass. The control plane now queues a PTR create after the delete for any
   PTR it still owns in a reverse zone of the group (`technitium` and
   `technitium_api`, single, batch and bulk), decided against the database so
-  a PTR deleted earlier is not resurrected from a stale bundle. Edits already
+  a PTR deleted earlier is not resurrected from a stale bundle. A delete that
+  fails and is retried after the PTR create applied re-asserts the PTR again
+  when its retry is acknowledged. Edits already
   ride `update` ops, which do not touch the PTR (checked in the v15.4.0
   source). A PTR in a reverse zone SpatiumDDI does not manage is still
   removed with its A record; this is documented in `DNS_DRIVERS.md`. Also

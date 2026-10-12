@@ -256,3 +256,207 @@ async def test_agentless_technitium_api_applies_the_reassert_after_the_delete(
     monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
     await enqueue_record_op(db_session, fwd, "delete", _a_delete())
     assert calls == [("delete", FWD, "A"), ("create", REV, "PTR")]
+
+
+# ── The IPAM address delete retracts the A AND the PTR (validation) ─────
+#
+# The scariest regression: a deleted address whose PTR the re-assert brings
+# back. ``_sync_dns_record(action="delete")`` enqueues one delete per record,
+# in whatever order the rows come back, and only drops each row after its op
+# is queued — so when the A goes first, its PTR row is still live and no PTR
+# delete is queued yet, and the re-assert does queue a create. That is safe
+# only because the PTR's own delete is queued after it: what each server ends
+# on is the LAST op for the PTR RRset.
+
+
+async def _ipam_address(
+    db: AsyncSession, fwd: DNSZone, rev: DNSZone, *, ptr_first: bool
+) -> tuple[Any, Any]:
+    from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db.add(space)
+    await db.flush()
+    block = IPBlock(space_id=space.id, network="192.0.2.0/24", name="b")
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="192.0.2.0/24",
+        name="s",
+        dns_zone_id=str(fwd.id),
+        dns_inherit_settings=False,
+    )
+    db.add(subnet)
+    await db.flush()
+    ip = IPAddress(subnet_id=subnet.id, address="192.0.2.10", status="allocated", hostname="web")
+    db.add(ip)
+    await db.flush()
+    a = DNSRecord(
+        zone_id=fwd.id,
+        name="web",
+        fqdn=f"{OWNER}.",
+        record_type="A",
+        value="192.0.2.10",
+        ttl=300,
+        auto_generated=True,
+        ip_address_id=ip.id,
+    )
+    ptr = DNSRecord(
+        zone_id=rev.id,
+        name="10",
+        fqdn=f"10.{REV}",
+        record_type="PTR",
+        value=f"{OWNER}.",
+        ttl=300,
+        auto_generated=True,
+        ip_address_id=ip.id,
+    )
+    for rec in (ptr, a) if ptr_first else (a, ptr):
+        db.add(rec)
+        await db.flush()
+    return ip, subnet
+
+
+async def _last_ptr_op(db: AsyncSession, server: DNSServer) -> str | None:
+    rows = (
+        await db.execute(
+            select(DNSRecordOp.op)
+            .where(DNSRecordOp.server_id == server.id, DNSRecordOp.zone_name == REV)
+            .order_by(DNSRecordOp.created_at, DNSRecordOp.seq)
+        )
+    ).all()
+    return rows[-1][0] if rows else None
+
+
+@pytest.mark.parametrize("ptr_first", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+async def test_an_ipam_address_delete_leaves_the_ptr_deleted(db_session, ptr_first, batched):
+    from app.api.v1.ipam.router import _batched_dns_ops, _sync_dns_record
+
+    servers, fwd, rev = await _group(db_session)
+    ip, subnet = await _ipam_address(db_session, fwd, rev, ptr_first=ptr_first)
+    if batched:
+        async with _batched_dns_ops(db_session):
+            await _sync_dns_record(db_session, ip, subnet, action="delete")
+    else:
+        await _sync_dns_record(db_session, ip, subnet, action="delete")
+    await db_session.flush()
+    for s in servers:
+        assert await _last_ptr_op(db_session, s) == "delete", s.name
+    # The PTR is retracted first, so no create is queued that its delete undoes.
+    creates = (
+        await db_session.execute(select(DNSRecordOp.id).where(DNSRecordOp.op == "create"))
+    ).all()
+    assert creates == []
+
+
+@pytest.mark.parametrize("ptr_first", [False, True])
+async def test_an_agentless_ipam_address_delete_ends_on_the_ptr_delete(
+    db_session, monkeypatch, ptr_first
+):
+    from app.api.v1.ipam.router import _sync_dns_record
+    from app.drivers.dns.base import DNSDriver
+
+    servers, fwd, rev = await _group(db_session, driver="technitium_api", servers=1)
+    ip, subnet = await _ipam_address(db_session, fwd, rev, ptr_first=ptr_first)
+    calls: list[tuple[str, str, str]] = []
+
+    class Fake:
+        apply_record_changes = DNSDriver.apply_record_changes
+
+        async def apply_record_change(self, server, change):
+            calls.append((change.op, change.zone_name, change.record.record_type))
+
+    monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
+    await _sync_dns_record(db_session, ip, subnet, action="delete")
+    ptr_calls = [c for c in calls if c[2] == "PTR"]
+    assert ptr_calls and ptr_calls[-1][0] == "delete", calls
+
+
+async def test_a_subnet_purge_retracts_the_ptr_without_a_reassert(db_session):
+    servers, fwd, rev = await _group(db_session)
+    _, subnet = await _ipam_address(db_session, fwd, rev, ptr_first=False)
+    await record_ops.retract_address_records(db_session, [subnet.id])
+    await db_session.flush()
+    for s in servers:
+        assert await _last_ptr_op(db_session, s) == "delete", s.name
+    creates = (
+        await db_session.execute(select(DNSRecordOp.id).where(DNSRecordOp.op == "create"))
+    ).all()
+    assert creates == []
+
+
+# ── A retried A delete lands after the re-assert (validation) ───────────
+
+
+async def _retry_a_delete_after_the_ptr_create(db: AsyncSession, server: DNSServer) -> DNSRecordOp:
+    """First page: the A delete fails, the PTR create applies. Second page: the
+    A delete's retry applies — after the create, so Technitium took the PTR."""
+    page, _ = await page_pending_ops(db, server)
+    acks = []
+    for p in page:
+        ok = p["record"]["type"] == "PTR"
+        acks.append(
+            {
+                "op_id": p["op_id"],
+                "result": "ok" if ok else "error",
+                "message": None if ok else "boom",
+                "dispatch": p["dispatch"],
+            }
+        )
+    await record_ops.apply_acks(db, server.id, acks)
+    a_op = (
+        (await db.execute(select(DNSRecordOp).where(DNSRecordOp.zone_name == FWD))).scalars().one()
+    )
+    assert a_op.state == "pending"
+    a_op.next_attempt_at = None
+    await db.flush()
+    page, _ = await page_pending_ops(db, server)
+    assert [p["op_id"] for p in page] == [str(a_op.id)]
+    await record_ops.apply_acks(
+        db,
+        server.id,
+        [{"op_id": page[0]["op_id"], "result": "ok", "dispatch": page[0]["dispatch"]}],
+    )
+    return a_op
+
+
+async def test_a_retried_a_delete_reasserts_the_ptr_again(db_session):
+    servers, fwd, rev = await _group(db_session, servers=1)
+    await _ptr(db_session, rev)
+    await enqueue_record_op(db_session, fwd, "delete", _a_delete())
+    a_op = await _retry_a_delete_after_the_ptr_create(db_session, servers[0])
+    again = (
+        (
+            await db_session.execute(
+                select(DNSRecordOp).where(
+                    DNSRecordOp.zone_name == REV,
+                    DNSRecordOp.op == "create",
+                    DNSRecordOp.state == "pending",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(again) == 1
+    assert (again[0].created_at, again[0].seq) > (a_op.created_at, a_op.seq)
+
+
+async def test_a_retried_a_delete_does_not_resurrect_a_ptr_deleted_since(db_session):
+    servers, fwd, rev = await _group(db_session, servers=1)
+    ptr = await _ptr(db_session, rev)
+    await enqueue_record_op(db_session, fwd, "delete", _a_delete())
+    ptr.deleted_at = datetime.now(UTC)
+    await db_session.flush()
+    await _retry_a_delete_after_the_ptr_create(db_session, servers[0])
+    pending = (
+        await db_session.execute(
+            select(DNSRecordOp.id).where(
+                DNSRecordOp.zone_name == REV, DNSRecordOp.state == "pending"
+            )
+        )
+    ).all()
+    assert pending == []
