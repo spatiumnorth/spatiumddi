@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A demote cordons the leaving node so nothing new lands on it
+  (#1750).** The leave never cordoned its node, so the scheduler could
+  still place pods there until k3s stopped. In a drill the replaced
+  `helm-install-spatiumddi-appliance` Job pod landed on the leaver and
+  stuck; when the eviction deleted the Node the Job re-ran on the seed
+  and dns-bind9 and dhcp-kea were gone for about 4.5 minutes. The
+  control plane now cordons each target once the demote's refusals have
+  passed, before the leave is stamped. It is cordon only, no drain: the
+  node's teardown and the Node eviction reschedule what already runs
+  there. A cordon that fails (no ServiceAccount, kubeapi down) is
+  logged and never fails the demote. A leave that fails, or a demote
+  cleared with clear-cluster-state, uncordons the node again. The cordon
+  marks the Node (`spatium.io/demote-cordoned`) and only a marked Node is
+  ever uncordoned, so a node you had already cordoned before the demote
+  stays cordoned when its leave fails. A leave that crashes part-way
+  reports neither result, so it stays cordoned until clear-cluster-state.
+
 - **Demoting control-plane members no longer costs the seed its quorum
   (#1541).** A demoted node reset itself to a fresh single-node seed
   without leaving etcd, and nobody removed its member or its k8s Node
