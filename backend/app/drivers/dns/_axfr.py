@@ -18,6 +18,7 @@ from typing import Any
 
 import structlog
 
+from app.drivers.dns._txt import txt_value
 from app.drivers.dns.base import RecordData, TsigKey
 
 logger = structlog.get_logger(__name__)
@@ -282,7 +283,12 @@ async def axfr_zone_records(
                     port_field = rdata.port
                     value = _absolutize(rdata.target)
                 elif rtype == "TXT":
-                    value = "".join(s.decode("utf-8", errors="replace") for s in rdata.strings)
+                    # #1760: joining the strings lost an explicit split
+                    # (``"p=AAA" "BBB"`` read back as ``p=AAABBB``) and any
+                    # non-UTF-8 octet, so drift never cleared and Sync
+                    # imported a merged duplicate. Plain text where that
+                    # says the same strings, presentation form otherwise.
+                    value = txt_value(list(rdata.strings))
                 elif rtype in ("SVCB", "HTTPS"):
                     # Same reason as ``_absolutize``: ``to_text()`` on a
                     # relativized in-zone target gives ``svc``, which reads

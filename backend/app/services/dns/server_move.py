@@ -45,13 +45,14 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
-from app.models.appliance import Appliance
 from app.models.dns import (
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
     DNSServerZoneState,
 )
+from app.services.appliance.ownership import owning_appliance_for_dns_server
+from app.services.dns import technitium_api_scope
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
 
@@ -140,6 +141,14 @@ async def ensure_group_single_driver(
             f"{driver!r}. A server group is single-driver — {hint}",
             status_code=422,
         )
+    # #1784 — the experimental agentless Technitium driver supports ONE
+    # server per group. Enforced on every path that puts a server in a group
+    # (create, driver change, move) because they all come through here.
+    if driver == technitium_api_scope.DRIVER:
+        if await technitium_api_scope.count_other_servers(db, group_id, exclude_server_id):
+            raise ServerMoveError(
+                technitium_api_scope.single_server_message(group_name), status_code=422
+            )
 
 
 async def _elect_primary(
@@ -316,15 +325,16 @@ async def move_server_to_group(
     # Only repointed when it currently names the group being left: an
     # appliance deliberately assigned elsewhere is not ours to redirect.
     appliance_repointed_id: uuid.UUID | None = None
-    if server.appliance_id is not None:
-        appliance = await db.get(Appliance, server.appliance_id)
-        if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
-            appliance.assigned_dns_group_id = target_group.id
-            appliance_repointed_id = appliance.id
-            # Per-appliance desired state changed, so wake the supervisor's
-            # heartbeat long-poll rather than making it wait out its interval
-            # for a firewall rule its agent already needs.
-            collect_wake(appliance_channel(appliance.id))
+    # Found by FK, else by the same hostname rule Fleet uses (#1749): agents
+    # register by hostname and never set ``appliance_id``.
+    appliance = await owning_appliance_for_dns_server(db, server)
+    if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+        appliance.assigned_dns_group_id = target_group.id
+        appliance_repointed_id = appliance.id
+        # Per-appliance desired state changed, so wake the supervisor's
+        # heartbeat long-poll rather than making it wait out its interval
+        # for a firewall rule its agent already needs.
+        collect_wake(appliance_channel(appliance.id))
 
     # Both groups' bundles change shape (a member left one and joined the
     # other), and the server's own channel is what reaches an agent already

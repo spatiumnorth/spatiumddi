@@ -30,9 +30,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
+from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
-from app.services.dns.record_ops import resolve_primary_server
+from app.services.dns.record_ops import resolve_primary_server, rrset_from_payload
+from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.tsig import (
     pull_zone_records_signed,
@@ -175,6 +177,13 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     * Everything else: stripped + lowercased (fine for A/AAAA/IP literals
       where case doesn't matter either).
     """
+    if rtype == "TXT":
+        # #1760: a stored value may be bare (``v=spf1 -all``) or quoted, and
+        # a server reads back whichever ``txt_value`` picks. Compare the
+        # character-strings both stand for, as one canonical presentation
+        # form, case kept: TXT content is case-sensitive (DKIM keys,
+        # tokens). Not stripped: the renderers serve surrounding spaces.
+        return quote_txt(value or "")
     v = (value or "").strip().lower()
     if rtype in ("A", "AAAA"):
         # Canonical form (#1513): an expanded/upper-case address as
@@ -335,6 +344,31 @@ async def _resolve_primary_and_driver(
     return primary, driver, [view_key, tsig], view_name
 
 
+def _legacy_technitium_txt_keys(db_rows: list[DNSRecord], zone_name: str) -> set[RecordKey]:
+    """What a ``technitium_api`` server holds for each DB TXT row written
+    before #1760, keyed like the wire.
+
+    The old write sent the stored value, trailing dot stripped, as
+    Technitium's ``text`` param, which takes it as content cut every 255
+    octets: ``"v=spf1 -all"`` was served with its quotes, ``"a" "b"`` as one
+    string, ``Hello.`` as ``Hello``. Such a record is the DB row served
+    wrong, not a record the operator added on the server, so Sync and pull
+    must not import it as a new row: a push (``overwrite=true`` on the
+    RRset) replaces it. A row the old write served correctly keys the same
+    as the wire and is never in this set.
+    """
+    out: set[RecordKey] = set()
+    for row in db_rows:
+        if row.record_type.upper() != "TXT":
+            continue
+        raw = (row.value or "").rstrip(".").encode("utf-8")
+        served = txt_value([raw[i : i + 255] for i in range(0, len(raw), 255)])
+        legacy = _key(RecordData(name=row.name, record_type="TXT", value=served), zone_name)
+        if legacy != _key(row, zone_name):
+            out.add(legacy)
+    return out
+
+
 def _additive_import(
     db: AsyncSession,
     zone: DNSZone,
@@ -343,8 +377,14 @@ def _additive_import(
     *,
     apply: bool,
     importable_types: frozenset[str] | None = None,
+    not_importable: set[RecordKey] | None = None,
 ) -> PullResult:
-    """Create DNSRecord rows for on-wire entries that are missing from DB."""
+    """Create DNSRecord rows for on-wire entries that are missing from DB.
+
+    ``not_importable`` names on-wire records that are a DB row served wrong
+    (``_legacy_technitium_txt_keys``): neither existing nor new, so they are
+    skipped and left for the push to replace.
+    """
     if importable_types is None:
         importable_types = frozenset(_IMPORTABLE_TYPES)
     zone_name = zone.name
@@ -359,8 +399,11 @@ def _additive_import(
         if rtype not in importable_types:
             skipped_unsupported += 1
             continue
-        if _key(rec, zone_name) in db_keys:
+        key = _key(rec, zone_name)
+        if key in db_keys:
             existing += 1
+            continue
+        if not_importable and key in not_importable:
             continue
 
         fqdn = zone_name_no_dot if rec.name == "@" else f"{rec.name}.{zone_name_no_dot}"
@@ -399,6 +442,14 @@ def _additive_import(
     )
 
 
+def _not_importable(primary: Any, db_rows: list[DNSRecord], zone_name: str) -> set[RecordKey]:
+    """On-wire keys the import must skip for ``primary``'s driver. Only the
+    agentless Technitium driver ever wrote the pre-#1760 TXT form."""
+    if getattr(primary, "driver", None) != "technitium_api":
+        return set()
+    return _legacy_technitium_txt_keys(db_rows, zone_name)
+
+
 async def pull_zone_from_server(
     db: AsyncSession,
     zone: DNSZone,
@@ -428,6 +479,7 @@ async def pull_zone_from_server(
         db_keys,
         apply=apply,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+        not_importable=_not_importable(primary, db_rows, zone.name),
     )
     if apply and result.imported:
         await db.flush()
@@ -516,6 +568,29 @@ async def _additive_push(
             push_errors=push_errors,
         )
 
+    # Each op carries the complete DB set at its (name, type), as the record
+    # op path does (#783). Without it a driver that writes a whole RRset
+    # (technitium_api ``overwrite=true``, Windows) replaces the set with the
+    # one pushed value, so pushing a TXT that is missing or served wrong
+    # (#1760) retires its in-sync siblings, and the next Sync pushes those
+    # back over it. The pulled rows were flushed above, so the set includes
+    # them.
+    payloads: list[dict[str, Any]] = [
+        {
+            "op": "create",
+            "record": {
+                "name": row.name,
+                "type": row.record_type.upper(),
+                "value": row.value,
+                "ttl": row.ttl,
+                "priority": row.priority,
+                "weight": row.weight,
+                "port": row.port,
+            },
+        }
+        for row in candidate_rows
+    ]
+    await stamp_rrsets_for_ops(db, zone, payloads)
     changes: list[RecordChange] = [
         RecordChange(
             op="create",
@@ -530,8 +605,9 @@ async def _additive_push(
                 port=row.port,
             ),
             target_serial=target_serial,
+            rrset=rrset_from_payload(payload["record"]),
         )
-        for row in candidate_rows
+        for row, payload in zip(candidate_rows, payloads, strict=True)
     ]
 
     if not changes:
@@ -671,6 +747,7 @@ async def sync_zone_with_server(
         db_keys,
         apply=apply,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+        not_importable=_not_importable(primary, db_rows, zone.name),
     )
     if apply and pull_result.imported:
         await db.flush()

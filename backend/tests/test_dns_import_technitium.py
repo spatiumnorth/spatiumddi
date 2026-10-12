@@ -42,7 +42,16 @@ def test_classify_zone_detects_reverse() -> None:
         ("DNAME", {"dname": "other.example.net"}, "other.example.net."),
         ("NS", {"nameServer": "ns1.example.net"}, "ns1.example.net."),
         ("PTR", {"ptrName": "host.example.net"}, "host.example.net."),
+        # #1760: no characterStringsBase64 (an older server) falls back to
+        # the joined ``text``, as content; a simple record reads back plain,
+        # an explicit split or a literal quote as presentation form.
         ("TXT", {"text": "v=spf1 -all"}, "v=spf1 -all"),
+        ("TXT", {"text": '"v=spf1 -all"'}, '"\\"v=spf1 -all\\""'),
+        (
+            "TXT",
+            {"text": "ab.", "characterStringsBase64": ["YQ==", "Yi4="]},
+            '"a" "b."',
+        ),
         (
             "CAA",
             {"flags": 0, "tag": "issue", "value": "letsencrypt.org"},

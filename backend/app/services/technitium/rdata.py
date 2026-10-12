@@ -50,6 +50,8 @@ import ipaddress
 import shlex
 from typing import Any
 
+from app.drivers.dns._txt import txt_strings, txt_value
+
 # Record types both directions model. Technitium-proprietary types
 # (ANAME / APP / FWD) are deliberately absent: they are not drop-in
 # equivalents of PowerDNS's ALIAS/LUA and need their own design pass.
@@ -567,7 +569,25 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
     if rtype == "PTR":
         return _dotted_target(rdata.get("ptrName")), extra
     if rtype == "TXT":
-        return str(rdata.get("text") or ""), extra
+        # characterStringsBase64 is the record exactly (#1760, as the agent
+        # driver reads it, #1694): ``text`` joins the strings and drops a
+        # string boundary. ``txt_value`` gives the plain text where that
+        # says the same strings, and presentation form where it would not
+        # (an explicit split, or literal quote characters in the content),
+        # so the stored value round-trips through ``record_params``.
+        encoded = rdata.get("characterStringsBase64")
+        if isinstance(encoded, list) and encoded:
+            try:
+                strings = [base64.b64decode(str(e), validate=True) for e in encoded]
+            except (ValueError, binascii.Error):
+                strings = None
+            if strings is not None:
+                return txt_value(strings), extra
+        # An older server: ``text`` is the content joined, which Technitium
+        # cut every 255 octets (``DnsTXTRecordData(string)``). Content, not
+        # presentation form, so a leading quote is a character.
+        raw = str(rdata.get("text") or "").encode("utf-8")
+        return txt_value([raw[i : i + 255] for i in range(0, len(raw), 255)]), extra
     if rtype == "MX":
         extra["priority"] = int_or(rdata.get("preference"), 10)
         return _dotted_target(rdata.get("exchange")), extra
@@ -640,6 +660,24 @@ def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, in
 # ── Write direction: stored value → Technitium add/delete params ───────
 
 
+def _txt_params(value: str) -> dict[str, Any]:
+    """TXT as ``characterStringsBase64`` (octet-exact, comma-separated).
+
+    Technitium cannot hold an empty character-string, so empties are left
+    out, as the agent driver does; a value of only empty strings goes as
+    ``text``.
+    """
+    strings = [s for s in txt_strings(value) if s]
+    if not strings:
+        if not value:
+            return {"text": ""}
+        raw = value.encode("utf-8")
+        strings = [raw[i : i + 255] for i in range(0, len(raw), 255)]
+    return {
+        "characterStringsBase64": ",".join(base64.b64encode(s).decode("ascii") for s in strings)
+    }
+
+
 def record_params(
     rtype: str,
     value: str,
@@ -668,6 +706,10 @@ def record_params(
         # ``false`` meaning none (AliasMode / a param-less record).
         prio, target, params = svcb_params(value, origin)
         return {"svcPriority": prio, "svcTargetName": target, "svcParams": params}
+    if rtype == "TXT":
+        # Text, not a name: it keeps a trailing full stop and its quotes are
+        # presentation syntax, not content (#1760). Before the rstrip below.
+        return _txt_params(value)
     raw = value
 
     def _target(name: str) -> str:
@@ -698,8 +740,6 @@ def record_params(
             "weight": 0 if weight is None else weight,
             "port": 0 if port is None else port,
         }
-    if rtype == "TXT":
-        return {"text": value}
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)

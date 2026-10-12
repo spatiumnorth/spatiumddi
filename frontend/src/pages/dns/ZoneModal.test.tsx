@@ -32,6 +32,7 @@ const updateZone = vi.fn(
     Promise.resolve({ id: zoneId, ...data }),
 );
 const pending = () => new Promise<never>(() => {});
+let groups: unknown[] = [];
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -42,6 +43,7 @@ vi.mock("@/lib/api", async () => {
       // The name's scope hint arrives later than an operator saves: the
       // kind must not wait for it.
       classifyZoneName: pending,
+      listGroups: () => Promise.resolve(groups),
       getZoneDnssecInfo: pending,
       listDnssecPolicies: pending,
       createZone: (groupId: string, data: Record<string, unknown>) =>
@@ -93,6 +95,7 @@ async function save() {
 
 afterEach(() => {
   cleanup();
+  groups = [];
   createZone.mockClear();
   updateZone.mockClear();
 });
@@ -163,6 +166,40 @@ describe("Add Zone's Kind", () => {
     expect(control("Kind").value).toBe("forward");
     await save();
     expect(updateZone.mock.calls[0][2]).toMatchObject({ kind: "forward" });
+  });
+});
+
+describe("Add Zone on an experimental technitium_api group (#1784)", () => {
+  it("offers Primary only and hides the SOA / TTL fields the driver never writes", async () => {
+    groups = [{ id: "grp-1", server_drivers: ["technitium_api"] }];
+    open();
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Primary NS", { selector: "label" }),
+      ).toBeNull(),
+    );
+    expect(screen.queryByText("Admin Email", { selector: "label" })).toBeNull();
+    expect(
+      screen.queryByText("Default TTL (seconds)", { selector: "label" }),
+    ).toBeNull();
+    const type = control("Type") as HTMLSelectElement;
+    expect([...type.options].map((o) => o.value)).toEqual(["primary"]);
+    typeName("corp.example.com");
+    await save();
+    // Defaults still sent, which the API accepts as "unchanged".
+    expect(createZone.mock.calls[0][1]).toMatchObject({
+      zone_type: "primary",
+      primary_ns: "",
+      admin_email: "",
+      ttl: 3600,
+    });
+  });
+
+  it("keeps every field for other drivers", async () => {
+    groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
+    open();
+    expect(screen.getByText("Primary NS", { selector: "label" })).toBeTruthy();
+    expect((control("Type") as HTMLSelectElement).options.length).toBe(4);
   });
 });
 

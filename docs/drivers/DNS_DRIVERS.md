@@ -831,6 +831,11 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 - **`forwarderProtocol` is silently ignored unless `forwarders` is set in the same call.** Setting the protocol alone returns `{"status":"ok"}` and leaves it at `Udp`. The two are always sent together.
 - **Encrypted forwarding needs a domain name, not an IP.** `1.1.1.1` is rejected with `Address must be a domain name` — there would be nothing to validate the upstream certificate against. The neutral model carries a list of forwarder IPs plus a single `forward_tls_hostname`, so over `tls`/`https`/`quic` the hostname wins and the IPs are dropped with a log line naming what went. Technitium then normalises a bare hostname into the transport's canonical form (`cloudflare-dns.com` → `cloudflare-dns.com:853` for DoT, `https://cloudflare-dns.com/dns-query` for DoH).
 
+**Recursion and rate limiting ([#1761](https://github.com/spatiumnorth/spatiumddi/issues/1761)).** Both have daemon defaults that stay in force unless sent (recursion `AllowOnlyForPrivateNetworks`; 600 queries/min per IPv4 /32 and 6000 per /24, IPv6 600/1200/6000, averaged over 5 minutes), so every structural apply sends them:
+
+- `recursion`: `Deny` when `recursion_enabled` is false (the bundle already ANDs in the group's `is_recursive`). Otherwise `allow_recursion` decides. Absent, empty, or exactly `["any"]` all send `AllowOnlyForPrivateNetworks`, the engine's private-network default. **SpatiumDDI does not expose open recursion on Technitium through the default.** `["any"]` is the model's stored default and nothing distinguishes an untouched group from one where an operator chose it; the BIND9 agent never renders `allow-recursion` ([#1786](https://github.com/spatiumnorth/spatiumddi/issues/1786)), so BIND groups run BIND's own `localnets; localhost;` default whatever the field says. Mapping `["any"]` to `Allow` would therefore open recursion to the internet on upgrade, on one engine only. Until `allow_recursion` is rendered the same way for every engine, `["any"]` means "the engine's private-network default", and `Allow` is never sent. Any other list is an explicit ACL and sends `UseSpecifiedNetworkACL` with `recursionNetworkACL` as comma-separated CIDRs (`!` denies; `localhost` / `localnets` expand to loopback / RFC 1918 + link-local + ULA, an approximation of BIND's attached-networks `localnets`; an `any` *inside* a longer list expands to `0.0.0.0/0, ::/0`, so open recursion takes an explicit list). Named ACLs and unparseable entries are dropped with a warning; if no allow entry survives the result is `Deny`. The mode is checked against the four enum values before sending, because `settings/set` ignores an unknown one silently.
+- Rate limits: RRL off (or `rrl_log_only`, which Technitium cannot express) sends empty `qpmPrefixLimitsIPv4` / `IPv6`, which disables the limit, and clears `qpmLimitBypassList`. `rrl_enabled` defaults to false, so on upgrade every existing Technitium group loses the daemon's built-in 600 qpm limit; that is the fix, not a side effect. RRL on sends one per-client limit, `32|N|N` and `128|N|N` with N = `rrl_responses_per_second` x 60, `qpmLimitSampleMinutes` from `rrl_window` (seconds rounded up to minutes), `qpmLimitUdpTruncationPercentage` from `rrl_slip` (100 / slip, 0 = drop), and `rrl_exempt_clients` as the bypass list. This approximates BIND's RRL (identical responses per second); Technitium counts queries per minute. Neither call restarts the daemon: in 15.4.0 `recursion` and the `qpm*` keys are plain property sets (an unchanged `recursion` is a no-op, the qpm setters re-arm the sampling timer), followed by the same config-file save every `settings/set` does.
+
 `forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
 
 ### 4B.3d Blocklists and the live-pull importer (issue #744)
@@ -980,6 +985,29 @@ Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry 
 `probe()` uses `/api/dnsClient/healthCheck`, which Technitium documents as the automated-health-check call: it confirms the process is up *and* that it resolves, and generates **no query-log entries**, which matters because a UI polls it. A failure counting zones afterwards downgrades the message but keeps the probe green — auth is already proven, and a token legitimately scoped to a subset of zones must not render as a red X on a working connection.
 
 `CloudDNSDriverBase.probe` has existed since #37 with **no caller**: nothing in the API, tasks or services invoked it, so the answer to "did that token work?" was "wait for the next sync to fail". #810 adds `POST /api/v1/dns/groups/{gid}/servers/{sid}/test-connection`, which probes a saved server with its stored credentials and returns `{ok, message}`. It covers every driver in `CREDENTIALED_DNS_DRIVERS`, so the eight cloud drivers get it too. Post-save only — the credentials come from the row, unlike `/test-windows-credentials`, which also accepts plaintext for a pre-save dry run.
+
+### 4C.7a Experimental in 1.0 — the supported scope, enforced ([#1784](https://github.com/spatiumnorth/spatiumddi/issues/1784))
+
+`technitium_api` writes into a server SpatiumDDI does not own and has no reconcile loop, so for 1.0 it is labelled **experimental** (`capabilities()["experimental"] is True`; an *Experimental* label on the driver picker, the server row and detail, and the group page) and its supported scope is enforced with 422s instead of being left to fail silently. Every refusal names `technitium_api is experimental in 1.0` and the reason.
+
+Supported:
+
+- **One server per group.** A second `technitium_api` server is refused on server create, on a driver change via update, and on a move into the group (`ensure_group_single_driver`). A second server never received zones the first was given (#1771).
+- **Zones SpatiumDDI creates, Primary only.** A non-Primary zone create is refused. If the zone already exists on the server, create adopts it only when it is an **empty Primary** (no records beyond the apex SOA and NS; a delegation NS below the apex counts as a record); a Secondary / Stub / Forwarder of the same name, or a Primary holding records, is a 409 naming what was found, because a later delete from SpatiumDDI would remove the operator's zone (#1775).
+- **Records** on those zones, over the REST API as in §4C.2.
+
+Refused (422), because the driver never writes them (#1769, #1771, #1774, #1775 track the 1.1 fixes):
+
+- **DNS pools** on the group: pool create and pool member add (a pool collapses to one member).
+- **Zone settings** SOA `ttl` / `refresh` / `retry` / `expire` / `minimum` / `primary_ns` / `admin_email` and `allow_query` / `allow_transfer` / `also_notify` / `notify_enabled`, and changing `zone_type` away from Primary. On update only a *changed* value is refused, so a zone that already holds one can be re-saved, or put back to the default.
+- **Group options** (`PUT …/options`): changing a value from the stored one is refused; an unchanged re-save, or a change back to the column default, is not. **Catalog zones**: turning `catalog_zones_enabled` on is refused, turning it off is not.
+- **Blocklist assignment** to the group (new assignments only).
+- **Moving a zone into** such a group when it is non-Primary, has pools, or carries a setting above. The move preview reports it as `technitium_api_refusal` and the move dialog blocks on it, so preview and commit agree.
+- The Operator Copilot's `create_dns_zone` is held to the same zone rules in its preview and its apply.
+
+The UI hides what it would refuse on such a group: the zone dialog offers Primary only and drops Primary NS / admin email / default TTL, the group's Options tab is hidden, and the zone's Pools view lists existing pools without a *New Pool* button.
+
+**Groups that already violate the scope** (two servers, existing pools) keep serving: nothing is removed or disabled. The group response carries `scope_warnings`, rendered as a banner on the group page, and only *new* changes are refused. Other drivers are untouched.
 
 ### 4C.8 Not in scope for this driver
 

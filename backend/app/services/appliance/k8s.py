@@ -983,6 +983,30 @@ def uncordon_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+def patch_node(name: str, patch: dict[str, Any]) -> tuple[int, str | None]:
+    """Strategic-merge PATCH a Node. Returns ``(status, error)``; ``error``
+    is None on 200/201, and status is 0 when kubeapi was not reached. A
+    ``null`` annotation value removes that key.
+
+    Unlike :func:`cordon_node` the status comes back, so a caller can tell
+    a Node that is gone (404) from a PATCH that failed."""
+    if get_config() is None:
+        return 0, "ServiceAccount not mounted"
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=json.dumps(patch).encode("utf-8"),
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return 0, str(exc)
+    if status in (200, 201):
+        return status, None
+    return status, f"kubeapi status {status}: {body[:200]!r}"
+
+
 def is_node_ready(node: dict[str, Any]) -> bool:
     """True if the node's ``Ready`` condition is ``True``.
 
@@ -1026,6 +1050,23 @@ def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
     """
     owners = (pod.get("metadata") or {}).get("ownerReferences") or []
     return any(o.get("kind") == "DaemonSet" for o in owners)
+
+
+def pod_has_controller(pod: dict[str, Any]) -> bool:
+    """True if the pod has a controller ownerReference.
+
+    A pod is controller-owned when one of its ``ownerReferences``
+    either carries ``controller: true`` (what the apiserver sets for
+    the managing controller) or names a workload controller kind
+    (ReplicaSet / StatefulSet / DaemonSet / Job /
+    ReplicationController). A bare pod — created directly, with no
+    controller — has neither, and nothing re-creates it if it is
+    deleted. Drain uses this to refuse evicting such pods (#1546),
+    matching ``kubectl drain`` without ``--force``.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    controller_kinds = {"ReplicaSet", "StatefulSet", "DaemonSet", "Job", "ReplicationController"}
+    return any(o.get("controller") or o.get("kind") in controller_kinds for o in owners)
 
 
 def pod_is_terminal(pod: dict[str, Any]) -> bool:

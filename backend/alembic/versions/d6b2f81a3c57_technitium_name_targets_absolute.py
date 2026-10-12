@@ -62,7 +62,7 @@ new rule is not here: it is the ``name_target_rule`` marker the renderer
 old one, so the agent reads that bundle's dot-less targets as absolute.
 
 Revision ID: d6b2f81a3c57
-Revises: a3d9e5c17b42
+Revises: e3a81c5d07f2
 Create Date: 2026-10-11
 """
 
@@ -78,7 +78,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "d6b2f81a3c57"
-down_revision = "a3d9e5c17b42"
+down_revision = "e3a81c5d07f2"
 branch_labels = None
 depends_on = None
 
