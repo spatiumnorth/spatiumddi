@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade waits for the control-plane Deployments before it
+  moves to the next node (#1544).** The other half of the gate that
+  already waits for CNPG: after each node's uncordon, the per-node
+  step waits (up to 10 minutes) until every Deployment of the release
+  (found by the chart's `app.kubernetes.io/name` and `/instance`
+  labels, so a Deployment the chart adds later is covered) has
+  available replicas equal to desired and no old pod still draining.
+  A single-replica Deployment passing through its retire-first
+  rollout is waited through, not failed. If it never settles the node
+  step fails and the run stops before the next node's drain; the node
+  is already uncordoned by then, so there is nothing to release. A
+  label selector that matches no Deployment, or a list call refused
+  for missing RBAC, fails the step at once instead of turning the
+  gate off.
+
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
 - **DNSSEC signing is no longer offered on Technitium (#1783).** The sign

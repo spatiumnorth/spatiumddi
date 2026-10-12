@@ -633,9 +633,11 @@ async def _drive_loop(
     cnpg_namespace: str | None = run.plan.get("cnpg_namespace")
     # #1463 — every node waits for this release's slot-image mirror before
     # it is told to fetch an uploaded image.
-    mirror_deployment = per_node.slot_image_mirror_deployment(
-        run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
-    )
+    release_name = run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
+    mirror_deployment = per_node.slot_image_mirror_deployment(release_name)
+    # #1544 — the namespace the chart-bump poll reads the release's
+    # Deployments in; the per-node control-plane gate reads the same one.
+    release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
 
     while True:
         if stop_event.is_set():
@@ -841,6 +843,8 @@ async def _drive_loop(
             cnpg_namespace=cnpg_namespace,
             lease_holder=run.lease_holder,
             mirror_deployment=mirror_deployment,
+            control_plane_release=release_name,
+            control_plane_namespace=release_namespace,
         )
 
         per_node_progress[next_node] = {
