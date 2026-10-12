@@ -95,6 +95,7 @@ from app.services.appliance.group_names import (
     group_name_problem,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns import technitium_api_scope
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -365,13 +366,22 @@ class ServerGroupResponse(BaseModel):
     # which cannot do them (Technitium). Existing groups keep rendering as
     # before; this is the visible warning.
     catalog_unsupported_warning: str | None = None
+    # #1784 — set when the group holds an experimental ``technitium_api``
+    # server, and says where an already-existing group falls outside the
+    # supported scope (second server, pools). Empty for every other group.
+    scope_warnings: list[str] = []
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_model(cls, g: DNSServerGroup, drivers: list[str] | None = None) -> ServerGroupResponse:
+    def from_model(
+        cls,
+        g: DNSServerGroup,
+        drivers: list[str] | None = None,
+        warnings: list[str] | None = None,
+    ) -> ServerGroupResponse:
         return cls(
             id=g.id,
             name=g.name,
@@ -388,6 +398,7 @@ class ServerGroupResponse(BaseModel):
                 if g.catalog_zones_enabled and set(drivers or []) & CATALOG_UNSUPPORTED_DRIVERS
                 else None
             ),
+            scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
@@ -1706,7 +1717,8 @@ async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
     result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
-    return [ServerGroupResponse.from_model(g, drivers.get(g.id)) for g in groups]
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
+    return [ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id)) for g in groups]
 
 
 @router.post("/groups", response_model=ServerGroupResponse, status_code=status.HTTP_201_CREATED)
@@ -1749,7 +1761,8 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
@@ -1775,6 +1788,17 @@ async def update_group(
             "is_public_facing",
         },
     )
+    # #1784 — only turning catalog zones ON is refused: turning an
+    # unapplied setting OFF is the way out of it, and a re-save of the
+    # stored value must keep working.
+    if (
+        changes.get("catalog_zones_enabled") is True
+        and not group.catalog_zones_enabled
+        and await technitium_api_scope.group_is_technitium_api(db, group.id)
+    ):
+        raise technitium_api_scope.refusal(
+            "catalog zones are not written to the Technitium server."
+        )
     # #1468 — an appliance's supervisor gets this group by NAME and drops a
     # name it won't put in its role env, so don't rename an assigned group
     # into one. Only on an actual change: re-saving a legacy name is fine.
@@ -1814,7 +1838,8 @@ async def update_group(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
@@ -1850,7 +1875,8 @@ async def rotate_group_key(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -3627,6 +3653,7 @@ async def update_options(
 ) -> DNSServerOptions:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
+    stored_opts = opts
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
@@ -3652,6 +3679,8 @@ async def update_options(
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
@@ -4593,11 +4622,27 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _enforce_technitium_api_zone_scope(
+    db: DB, group_id: uuid.UUID, changes: dict[str, Any], current: DNSZone | None
+) -> None:
+    """422 zone settings the experimental ``technitium_api`` driver can't apply (#1784).
+
+    No-op for every other driver. ``current`` is the stored zone on update,
+    so only a CHANGED value is refused and an unchanged re-save passes.
+    """
+    if not await technitium_api_scope.group_is_technitium_api(db, group_id):
+        return
+    if current is None or ("zone_type" in changes and changes["zone_type"] != current.zone_type):
+        technitium_api_scope.refuse_non_primary(changes.get("zone_type", "primary"))
+    technitium_api_scope.refuse_unapplied_zone_changes(changes, current)
+
+
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
 ) -> ZoneResponse:
     await _require_group(group_id, db)
+    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -5316,6 +5361,7 @@ async def update_zone(
     # nor empty the masters on an existing secondary.
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -6377,6 +6423,9 @@ class ZoneMovePreviewResponse(BaseModel):
     acl_names_remapped: list[str]
     acl_names_lost: list[str]
     key_names_lost: list[str]
+    #: #1784 — the experimental technitium_api target refuses this zone;
+    #: non-null means the commit refuses, not waivable by acknowledgement.
+    technitium_api_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6413,6 +6462,7 @@ class ZoneMovePreviewResponse(BaseModel):
             acl_names_remapped=plan.acl_names_remapped,
             acl_names_lost=plan.acl_names_lost,
             key_names_lost=plan.key_names_lost,
+            technitium_api_refusal=plan.technitium_api_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -7461,6 +7511,7 @@ async def update_record(
     )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
+    before_op = record_op_payload(record)
     for k, v in changes.items():
         setattr(record, k, v)
     # #424 — validate the merged per-type fields (record_type is immutable on
@@ -7524,21 +7575,44 @@ async def update_record(
     target_serial = bump_zone_serial(zone) if zone is not None else None
     op = None
     if zone is not None:
-        op = await enqueue_record_op(
-            db,
-            zone,
-            "update",
-            {
-                "name": record.name,
-                "type": record.record_type,
-                "value": record.value,
-                "ttl": record.ttl,
-                "priority": record.priority,
-                "weight": record.weight,
-                "port": record.port,
-            },
-            target_serial=target_serial,
-        )
+        new_payload = {
+            "name": record.name,
+            "type": record.record_type,
+            "value": record.value,
+            "ttl": record.ttl,
+            "priority": record.priority,
+            "weight": record.weight,
+            "port": record.port,
+        }
+        if name_changed:
+            # #1773 — a rename is delete-at-old-name + create-at-new-name: an
+            # "update" replaces the RRset AT the new name and never touches
+            # the old one, so the old name stayed served (#492 fixed only the
+            # IPAM path). One batch, delete first (#1489): agentless drivers
+            # get both in one apply_record_changes call, agents get two
+            # ordered rows. record_type is immutable on update, so a rename is
+            # the only identity change an edit can make.
+            ops = await enqueue_record_ops_batch(
+                db,
+                zone,
+                [
+                    {"op": "delete", "record": before_op, "target_serial": target_serial},
+                    {
+                        "op": "create",
+                        "record": {**new_payload, "record_id": str(record.id)},
+                        "target_serial": target_serial,
+                    },
+                ],
+            )
+            # Surface a failure of either half: a failed delete leaves the old
+            # name live, which is the very bug being fixed.
+            op = next((o for o in ops if o is not None and o.last_error), None) or (
+                ops[-1] if ops else None
+            )
+        else:
+            op = await enqueue_record_op(
+                db, zone, "update", new_payload, target_serial=target_serial
+            )
     # #1538 — as create: a failed first agentless attempt is surfaced, not
     # silently audited as success.
     provider_warning = _agentless_op_warning(op)
