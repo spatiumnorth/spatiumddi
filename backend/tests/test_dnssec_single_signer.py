@@ -27,7 +27,9 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
-DRIVERS = ["bind9", "powerdns", "technitium"]
+# Drivers SpatiumDDI signs on. Technitium signing is refused outright (#1783,
+# covered by test_technitium_dnssec_withdrawn.py), so its 422 is not this one.
+DRIVERS = ["bind9", "powerdns"]
 
 
 async def _user(db: AsyncSession) -> User:
@@ -396,8 +398,12 @@ async def test_agentless_groups_are_outside_the_rule(db_session: AsyncSession) -
 def test_signing_drivers_match_the_router_gate() -> None:
     from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
     from app.services.dns.dnssec_signers import SIGNING_DRIVERS
+    from app.services.dns.zone_move import DNSSEC_SIGN_DRIVERS
 
-    assert SIGNING_DRIVERS == _DRIVER_GATED_OPERATIONS["dnssec_sign"]
+    # One list, not copies kept in step (#1783 removed Technitium from it).
+    assert _DRIVER_GATED_OPERATIONS["dnssec_sign"] is SIGNING_DRIVERS
+    assert DNSSEC_SIGN_DRIVERS is SIGNING_DRIVERS
+    assert "technitium" not in SIGNING_DRIVERS
 
 
 # ── Existing multi-signer zones: flagged, not unsigned ───────────────────

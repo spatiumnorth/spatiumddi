@@ -391,7 +391,7 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": True,  # issue #740 — online signing
+            "dnssec_inline_signing": False,  # #1783; full support is #1767
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
