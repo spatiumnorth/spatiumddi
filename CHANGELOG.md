@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The agentless `technitium_api` driver is marked experimental
+  for 1.0 and its supported scope is enforced.** It writes into a
+  Technitium server SpatiumDDI does not own and has no reconcile loop,
+  so pools, SOA / ACL / option settings and a second server were
+  accepted and silently not applied, and a same-name Secondary or
+  populated zone was adopted and later deleted with its records. Now
+  the API refuses (422, naming "technitium_api is experimental in
+  1.0") a second server per group (create, driver change, move), DNS
+  pools, non-Primary zones, zone and group settings the driver never
+  writes (only a changed value; re-saving a stored one or putting it
+  back to the default still works), turning catalog zones on, and
+  blocklist assignment; the Copilot's zone create is held to the same
+  rules, and the zone-move preview shows the refusal the commit
+  raises. Zone create adopts an existing zone only if it is an empty
+  Primary (a delegation below the apex counts as content). The UI
+  hides the zone SOA / TTL fields, non-Primary types, the group
+  Options tab and *New Pool* on such a group. A group that already
+  breaks the scope keeps serving and shows a warning
+  (`scope_warnings`). Capability flag `experimental`, an
+  Experimental label in the UI, and `DNS_DRIVERS.md` §4C.7a list what
+  is supported. Full support is tracked for 1.1.0 (#1769, #1771,
+  #1774, #1775). (#1784)
+
 - **Moving an appliance's own DNS server repoints the appliance
   (#1749).** The DNS server PUT (the #934 move) repointed
   `assigned_dns_group_id` only when the row had `appliance_id`, which

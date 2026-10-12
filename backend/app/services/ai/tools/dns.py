@@ -416,6 +416,7 @@ async def preview_dns_zone_move(
         "dnssec_unsupported_drivers": plan.dnssec_unsupported_drivers,
         "acl_names_lost": plan.acl_names_lost,
         "key_names_lost": plan.key_names_lost,
+        "technitium_api_refusal": plan.technitium_api_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }

@@ -406,7 +406,7 @@ const CRED_FIELDS_BY_DRIVER: Record<string, CloudCredField[]> = {
 
 const CRED_DRIVER_LABELS: Record<string, string> = {
   ...CLOUD_DNS_LABELS,
-  technitium_api: "Technitium (remote API)",
+  technitium_api: "Technitium (remote API, experimental)",
 };
 
 function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
@@ -1606,7 +1606,7 @@ function ServerModal({
               <option value="powerdns">PowerDNS (agent-managed)</option>
               <option value="technitium">Technitium (agent-managed)</option>
               <option value="technitium_api">
-                Technitium (agentless, remote API)
+                Technitium (agentless, remote API) — Experimental
               </option>
               <option value="windows_dns">
                 Windows DNS (agentless, RFC 2136 + optional WinRM)
@@ -1659,7 +1659,9 @@ function ServerModal({
         )}
         {driver === "technitium_api" && (
           <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
-            <strong>Technitium (remote API):</strong> agentless. For a
+            <strong>Technitium (remote API) — Experimental in 1.0:</strong> one
+            server per group, zones SpatiumDDI creates, no DNS pools and no
+            group or zone options (the API refuses them). Agentless. For a
             Technitium server <em>you already run</em> — nothing is deployed,
             and record CRUD runs from the SpatiumDDI control plane against its
             HTTP API. Enter the API URL and a permanent token below; they're
@@ -2532,6 +2534,18 @@ export function ZoneModal({
   const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
+  // #1784 — the experimental agentless Technitium driver writes only the
+  // zone name + Primary type, and the API refuses a changed SOA / TTL or a
+  // non-Primary type there. Shared ["dns-groups"] cache, so no new request
+  // when the group list is already loaded.
+  const { data: groupList } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    staleTime: 30_000,
+  });
+  const technitiumApi = (
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? []
+  ).includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
@@ -2669,11 +2683,23 @@ export function ZoneModal({
               className={inputCls}
               value={zoneType}
               onChange={(e) => setZoneType(e.target.value)}
+              disabled={technitiumApi && zoneType === "primary"}
+              title={
+                technitiumApi
+                  ? "technitium_api (experimental) supports Primary zones only."
+                  : undefined
+              }
             >
               <option value="primary">Primary</option>
-              <option value="secondary">Secondary</option>
-              <option value="stub">Stub</option>
-              <option value="forward">Forward</option>
+              {(!technitiumApi || zoneType === "secondary") && (
+                <option value="secondary">Secondary</option>
+              )}
+              {(!technitiumApi || zoneType === "stub") && (
+                <option value="stub">Stub</option>
+              )}
+              {(!technitiumApi || zoneType === "forward") && (
+                <option value="forward">Forward</option>
+              )}
             </select>
           </Field>
           <Field label="Kind">
@@ -2757,33 +2783,45 @@ export function ZoneModal({
             </select>
           </Field>
         )}
+        {technitiumApi && (
+          <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            This group runs the experimental <code>technitium_api</code> driver,
+            which writes only the zone itself: Primary NS, admin email and the
+            default TTL are not sent to the Technitium server, so they are not
+            editable here.
+          </p>
+        )}
+        {!technitiumApi && (
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Primary NS">
+              <input
+                className={inputCls}
+                value={primaryNs}
+                onChange={(e) => setPrimaryNs(e.target.value)}
+                placeholder="ns1.example.com."
+              />
+            </Field>
+            <Field label="Admin Email">
+              <input
+                className={inputCls}
+                value={adminEmail}
+                onChange={(e) => setAdminEmail(e.target.value)}
+                placeholder="hostmaster.example.com."
+              />
+            </Field>
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Primary NS">
-            <input
-              className={inputCls}
-              value={primaryNs}
-              onChange={(e) => setPrimaryNs(e.target.value)}
-              placeholder="ns1.example.com."
-            />
-          </Field>
-          <Field label="Admin Email">
-            <input
-              className={inputCls}
-              value={adminEmail}
-              onChange={(e) => setAdminEmail(e.target.value)}
-              placeholder="hostmaster.example.com."
-            />
-          </Field>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Default TTL (seconds)">
-            <input
-              className={inputCls}
-              value={ttl}
-              onChange={(e) => setTtl(e.target.value)}
-              placeholder="3600"
-            />
-          </Field>
+          {!technitiumApi && (
+            <Field label="Default TTL (seconds)">
+              <input
+                className={inputCls}
+                value={ttl}
+                onChange={(e) => setTtl(e.target.value)}
+                placeholder="3600"
+              />
+            </Field>
+          )}
           <Field label="DNSSEC">
             {zone ? (
               <div className="mt-1 text-xs text-muted-foreground">
@@ -3341,7 +3379,8 @@ function MoveZoneModal({
     (preview.name_collision ||
       preview.dnssec_unsupported_drivers.length > 0 ||
       preview.acl_names_lost.length > 0 ||
-      preview.key_names_lost.length > 0);
+      preview.key_names_lost.length > 0 ||
+      !!preview.technitium_api_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3395,6 +3434,11 @@ function MoveZoneModal({
                 which cannot sign. It would keep reporting as signed while being
                 served unsigned. Unsign it first, or pick a BIND9 / PowerDNS
                 group.
+              </div>
+            )}
+            {preview.technitium_api_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.technitium_api_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -5271,6 +5315,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
                     {s.driver}
                   </span>
+                  {s.driver === "technitium_api" && <ExperimentalBadge />}
                   {s.maintenance_mode && (
                     <span
                       className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
@@ -10391,6 +10436,17 @@ type GroupTab =
   | "tsig"
   | "options";
 
+function ExperimentalBadge() {
+  return (
+    <span
+      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+      title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+    >
+      Experimental
+    </span>
+  );
+}
+
 function GroupDetailView({
   group,
   onSelectZone,
@@ -10440,9 +10496,15 @@ function GroupDetailView({
       { replace: true },
     );
 
+  // #1784 — the experimental agentless Technitium driver applies no group
+  // option (the API refuses a changed one), so its Options tab is hidden.
+  const technitiumApiGroup = (group.server_drivers ?? []).includes(
+    "technitium_api",
+  );
+
   // Tab order mirrors DHCP — Servers first (the agents driving the
   // group), then content (zones / records), then ancillary surfaces.
-  const tabs: { id: GroupTab; label: string; icon: React.ElementType }[] = [
+  const allTabs: { id: GroupTab; label: string; icon: React.ElementType }[] = [
     { id: "servers", label: "Servers", icon: Cpu },
     { id: "zones", label: "Zones", icon: FileText },
     { id: "records", label: "Records", icon: ListTree },
@@ -10452,6 +10514,9 @@ function GroupDetailView({
     { id: "tsig", label: "TSIG Keys", icon: KeyRound },
     { id: "options", label: "Options", icon: Settings2 },
   ];
+  const tabs = allTabs.filter(
+    (t) => !(t.id === "options" && technitiumApiGroup),
+  );
 
   const typeBadge: Record<string, string> = {
     internal: "bg-blue-500/15 text-blue-600",
@@ -10527,6 +10592,16 @@ function GroupDetailView({
             {group.description}
           </p>
         )}
+        {(group.scope_warnings ?? []).length > 0 && (
+          <div
+            className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+            role="note"
+          >
+            {(group.scope_warnings ?? []).map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="flex border-b">
@@ -10554,7 +10629,16 @@ function GroupDetailView({
         {tab === "acls" && <AclsTab groupId={group.id} />}
         {tab === "blocklists" && <BlocklistsTab group={group} />}
         {tab === "tsig" && <TSIGKeysTab group={group} />}
-        {tab === "options" && <OptionsTab groupId={group.id} />}
+        {tab === "options" && !technitiumApiGroup && (
+          <OptionsTab groupId={group.id} />
+        )}
+        {tab === "options" && technitiumApiGroup && (
+          <p className="text-sm text-muted-foreground">
+            Group options are not applied by the experimental{" "}
+            <code>technitium_api</code> driver. Configure the Technitium server
+            in its own console.
+          </p>
+        )}
       </div>
 
       {groupSyncResult && (

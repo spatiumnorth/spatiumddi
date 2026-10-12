@@ -4971,6 +4971,9 @@ export interface ZoneMovePreview {
    *  doesn't define (#1316). Non-empty means the commit refuses, for the
    *  same reason as ``acl_names_lost``. */
   key_names_lost: string[];
+  /** #1784 — why the experimental technitium_api target refuses this zone.
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  technitium_api_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5001,6 +5004,10 @@ export interface DNSServerGroup {
    *  was mixed through the create path, which doesn't enforce homogeneity.
    *  Lets the move picker tell which groups a server can actually go to. */
   server_drivers?: string[];
+  /** #1784 — set for a group holding the experimental `technitium_api`
+   *  driver; says where an existing group falls outside its supported scope
+   *  (second server, pools). Empty for every other group. */
+  scope_warnings?: string[];
   created_at: string;
   modified_at: string;
 }

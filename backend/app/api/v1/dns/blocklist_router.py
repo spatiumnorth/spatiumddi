@@ -42,6 +42,7 @@ from app.models.dns import (
     DNSServerGroup,
     DNSView,
 )
+from app.services.dns import technitium_api_scope
 from app.services.dns.blocklist_templates import (
     BlocklistTemplate,
     TemplateGroupConflict,
@@ -1128,6 +1129,15 @@ async def update_assignments(
         )
         if len(groups) != len(set(body.server_group_ids)):
             raise HTTPException(status_code=404, detail="One or more server groups not found")
+        # #1784 — only NEWLY assigned groups are refused, so a list already
+        # applied to such a group can still be edited / de-assigned.
+        for g in groups:
+            if g.id not in old_group_ids and await technitium_api_scope.group_is_technitium_api(
+                db, g.id
+            ):
+                raise technitium_api_scope.refusal(
+                    f"blocklists are not applied to the Technitium server " f"(group {g.name!r})."
+                )
         bl.server_groups = groups
         changed.append("server_group_ids")
 

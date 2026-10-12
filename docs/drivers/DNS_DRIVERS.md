@@ -986,6 +986,29 @@ Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry 
 
 `CloudDNSDriverBase.probe` has existed since #37 with **no caller**: nothing in the API, tasks or services invoked it, so the answer to "did that token work?" was "wait for the next sync to fail". #810 adds `POST /api/v1/dns/groups/{gid}/servers/{sid}/test-connection`, which probes a saved server with its stored credentials and returns `{ok, message}`. It covers every driver in `CREDENTIALED_DNS_DRIVERS`, so the eight cloud drivers get it too. Post-save only — the credentials come from the row, unlike `/test-windows-credentials`, which also accepts plaintext for a pre-save dry run.
 
+### 4C.7a Experimental in 1.0 — the supported scope, enforced ([#1784](https://github.com/spatiumnorth/spatiumddi/issues/1784))
+
+`technitium_api` writes into a server SpatiumDDI does not own and has no reconcile loop, so for 1.0 it is labelled **experimental** (`capabilities()["experimental"] is True`; an *Experimental* label on the driver picker, the server row and detail, and the group page) and its supported scope is enforced with 422s instead of being left to fail silently. Every refusal names `technitium_api is experimental in 1.0` and the reason.
+
+Supported:
+
+- **One server per group.** A second `technitium_api` server is refused on server create, on a driver change via update, and on a move into the group (`ensure_group_single_driver`). A second server never received zones the first was given (#1771).
+- **Zones SpatiumDDI creates, Primary only.** A non-Primary zone create is refused. If the zone already exists on the server, create adopts it only when it is an **empty Primary** (no records beyond the apex SOA and NS; a delegation NS below the apex counts as a record); a Secondary / Stub / Forwarder of the same name, or a Primary holding records, is a 409 naming what was found, because a later delete from SpatiumDDI would remove the operator's zone (#1775).
+- **Records** on those zones, over the REST API as in §4C.2.
+
+Refused (422), because the driver never writes them (#1769, #1771, #1774, #1775 track the 1.1 fixes):
+
+- **DNS pools** on the group: pool create and pool member add (a pool collapses to one member).
+- **Zone settings** SOA `ttl` / `refresh` / `retry` / `expire` / `minimum` / `primary_ns` / `admin_email` and `allow_query` / `allow_transfer` / `also_notify` / `notify_enabled`, and changing `zone_type` away from Primary. On update only a *changed* value is refused, so a zone that already holds one can be re-saved, or put back to the default.
+- **Group options** (`PUT …/options`): changing a value from the stored one is refused; an unchanged re-save, or a change back to the column default, is not. **Catalog zones**: turning `catalog_zones_enabled` on is refused, turning it off is not.
+- **Blocklist assignment** to the group (new assignments only).
+- **Moving a zone into** such a group when it is non-Primary, has pools, or carries a setting above. The move preview reports it as `technitium_api_refusal` and the move dialog blocks on it, so preview and commit agree.
+- The Operator Copilot's `create_dns_zone` is held to the same zone rules in its preview and its apply.
+
+The UI hides what it would refuse on such a group: the zone dialog offers Primary only and drops Primary NS / admin email / default TTL, the group's Options tab is hidden, and the zone's Pools view lists existing pools without a *New Pool* button.
+
+**Groups that already violate the scope** (two servers, existing pools) keep serving: nothing is removed or disabled. The group response carries `scope_warnings`, rendered as a banner on the group page, and only *new* changes are refused. Other drivers are untouched.
+
 ### 4C.8 Not in scope for this driver
 
 DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumnorth/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.

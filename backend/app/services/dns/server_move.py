@@ -52,6 +52,7 @@ from app.models.dns import (
     DNSServerZoneState,
 )
 from app.services.appliance.ownership import owning_appliance_for_dns_server
+from app.services.dns import technitium_api_scope
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
 
@@ -140,6 +141,14 @@ async def ensure_group_single_driver(
             f"{driver!r}. A server group is single-driver — {hint}",
             status_code=422,
         )
+    # #1784 — the experimental agentless Technitium driver supports ONE
+    # server per group. Enforced on every path that puts a server in a group
+    # (create, driver change, move) because they all come through here.
+    if driver == technitium_api_scope.DRIVER:
+        if await technitium_api_scope.count_other_servers(db, group_id, exclude_server_id):
+            raise ServerMoveError(
+                technitium_api_scope.single_server_message(group_name), status_code=422
+            )
 
 
 async def _elect_primary(
