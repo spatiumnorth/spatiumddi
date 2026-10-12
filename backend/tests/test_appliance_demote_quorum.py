@@ -304,7 +304,7 @@ def _fake_kubeapi(monkeypatch, *names: str, cordoned: tuple[str, ...] = ()) -> _
     def _no_network(*_a, **_kw):
         raise k8s.KubeapiUnavailableError("test: no kubeapi")
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "_request", _no_network)
     monkeypatch.setattr(k8s, "get_node", fake.get_node)
     monkeypatch.setattr(k8s, "patch_node", fake.patch_node)
@@ -419,8 +419,10 @@ async def _sessions(db_session: AsyncSession, *rows) -> dict[str, str]:
     "reason",
     [
         # rc != 0 from --leave-self: etcd refused the removal, k3s restarted.
-        "leave refused: this node's etcd member removal was not confirmed by the "
-        "cluster, so the node was not reset (see etcd-evict.log)",
+        (
+            "leave refused: this node's etcd member removal was not confirmed by the "
+            "cluster, so the node was not reset (see etcd-evict.log)"
+        ),
         # wiped, but the standalone k3s never came Ready.
         "leave failed; k3s not Ready",
     ],
