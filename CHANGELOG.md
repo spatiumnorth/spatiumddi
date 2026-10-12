@@ -101,8 +101,34 @@ the formatter handles the rest.
   the reason. Re-saving a stored value stays allowed, and a value stored
   before this, or before a Technitium server joined the group, is listed
   in the options response's `technitium_warnings` and shown on the tab.
-  Forwarding options are left to #1764. BIND9 and PowerDNS
-  bundles are unchanged.
+  BIND9 and PowerDNS bundles are unchanged.
+
+- **Technitium forwarding no longer sends DoH as cleartext, drops
+  upstreams, or defeats its own encryption (#1764).** A forward zone was
+  created with `forwarder=<first>` and no `protocol`, so Technitium used
+  `Udp` and re-derived the address: `https://dns.quad9.net/dns-query`
+  went out as plain `dns.quad9.net:53`, a `host:853` entry failed, the
+  other upstreams were dropped and `dnssecValidation` stayed off. The
+  agent now derives `protocol` from the scheme or port, sends the group's
+  DNSSEC setting, and keeps every upstream as an apex FWD record with a
+  `forwarderPriority` (an existing zone is converged the same way).
+  Server-level DoT/DoH/DoQ forwarding used to replace the operator's IPs
+  with the TLS hostname, which Technitium then resolved by plaintext
+  recursion from the root; it now sends `name (ip)` per IP, so the IP is
+  dialled and the name validated. A zone's plain-IP upstreams follow the
+  group's encrypted transport, as on BIND9, instead of going out as
+  cleartext UDP, and a neutral `ip@port` forwarder is sent as `ip:port`.
+  **Upgrade note:** in a Technitium group forwarding over DoT / DoH / DoQ
+  with a TLS hostname, a forward zone whose upstream is a plain IP (an
+  internal domain controller, say) now queries it over that transport, and
+  fails if the upstream does not speak it. Write the upstream as
+  `udp://<ip>` to keep it on plain DNS.
+  Technitium validates upstream certificates unconditionally, so
+  `forward_tls_verify = false` (accepted, then refused by the agent on
+  every apply) now answers 422 on a group with a Technitium server, as
+  does `tls` without `forward_tls_hostname`; `forward_policy` may only move
+  to `only`, which is what Technitium does with forwarders. BIND9 and
+  PowerDNS bundles are unchanged.
 
 - **A Technitium record target is read the way a zone file reads it, and
   imported targets keep their dot (#1759).** Both Technitium drivers

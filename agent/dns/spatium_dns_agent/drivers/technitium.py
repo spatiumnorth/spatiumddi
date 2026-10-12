@@ -184,6 +184,219 @@ _FORWARDER_PROTOCOLS = {
     "quic": "Quic",
 }
 
+# Scheme of a forwarder address -> the protocol Technitium must be told to use.
+# ``zones/create`` and the FWD record both default ``protocol`` to ``Udp`` and
+# *re-derive the address from it*: ``NameServerAddress.Clone(Udp)`` of an
+# ``https://`` address keeps the host and takes port 53, so a DoH URL silently
+# became cleartext UDP to ``host:53`` (#1764; APIDOCS.md "Create Zone" /
+# "Add Record", Technitium DnsServer v15.4.0). ``h3://`` and ``http://`` are
+# parsed as DoH endpoints by ``NameServerAddress``.
+_FORWARDER_SCHEMES = {
+    "https": "Https",
+    "h3": "Https",
+    "http": "Https",
+    "tls": "Tls",
+    "quic": "Quic",
+    "tcp": "Tcp",
+    "udp": "Udp",
+}
+_DOT_PORT = "853"
+
+
+def _split_host_port(text: str) -> tuple[str, str | None]:
+    """``host``, ``host:port``, ``host@port``, ``[v6]``, ``[v6]:port`` or a
+    bare v6 -> (host, port).
+
+    ``ip@port`` is SpatiumDDI's neutral spelling (the group forwarder
+    validator stores it, BIND's ``ip port n``); Technitium has no ``@`` form.
+    """
+    text = text.strip()
+    if "@" in text and "://" not in text:
+        host, _, port = text.rpartition("@")
+        host = host.strip()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        return host, port.strip() or None
+    if text.startswith("["):
+        end = text.find("]")
+        if end > 0:
+            rest = text[end + 1 :]
+            return text[1:end], (rest[1:] or None) if rest.startswith(":") else None
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        return host, port or None
+    return text, None
+
+
+def _forwarder_protocol(address: str) -> str:
+    """The Technitium ``protocol`` an upstream address implies (#1764).
+
+    Scheme first (``https://`` Https, ``tls://`` Tls, ``quic://`` Quic, ...),
+    then the well-known DoT port (``host:853`` Tls), otherwise plain ``Udp``.
+    An optional ``name (ip)`` suffix is ignored. ``:853`` is read as DoT, not
+    DoQ: only an explicit ``quic://`` selects Quic.
+    """
+    head = address.split(" (", 1)[0].strip()
+    scheme, sep, _rest = head.partition("://")
+    if sep and scheme.lower() in _FORWARDER_SCHEMES:
+        return _FORWARDER_SCHEMES[scheme.lower()]
+    if _split_host_port(head)[1] == _DOT_PORT:
+        return "Tls"
+    return "Udp"
+
+
+def _forwarder_specs(forwarders: list[str]) -> list[tuple[str, str, int]]:
+    """``(address, protocol, priority)`` per upstream of a forward zone.
+
+    Priority is the list position, so the operator's order is kept: Technitium
+    queries a lower value first and queries equal priorities concurrently
+    (APIDOCS.md "Add Record", ``forwarderPriority``; a ``byte``, hence the cap).
+    """
+    out: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    for address in forwarders:
+        protocol = _forwarder_protocol(address)
+        key = (_norm_forwarder(address), protocol)
+        # A repeated upstream is one record on the daemon (identity is
+        # protocol + forwarder): keeping both would update its priority back
+        # and forth on every pass.
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((address, protocol, min(len(out), 255)))
+    return out
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _ip_port(host: str, port: str | None) -> str:
+    """``ip`` / ``ip:port`` / ``[v6]:port`` in Technitium's address format."""
+    if not port:
+        return host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _technitium_forwarder(entry: str) -> str:
+    """A neutral ``ip@port`` forwarder in Technitium's ``ip:port`` form.
+
+    Anything else (a hostname, a DoH URL, ``name (ip)``) is passed on as
+    written. Technitium reads ``@`` as part of a domain name, so an
+    ``ip@port`` sent verbatim was never the address the operator meant.
+    """
+    text = str(entry).strip()
+    if "@" not in text or "://" in text or "(" in text:
+        return text
+    host, port = _split_host_port(text)
+    return _ip_port(host, port) if _is_ip(host) else text
+
+
+def _norm_forwarder(address: str) -> str:
+    """Comparison key for an upstream address as stored vs as sent."""
+    return " ".join(str(address).lower().split()).rstrip(".")
+
+
+def _address_with_ip(host_part: str, ip: str) -> str:
+    """``"<host_part> (<ip>)"`` in Technitium's Name Server Address Format.
+
+    A bare IPv6 is bracketed (APIDOCS.md "Name Server Address Format");
+    ``ip:port`` and ``[v6]:port`` are passed on as written.
+    """
+    ip = ip.strip()
+    if ip.count(":") > 1 and not ip.startswith("["):
+        ip = f"[{ip}]"
+    return f"{host_part} ({ip})"
+
+
+def _encrypted_forwarders(forwarders: list[str], hostname: str, transport: str) -> list[str]:
+    """One ``name (ip)`` entry per upstream IP for DoT / DoH / DoQ (#1764).
+
+    The name is what the certificate is checked against; the IP in brackets
+    is what Technitium dials, "instead of trying to resolve it separately"
+    (APIDOCS.md "Name Server Address Format"). Sending the name alone made
+    the daemon bootstrap it by plaintext recursion from the root, which
+    defeats the point of encrypting and SERVFAILs where egress is limited to
+    853/443. An entry that is not an IP literal cannot be paired; with none
+    pairable the bare name is sent.
+    """
+    out: list[str] = []
+    for fwd in forwarders:
+        paired = _paired_address(fwd, hostname, transport, scheme=False)
+        if paired is not None:
+            out.append(paired)
+    if out:
+        return out
+    return [f"https://{hostname}/dns-query" if transport == "https" else hostname]
+
+
+def _paired_address(
+    fwd: str, hostname: str, transport: str, *, scheme: bool
+) -> str | None:
+    """``fwd`` (``ip``, ``ip@port``, ``ip:port``, ``[v6]:port``) paired with
+    the certificate name, or None when ``fwd`` is not an IP literal.
+
+    The port goes on the NAME part: Technitium refuses a name and an IP
+    whose ports disagree, and a DoH URL's port must be the one in the URL
+    (``NameServerAddress.InternalParse``). ``scheme`` prefixes ``tls://`` /
+    ``quic://`` so the address carries its own protocol, which a zone's
+    FWD record needs and the server setting (``forwarderProtocol``) does not.
+    """
+    host, port = _split_host_port(fwd)
+    if not _is_ip(host):
+        return None
+    if transport == "https":
+        name = f"{hostname}:{port}" if port and port != "443" else hostname
+        return _address_with_ip(f"https://{name}/dns-query", host)
+    name = f"{hostname}:{port}" if port else hostname
+    if scheme:
+        name = f"{transport}://{name}"
+    return _address_with_ip(name, host)
+
+
+def _zone_forwarder(entry: str, options: dict[str, Any]) -> str:
+    """A forward zone's upstream as its FWD record should carry it.
+
+    The group's encrypted ``forward_transport`` applies to per-zone
+    upstreams too, as it does on BIND9 (#50): a plain IP with no scheme and
+    no DoT port, in a group forwarding over tls/https/quic with a
+    ``forward_tls_hostname``, becomes ``tls://<name> (<ip>)`` (or the DoH /
+    DoQ equivalent) instead of going out as cleartext UDP. An address that
+    names its own scheme or port is the operator's choice and kept.
+    """
+    text = _technitium_forwarder(entry)
+    transport = str(options.get("forward_transport") or "do53")
+    hostname = str(options.get("forward_tls_hostname") or "").strip()
+    if transport not in ("tls", "https", "quic") or not hostname:
+        return text
+    if "://" in text or "(" in text or _forwarder_protocol(text) != "Udp":
+        return text
+    host, port = _split_host_port(text)
+    if port and port != "53":
+        # An explicit non-53 port on a plain address is a deliberate
+        # target; keep it rather than guess what it speaks.
+        return text
+    paired = _paired_address(host, hostname, transport, scheme=True)
+    return paired if paired is not None else text
+
+
+def _dnssec_flag(raw: Any) -> bool | None:
+    """Group ``dnssec_validation`` (``auto|yes|no``) -> Technitium's boolean.
+
+    ``None`` when the bundle carries no usable value (old bundle): the
+    daemon's own default then stands.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value not in ("auto", "yes", "no"):
+        return None
+    return value != "no"
+
 # ── Recursion + rate limiting (issue #1761) ─────────────────────────────
 #
 # ``settings/set`` silently ignores an unrecognised ``recursion`` value
@@ -1316,16 +1529,16 @@ class TechnitiumDriver(DriverBase):
     # cached bundle from the older control plane keeps its own meaning, and
     # read by ``apply_record_op`` for ops shipped beside that bundle.
     _svcb_zone_file_targets: bool = False
+    # The same, for every other name-valued target (#1759), read from
+    # ``name_target_rule``. Independent of the SVCB flag: a bundle cached by
+    # a #1513 control plane has the SVCB marker and not this one.
+    _name_zone_file_targets: bool = False
 
     # Zones whose group ``allow_query`` this apply could not express (#1763),
     # collected by ``_apply_zone_options`` and reported ONCE by
     # ``swap_and_reload``: the cause is one group option, and a refusal per
     # zone would bury every other refusal in the truncated apply error.
     _unapplied_query_access: list[str] | None = None
-    # The same, for every other name-valued target (#1759), read from
-    # ``name_target_rule``. Independent of the SVCB flag: a bundle cached by
-    # a #1513 control plane has the SVCB marker and not this one.
-    _name_zone_file_targets: bool = False
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -1466,7 +1679,12 @@ class TechnitiumDriver(DriverBase):
             if masters:
                 entry["masters"] = masters
             if forwarders:
-                entry["forwarders"] = forwarders
+                group_opts = bundle.get("options") or {}
+                entry["forwarders"] = [_zone_forwarder(f, group_opts) for f in forwarders]
+            if ztype == "Forwarder":
+                dnssec = _dnssec_flag((bundle.get("options") or {}).get("dnssec_validation"))
+                if dnssec is not None:
+                    entry["dnssec_validation"] = dnssec
             if ztype in _RECORD_MANAGED_ZONE_TYPES:
                 apex = _zone_apex(zname, zone)
                 if apex is not None:
@@ -2447,13 +2665,23 @@ class TechnitiumDriver(DriverBase):
         ok and leaves it at Udp). So the two always go together, or not at
         all.
 
-        For DoT/DoH/DoQ, Technitium wants a **domain name** — an IP address
-        is rejected outright ("Address must be a domain name"), because
-        there would be no name to validate the upstream certificate
-        against. That is a real mismatch with the neutral model, which
-        carries a list of forwarder IPs plus one ``forward_tls_hostname``:
-        over an encrypted transport the hostname is the only usable
-        address, so it wins and the IPs are dropped with a warning.
+        For DoT/DoH/DoQ the certificate is checked against a **name**, so
+        the group's ``forward_tls_hostname`` is paired with every forwarder
+        IP as ``"<name> (<ip>)"`` (``https://<name>/dns-query (<ip>)`` for
+        DoH). Technitium dials the bracketed IP and validates the name
+        (APIDOCS.md "Name Server Address Format"). It used to send the name
+        alone, which made the daemon resolve it by plaintext recursion from
+        the root before it could forward (#1764).
+
+        Technitium has no switch to skip certificate validation
+        (``TlsClientConnection`` authenticates against the server's host
+        unconditionally), so ``forward_tls_verify=false`` cannot be honoured
+        and a hostname is required for every encrypted transport. A stored
+        row without one is refused (reported, previous forwarders kept)
+        rather than sent as bare IPs, which would fail every forwarded query
+        wherever the certificate carries no IP SAN.
+
+        A neutral ``ip@port`` is sent as Technitium's ``ip:port``.
         """
         forwarders = [str(f) for f in (options.get("forwarders") or []) if f]
         transport = str(options.get("forward_transport") or "do53")
@@ -2486,25 +2714,29 @@ class TechnitiumDriver(DriverBase):
         if transport != "do53":
             hostname = options.get("forward_tls_hostname")
             if hostname:
-                if forwarders != [hostname]:
-                    log.info(
-                        "technitium_forwarder_hostname_substituted",
-                        transport=transport,
-                        hostname=hostname,
-                        dropped=forwarders,
-                        reason="encrypted transports need a name to validate against",
-                    )
-                forwarders = [str(hostname)]
+                forwarders = _encrypted_forwarders(forwarders, str(hostname), transport)
             else:
+                # Not "send the IPs over Tls": Technitium validates the
+                # certificate against the address it was given, so bare IPs
+                # work only where the certificate carries them as IP SANs,
+                # and everywhere else every forwarded query would fail. The
+                # previous forwarders keep resolving and the refusal is
+                # reported; the API no longer lets this be newly stored.
                 log.error(
                     "technitium_forwarder_hostname_missing",
                     transport=transport,
-                    hint="forward_tls_hostname is required for tls/https/quic",
+                    hint=(
+                        "forward_tls_hostname is required: Technitium always validates "
+                        "the upstream certificate, against that name"
+                    ),
                 )
                 self._note_apply_failure(
-                    f"forwarders: no forward_tls_hostname for {transport}"
+                    f"forwarders: no forward_tls_hostname for {transport}; Technitium "
+                    "always validates the upstream certificate, so set one"
                 )
                 return
+        else:
+            forwarders = [_technitium_forwarder(f) for f in forwarders]
 
         resp = self._call(
             token,
@@ -3031,23 +3263,23 @@ class TechnitiumDriver(DriverBase):
         zone = entry["zone"]
         ztype = entry.get("type", "Primary")
         params: dict[str, Any] = {"zone": zone, "type": ztype}
+        forwarder_specs: list[tuple[str, str, int]] = []
+        dnssec: bool | None = None
         if ztype in ("Secondary", "Stub", "SecondaryCatalog"):
             params["primaryNameServerAddresses"] = ",".join(
                 _technitium_master(m) for m in entry.get("masters") or []
             )
         elif ztype == "Forwarder":
-            forwarders = entry.get("forwarders") or []
-            # Technitium's Forwarder zone takes a single upstream; BIND's
-            # takes a list. Use the first and say so, rather than silently
-            # dropping the rest.
-            params["forwarder"] = forwarders[0]
-            if len(forwarders) > 1:
-                log.warning(
-                    "technitium_forwarder_extra_upstreams_ignored",
-                    zone=zone,
-                    used=forwarders[0],
-                    ignored=forwarders[1:],
-                )
+            # First upstream rides zones/create with its protocol (without
+            # ``protocol`` Technitium uses Udp and re-derives the address, so
+            # a DoH URL went out as cleartext host:53, #1764). The rest are
+            # further apex FWD records, added by ``_sync_forwarder_records``.
+            forwarder_specs = _forwarder_specs([str(f) for f in entry.get("forwarders") or []])
+            dnssec = entry.get("dnssec_validation")
+            params["forwarder"] = forwarder_specs[0][0]
+            params["protocol"] = forwarder_specs[0][1]
+            if dnssec is not None:
+                params["dnssecValidation"] = "true" if dnssec else "false"
 
         resp = self._call(token, "POST", "zones/create", params)
         body = resp.json()
@@ -3065,9 +3297,12 @@ class TechnitiumDriver(DriverBase):
                 # from forward to primary in SpatiumDDI stayed a Forwarder
                 # here, so every name that was not a local record went to
                 # the old upstream. Convert first, so the upstream below is
-                # applied to the type the zone now has.
+                # applied to the type the zone now has (a zone converted to
+                # Forwarder gets every upstream in the bundle, #1764).
                 self._reconcile_zone_type(token, zone, ztype)
-                self._reapply_zone_upstream(token, zone, ztype, params)
+                self._reapply_zone_upstream(
+                    token, zone, ztype, params, forwarder_specs, dnssec
+                )
                 return
             log.error(
                 "technitium_zone_create_failed",
@@ -3078,6 +3313,10 @@ class TechnitiumDriver(DriverBase):
             self._note_apply_failure(
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
+            return
+        if ztype == "Forwarder":
+            # The create carried the first upstream only.
+            self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)
 
     def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
         """Bring an existing zone's type in line with the bundle (#1457).
@@ -3122,16 +3361,24 @@ class TechnitiumDriver(DriverBase):
         self._note_apply_failure(f"{zone}: zone type: {resp.get('errorMessage')}")
 
     def _reapply_zone_upstream(
-        self, token: str, zone: str, ztype: str, params: dict[str, Any]
+        self,
+        token: str,
+        zone: str,
+        ztype: str,
+        params: dict[str, Any],
+        forwarder_specs: list[tuple[str, str, int]] | None = None,
+        dnssec: bool | None = None,
     ) -> None:
         """Push an existing zone's upstream to the daemon.
 
         A secondary/stub's primaries go through ``zones/options/set``. A
-        Forwarder's upstream does not: it lives in the zone's apex FWD
-        record, see ``_sync_forwarder_record``.
+        Forwarder's upstreams do not: ``zones/options/set`` has no
+        ``forwarder`` parameter (it answers ``ok`` and stores nothing,
+        #1647); they live in the zone's apex FWD records, see
+        ``_sync_forwarder_records``.
         """
         if "forwarder" in params:
-            self._sync_forwarder_record(token, zone, params["forwarder"])
+            self._sync_forwarder_records(token, zone, forwarder_specs or [], dnssec)
             return
         opts: dict[str, Any] = {"zone": zone}
         if "primaryNameServerAddresses" in params:
@@ -3166,54 +3413,94 @@ class TechnitiumDriver(DriverBase):
             if (r.get("name") or "").rstrip(".").lower() == zone.lower()
         ]
 
-    def _sync_forwarder_record(self, token: str, zone: str, forwarder: str) -> None:
-        """Point an existing Forwarder zone at ``forwarder``.
+    def _sync_forwarder_records(
+        self,
+        token: str,
+        zone: str,
+        specs: list[tuple[str, str, int]],
+        dnssec: bool | None,
+    ) -> None:
+        """Make the zone's apex FWD records exactly ``specs`` (#1764).
 
-        In Technitium (15.4) a Forwarder zone's upstream is its apex FWD
-        record. ``zones/options/set`` has no ``forwarder`` parameter: it
-        answers ``ok`` and stores nothing, so a changed forwarder never
-        reached the daemon (#1647). And ``zones/convert`` from Primary
-        leaves the zone with no FWD record at all, so a zone switched to
-        forward answered every unknown name with an empty NOERROR.
+        A Forwarder zone's upstreams are its apex FWD records. A record's
+        identity is ``(protocol, forwarder)``; ``forwarderPriority`` and
+        ``dnssecValidation`` are its data (APIDOCS.md "Add Record" /
+        "Update Record" / "Delete Record"; ``WebServiceZonesApi.cs``).
+        So: a missing record is added, one whose priority or DNSSEC flag
+        differs is updated in place, and a record no longer wanted is
+        deleted LAST, so the zone never has no upstream in between. If an
+        add is refused, nothing is deleted: the old upstream stays until
+        the new one is in (#1647). ``dnssec`` None leaves the flag at
+        whatever the record has.
 
-        The wanted record is added before any other is removed, so the
-        zone is never left without an upstream in between. Like
-        ``zones/create``, only the first forwarder is used.
+        This is also the path a zone converted to Forwarder takes
+        (#1457): ``zones/convert`` from Primary leaves it with no FWD
+        record at all, so every upstream here is an add. Every refusal is
+        noted, so a refused forwarder change reads as a partial apply
+        (#1516).
         """
+        if not specs:
+            return
         apex = self._apex_records(token, zone)
         if apex is None:
+            self._note_apply_failure(f"{zone}: zone upstream: apex records unreadable")
             return
-        live = [r for r in apex if r.get("type") == "FWD"]
-        if forwarder not in {(r.get("rData") or {}).get("forwarder") for r in live}:
-            body = self._call(
-                token,
-                "POST",
-                "zones/records/add",
-                {
-                    "domain": zone,
-                    "zone": zone,
-                    "type": "FWD",
-                    "forwarder": forwarder,
-                    "protocol": "Udp",
-                },
-            ).json()
-            if body.get("status") != "ok":
+        live = [(r.get("rData") or {}) for r in apex if r.get("type") == "FWD"]
+        by_key = {(_norm_forwarder(r.get("forwarder") or ""), r.get("protocol") or "Udp"): r for r in live}
+        wanted: set[tuple[str, str]] = set()
+        add_refused = False
+        for address, protocol, priority in specs:
+            key = (_norm_forwarder(address), protocol)
+            wanted.add(key)
+            have = by_key.get(key)
+            params: dict[str, Any] = {
+                "domain": zone,
+                "zone": zone,
+                "type": "FWD",
+                "forwarder": address,
+                "protocol": protocol,
+                "forwarderPriority": str(priority),
+            }
+            if have is None:
+                if dnssec is not None:
+                    params["dnssecValidation"] = "true" if dnssec else "false"
+                path = "zones/records/add"
+            else:
+                live_dnssec = bool(have.get("dnssecValidation"))
+                if int(have.get("priority") or 0) == priority and (
+                    dnssec is None or live_dnssec == dnssec
+                ):
+                    continue
+                params["forwarder"] = have.get("forwarder") or address
+                params["dnssecValidation"] = (
+                    "true" if (live_dnssec if dnssec is None else dnssec) else "false"
+                )
+                path = "zones/records/update"
+            result = self._call(token, "POST", path, params).json()
+            if result.get("status") != "ok":
                 log.warning(
                     "technitium_zone_forwarder_set_failed",
                     zone=zone,
-                    forwarder=forwarder,
-                    error=body.get("errorMessage"),
+                    forwarder=address,
+                    error=result.get("errorMessage"),
                 )
                 self._note_apply_failure(
-                    f"{zone}: zone upstream: {body.get('errorMessage')}"
+                    f"{zone}: zone upstream: {address}: {result.get('errorMessage')}"
                 )
-                return
-            log.info("technitium_zone_forwarder_set", zone=zone, forwarder=forwarder)
-        for rec in live:
-            rdata = rec.get("rData") or {}
-            if rdata.get("forwarder") == forwarder:
-                continue
-            body = self._call(
+                if path == "zones/records/add":
+                    add_refused = True
+            else:
+                log.info("technitium_zone_forwarder_set", zone=zone, forwarder=address)
+        stale = [(k, r) for k, r in by_key.items() if k not in wanted]
+        if stale and add_refused:
+            log.warning(
+                "technitium_zone_forwarder_stale_kept",
+                zone=zone,
+                forwarders=[r.get("forwarder") for _, r in stale],
+            )
+            return
+        for _key, rdata in stale:
+            result = self._call(
                 token,
                 "POST",
                 "zones/records/delete",
@@ -3225,15 +3512,16 @@ class TechnitiumDriver(DriverBase):
                     "protocol": rdata.get("protocol") or "Udp",
                 },
             ).json()
-            if body.get("status") != "ok":
+            if result.get("status") != "ok":
                 log.warning(
                     "technitium_zone_forwarder_remove_failed",
                     zone=zone,
                     forwarder=rdata.get("forwarder"),
-                    error=body.get("errorMessage"),
+                    error=result.get("errorMessage"),
                 )
                 self._note_apply_failure(
-                    f"{zone}: zone upstream: {body.get('errorMessage')}"
+                    f"{zone}: zone upstream: {rdata.get('forwarder')}: "
+                    f"{result.get('errorMessage')}"
                 )
 
     def _replace_placeholder_soa(self, token: str, zone: str) -> None:
