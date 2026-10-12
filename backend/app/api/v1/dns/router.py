@@ -143,7 +143,10 @@ from app.services.dns.resolver_presets import (
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import (
+    CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
+    catalog_unsupported_message,
+    ensure_group_catalog_compatible,
     ensure_group_single_driver,
     move_server_to_group,
 )
@@ -359,6 +362,10 @@ class ServerGroupResponse(BaseModel):
     # Exposed so a client can tell which groups a given server may move into
     # without fetching every group's server list to find out.
     server_drivers: list[str] = []
+    # #1782 — set when catalog zones are on for a group that has a driver
+    # which cannot do them (Technitium). Existing groups keep rendering as
+    # before; this is the visible warning.
+    catalog_unsupported_warning: str | None = None
     # #1784 — set when the group holds an experimental ``technitium_api``
     # server, and says where an already-existing group falls outside the
     # supported scope (second server, pools). Empty for every other group.
@@ -386,6 +393,11 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             server_drivers=sorted(drivers or []),
+            catalog_unsupported_warning=(
+                catalog_unsupported_message(drivers or [])
+                if g.catalog_zones_enabled and set(drivers or []) & CATALOG_UNSUPPORTED_DRIVERS
+                else None
+            ),
             scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
@@ -1799,6 +1811,13 @@ async def update_group(
         problem = group_name_problem("dns", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    # #1782 — refuse turning catalog zones ON for a group running a driver
+    # that cannot do them. Only the False -> True transition: re-saving an
+    # already-enabled legacy group must keep working (it gets a warning).
+    if changes.get("catalog_zones_enabled") is True and not group.catalog_zones_enabled:
+        group_drivers = (await _drivers_by_group(db, [group.id])).get(group.id, [])
+        if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
+            raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -2020,6 +2039,7 @@ async def create_server(
             group_name=group.name,
             hint=f"create it in a {body.driver}-only group, or an empty one.",
         )
+        await ensure_group_catalog_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     existing = await db.execute(
@@ -2133,6 +2153,7 @@ async def update_server(
                 ),
                 exclude_server_id=server.id,
             )
+            await ensure_group_catalog_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column

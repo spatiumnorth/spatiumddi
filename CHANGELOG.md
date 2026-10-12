@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium no longer claims catalog-zone support (#1782).** Both
+  roles are broken: producer member zones inherit the catalog zone's
+  transfer Deny / notify None (undoing the #734 grant, so drift, Sync
+  with Servers and NOTIFY stop), and the consumer's `SecondaryCatalog`
+  has no TSIG and stays empty. The `technitium` driver now reports
+  `catalog_zones: False`; turning catalog zones on for a group with a
+  `technitium` / `technitium_api` server, or putting such a server into a
+  catalog-enabled group (server create, driver change, server move, or a
+  Fleet / Copilot role assignment pointing a `dns-technitium` appliance
+  at one), is a 422 naming #1766 (the 1.1.0 fix). An agent
+  auto-registering straight into a catalog group is logged, not refused,
+  since a refused registration loops. A group that already has it on
+  keeps rendering as before and shows a `catalog_unsupported_warning` on
+  the API and in the group editor.
+  `DNS_DRIVERS.md`, `DNS.md`, `GETTING_STARTED.md`, `TOPOLOGIES.md` and the
+  README no longer say both roles work.
+
 - **Agentless Technitium servers now serve TXT records as written
   (#1760).** The #1694 fix reached only the agent-managed driver. The
   agentless `technitium_api` driver still sent a TXT value as

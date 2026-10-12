@@ -1234,6 +1234,11 @@ function GroupModal({
             Distribute zones via one catalog instead of per-server config push.
             Requires BIND 9.18+. Skip on single-server groups.
           </p>
+          {group?.catalog_unsupported_warning && (
+            <p className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-700 dark:text-amber-400">
+              {group.catalog_unsupported_warning}
+            </p>
+          )}
           {catalogZonesEnabled && (
             <div className="mt-2">
               <label className="mb-0.5 block text-xs font-medium">

@@ -5004,6 +5004,9 @@ export interface DNSServerGroup {
    *  was mixed through the create path, which doesn't enforce homogeneity.
    *  Lets the move picker tell which groups a server can actually go to. */
   server_drivers?: string[];
+  /** #1782 — set when catalog zones are on for a group with a driver that
+   *  cannot do them (Technitium). */
+  catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
    *  (second server, pools). Empty for every other group. */
