@@ -36,7 +36,13 @@ async def test_enabling_catalog_on_technitium_group_is_422(
         headers=_auth(token),
     )
     assert r.status_code == 422
-    assert "#1766" in r.json()["detail"]
+    detail = r.json()["detail"]
+    if driver == "technitium_api":
+        # #1784's experimental-scope refusal runs first for the agentless
+        # driver; either refusal keeps catalog zones off, which is the point.
+        assert "#1766" in detail or "experimental in 1.0" in detail
+    else:
+        assert "#1766" in detail
 
 
 @pytest.mark.asyncio
