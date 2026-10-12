@@ -31,6 +31,7 @@ pinned against its own wire:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1115,6 +1116,8 @@ def test_powerdns_without_rrset_still_does_the_get_merge_patch(
     [
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
+        # The real primary-zone text (AuthZone.cs:135/145 TrySetRecords, v15.4.0).
+        "Cannot add record: a CNAME record cannot exists with other record types for the same name.",
         "Record already exists. Use overwrite option if you wish to overwrite existing record.",
         "Record already exists.",
     ],
@@ -1127,7 +1130,7 @@ def test_technitium_conflict_refusal_is_a_failure(tmp_path: Path, message: str) 
     _install_fake_request(
         driver, lambda path, params, n: {"status": "error", "errorMessage": message}
     )
-    with pytest.raises(RuntimeError, match="already exists"):
+    with pytest.raises(RuntimeError, match=re.escape(message.rstrip("."))):
         driver.apply_record_op(
             {
                 "zone_name": "example.com.",

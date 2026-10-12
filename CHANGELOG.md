@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an A/AAAA on Technitium no longer loses its PTR (#1800).**
+  Technitium's web API deletes the matching PTR with the A/AAAA when the
+  reverse zone is on the same server, and #1768 only repaired the structural
+  reconcile. A record-op delete left the PTR gone until the next structural
+  pass. The control plane now queues a PTR create after the delete for any
+  PTR it still owns in a reverse zone of the group (`technitium` and
+  `technitium_api`, single, batch and bulk), decided against the database so
+  a PTR deleted earlier is not resurrected from a stale bundle. Edits already
+  ride `update` ops, which do not touch the PTR (checked in the v15.4.0
+  source). A PTR in a reverse zone SpatiumDDI does not manage is still
+  removed with its A record; this is documented in `DNS_DRIVERS.md`. Also
+  corrects the Technitium CNAME-conflict text quoted in comments and docs: a
+  primary zone answers "a CNAME record cannot exists with other record types
+  for the same name", and both drivers count it as a failure (test added).
+
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
 - **DNSSEC signing is no longer offered on Technitium (#1783).** The sign

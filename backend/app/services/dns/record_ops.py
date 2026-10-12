@@ -11,13 +11,14 @@ plane applies the change directly at enqueue time and writes the row as
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, func, select, tuple_
+from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -457,6 +458,123 @@ async def _apply_agentless(
     return op_row
 
 
+# #1800 — drivers whose A/AAAA delete also deletes the matching PTR.
+# Technitium's web API (``WebServiceZonesApi.DeleteRecord``, v15.4.0) looks up
+# the reverse zone for the address on the same server and deletes the PTR whose
+# target is the deleted record's owner; no parameter turns that off. (``add``
+# with ``overwrite=true`` and ``update`` do NOT do it, so a value change that
+# rides an ``update`` op is already safe.)
+PTR_CLEANUP_DRIVERS: frozenset[str] = frozenset({"technitium", "technitium_api"})
+
+
+def _qualified_owner(zone: DNSZone, name: str) -> str:
+    zone_name = zone.name.rstrip(".").lower()
+    name = (name or "@").rstrip(".").lower()
+    return zone_name if name == "@" else f"{name}.{zone_name}"
+
+
+async def _ptr_delete_queued_last(db: AsyncSession, zone_name: str, ptr_name: str) -> bool:
+    """Whether the newest still-relevant op for a PTR RRset is a delete.
+
+    "Still relevant" is queued (``pending`` / ``in_flight``) or written by THIS
+    transaction (an agentless op is already ``applied`` when we look). A caller
+    that queued the PTR's delete before the A's has deliberately removed it; a
+    re-assert queued after would bring it back."""
+    key = (zone_name, ptr_name.lower() or "@", "PTR")
+    rows = (
+        await db.execute(
+            select(DNSRecordOp.op, DNSRecordOp.created_at, DNSRecordOp.seq)
+            .where(
+                DNSRecordOp.state.in_(("pending", "in_flight", "applied")),
+                or_(
+                    DNSRecordOp.state != "applied",
+                    DNSRecordOp.created_at == func.now(),
+                ),
+                rrset_match_where([key]),
+            )
+            .order_by(DNSRecordOp.created_at.desc(), DNSRecordOp.seq.desc())
+            .limit(1)
+        )
+    ).all()
+    return bool(rows) and rows[0][0] == "delete"
+
+
+async def reassert_ptrs_after_a_deletes(
+    db: AsyncSession,
+    zone: DNSZone,
+    primary: DNSServer,
+    ops: Collection[dict[str, Any]],
+) -> int:
+    """Queue a PTR ``create`` after every A/AAAA ``delete`` that took its PTR.
+
+    Technitium removes the PTR with the A/AAAA (see ``PTR_CLEANUP_DRIVERS``),
+    so a record-op delete silently dropped a PTR SpatiumDDI still owns until
+    the next structural pass (#1800). Re-asserting from the AGENT's cached
+    bundle is unsafe — a PTR delete op that ran earlier, with a bundle not yet
+    re-rendered, would be resurrected — so the decision is made here, against
+    the database that is the source of truth: a PTR is re-asserted only while
+    its row is live and no newer delete of it is queued. The ``create`` rows are
+    inserted after the delete rows (``seq``), so every server applies them in
+    that order.
+
+    Returns the number of PTR creates queued. Does nothing for other drivers.
+    """
+    if primary.driver not in PTR_CLEANUP_DRIVERS:
+        return 0
+    owners: dict[str, str] = {}  # reverse pointer (lower, no dot) -> owner fqdn
+    for o in ops:
+        rec = o.get("record") or {}
+        rtype = (rec.get("type") or "").upper()
+        if o.get("op") != "delete" or rtype not in ("A", "AAAA"):
+            continue
+        try:
+            ip = ipaddress.ip_address(str(rec.get("value") or "").strip())
+        except ValueError:
+            continue
+        owners[ip.reverse_pointer.lower()] = _qualified_owner(zone, rec.get("name") or "@")
+    if not owners:
+        return 0
+    rows = (
+        await db.execute(
+            select(DNSRecord, DNSZone)
+            .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+            .where(
+                DNSZone.group_id == zone.group_id,
+                DNSRecord.record_type == "PTR",
+                DNSRecord.deleted_at.is_(None),
+                func.lower(func.rtrim(DNSRecord.fqdn, ".")).in_(list(owners)),
+            )
+        )
+    ).all()
+    by_zone: dict[uuid.UUID, tuple[DNSZone, list[dict[str, Any]]]] = {}
+    for ptr, rev_zone in rows:
+        owner = owners.get(ptr.fqdn.rstrip(".").lower())
+        if owner is None or ptr.value.rstrip(".").lower() != owner:
+            continue
+        if await _ptr_delete_queued_last(db, rev_zone.name, ptr.name):
+            continue
+        entry = by_zone.setdefault(rev_zone.id, (rev_zone, []))
+        entry[1].append(
+            {
+                "op": "create",
+                "record": record_op_payload(ptr),
+                "target_serial": bump_zone_serial(rev_zone),
+            }
+        )
+    queued = 0
+    for rev_zone, rev_ops in by_zone.values():
+        await enqueue_record_ops_batch(db, rev_zone, rev_ops)
+        queued += len(rev_ops)
+    if queued:
+        logger.info(
+            "technitium_ptr_reasserted_after_delete",
+            zone=zone.name,
+            driver=primary.driver,
+            ptrs=queued,
+        )
+    return queued
+
+
 async def enqueue_dnssec_op(db: AsyncSession, zone: DNSZone, op: str) -> None:
     """Queue the driver-side half of a DNSSEC state change.
 
@@ -555,7 +673,9 @@ async def enqueue_record_op(
                 type=record.get("type"),
             )
             return None
-        return await _apply_agentless(db, primary, zone, op, record, target_serial)
+        row = await _apply_agentless(db, primary, zone, op, record, target_serial)
+        await reassert_ptrs_after_a_deletes(db, zone, primary, [{"op": op, "record": record}])
+        return row
 
     # Agent-based group: fan out to every ENABLED, agent-based server in the
     # group, independent of whether the designated primary is currently
@@ -627,6 +747,7 @@ async def enqueue_record_op(
     # tick. Collected here (no commit yet); the request's
     # ``wake_publishing`` dependency flushes it after the outer commit.
     collect_wake(dns_group_channel(zone.group_id))
+    await reassert_ptrs_after_a_deletes(db, zone, primary, [{"op": op, "record": record}])
     # Return the primary's op when the primary is among the enabled servers,
     # else the first enabled agent's op. The return must be truthy whenever we
     # actually enqueued something — a disabled primary + enabled secondary still
@@ -812,14 +933,18 @@ async def enqueue_record_ops_batch(
                 count=len(ops),
             )
             return [None] * len(ops)
-        return await _apply_agentless_batch(db, primary, zone, ops)
+        batch_rows = await _apply_agentless_batch(db, primary, zone, ops)
+        await reassert_ptrs_after_a_deletes(db, zone, primary, ops)
+        return batch_rows
 
     # Agent-based: DB rows only; the agent batches at poll time. One fan-out
     # to every ENABLED agent-based server regardless of whether the designated
     # primary is disabled (#481), with the RRsets resolved for the whole batch
     # first (#773) so every op at a shared (name, type) carries the same
     # complete set whatever order the agent drains them in.
-    return await _fanout_agent_ops(db, zone, primary, ops)
+    fan_rows = await _fanout_agent_ops(db, zone, primary, ops)
+    await reassert_ptrs_after_a_deletes(db, zone, primary, ops)
+    return fan_rows
 
 
 async def enqueue_record_ops_bulk(
@@ -861,10 +986,12 @@ async def enqueue_record_ops_bulk(
             )
             return 0
         rows = await _apply_agentless_batch(db, primary, zone, ops)
+        await reassert_ptrs_after_a_deletes(db, zone, primary, ops)
         return sum(1 for r in rows if r is not None)
     # Agent-based: same fan-out as the batch path — every enabled agent-based
     # server, resolved once, one add_all + flush (#481 semantics included).
     rows = await _fanout_agent_ops(db, zone, primary, ops)
+    await reassert_ptrs_after_a_deletes(db, zone, primary, ops)
     return sum(1 for r in rows if r is not None)
 
 
