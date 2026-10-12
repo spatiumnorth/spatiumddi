@@ -22,15 +22,28 @@ from typing import Any
 
 #: field -> (default, why Technitium cannot honour another value)
 #:
-#: The forwarding options (``forward_policy``, ``forward_tls_verify``) are
-#: deliberately absent: what Technitium does with forwarders, and which of
-#: those values is the honest default for it, is #1764's to settle.
+#: ``forward_policy`` is not in this table: its default (``first``) is the
+#: value Technitium cannot honour, so it has its own rule (``refusals``).
 UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "minimal_responses": (False, "Technitium has no minimal-responses setting"),
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "max_clients_per_query": (None, "Technitium has no clients-per-query setting"),
+    "forward_tls_verify": (
+        True,
+        "Technitium always validates an encrypted upstream's certificate and has no "
+        "setting to skip it, so opportunistic DoT (verification off) cannot be honoured",
+    ),
 }
+
+#: Why ``forward_policy = first`` is not true on Technitium (#1764). With
+#: forwarders set the daemon resolves through them and never falls back to
+#: recursing from the root when they fail (it answers SERVFAIL), which is
+#: BIND's ``forward only``. ``only`` is therefore the one honest value.
+FORWARD_FIRST_WHY = (
+    "forward_policy 'first' is not what Technitium does: with forwarders set it resolves "
+    "only through them and never falls back to recursion (BIND's 'only')"
+)
 
 
 def allow_query_problem(elements: list[str] | None) -> str | None:
@@ -68,6 +81,13 @@ def refusals(changes: dict[str, Any], stored: Any) -> list[str]:
         if value == default or value == getattr(stored, field, None):
             continue
         out.append(f"{field}: {why}")
+    # Changing TO 'first' is refused; 'first' re-posted over a stored 'first'
+    # (the column default, which the form sends on every save) is tolerated.
+    if (
+        changes.get("forward_policy") == "first"
+        and getattr(stored, "forward_policy", "first") != "first"
+    ):
+        out.append(FORWARD_FIRST_WHY)
     if "allow_query" in changes and changes["allow_query"] != getattr(stored, "allow_query", None):
         problem = allow_query_problem(changes["allow_query"])
         if problem:
@@ -92,6 +112,17 @@ def stored_warnings(stored: Any) -> list[str]:
         for field, (default, why) in UNSUPPORTED_OPTIONS.items()
         if getattr(stored, field, default) != default
     ]
+    if getattr(stored, "forward_policy", "first") == "first" and getattr(
+        stored, "forwarders", None
+    ):
+        out.append(FORWARD_FIRST_WHY + "; set it to 'only' to match")
+    transport = getattr(stored, "forward_transport", "do53") or "do53"
+    if transport != "do53" and not getattr(stored, "forward_tls_hostname", None):
+        out.append(
+            f"forward_transport {transport!r} without forward_tls_hostname: Technitium "
+            "always validates the upstream certificate against a name, so these "
+            "forwarders are not applied; set forward_tls_hostname"
+        )
     problem = allow_query_problem(getattr(stored, "allow_query", None))
     if problem:
         out.append(problem + "; query access is left as each zone has it")

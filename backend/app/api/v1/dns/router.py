@@ -3377,12 +3377,24 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     # Every encrypted transport needs a name, not just DoT.
     #
     # For bind9 (tls) it is what ``remote-hostname`` validates against, so
-    # the requirement is conditional on verification being on. For
-    # technitium it is stricter: the daemon rejects an IP outright
-    # ("Address must be a domain name") for tls/https/quic, so without a
-    # hostname the agent has nothing to send and skips the forwarder apply
-    # entirely — leaving whatever forwarders were there before. Requiring
-    # it up front turns that silent staleness into a 422.
+    # the requirement is conditional on verification being on. Technitium
+    # validates the upstream certificate against the name unconditionally and
+    # pairs it with each forwarder IP as "name (ip)" (#1764), so for a group
+    # with a Technitium server the name is required for tls whatever
+    # ``forward_tls_verify`` says (the agent refuses to send bare IPs over
+    # Tls, since they fail wherever the certificate has no IP SAN).
+    if (
+        opts.forward_transport == "tls"
+        and not opts.forward_tls_hostname
+        and "technitium" in drivers
+    ):
+        raise HTTPException(
+            422,
+            "forward_tls_hostname is required when forwarding over TLS in a group "
+            "with a Technitium server: Technitium always validates the upstream "
+            "certificate, against that name. Set the provider's DoT hostname (e.g. "
+            "dns.quad9.net).",
+        )
     if opts.forward_transport in ("https", "quic") and not opts.forward_tls_hostname:
         raise HTTPException(
             422,

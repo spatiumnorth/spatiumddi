@@ -297,9 +297,9 @@ async def test_a_technitium_group_still_takes_what_the_daemon_applies(
         "allow_query": ["!10.1.0.0/16", "10.0.0.0/8", "2001:db8::/32"],
         # Defaults re-posted by the form on every save stay allowed.
         "minimal_responses": False,
-        # Forwarding semantics on Technitium are #1764's, not refused here.
+        # 'only' is what Technitium does with forwarders (#1764).
         "forward_policy": "only",
-        "forward_tls_verify": False,
+        "forward_tls_verify": True,
     }
     r = await client.put(url, json=body, headers=headers)
     assert r.status_code == 200, r.text
@@ -368,3 +368,115 @@ async def test_a_technitium_server_joining_a_group_with_stored_values_is_warned(
     r = await client.put(url, json={"tcp_clients": None, "allow_query": ["any"]}, headers=headers)
     assert r.status_code == 200, r.text
     assert r.json()["technitium_warnings"] == []
+
+
+# ── Forwarding semantics on Technitium (#1764) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_technitium_group_refuses_opportunistic_dot(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Technitium validates every encrypted upstream's certificate; verify off
+    was accepted, then refused by the agent on every apply."""
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options",
+        json={"forward_transport": "tls", "forward_tls_verify": False},
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "forward_tls_verify" in str(r.json()["detail"])
+
+
+@pytest.mark.asyncio
+async def test_a_technitium_group_cannot_be_moved_back_to_forward_first(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+    # Re-posting the stored default is fine...
+    r = await client.put(url, json={"forward_policy": "first"}, headers=headers)
+    assert r.status_code == 200, r.text
+    # ...'only' is accepted...
+    r = await client.put(url, json={"forward_policy": "only"}, headers=headers)
+    assert r.status_code == 200, r.text
+    # ...and going back to 'first' is a change to something untrue.
+    r = await client.put(url, json={"forward_policy": "first"}, headers=headers)
+    assert r.status_code == 422, r.text
+    assert "forward_policy" in str(r.json()["detail"])
+
+
+@pytest.mark.asyncio
+async def test_stored_forward_first_with_forwarders_is_warned_on_technitium(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, forwarders=["9.9.9.9"]))
+    await db_session.commit()
+    r = await client.get(f"/api/v1/dns/groups/{group.id}/options", headers=headers)
+    assert any(w.startswith("forward_policy") for w in r.json()["technitium_warnings"])
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options", json={"forward_policy": "only"}, headers=headers
+    )
+    assert not any(w.startswith("forward_policy") for w in r.json()["technitium_warnings"])
+
+
+@pytest.mark.asyncio
+async def test_a_technitium_group_needs_a_tls_name_even_with_stored_verify_off(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """A legacy row with verification off re-posts it (allowed, it is
+    stored); tls with no name still has to be refused, because the agent
+    will not send bare IPs over Tls (they fail wherever the certificate has
+    no IP SAN), so the API would otherwise store forwarders that never
+    apply (#1764)."""
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, forward_tls_verify=False))
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+    r = await client.put(
+        url,
+        json={"forward_transport": "tls", "forward_tls_verify": False, "forwarders": ["9.9.9.9"]},
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert "forward_tls_hostname" in str(r.json()["detail"])
+    r = await client.put(
+        url,
+        json={
+            "forward_transport": "tls",
+            "forward_tls_verify": False,
+            "forward_tls_hostname": "dns.quad9.net",
+            "forwarders": ["9.9.9.9"],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_stored_tls_without_name_is_warned_on_technitium(
+    client: AsyncClient, db_session: AsyncSession
+):
+    headers = await _superadmin(db_session)
+    group = await _technitium_group(db_session)
+    db_session.add(
+        DNSServerOptions(
+            group_id=group.id,
+            forward_transport="tls",
+            forward_tls_verify=False,
+            forward_policy="only",
+            forwarders=["9.9.9.9"],
+        )
+    )
+    await db_session.commit()
+    r = await client.get(f"/api/v1/dns/groups/{group.id}/options", headers=headers)
+    warnings = r.json()["technitium_warnings"]
+    assert any(w.startswith("forward_transport 'tls'") for w in warnings), warnings

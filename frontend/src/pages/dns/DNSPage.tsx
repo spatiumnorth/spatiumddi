@@ -6697,6 +6697,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
     tcpClients: techUnsupported && opts?.tcp_clients == null,
     clientsPerQuery: techUnsupported && opts?.clients_per_query == null,
     maxClientsPerQuery: techUnsupported && opts?.max_clients_per_query == null,
+    // #1764: Technitium always validates an encrypted upstream's certificate,
+    // and with forwarders set it never falls back to recursion ('only').
+    tlsVerify: techUnsupported && opts?.forward_tls_verify !== false,
+    forwardFirst: techUnsupported && opts?.forward_policy !== "first",
   };
   const techReason =
     "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
@@ -7180,7 +7184,15 @@ function OptionsTab({ groupId }: { groupId: string }) {
                   setDirty(true);
                 }}
               >
-                <option value="first">
+                <option
+                  value="first"
+                  disabled={techLocked.forwardFirst}
+                  title={
+                    techLocked.forwardFirst
+                      ? "Not supported by Technitium: with forwarders set it never falls back to recursion."
+                      : undefined
+                  }
+                >
                   first — try forwarders first, fall back to recursion
                 </option>
                 <option value="only">
@@ -7188,6 +7200,13 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
+            {techUnsupported && (
+              <p className="text-xs text-muted-foreground">
+                This group has a Technitium server, which resolves only through
+                its forwarders and never falls back to recursion, so
+                &quot;only&quot; is what it does whichever is chosen here.
+              </p>
+            )}
           </>
         )}
       </div>
@@ -7616,7 +7635,7 @@ function OptionsTab({ groupId }: { groupId: string }) {
               </option>
             </select>
           </Field>
-          {forwardTransport === "tls" && (
+          {forwardTransport !== "do53" && (
             <>
               <p className="text-xs text-muted-foreground">
                 Applies to the forwarders configured above, and to per-zone
@@ -7625,19 +7644,36 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 https and quic options are rejected for a group containing a
                 BIND9 server — use a Technitium-only group for those.
               </p>
-              <label className="flex items-center gap-2 cursor-pointer text-sm">
-                <input
-                  type="checkbox"
-                  checked={forwardTlsVerify}
-                  onChange={(e) => {
-                    setForwardTlsVerify(e.target.checked);
-                    setDirty(true);
-                  }}
-                  className="h-4 w-4"
-                />
-                Verify the upstream certificate
-              </label>
-              {forwardTlsVerify ? (
+              {forwardTransport === "tls" && (
+                <label className="flex items-center gap-2 cursor-pointer text-sm">
+                  <input
+                    type="checkbox"
+                    checked={forwardTlsVerify}
+                    disabled={techLocked.tlsVerify}
+                    title={
+                      techLocked.tlsVerify
+                        ? "Not supported by Technitium: it always validates the upstream certificate."
+                        : undefined
+                    }
+                    onChange={(e) => {
+                      setForwardTlsVerify(e.target.checked);
+                      setDirty(true);
+                    }}
+                    className="h-4 w-4"
+                  />
+                  Verify the upstream certificate
+                </label>
+              )}
+              {techUnsupported && (
+                <p className="text-xs text-muted-foreground">
+                  Technitium always validates the upstream certificate against
+                  the hostname below, so verification cannot be turned off and
+                  the hostname is required for this group.
+                </p>
+              )}
+              {forwardTransport !== "tls" ||
+              forwardTlsVerify ||
+              techUnsupported ? (
                 <Field label="Upstream TLS hostname (required)">
                   <input
                     className={inputCls}

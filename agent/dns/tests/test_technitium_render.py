@@ -1115,9 +1115,33 @@ def test_tsig_key_names_strip_root_dot() -> None:
     ) == ["a", "b"]
 
 
+def _forwarding_daemon():
+    """A fake daemon that keeps FWD records: ``zones/create`` of a Forwarder
+    stores its first, ``records/add`` appends, ``records/get`` reads them."""
+    store: dict[str, list[dict[str, Any]]] = {}
+
+    def responder(path, params, n):
+        zone = params.get("zone")
+        if path == "zones/create" and params.get("type") == "Forwarder":
+            store[zone] = [{"protocol": params.get("protocol", "Udp"),
+                            "forwarder": params["forwarder"], "priority": 0,
+                            "dnssecValidation": params.get("dnssecValidation") == "true"}]
+        elif path == "zones/records/add" and params.get("type") == "FWD":
+            store.setdefault(zone, []).append({
+                "protocol": params["protocol"], "forwarder": params["forwarder"],
+                "priority": int(params["forwarderPriority"]),
+                "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": zone, "type": "FWD", "rData": r} for r in store.get(zone, [])]}}
+        return {"status": "ok"}
+
+    return responder
+
+
 def test_ensure_zone_exists_sends_type_specific_params(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    calls = _install_fake_request(d, _forwarding_daemon())
 
     d._ensure_zone_exists("t", {"zone": "s.test", "type": "Secondary",
                                 "masters": ["192.0.2.1", "192.0.2.2"]})
@@ -1125,10 +1149,15 @@ def test_ensure_zone_exists_sends_type_specific_params(tmp_path: Path) -> None:
 
     d._ensure_zone_exists("t", {"zone": "f.test", "type": "Forwarder",
                                 "forwarders": ["8.8.8.8", "9.9.9.9"]})
-    # Technitium's Forwarder zone takes ONE upstream; extras are dropped
-    # with a warning rather than silently.
-    assert calls[-1][3]["forwarder"] == "8.8.8.8"
-    assert "forwarders" not in calls[-1][3]
+    create = [c for c in calls if c[2] == "zones/create" and c[3]["zone"] == "f.test"][0]
+    assert create[3]["forwarder"] == "8.8.8.8"
+    assert create[3]["protocol"] == "Udp"
+    assert "forwarders" not in create[3]
+    # The second upstream is not dropped: it is a further apex FWD record.
+    adds = [c[3] for c in calls if c[2] == "zones/records/add"]
+    assert len(adds) == 1
+    assert adds[0]["type"] == "FWD" and adds[0]["forwarder"] == "9.9.9.9"
+    assert adds[0]["forwarderPriority"] == "1" and adds[0]["protocol"] == "Udp"
 
 
 def test_apply_zone_options_refuses_unknown_transfer_value(tmp_path: Path) -> None:
@@ -1491,25 +1520,98 @@ def test_forwarders_and_protocol_are_sent_together(tmp_path: Path) -> None:
     assert params["forwarderProtocol"] == "Udp"
 
 
-def test_forwarders_substitute_hostname_for_encrypted_transports(tmp_path: Path) -> None:
-    """Technitium rejects an IP for DoT/DoH/DoQ ("Address must be a domain
-    name") — there'd be no name to validate the upstream cert against. The
-    neutral model carries IPs plus one hostname, so the hostname wins."""
+def test_forwarders_pair_the_hostname_with_every_ip_for_encrypted_transports(
+    tmp_path: Path,
+) -> None:
+    """The cert name goes beside each IP, ``"name (ip)"``, so Technitium dials
+    the IP instead of bootstrapping the name by plaintext recursion (#1764)."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_forwarders(
         "t",
         {
-            "forwarders": ["1.1.1.1", "1.0.0.1"],
+            "forwarders": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111"],
             "forward_transport": "tls",
             "forward_tls_hostname": "cloudflare-dns.com",
         },
     )
-    assert calls[0][3]["forwarders"] == "cloudflare-dns.com"
+    assert calls[0][3]["forwarders"] == (
+        "cloudflare-dns.com (1.1.1.1),cloudflare-dns.com (1.0.0.1),"
+        "cloudflare-dns.com ([2606:4700:4700::1111])"
+    )
     assert calls[0][3]["forwarderProtocol"] == "Tls"
 
 
-def test_forwarders_refuse_encrypted_transport_without_hostname(tmp_path: Path) -> None:
+def test_forwarders_https_pairs_the_url_with_each_ip(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {
+            "forwarders": ["1.1.1.1"],
+            "forward_transport": "https",
+            "forward_tls_hostname": "cloudflare-dns.com",
+        },
+    )
+    assert calls[0][3]["forwarders"] == "https://cloudflare-dns.com/dns-query (1.1.1.1)"
+    assert calls[0][3]["forwarderProtocol"] == "Https"
+
+
+def test_forwarders_tls_without_hostname_is_refused_not_sent_as_bare_ips(
+    tmp_path: Path,
+) -> None:
+    """A stored opportunistic-DoT row (verify off, no name). Technitium
+    validates the certificate against the address it is given, so bare IPs
+    over Tls would fail every forwarded query wherever the certificate has no
+    IP SAN. The previous forwarders stay and the refusal is reported (#1764)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d._apply_failures = []
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["1.1.1.1", "9.9.9.9"], "forward_transport": "tls",
+         "forward_tls_verify": False},
+    )
+    assert calls == []
+    assert any("forward_tls_hostname" in f for f in d._apply_failures)
+
+
+def test_forwarders_neutral_ip_at_port_becomes_technitium_ip_colon_port(
+    tmp_path: Path,
+) -> None:
+    """The group validator stores ``ip@port``; Technitium reads ``@`` as part
+    of a domain name, so it is translated (``[v6]:port`` for IPv6)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t", {"forwarders": ["10.0.0.1@5353", "10.0.0.2", "2001:db8::1@5353"]}
+    )
+    assert calls[0][3]["forwarders"] == "10.0.0.1:5353,10.0.0.2,[2001:db8::1]:5353"
+
+
+def test_encrypted_forwarders_put_the_port_on_the_name(tmp_path: Path) -> None:
+    """Technitium refuses a name and an IP whose ports disagree, and a DoH
+    URL's port must be the URL's: the port rides the name part."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["9.9.9.9@8853", "149.112.112.112"], "forward_transport": "tls",
+         "forward_tls_hostname": "dns.quad9.net"},
+    )
+    assert calls[0][3]["forwarders"] == (
+        "dns.quad9.net:8853 (9.9.9.9),dns.quad9.net (149.112.112.112)"
+    )
+    calls.clear()
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["9.9.9.9@8443"], "forward_transport": "https",
+         "forward_tls_hostname": "dns.quad9.net"},
+    )
+    assert calls[0][3]["forwarders"] == "https://dns.quad9.net:8443/dns-query (9.9.9.9)"
+
+
+def test_forwarders_refuse_https_without_hostname(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_forwarders("t", {"forwarders": ["1.1.1.1"], "forward_transport": "https"})
@@ -2062,6 +2164,7 @@ def test_primary_zone_switched_to_forwarder_gets_its_fwd_record(tmp_path: Path) 
         "type": "FWD",
         "forwarder": "192.0.2.53",
         "protocol": "Udp",
+        "forwarderPriority": "0",
     }
     assert not any(
         c[2] == "zones/options/set" and "forwarder" in c[3] for c in calls
@@ -2214,7 +2317,34 @@ def test_refused_fwd_record_change_is_noted_as_an_apply_failure(
         "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
     )
 
-    assert d._apply_failures == ["f.test: zone upstream: Access was denied."]
+    if refused_path == "zones/records/add":
+        assert d._apply_failures == ["f.test: zone upstream: 192.0.2.2: Access was denied."]
+    else:
+        assert d._apply_failures == ["f.test: zone upstream: 192.0.2.1: Access was denied."]
+
+
+def test_refused_fwd_add_keeps_the_old_upstream(tmp_path: Path) -> None:
+    """#1647's invariant survives the multi-record reconciler (#1764): if the
+    new upstream is refused, the old one is not deleted, so the zone is never
+    left with no upstream at all."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    inner = _existing_zone_responder(
+        "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+    )
+
+    def responder(path, params, n):
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return inner(path, params, n)
+
+    calls = _install_fake_request(d, responder)
+    d._apply_failures = []
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    assert "zones/records/delete" not in [c[2] for c in calls]
 
 
 def test_unreadable_live_type_is_not_guessed(tmp_path: Path) -> None:
@@ -3367,6 +3497,319 @@ def test_a_clean_apply_after_an_untranslatable_one_reports_nothing(tmp_path: Pat
         d.validate()
         d.swap_and_reload()
     assert not [r for r in d._refused_zones if "allow_query" in r]
+
+
+# ── Forward zones: protocol, every upstream, DNSSEC (#1764) ─────────────
+
+
+@pytest.mark.parametrize(
+    "address,protocol",
+    [
+        ("8.8.8.8", "Udp"),
+        ("dns.example", "Udp"),
+        ("8.8.8.8:5353", "Udp"),
+        ("https://dns.quad9.net/dns-query", "Https"),
+        ("https://cloudflare-dns.com/dns-query (1.1.1.1)", "Https"),
+        ("tls://dns.quad9.net", "Tls"),
+        ("dns.quad9.net:853", "Tls"),
+        ("dns.quad9.net:853 (9.9.9.9)", "Tls"),
+        ("[2606:4700:4700::1111]:853", "Tls"),
+        ("quic://dns.adguard.com", "Quic"),
+        ("tcp://10.0.0.1", "Tcp"),
+        ("2606:4700:4700::1111", "Udp"),
+    ],
+)
+def test_forwarder_protocol_is_derived_from_the_address(address: str, protocol: str) -> None:
+    from spatium_dns_agent.drivers.technitium import _forwarder_protocol
+
+    assert _forwarder_protocol(address) == protocol
+
+
+def test_forward_zone_create_sends_protocol_and_dnssec(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder",
+         "forwarders": ["https://dns.quad9.net/dns-query"], "dnssec_validation": True},
+    )
+    params = calls[0][3]
+    assert params["forwarder"] == "https://dns.quad9.net/dns-query"
+    assert params["protocol"] == "Https"
+    assert params["dnssecValidation"] == "true"
+
+
+def test_forward_zone_dnssec_off_is_sent_as_false(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["8.8.8.8"],
+              "dnssec_validation": False},
+    )
+    assert calls[0][3]["dnssecValidation"] == "false"
+
+
+def test_forward_zone_extra_upstreams_keep_protocol_priority_and_dnssec(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _forwarding_daemon())
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["10.0.0.1", "tls://dns.quad9.net", "10.0.0.3"]},
+    )
+    adds = [c[3] for c in calls if c[2] == "zones/records/add"]
+    assert [(a["forwarder"], a["protocol"], a["forwarderPriority"]) for a in adds] == [
+        ("tls://dns.quad9.net", "Tls", "1"),
+        ("10.0.0.3", "Udp", "2"),
+    ]
+    assert all(a["dnssecValidation"] == "true" for a in adds)
+
+
+def _existing_forward_zone(live: list[dict[str, Any]]):
+    def responder(path, params, n):
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": f"Zone already exists: {params['zone']}"}
+        if path == "zones/options/get":
+            return {"status": "ok", "response": {"name": params["zone"], "type": "Forwarder"}}
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD", "rData": r} for r in live]}}
+        return {"status": "ok"}
+    return responder
+
+
+def test_existing_forward_zone_converges_to_the_bundle_upstreams(tmp_path: Path) -> None:
+    """Missing upstream added, a changed priority updated in place, a stale
+    one deleted last; an unchanged one is left alone."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_forward_zone([
+        {"protocol": "Udp", "forwarder": "10.0.0.1", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Udp", "forwarder": "10.0.0.2", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Udp", "forwarder": "10.0.0.9", "priority": 3, "dnssecValidation": True},
+    ]))
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["10.0.0.1", "10.0.0.2", "tls://dns.example"]},
+    )
+    writes = [(c[2], c[3]) for c in calls if c[2].startswith("zones/records/") and c[2] != "zones/records/get"]
+    assert [w[0] for w in writes] == [
+        "zones/records/update", "zones/records/add", "zones/records/delete"]
+    assert writes[0][1]["forwarder"] == "10.0.0.2" and writes[0][1]["forwarderPriority"] == "1"
+    assert writes[1][1]["forwarder"] == "tls://dns.example" and writes[1][1]["protocol"] == "Tls"
+    assert writes[2][1]["forwarder"] == "10.0.0.9"
+    assert not any(c[2] == "zones/options/set" for c in calls)
+
+
+def test_existing_forward_zone_in_sync_writes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_forward_zone([
+        {"protocol": "Https", "forwarder": "https://dns.quad9.net/dns-query",
+         "priority": 0, "dnssecValidation": True},
+    ]))
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["https://dns.quad9.net/dns-query"]},
+    )
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_render_ships_the_group_dnssec_setting_to_forward_zones(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["8.8.8.8"]}],
+         "options": {"dnssec_validation": "no"}},
+    )
+    create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
+    assert create[3]["dnssecValidation"] == "false"
+
+
+def _technitium_like_daemon():
+    """A fake daemon that keeps FWD records the way Technitium does
+    (``DnsForwarderRecordData``, v15.4.0): the forwarder string is stored
+    verbatim and compared case-insensitively, identity is (protocol,
+    forwarder), an update finds the old record by ``protocol`` +
+    ``forwarder`` and ``newProtocol`` / ``newForwarder`` default to them,
+    and ``zones/create`` of an existing zone answers "Zone already exists"."""
+    zones: dict[str, list[dict[str, Any]]] = {}
+    types: dict[str, str] = {}
+
+    def find(zone, protocol, forwarder):
+        for r in zones.get(zone, []):
+            if r["protocol"] == protocol and r["forwarder"].lower() == forwarder.lower():
+                return r
+        return None
+
+    def responder(path, params, n):
+        zone = params.get("zone")
+        if path == "zones/create":
+            if zone in zones:
+                return {"status": "error", "errorMessage": f"Zone already exists: {zone}"}
+            zones[zone] = [{"protocol": params.get("protocol", "Udp"),
+                            "forwarder": params["forwarder"], "priority": 0,
+                            "dnssecValidation": params.get("dnssecValidation") == "true"}]
+            types[zone] = params.get("type", "Primary")
+        elif path == "zones/options/get":
+            return {"status": "ok", "response": {"name": zone,
+                                                 "type": types.get(zone, "Forwarder")}}
+        elif path == "zones/convert":
+            # Primary -> Forwarder keeps the zone but it has no FWD record.
+            types[zone] = params["type"]
+        elif path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": zone, "type": "FWD", "rData": dict(r)} for r in zones.get(zone, [])]}}
+        elif path == "zones/records/add":
+            protocol = params.get("protocol", "Udp")
+            if find(zone, protocol, params["forwarder"]) is None:
+                zones[zone].append({"protocol": protocol, "forwarder": params["forwarder"],
+                                    "priority": int(params.get("forwarderPriority", 0)),
+                                    "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/update":
+            protocol = params.get("protocol", "Udp")
+            old = find(zone, protocol, params["forwarder"])
+            if old is None:
+                return {"status": "error", "errorMessage": "no such record"}
+            old.update({"protocol": params.get("newProtocol", protocol),
+                        "forwarder": params.get("newForwarder", params["forwarder"]),
+                        "priority": int(params.get("forwarderPriority", 0)),
+                        "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/delete":
+            old = find(zone, params.get("protocol", "Udp"), params["forwarder"])
+            if old is None:
+                return {"status": "error", "errorMessage": "no such record"}
+            zones[zone].remove(old)
+        return {"status": "ok"}
+
+    responder.types = types  # type: ignore[attr-defined]
+    return responder, zones
+
+
+@pytest.mark.parametrize(
+    "forwarders",
+    [
+        ["https://dns.quad9.net/dns-query", "9.9.9.9", "tls://dns.quad9.net"],
+        ["Dns.Quad9.NET:853 (9.9.9.9)", "10.0.0.1", "10.0.0.1"],
+        ["10.0.0.1@5353", "2001:db8::53"],
+    ],
+)
+def test_second_forward_zone_pass_against_a_technitium_like_daemon_writes_nothing(
+    tmp_path: Path, forwarders: list[str]
+) -> None:
+    """Every structural pass re-runs the zone sync: the second one must make
+    zero writes, or each apply churns the zone's upstreams (#1764)."""
+    from spatium_dns_agent.drivers.technitium import _zone_forwarder
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": [_zone_forwarder(f, {}) for f in forwarders]}
+    d._ensure_zone_exists("t", entry)
+    assert len(zones["f.test"]) == len({(f.lower()) for f in entry["forwarders"]})
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_forward_zone_upgraded_from_udp_records_converges_once(tmp_path: Path) -> None:
+    """A zone an older agent created (DoH URL stored as Udp) gets the Https
+    record and loses the Udp one, then stays put."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    zones["f.test"] = [{"protocol": "Udp", "forwarder": "https://dns.quad9.net/dns-query",
+                        "priority": 0, "dnssecValidation": False}]
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": ["https://dns.quad9.net/dns-query"]}
+    d._ensure_zone_exists("t", entry)
+    assert zones["f.test"] == [{"protocol": "Https",
+                                "forwarder": "https://dns.quad9.net/dns-query",
+                                "priority": 0, "dnssecValidation": True}]
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_primary_converted_to_forwarder_gets_every_upstream_then_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """#1457 + #1764: a Primary switched to forward is converted in place and
+    gets the bundle's full upstream set (protocol, priority, DNSSEC), not just
+    the first one as Udp; the next pass converts nothing and writes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    zones["f.test"] = []
+    responder.types["f.test"] = "Primary"  # type: ignore[attr-defined]
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": ["10.0.0.1", "tls://dns.quad9.net"]}
+    d._ensure_zone_exists("t", entry)
+    paths = [c[2] for c in calls]
+    assert paths.index("zones/convert") < paths.index("zones/records/add")
+    assert zones["f.test"] == [
+        {"protocol": "Udp", "forwarder": "10.0.0.1", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Tls", "forwarder": "tls://dns.quad9.net", "priority": 1,
+         "dnssecValidation": True},
+    ]
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+@pytest.mark.parametrize(
+    "entry,options,expected",
+    [
+        ("9.9.9.9", {}, "9.9.9.9"),
+        ("10.0.0.1@5353", {}, "10.0.0.1:5353"),
+        ("9.9.9.9", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "tls://dns.quad9.net (9.9.9.9)"),
+        ("2620:fe::fe", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "tls://dns.quad9.net ([2620:fe::fe])"),
+        ("9.9.9.9", {"forward_transport": "https", "forward_tls_hostname": "dns.quad9.net"},
+         "https://dns.quad9.net/dns-query (9.9.9.9)"),
+        ("9.9.9.9", {"forward_transport": "quic", "forward_tls_hostname": "dns.quad9.net"},
+         "quic://dns.quad9.net (9.9.9.9)"),
+        # The operator's own scheme / port / name is kept.
+        ("https://dns.google/dns-query",
+         {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "https://dns.google/dns-query"),
+        ("10.0.0.1@5353", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "10.0.0.1:5353"),
+        ("dns.internal", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "dns.internal"),
+        # No hostname: nothing to validate against, left as written.
+        ("9.9.9.9", {"forward_transport": "tls"}, "9.9.9.9"),
+    ],
+)
+def test_zone_forwarders_inherit_the_group_encrypted_transport(
+    entry: str, options: dict[str, Any], expected: str
+) -> None:
+    """BIND9 applies the group's forward transport to per-zone upstreams
+    (#50) and the Options tab says so; a plain-IP Technitium zone upstream in
+    a DoT group used to go out as cleartext UDP."""
+    from spatium_dns_agent.drivers.technitium import _forwarder_protocol, _zone_forwarder
+
+    out = _zone_forwarder(entry, options)
+    assert out == expected
+    if "://" not in entry and "://" in out:
+        assert _forwarder_protocol(out) == _FORWARDER_PROTOCOLS_FOR_TEST[
+            options["forward_transport"]]
+
+
+_FORWARDER_PROTOCOLS_FOR_TEST = {"tls": "Tls", "https": "Https", "quic": "Quic"}
+
+
+def test_render_pairs_zone_forwarders_with_the_group_tls_name(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["9.9.9.9"]}],
+         "options": {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net",
+                     "forwarders": ["9.9.9.9"]}},
+    )
+    create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
+    assert create[3]["forwarder"] == "tls://dns.quad9.net (9.9.9.9)"
+    assert create[3]["protocol"] == "Tls"
 
 
 # ── #1759: one target rule for every name-valued type ───────────────────
