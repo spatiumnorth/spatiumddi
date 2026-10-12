@@ -230,17 +230,19 @@ async def plan_upgrade(
     # before/after picture even if the appliance row's
     # installed_appliance_version is updated mid-run.
     from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.services.appliance.ownership import hostname_sql, k8s_node_name  # noqa: PLC0415
 
     source_versions: dict[str, str | None] = {}
     appliance_rows = (
         await db.execute(
             select(Appliance.hostname, Appliance.installed_appliance_version).where(
-                Appliance.hostname.in_(order)
+                hostname_sql(Appliance.hostname).in_([k8s_node_name(n) for n in order])
             )
         )
     ).all()
     for hostname, installed in appliance_rows:
-        source_versions[hostname] = installed
+        # Keyed by the Node name the plan and the per-node steps use (#1757).
+        source_versions[k8s_node_name(hostname)] = installed
 
     run = SystemUpgradeRun(
         kind="cluster_rolling",

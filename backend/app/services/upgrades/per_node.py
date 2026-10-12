@@ -89,6 +89,7 @@ from app.core.agent_wake import appliance_channel, publish_wake
 from app.models.appliance import Appliance
 from app.models.audit import AuditLog
 from app.services.appliance import k8s
+from app.services.appliance.ownership import hostname_sql, k8s_node_name
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.slot_image_target import (
     SlotImageArchitectureMismatch,
@@ -673,7 +674,8 @@ async def _resolve_appliance(db: AsyncSession, node_name: str) -> Appliance | No
     name by default). A future polish can grow an explicit
     ``Appliance.k8s_node_name`` column if operators rename either.
     """
-    stmt = select(Appliance).where(Appliance.hostname == node_name)
+    # Case-blind: k3s lowercases the host's name for the Node (#1757).
+    stmt = select(Appliance).where(hostname_sql(Appliance.hostname) == k8s_node_name(node_name))
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
