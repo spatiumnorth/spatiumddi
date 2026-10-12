@@ -76,6 +76,7 @@ from app.services.dns.agent_token import (
 )
 from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
+from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
@@ -439,6 +440,20 @@ async def agent_register(
         server.status = "active"
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
+
+    # #1782 — Technitium cannot do catalog zones (#1766). Registration must
+    # not refuse (a refused agent re-bootstraps in a loop), and the group API
+    # / server create / move / Fleet role assignment refuse the operator-driven
+    # paths. An agent pointed straight at a catalog group lands here; say so,
+    # and the group's ``catalog_unsupported_warning`` shows it in the UI.
+    if group.catalog_zones_enabled and body.driver in CATALOG_UNSUPPORTED_DRIVERS:
+        logger.warning(
+            "dns_agent_catalog_unsupported_driver",
+            server_id=str(server.id),
+            group=group.name,
+            driver=body.driver,
+            issue="#1766",
+        )
 
     # Mint token
     token, exp = mint_agent_token(

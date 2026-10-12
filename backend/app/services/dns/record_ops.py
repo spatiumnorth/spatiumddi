@@ -333,7 +333,7 @@ async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer |
     return res.scalar_one_or_none()
 
 
-def _rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
+def rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
     """Lift the stamped ``record["rrset"]`` payload into the neutral type.
 
     #783 — the agentless drivers consume dataclasses, not the wire dict the
@@ -413,7 +413,7 @@ async def _apply_agentless(
             port=record.get("port"),
         ),
         target_serial=target_serial or 0,
-        rrset=_rrset_from_payload(record),
+        rrset=rrset_from_payload(record),
     )
 
     try:
@@ -1019,7 +1019,7 @@ async def _apply_agentless_batch(
                 port=o["record"].get("port"),
             ),
             target_serial=o.get("target_serial") or 0,
-            rrset=_rrset_from_payload(o["record"]),
+            rrset=rrset_from_payload(o["record"]),
         )
         for o in ops
     ]
@@ -1096,7 +1096,7 @@ def _change_from_op_row(op_row: DNSRecordOp) -> RecordChange | None:
             port=record.get("port"),
         ),
         target_serial=op_row.target_serial or 0,
-        rrset=_rrset_from_payload(record),
+        rrset=rrset_from_payload(record),
     )
 
 

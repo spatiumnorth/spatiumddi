@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
@@ -53,6 +54,7 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
@@ -187,6 +189,11 @@ class ZoneMovePlan:
     #: ``key {}`` is group-scoped too, so a key the target does not define
     #: is the same undefined symbol and the same whole-group failure.
     key_names_lost: list[str] = field(default_factory=list)
+    #: #1784 — why the experimental ``technitium_api`` driver in the target
+    #: cannot take this zone (non-Primary, settings it never writes, pools).
+    #: Set by the plan so the preview reports the same refusal the commit
+    #: raises; ``None`` when the target is not such a group or the zone fits.
+    technitium_api_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -425,6 +432,21 @@ async def assemble_move_plan(
 
     # ── Named ACLs cited by the zone's own address-match lists ────────
     _scan_acl_references(plan, zone, source_acls, target_acls)
+
+    # ── Experimental technitium_api target (#1784, a refusal) ─────────
+    if technitium_api_scope.DRIVER in plan.target_drivers:
+        try:
+            technitium_api_scope.refuse_non_primary(zone.zone_type)
+            technitium_api_scope.refuse_unapplied_zone_changes(
+                {f: getattr(zone, f) for f in technitium_api_scope.ZONE_UNAPPLIED_DEFAULTS},
+                None,
+            )
+            if plan.pools_repointed:
+                raise technitium_api_scope.refusal(
+                    "DNS pools are not supported; this zone has pools."
+                )
+        except HTTPException as exc:
+            plan.technitium_api_refusal = str(exc.detail)
 
     _fill_warnings(plan)
     return plan
@@ -665,6 +687,11 @@ async def commit_move(
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
             status_code=422,
         )
+    if plan.technitium_api_refusal:
+        # #1784 — refused, not warned: the zone would read as configured on
+        # a server that ignores the config. Derived in the plan so the
+        # preview shows the same refusal.
+        raise ZoneMoveError(plan.technitium_api_refusal, status_code=422)
     if plan.dnssec_signed and plan.dnssec_target_signers > 1:
         raise ZoneMoveError(
             f"This zone is DNSSEC-signed and '{target_group.name}' has "

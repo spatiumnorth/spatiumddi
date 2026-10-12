@@ -73,7 +73,10 @@ _MAX_ERROR = 2000
 #   timers only once the group's last BIND9 agent renders them.
 # 6 (#1513): a Technitium server's bundle carries ``svcb_target_rule``, and
 #   its SVCB / HTTPS targets the trailing dot migration a3d9e5c17b42 wrote.
-RENDERER_REVISION = 6
+# 7 (#1759): a Technitium server's bundle also carries ``name_target_rule``, and
+#   its CNAME / DNAME / NS / PTR / MX / SRV / NAPTR targets the trailing dot
+#   migration d6b2f81a3c57 wrote.
+RENDERER_REVISION = 7
 
 
 def _serves(revision: int | None) -> bool:

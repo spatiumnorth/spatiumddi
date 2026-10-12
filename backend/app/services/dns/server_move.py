@@ -45,13 +45,14 @@ from app.core.agent_wake import (
     dns_group_channel,
     dns_server_channel,
 )
-from app.models.appliance import Appliance
 from app.models.dns import (
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
     DNSServerZoneState,
 )
+from app.services.appliance.ownership import owning_appliance_for_dns_server
+from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
@@ -106,6 +107,36 @@ class ServerMoveResult:
         }
 
 
+# #1782 — Technitium catalog zones are broken in both roles (the producer's
+# member zones inherit the catalog's transfer Deny / notify None, undoing the
+# #734 grant; the consumer's SecondaryCatalog has no TSIG and stays empty).
+# The real fix is #1766 (1.1.0); until then SpatiumDDI stops claiming it.
+CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium", "technitium_api"})
+
+
+def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
+    bad = ", ".join(sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS))
+    return (
+        f"Catalog zones are not supported on Technitium (driver {bad}): its member "
+        "zones inherit the catalog zone's zone-transfer Deny and notify None, which "
+        "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
+        "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
+    )
+
+
+async def ensure_group_catalog_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a catalog-enabled group
+    when that driver cannot do catalog zones (#1782)."""
+    if group.catalog_zones_enabled and driver in CATALOG_UNSUPPORTED_DRIVERS:
+        raise ServerMoveError(
+            f"Group {group.name!r} has catalog zones enabled. "
+            + catalog_unsupported_message({driver}),
+            status_code=422,
+        )
+
+
 async def ensure_group_single_driver(
     db: AsyncSession,
     group_id: uuid.UUID,
@@ -141,6 +172,14 @@ async def ensure_group_single_driver(
             f"{driver!r}. A server group is single-driver — {hint}",
             status_code=422,
         )
+    # #1784 — the experimental agentless Technitium driver supports ONE
+    # server per group. Enforced on every path that puts a server in a group
+    # (create, driver change, move) because they all come through here.
+    if driver == technitium_api_scope.DRIVER:
+        if await technitium_api_scope.count_other_servers(db, group_id, exclude_server_id):
+            raise ServerMoveError(
+                technitium_api_scope.single_server_message(group_name), status_code=422
+            )
 
 
 async def _elect_primary(
@@ -237,6 +276,7 @@ async def move_server_to_group(
         group_name=target_group.name,
         hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
+    await ensure_group_catalog_compatible(db, target_group, server.driver)
 
     # #1762 — a server joining a group that already has one and holds signed
     # zones would sign them with its own keys. Enabled or not: a disabled
@@ -324,15 +364,16 @@ async def move_server_to_group(
     # Only repointed when it currently names the group being left: an
     # appliance deliberately assigned elsewhere is not ours to redirect.
     appliance_repointed_id: uuid.UUID | None = None
-    if server.appliance_id is not None:
-        appliance = await db.get(Appliance, server.appliance_id)
-        if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
-            appliance.assigned_dns_group_id = target_group.id
-            appliance_repointed_id = appliance.id
-            # Per-appliance desired state changed, so wake the supervisor's
-            # heartbeat long-poll rather than making it wait out its interval
-            # for a firewall rule its agent already needs.
-            collect_wake(appliance_channel(appliance.id))
+    # Found by FK, else by the same hostname rule Fleet uses (#1749): agents
+    # register by hostname and never set ``appliance_id``.
+    appliance = await owning_appliance_for_dns_server(db, server)
+    if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+        appliance.assigned_dns_group_id = target_group.id
+        appliance_repointed_id = appliance.id
+        # Per-appliance desired state changed, so wake the supervisor's
+        # heartbeat long-poll rather than making it wait out its interval
+        # for a firewall rule its agent already needs.
+        collect_wake(appliance_channel(appliance.id))
 
     # Both groups' bundles change shape (a member left one and joined the
     # other), and the server's own channel is what reaches an agent already
