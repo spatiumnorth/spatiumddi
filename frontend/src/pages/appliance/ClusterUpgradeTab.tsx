@@ -73,6 +73,8 @@ const CATEGORY_LABELS: Record<ClusterUpgradeFailureCategory, string> = {
   node_did_not_rejoin: "Node didn't rejoin",
   chart_bump_failed: "Chart bump failed",
   uncordon_fail: "Uncordon failed",
+  slot_image_mirror_not_ready: "Slot-image mirror not ready",
+  release_failed: "Release failed — node held",
   other: "Other",
 };
 
@@ -104,6 +106,10 @@ const CATEGORY_HINTS: Record<ClusterUpgradeFailureCategory, string> = {
     "Forward-fix: helm rollback the chart, debug, re-apply the bump.",
   uncordon_fail:
     "Node upgraded but cordon/maintenance-window clear failed. Manual kubectl uncordon required.",
+  slot_image_mirror_not_ready:
+    "The in-cluster slot-image mirror isn't serving. Check its pod + events, then plan again.",
+  release_failed:
+    "The upgrade failed AND the automatic release failed, so the node is still held. Release by hand: kubectl uncordon and/or set the CNPG Cluster's nodeMaintenanceWindow.inProgress to false.",
   other: "Check progress.per_node[<node>].error for the raw message.",
 };
 
@@ -794,6 +800,15 @@ function FailureBanner({
       {progress.error ? (
         <div className="mt-1 font-mono text-rose-700 dark:text-rose-300 break-all">
           {progress.error}
+        </div>
+      ) : null}
+      {progress.release_failed ? (
+        <div className="mt-1 text-rose-700 dark:text-rose-300 break-all">
+          <strong>Still held:</strong>{" "}
+          {progress.release_failed.stuck.length
+            ? progress.release_failed.stuck.join(", ")
+            : "unknown"}{" "}
+          — {progress.release_failed.error}
         </div>
       ) : null}
       {cat && CATEGORY_HINTS[cat] ? (

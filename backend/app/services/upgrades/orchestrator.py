@@ -884,6 +884,7 @@ async def _drive_loop(
             release_failed = upgrade_alerts.release_failure(result.steps)
             if release_failed is not None:
                 release_error, stuck = release_failed
+                underlying_category = category
                 category = upgrade_alerts.CATEGORY_RELEASE_FAILED
                 run.last_error = (
                     f"{run.last_error}; release of node {next_node} failed "
@@ -892,6 +893,9 @@ async def _drive_loop(
                 per_node_progress[next_node]["release_failed"] = {
                     "error": release_error,
                     "stuck": stuck,
+                    # What the step failure would have been classified as,
+                    # so the original cause survives the override.
+                    "underlying_category": underlying_category,
                 }
             per_node_progress[next_node]["failure_category"] = category
             run.progress = {**run.progress, "per_node": per_node_progress}

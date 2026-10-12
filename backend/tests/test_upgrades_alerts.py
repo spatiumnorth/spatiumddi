@@ -155,6 +155,8 @@ def test_classify_none_failed_at() -> None:
         upgrade_alerts.CATEGORY_CONVERGENCE_TIMEOUT,
         upgrade_alerts.CATEGORY_CHART_BUMP,
         upgrade_alerts.CATEGORY_UNCORDON_FAIL,
+        upgrade_alerts.CATEGORY_MIRROR_NOT_READY,
+        upgrade_alerts.CATEGORY_RELEASE_FAILED,
         upgrade_alerts.CATEGORY_OTHER,
     ],
 )
@@ -620,4 +622,5 @@ async def test_orchestrator_distinct_alert_when_release_fails(
     entry = run.progress["per_node"]["node-a"]
     assert entry["failure_category"] == "release_failed"
     assert entry["release_failed"]["stuck"] == ["maintenance_window"]
+    assert entry["release_failed"]["underlying_category"] == upgrade_alerts.CATEGORY_DRAIN_STUCK
     assert "maintenance_window" in (run.last_error or "")

@@ -1640,3 +1640,55 @@ async def test_cluster_verify_not_settled_before_controller_observes_spec(
     )
     assert step.ok is False
     assert "cp-api" in step.error
+
+
+# ── #1542 — ``stuck`` names exactly what the failed release left held ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("skip", "clear_window", "uncordon_rc", "window_rc", "expect_ok", "expect_stuck"),
+    [
+        # Uncordon fails: the window clear is never attempted.
+        (None, True, (False, "403"), (True, None), False, ["cordon", "maintenance_window"]),
+        # Uncordon fails, no window was set by this run.
+        (None, False, (False, "403"), (True, None), False, ["cordon"]),
+        # Uncordon ok, window clear fails.
+        (None, True, (True, None), (False, "403"), False, ["maintenance_window"]),
+        # Pre-cordoned node (#1610 leaves it cordoned on purpose): only the
+        # window may be reported, never the operator's cordon.
+        (
+            "the node was already cordoned before the upgrade",
+            True,
+            (True, None),
+            (False, "403"),
+            False,
+            ["maintenance_window"],
+        ),
+        # Both succeed: nothing stuck.
+        (None, True, (True, None), (True, None), True, None),
+    ],
+)
+async def test_release_node_stuck_names_what_is_held(
+    skip: str | None,
+    clear_window: bool,
+    uncordon_rc: tuple[bool, str | None],
+    window_rc: tuple[bool, str | None],
+    expect_ok: bool,
+    expect_stuck: list[str] | None,
+) -> None:
+    with (
+        patch.object(per_node.k8s, "uncordon_node", return_value=uncordon_rc) as un,
+        patch.object(per_node.k8s, "patch_cnpg_maintenance_window", return_value=window_rc),
+    ):
+        step = await per_node._step_release_node(  # noqa: SLF001
+            "node-1",
+            "pg-cluster",
+            None,
+            clear_window=clear_window,
+            uncordon_skip_reason=skip,
+        )
+    assert step.ok is expect_ok
+    assert step.detail.get("stuck") == expect_stuck
+    if skip is not None:
+        un.assert_not_called()

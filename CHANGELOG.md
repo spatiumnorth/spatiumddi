@@ -92,9 +92,11 @@ the formatter handles the rest.
   existing `cluster-upgrade-failed` event now carries category
   `release_failed`, names what is still held (`cordon`,
   `maintenance_window`) in its message and `stuck` detail, and the
-  per-node progress records `release_failed` with the error. The run
-  still stops. No new rule or migration: the rule is already critical,
-  the highest severity.
+  per-node progress records `release_failed` with the error, what is
+  held and the step's own category. The Cluster upgrade tab labels the
+  node "Release failed — node held" and lists what is still held. The
+  run still stops. No new rule or migration: the rule is already
+  critical, the highest severity.
 
 - **A rolling upgrade waits for the control-plane Deployments before it
   moves to the next node (#1544).** The other half of the gate that
