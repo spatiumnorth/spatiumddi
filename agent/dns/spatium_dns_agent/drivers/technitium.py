@@ -471,6 +471,49 @@ _TSIG_ALGORITHMS = frozenset(
 )
 
 
+# Exact Technitium "the server is already in that state" answers (#1770).
+# Matching the bare substring "already exists" also swallowed Technitium's
+# CNAME/DNAME conflict refusal, "Cannot add record: CNAME record already
+# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a REFUSAL:
+# the record does not exist and the server keeps serving the old data.
+# Upstream (TechnitiumSoftware/DnsServer v15.4.0):
+#   WebServiceZonesApi.cs:4229  "Cannot add record: record already exists."
+#   WebServiceZonesApi.cs:4336-4596  "Cannot delete record: no such record exists."
+#   WebServiceZonesApi.cs:1661-1877  "Zone already exists: <zone>"
+# Unchanged through v15.6.1. Compared whole (case-folded, trailing period
+# dropped), never as a substring.
+#
+# Deliberately NOT a no-op: "Record already exists. Use overwrite option if
+# you wish to overwrite existing record." (WebServiceZonesApi.cs:3932/4022/
+# 4183). It is raised for a CNAME / DNAME / APP add with overwrite=false when
+# ANY record of that type is at the name, whatever its value. This driver only
+# sends overwrite=false for a record the server lacks (reconcile adds, RRset
+# members after the first), so the answer means a different one holds the
+# name. Same set as ``app/services/technitium/rdata.py``; pinned by the
+# backend's test_technitium_svcb_parity.py.
+_RECORD_ABSENT_MESSAGE = "cannot delete record: no such record exists"
+_RECORD_NOOP_MESSAGES = frozenset(
+    {
+        "cannot add record: record already exists",
+        "cannot delete record: no such record exists",
+    }
+)
+
+
+def _norm_error(message: Any) -> str:
+    return str(message or "").strip().lower().rstrip(".").strip()
+
+
+def _is_record_noop(message: Any) -> bool:
+    """True when Technitium says the record op was already satisfied."""
+    return _norm_error(message) in _RECORD_NOOP_MESSAGES
+
+
+def _is_zone_exists(message: Any) -> bool:
+    """True for ``Zone already exists: <zone>`` (zone create on an existing zone)."""
+    return _norm_error(message).startswith("zone already exists:")
+
+
 def _qualified_name(zone_name: str, name: str) -> str:
     """Compose the bare (no trailing dot) FQDN Technitium expects for a
     record's ``domain`` param."""
@@ -2682,8 +2725,7 @@ class TechnitiumDriver(DriverBase):
         body = self._call(token, "POST", f"zones/records/{endpoint}", params).json()
         if body.get("status") != "error":
             return True
-        msg = (body.get("errorMessage") or "").lower()
-        if "already exists" in msg or "no such record" in msg:
+        if _is_record_noop(body.get("errorMessage")):
             log.info(
                 "technitium_record_op_idempotent_noop",
                 zone=zone,
@@ -3414,7 +3456,7 @@ class TechnitiumDriver(DriverBase):
                     # not a deletion. Counting it (or the failure case) would
                     # report churn that never happened, which is the same
                     # phantom the apex-NS filter above exists to prevent.
-                    if "no such record" not in (body.get("errorMessage") or "").lower():
+                    if _norm_error(body.get("errorMessage")) != _RECORD_ABSENT_MESSAGE:
                         log.warning(
                             "technitium_reconcile_delete_failed",
                             zone=zone,
@@ -3440,7 +3482,7 @@ class TechnitiumDriver(DriverBase):
                 if body.get("status") == "error":
                     # "already exists" is a no-op, not an add — same
                     # reasoning as the delete branch above.
-                    if "already exists" not in (body.get("errorMessage") or "").lower():
+                    if not _is_record_noop(body.get("errorMessage")):
                         log.error(
                             "technitium_reconcile_add_failed",
                             zone=zone,
@@ -3627,7 +3669,7 @@ class TechnitiumDriver(DriverBase):
         resp = self._call(token, "POST", "zones/create", params)
         body = resp.json()
         if body.get("status") == "error":
-            if "already exists" in (body.get("errorMessage") or "").lower():
+            if _is_zone_exists(body.get("errorMessage")):
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,
@@ -3825,7 +3867,14 @@ class TechnitiumDriver(DriverBase):
                 )
                 path = "zones/records/update"
             result = self._call(token, "POST", path, params).json()
-            if result.get("status") != "ok":
+            if result.get("status") != "ok" and _is_record_noop(result.get("errorMessage")):
+                # Technitium's exact "record already exists" (#1770): this
+                # upstream is in, under a spelling ``_norm_forwarder`` did not
+                # fold to ours. Applied, so it does not hold back the stale
+                # deletes below. The CNAME-style conflict answers are not in
+                # the no-op set and still count as refused.
+                log.info("technitium_zone_forwarder_set", zone=zone, forwarder=address)
+            elif result.get("status") != "ok":
                 log.warning(
                     "technitium_zone_forwarder_set_failed",
                     zone=zone,
@@ -3860,7 +3909,11 @@ class TechnitiumDriver(DriverBase):
                     "protocol": rdata.get("protocol") or "Udp",
                 },
             ).json()
-            if result.get("status") != "ok":
+            if result.get("status") != "ok" and (
+                _norm_error(result.get("errorMessage")) != _RECORD_ABSENT_MESSAGE
+            ):
+                # "no such record exists" (#1770): already gone, which is the
+                # state this delete wanted.
                 log.warning(
                     "technitium_zone_forwarder_remove_failed",
                     zone=zone,

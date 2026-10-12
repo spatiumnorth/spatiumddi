@@ -479,6 +479,24 @@ the formatter handles the rest.
   version of this fix waited before the uncordon and timed out on the
   first node holding an instance, which ended the run.
 
+- **Technitium's "CNAME record already exists" refusal is no longer
+  counted as success (#1770).** Both Technitium drivers treated any
+  error containing "already exists" as an idempotent no-op, so adding a
+  CNAME or DNAME beside other data at a name, which Technitium refuses
+  with `Cannot add record: CNAME record already exists for the same
+  name.`, was marked applied while the server kept serving the old data.
+  The drivers now match Technitium's exact no-op messages (record
+  already exists, no such record to delete, zone already exists), so
+  the conflict surfaces as a failed op with Technitium's message.
+  `Record already exists. Use overwrite option …` is a failure too: it
+  is raised when a CNAME or DNAME with any value holds the name, so it
+  does not mean ours is there. A Technitium release that rewords one of
+  these messages now fails the op rather than reading it as applied.
+  The forward-zone upstream reconciler (#1764) reads the same exact
+  messages: an identical upstream answering "record already exists" is
+  applied and no longer holds back removing a stale one, while the
+  overwrite-option refusal still keeps the old upstream.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents

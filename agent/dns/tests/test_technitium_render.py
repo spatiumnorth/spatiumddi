@@ -1655,7 +1655,7 @@ def test_reconcile_counts_only_real_deletes(tmp_path: Path) -> None:
                 {"name": "gone.z.test", "type": "A", "ttl": 300,
                  "rData": {"ipAddress": "10.0.0.9"}}]}}
         if path == "zones/records/delete":
-            return {"status": "error", "errorMessage": "No such record exists."}
+            return {"status": "error", "errorMessage": "Cannot delete record: no such record exists."}
         return {"status": "ok"}
 
     _install_fake_request(d, responder)
@@ -1680,7 +1680,7 @@ def test_reconcile_counts_only_real_adds(tmp_path: Path) -> None:
         if path == "zones/records/get":
             return {"status": "ok", "response": {"records": []}}
         if path == "zones/records/add":
-            return {"status": "error", "errorMessage": "Record already exists."}
+            return {"status": "error", "errorMessage": "Cannot add record: record already exists."}
         return {"status": "ok"}
 
     _install_fake_request(d, responder)
@@ -2070,7 +2070,7 @@ def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
 
     def responder(path, params, n):
         if path == "zones/create":
-            return {"status": "error", "errorMessage": "Zone already exists."}
+            return {"status": "error", "errorMessage": "Zone already exists: s.test"}
         return {"status": "ok"}
 
     calls = _install_fake_request(d, responder)
@@ -3672,10 +3672,12 @@ def _technitium_like_daemon():
                 {"name": zone, "type": "FWD", "rData": dict(r)} for r in zones.get(zone, [])]}}
         elif path == "zones/records/add":
             protocol = params.get("protocol", "Udp")
-            if find(zone, protocol, params["forwarder"]) is None:
-                zones[zone].append({"protocol": protocol, "forwarder": params["forwarder"],
-                                    "priority": int(params.get("forwarderPriority", 0)),
-                                    "dnssecValidation": params.get("dnssecValidation") == "true"})
+            if find(zone, protocol, params["forwarder"]) is not None:
+                return {"status": "error",
+                        "errorMessage": "Cannot add record: record already exists."}
+            zones[zone].append({"protocol": protocol, "forwarder": params["forwarder"],
+                                "priority": int(params.get("forwarderPriority", 0)),
+                                "dnssecValidation": params.get("dnssecValidation") == "true"})
         elif path == "zones/records/update":
             protocol = params.get("protocol", "Udp")
             old = find(zone, protocol, params["forwarder"])
@@ -3688,7 +3690,8 @@ def _technitium_like_daemon():
         elif path == "zones/records/delete":
             old = find(zone, params.get("protocol", "Udp"), params["forwarder"])
             if old is None:
-                return {"status": "error", "errorMessage": "no such record"}
+                return {"status": "error",
+                        "errorMessage": "Cannot delete record: no such record exists."}
             zones[zone].remove(old)
         return {"status": "ok"}
 
@@ -4248,3 +4251,99 @@ def test_render_reads_the_name_rule_from_the_bundle(tmp_path: Path) -> None:
     assert d._name_zone_file_targets
     d.render({"zones": []})
     assert not d._name_zone_file_targets
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        # A different CNAME at the name: reconcile only adds what the server
+        # lacks, so this answer cannot mean ours is already there.
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+    ],
+)
+def test_reconcile_add_conflict_is_an_apply_failure(tmp_path: Path, message: str) -> None:
+    """#1770: the conflict refusal must be recorded as an apply failure."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": []}}
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": message}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._reconcile_zones(
+        "t",
+        [{"zone": "z.test", "type": "Primary", "records": [
+            {"domain": "www.z.test", "type": "CNAME", "ttl": 300, "cname": "t.z.test"}]}],
+    )
+    assert any("already exists" in f for f in d._apply_failures)
+
+
+def _fwd_noop_daemon(add_error: str):
+    """Live apex holds one stale upstream; every FWD add answers ``add_error``."""
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD",
+                 "rData": {"protocol": "Udp", "forwarder": "192.0.2.9", "priority": 0}}]}}
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": add_error}
+        return {"status": "ok"}
+
+    return responder
+
+
+def test_forwarder_add_exact_noop_counts_as_applied(tmp_path: Path) -> None:
+    """#1770 x #1764: Technitium's exact "record already exists" says the
+    upstream is in, so it must not hold back the stale delete or read as a
+    refused forwarder change."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _fwd_noop_daemon("Cannot add record: record already exists.")
+    )
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    deletes = [c[3] for c in calls if c[2] == "zones/records/delete"]
+    assert [x["forwarder"] for x in deletes] == ["192.0.2.9"]
+    assert d._apply_failures == []
+
+
+def test_forwarder_add_conflict_refusal_keeps_the_old_upstream(tmp_path: Path) -> None:
+    """The overwrite-option answer is not in the no-op set: still refused, so
+    the old upstream stays (#1647) and the failure is noted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _fwd_noop_daemon(
+            "Record already exists. Use overwrite option if you wish to "
+            "overwrite existing record."
+        ),
+    )
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    assert not [c for c in calls if c[2] == "zones/records/delete"]
+    assert any("overwrite option" in f for f in d._apply_failures)
+
+
+def test_forwarder_stale_delete_of_a_gone_record_is_not_a_failure(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD",
+                 "rData": {"protocol": "Udp", "forwarder": "192.0.2.9", "priority": 0}}]}}
+        if path == "zones/records/delete":
+            return {"status": "error",
+                    "errorMessage": "Cannot delete record: no such record exists."}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    assert d._apply_failures == []
