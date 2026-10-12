@@ -2376,6 +2376,28 @@ class CreateDNSZoneArgs(BaseModel):
     )
 
 
+def _technitium_api_zone_arg_conflict(args: CreateDNSZoneArgs, drivers: set[str]) -> str | None:
+    """#1784 — the REST zone-create scope gate for an experimental
+    ``technitium_api`` group, applied to the Copilot's create too: the
+    Copilot fronts the REST API and must not be a way around its 422s.
+    Shared by preview and apply, like the DNSSEC gate above."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.dns import technitium_api_scope  # noqa: PLC0415
+
+    if technitium_api_scope.DRIVER not in drivers:
+        return None
+    try:
+        technitium_api_scope.refuse_non_primary(args.zone_type)
+        technitium_api_scope.refuse_unapplied_zone_changes(
+            {"ttl": args.ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
+            None,
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
 def _normalize_zone_name(raw: str) -> str:
     name = raw.strip()
     if not name:
@@ -2498,6 +2520,9 @@ async def _preview_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    conflict = _technitium_api_zone_arg_conflict(args, drivers)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
 
     existing = (
         await db.execute(
@@ -2561,6 +2586,9 @@ async def _apply_create_dns_zone(
     # group between proposal and approval, and an unsignable zone must not
     # land just because the preview predates the new member.
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
+    if conflict is not None:
+        raise ValueError(conflict)
+    conflict = _technitium_api_zone_arg_conflict(args, drivers)
     if conflict is not None:
         raise ValueError(conflict)
 

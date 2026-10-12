@@ -61,6 +61,12 @@ class LifecycleResult:
     reason: str | None = None
     started: tuple[str, ...] = ()
     stopped: tuple[str, ...] = ()
+    # #1750 — the apply wrote nothing because this node may not write the
+    # chart right now (it shares a cluster it is not a member of). Reported as
+    # ``idle``, but the heartbeat must not stamp its apply key on it, or the
+    # node would never write its own chart once it is allowed to again (a
+    # demoted node's fresh standalone cluster after ``left``).
+    deferred: bool = False
 
 
 # Service names the appliance can run. Match the chart's component
@@ -432,6 +438,57 @@ def _keep_agents_other_nodes_serve(
     return out, kept, None
 
 
+def _other_nodes(names: list[str]) -> list[str]:
+    """The nodes of ``names`` other than this one. A node that cannot name
+    itself takes one of them as itself, so two nodes still read as shared."""
+    me = _resolve_node_name()
+    return [n for n in names if n != me] if me else names[1:]
+
+
+def shared_chart_write_refusal(member: bool | None = None) -> str | None:
+    """Why this node must not write the ``spatiumddi-appliance`` HelmChart now,
+    or ``None`` when it may (#1750).
+
+    A formed cluster has ONE role chart, and every node's supervisor applies it
+    whole. Only a control-plane member renders the values the cluster needs:
+    the in-cluster api URL, and the agents other nodes serve kept on (#1439).
+    Membership on a promoted appliance is its join state reading ``ready``
+    (:func:`appliance_state.is_control_plane_member`), so a node whose join or
+    leave is in flight (``joining`` / ``leaving``), whose leave was refused
+    (``failed``, still a member) or whose verdict was consumed reads as a
+    non-member while its kubeapi is still the cluster's. Its render then turns
+    every agent off and points them at the external URL, and the helm upgrade
+    deleted dns-bind9 and dhcp-kea on every node: a 3 -> 1 demote lost DNS for
+    about four minutes, until the seed's watchdog wrote the chart again.
+
+    So a member (the seed, or any promoted member reading ``ready``, which keeps
+    the chart applied if the seed is gone) always may. A non-member may only
+    when it is alone in its k3s, because then the chart is its own: an
+    appliance never promoted, one whose leave finished (its fresh standalone
+    cluster), or one a failed join rolled back. Not knowing whether another
+    node is there is a refusal, never "alone".
+
+    ``member`` is the caller's own read of membership, so the gate and the
+    render it guards are judged on one answer; ``None`` reads it here."""
+    if member is None:
+        member = appliance_state.is_control_plane_member()
+    if member:
+        return None
+    names, err = k8s_api.cluster_node_names()
+    if names is None:
+        return (
+            "not writing the role chart: could not tell whether this node's "
+            f"cluster is shared ({err})"
+        )
+    if _other_nodes(names):
+        return (
+            "not writing the role chart: this node shares a cluster it is not a "
+            "control-plane member of (its join or leave is in flight), and "
+            "only a member writes the chart the cluster shares"
+        )
+    return None
+
+
 def roles_awaiting_key(profiles: list[str], values: dict[str, object]) -> set[str]:
     """The assigned profiles whose DaemonSet the values do NOT render yet
     (#1062): the role's chart block is ``enabled: False`` because its agent
@@ -607,7 +664,8 @@ def apply_role_assignment(
     Returns ``ready`` on PATCH success, ``idle`` when k3s isn't
     available (no chart baked / kubeapi unreachable — caller's
     fallback to the compose path), ``failed`` on a kubeapi or
-    serialisation error.
+    serialisation error. #1750 — ``idle`` with ``deferred`` set when this node
+    may not write the chart its cluster shares (:func:`shared_chart_write_refusal`).
     """
     env = k3s_available()
     if not env.available:
@@ -616,6 +674,17 @@ def apply_role_assignment(
         # this just isn't the runtime here. Caller (heartbeat) reads
         # ``state="idle"`` as "skip + report we did nothing".
         return LifecycleResult(state="idle", reason=env.reason)
+
+    # #1750 — a node that shares a cluster it is not a member of writes
+    # nothing: what it would render is a non-member's chart, and the chart is
+    # every node's. Membership is read once here and again before the write,
+    # so a leave that starts while this apply renders (``ready`` -> ``leaving``)
+    # cannot ship values rendered as a non-member under a member's gate.
+    was_member = appliance_state.is_control_plane_member()
+    refusal = shared_chart_write_refusal(was_member)
+    if refusal:
+        log.info("supervisor.k3s_lifecycle.shared_chart_write_deferred", reason=refusal)
+        return LifecycleResult(state="idle", reason=refusal, deferred=True)
 
     env_vars = _parse_env_file(env_file)
     values = _build_values(profiles, env_vars)
@@ -648,6 +717,14 @@ def apply_role_assignment(
     except OSError as exc:
         return LifecycleResult(state="failed", reason=f"chart read: {exc}")
     chart_b64 = base64.b64encode(chart_bytes).decode("ascii")
+
+    if appliance_state.is_control_plane_member() != was_member:
+        reason = (
+            "not writing the role chart: this node's control-plane membership "
+            "changed while it rendered"
+        )
+        log.info("supervisor.k3s_lifecycle.shared_chart_write_deferred", reason=reason)
+        return LifecycleResult(state="idle", reason=reason, deferred=True)
 
     ok, err = k8s_api.apply_helmchart(
         _HELMCHART_NAME,
@@ -749,9 +826,21 @@ def tear_down_supervised_services() -> LifecycleResult:
     if not env.available:
         return LifecycleResult(state="idle", reason=env.reason)
 
-    ok, err = k8s_api.delete_helmchart(_HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE)
-    if not ok:
-        return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
+    # #1750 — deleting the chart uninstalls the release on every node. On a
+    # node alone in its k3s that is its own release; on a node sharing a
+    # cluster it is every other node's DNS and DHCP, so there the teardown only
+    # clears this node's role labels below, which takes its own agents away.
+    names, names_err = k8s_api.cluster_node_names()
+    if names is None or _other_nodes(names):
+        log.warning(
+            "supervisor.k3s_lifecycle.teardown_chart_kept",
+            reason="this node shares its cluster; only its role labels are cleared",
+            error=names_err,
+        )
+    else:
+        ok, err = k8s_api.delete_helmchart(_HELMCHART_NAME, chart_namespace=_CHART_NAMESPACE)
+        if not ok:
+            return LifecycleResult(state="failed", reason=err or "kubeapi delete failed")
 
     # Phase 10 (#183) — clear every per-role label so pods that
     # somehow survived the chart delete don't keep running on the
@@ -780,5 +869,6 @@ __all__ = [
     "k3s_available",
     "reconcile_node_labels",
     "roles_awaiting_key",
+    "shared_chart_write_refusal",
     "tear_down_supervised_services",
 ]

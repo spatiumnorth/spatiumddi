@@ -16,6 +16,7 @@ from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page,
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._leases import LeaseResponse, apply_lease_filters, enrich_leases
 from app.core.agent_wake import (
+    appliance_channel,
     collect_wake,
     dhcp_group_channel,
     dhcp_server_channel,
@@ -38,6 +39,7 @@ from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
+from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.option_spelling import group_drivers, scopes_losing_raw_options
@@ -673,6 +675,21 @@ async def update_server(
             if gid is not None:
                 collect_wake(dhcp_group_channel(gid))
 
+    # #1749 — an appliance's own DHCP server moved: repoint the appliance so
+    # the supervisor renders AGENT_GROUP, the network mode and the #1167 HA
+    # listener for the group the agent now serves. Found by FK, else by the
+    # Fleet hostname rule (agents register by hostname and never set
+    # ``appliance_id``). Only when the pointer names the group being left —
+    # an appliance deliberately assigned elsewhere is not ours to redirect —
+    # and never on a clear: a NULL group idles the supervisor's DHCP role.
+    appliance_repointed_id: uuid.UUID | None = None
+    if s.server_group_id is not None and s.server_group_id != old_group_id:
+        owner = await owning_appliance_for_dhcp_server(db, s)
+        if owner is not None and owner.assigned_dhcp_group_id == old_group_id:
+            owner.assigned_dhcp_group_id = s.server_group_id
+            appliance_repointed_id = owner.id
+            collect_wake(appliance_channel(owner.id))
+
     # Credentials handling:
     #   * None → leave alone
     #   * {}   → clear
@@ -743,6 +760,8 @@ async def update_server(
     )
     if clear_group:
         audit_payload["server_group_id"] = None
+    if appliance_repointed_id is not None:
+        audit_payload["appliance_repointed_id"] = str(appliance_repointed_id)
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:

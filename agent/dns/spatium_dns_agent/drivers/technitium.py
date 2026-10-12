@@ -184,6 +184,29 @@ _FORWARDER_PROTOCOLS = {
     "quic": "Quic",
 }
 
+# ── Recursion + rate limiting (issue #1761) ─────────────────────────────
+#
+# ``settings/set`` silently ignores an unrecognised ``recursion`` value
+# (it is parsed with a try-parse), so every value is checked against this
+# set in ``_apply_recursion`` before it is sent.
+_RECURSION_MODES = frozenset(
+    {"Deny", "Allow", "AllowOnlyForPrivateNetworks", "UseSpecifiedNetworkACL"}
+)
+# BIND ACL keywords that have no CIDR spelling, expanded for Technitium's
+# ``recursionNetworkACL`` (``NetworkAccessControl`` entries: CIDR or
+# ``!``-prefixed CIDR).
+_ACL_ANY = ("0.0.0.0/0", "::/0")
+_ACL_LOCALHOST = ("127.0.0.0/8", "::1/128")
+_ACL_LOCALNETS = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 #
 # Technitium has no RPZ. It blocks natively, either from subscribed URL
@@ -1436,6 +1459,10 @@ class TechnitiumDriver(DriverBase):
                     token, server_options, server_state.get("tls_cert")
                 )
                 self._apply_forwarders(token, server_options)
+                # #1761: recursion policy + per-client rate limit. Both
+                # have daemon defaults that stay in force unless sent.
+                self._apply_recursion(token, server_options)
+                self._apply_rate_limits(token, server_options)
 
             # Blocklists (#744). Always applied, even when empty — an emptied
             # list has to actually clear on the daemon.
@@ -2313,6 +2340,140 @@ class TechnitiumDriver(DriverBase):
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
         )
 
+    def _apply_recursion(self, token: str, options: dict[str, Any]) -> None:
+        """Set the recursion policy from the bundle (#1761).
+
+        Technitium's fresh default is ``AllowOnlyForPrivateNetworks``; left
+        alone, a group with recursion off (or ``is_recursive=false``, which
+        the bundle already folds into ``recursion_enabled``) still resolves
+        for every RFC 1918 client, and an ``allow_recursion`` naming a
+        public range is refused. Always sent, so turning recursion off or
+        editing the list converges instead of sticking.
+        """
+        mode, acl = self._recursion_params(options)
+        if mode not in _RECURSION_MODES:
+            # settings/set try-parses the enum and ignores a bad value with
+            # status "ok", so an unknown mode would read as applied.
+            log.error("technitium_recursion_mode_invalid", mode=mode)
+            self._note_apply_failure(f"recursion: invalid mode {mode!r}")
+            return
+        params: dict[str, Any] = {"recursion": mode}
+        if mode == "UseSpecifiedNetworkACL":
+            params["recursionNetworkACL"] = ",".join(acl)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_recursion_failed", mode=mode, error=body.get("errorMessage"))
+            self._note_apply_failure(f"recursion: {body.get('errorMessage')}")
+            return
+        log.info("technitium_recursion_applied", mode=mode, acl=len(acl))
+
+    @staticmethod
+    def _recursion_params(options: dict[str, Any]) -> tuple[str, list[str]]:
+        """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
+
+        * ``recursion_enabled`` false → ``Deny``.
+        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
+          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
+          default and nothing distinguishes it from an explicit choice, while
+          the BIND9 agent never renders ``allow-recursion`` (#1786) and so
+          runs BIND's localnets/localhost default. Mapping it to ``Allow``
+          would open recursion to the internet on upgrade; the engine's
+          private-network default is the closest match and is what
+          Technitium already did. ``Allow`` is therefore never sent.
+        * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
+          CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
+          a warning; if none survive the result is ``Deny`` — fail closed.
+        """
+        if not options.get("recursion_enabled", True):
+            return "Deny", []
+        raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
+        if not raw or [e.lower() for e in raw] == ["any"]:
+            return "AllowOnlyForPrivateNetworks", []
+        acl: list[str] = []
+        for entry in raw:
+            deny = entry.startswith("!")
+            name = entry.lstrip("!").strip()
+            low = name.lower()
+            if low == "any":
+                cidrs: tuple[str, ...] = _ACL_ANY
+            elif low == "none":
+                continue
+            elif low == "localhost":
+                cidrs = _ACL_LOCALHOST
+            elif low == "localnets":
+                cidrs = _ACL_LOCALNETS
+            else:
+                try:
+                    ipaddress.ip_network(name, strict=False)
+                except ValueError:
+                    log.warning("technitium_allow_recursion_entry_dropped", entry=entry)
+                    continue
+                cidrs = (name,)
+            acl.extend(("!" + c) if deny else c for c in cidrs)
+        if not any(not a.startswith("!") for a in acl):
+            return "Deny", []
+        return "UseSpecifiedNetworkACL", acl
+
+    def _apply_rate_limits(self, token: str, options: dict[str, Any]) -> None:
+        """Map the group's RRL intent onto Technitium's QPM limits (#1761).
+
+        Technitium ships ``qpmPrefixLimits`` of 600/min per IPv4 /32 and
+        6000/min per /24 (IPv6 600 / 1200 / 6000), averaged over 5 minutes,
+        applied to every inbound query. With RRL off in SpatiumDDI those
+        defaults stayed in force and dropped a busy downstream resolver's
+        answers. So: RRL off (or ``log-only``, which Technitium cannot
+        express) sends EMPTY limits, which disables the feature; RRL on
+        derives a per-client (/32, /128) limit from
+        ``rrl_responses_per_second`` x 60, a sample window from
+        ``rrl_window`` (seconds → whole minutes, min 1) and the truncation
+        share from ``rrl_slip`` (BIND: every Nth response slips, so 100/N %;
+        0 = drop all). ``rrl_exempt_clients`` becomes the bypass list.
+        This is an approximation, not equivalence: BIND limits identical
+        responses per second, Technitium counts queries per minute.
+        """
+        params = self._rate_limit_params(options)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_rate_limits_failed", error=body.get("errorMessage"))
+            self._note_apply_failure(f"rate limits: {body.get('errorMessage')}")
+            return
+        log.info("technitium_rate_limits_applied", enabled=bool(params["qpmPrefixLimitsIPv4"]))
+
+    @staticmethod
+    def _rate_limit_params(options: dict[str, Any]) -> dict[str, Any]:
+        """Pure mapping: bundle options → the ``settings/set`` qpm payload."""
+        if not options.get("rrl_enabled") or options.get("rrl_log_only"):
+            if options.get("rrl_enabled"):
+                log.warning(
+                    "technitium_rrl_log_only_not_supported",
+                    hint="Technitium cannot log without limiting; limits left off",
+                )
+            return {
+                "qpmPrefixLimitsIPv4": "",
+                "qpmPrefixLimitsIPv6": "",
+                "qpmLimitBypassList": "",
+            }
+        rps = max(1, int(options.get("rrl_responses_per_second") or 15))
+        limit = rps * 60
+        window_s = max(1, int(options.get("rrl_window") or 15))
+        slip = int(options.get("rrl_slip") if options.get("rrl_slip") is not None else 2)
+        pct = 0 if slip <= 0 else min(100, round(100 / slip))
+        bypass: list[str] = []
+        for c in options.get("rrl_exempt_clients") or []:
+            try:
+                ipaddress.ip_network(str(c).strip(), strict=False)
+            except ValueError:
+                log.warning("technitium_rrl_exempt_entry_dropped", entry=str(c))
+                continue
+            bypass.append(str(c).strip())
+        return {
+            "qpmPrefixLimitsIPv4": f"32|{limit}|{limit}",
+            "qpmPrefixLimitsIPv6": f"128|{limit}|{limit}",
+            "qpmLimitSampleMinutes": max(1, -(-window_s // 60)),
+            "qpmLimitUdpTruncationPercentage": pct,
+            "qpmLimitBypassList": ",".join(bypass),
+        }
+
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 
     def _dnssec_sign(self, token: str, zone: str) -> dict[str, Any]:
@@ -2714,6 +2875,13 @@ class TechnitiumDriver(DriverBase):
                 # permanent silent no-op: the operator edits it, the
                 # bundle changes, and the daemon keeps transferring from
                 # the old address forever.
+                #
+                # The same holds for the zone TYPE (#1457): a zone switched
+                # from forward to primary in SpatiumDDI stayed a Forwarder
+                # here, so every name that was not a local record went to
+                # the old upstream. Convert first, so the upstream below is
+                # applied to the type the zone now has.
+                self._reconcile_zone_type(token, zone, ztype)
                 self._reapply_zone_upstream(token, zone, ztype, params)
                 return
             log.error(
@@ -2726,15 +2894,63 @@ class TechnitiumDriver(DriverBase):
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
 
+    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
+        """Bring an existing zone's type in line with the bundle (#1457).
+
+        ``zones/create`` never changes the type of a zone that already
+        exists, so a type change in SpatiumDDI used to stop at the daemon.
+        ``zones/convert`` changes it in place and keeps the zone's records
+        (verified live against 15.4.0: Forwarder → Primary keeps every
+        record, Primary → Forwarder works too). Converting to Secondary or
+        Stub is refused by Technitium ("not supported") from both Primary
+        and Forwarder; that is logged at error rather than worked around
+        with a delete + recreate, because deleting a zone is not something
+        the agent does on its own (see ``_reconcile_zones``).
+
+        An unreadable live type is skipped, not guessed: converting on a
+        wrong guess is worse than leaving the zone as it is.
+        """
+        body = self._call(token, "GET", "zones/options/get", {"zone": zone}).json()
+        live = (body.get("response") or {}).get("type") if body.get("status") == "ok" else None
+        if not live:
+            log.warning(
+                "technitium_zone_type_unreadable",
+                zone=zone,
+                error=body.get("errorMessage"),
+            )
+            return
+        if live == ztype:
+            return
+        resp = self._call(token, "POST", "zones/convert", {"zone": zone, "type": ztype}).json()
+        if resp.get("status") == "ok":
+            log.info("technitium_zone_type_converted", zone=zone, from_type=live, to_type=ztype)
+            if live == "Forwarder" and ztype == "Primary":
+                self._replace_placeholder_soa(token, zone)
+            return
+        log.error(
+            "technitium_zone_type_mismatch",
+            zone=zone,
+            live_type=live,
+            desired_type=ztype,
+            error=resp.get("errorMessage"),
+        )
+        self._note_apply_failure(f"{zone}: zone type: {resp.get('errorMessage')}")
+
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
     ) -> None:
-        """Push a existing zone's upstream through ``zones/options/set``."""
+        """Push an existing zone's upstream to the daemon.
+
+        A secondary/stub's primaries go through ``zones/options/set``. A
+        Forwarder's upstream does not: it lives in the zone's apex FWD
+        record, see ``_sync_forwarder_record``.
+        """
+        if "forwarder" in params:
+            self._sync_forwarder_record(token, zone, params["forwarder"])
+            return
         opts: dict[str, Any] = {"zone": zone}
         if "primaryNameServerAddresses" in params:
             opts["primaryNameServerAddresses"] = params["primaryNameServerAddresses"]
-        elif "forwarder" in params:
-            opts["forwarder"] = params["forwarder"]
         else:
             return
         body = self._call(token, "POST", "zones/options/set", opts).json()
@@ -2747,6 +2963,132 @@ class TechnitiumDriver(DriverBase):
             )
             self._note_apply_failure(
                 f"{zone}: zone upstream: {body.get('errorMessage')}"
+            )
+
+    def _apex_records(self, token: str, zone: str) -> list[dict[str, Any]] | None:
+        """The zone's apex records, or None when they can't be read."""
+        body = self._call(
+            token, "GET", "zones/records/get", {"domain": zone, "zone": zone}
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_apex_unreadable", zone=zone, error=body.get("errorMessage")
+            )
+            return None
+        return [
+            r
+            for r in (body.get("response") or {}).get("records") or []
+            if (r.get("name") or "").rstrip(".").lower() == zone.lower()
+        ]
+
+    def _sync_forwarder_record(self, token: str, zone: str, forwarder: str) -> None:
+        """Point an existing Forwarder zone at ``forwarder``.
+
+        In Technitium (15.4) a Forwarder zone's upstream is its apex FWD
+        record. ``zones/options/set`` has no ``forwarder`` parameter: it
+        answers ``ok`` and stores nothing, so a changed forwarder never
+        reached the daemon (#1647). And ``zones/convert`` from Primary
+        leaves the zone with no FWD record at all, so a zone switched to
+        forward answered every unknown name with an empty NOERROR.
+
+        The wanted record is added before any other is removed, so the
+        zone is never left without an upstream in between. Like
+        ``zones/create``, only the first forwarder is used.
+        """
+        apex = self._apex_records(token, zone)
+        if apex is None:
+            return
+        live = [r for r in apex if r.get("type") == "FWD"]
+        if forwarder not in {(r.get("rData") or {}).get("forwarder") for r in live}:
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/add",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "FWD",
+                    "forwarder": forwarder,
+                    "protocol": "Udp",
+                },
+            ).json()
+            if body.get("status") != "ok":
+                log.warning(
+                    "technitium_zone_forwarder_set_failed",
+                    zone=zone,
+                    forwarder=forwarder,
+                    error=body.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {body.get('errorMessage')}"
+                )
+                return
+            log.info("technitium_zone_forwarder_set", zone=zone, forwarder=forwarder)
+        for rec in live:
+            rdata = rec.get("rData") or {}
+            if rdata.get("forwarder") == forwarder:
+                continue
+            body = self._call(
+                token,
+                "POST",
+                "zones/records/delete",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "FWD",
+                    "forwarder": rdata.get("forwarder"),
+                    "protocol": rdata.get("protocol") or "Udp",
+                },
+            ).json()
+            if body.get("status") != "ok":
+                log.warning(
+                    "technitium_zone_forwarder_remove_failed",
+                    zone=zone,
+                    forwarder=rdata.get("forwarder"),
+                    error=body.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {body.get('errorMessage')}"
+                )
+
+    def _replace_placeholder_soa(self, token: str, zone: str) -> None:
+        """Give a zone converted from Forwarder a real SOA.
+
+        A Forwarder zone carries a placeholder SOA (responsible person
+        ``invalid``, TTL 0), and ``zones/convert`` keeps it. As a Primary
+        that means negative answers are not cached. Set what Technitium
+        gives a zone created as Primary (``hostadmin@<zone>``, TTL 900),
+        keeping the rest. Only the placeholder is touched; any other SOA
+        is left alone.
+        """
+        apex = self._apex_records(token, zone)
+        soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+        if soa is None:
+            return
+        rdata = soa.get("rData") or {}
+        if rdata.get("responsiblePerson") != "invalid":
+            return
+        body = self._call(
+            token,
+            "POST",
+            "zones/records/update",
+            {
+                "domain": zone,
+                "zone": zone,
+                "type": "SOA",
+                "ttl": "900",
+                "primaryNameServer": rdata.get("primaryNameServer") or "",
+                "responsiblePerson": f"hostadmin@{zone}",
+                "serial": str(rdata.get("serial") or 1),
+                "refresh": str(rdata.get("refresh") or 900),
+                "retry": str(rdata.get("retry") or 300),
+                "expire": str(rdata.get("expire") or 604800),
+                "minimum": str(rdata.get("minimum") or 900),
+            },
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_soa_placeholder_kept", zone=zone, error=body.get("errorMessage")
             )
 
     def _apply_zone_options(
