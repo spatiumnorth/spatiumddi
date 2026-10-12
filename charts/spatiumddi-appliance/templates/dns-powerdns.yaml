@@ -85,6 +85,16 @@ spec:
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
             - name: AGENT_GROUP
               value: {{ .Values.dnsPowerdns.serverGroupName | quote }}
+            {{- if .Values.dns.useMetalLBVIP }}
+            # #1715 — without hostNetwork the pod's own nodename is the POD
+            # name, so the agent would register under ``dns-…-x7k2q`` and a
+            # Fleet group change (which finds the appliance's servers by its
+            # hostname) could never find it. The node name is the hostname.
+            - name: AGENT_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             {{- if .Values.dnsPowerdns.lmdbRestore }}
             # #638 — the LMDB rollback lever. PowerDNS 5.0 migrates the LMDB
             # schema one way on first open, and the A/B slot rollback swaps

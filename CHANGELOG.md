@@ -84,6 +84,154 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Rolling upgrades no longer strand nodes or skip their safety
+  checks (#1542, #1545, #1546, #1544).** A failure at any step after
+  the cordon (the reboot step included, and in a run resumed past the
+  cordon) now runs a compensating release — uncordon the node and
+  clear the CNPG maintenance window this run set — instead of leaving
+  the node cordoned with the window on. A failure at the cordon itself,
+  after the window was set, clears the window without uncordoning a
+  node the run never cordoned; and a node that was already cordoned
+  before the upgrade is left cordoned. When the run has no CNPG
+  cluster (none configured and none detected), the maintenance-window
+  clear at uncordon time is skipped instead of failing every node's
+  uncordon. The drain step refuses to evict pods with no controller
+  owner, honouring the no-force rule (a bare pod would never be
+  re-created). And no node is drained while the CNPG cluster is short
+  an instance: after each node's uncordon, the chain waits (up to
+  15 minutes) for `readyInstances` to reach `spec.instances` before it
+  reports the node done, the last node included, and each node's
+  preflight waits for the same count before its cordon. The wait comes
+  after the uncordon on purpose: the node's own drain evicts its
+  Postgres instance, whose local-path volume pins it to that node, so
+  the count cannot recover while the node is cordoned. An earlier
+  version of this fix waited before the uncordon and timed out on the
+  first node holding an instance, which ended the run.
+
+- **A Fleet group change now finds the appliance's own servers
+  (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
+  group by selecting `appliance_id`, which nothing writes: agents
+  register with `host` set to the node's hostname, so on a real
+  appliance only the pointer moved and the server kept serving the old
+  group. The roles PUT now also matches agent-based rows by hostname
+  (case-insensitive, never a row another appliance owns, and not when
+  two approved appliances share the hostname). After an engine switch
+  only the current engine's DNS row moves. Moving back to the group the
+  old engine served used to clash with the appliance's own dead row of
+  that engine (same name, other driver); that row is now retired as part
+  of the save, audited like a server delete, and only when it is this
+  appliance's, of an engine it no longer runs, and silent for more than
+  two minutes. While the old agent is still reporting, the save answers
+  409 naming the row. A clash with any other row still refuses the move,
+  and a re-registering agent still does not undo it. The route now
+  publishes the wakes the move collects (before, there was no collector,
+  so the moved agent and both groups converged only on the safety tick),
+  writes an audit row per moved server, and locks the appliance row so
+  two saves cannot interleave. Under a DNS VIP the agent pod has no
+  hostNetwork, so it registered under its pod name; it now registers
+  under the node name.
+
+- **Technitium SVCB / HTTPS records are sent the way the daemon parses
+  them, and stop churning and reading as drift (#1513, #1698).**
+  - **Two or more SvcParams were refused (#1698).** Technitium splits
+    `svcParams` on `|` and reads key, value, key, value
+    (`alpn|h2|port|8443`); the agent and the agentless driver joined pairs
+    with commas, which parses for one param only. A record with no params
+    sent nothing, and the API requires the field (`false` means none), so
+    an AliasMode record was refused too, and so was its delete. `ech` and
+    unnamed `keyNNNNN` params now go as hex and by key number, which is
+    what the daemon parses.
+  - **A stored record churned.** `1 . alpn=h2` read back as
+    `1 . alpn="h2"` and params came back in another order, so the
+    structural reconcile deleted and re-added the record on every pass.
+    Both sides now compare one RFC 9460 form: params in key-number order,
+    values unquoted, `mandatory` sorted, hint addresses canonical.
+  - **Drift and Sync with Servers listed it twice**, once as missing and
+    once as extra: the zone transfer gave an in-zone target relative
+    (`svc`). It is now absolute, and both sides compare the same form.
+  - **A target is read the way a zone file reads it**: a trailing dot is
+    absolute whatever the label count (`localhost.` and `.` are never
+    rewritten), and no trailing dot is relative to the zone. Technitium
+    has no relative names, so a stored `1 svc alpn=h2` used to be served
+    as `svc.`; it is now served as `svc.<zone>.`, and the agent replaces
+    the old record once. A migration writes the trailing dot on the
+    dot-less multi-label targets of Technitium groups (`cdn.example.net`),
+    which were always served as absolute, so nothing they serve changes.
+    BIND9 and PowerDNS groups are not touched.
+  - **The upgrade itself does not re-point those records.** A Technitium
+    server's bundle now says which rule its targets follow
+    (`svcb_target_rule`), and the agent applies that rule to the bundle it
+    is applying. The agent replays its cached bundle on start, and a cached
+    bundle from before the upgrade has no such field, so its dot-less
+    targets stay absolute, as that build meant them. The migration also
+    marks the affected servers' stored bundles out of date and rewrites the
+    same targets in their queued record ops. Because the field is part of
+    the bundle's structural fingerprint, every Technitium agent
+    re-reconciles its zones once under the new rule when the new bundle
+    arrives. Before this, the new agent served
+    `cdn.example.net.<zone>.` from its cache until the next structural
+    change in the group.
+  - Records the Technitium importer and the agentless pull read are now
+    stored with absolute targets and unquoted params.
+  - Not verified against a live daemon: the `no-default-alpn`, `ech` and
+    `keyNNNNN` forms, taken from Technitium 15.4.0's source.
+
+- **Losing the node that held the Redis master no longer restarts
+  every Celery worker (#1669).** kombu leaves `socket_timeout`,
+  `socket_connect_timeout` and `socket_keepalive` unset, and the
+  Sentinel queries had no timeouts either, so a connection to a
+  vanished peer never errored: the worker stayed deaf after Sentinel
+  promoted a replica, its `inspect ping` liveness probe failed three
+  times, and the pod was killed. The broker now sets a 10 s socket
+  timeout, 5 s connect timeout and TCP keepalive (the kernel resets a
+  connection to a vanished peer within about 25 s), on plain
+  `redis://` URLs too; Sentinel queries and the result backend get
+  shorter timeouts of their own (below). The worker now reconnects to
+  the promoted master on its own. The liveness
+  probe tolerates 5 misses instead of 3.
+  - **The worker reconnects within about 2 s of Sentinel's switch.**
+    Celery's reconnect loop waited kombu's default 2, 4, 6 ... up to
+    30 s between attempts, so a worker could reconnect 10 s or more after
+    a master was available again. The wait is now 1 s and then 2 s each
+    time (through celery's `worker_consumer` setting). Each attempt is
+    one bounded Sentinel lookup, so while no master exists a worker asks
+    Sentinel at most once every 2 s. Celery's 100 reconnect attempts now
+    run out after roughly 4–8 minutes of continuous outage instead of
+    about 45, after which the worker exits and is restarted.
+  - **A warm shutdown with no Redis master finishes.** It used to run
+    out its 60 s grace and end in SIGKILL, on main as well. The worker
+    heartbeat publishes every 2 s from the event loop and, with no
+    master, sat in kombu's reconnect for as long as the outage lasted,
+    so SIGTERM was never acted on. Nothing reads worker heartbeats or
+    events, so the worker now starts with `--without-heartbeat` and
+    `--without-gossip` (gossip only consumes heartbeats), as well as
+    `--without-mingle`: mingle syncs revoked-task lists, SpatiumDDI
+    never revokes a task, and a reconnect that met a dead Sentinel
+    inside it exited the worker. Sentinel lookups also no longer take
+    redis-py's default 3 retries, which nest around the connect too and
+    made one lookup against an unreachable Sentinel take about 100 s,
+    and Sentinel queries now time out after 3 s (2 s to connect)
+    instead of the data connections' 10 s and 5 s. In a test rig,
+    shutdowns with no master take 3–23 s. With a task that finishes
+    and fails its result write during the shutdown, they take 31–43 s,
+    17 s of which, in the longer case, is the task still running.
+  - **The first result write in each pool child after a failover no
+    longer fails its task.** Its pooled socket still pointed at the old
+    master, and celery's first read of the task's state is not retried.
+    Result writes now retry up to 2 times, each on a connection that
+    asks Sentinel for the current master, and the result backend's socket
+    and connect timeouts are 5 s and 2 s. A write that cannot succeed
+    because there is no master fails after at most about 16 s (it took
+    about 40 s on a test cluster).
+  - **A `Task.retry` during a broker outage is requeued instead of
+    deleted.** celery turns any failure to publish the retry into
+    `Reject(requeue=False)`, which `task_acks_late` turns into a deleted
+    message; this happened on main too whenever Sentinel had no master.
+    A reject caused by a broker error is now a requeue, so the task runs
+    again once Redis is back.
+  - Not fixed here: Sentinel goes into TILT on a node loss and fails over
+    only after 78–102 s (#1718), and a worker reconnects only after that.
+
 - **A rolling upgrade from an uploaded image no longer drains the
   slot-image mirror before a node fetches from it (#1463).** On a
   multi-node appliance an uploaded image reaches every node through the
@@ -1768,30 +1916,6 @@ the formatter handles the rest.
   closed by the generic evaluator's auto-resolve passes; the
   conformity engine owns them.
 
-- **Rolling upgrades no longer strand nodes or skip their safety
-  checks (#1542, #1545, #1546, #1544).** A failure at any step after
-  the cordon (the reboot step included, and in a run resumed past the
-  cordon) now runs a compensating release — uncordon the node and
-  clear the CNPG maintenance window this run set — instead of leaving
-  the node cordoned with the window on. A failure at the cordon itself,
-  after the window was set, clears the window without uncordoning a
-  node the run never cordoned; and a node that was already cordoned
-  before the upgrade is left cordoned. When the run has no CNPG
-  cluster (none configured and none detected), the maintenance-window
-  clear at uncordon time is skipped instead of failing every node's
-  uncordon. The drain step refuses to evict pods with no controller
-  owner, honouring the no-force rule (a bare pod would never be
-  re-created). And no node is drained while the CNPG cluster is short
-  an instance: after each node's uncordon, the chain waits (up to
-  15 minutes) for `readyInstances` to reach `spec.instances` before it
-  reports the node done, the last node included, and each node's
-  preflight waits for the same count before its cordon. The wait comes
-  after the uncordon on purpose: the node's own drain evicts its
-  Postgres instance, whose local-path volume pins it to that node, so
-  the count cannot recover while the node is cordoned. An earlier
-  version of this fix waited before the uncordon and timed out on the
-  first node holding an instance, which ended the run.
-
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`
   destination passed 1 MiB to each `nfs_pwrite`. libnfs splits that by
@@ -2797,6 +2921,12 @@ the formatter handles the rest.
   (`ipv4` | `ipv6` | `dual`), backfilled from each class's test
   expression and whether its group has a DHCPv6 scope. Downgrade drops
   the column.
+- `a3d9e5c17b42` — #1513, data-only: SVCB / HTTPS records in groups
+  running a Technitium driver whose target has two or more labels and no
+  trailing dot get the dot they were already served with, so the new
+  zone-file reading of a dot-less target does not re-point them.
+  Downgrade is a no-op: the dotted value means the same under either
+  reading.
 
 ## 2026.10.02-1 — 2026-10-02
 
