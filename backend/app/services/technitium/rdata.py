@@ -811,3 +811,44 @@ __all__ = [
     "svcb_wire",
     "zone_file_target",
 ]
+
+
+# ── "Already in that state" answers (#1770) ────────────────────────────
+#
+# Exact messages, not a substring: the bare ``"already exists"`` also matched
+# the CNAME/DNAME conflict refusal "Cannot add record: CNAME record already
+# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a failure
+# (the record does not exist; old data keeps being served). Upstream,
+# TechnitiumSoftware/DnsServer v15.4.0:
+#   WebServiceZonesApi.cs:4229          "Cannot add record: record already exists."
+#   WebServiceZonesApi.cs:4336-4596     "Cannot delete record: no such record exists."
+#   WebServiceZonesApi.cs:1661-1877     "Zone already exists: <zone>"
+# Unchanged through v15.6.1.
+#
+# Deliberately NOT a no-op: "Record already exists. Use overwrite option if
+# you wish to overwrite existing record." (WebServiceZonesApi.cs:3932/4022/
+# 4183). It is raised for a CNAME / DNAME / APP add with overwrite=false when
+# ANY record of that type is at the name, whatever its value, so it does not
+# say the requested record is there. Every path that sends overwrite=false for
+# those types (reconcile adds, RRset members after the first) only does so
+# when the server lacks the record, so the answer means a different one holds
+# the name.
+# The agent driver keeps a copy (``_is_record_noop`` / ``_is_zone_exists``),
+# pinned equal by tests/test_technitium_svcb_parity.py.
+
+_NOOP_MESSAGES = frozenset(
+    {
+        "cannot add record: record already exists",
+        "cannot delete record: no such record exists",
+    }
+)
+
+
+def _norm_error(message: Any) -> str:
+    return str(message or "").strip().lower().rstrip(".").strip()
+
+
+def is_idempotent_noop(message: Any) -> bool:
+    """True when Technitium reports the op's target state already holds."""
+    msg = _norm_error(message)
+    return msg in _NOOP_MESSAGES or msg.startswith("zone already exists:")
