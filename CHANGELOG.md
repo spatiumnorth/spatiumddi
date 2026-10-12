@@ -105,6 +105,38 @@ the formatter handles the rest.
   in the options response's `technitium_warnings` and shown on the tab.
   BIND9 and PowerDNS bundles are unchanged.
 
+- **Technitium zone transfer: the ACL is translated, secondaries sign,
+  and every TSIG algorithm is installed (#1765).** `allow_transfer` was
+  validated as a BIND address-match list and then guessed at:
+  `["!10.1.0.0/16", "any"]` became `Allow` and lost the exclusion, while
+  `key X`, ACL names and `localnets` became a network ACL Technitium
+  refuses, leaving the old policy in place. One translator now serves
+  `allow_query` and `allow_transfer`: `!` exclusions stay in order under
+  `UseSpecifiedNetworkACL`, `any` becomes `0.0.0.0/0,::/0`, `localhost`
+  loopback, `key X` the zone's TSIG key names and a named ACL is expanded
+  from the bundle. What has no exact equivalent (`localnets`, an address
+  beside a key, a negated key or ACL, `!localhost`) answers 422 on a group
+  with a Technitium server, for group options and zone `allow_transfer`,
+  when changed; stored values are reported in `technitium_warnings` and as
+  an apply failure. Secondary and catalog-consumer zones were created
+  without a TSIG key, so a signed-only SpatiumDDI primary refused every
+  transfer and the zone expired to SERVFAIL; the bundle now names a key
+  the managed master grants and the agent sends `tsigKeyName` /
+  `primaryZoneTransferTsigKeyName` (a master SpatiumDDI does not manage
+  gets none; Technitium has no key for a Stub zone). **Only a key the
+  secondary's own group already holds is named**: a master in the same
+  group signs with the group key, and a master in *another* group needs a
+  TSIG key the operator adds to both groups with the same name, algorithm
+  and secret. No group's secret is shipped to another group's agent — the
+  master group's own key is also the unrestricted `allow-update` grant on
+  every zone it serves. Without a shared key the zone is created, and the
+  apply reports that its transfers will be refused. `none` is now read as
+  BIND reads it, a deny-everyone match (`!any`), so `["none", "10.0.0.0/8"]`
+  admits nobody instead of 10/8; an IPv4-mapped prefix is refused.
+  `hmac-sha224`, `hmac-sha384-192` and `hmac-sha512-256` are installed
+  instead of skipped, and a key still skipped is an apply failure and is
+  no longer pinned on every zone. BIND9 and PowerDNS bundles are unchanged.
+
 - **Technitium forwarding no longer sends DoH as cleartext, drops
   upstreams, or defeats its own encryption (#1764).** A forward zone was
   created with `forwarder=<first>` and no `protocol`, so Technitium used

@@ -62,6 +62,7 @@ import binascii
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -112,6 +113,11 @@ _ZONE_TYPE_MAP = {
 # come from the transfer, and a forwarder has none — reconciling any of
 # them would fight the daemon and delete records it just pulled.
 _RECORD_MANAGED_ZONE_TYPES = frozenset({"Primary"})
+
+# Zone types that pull a transfer and so can sign it (APIDOCS "Create Zone" /
+# "Set Zone Options": ``tsigKeyName`` / ``primaryZoneTransferTsigKeyName`` are
+# for Secondary, SecondaryForwarder and SecondaryCatalog; a Stub takes neither).
+_TSIG_SECONDARY_ZONE_TYPES = frozenset({"Secondary", "SecondaryCatalog"})
 
 # ``zones/options/set`` SILENTLY IGNORES a value it does not recognise —
 # verified live: setting zoneTransfer="Bogus" returns {"status":"ok"} and
@@ -454,10 +460,13 @@ _TSIG_ALGORITHMS = frozenset(
     {
         "hmac-md5",
         "hmac-sha1",
+        "hmac-sha224",
         "hmac-sha256",
         "hmac-sha256-128",
         "hmac-sha384",
+        "hmac-sha384-192",
         "hmac-sha512",
+        "hmac-sha512-256",
     }
 )
 
@@ -1084,19 +1093,235 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
     return apex
 
 
+#: Apply-failure text per ``_unapplied`` kind (once per apply, with a zone count).
+_UNAPPLIED_ACL_MESSAGES = {
+    "allow_query": (
+        "allow_query: the group's list has an element Technitium cannot "
+        "express (localnets, an undefined ACL name or a key), so query "
+        "access was left as the daemon has it on {zones} zone(s)"
+    ),
+    "allow_transfer": (
+        "allow_transfer: the list has an element Technitium cannot express "
+        "(localnets, a key beside an address, a negated key or ACL, an "
+        "undefined ACL name), so zone transfer was left as the daemon has it "
+        "on {zones} zone(s)"
+    ),
+    "allow_transfer_key": (
+        "allow_transfer: the list names a TSIG key the daemon does not hold "
+        "(missing, no secret or an unsupported algorithm), so transfer is "
+        "limited to the keys it does hold on {zones} zone(s)"
+    ),
+}
+
+
+def _usable_tsig_keys(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """The bundle's TSIG keys ``_sync_tsig_keys`` will actually install.
+
+    A key it skips (no secret, an algorithm Technitium does not have) must not
+    be pinned onto a zone either: Technitium would then demand a signature by a
+    key it does not hold and refuse every transfer (#1765).
+    """
+    out = []
+    for k in bundle.get("tsig_keys") or []:
+        if not (k.get("name") or "").rstrip("."):
+            continue
+        if not _tsig_key_installable(k):
+            continue
+        out.append(k)
+    return out
+
+
+def _tsig_key_installable(key: dict[str, Any]) -> bool:
+    return bool(key.get("secret")) and (
+        (key.get("algorithm") or "hmac-sha256").lower() in _TSIG_ALGORITHMS
+    )
+
+
 def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
-    """Bundle TSIG key names, root dot stripped.
+    """Names of the bundle's installable TSIG keys, root dot stripped.
 
     Technitium stores names un-dotted (verified: sending ``spatium-xfer.``
     reads back as ``spatium-xfer``), so normalise here or every options
     comparison sees a difference that isn't one.
     """
-    out = []
-    for k in bundle.get("tsig_keys") or []:
-        name = (k.get("name") or "").rstrip(".")
+    return sorted({(k.get("name") or "").rstrip(".") for k in _usable_tsig_keys(bundle)})
+
+
+def _bundle_acls(bundle: dict[str, Any]) -> dict[str, list[tuple[str, bool]]]:
+    """The bundle's named ACLs (#899) as ``name -> [(value, negate)]``."""
+    out: dict[str, list[tuple[str, bool]]] = {}
+    for acl in bundle.get("acls") or []:
+        name = str(acl.get("name") or "").strip()
         if name:
-            out.append(name)
-    return sorted(set(out))
+            out[name] = [
+                (str(e.get("value") or ""), bool(e.get("negate")))
+                for e in acl.get("entries") or []
+            ]
+    return out
+
+
+# ── BIND address-match translation (#1765)
+#
+# SpatiumDDI stores ``allow_query`` / ``allow_transfer`` as BIND address-match
+# lists. Technitium has no such grammar: a network ACL is an ordered list of
+# addresses / CIDRs where a leading ``!`` denies and the first match wins
+# (APIDOCS "Set Zone Options", ``NetworkAccessControl.cs``), no match denies,
+# and transfer TSIG keys are a SEPARATE set that is ANDed with the ACL
+# (``DnsServer.cs``: ``IsZoneTransferAllowed`` then ``IsTsigAuthenticated``).
+# This block translates what can be translated exactly and raises
+# ``AddressMatchError`` for everything else, because a guess either widens
+# access or locks the zone out. It is shared, byte for byte, with the agent
+# (``test_technitium_acl_parity.py``).
+_OPEN_ACL: list[str] = ["0.0.0.0/0", "::/0"]
+_V4_MAPPED = ipaddress.ip_network("::ffff:0:0/96")
+_KEY_ELEMENT = re.compile(r'^key\s+"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?$', re.IGNORECASE)
+
+
+class AddressMatchError(ValueError):
+    """The list holds an element Technitium cannot express exactly."""
+
+
+def _flatten_address_match(
+    elements: list[Any], acls: dict[str, list[tuple[str, bool]]], trail: tuple[str, ...]
+) -> list[tuple[bool, str, str]]:
+    """Ordered ``(negated, kind, value)`` items, named ACLs expanded inline.
+
+    ``kind`` is ``net`` / ``any`` / ``key`` (``none`` arrives as a negated
+    ``any``, which is what BIND compiles it to). BIND flattens a nested
+    ACL into the list that cites it, so first-match order is preserved.
+    """
+    items: list[tuple[bool, str, str]] = []
+    for raw in elements:
+        text = str(raw).strip()
+        if not text:
+            continue
+        neg = text.startswith("!")
+        body = text[1:].strip() if neg else text
+        low = body.lower()
+        if low == "any":
+            items.append((neg, "any", ""))
+            continue
+        if low == "none":
+            # BIND compiles ``none`` as ``!any`` (aclconf.c: "none == !any"):
+            # a match that DENIES everyone, ending the list there. So
+            # ``["none", "10.0.0.0/8"]`` admits nobody, and ``!none`` admits
+            # everyone. Dropping it instead would let the later elements grant.
+            items.append((not neg, "any", ""))
+            continue
+        if low == "localhost":
+            if neg:
+                raise AddressMatchError(
+                    "'!localhost' cannot be applied: Technitium has no equivalent of the "
+                    "server's own addresses, so the exclusion would be lost"
+                )
+            items.append((False, "net", "127.0.0.1/32"))
+            items.append((False, "net", "::1/128"))
+            continue
+        if low == "localnets":
+            raise AddressMatchError(
+                "'localnets' cannot be applied: Technitium has no equivalent of the "
+                "server's directly attached networks"
+            )
+        key = _KEY_ELEMENT.match(body)
+        if key:
+            if neg:
+                raise AddressMatchError(f"'!{body}' cannot be applied: a key cannot be negated")
+            items.append((False, "key", key.group(1)))
+            continue
+        try:
+            net = ipaddress.ip_network(body, strict=False)
+        except ValueError:
+            pass
+        else:
+            if net.version == 6 and net.subnet_of(_V4_MAPPED):  # type: ignore[arg-type]
+                raise AddressMatchError(
+                    f"{body!r} cannot be applied: Technitium matches an IPv4-mapped client "
+                    "as IPv4, so an IPv4-mapped prefix would never match; write the IPv4 "
+                    "prefix instead"
+                )
+            items.append((neg, "net", str(net)))
+            continue
+        if body not in acls:
+            raise AddressMatchError(
+                f"{body!r} is not an address, a CIDR prefix, 'key <name>' or an ACL defined in "
+                "this group"
+            )
+        if body in trail:
+            raise AddressMatchError(f"ACL {body!r} refers to itself")
+        inner = _flatten_address_match(
+            [
+                ("!" if n or v.startswith("!") else "") + v.lstrip("!").strip()
+                for v, n in acls[body]
+            ],
+            acls,
+            (*trail, body),
+        )
+        if neg:
+            if any(i[0] or i[1] == "key" for i in inner):
+                raise AddressMatchError(
+                    f"'!{body}' cannot be applied: the ACL holds a negation or a key, and "
+                    "inverting it is not a prefix list"
+                )
+            inner = [(True, k, v) for _, k, v in inner]
+        items.extend(inner)
+    return items
+
+
+def translate_address_match(
+    elements: Any,
+    acls: dict[str, list[tuple[str, bool]]] | None = None,
+    *,
+    allow_keys: bool = False,
+) -> tuple[list[str], list[str]]:
+    """BIND address-match list -> ``(technitium_acl, key_names)``.
+
+    ``acl`` is an ordered list for ``*NetworkACL`` (``!`` kept, ``any`` as both
+    default routes, ``none`` as their negation); ``key_names`` are the ``key X`` elements.
+    With keys present the result is the negations followed by the open ACL, to
+    be ANDed with the key set: that is exact only while every address element
+    is a negation placed before the first key. A positive address beside a key
+    is an OR in BIND and an AND here, so it is refused rather than narrowed.
+    """
+    items = _flatten_address_match(list(elements or []), acls or {}, ())
+    # A deny-everyone match (``none`` / ``!any``) ends evaluation in BIND and in
+    # Technitium alike, so nothing after it is reachable: drop the tail rather
+    # than refuse an element that can never take effect.
+    deny_all = next((i for i, it in enumerate(items) if it[0] and it[1] == "any"), None)
+    if deny_all is not None:
+        items = items[: deny_all + 1]
+    first_key = next((i for i, it in enumerate(items) if it[1] == "key"), None)
+    if first_key is not None and deny_all is not None and deny_all > first_key:
+        # ``[key X, none]``: after the keys, a final deny-all only restates
+        # "no match denies", which holds in both systems.
+        items = items[:deny_all]
+    if first_key is not None and not allow_keys:
+        raise AddressMatchError("'key <name>' cannot be applied to this list")
+    acl: list[str] = []
+    keys: list[str] = []
+    for index, (neg, kind, value) in enumerate(items):
+        if kind == "key":
+            if value not in keys:
+                keys.append(value)
+            continue
+        if first_key is not None:
+            if not neg:
+                raise AddressMatchError(
+                    "an address listed next to 'key <name>' is an OR in BIND but Technitium "
+                    "requires the address AND the key, so it cannot be applied"
+                )
+            if index > first_key:
+                raise AddressMatchError(
+                    "a negation listed after 'key <name>' cannot be applied: BIND lets the key "
+                    "through first, Technitium would still apply the exclusion"
+                )
+        for net in _OPEN_ACL if kind == "any" else [value]:
+            acl.append(("!" if neg else "") + net)
+    if first_key is not None:
+        acl.extend(_OPEN_ACL)
+    return acl, keys
+
+
+# ── end of the block shared with the agent
 
 
 # Zone types whose queries the group's ``allow_query`` governs. BIND applies
@@ -1107,9 +1332,11 @@ def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
 _QUERY_ACCESS_ZONE_TYPES = frozenset({"Primary", "Secondary", "Stub", "Forwarder"})
 
 
-def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
+def _query_access(
+    allow_query: Any, acls: dict[str, list[tuple[str, bool]]] | None = None
+) -> tuple[str, list[str]] | None:
     """Translate a group's BIND ``allow-query`` list into Technitium's
-    per-zone ``queryAccess`` + ``queryAccessNetworkACL`` (#1763).
+    per-zone ``queryAccess`` + ``queryAccessNetworkACL`` (#1763, #1765).
 
     Parameters per APIDOCS.md, "Set Zone Options" (TechnitiumSoftware/
     DnsServer v15.4.0): ``queryAccess`` is one of ``Deny`` / ``Allow`` /
@@ -1119,17 +1346,15 @@ def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
     leading ``!`` denies, evaluated in order, and "if no networks match, the
     default policy is to deny all except loopback".
 
-    Returns ``(queryAccess, acl)``, or ``None`` when the list holds an element
-    with no Technitium equivalent (``localnets``, ``localhost``, ``key X``, a
-    named ACL). The caller then leaves the zone alone and says so: guessing
-    would either widen the access or lock the zone out.
+    The grammar is ``translate_address_match``'s: addresses, ``!`` negations,
+    ``localhost`` and named ACLs from the bundle. Returns ``None`` when the
+    list holds an element with no Technitium equivalent (``localnets``, a key,
+    an undefined ACL name): the caller leaves the zone alone and says so,
+    because guessing would either widen the access or lock the zone out.
 
-    Empty / absent means ``any``, as the BIND9 agent reads it. Inside a list
-    ``any`` becomes both default routes (so ``["!10.1.0.0/16", "any"]`` keeps
-    its exception). ``none`` is NOT a no-op: BIND compiles it as ``!any``, a
-    deny-everyone match (``aclconf.c``: "none == !any"), so
-    ``["none", "10.0.0.0/8"]`` admits nobody. Both are catch-alls, so
-    everything after the first one is unreachable and dropped.
+    Empty / absent means ``any``, as the BIND9 agent reads it. ``none`` is
+    NOT a no-op: BIND compiles it as ``!any`` (``aclconf.c``: "none ==
+    !any"), so ``["none", "10.0.0.0/8"]`` admits nobody.
     """
     elements = [str(e).strip() for e in (allow_query or []) if str(e).strip()]
     if not elements:
@@ -1139,28 +1364,58 @@ def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
         return "Allow", []
     if lowered == ["none"]:
         return "Deny", []
-    acl: list[str] = []
-    for element in elements:
-        negated = element.startswith("!")
-        body = element[1:].strip() if negated else element
-        prefix = "!" if negated else ""
-        name = body.lower()
-        if name in ("any", "none"):
-            # ``none`` is ``!any``; ``!none`` is ``any``. Either way it
-            # matches every client, so nothing after it can be reached.
-            deny = negated != (name == "none")
-            mark = "!" if deny else ""
-            acl += [f"{mark}0.0.0.0/0", f"{mark}::/0"]
-            break
-        else:
-            try:
-                net = ipaddress.ip_network(body, strict=False)
-            except ValueError:
-                return None
-            acl.append(f"{prefix}{net}")
-    if not acl or all(a.startswith("!") for a in acl):
+    try:
+        acl, _ = translate_address_match(elements, acls, allow_keys=False)
+    except AddressMatchError:
+        return None
+    if not acl:
         return "Deny", []
+    if acl == _OPEN_ACL:
+        return "Allow", []
     return "UseSpecifiedNetworkACL", acl
+
+
+def _transfer_access(
+    source: Any,
+    names: list[str],
+    acls: dict[str, list[tuple[str, bool]]] | None = None,
+) -> tuple[str, list[str], list[str], list[str]] | None:
+    """Translate an ``allow_transfer`` list into
+    ``(zoneTransfer, zoneTransferNetworkACL, zoneTransferTsigKeyNames, missing)``.
+
+    ``names`` are the group's installable TSIG keys. Technitium ANDs the
+    network ACL with the key set (``DnsServer.cs``), so ``Allow`` + names is
+    "any source, but signed by one of these" (#734).
+
+    * empty / ``none``: the #734 posture, ``Allow`` + every key, or ``Deny``
+      when the group has none;
+    * ``key X``: only the named keys that are installed. ``missing`` lists
+      the ones that are not; when none are, the zone is denied rather than
+      left open to a signature nobody can make;
+    * an address list: the translated ACL, plus every group key as before.
+
+    ``None`` when the list cannot be expressed exactly.
+    """
+    elements = [str(a).strip() for a in (source or []) if str(a).strip()]
+    if not elements or {e.lower() for e in elements} == {"none"}:
+        return ("Allow" if names else "Deny"), [], names, []
+    try:
+        acl, keys = translate_address_match(elements, acls, allow_keys=True)
+    except AddressMatchError:
+        return None
+    missing: list[str] = []
+    if keys:
+        installed = {n.lower(): n for n in names}
+        wanted = [installed[k.lower()] for k in keys if k.lower() in installed]
+        missing = [k for k in keys if k.lower() not in installed]
+        if not wanted:
+            return "Deny", [], [], missing
+        names = sorted(set(wanted))
+    if not acl:
+        return "Deny", [], [], missing
+    if acl == _OPEN_ACL:
+        return "Allow", [], names, missing
+    return "UseSpecifiedNetworkACL", acl, names, missing
 
 
 def _zone_options_payload(
@@ -1181,8 +1436,13 @@ def _zone_options_payload(
     be silently ignored here — which is the exact defect #734 is about, one
     driver over.
 
-    The list follows BIND's vocabulary: ``["none"]`` (or empty) denies,
-    ``any`` allows, anything else is treated as a network ACL.
+    The list follows BIND's vocabulary and is translated by
+    ``_transfer_access`` (#1765): ``["none"]`` (or empty) denies, ``key X``
+    becomes the key set, ``localhost`` loopback, named ACLs are expanded, and
+    ``!`` exclusions stay in order under ``UseSpecifiedNetworkACL``. A list
+    with an element Technitium cannot express is left alone and reported in
+    ``_unapplied`` — it used to be guessed at, which turned
+    ``["!10.1.0.0/16", "any"]`` into ``Allow`` and lost the exclusion.
 
     Issue #734: ``none`` is the default, so honouring it literally left the
     control plane unable to read any zone — the drift report and
@@ -1195,49 +1455,70 @@ def _zone_options_payload(
     not wider: it demands possession of a secret.
     """
     payload: dict[str, Any] = {}
+    unapplied: list[dict[str, str]] = []
+    acls = _bundle_acls(bundle)
     if ztype in _QUERY_ACCESS_ZONE_TYPES:
         # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
         # so widening the list back to ``any`` un-restricts a zone an earlier
         # bundle restricted; an empty ACL clears the stored one.
-        qa = _query_access((bundle.get("options") or {}).get("allow_query"))
+        qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
         if qa is None:
-            payload["_unapplied"] = "allow_query has an element Technitium cannot express"
+            unapplied.append(
+                {
+                    "kind": "allow_query",
+                    "reason": "allow_query has an element Technitium cannot express",
+                }
+            )
         else:
             payload["queryAccess"] = qa[0]
             payload["queryAccessNetworkACL"] = qa[1]
     if ztype != "Primary":
+        if unapplied:
+            payload["_unapplied"] = unapplied
         return payload
     opts = bundle.get("options") or {}
     zone_acl = (zone or {}).get("allow_transfer")
     source = zone_acl if zone_acl is not None else opts.get("allow_transfer")
-    acl = [str(a) for a in (source or []) if a]
-    lowered = {a.lower() for a in acl}
-    names = _tsig_key_names(bundle)
-
-    if not acl or lowered == {"none"}:
-        payload["zoneTransfer"] = "Allow" if names else "Deny"
-    elif "any" in lowered:
-        payload["zoneTransfer"] = "Allow"
+    transfer = _transfer_access(source, _tsig_key_names(bundle), acls)
+    if transfer is None:
+        unapplied.append(
+            {
+                "kind": "allow_transfer",
+                "reason": "allow_transfer has an element Technitium cannot express",
+            }
+        )
     else:
-        payload["zoneTransfer"] = "UseSpecifiedNetworkACL"
-        payload["zoneTransferNetworkACL"] = [a for a in acl if a.lower() != "none"]
-
-    # Naming keys here is what makes a transfer TSIG-*authenticated* rather
-    # than merely address-filtered.
-    #
-    # ALWAYS sent, including empty. Technitium treats an absent parameter as
-    # "leave unchanged" and an empty one as "clear" (verified in upstream
-    # ``WebServiceZonesApi.cs``: ``Length == 0`` sets the set to null). So
-    # omitting it when the group's last key is deleted would strand the old
-    # key names on every zone, and transfers from an otherwise-permitted
-    # network would then fail forever, demanding a signature by a key that
-    # no longer exists anywhere. The control plane is the source of truth for
-    # this list, the same stance ``_sync_tsig_keys`` takes for the keys.
-    #
-    # On a Deny zone the list is necessarily empty (the branch above only
-    # picks Deny when there are no keys), so this never reads as "signed
-    # transfer enabled" on a zone that cannot transfer at all.
-    payload["zoneTransferTsigKeyNames"] = names
+        mode, acl, names, missing = transfer
+        payload["zoneTransfer"] = mode
+        if acl:
+            payload["zoneTransferNetworkACL"] = acl
+        # Naming keys here is what makes a transfer TSIG-*authenticated*
+        # rather than merely address-filtered.
+        #
+        # ALWAYS sent, including empty. Technitium treats an absent parameter
+        # as "leave unchanged" and an empty one as "clear" (verified in
+        # upstream ``WebServiceZonesApi.cs``: ``Length == 0`` sets the set to
+        # null). So omitting it when the group's last key is deleted would
+        # strand the old key names on every zone, and transfers from an
+        # otherwise-permitted network would then fail forever, demanding a
+        # signature by a key that no longer exists anywhere. The control plane
+        # is the source of truth for this list, the same stance
+        # ``_sync_tsig_keys`` takes for the keys.
+        #
+        # On a Deny zone the list is necessarily empty (the translation only
+        # picks Deny when there are no keys to name), so this never reads as
+        # "signed transfer enabled" on a zone that cannot transfer at all.
+        payload["zoneTransferTsigKeyNames"] = names
+        if missing:
+            unapplied.append(
+                {
+                    "kind": "allow_transfer_key",
+                    "reason": "allow_transfer names key(s) the daemon does not hold: "
+                    + ", ".join(missing),
+                }
+            )
+    if unapplied:
+        payload["_unapplied"] = unapplied
     return payload
 
 
@@ -1538,7 +1819,7 @@ class TechnitiumDriver(DriverBase):
     # collected by ``_apply_zone_options`` and reported ONCE by
     # ``swap_and_reload``: the cause is one group option, and a refusal per
     # zone would bury every other refusal in the truncated apply error.
-    _unapplied_query_access: list[str] | None = None
+    _unapplied_acl: dict[str, list[str]] | None = None
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -1594,6 +1875,26 @@ class TechnitiumDriver(DriverBase):
                 }
             )
         )
+
+        # The key a secondary signs with is always one of the group's own
+        # (#1765): the control plane names only a key this group holds with
+        # the same secret as one its master grants, so no other group's
+        # secret is ever installed here.
+        server_tsig_keys = list(bundle.get("tsig_keys") or [])
+        installable_keys = {
+            (k.get("name") or "").rstrip(".").lower(): (k.get("name") or "").rstrip(".")
+            for k in _usable_tsig_keys(bundle)
+        }
+
+        def _signing_key(name: Any, where: str) -> str | None:
+            """The installed spelling of a transfer key, or None (and say so)."""
+            wanted = str(name or "").rstrip(".")
+            if not wanted:
+                return None
+            if wanted.lower() in installable_keys:
+                return installable_keys[wanted.lower()]
+            log.warning("technitium_transfer_key_not_installed", where=where, key=wanted)
+            return None
 
         zones_payload = []
         for zone in raw_zones or []:
@@ -1678,6 +1979,18 @@ class TechnitiumDriver(DriverBase):
             }
             if masters:
                 entry["masters"] = masters
+            if ztype == "Secondary":
+                # Stub has no transfer, so no key (APIDOCS "Create Zone":
+                # ``tsigKeyName`` is for Secondary / SecondaryForwarder /
+                # SecondaryCatalog).
+                signing = _signing_key(zone.get("masters_tsig_key"), zname)
+                if signing:
+                    entry["tsig_key"] = signing
+                elif zone.get("masters_tsig_key") or zone.get("masters_tsig_unresolved"):
+                    # A SpatiumDDI master requires a signed transfer and there
+                    # is no key to sign with: say so instead of creating a
+                    # zone that is refused every AXFR and expires.
+                    entry["tsig_unresolved"] = True
             if forwarders:
                 group_opts = bundle.get("options") or {}
                 entry["forwarders"] = [_zone_forwarder(f, group_opts) for f in forwarders]
@@ -1698,6 +2011,13 @@ class TechnitiumDriver(DriverBase):
         # Written to its own file, and 0600: unlike zones.json this one
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
+        if catalog and catalog.get("producer_tsig_key"):
+            catalog = {
+                **catalog,
+                "producer_tsig_key": _signing_key(
+                    catalog.get("producer_tsig_key"), "catalog consumer"
+                ),
+            }
         server_payload = {
             # Encrypted transports + forwarders (#741). Carried verbatim so
             # swap_and_reload can apply them without re-reading the bundle.
@@ -1712,7 +2032,7 @@ class TechnitiumDriver(DriverBase):
                     "secret": k.get("secret") or "",
                     "algorithm": (k.get("algorithm") or "hmac-sha256").lower(),
                 }
-                for k in (bundle.get("tsig_keys") or [])
+                for k in server_tsig_keys
                 if (k.get("name") or "").rstrip(".")
             ],
             "catalog": catalog,
@@ -1785,7 +2105,7 @@ class TechnitiumDriver(DriverBase):
         # them through ``refused_zones()`` so the apply reads as a partial
         # one rather than as success (#1280's model).
         self._apply_failures = []
-        self._unapplied_query_access = []
+        self._unapplied_acl = {}
         try:
             server_path = current / "server.json"
             server_state: dict[str, Any] = {}
@@ -1838,17 +2158,22 @@ class TechnitiumDriver(DriverBase):
             )
             self._reconcile_zones(token, payload)
             self._apply_catalog(token, server_state.get("catalog"), payload)
-            if self._unapplied_query_access:
-                skipped = self._unapplied_query_access
+            unsigned = sorted(e["zone"] for e in payload if e.get("tsig_unresolved"))
+            if unsigned:
                 self._note_apply_failure(
-                    "allow_query: the group's list has an element Technitium cannot "
-                    "express (localhost, localnets, a key or an ACL name), so query "
-                    f"access was left as the daemon has it on {len(skipped)} zone(s)"
+                    "secondary zone(s) "
+                    + ", ".join(unsigned)
+                    + ": the master is a SpatiumDDI server that requires a signed "
+                    "transfer and this group holds no key it grants (add the same TSIG "
+                    "key, name and secret, to both groups), so every transfer will be "
+                    "refused"
                 )
+            for kind, skipped in sorted((self._unapplied_acl or {}).items()):
+                self._note_apply_failure(_UNAPPLIED_ACL_MESSAGES[kind].format(zones=len(skipped)))
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None
-            self._unapplied_query_access = None
+            self._unapplied_acl = None
         # Partial apply, not a failure (#1280): every step the daemon took is
         # live, and re-applying this bundle or the last-known-good cannot make
         # it accept what it just refused — the QA walk of #1608 showed a
@@ -1974,7 +2299,11 @@ class TechnitiumDriver(DriverBase):
             name = (k.get("name") or "").rstrip(".")
             secret = k.get("secret") or ""
             algorithm = (k.get("algorithm") or "hmac-sha256").lower()
-            if not name or not secret:
+            if not name:
+                continue
+            if not secret:
+                log.warning("technitium_tsig_key_without_secret", key=name)
+                self._note_apply_failure(f"tsig key {name}: no secret, so it was not installed")
                 continue
             if algorithm not in _TSIG_ALGORITHMS:
                 log.warning(
@@ -1982,6 +2311,14 @@ class TechnitiumDriver(DriverBase):
                     key=name,
                     algorithm=algorithm,
                     supported=sorted(_TSIG_ALGORITHMS),
+                )
+                # Reported, not just logged (#1765): a skipped key is not
+                # pinned onto the zones (``_tsig_key_names``), so a transfer
+                # signed with it is refused and the operator needs to know
+                # why.
+                self._note_apply_failure(
+                    f"tsig key {name}: algorithm {algorithm} is not supported by "
+                    "Technitium, so it was not installed"
                 )
                 continue
             tokens.extend([name, secret, algorithm])
@@ -2045,6 +2382,7 @@ class TechnitiumDriver(DriverBase):
                     "zone": cat_name,
                     "type": "SecondaryCatalog",
                     "masters": [str(producer)],
+                    "tsig_key": (catalog or {}).get("producer_tsig_key"),
                 },
             )
             self._save_catalog_state({"zone_name": cat_name, "mode": mode})
@@ -3269,6 +3607,11 @@ class TechnitiumDriver(DriverBase):
             params["primaryNameServerAddresses"] = ",".join(
                 _technitium_master(m) for m in entry.get("masters") or []
             )
+            if ztype in _TSIG_SECONDARY_ZONE_TYPES and entry.get("tsig_key"):
+                # The key the zone's masters require for a transfer (#1765).
+                # Without it a signed-only primary refuses every AXFR, and the
+                # zone expires to SERVFAIL after a create that succeeded.
+                params["tsigKeyName"] = entry["tsig_key"]
         elif ztype == "Forwarder":
             # First upstream rides zones/create with its protocol (without
             # ``protocol`` Technitium uses Udp and re-derives the address, so
@@ -3385,6 +3728,11 @@ class TechnitiumDriver(DriverBase):
             opts["primaryNameServerAddresses"] = params["primaryNameServerAddresses"]
         else:
             return
+        if ztype in _TSIG_SECONDARY_ZONE_TYPES:
+            # Always sent, empty included: an absent parameter leaves the old
+            # key, an empty one clears it (``WebServiceZonesApi.cs``), and the
+            # control plane decides which masters need signing (#1765).
+            opts["primaryZoneTransferTsigKeyName"] = params.get("tsigKeyName", "")
         body = self._call(token, "POST", "zones/options/set", opts).json()
         if body.get("status") != "ok":
             log.warning(
@@ -3578,14 +3926,14 @@ class TechnitiumDriver(DriverBase):
         anything not in the known set.
         """
         options = dict(options)
-        unapplied = options.pop("_unapplied", None)
-        if unapplied:
+        for item in options.pop("_unapplied", None) or []:
             # Left as the daemon has it rather than guessed at (see
-            # ``_query_access``); the API refuses to store such a value for a
-            # Technitium group, so this is a row saved before that gate.
-            log.error("technitium_zone_option_unapplied", zone=zone, reason=unapplied)
-            if self._unapplied_query_access is not None:
-                self._unapplied_query_access.append(zone)
+            # ``_query_access`` / ``_transfer_access``); the API refuses to
+            # store such a value for a Technitium group, so this is a row saved
+            # before that gate.
+            log.error("technitium_zone_option_unapplied", zone=zone, **item)
+            if self._unapplied_acl is not None:
+                self._unapplied_acl.setdefault(item["kind"], []).append(zone)
         if not options:
             return
         transfer = options.get("zoneTransfer")
