@@ -150,6 +150,8 @@ from app.services.dns.server_move import (
     ensure_group_single_driver,
     move_server_to_group,
 )
+from app.services.dns.technitium_options import refusals as technitium_option_refusals
+from app.services.dns.technitium_options import stored_warnings as technitium_stored_warnings
 from app.services.dns.tld_registry import (
     SOURCE_URL,
     TldFetchError,
@@ -928,6 +930,9 @@ class ServerOptionsResponse(BaseModel):
     forward_tls_verify: bool
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
+    # Stored values a Technitium server in this group will not apply (#1763).
+    # Empty for a group with no agent-managed Technitium server.
+    technitium_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -3494,8 +3499,17 @@ async def _load_options(group_id: uuid.UUID, db: DB) -> DNSServerOptions | None:
     return result.scalar_one_or_none()
 
 
+async def _options_response(
+    db: DB, group_id: uuid.UUID, opts: DNSServerOptions
+) -> ServerOptionsResponse:
+    out = ServerOptionsResponse.model_validate(opts)
+    if "technitium" in await _group_driver_names(db, group_id):
+        out.technitium_warnings = technitium_stored_warnings(opts)
+    return out
+
+
 @router.get("/groups/{group_id}/options", response_model=ServerOptionsResponse)
-async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerOptions:
+async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerOptionsResponse:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     if not opts:
@@ -3504,7 +3518,8 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerO
         db.add(opts)
         await db.commit()
         opts = await _load_options(group_id, db)
-    return opts  # type: ignore[return-value]
+    assert opts is not None
+    return await _options_response(db, group_id, opts)
 
 
 async def _validated_option_changes(
@@ -3650,7 +3665,7 @@ async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) ->
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
-) -> DNSServerOptions:
+) -> ServerOptionsResponse:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     stored_opts = opts
@@ -3682,6 +3697,18 @@ async def update_options(
     if await technitium_api_scope.group_is_technitium_api(db, group_id):
         technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
+    # Options the agent-managed Technitium driver cannot apply (#1763): refuse
+    # rather than store a value the daemon will silently ignore. Same subset
+    # semantics as the transport gates: any Technitium server in the group.
+    if "technitium" in await _group_driver_names(db, group_id):
+        if refused := technitium_option_refusals(changes, opts):
+            raise HTTPException(
+                422,
+                "This group has a Technitium server, which cannot apply: "
+                + "; ".join(refused)
+                + ". Move the Technitium server to its own group, or leave these at "
+                "their defaults.",
+            )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
         setattr(opts, k, v)
@@ -3750,7 +3777,8 @@ async def update_options(
         await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()
     reloaded = await _load_options(group_id, db)
-    return reloaded  # type: ignore[return-value]
+    assert reloaded is not None
+    return await _options_response(db, group_id, reloaded)
 
 
 @router.post(

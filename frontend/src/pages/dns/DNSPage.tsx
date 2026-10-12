@@ -6682,6 +6682,25 @@ function OptionsTab({ groupId }: { groupId: string }) {
     retry: false,
   });
 
+  // Options the agent-managed Technitium driver cannot apply (#1763): the
+  // API refuses a non-default value for a group holding such a server, so the
+  // controls are disabled with the reason rather than offered and ignored. A
+  // control holding a stored non-default value stays enabled so it can be
+  // cleared back to the default.
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dns-servers", groupId],
+    queryFn: () => dnsApi.listServers(groupId),
+  });
+  const techUnsupported = groupServers.some((s) => s.driver === "technitium");
+  const techLocked = {
+    minimal: techUnsupported && !opts?.minimal_responses,
+    tcpClients: techUnsupported && opts?.tcp_clients == null,
+    clientsPerQuery: techUnsupported && opts?.clients_per_query == null,
+    maxClientsPerQuery: techUnsupported && opts?.max_clients_per_query == null,
+  };
+  const techReason =
+    "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
+
   const [forwardersEnabled, setForwardersEnabled] = useState(false);
   const [forwarders, setForwarders] = useState("");
   const [forwardPolicy, setForwardPolicy] = useState("first");
@@ -7008,6 +7027,23 @@ function OptionsTab({ groupId }: { groupId: string }) {
         </p>
       )}
 
+      {/* Stored values a Technitium server here will not apply (#1763):
+          saved before the gate, or before the server joined the group. */}
+      {(opts?.technitium_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">
+            This group has a Technitium server, which does not apply:
+          </p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.technitium_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className={card}>
         <div className="flex items-center justify-between">
           <h4 className={cardTitle}>
@@ -7313,10 +7349,18 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </>
         )}
         <div className="border-t pt-3 space-y-3">
+          {techUnsupported && (
+            <p className="text-xs text-muted-foreground">
+              Technitium has no minimal-responses, tcp-clients or
+              clients-per-query settings, so these are disabled for this group.
+            </p>
+          )}
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
               type="checkbox"
               checked={minimalResponses}
+              disabled={techLocked.minimal}
+              title={techLocked.minimal ? techReason : undefined}
               onChange={(e) => {
                 setMinimalResponses(e.target.checked);
                 setDirty(true);
@@ -7332,6 +7376,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={tcpClients}
+                disabled={techLocked.tcpClients}
+                title={techLocked.tcpClients ? techReason : undefined}
                 onChange={(e) => {
                   setTcpClients(e.target.value);
                   setDirty(true);
@@ -7345,6 +7391,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={clientsPerQuery}
+                disabled={techLocked.clientsPerQuery}
+                title={techLocked.clientsPerQuery ? techReason : undefined}
                 onChange={(e) => {
                   setClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7358,6 +7406,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={maxClientsPerQuery}
+                disabled={techLocked.maxClientsPerQuery}
+                title={techLocked.maxClientsPerQuery ? techReason : undefined}
                 onChange={(e) => {
                   setMaxClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -7736,6 +7786,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
 
       <div className={card}>
         <h4 className={cardTitle}>Query &amp; Transfer ACLs</h4>
+        {techUnsupported && (
+          <p className="text-xs text-muted-foreground">
+            Technitium applies allow-query to each zone it serves as a network
+            ACL: addresses and CIDRs (optionally prefixed with !), or any /
+            none. localhost, localnets, key and ACL names are refused for this
+            group.
+          </p>
+        )}
         <Field label="allow-query (comma-separated CIDRs / ACL names)">
           <input
             className={inputCls}

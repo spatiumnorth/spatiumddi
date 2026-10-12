@@ -838,6 +838,21 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 
 `forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
 
+### 4B.3cc Group server options (issue #1763)
+
+The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic and the bundle carries every option, but the agent applies only some. Parameter names are from Technitium's `APIDOCS.md` ("Set DNS Settings", "Set Zone Options", v15.4.0).
+
+| Option | Technitium |
+|---|---|
+| `dnssec_validation` | **applied**: `settings/set dnssecValidation` (boolean, default `true`). `no` sends `false`; `yes` and `auto` send `true`. A bundle without the key leaves the daemon alone. |
+| `allow_query` | **applied per zone**: `zones/options/set queryAccess` + `queryAccessNetworkACL` on Primary, Secondary, Stub and Forwarder zones (BIND's options-level `allow-query` covers a conditional-forward zone too). `any` (or empty) is `Allow`, `none` is `Deny`, a list of addresses / CIDRs (optionally `!`-negated, in order) is `UseSpecifiedNetworkACL`, with `any` inside a list becoming `0.0.0.0/0,::/0`. `Allow` and an empty ACL are sent too (Technitium reads an empty `queryAccessNetworkACL` as "clear"), so widening a list back to `any` un-restricts the zones. `localhost`, `localnets`, `key X` and ACL names have no equivalent: the API refuses them for a Technitium group, and a row stored earlier is reported once per apply as a partial apply and left as the daemon has it. It does not restrict recursion for names outside every zone; that is Technitium's own recursion setting. The zone-level `allow_query` override is not in the agent zone payload for any driver. |
+| `minimal_responses`, `tcp_clients`, `clients_per_query`, `max_clients_per_query` | **not supported**: Technitium has no setting for them. The API answers 422 to a change to a non-default value for a group holding a Technitium server (`services/dns/technitium_options.py`); re-posting the stored value, or the default, stays allowed because the form sends every field. The Options tab disables these controls with the reason, except one holding a stored value, which stays enabled so it can be cleared. |
+| `forward_policy`, `forward_tls_verify` | Not gated here; Technitium's forwarding semantics are tracked in #1764. |
+
+A value stored before the gate, or before a Technitium server joined the group (agent registration, a server move, a Fleet role assignment), never passes through the PUT gate. `GET`/`PUT /dns/groups/{id}/options` return it in `technitium_warnings`, and the Options tab shows it as a banner.
+
+The gate covers the agent-managed `technitium` driver; the agentless `technitium_api` driver applies no group option.
+
 ### 4B.3d Blocklists and the live-pull importer (issue #744)
 
 **Blocklists.** Technitium has no RPZ. It blocks natively, from subscribed URL lists or from a per-domain *blocked zones* set, so SpatiumDDI's effective blocklist entries map onto the latter and its exceptions onto the *allowed* set — Technitium's allowed set is exactly an RPZ passthru. `blockingType` derives from the entries' block modes (`nxdomain` → `NxDomain`, `sinkhole`/`redirect` → `CustomAddress`), and it has the same silent-ignore trap as `zoneTransfer`, so it is validated before sending.

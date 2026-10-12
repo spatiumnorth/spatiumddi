@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Group options the Options tab offers for every driver are no longer
+  silently ignored on Technitium (#1763).** The bundle carried
+  `dnssec_validation`, `allow_query` and the rest, and the Technitium
+  agent read none of them, so `dnssec_validation = no` behind a
+  DNSSEC-stripping upstream kept validating and SERVFAILed signed names,
+  and a group's `allow_query` left every authoritative zone answering
+  anyone. The agent now sends `dnssecValidation` and maps `allow_query`
+  onto each served zone's `queryAccess` / `queryAccessNetworkACL`
+  (addresses, CIDRs, `!` negation, `any`, `none`), forwarder zones
+  included. The options Technitium has no setting for
+  (`minimal_responses`, `tcp_clients`, `clients_per_query`,
+  `max_clients_per_query`, and an `allow_query` using `localnets`, `key`
+  or ACL names) now answer 422 when changed to a non-default value on a
+  group with a Technitium server, and the Options tab disables them with
+  the reason. Re-saving a stored value stays allowed, and a value stored
+  before this, or before a Technitium server joined the group, is listed
+  in the options response's `technitium_warnings` and shown on the tab.
+  Forwarding options are left to #1764. BIND9 and PowerDNS
+  bundles are unchanged.
+
 - **A Technitium record target is read the way a zone file reads it, and
   imported targets keep their dot (#1759).** Both Technitium drivers
   (the agent and the agentless `technitium_api`) stripped the trailing

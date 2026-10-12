@@ -886,6 +886,70 @@ def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
     return sorted(set(out))
 
 
+# Zone types whose queries the group's ``allow_query`` governs. BIND applies
+# an options-level ``allow-query`` to every query the server receives, a
+# conditional-forward zone's included, so a Forwarder zone carries it too
+# (Technitium's "Set Zone Options" accepts ``queryAccess`` on every zone type
+# but ``SecondaryCatalog``). A catalog zone is not a served namespace.
+_QUERY_ACCESS_ZONE_TYPES = frozenset({"Primary", "Secondary", "Stub", "Forwarder"})
+
+
+def _query_access(allow_query: Any) -> tuple[str, list[str]] | None:
+    """Translate a group's BIND ``allow-query`` list into Technitium's
+    per-zone ``queryAccess`` + ``queryAccessNetworkACL`` (#1763).
+
+    Parameters per APIDOCS.md, "Set Zone Options" (TechnitiumSoftware/
+    DnsServer v15.4.0): ``queryAccess`` is one of ``Deny`` / ``Allow`` /
+    ``AllowOnlyPrivateNetworks`` / ``AllowOnlyZoneNameServers`` /
+    ``UseSpecifiedNetworkACL`` / ``AllowZoneNameServersAndUseSpecifiedNetworkACL``;
+    ``queryAccessNetworkACL`` is a comma separated list of IPs / networks, a
+    leading ``!`` denies, evaluated in order, and "if no networks match, the
+    default policy is to deny all except loopback".
+
+    Returns ``(queryAccess, acl)``, or ``None`` when the list holds an element
+    with no Technitium equivalent (``localnets``, ``localhost``, ``key X``, a
+    named ACL). The caller then leaves the zone alone and says so: guessing
+    would either widen the access or lock the zone out.
+
+    Empty / absent means ``any``, as the BIND9 agent reads it. Inside a list
+    ``any`` becomes both default routes (so ``["!10.1.0.0/16", "any"]`` keeps
+    its exception). ``none`` is NOT a no-op: BIND compiles it as ``!any``, a
+    deny-everyone match (``aclconf.c``: "none == !any"), so
+    ``["none", "10.0.0.0/8"]`` admits nobody. Both are catch-alls, so
+    everything after the first one is unreachable and dropped.
+    """
+    elements = [str(e).strip() for e in (allow_query or []) if str(e).strip()]
+    if not elements:
+        return "Allow", []
+    lowered = [e.lower() for e in elements]
+    if lowered == ["any"]:
+        return "Allow", []
+    if lowered == ["none"]:
+        return "Deny", []
+    acl: list[str] = []
+    for element in elements:
+        negated = element.startswith("!")
+        body = element[1:].strip() if negated else element
+        prefix = "!" if negated else ""
+        name = body.lower()
+        if name in ("any", "none"):
+            # ``none`` is ``!any``; ``!none`` is ``any``. Either way it
+            # matches every client, so nothing after it can be reached.
+            deny = negated != (name == "none")
+            mark = "!" if deny else ""
+            acl += [f"{mark}0.0.0.0/0", f"{mark}::/0"]
+            break
+        else:
+            try:
+                net = ipaddress.ip_network(body, strict=False)
+            except ValueError:
+                return None
+            acl.append(f"{prefix}{net}")
+    if not acl or all(a.startswith("!") for a in acl):
+        return "Deny", []
+    return "UseSpecifiedNetworkACL", acl
+
+
 def _zone_options_payload(
     ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -917,8 +981,19 @@ def _zone_options_payload(
     ``allow-transfer { key "…"; };`` and is narrower than an address ACL,
     not wider: it demands possession of a secret.
     """
+    payload: dict[str, Any] = {}
+    if ztype in _QUERY_ACCESS_ZONE_TYPES:
+        # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
+        # so widening the list back to ``any`` un-restricts a zone an earlier
+        # bundle restricted; an empty ACL clears the stored one.
+        qa = _query_access((bundle.get("options") or {}).get("allow_query"))
+        if qa is None:
+            payload["_unapplied"] = "allow_query has an element Technitium cannot express"
+        else:
+            payload["queryAccess"] = qa[0]
+            payload["queryAccessNetworkACL"] = qa[1]
     if ztype != "Primary":
-        return {}
+        return payload
     opts = bundle.get("options") or {}
     zone_acl = (zone or {}).get("allow_transfer")
     source = zone_acl if zone_acl is not None else opts.get("allow_transfer")
@@ -926,7 +1001,6 @@ def _zone_options_payload(
     lowered = {a.lower() for a in acl}
     names = _tsig_key_names(bundle)
 
-    payload: dict[str, Any] = {}
     if not acl or lowered == {"none"}:
         payload["zoneTransfer"] = "Allow" if names else "Deny"
     elif "any" in lowered:
@@ -1243,6 +1317,11 @@ class TechnitiumDriver(DriverBase):
     # read by ``apply_record_op`` for ops shipped beside that bundle.
     _svcb_zone_file_targets: bool = False
 
+    # Zones whose group ``allow_query`` this apply could not express (#1763),
+    # collected by ``_apply_zone_options`` and reported ONCE by
+    # ``swap_and_reload``: the cause is one group option, and a refusal per
+    # zone would bury every other refusal in the truncated apply error.
+    _unapplied_query_access: list[str] | None = None
     # The same, for every other name-valued target (#1759), read from
     # ``name_target_rule``. Independent of the SVCB flag: a bundle cached by
     # a #1513 control plane has the SVCB marker and not this one.
@@ -1488,6 +1567,7 @@ class TechnitiumDriver(DriverBase):
         # them through ``refused_zones()`` so the apply reads as a partial
         # one rather than as success (#1280's model).
         self._apply_failures = []
+        self._unapplied_query_access = []
         try:
             server_path = current / "server.json"
             server_state: dict[str, Any] = {}
@@ -1518,6 +1598,7 @@ class TechnitiumDriver(DriverBase):
                     token, server_options, server_state.get("tls_cert")
                 )
                 self._apply_forwarders(token, server_options)
+                self._apply_dnssec_validation(token, server_options)
                 # #1761: recursion policy + per-client rate limit. Both
                 # have daemon defaults that stay in force unless sent.
                 self._apply_recursion(token, server_options)
@@ -1539,9 +1620,17 @@ class TechnitiumDriver(DriverBase):
             )
             self._reconcile_zones(token, payload)
             self._apply_catalog(token, server_state.get("catalog"), payload)
+            if self._unapplied_query_access:
+                skipped = self._unapplied_query_access
+                self._note_apply_failure(
+                    "allow_query: the group's list has an element Technitium cannot "
+                    "express (localhost, localnets, a key or an ACL name), so query "
+                    f"access was left as the daemon has it on {len(skipped)} zone(s)"
+                )
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None
+            self._unapplied_query_access = None
         # Partial apply, not a failure (#1280): every step the daemon took is
         # live, and re-applying this bundle or the last-known-good cannot make
         # it accept what it just refused — the QA walk of #1608 showed a
@@ -2319,6 +2408,36 @@ class TechnitiumDriver(DriverBase):
             doh=bool(options.get("doh_enabled")),
             doq=bool(options.get("doq_enabled")),
         )
+
+    def _apply_dnssec_validation(self, token: str, options: dict[str, Any]) -> None:
+        """Set the resolver's DNSSEC validation from the group's option (#1763).
+
+        ``settings/set`` takes a boolean ``dnssecValidation`` (APIDOCS.md,
+        "Set DNS Settings", Technitium DnsServer v15.4.0), default ``true``.
+        The group's ``dnssec_validation`` is BIND's ``auto | yes | no``: ``no``
+        turns validation off, and both others validate (``auto`` is BIND's
+        built-in-trust-anchor mode, which is what Technitium does when on).
+        Without this, ``no`` behind a DNSSEC-stripping upstream still
+        validated and SERVFAILed every signed name. An old bundle without
+        the key leaves the daemon alone.
+        """
+        raw = options.get("dnssec_validation")
+        if raw is None:
+            return
+        value = str(raw).strip().lower()
+        if value not in ("auto", "yes", "no"):
+            log.error("technitium_dnssec_validation_value_invalid", value=raw)
+            self._note_apply_failure(f"dnssec validation: bad value {raw!r}")
+            return
+        body = self._call(
+            token,
+            "POST",
+            "settings/set",
+            {"dnssecValidation": "false" if value == "no" else "true"},
+        ).json()
+        if body.get("status") != "ok":
+            log.error("technitium_dnssec_validation_failed", error=body.get("errorMessage"))
+            self._note_apply_failure(f"dnssec validation: {body.get('errorMessage')}")
 
     def _apply_forwarders(self, token: str, options: dict[str, Any]) -> None:
         """Set the upstream forwarders and the protocol to reach them with.
@@ -3170,6 +3289,15 @@ class TechnitiumDriver(DriverBase):
         security regression that no log line would report. Refuse to send
         anything not in the known set.
         """
+        options = dict(options)
+        unapplied = options.pop("_unapplied", None)
+        if unapplied:
+            # Left as the daemon has it rather than guessed at (see
+            # ``_query_access``); the API refuses to store such a value for a
+            # Technitium group, so this is a row saved before that gate.
+            log.error("technitium_zone_option_unapplied", zone=zone, reason=unapplied)
+            if self._unapplied_query_access is not None:
+                self._unapplied_query_access.append(zone)
         if not options:
             return
         transfer = options.get("zoneTransfer")

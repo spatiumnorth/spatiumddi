@@ -986,7 +986,9 @@ def test_zone_options_only_for_primary() -> None:
     """A secondary transfers IN. Whether it re-serves is a separate
     decision we don't make on the operator's behalf."""
     for ztype in ("Secondary", "Stub", "Forwarder"):
-        assert _zone_options_payload(ztype, _zone_bundle()) == {}
+        payload = _zone_options_payload(ztype, _zone_bundle())
+        # Never a transfer setting; a served type may carry query access (#1763).
+        assert not {k for k in payload if k.startswith("zoneTransfer")}
 
 
 def test_tsig_key_names_track_the_bundle() -> None:
@@ -3212,6 +3214,159 @@ def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
     assert d._svcb_zone_file_targets
     d.render({"zones": []})
     assert not d._svcb_zone_file_targets
+
+
+# ── Group options (#1763): dnssec_validation + allow_query ──────────────
+
+
+def _apply_with_calls(
+    tmp_path: Path, bundle: dict[str, Any]
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    return calls
+
+
+def _settings_values(calls: Any, key: str) -> list[Any]:
+    return [c[3][key] for c in calls if c[2] == "settings/set" and key in c[3]]
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("no", "false"), ("yes", "true"), ("auto", "true")]
+)
+def test_dnssec_validation_reaches_the_daemon(tmp_path: Path, mode: str, expected: str) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [], "options": {"dnssec_validation": mode, "allow_query": ["any"]}}
+    )
+    assert _settings_values(calls, "dnssecValidation") == [expected]
+
+
+def test_a_bundle_without_the_dnssec_option_leaves_the_daemon_alone(tmp_path: Path) -> None:
+    calls = _apply_with_calls(tmp_path, {"zones": [], "options": {"forwarders": []}})
+    assert _settings_values(calls, "dnssecValidation") == []
+
+
+def _zone(name: str, ztype: str = "primary") -> dict[str, Any]:
+    z: dict[str, Any] = {"name": name, "type": ztype, "records": []}
+    if ztype in ("secondary", "stub"):
+        z["masters"] = ["192.0.2.1"]
+    if ztype == "forward":
+        z["forwarders"] = ["192.0.2.53"]
+    return z
+
+
+def _query_access_calls(calls: Any) -> dict[str, dict[str, Any]]:
+    return {
+        c[3]["zone"]: c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "queryAccess" in c[3]
+    }
+
+
+def test_allow_query_becomes_a_per_zone_network_acl(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {
+            "zones": [_zone("a.test"), _zone("b.test", "secondary"), _zone("c.test", "forward")],
+            "options": {"allow_query": ["!10.1.0.0/16", "10.0.0.0/8", "2001:db8::/32"]},
+        },
+    )
+    sent = _query_access_calls(calls)
+    # BIND's options-level allow-query covers a conditional-forward zone too.
+    assert set(sent) == {"a.test", "b.test", "c.test"}
+    for params in sent.values():
+        assert params["queryAccess"] == "UseSpecifiedNetworkACL"
+        assert params["queryAccessNetworkACL"] == "!10.1.0.0/16,10.0.0.0/8,2001:db8::/32"
+
+
+def test_allow_query_any_clears_an_earlier_restriction(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [_zone("a.test")], "options": {"allow_query": ["any"]}}
+    )
+    p = _query_access_calls(calls)["a.test"]
+    assert p["queryAccess"] == "Allow"
+    assert p["queryAccessNetworkACL"] == ""
+
+
+def test_allow_query_none_denies(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [_zone("a.test")], "options": {"allow_query": ["none"]}}
+    )
+    assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
+
+
+def test_allow_query_none_inside_a_list_denies_everyone(tmp_path: Path) -> None:
+    # BIND compiles ``none`` as ``!any`` (aclconf.c: "none == !any"), so a
+    # ``none`` ahead of an address admits nobody. Dropping it as a no-op
+    # would open the zone to 10/8.
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["none", "10.0.0.0/8"]}},
+    )
+    assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
+
+
+def test_allow_query_address_before_none_keeps_only_that_address(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["10.0.0.0/8", "none", "any"]}},
+    )
+    got = _query_access_calls(calls)["a.test"]
+    assert got["queryAccess"] == "UseSpecifiedNetworkACL"
+    assert got["queryAccessNetworkACL"] == "10.0.0.0/8,!0.0.0.0/0,!::/0"
+
+
+def test_allow_query_any_inside_a_list_keeps_the_exception(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["!192.0.2.0/24", "any"]}},
+    )
+    assert (
+        _query_access_calls(calls)["a.test"]["queryAccessNetworkACL"]
+        == "!192.0.2.0/24,0.0.0.0/0,::/0"
+    )
+
+
+def test_untranslatable_allow_query_is_reported_and_never_guessed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(
+        {
+            "zones": [_zone("a.test"), _zone("b.test"), _zone("c.test", "secondary")],
+            "options": {"allow_query": ["localnets"]},
+        }
+    )
+    d.validate()
+    d.swap_and_reload()
+    assert _query_access_calls(calls) == {}
+    # One refusal for the one group option, naming how many zones it left
+    # alone, not one per zone burying every other refusal.
+    refused = [r for r in d._refused_zones if "allow_query" in r]
+    assert len(refused) == 1, d._refused_zones
+    assert "3 zone(s)" in refused[0]
+
+
+def test_a_clean_apply_after_an_untranslatable_one_reports_nothing(tmp_path: Path) -> None:
+    """The once-per-apply collector is reset, so fixing the option clears it."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    for allow_query in (["localnets"], ["10.0.0.0/8"]):
+        d.render({"zones": [_zone("a.test")], "options": {"allow_query": allow_query}})
+        d.validate()
+        d.swap_and_reload()
+    assert not [r for r in d._refused_zones if "allow_query" in r]
 
 
 # ── #1759: one target rule for every name-valued type ───────────────────
