@@ -573,6 +573,189 @@ def reclaim_stranded_redis_storage(
     return reclaimed, None
 
 
+# #1541 — the slot-image mirror's claim, stranded on an evicted node.
+_MIRROR_COMPONENT = "slot-image-mirror"
+_MIRROR_CLAIM_SUFFIX = "-slot-image-mirror-data"
+# Metadata the apiserver / provisioner / scheduler stamp on a bound claim.
+# A re-created claim must carry none of them: ``selected-node`` names the
+# node that is gone, and the bind annotations describe a PV the new claim
+# does not have.
+_CLAIM_RUNTIME_ANNOTATIONS = (
+    "volume.kubernetes.io/selected-node",
+    "pv.kubernetes.io/bind-completed",
+    "pv.kubernetes.io/bound-by-controller",
+    "volume.beta.kubernetes.io/storage-provisioner",
+    "volume.kubernetes.io/storage-provisioner",
+    "kubectl.kubernetes.io/last-applied-configuration",
+)
+
+
+def _recreatable_claim(pvc: dict) -> dict:
+    """A copy of ``pvc`` the apiserver will accept as a NEW claim: its name,
+    namespace, labels and Helm ownership annotations (so the release still
+    owns it and its next upgrade patches it rather than refusing it), and its
+    requested shape — never its binding (``volumeName``), its status, or the
+    node the old volume was provisioned on."""
+    meta = pvc.get("metadata") or {}
+    spec = pvc.get("spec") or {}
+    anns = {
+        k: v
+        for k, v in (meta.get("annotations") or {}).items()
+        if k not in _CLAIM_RUNTIME_ANNOTATIONS
+    }
+    out_meta: dict[str, Any] = {"name": meta.get("name")}
+    if meta.get("namespace"):
+        out_meta["namespace"] = meta["namespace"]
+    if meta.get("labels"):
+        out_meta["labels"] = dict(meta["labels"])
+    if anns:
+        out_meta["annotations"] = anns
+    out_spec: dict[str, Any] = {}
+    for key in ("accessModes", "resources", "storageClassName", "volumeMode"):
+        if spec.get(key) is not None:
+            out_spec[key] = spec[key]
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": out_meta,
+        "spec": out_spec,
+    }
+
+
+def reclaim_stranded_mirror_storage(
+    node: str, namespace: str = "spatium"
+) -> tuple[dict[str, dict], str | None]:
+    """Delete the slot-image mirror's claim (and its Pending pod) when its
+    volume is pinned to ``node``, a node that was just deleted — returns
+    ``({claim_name: manifest_to_recreate}, error)``.
+
+    #1541 — the mirror is a single-replica Deployment on a local-path RWO
+    claim, so it has the Redis and Postgres hazard: once the node holding
+    its volume is evicted (a dead-node Replace, or a demote's cleanup), the
+    re-created pod sits Pending on the volume's node affinity for good. The
+    shrink reclaimed Redis's and Postgres's claims and not the mirror's (the
+    #1659 walk). Unlike those, nothing re-creates this claim: it is a plain
+    Helm-owned PVC (``helm.sh/resource-policy: keep``), not a StatefulSet
+    volumeClaimTemplate or a CNPG instance claim, and a Helm upgrade only
+    restores it if one happens to run. So the caller keeps the returned
+    manifest and hands it to :func:`recreate_reclaimed_claims` until the old
+    claim has finished terminating.
+
+    The bytes on the old volume are gone with the node either way; the
+    mirror starts empty on a live node and the api's download handler falls
+    back to its local copy, as it does after a promote.
+
+    The bound PV's node affinity decides it, with the scheduler's
+    ``selected-node`` annotation standing in only when there is no PV to
+    read (:func:`_pvc_pinned_hostnames`); a PV read that fails is an error,
+    never a guess."""
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    try:
+        status, resp = _request("GET", f"{base}/persistentvolumeclaims")
+    except RuntimeError as exc:
+        return {}, str(exc)
+    if status != 200:
+        return {}, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        items = json.loads(resp).get("items", [])
+    except ValueError:
+        return {}, "unparseable PVC list"
+    owed: dict[str, dict] = {}
+    for pvc in items:
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
+        if not name.endswith(_MIRROR_CLAIM_SUFFIX) or meta.get("deletionTimestamp"):
+            continue
+        hostnames, _source, err = _pvc_pinned_hostnames(pvc)
+        if err:
+            return owed, err
+        if node not in hostnames:
+            continue
+        manifest = _recreatable_claim(pvc)
+        try:
+            status, resp = _request(
+                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+            )
+        except RuntimeError as exc:
+            return owed, str(exc)
+        if status not in (200, 202, 404):
+            return owed, f"kubeapi status {status}: {resp[:200]!r}"
+        owed[name] = manifest
+        _delete_component_pods(_MIRROR_COMPONENT, namespace)
+    return owed, None
+
+
+def _delete_component_pods(component: str, namespace: str) -> None:
+    """Delete every pod carrying ``app.kubernetes.io/component=<component>``
+    so pvc-protection releases the claim it references and the Deployment
+    re-creates the pod against the new one. Best effort: the claim reclaim
+    is what matters, and a pod that is already gone is the goal."""
+    for pod in list_pods(
+        namespace, label_selector=f"app.kubernetes.io/component={component}"
+    ):
+        try:
+            _request(
+                "DELETE", f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod.name)}"
+            )
+        except RuntimeError:
+            pass  # gone already, or the next tick retries via the 409 path
+
+
+def recreate_reclaimed_claims(
+    owed: dict[str, dict], namespace: str = "spatium"
+) -> tuple[list[str], dict[str, dict], str | None]:
+    """Create each claim :func:`reclaim_stranded_mirror_storage` deleted —
+    returns ``(created, still_owed, error)``.
+
+    A claim still terminating answers 409 (pvc-protection holds it until no
+    pod references it): it stays owed, and its consumer pods are deleted
+    again in case the Deployment re-created one against the old claim in
+    between. A 409 for a claim that is NOT terminating means somebody else
+    (a Helm upgrade) has already re-created it, which is the outcome wanted,
+    so it is settled without a second write."""
+    base = f"/api/v1/namespaces/{quote(namespace)}/persistentvolumeclaims"
+    created: list[str] = []
+    still: dict[str, dict] = {}
+    error: str | None = None
+    for name, manifest in owed.items():
+        try:
+            status, resp = _request(
+                "POST",
+                base,
+                body=json.dumps(manifest).encode(),
+                content_type="application/json",
+            )
+        except RuntimeError as exc:
+            still[name], error = manifest, str(exc)
+            continue
+        if status in (200, 201, 202):
+            created.append(name)
+            continue
+        if status != 409:
+            still[name] = manifest
+            error = f"kubeapi status {status}: {resp[:200]!r}"
+            continue
+        try:
+            status, resp = _request("GET", f"{base}/{quote(name)}")
+        except RuntimeError as exc:
+            still[name], error = manifest, str(exc)
+            continue
+        terminating = True
+        if status == 200:
+            try:
+                terminating = bool(
+                    (json.loads(resp).get("metadata") or {}).get("deletionTimestamp")
+                )
+            except ValueError:
+                terminating = True
+        elif status == 404:
+            terminating = True  # gone between the two calls: create next tick
+        if terminating:
+            still[name] = manifest
+            _delete_component_pods(_MIRROR_COMPONENT, namespace)
+    return created, still, error
+
+
 # #1058 — CloudNativePG instance storage stranded on an evicted node.
 #
 # CNPG's own labels on the claims and pods it creates (docs: "Labels and
@@ -2010,6 +2193,7 @@ def patch_cnpg_instances(
     namespace: str = "spatium",
     scale_down: bool = True,
     hold_reason: str = "",
+    shrink_past_unready: bool = False,
 ) -> CnpgScale:
     """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and
     its instance-spreading policy.
@@ -2058,8 +2242,21 @@ def patch_cnpg_instances(
     ``Status.Instances`` counts PVC groups, a pending join included), so it
     would refuse the write anyway and act on it later, when the cluster is
     whole and nobody means it any more. The
-    caller retries every tick, so a real demote still lands once the cluster
-    is whole. Scale-UP and the affinity patch are never deferred.
+    caller retries every tick; a demote, whose departed instances never make
+    the cluster whole again, lifts this deferral (#1541, below). Scale-UP and
+    the affinity patch are never deferred.
+
+    #1541 — ``shrink_past_unready`` lifts the readiness deferral for a
+    demote whose nodes are gone (``heartbeat._DemoteShrink``). There the
+    unready instances are the departed nodes' and never come back, so the
+    Cluster is never whole again and the deferral above would hold the old
+    size for good. It is lifted only when the new size is at least the
+    number of ready instances: a spec no smaller than what is healthy can
+    never make CloudNativePG remove a healthy instance. CNPG's own gate
+    still keeps it from acting until the stranded instances' claims are
+    reclaimed (#1058; it does not remove instances while one is not
+    reporting), and then the smaller spec is what stops it re-creating them
+    on the nodes that are left.
 
     Note the affinity patch can strand an instance whose PVC is already
     bound to a node that now hosts another instance — it goes Pending until
@@ -2113,7 +2310,7 @@ def patch_cnpg_instances(
             deferred = hold_reason or "scale-down held by the caller"
         elif ready is None or reported is None:
             deferred = "the Cluster reports no readiness yet"
-        elif ready < reported:
+        elif ready < reported and not (shrink_past_unready and instances >= ready):
             deferred = f"readyInstances {ready} < instances {reported}"
     result = CnpgScale(current=current if isinstance(current, int) else None,
                        ready=ready, reported=reported, deferred=deferred)

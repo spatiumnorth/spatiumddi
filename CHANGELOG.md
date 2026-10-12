@@ -84,6 +84,72 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Demoting control-plane members no longer costs the seed its quorum
+  (#1541).** A demoted node reset itself to a fresh single-node seed
+  without leaving etcd, and nobody removed its member or its k8s Node
+  from the seed. From three members the odd-count rule allows only one
+  demote, of both non-seed members, so the seed was left with three
+  voters, two of them gone for good: it lost quorum and its control
+  plane wedged. From five, the cluster kept two ghost voters and no
+  fault tolerance, and a demoted node could not be promoted again under
+  its hostname. Now the leave runner removes the node's own etcd member
+  while it still votes (`spatium-etcd-evict --leave-self`), stops k3s,
+  and resets the node once the removal is done. etcd accepting the
+  removal is the removal (a member change commits through the quorum);
+  the node it joined is asked too, and only a survivor that answers and
+  still lists the member refuses the leave, leaving the node a working
+  member. A survivor that cannot be reached does not: refusing there
+  restarted k3s on a node whose member was already gone, which rejoined
+  it as a new member and left the control plane on two voters. Its
+  `left` report then hands the row to the seed's
+  eviction (the path Replace uses), which deletes the stale Node and
+  confirms etcd agrees before the row settles `left`. This does not
+  clean up ghost voters an earlier demote already left behind: a
+  cluster that lost quorum to one needs the etcd restore path, and one
+  that kept it (five down to three) still carries them until they are
+  removed by hand.
+
+  Two follow-ups from the three-node drills. **A demote now scales the
+  control plane down.** The seed treated the demote's eviction as a
+  Replace and armed #1059's size hold on it, and neither of the hold's
+  releases can fire after a demote, so a cluster demoted to one node
+  kept three Postgres instances and three api / frontend / worker /
+  redis replicas, with their pods Pending on the lone seed. The row now
+  carries `evict_after_demote`; the seed holds the size only for a
+  Replace, and for a demote lets the scale-down past CloudNativePG's
+  readiness deferral, which would otherwise have held it too (the
+  departed nodes' instances never report ready again). It never asks for
+  fewer instances than are ready, so it cannot make CloudNativePG remove
+  a healthy one. **A demote is refused (409) while a control-plane member
+  is unhealthy** — a heartbeat older than 90 s, or a k8s Node that is
+  NotReady or absent — naming the member, unless that member is itself
+  being demoted and a majority of the voters stays live at every step of
+  the leave. A leave's removal goes to the leaver's own etcd, a follower
+  whose view of its peers can be minutes stale: with one member powered
+  off and both demoted, it accepted its own removal and left the seed one
+  live voter of two. The check narrows that window, it does not close
+  it: a member that dies within the 40–50 s before its Node turns NotReady,
+  or during the leave itself, is not seen. The refusal names every
+  unhealthy member, each marked as staying or being demoted, and on k3s
+  the seed is judged by its Node alone: a member's sudden loss stalls the
+  seed's own heartbeat for about two minutes (#1805), and the first cut
+  then named the healthy seed instead of the member that was off.
+
+  Three more from the gate walk of a 3 → 1 demote. **The api and worker
+  rollouts no longer wedge.** The one-replica render switched both to a
+  surge-first rollout, but the one surviving old pod still carried the
+  3-node spec's required anti-affinity, which keeps the new pod off the
+  only node; the rollout timed out and the old 3-node pods, three redis
+  sentinels in their env, served on. Under the appliance's `hard`
+  anti-affinity both now retire an old pod first at any replica count, so
+  a one-node control plane takes a brief api / worker outage on each
+  rollout, as its frontend already did with `Recreate`. **The slot-image
+  mirror's volume is reclaimed** with Redis's and Postgres's when the seed
+  deletes an evicted node; the mirror sat Pending for good on a volume
+  pinned to the removed node. Nothing re-creates that claim on its own, so
+  the seed re-creates it once the old one has gone, and the mirror starts
+  empty on a live node (the images it held were on the removed node).
+
 - **Changing a zone's type now reaches Technitium (#1457).** The agent
   creates zones with `zones/create` and treats "already exists" as
   success, re-applying only the upstream, so the type of an existing
@@ -2968,6 +3034,10 @@ the formatter handles the rest.
   zone-file reading of a dot-less target does not re-point them.
   Downgrade is a no-op: the dotted value means the same under either
   reading.
+- `e3a81c5d07f2` — #1541: `appliance.evict_after_demote`, a boolean,
+  NOT NULL, default false. No backfill: every eviction an older build
+  stamped was a Replace, which is what false means. Downgrade drops the
+  column.
 
 ## 2026.10.02-1 — 2026-10-02
 
