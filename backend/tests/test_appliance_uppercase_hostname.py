@@ -24,6 +24,8 @@ from app.models.appliance import (
     CLUSTER_JOIN_STATE_LEFT,
     CLUSTER_ROLE_MEMBER,
 )
+from app.models.dhcp import DHCPServer
+from app.models.dns import DNSServer, DNSServerGroup
 from tests.test_appliance_control_plane_promote import _admin, _appliance, _hdr, _seed
 from tests.test_appliance_demote_quorum import DEMOTE, _fake_kubeapi
 from tests.test_appliance_evict_etcd import _beat, _row
@@ -126,3 +128,119 @@ async def test_the_seed_is_asked_to_evict_by_the_nodes_lowercase_name(
     await db_session.refresh(ghost)
     assert ghost.cluster_join_state == CLUSTER_JOIN_STATE_LEFT
     assert ghost.evict_requested is False
+
+
+# ── Appliance delete: case-blind, but never across an ambiguous hostname ──
+
+
+async def _agent_dns(db: AsyncSession, host: str) -> DNSServer:
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:8]}", description="")
+    db.add(group)
+    await db.flush()
+    server = DNSServer(
+        group_id=group.id,
+        name=f"{host}-{uuid.uuid4().hex[:4]}",
+        driver="bind9",
+        host=host,
+        port=53,
+        roles=["authoritative"],
+        status="active",
+        agent_id=uuid.uuid4(),
+    )
+    db.add(server)
+    await db.flush()
+    return server
+
+
+async def _agent_dhcp(db: AsyncSession, host: str) -> DHCPServer:
+    server = DHCPServer(
+        name=f"{host}-{uuid.uuid4().hex[:4]}",
+        driver="kea",
+        host=host,
+        port=67,
+        status="active",
+        agent_id=uuid.uuid4(),
+    )
+    db.add(server)
+    await db.flush()
+    return server
+
+
+async def _dependents(client: AsyncClient, token: str, appliance_id: uuid.UUID) -> set[str]:
+    resp = await client.get(
+        f"/api/v1/appliance/appliances/{appliance_id}/dependents", headers=_hdr(token)
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return {d["id"] for d in body["dns"]} | {d["id"] for d in body["dhcp"]}
+
+
+@pytest.mark.asyncio
+async def test_an_uppercase_appliance_owns_the_server_its_agent_registered_lowercase(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A DNS agent on k3s registers ``host`` = the Node's name (lowercase); a
+    Kea agent on hostNetwork registers the kernel nodename as typed. Both are
+    the appliance's own and both are found."""
+    token = await _admin(db_session)
+    ap = await _appliance(db_session, "Ddi-Upper-1")
+    dns = await _agent_dns(db_session, "ddi-upper-1")
+    dhcp = await _agent_dhcp(db_session, "Ddi-Upper-1")
+    await db_session.commit()
+
+    assert await _dependents(client, token, ap.id) == {str(dns.id), str(dhcp.id)}
+
+
+@pytest.mark.asyncio
+async def test_two_appliances_differing_only_in_case_never_claim_each_others_servers(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The case-blind match must not widen the #1810 hazard: with two approved
+    appliances whose hostnames differ only in case, a hostname is not a safe
+    claim, so neither previews (or deletes) the other's agent rows — only rows
+    whose FK names it."""
+    token = await _admin(db_session)
+    live = await _appliance(db_session, "ddi-twin")
+    dup = await _appliance(db_session, "DDI-Twin")
+    live_dns = await _agent_dns(db_session, "ddi-twin")
+    live_dhcp = await _agent_dhcp(db_session, "ddi-twin")
+    dup_owned = await _agent_dns(db_session, "DDI-Twin")
+    dup_owned.appliance_id = dup.id
+    await db_session.commit()
+    ids = {"live_dns": live_dns.id, "live_dhcp": live_dhcp.id, "dup_owned": dup_owned.id}
+
+    assert await _dependents(client, token, dup.id) == {str(dup_owned.id)}
+    assert await _dependents(client, token, live.id) == set()
+
+    resp = await client.request(
+        "DELETE",
+        f"/api/v1/appliance/appliances/{dup.id}",
+        headers=_hdr(token),
+        json={"password": "password123"},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert await db_session.get(DNSServer, ids["live_dns"]) is not None
+    assert await db_session.get(DHCPServer, ids["live_dhcp"]) is not None
+    assert await db_session.get(DNSServer, ids["dup_owned"]) is None
+
+
+@pytest.mark.asyncio
+async def test_rolling_upgrade_resolves_one_approved_appliance_case_blind(
+    db_session: AsyncSession,
+) -> None:
+    from app.models.appliance import APPLIANCE_STATE_REVOKED
+    from app.services.upgrades.per_node import _resolve_appliance
+
+    live = await _appliance(db_session, "Ddi-Roll-1")
+    old = await _appliance(db_session, "ddi-roll-1")
+    old.state = APPLIANCE_STATE_REVOKED  # the row a re-pair leaves behind
+    await db_session.commit()
+
+    got = await _resolve_appliance(db_session, "ddi-roll-1")
+    assert got is not None and got.id == live.id
+
+    # Two approved rows meeting on the Node name: ambiguous, never a guess.
+    old.state = live.state
+    await db_session.commit()
+    assert await _resolve_appliance(db_session, "ddi-roll-1") is None

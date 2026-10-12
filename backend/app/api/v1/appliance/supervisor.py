@@ -3645,9 +3645,14 @@ async def _find_appliance_dependents(
     appliance: Appliance,
 ) -> ApplianceDependents:
     """Return the dns_server + dhcp_server rows that belong to this
-    appliance. Matches on EITHER ``appliance_id`` (FK populated at
-    register time per #197) OR ``hostname`` (legacy / pre-FK rows).
-    Duplicates de-duped by row id.
+    appliance, by the shared ownership rule (#1715 / #1749): the
+    ``appliance_id`` FK, or an agent-based row with no FK whose host equals
+    this appliance's hostname case-blind — only while no OTHER approved
+    appliance shares that hostname. The host side is case-blind because an
+    agent on k3s registers the Node's name, which k3s lowercases (#1757);
+    the ambiguity guard is what keeps that from letting two appliances that
+    differ only in case (or a re-paired duplicate) delete each other's
+    servers.
     """
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
@@ -3663,12 +3668,7 @@ async def _find_appliance_dependents(
     dns_rows = (
         (
             await db.execute(
-                select(DNSServer).where(
-                    or_(
-                        DNSServer.appliance_id == appliance.id,
-                        _hostname_sql(DNSServer.host) == _k8s_node_name(appliance.hostname),
-                    )
-                )
+                select(DNSServer).where(await _own_server_condition(db, appliance, DNSServer))
             )
         )
         .scalars()
@@ -3681,12 +3681,7 @@ async def _find_appliance_dependents(
     dhcp_rows = (
         (
             await db.execute(
-                select(DHCPServer).where(
-                    or_(
-                        DHCPServer.appliance_id == appliance.id,
-                        _hostname_sql(DHCPServer.host) == _k8s_node_name(appliance.hostname),
-                    )
-                )
+                select(DHCPServer).where(await _own_server_condition(db, appliance, DHCPServer))
             )
         )
         .scalars()
